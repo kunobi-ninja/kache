@@ -27,10 +27,15 @@ const DYLD_DEFAULT_FALLBACK: &str = "/usr/local/lib:/usr/lib";
 /// inherited value already covers it or `rustc` is not a toolchain binary
 /// (a rustup proxy sets the variable itself).
 pub(crate) fn apply(cmd: &mut Command, rustc: &Path) {
-    let Some(lib) = toolchain_lib_dir(rustc) else {
+    apply_for(cmd, rustc, &crate::invocation::InvocationEnv::capture());
+}
+
+/// Restore the toolchain library path using only this invocation's inputs.
+pub(crate) fn apply_for(cmd: &mut Command, rustc: &Path, env: &crate::invocation::InvocationEnv) {
+    let Some(lib) = toolchain_lib_dir_for(rustc, env) else {
         return;
     };
-    let current = std::env::var(FALLBACK_VAR).ok();
+    let current = env.var(FALLBACK_VAR).ok();
     if let Some(value) = fallback_with(&lib, current.as_deref()) {
         cmd.env(FALLBACK_VAR, value);
     }
@@ -38,8 +43,8 @@ pub(crate) fn apply(cmd: &mut Command, rustc: &Path) {
 
 /// The `lib/` of the toolchain whose `bin/` holds `rustc`, following
 /// symlinks. `None` for anything that is not laid out as a toolchain.
-fn toolchain_lib_dir(rustc: &Path) -> Option<PathBuf> {
-    let resolved = crate::compiler::resolve_program_on_path(rustc.to_str()?)?;
+fn toolchain_lib_dir_for(rustc: &Path, env: &crate::invocation::InvocationEnv) -> Option<PathBuf> {
+    let resolved = env.resolve_program(rustc)?;
     let real = resolved.canonicalize().ok()?;
     let lib = real.parent()?.parent()?.join("lib");
     lib.join("rustlib").is_dir().then_some(lib)
@@ -58,6 +63,10 @@ fn fallback_with(lib: &Path, current: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn toolchain_lib_dir(rustc: &Path) -> Option<PathBuf> {
+        toolchain_lib_dir_for(rustc, &crate::invocation::InvocationEnv::capture())
+    }
 
     fn toolchain(root: &Path) -> PathBuf {
         let bin = root.join("toolchain/bin");
@@ -145,5 +154,44 @@ mod tests {
         let mut other = Command::new("true");
         apply(&mut other, &dir.path().join("missing/bin/rustc"));
         assert_eq!(other.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn invocation_toolchains_and_fallbacks_are_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let mut contexts = Vec::new();
+        for token in ["one", "two"] {
+            let cwd = root.path().join(token);
+            let rustc = toolchain(&cwd);
+            let lib = cwd.join("toolchain/lib").canonicalize().unwrap();
+            let fallback = format!("/{token}/lib");
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [("PATH", "toolchain/bin"), (FALLBACK_VAR, &fallback)],
+                Some(cwd),
+                None,
+                root.path().to_owned(),
+            );
+            contexts.push((rustc, lib, fallback, env));
+        }
+        for (_, lib, fallback, env) in &contexts {
+            // A relative PATH entry belongs to the client's cwd.
+            assert_eq!(
+                toolchain_lib_dir_for(Path::new("rustc"), env),
+                Some(lib.clone())
+            );
+            // A direct relative compiler path has the same interpretation.
+            assert_eq!(
+                toolchain_lib_dir_for(Path::new("toolchain/bin/rustc"), env),
+                Some(lib.clone())
+            );
+            let mut cmd = env.command("rustc").unwrap();
+            apply_for(&mut cmd, Path::new("rustc"), env);
+            let actual = cmd
+                .get_envs()
+                .find(|(key, _)| *key == FALLBACK_VAR)
+                .and_then(|(_, value)| value)
+                .unwrap();
+            assert_eq!(actual, format!("{}:{fallback}", lib.display()).as_str());
+        }
     }
 }

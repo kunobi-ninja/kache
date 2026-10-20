@@ -23,10 +23,12 @@
 //! cadence never reads the event log, so heartbeats cost a cold build with
 //! hundreds of fast misses nothing.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::events::{HEARTBEAT_EVENT_TAG, HEARTBEAT_SCHEMA, HeartbeatEvent};
@@ -36,11 +38,9 @@ const STUCK_WINDOW: Duration = Duration::from_secs(60);
 /// Stuck detection CPU-usage floor (fraction of one core).
 const STUCK_CPU_FLOOR: f64 = 0.01;
 
-/// Per-process heartbeat context, set once at wrapper entry (each compiler
-/// invocation runs under its own wrapper process, so process-global is
-/// per-compile — the same pattern as `link.rs`'s restore toggles).
+/// Heartbeat configuration owned by an invocation and its monitor thread.
 struct HeartbeatCtx {
-    /// Cadence in seconds; `set_heartbeat_ctx` is never called with 0.
+    /// Nonzero cadence in seconds; a cadence of 0 installs no context.
     cadence_secs: u64,
     event_log: PathBuf,
     /// Daemon socket, for the fire-and-forget in-flight registry
@@ -54,11 +54,52 @@ struct HeartbeatCtx {
     show_lines: bool,
 }
 
-static CTX: OnceLock<HeartbeatCtx> = OnceLock::new();
+static CTX: OnceLock<Arc<HeartbeatCtx>> = OnceLock::new();
+
+type InvocationHeartbeatCtx = Rc<RefCell<Option<Arc<HeartbeatCtx>>>>;
+
+thread_local! {
+    static INVOCATION_CTX: RefCell<Option<InvocationHeartbeatCtx>> = const { RefCell::new(None) };
+}
+
+/// Own heartbeat configuration for one synchronous compiler invocation.
+///
+/// Each scope starts disabled. Nested scopes restore their parent on drop.
+/// The guard cannot move between threads and must not span an async suspension
+/// or task switch. A spawned monitor retains its own context after scope exit.
+pub(crate) struct InvocationHeartbeatScope {
+    previous: Option<InvocationHeartbeatCtx>,
+    _current: InvocationHeartbeatCtx,
+}
+
+impl InvocationHeartbeatScope {
+    pub(crate) fn enter() -> Self {
+        let current = Rc::new(RefCell::new(None));
+        let previous = INVOCATION_CTX.with(|slot| slot.replace(Some(Rc::clone(&current))));
+        Self {
+            previous,
+            _current: current,
+        }
+    }
+}
+
+impl Drop for InvocationHeartbeatScope {
+    fn drop(&mut self) {
+        INVOCATION_CTX.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn current_heartbeat_ctx() -> Option<Arc<HeartbeatCtx>> {
+    INVOCATION_CTX.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or_else(|| CTX.get().cloned(), |current| current.borrow().clone())
+    })
+}
 
 /// Install the heartbeat context (from `Config::heartbeat_secs` and the
-/// derived event root). Call once per process before the compile; not calling
-/// it — or a `cadence_secs` of 0 — leaves heartbeats off.
+/// derived event root). In an invocation scope, a cadence of 0 disables the
+/// current context. Outside a scope, the first nonzero configuration wins.
 pub fn set_heartbeat_ctx(
     cadence_secs: u64,
     event_log: PathBuf,
@@ -66,15 +107,21 @@ pub fn set_heartbeat_ctx(
     root: String,
     show_lines: bool,
 ) {
-    if cadence_secs == 0 {
-        return;
-    }
-    let _ = CTX.set(HeartbeatCtx {
-        cadence_secs,
-        event_log,
-        socket,
-        root,
-        show_lines,
+    let ctx = (cadence_secs != 0).then(|| {
+        Arc::new(HeartbeatCtx {
+            cadence_secs,
+            event_log,
+            socket,
+            root,
+            show_lines,
+        })
+    });
+    INVOCATION_CTX.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            current.replace(ctx);
+        } else if let Some(ctx) = ctx {
+            let _ = CTX.set(ctx);
+        }
     });
 }
 
@@ -94,7 +141,7 @@ pub struct CompileMonitor {
 /// Start monitoring a spawned compiler child. Returns `None` (a no-op) when
 /// no heartbeat context is installed — callers need no gating of their own.
 pub fn start_monitor(crate_name: &str, pid: u32) -> Option<CompileMonitor> {
-    let ctx = CTX.get()?;
+    let ctx = current_heartbeat_ctx()?;
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -103,7 +150,7 @@ pub fn start_monitor(crate_name: &str, pid: u32) -> Option<CompileMonitor> {
     let _ = std::thread::Builder::new()
         .name("kache-heartbeat".into())
         .spawn(move || {
-            monitor_loop(ctx, &crate_name, pid, &thread_stop, &wake_rx);
+            monitor_loop(&ctx, &crate_name, pid, &thread_stop, &wake_rx);
             let _ = done_tx.send(());
         })
         .ok()?;
@@ -370,6 +417,130 @@ fn child_cpu_time(_pid: u32) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_test_context(cadence_secs: u64, root: &str, show_lines: bool) {
+        set_heartbeat_ctx(
+            cadence_secs,
+            PathBuf::from(format!("{root}/events.jsonl")),
+            PathBuf::from(format!("{root}/daemon.sock")),
+            root.to_string(),
+            show_lines,
+        );
+    }
+
+    fn assert_test_context(cadence_secs: u64, root: &str, show_lines: bool) {
+        let ctx = current_heartbeat_ctx().expect("this invocation enabled heartbeats");
+        assert_eq!(ctx.cadence_secs, cadence_secs);
+        assert_eq!(ctx.event_log, PathBuf::from(format!("{root}/events.jsonl")));
+        assert_eq!(ctx.socket, PathBuf::from(format!("{root}/daemon.sock")));
+        assert_eq!(ctx.root, root);
+        assert_eq!(ctx.show_lines, show_lines);
+    }
+
+    #[test]
+    fn concurrent_monitors_keep_request_context_after_scope_exit() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for cadence_secs in [1, 2] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let scope = InvocationHeartbeatScope::enter();
+                    let dir = tempfile::tempdir().unwrap();
+                    let event_log = dir.path().join("events.jsonl");
+                    let socket = dir.path().join("missing-daemon.sock");
+                    let root = format!("/request-{cadence_secs}");
+                    let crate_name = format!("crate_{cadence_secs}");
+                    set_heartbeat_ctx(
+                        cadence_secs,
+                        event_log.clone(),
+                        socket.clone(),
+                        root.clone(),
+                        false,
+                    );
+                    barrier.wait();
+                    let ctx = current_heartbeat_ctx().unwrap();
+                    assert_eq!(ctx.cadence_secs, cadence_secs);
+                    assert_eq!(ctx.event_log, event_log);
+                    assert_eq!(ctx.socket, socket);
+                    assert_eq!(ctx.root, root);
+                    assert!(!ctx.show_lines);
+                    let monitor = start_monitor(&crate_name, std::process::id()).unwrap();
+                    drop(scope);
+                    drop(ctx);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let event = loop {
+                        if let Ok(contents) = std::fs::read_to_string(&event_log)
+                            && let Some(event) = contents
+                                .lines()
+                                .find_map(|line| serde_json::from_str::<HeartbeatEvent>(line).ok())
+                        {
+                            break event;
+                        }
+                        assert!(Instant::now() < deadline, "request monitor did not tick");
+                        std::thread::sleep(Duration::from_millis(20));
+                    };
+                    drop(monitor);
+                    assert_eq!(event.root, root);
+                    assert_eq!(event.crate_name, crate_name);
+                    assert_eq!(event.pid, std::process::id());
+                    assert_eq!(event.schema, HEARTBEAT_SCHEMA);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn disabled_invocation_does_not_inherit_another_context() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for enabled in [false, true] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let _scope = InvocationHeartbeatScope::enter();
+                    set_test_context(3600, "/initial-root", false);
+                    if !enabled {
+                        set_test_context(0, "/disabled-root", true);
+                    }
+                    barrier.wait();
+                    let monitor = start_monitor("test_crate", std::process::id());
+                    assert_eq!(monitor.is_some(), enabled);
+                    if enabled {
+                        assert_test_context(3600, "/initial-root", false);
+                    } else {
+                        assert!(current_heartbeat_ctx().is_none());
+                    }
+                    drop(monitor);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn nested_heartbeat_scopes_restore_parent_after_panic_and_worker_reuse() {
+        std::thread::spawn(|| {
+            for cadence_secs in [13, 37] {
+                let _scope = InvocationHeartbeatScope::enter();
+                assert!(current_heartbeat_ctx().is_none());
+                set_test_context(cadence_secs, "/parent-root", false);
+                {
+                    let _nested = InvocationHeartbeatScope::enter();
+                    assert!(current_heartbeat_ctx().is_none());
+                    assert!(start_monitor("disabled", std::process::id()).is_none());
+                    set_test_context(71, "/child-root", true);
+                    assert_test_context(71, "/child-root", true);
+                }
+                assert_test_context(cadence_secs, "/parent-root", false);
+                let _ = std::panic::catch_unwind(|| {
+                    let _nested = InvocationHeartbeatScope::enter();
+                    set_test_context(97, "/panicking-root", true);
+                    panic!("test panic");
+                });
+                assert_test_context(cadence_secs, "/parent-root", false);
+            }
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn format_secs_is_compact() {

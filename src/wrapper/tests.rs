@@ -629,6 +629,7 @@ fn volume_route_path_rustc_prefers_out_dir_then_output_parent() {
 #[test]
 fn volume_route_path_cc_uses_output_parent() {
     let mut parsed = crate::compiler::cc::CcArgs {
+        invocation_env: crate::invocation::InvocationEnv::capture(),
         program: "cc".into(),
         rest: Vec::new(),
         sources: vec![PathBuf::from("a.c")],
@@ -7353,6 +7354,7 @@ fn seed_nvcc_entry(
     let file_hasher = FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,

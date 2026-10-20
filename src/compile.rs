@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ExitStatus};
 
 use crate::compiler::{ArtifactSet, classify_by_filename};
 
@@ -56,10 +56,17 @@ pub(crate) struct RustcResponseFile {
 
 impl RustcResponseFile {
     pub(crate) fn new<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        Self::new_in(&std::env::temp_dir(), args)
+    }
+
+    pub(crate) fn new_in<'a>(
+        temp_dir: &Path,
+        args: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self> {
         let mut file = tempfile::Builder::new()
             .prefix("kache-rustc-")
             .suffix(".args")
-            .tempfile()
+            .tempfile_in(temp_dir)
             .context("creating rustc response file")?;
         for arg in args {
             if arg.contains('\n') || arg.contains('\r') {
@@ -94,7 +101,8 @@ impl RustcResponseFile {
 /// Cross-machine cache hits then serve binaries whose DWARF / PDB
 /// references map cleanly to a recipient's local source via
 /// `lldb`/`gdb`'s `set substitute-path` (or equivalent).
-pub fn run_rustc(
+pub(crate) fn run_rustc(
+    env: &crate::invocation::InvocationEnv,
     rustc: &Path,
     inner_rustc: Option<&Path>,
     args: &[String],
@@ -110,6 +118,22 @@ pub fn run_rustc(
     metadata_sink: Option<&mut dyn Write>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<CompileResult> {
+    let cwd = env
+        .cwd()
+        .context("compiler invocation has no working directory")?;
+    // These paths are used by Kache's filesystem operations. Keep compiler
+    // arguments unchanged so rustc resolves them in its own invocation cwd.
+    let output_path = output_path
+        .map(|path| env.resolve(path).context("resolving rustc output path"))
+        .transpose()?;
+    let out_dir = out_dir
+        .map(|path| {
+            env.resolve(path)
+                .context("resolving rustc output directory")
+        })
+        .transpose()?;
+    let output_path = output_path.as_deref();
+    let out_dir = out_dir.as_deref();
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
     // files and fails with "output file is not writeable".
@@ -123,8 +147,8 @@ pub fn run_rustc(
         crate::opcounts::record_compiler_run();
     }
     let spawned = std::time::Instant::now();
-    let mut cmd = Command::new(rustc);
-    crate::toolchain_dylib::apply(&mut cmd, rustc);
+    let mut cmd = env.command(rustc)?;
+    crate::toolchain_dylib::apply_for(&mut cmd, rustc, env);
     if matches!(
         incremental_mode,
         IncrementalMode::PreserveIsolated { bootstrap: true }
@@ -173,7 +197,11 @@ pub fn run_rustc(
         IncrementalMode::PreserveIsolated { .. } => args.iter().collect(),
     };
     let response_file = if use_response_file {
-        let response = RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str()))?;
+        let temp_dir = env
+            .resolve(env.temp_dir())
+            .context("resolving rustc response-file directory")?;
+        let response =
+            RustcResponseFile::new_in(&temp_dir, compiler_args.iter().map(|arg| arg.as_str()))?;
         cmd.arg(response.argument());
         Some(response)
     } else {
@@ -262,7 +290,7 @@ pub fn run_rustc(
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
     let artifacts = if exit_code == 0 {
-        let from_json = resolve_artifacts(&captured_stderr.artifacts);
+        let from_json = resolve_artifacts_in(&captured_stderr.artifacts, cwd);
         if from_json.is_empty() {
             tracing::debug!(
                 "[kache] no rustc artifact notifications for {}; falling back to candidate path discovery",
@@ -506,13 +534,11 @@ fn parse_rustc_artifact(line: &[u8]) -> Option<serde_json::Value> {
 /// Resolve rustc-reported artifact paths into the `(absolute_path,
 /// store_filename)` pairs the cache layer stores.
 ///
-/// rustc reports artifact paths relative to its own cwd; kache never
-/// sets a cwd on the rustc child, so that cwd is the wrapper's cwd.
+/// rustc reports artifact paths relative to its invocation cwd.
 /// Absolute paths are kept as-is. A reported artifact missing from disk
 /// is dropped with a warning rather than aborting — kache then stores a
 /// smaller set (a conservative miss next time), never a corrupt entry.
-fn resolve_artifacts(artifacts: &[PathBuf]) -> Vec<(PathBuf, String)> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+fn resolve_artifacts_in(artifacts: &[PathBuf], cwd: &Path) -> Vec<(PathBuf, String)> {
     let mut files = Vec::new();
     for artifact in artifacts {
         let abs = if artifact.is_absolute() {
@@ -812,11 +838,146 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::rc::Rc;
     // Used only by the `#[cfg(unix)]` hardlink test below, which relies on
     // Unix mode bits; the portable read-only tests use `make_readonly`.
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_compilers_use_client_environment_paths_and_response_files() {
+        use crate::invocation::InvocationEnv;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut invocations = Vec::new();
+        for token in ["left", "right"] {
+            let cwd = root.path().join(token);
+            let temp = cwd.join("tmp");
+            fs::create_dir_all(cwd.join("out")).unwrap();
+            fs::create_dir_all(&temp).unwrap();
+            let compiler = cwd.join("fake-rustc");
+            kache_fs::testutil::write_executable(
+                &compiler,
+                r##"#!/bin/sh
+set -eu
+response=${1#@}
+test "$response" != "$1"
+case "$response" in "$TMPDIR"/*) ;; *) exit 92 ;; esac
+while IFS= read -r argument; do
+    printf '%s\n' "$argument"
+done < "$response" > actual-args
+test ! -e out/libsample.rlib
+test ! -e out/libsample.rmeta
+printf '%s' "$INVOCATION_TOKEN" > out/libsample.rlib
+printf '%s' "$INVOCATION_TOKEN" > out/libsample.rmeta
+printf '%s\n%s\n%s\n' "$PWD" "$INVOCATION_TOKEN" "$response"
+printf '%s\n' 'compiler diagnostic' >&2
+if test "$REPORT_ARTIFACTS" = yes; then
+    printf '%s\n' '{"$message_type":"artifact","artifact":"out/libsample.rmeta","emit":"metadata"}' >&2
+    printf '%s\n' '{"$message_type":"artifact","artifact":"out/libsample.rlib","emit":"link"}' >&2
+fi
+"##,
+            );
+            invocations.push((
+                token,
+                cwd.clone(),
+                compiler,
+                InvocationEnv::from_parts(
+                    [
+                        ("INVOCATION_TOKEN", token.into()),
+                        ("TMPDIR", temp.into_os_string()),
+                    ],
+                    Some(cwd),
+                    None,
+                    PathBuf::from("tmp"),
+                ),
+            ));
+        }
+
+        // Exercise authoritative JSON and fallback discovery with both forms
+        // of output selection. The argv paths must remain relative in all cases.
+        for (json, explicit_output) in [(true, true), (false, false)] {
+            for (_, cwd, _, _) in &invocations {
+                for name in ["libsample.rlib", "libsample.rmeta"] {
+                    let path = cwd.join("out").join(name);
+                    fs::write(&path, b"old cache hardlink").unwrap();
+                    let mut permissions = fs::metadata(&path).unwrap().permissions();
+                    permissions.set_readonly(true);
+                    fs::set_permissions(path, permissions).unwrap();
+                }
+            }
+            std::thread::scope(|scope| {
+                let mut children = Vec::new();
+                for (token, cwd, compiler, env) in &invocations {
+                    let mut env = env.clone();
+                    env.set("REPORT_ARTIFACTS", if json { "yes" } else { "no" });
+                    children.push(scope.spawn(move || {
+                        let args = vec![
+                            "--out-dir".to_owned(),
+                            "out".to_owned(),
+                            "-o".to_owned(),
+                            "out/libsample.rlib".to_owned(),
+                            "relative.rs".to_owned(),
+                        ];
+                        let mut metadata = Vec::new();
+                        let result = run_rustc(
+                            &env,
+                            compiler,
+                            None,
+                            &args,
+                            true,
+                            explicit_output.then_some(Path::new("out/libsample.rlib")),
+                            Some(Path::new("out")),
+                            Some("sample"),
+                            None,
+                            &[],
+                            false,
+                            &crate::path_normalizer::PathNormalizer::empty(),
+                            IncrementalMode::Strip,
+                            Some(&mut metadata),
+                            None,
+                        )
+                        .unwrap();
+                        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+                        assert!(!result.signaled);
+                        assert_eq!(
+                            fs::read_to_string(cwd.join("actual-args")).unwrap(),
+                            format!("{}\n", args.join("\n"))
+                        );
+                        let lines: Vec<_> = result.stdout.lines().collect();
+                        assert_eq!(lines.len(), 3);
+                        assert_eq!(Path::new(lines[0]), cwd.canonicalize().unwrap());
+                        assert_eq!(lines[1], *token);
+                        let response = Path::new(lines[2]);
+                        assert_eq!(response.parent(), Some(cwd.join("tmp").as_path()));
+                        assert!(!response.exists(), "response file must be removed");
+                        assert_eq!(result.artifacts.outputs().len(), 2);
+                        for artifact in result.artifacts.outputs() {
+                            assert_eq!(artifact.path.parent(), Some(cwd.join("out").as_path()));
+                            assert_eq!(fs::read_to_string(&artifact.path).unwrap(), *token);
+                        }
+                        if json {
+                            assert_eq!(
+                                String::from_utf8(metadata).unwrap(),
+                                "{\"$message_type\":\"artifact\",\"artifact\":\"out/libsample.rmeta\",\"emit\":\"metadata\"}\n"
+                            );
+                            assert!(!result.pending_stderr().contains("\"emit\":\"metadata\""));
+                            assert!(result.pending_stderr().contains("\"emit\":\"link\""));
+                        } else {
+                            assert!(metadata.is_empty());
+                        }
+                        assert!(result.pending_stderr().contains("compiler diagnostic"));
+                    }));
+                }
+                for child in children {
+                    child.join().unwrap();
+                }
+            });
+        }
+    }
 
     #[cfg(unix)]
     struct FailingPipe<R>(R);
@@ -1484,7 +1645,7 @@ mod tests {
         fs::write(&present, b"rlib bytes").unwrap();
         let missing = dir.path().join("ghost-9a.rmeta");
 
-        let resolved = resolve_artifacts(&[present.clone(), missing]);
+        let resolved = resolve_artifacts_in(&[present.clone(), missing], dir.path());
 
         // A reported-but-missing artifact is dropped, not fatal: kache
         // stores the smaller set rather than a corrupt entry.

@@ -1,22 +1,112 @@
-//! Process-global counters for the work kache does while handling one
-//! compile — external programs spawned, and bytes restored from cache.
+//! Counters for one synchronous compiler invocation.
 //!
-//! Each `kache` wrapper invocation is its own process and handles
-//! exactly one compile, so a process-global counter read when the build
-//! event is logged reflects that compile's work — no per-call plumbing
-//! through the `Compiler` trait is needed.
-//!
-//! Unlike timings, these counts are **deterministic**: they do not
-//! depend on machine speed, runner load, or filesystem-cache warmth. So
-//! the e2e harness can assert on them as a perf-regression guard — e.g.
-//! "a warm cache hit must not spawn the compiler" — with the same
-//! reliability as a correctness assertion. Wall-clock budgets cannot do
-//! that across the self-hosted / GitHub-hosted runner mix.
+//! An explicit scope owns accounting while a daemon worker handles a compile.
+//! Legacy callers without a scope retain process totals. Counts are deterministic
+//! given the same compiler work and filesystem; timings measure elapsed work.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+struct InvocationCounts {
+    start: Instant,
+    suspend_spawn_counts: Cell<u32>,
+    compiler_runs: Cell<u32>,
+    preprocessor_runs: Cell<u32>,
+    probe_runs: Cell<u32>,
+    dep_info_runs: Cell<u32>,
+    startup_us: Cell<u64>,
+    dep_info_us: Cell<u64>,
+    flight_wait_us: Cell<u64>,
+    permit_wait_us: Cell<u64>,
+    prediction_mismatches: Cell<u64>,
+}
+
+thread_local! {
+    static INVOCATION_COUNTS: RefCell<Option<Rc<InvocationCounts>>> = const { RefCell::new(None) };
+}
+
+/// Account for one synchronous compilation on this thread, starting at `start`.
+///
+/// Nested scopes restore their parent on drop. The guard cannot move between
+/// threads and must not span an async suspension or task switch.
+pub struct InvocationScope {
+    previous: Option<Rc<InvocationCounts>>,
+    _current: Rc<InvocationCounts>,
+    _bytes: kache_store::opcounts::InvocationByteScope,
+}
+
+impl InvocationScope {
+    pub fn enter(start: Instant) -> Self {
+        let current = Rc::new(InvocationCounts {
+            start,
+            suspend_spawn_counts: Cell::new(0),
+            compiler_runs: Cell::new(0),
+            preprocessor_runs: Cell::new(0),
+            probe_runs: Cell::new(0),
+            dep_info_runs: Cell::new(0),
+            startup_us: Cell::new(0),
+            dep_info_us: Cell::new(0),
+            flight_wait_us: Cell::new(0),
+            permit_wait_us: Cell::new(0),
+            prediction_mismatches: Cell::new(0),
+        });
+        let previous = INVOCATION_COUNTS.with(|slot| slot.replace(Some(Rc::clone(&current))));
+        Self {
+            previous,
+            _current: current,
+            _bytes: kache_store::opcounts::InvocationByteScope::enter(),
+        }
+    }
+}
+
+impl Drop for InvocationScope {
+    fn drop(&mut self) {
+        INVOCATION_COUNTS.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn add_u32(global: &AtomicU32, field: fn(&InvocationCounts) -> &Cell<u32>, value: u32) {
+    INVOCATION_COUNTS.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            let counter = field(current);
+            counter.set(counter.get() + value);
+        } else {
+            global.fetch_add(value, Ordering::Relaxed);
+        }
+    });
+}
+
+fn get_u32(global: &AtomicU32, field: fn(&InvocationCounts) -> &Cell<u32>) -> u32 {
+    INVOCATION_COUNTS.with(|slot| {
+        slot.borrow().as_ref().map_or_else(
+            || global.load(Ordering::Relaxed),
+            |current| field(current).get(),
+        )
+    })
+}
+
+fn add_u64(global: &AtomicU64, field: fn(&InvocationCounts) -> &Cell<u64>, value: u64) {
+    INVOCATION_COUNTS.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            let counter = field(current);
+            counter.set(counter.get() + value);
+        } else {
+            global.fetch_add(value, Ordering::Relaxed);
+        }
+    });
+}
+
+fn get_u64(global: &AtomicU64, field: fn(&InvocationCounts) -> &Cell<u64>) -> u64 {
+    INVOCATION_COUNTS.with(|slot| {
+        slot.borrow().as_ref().map_or_else(
+            || global.load(Ordering::Relaxed),
+            |current| field(current).get(),
+        )
+    })
+}
 
 static COMPILER_RUNS: AtomicU32 = AtomicU32::new(0);
 static PREPROCESSOR_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -31,24 +121,41 @@ thread_local! {
     static SKIPPED_COMPILER_RUNS: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Run `f` without counting compiler/preprocessor/probe spawns toward this
-/// process's event. Compile-and-compare qualification still spawns rustc on
-/// a hit; the hit event must keep `compiler_runs = 0` so warm-cache
+/// Run `f` without counting compiler/preprocessor/probe spawns toward the
+/// active invocation's event (or the legacy process total). Compile-and-compare
+/// qualification still spawns rustc on a hit; the hit event must keep
+/// `compiler_runs = 0` so warm-cache
 /// assertions stay meaningful.
 pub fn suspend_spawn_counts<T>(f: impl FnOnce() -> T) -> T {
-    SUSPEND_SPAWN_COUNTS.with(|depth| depth.set(depth.get() + 1));
-    struct Restore;
+    let invocation = INVOCATION_COUNTS.with(|slot| slot.borrow().clone());
+    if let Some(current) = invocation.as_ref() {
+        let depth = &current.suspend_spawn_counts;
+        depth.set(depth.get() + 1);
+    } else {
+        SUSPEND_SPAWN_COUNTS.with(|depth| depth.set(depth.get() + 1));
+    }
+    struct Restore(Option<Rc<InvocationCounts>>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            SUSPEND_SPAWN_COUNTS.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            if let Some(current) = self.0.as_ref() {
+                let depth = &current.suspend_spawn_counts;
+                depth.set(depth.get().saturating_sub(1));
+            } else {
+                SUSPEND_SPAWN_COUNTS.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            }
         }
     }
-    let _restore = Restore;
+    let _restore = Restore(invocation);
     f()
 }
 
 fn spawn_counts_suspended() -> bool {
-    SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() > 0)
+    INVOCATION_COUNTS.with(|slot| {
+        slot.borrow().as_ref().map_or_else(
+            || SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() > 0),
+            |current| current.suspend_spawn_counts.get() > 0,
+        )
+    })
 }
 
 /// Record that kache spawned the underlying compiler — `rustc`, or a
@@ -60,7 +167,7 @@ pub fn record_compiler_run() {
         SKIPPED_COMPILER_RUNS.with(|count| count.set(count.get() + 1));
         return;
     }
-    COMPILER_RUNS.fetch_add(1, Ordering::Relaxed);
+    add_u32(&COMPILER_RUNS, |counts| &counts.compiler_runs, 1);
 }
 
 /// Record that kache spawned the preprocessor (`cc -E`) — currently
@@ -70,17 +177,17 @@ pub fn record_preprocessor_run() {
     if spawn_counts_suspended() {
         return;
     }
-    PREPROCESSOR_RUNS.fetch_add(1, Ordering::Relaxed);
+    add_u32(&PREPROCESSOR_RUNS, |counts| &counts.preprocessor_runs, 1);
 }
 
-/// Compiler spawns recorded so far in this process.
+/// Compiler spawns for the active invocation, or the legacy process total.
 pub fn compiler_runs() -> u32 {
-    COMPILER_RUNS.load(Ordering::Relaxed)
+    get_u32(&COMPILER_RUNS, |counts| &counts.compiler_runs)
 }
 
-/// Preprocessor spawns recorded so far in this process.
+/// Preprocessor spawns for the active invocation, or the legacy process total.
 pub fn preprocessor_runs() -> u32 {
-    PREPROCESSOR_RUNS.load(Ordering::Relaxed)
+    get_u32(&PREPROCESSOR_RUNS, |counts| &counts.preprocessor_runs)
 }
 
 /// Record that kache ran a compiler probe — `<cc> --version` (and, in
@@ -91,12 +198,12 @@ pub fn record_probe_run() {
     if spawn_counts_suspended() {
         return;
     }
-    PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+    add_u32(&PROBE_RUNS, |counts| &counts.probe_runs, 1);
 }
 
-/// Compiler probes recorded so far in this process.
+/// Compiler probes for the active invocation, or the legacy process total.
 pub fn probe_runs() -> u32 {
-    PROBE_RUNS.load(Ordering::Relaxed)
+    get_u32(&PROBE_RUNS, |counts| &counts.probe_runs)
 }
 
 // ── Restore-method byte counters ───────────────────────────────────────────
@@ -126,49 +233,55 @@ static DEP_INFO_RUNS: AtomicU32 = AtomicU32::new(0);
 static FLIGHT_WAIT_US: AtomicU64 = AtomicU64::new(0);
 static PERMIT_WAIT_US: AtomicU64 = AtomicU64::new(0);
 
-/// Pin the process start. Called first thing in `main`, before argv handling
+/// Pin the legacy process start. Called first thing in `main`, before argv handling
 /// or config load, so `startup_ms` covers everything that runs before the
 /// wrapper's first cache decision. A second call changes nothing.
 ///
 /// Process-wide and permanent: in a test binary, once any test pins it,
 /// every later in-process wrapper run measures `elapsed_ms` from that pin.
-/// Tests must not assert an upper bound on `elapsed_ms` or `startup_ms`.
+/// Tests must not assert an upper bound on legacy `elapsed_ms` or `startup_ms`.
+/// An invocation scope keeps its injected start instead.
 pub fn mark_process_start() {
     let _ = PROCESS_START.set(Instant::now());
 }
 
-/// The instant `main` pinned, or `None` when this process never went through
-/// `main` (unit tests, library callers). The wrapper then anchors elapsed
-/// time at its own entry and records no startup.
+/// The active invocation's injected start, otherwise the instant `main` pinned.
+/// Returns `None` when neither exists (unit tests, library callers); the wrapper
+/// then anchors elapsed time at its own entry and records no startup.
 pub fn process_start() -> Option<Instant> {
-    PROCESS_START.get().copied()
+    INVOCATION_COUNTS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|current| current.start)
+            .or_else(|| PROCESS_START.get().copied())
+    })
 }
 
 /// Record the time from process start to the wrapper's entry.
 pub fn record_startup(spent: Duration) {
-    STARTUP_US.fetch_add(micros(spent), Ordering::Relaxed);
+    add_u64(&STARTUP_US, |counts| &counts.startup_us, micros(spent));
 }
 
-/// Process start to wrapper entry so far in this process, whole milliseconds.
+/// Startup time for the active invocation, or the process total, in milliseconds.
 pub fn startup_ms() -> u64 {
-    ms_from_micros(STARTUP_US.load(Ordering::Relaxed))
+    ms_from_micros(get_u64(&STARTUP_US, |counts| &counts.startup_us))
 }
 
 /// Record one `rustc --emit=dep-info` pre-pass spawn and the time spent
 /// waiting for it. Counted whether or not rustc succeeded: the spawn happened.
 pub fn record_dep_info_run(spent: Duration) {
-    DEP_INFO_RUNS.fetch_add(1, Ordering::Relaxed);
-    DEP_INFO_US.fetch_add(micros(spent), Ordering::Relaxed);
+    add_u32(&DEP_INFO_RUNS, |counts| &counts.dep_info_runs, 1);
+    add_u64(&DEP_INFO_US, |counts| &counts.dep_info_us, micros(spent));
 }
 
-/// Dep-info pre-pass spawns so far in this process.
+/// Dep-info pre-pass spawns for the active invocation, or the process total.
 pub fn dep_info_runs() -> u32 {
-    DEP_INFO_RUNS.load(Ordering::Relaxed)
+    get_u32(&DEP_INFO_RUNS, |counts| &counts.dep_info_runs)
 }
 
-/// Time spent in dep-info pre-pass spawns so far, whole milliseconds.
+/// Dep-info time for the active invocation, or the process total, in milliseconds.
 pub fn dep_info_ms() -> u64 {
-    ms_from_micros(DEP_INFO_US.load(Ordering::Relaxed))
+    ms_from_micros(get_u64(&DEP_INFO_US, |counts| &counts.dep_info_us))
 }
 
 static PREDICTION_MISMATCHES: AtomicU64 = AtomicU64::new(0);
@@ -177,32 +290,46 @@ static PREDICTION_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// the pre-pass closure. The pre-pass result won; the record was refreshed
 /// from it downstream.
 pub fn record_prediction_mismatch() {
-    PREDICTION_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    add_u64(
+        &PREDICTION_MISMATCHES,
+        |counts| &counts.prediction_mismatches,
+        1,
+    );
 }
 
-/// Sampled-verification mismatches so far in this process.
+/// Verification mismatches for the active invocation, or the process total.
 pub fn prediction_mismatches() -> u64 {
-    PREDICTION_MISMATCHES.load(Ordering::Relaxed)
+    get_u64(&PREDICTION_MISMATCHES, |counts| {
+        &counts.prediction_mismatches
+    })
 }
 
 /// Record time blocked joining a scheduler flight another process owned.
 pub fn record_flight_wait(spent: Duration) {
-    FLIGHT_WAIT_US.fetch_add(micros(spent), Ordering::Relaxed);
+    add_u64(
+        &FLIGHT_WAIT_US,
+        |counts| &counts.flight_wait_us,
+        micros(spent),
+    );
 }
 
 /// Record time blocked acquiring scheduler permit slots.
 pub fn record_permit_wait(spent: Duration) {
-    PERMIT_WAIT_US.fetch_add(micros(spent), Ordering::Relaxed);
+    add_u64(
+        &PERMIT_WAIT_US,
+        |counts| &counts.permit_wait_us,
+        micros(spent),
+    );
 }
 
-/// Flight-join wait so far in this process, whole milliseconds.
+/// Flight wait for the active invocation, or the process total, in milliseconds.
 pub fn flight_wait_ms() -> u64 {
-    ms_from_micros(FLIGHT_WAIT_US.load(Ordering::Relaxed))
+    ms_from_micros(get_u64(&FLIGHT_WAIT_US, |counts| &counts.flight_wait_us))
 }
 
-/// Permit wait so far in this process, whole milliseconds.
+/// Permit wait for the active invocation, or the process total, in milliseconds.
 pub fn permit_wait_ms() -> u64 {
-    ms_from_micros(PERMIT_WAIT_US.load(Ordering::Relaxed))
+    ms_from_micros(get_u64(&PERMIT_WAIT_US, |counts| &counts.permit_wait_us))
 }
 
 fn micros(spent: Duration) -> u64 {
@@ -216,6 +343,129 @@ fn ms_from_micros(micros: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_invocation_work(repetitions: u32) {
+        for _ in 0..repetitions {
+            record_compiler_run();
+            record_preprocessor_run();
+            record_probe_run();
+            record_startup(Duration::from_millis(2));
+            record_dep_info_run(Duration::from_millis(3));
+            record_flight_wait(Duration::from_millis(5));
+            record_permit_wait(Duration::from_millis(7));
+            record_prediction_mismatch();
+            record_reflinked(11);
+            record_hardlinked(13);
+            record_copied(17);
+        }
+    }
+
+    fn assert_invocation_work(repetitions: u32) {
+        assert_eq!(compiler_runs(), repetitions);
+        assert_eq!(preprocessor_runs(), repetitions);
+        assert_eq!(probe_runs(), repetitions);
+        assert_eq!(dep_info_runs(), repetitions);
+        let repetitions = u64::from(repetitions);
+        assert_eq!(startup_ms(), repetitions * 2);
+        assert_eq!(dep_info_ms(), repetitions * 3);
+        assert_eq!(flight_wait_ms(), repetitions * 5);
+        assert_eq!(permit_wait_ms(), repetitions * 7);
+        assert_eq!(prediction_mismatches(), repetitions);
+        assert_eq!(reflinked_bytes(), repetitions * 11);
+        assert_eq!(hardlinked_bytes(), repetitions * 13);
+        assert_eq!(copied_bytes(), repetitions * 17);
+    }
+
+    #[test]
+    fn concurrent_invocations_keep_counts_timings_and_bytes_separate() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for repetitions in [2, 5] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let start = Instant::now() - Duration::from_secs(60 + u64::from(repetitions));
+                    let _scope = InvocationScope::enter(start);
+                    barrier.wait();
+                    record_invocation_work(repetitions);
+                    assert_invocation_work(repetitions);
+                    assert_eq!(process_start(), Some(start));
+                    mark_process_start();
+                    assert_eq!(process_start(), Some(start));
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn reused_worker_and_nested_scopes_restore_their_own_metrics() {
+        let worker = std::thread::spawn(|| {
+            let parent_start = Instant::now() - Duration::from_secs(30);
+            for repetitions in [2, 4] {
+                let _parent = InvocationScope::enter(parent_start);
+                assert_invocation_work(0);
+                record_invocation_work(repetitions);
+                {
+                    let child_start = Instant::now();
+                    let _child = InvocationScope::enter(child_start);
+                    assert_invocation_work(0);
+                    assert_eq!(process_start(), Some(child_start));
+                    record_invocation_work(3);
+                    assert_invocation_work(3);
+                }
+                assert_invocation_work(repetitions);
+                assert_eq!(process_start(), Some(parent_start));
+            }
+        });
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn invocation_suspension_is_nested_and_restored_after_panic() {
+        let _parent = InvocationScope::enter(Instant::now());
+        suspend_spawn_counts(|| {
+            record_compiler_run();
+            record_preprocessor_run();
+            record_probe_run();
+            {
+                let _child = InvocationScope::enter(Instant::now());
+                record_compiler_run();
+                assert_eq!(compiler_runs(), 1);
+            }
+            assert!(spawn_counts_suspended());
+            suspend_spawn_counts(|| {
+                record_compiler_run();
+                assert!(spawn_counts_suspended());
+            });
+            assert!(spawn_counts_suspended());
+        });
+        assert_eq!(compiler_runs(), 0);
+        assert_eq!(preprocessor_runs(), 0);
+        assert_eq!(probe_runs(), 0);
+        let _ = std::panic::catch_unwind(|| {
+            suspend_spawn_counts(|| panic!("test panic"));
+        });
+        assert!(!spawn_counts_suspended());
+        record_compiler_run();
+        record_preprocessor_run();
+        record_probe_run();
+        assert_eq!(compiler_runs(), 1);
+        assert_eq!(preprocessor_runs(), 1);
+        assert_eq!(probe_runs(), 1);
+    }
+
+    #[test]
+    fn invocation_scope_restores_parent_after_panic() {
+        let start = Instant::now() - Duration::from_secs(30);
+        let _scope = InvocationScope::enter(start);
+        record_invocation_work(2);
+        let _ = std::panic::catch_unwind(|| {
+            let _nested = InvocationScope::enter(Instant::now());
+            record_invocation_work(3);
+            panic!("test panic");
+        });
+        assert_invocation_work(2);
+        assert_eq!(process_start(), Some(start));
+    }
 
     // The counters are process-global and only ever increment (no
     // reset), so these assertions are safe under parallel test

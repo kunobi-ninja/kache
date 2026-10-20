@@ -52,8 +52,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
+
+use crate::invocation::InvocationEnv;
 
 use super::flags::{Dialect, FlagClass, FlagSpec, Matcher};
 use super::{
@@ -82,8 +83,13 @@ pub(crate) fn cc_expansion_is_stdout(parsed: &CcArgs) -> bool {
 
 /// The `-E -P` / `/EP` key probe sets this so a kache shim does not cache
 /// the probe as a user-facing stdout preprocess.
+#[cfg(test)]
 pub(crate) fn cc_is_internal_key_probe() -> bool {
-    std::env::var_os("KACHE_CC_KEY_PROBE").is_some()
+    cc_is_internal_key_probe_for(&InvocationEnv::capture())
+}
+
+pub(crate) fn cc_is_internal_key_probe_for(env: &InvocationEnv) -> bool {
+    env.var_os("KACHE_CC_KEY_PROBE").is_some()
 }
 
 impl ToolFamily {
@@ -204,6 +210,8 @@ pub struct DepInfoSpec {
 /// makes the cache_key implementation (PR5-B) easier to read.
 #[derive(Debug, Clone)]
 pub struct CcArgs {
+    /// Environment and filesystem context owned by this compilation.
+    pub(crate) invocation_env: InvocationEnv,
     /// argv[0] — the compiler binary path the wrapper was invoked as.
     pub program: String,
     /// argv[1..] verbatim — preserved for passthrough / re-execution.
@@ -656,6 +664,10 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
 
 impl CcArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
+        Self::parse_for(args, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn parse_for(args: &[String], env: &InvocationEnv) -> Result<Self> {
         let (program, rest) = args
             .split_first()
             .context("cc invocation missing argv[0]")?;
@@ -663,6 +675,7 @@ impl CcArgs {
         let family = ToolFamily::detect(program, rest);
 
         let mut parsed = CcArgs {
+            invocation_env: env.clone(),
             program: program.clone(),
             rest: rest.to_vec(),
             sources: Vec::new(),
@@ -1051,9 +1064,11 @@ impl CcArgs {
     /// them on a miss. Symlinks, hardlinks, read-only files and non-regular
     /// paths still need the selected compiler's exact pathname semantics.
     pub(crate) fn requires_compiler_output_semantics(&self) -> bool {
-        self.compiler_output_paths()
-            .into_iter()
-            .any(|path| output_path_requires_compiler_semantics(&path))
+        self.compiler_output_paths().into_iter().any(|path| {
+            self.invocation_env
+                .resolve(&path)
+                .is_none_or(|path| output_path_requires_compiler_semantics(&path))
+        })
     }
 
     /// Anchor used to relativize/expand C/C++ dep-info target paths.
@@ -2188,7 +2203,7 @@ fn preprocess_hash(
     let dep_temp = if capture_dependencies {
         match tempfile::Builder::new()
             .prefix("kache-cc-preprocess-")
-            .tempdir()
+            .tempdir_in(parsed.invocation_env.temp_dir())
         {
             Ok(temp) => Some(temp),
             Err(error) => {
@@ -2208,7 +2223,7 @@ fn preprocess_hash(
     });
     let run = |args: &[String]| {
         crate::opcounts::record_preprocessor_run();
-        let mut command = Command::new(&parsed.program);
+        let mut command = parsed.invocation_env.command(&parsed.program)?;
         command.args(args);
         // If `program` is a kache shim, this probe must not re-enter the
         // cache (it would try to key another -E to stdout). The wrapper
@@ -2216,7 +2231,7 @@ fn preprocess_hash(
         command.env("KACHE_CC_KEY_PROBE", "1");
         // Pin the build timestamp so `__DATE__` / `__TIME__` expand
         // deterministically. The real compile uses the same value.
-        if let Some(epoch) = effective_source_date_epoch() {
+        if let Some(epoch) = effective_source_date_epoch_for(&parsed.invocation_env) {
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         command
@@ -2267,8 +2282,11 @@ fn preprocess_hash(
         let dependencies = std::fs::read_to_string(path)
             .context("reading cc preprocess dependency file")
             .and_then(|raw| {
-                let cwd = std::env::current_dir().context("reading cc compiler directory")?;
-                parse_preprocess_dependencies(&raw, &cwd)
+                let cwd = parsed
+                    .invocation_env
+                    .cwd()
+                    .context("reading cc compiler directory")?;
+                parse_preprocess_dependencies(&raw, cwd)
             });
         match dependencies {
             Ok(paths) => {
@@ -4435,8 +4453,9 @@ fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
             .map(str::to_string)
         })
         .or_else(|| {
-            std::env::current_dir()
-                .ok()
+            parsed
+                .invocation_env
+                .cwd()
                 .map(|p| p.to_string_lossy().into_owned())
         });
     if let Some(d) = dir {
@@ -4449,7 +4468,7 @@ thread_local! {
     /// The prefix maps of the last invocation keyed in this process. One
     /// wrapper keys the same invocation up to three times (memo lookup, the
     /// re-check after a discovery flight, the key after a deferred compile)
-    /// and the maps only depend on the arguments, the process environment
+    /// and the maps only depend on the arguments, the invocation snapshot
     /// and the configured base dirs.
     static PREFIX_MAPS_MEMO: std::cell::RefCell<Option<PrefixMapsMemo>> =
         const { std::cell::RefCell::new(None) };
@@ -4476,7 +4495,9 @@ struct PrefixMapsMemo {
 fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPrefixMap> {
     // Everything the uncached computation reads besides its arguments.
     let env = |name: &str| {
-        std::env::var_os(name)
+        parsed
+            .invocation_env
+            .var_os(name)
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
@@ -4484,9 +4505,18 @@ fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPre
     identity.push(parsed.program.clone());
     identity.extend(parsed.rest.iter().cloned());
     identity.push(
-        std::env::current_dir()
+        parsed
+            .invocation_env
+            .cwd()
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default(),
+    );
+    identity.push(
+        parsed
+            .invocation_env
+            .temp_dir()
+            .to_string_lossy()
+            .into_owned(),
     );
     for name in [
         "KACHE_CC_PATH_NORMALIZE",
@@ -4522,36 +4552,44 @@ fn cc_prefix_maps_uncached(parsed: &CcArgs, configured_base_dirs: &[String]) -> 
     // `-ffile-prefix-map`. The conservative escape hatch — cc keys become
     // path-literal (no cross-machine cc sharing, but zero normalization
     // miscache risk). Default on.
-    if !cc_path_normalize_enabled() {
+    if !cc_path_normalize_enabled_for(&parsed.invocation_env) {
         return Vec::new();
     }
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(_) => return Vec::new(),
+    let Some(cwd) = parsed.invocation_env.cwd() else {
+        return Vec::new();
     };
-    let base = std::env::var_os("KACHE_BASE_DIR").filter(|v| !v.is_empty());
+    let base = parsed
+        .invocation_env
+        .var_os("KACHE_BASE_DIR")
+        .filter(|v| !v.is_empty());
     // `SDKROOT` is the Apple-clang env that pins the SDK when no explicit
     // `-isysroot` is on the command line; read here (the only env access)
     // and threaded into the deterministic core for testability.
-    let sdkroot = std::env::var_os("SDKROOT").filter(|v| !v.is_empty());
+    let sdkroot = parsed
+        .invocation_env
+        .var_os("SDKROOT")
+        .filter(|v| !v.is_empty());
     let mut maps = cc_prefix_maps_cfg(
         parsed,
-        &cwd,
+        cwd,
         base.as_deref().map(Path::new),
         sdkroot.as_deref().map(Path::new),
         configured_base_dirs,
     );
     if !maps.is_empty()
-        && let Some(out_dir) = std::env::var_os("OUT_DIR").filter(|v| !v.is_empty())
+        && let Some(out_dir) = parsed
+            .invocation_env
+            .var_os("OUT_DIR")
+            .filter(|v| !v.is_empty())
     {
-        push_cargo_out_dir_maps(&mut maps, &cwd, Path::new(&out_dir));
-        let mut include_dirs = cc_user_include_dirs(parsed, &cwd);
+        push_cargo_out_dir_maps(&mut maps, cwd, Path::new(&out_dir));
+        let mut include_dirs = cc_user_include_dirs(parsed, cwd);
         include_dirs.extend(
             cc_flag_dir_values(&parsed.rest, "-isystem")
                 .into_iter()
-                .map(|dir| absolutize_path(&cwd, Path::new(dir))),
+                .map(|dir| absolutize_path(cwd, Path::new(dir))),
         );
-        push_cargo_dep_out_dir_maps(&mut maps, &cwd, Path::new(&out_dir), &include_dirs);
+        push_cargo_dep_out_dir_maps(&mut maps, cwd, Path::new(&out_dir), &include_dirs);
         maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     }
     maps
@@ -4733,8 +4771,8 @@ fn cc_prefix_maps_cfg(
 
 /// Whether cc path normalization is active. `KACHE_CC_PATH_NORMALIZE` set
 /// to `0` / `false` / `off` / `no` disables it; default on.
-fn cc_path_normalize_enabled() -> bool {
-    parse_cc_normalize_toggle(std::env::var("KACHE_CC_PATH_NORMALIZE").ok().as_deref())
+fn cc_path_normalize_enabled_for(env: &InvocationEnv) -> bool {
+    parse_cc_normalize_toggle(env.var("KACHE_CC_PATH_NORMALIZE").ok().as_deref())
 }
 
 fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
@@ -4763,10 +4801,10 @@ fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
 ///   time-dependent key, so a stale wall-clock object is very unlikely to be
 ///   reused (best-effort, not a guarantee: two probes landing in the same
 ///   second expand identically, so a cross-second cold store can still be hit).
-fn effective_source_date_epoch() -> Option<std::ffi::OsString> {
+fn effective_source_date_epoch_for(env: &InvocationEnv) -> Option<std::ffi::OsString> {
     resolve_source_date_epoch(
-        std::env::var_os("SOURCE_DATE_EPOCH"),
-        source_date_epoch_passthrough(),
+        env.var_os("SOURCE_DATE_EPOCH"),
+        source_date_epoch_passthrough_for(env),
     )
 }
 
@@ -4792,8 +4830,8 @@ pub(super) fn resolve_source_date_epoch(
 /// `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` (aliases: `wallclock` / `off`), for
 /// the rare project that must bake the real wall-clock time into its objects.
 /// Ignored when the build exports its own `SOURCE_DATE_EPOCH` (always honored).
-fn source_date_epoch_passthrough() -> bool {
-    std::env::var("KACHE_CC_SOURCE_DATE_EPOCH")
+fn source_date_epoch_passthrough_for(env: &InvocationEnv) -> bool {
+    env.var("KACHE_CC_SOURCE_DATE_EPOCH")
         .ok()
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
@@ -4974,9 +5012,11 @@ fn cc_preprocess_memo_key_as(
     prefix_maps: &[CcPrefixMap],
     compiler_version: &str,
 ) -> Option<String> {
-    let epoch = effective_source_date_epoch()?;
-    let cwd = std::env::current_dir().ok()?;
-    let compiler_path = super::resolve_program_on_path(&parsed.program)?;
+    let epoch = effective_source_date_epoch_for(&parsed.invocation_env)?;
+    let cwd = parsed.invocation_env.cwd()?;
+    let compiler_path = parsed
+        .invocation_env
+        .resolve_program(Path::new(&parsed.program))?;
     let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
     let mut hasher = blake3::Hasher::new();
     fold_cc_memo_field(&mut hasher, b"schema", schema);
@@ -5021,7 +5061,7 @@ fn cc_preprocess_memo_key_as(
     fold_cc_memo_field(
         &mut hasher,
         b"cwd",
-        cc_mapped_path(&cwd, prefix_maps).as_bytes(),
+        cc_mapped_path(cwd, prefix_maps).as_bytes(),
     );
     fold_cc_memo_field(
         &mut hasher,
@@ -5047,7 +5087,7 @@ fn cc_preprocess_memo_key_as(
     // preprocessor the memo exists to avoid. A source that cannot be read
     // keys as such; its compile fails on its own.
     for source in &parsed.sources {
-        let content = crate::cache_key::hash_file(&absolutize_path(&cwd, source))
+        let content = crate::cache_key::hash_file(&absolutize_path(cwd, source))
             .unwrap_or_else(|_| "unreadable".to_string());
         fold_cc_memo_field(&mut hasher, b"source-content", content.as_bytes());
     }
@@ -5067,7 +5107,9 @@ fn cc_preprocess_memo_key_as(
     // dependency's include directory down as `DEP_<links>_INCLUDE`, a path
     // under this build directory's target, and it must not give every build
     // directory its own memo any more than `-I` does.
-    let mut environment: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+    let mut environment: Vec<(Vec<u8>, Vec<u8>)> = parsed
+        .invocation_env
+        .vars_os()
         .filter(|(name, _)| cc_memo_env_is_keyed(name))
         .map(|(name, value)| {
             // Mapped as text, then encoded like every other memo field: on
@@ -5114,7 +5156,12 @@ fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
         .map(Path::to_path_buf)
         .unwrap_or(source_canon);
     if let Some(common) = common_ancestor(&cwd_canon, &source_canon_parent)
-        && stable_cc_common_root(&common, &cwd_canon, &source_canon_parent)
+        && stable_cc_common_root_for(
+            &common,
+            &cwd_canon,
+            &source_canon_parent,
+            parsed.invocation_env.temp_dir(),
+        )
     {
         roots.push((common, CC_ROOT_SENTINEL));
     }
@@ -5136,7 +5183,7 @@ fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
             (&cwd_canon, canonicalize_or_self(&include_abs)),
         ] {
             if let Some(common) = common_ancestor(a, &b)
-                && stable_cc_common_root(&common, a, &b)
+                && stable_cc_common_root_for(&common, a, &b, parsed.invocation_env.temp_dir())
             {
                 roots.push((common, CC_ROOT_SENTINEL));
             }
@@ -5267,24 +5314,34 @@ fn useful_cc_prefix(path: &Path) -> bool {
         >= 3
 }
 
+#[cfg(test)]
 fn stable_cc_common_root(common: &Path, cwd: &Path, source_parent: &Path) -> bool {
+    stable_cc_common_root_for(
+        common,
+        cwd,
+        source_parent,
+        InvocationEnv::capture().temp_dir(),
+    )
+}
+
+fn stable_cc_common_root_for(common: &Path, cwd: &Path, source_parent: &Path, temp: &Path) -> bool {
     if common == cwd || common == source_parent {
         return true;
     }
-    if common_is_temp_dir(common) {
+    if common_is_temp_dir(common, temp) {
         return false;
     }
-    useful_cc_prefix(common) || common_is_below_temp_dir(common)
+    useful_cc_prefix(common) || common_is_below_temp_dir(common, temp)
 }
 
-fn common_is_below_temp_dir(common: &Path) -> bool {
-    let temp_dir = canonicalize_or_self(&std::env::temp_dir());
+fn common_is_below_temp_dir(common: &Path, temp: &Path) -> bool {
+    let temp_dir = canonicalize_or_self(temp);
     let common = canonicalize_or_self(common);
     common != temp_dir && common.starts_with(temp_dir)
 }
 
-fn common_is_temp_dir(common: &Path) -> bool {
-    canonicalize_or_self(common) == canonicalize_or_self(&std::env::temp_dir())
+fn common_is_temp_dir(common: &Path, temp: &Path) -> bool {
+    canonicalize_or_self(common) == canonicalize_or_self(temp)
 }
 
 /// Substitute build-path prefixes with their targets in a byte buffer (resolved
@@ -5580,7 +5637,7 @@ fn cc_shadowing_names(
     read_inputs: &[PathBuf],
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<CcShadowingNames> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = parsed.invocation_env.cwd().context("C/C++ invocation has no working directory")?;
     let dirs = cc_user_include_dirs(parsed, &cwd);
     let mut probe_dirs = dirs.clone();
     probe_dirs.extend(cc_system_include_dirs(parsed, &cwd));
@@ -5798,8 +5855,11 @@ fn digest_cc_shadowing_names_stamped(
     names: &CcShadowingNames,
     file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
 ) -> Result<(String, Option<CcListingStamps>)> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let dirs = cc_user_include_dirs(parsed, &cwd);
+    let cwd = parsed
+        .invocation_env
+        .cwd()
+        .context("cc invocation has no working directory")?;
+    let dirs = cc_user_include_dirs(parsed, cwd);
     let mut hasher = blake3::Hasher::new();
     let mut listings = CcDirectoryListings::default();
     for name in &names.names {
@@ -6179,12 +6239,15 @@ fn digest_cc_include_dir_names(parsed: &CcArgs) -> Result<String> {
 }
 
 fn digest_cc_include_dir_names_capped(parsed: &CcArgs, cap: usize) -> Result<String> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exempt = cc_system_include_dirs(parsed, &cwd);
+    let cwd = parsed
+        .invocation_env
+        .cwd()
+        .context("cc invocation has no working directory")?;
+    let exempt = cc_system_include_dirs(parsed, cwd);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"include_dir_names.v1\n");
     let mut seen = 0usize;
-    for dir in cc_user_include_dirs(parsed, &cwd) {
+    for dir in cc_user_include_dirs(parsed, cwd) {
         if exempt.iter().any(|root| dir.starts_with(root)) {
             continue;
         }
@@ -6233,12 +6296,15 @@ fn cc_system_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
         push(PathBuf::from(value));
         push(PathBuf::from(value).join("usr/include"));
     }
-    if let Ok(sdk) = std::env::var("SDKROOT") {
-        let path = PathBuf::from(sdk);
-        if path.is_dir() {
-            push(path.clone());
-            push(path.join("usr/include"));
-        }
+    if let Some(path) = parsed
+        .invocation_env
+        .var_os("SDKROOT")
+        .filter(|sdk| !sdk.is_empty())
+        .and_then(|sdk| parsed.invocation_env.resolve(Path::new(&sdk)))
+        && path.is_dir()
+    {
+        push(path.clone());
+        push(path.join("usr/include"));
     }
     dirs
 }
@@ -6483,7 +6549,9 @@ const CC_DIRECT_CAPTURE_TARGET: &str = "__kache_direct_capture";
 /// to accept the flags the capture adds.
 pub(crate) fn cc_direct_key_eligible(parsed: &CcArgs) -> bool {
     cc_direct_key_shape_ok(parsed)
-        && cc_driver_captures_dependencies(&parsed.program, &crate::config::probe_memo_dir())
+        && crate::config::probe_memo_dir_for(&parsed.invocation_env).is_ok_and(|memo| {
+            cc_driver_captures_dependencies_for(&parsed.program, &memo, &parsed.invocation_env)
+        })
 }
 
 /// Only the GNU dialect adds a private `-MD -MF`; a caller that asked for
@@ -6504,8 +6572,17 @@ fn cc_direct_key_shape_ok(parsed: &CcArgs) -> bool {
 /// vouch for the driver before any flag was injected; without it, this one
 /// compile of an empty unit does, once per driver binary, remembered in
 /// the probe memo directory.
+#[cfg(test)]
 fn cc_driver_captures_dependencies(program: &str, memo_dir: &Path) -> bool {
-    let Some(digest) = cc_direct_probe_material(program) else {
+    cc_driver_captures_dependencies_for(program, memo_dir, &InvocationEnv::capture())
+}
+
+fn cc_driver_captures_dependencies_for(
+    program: &str,
+    memo_dir: &Path,
+    env: &InvocationEnv,
+) -> bool {
+    let Some(digest) = cc_direct_probe_material(program, env) else {
         return false;
     };
     let path = crate::probe_memo::memo_path(memo_dir, "cc-direct-capture", "txt", &digest);
@@ -6514,29 +6591,47 @@ fn cc_driver_captures_dependencies(program: &str, memo_dir: &Path) -> bool {
     }
     let supported = {
         let _trace = crate::phase_trace::phase("cc_direct_probe");
-        cc_direct_probe(program)
+        cc_direct_probe(program, env)
     };
     tracing::debug!("cc: probed {program} for compile-first capture: {supported}");
     crate::probe_memo::write_verified(&path, &digest, if supported { "ok" } else { "no" });
     supported
 }
 
-fn cc_direct_probe_material(program: &str) -> Option<String> {
-    let resolved = super::resolve_program_on_path(program)?;
+fn cc_direct_probe_material(program: &str, env: &InvocationEnv) -> Option<String> {
+    let resolved = env.resolve_program(Path::new(program))?;
     let canonical = std::fs::canonicalize(&resolved).ok()?;
     let metadata = std::fs::metadata(&canonical).ok()?;
-    let mut material = crate::probe_memo::Material::new("cc-direct-capture-v1");
+    let mut material = crate::probe_memo::Material::new("cc-direct-capture-v2");
     material.push(program.as_bytes());
     material.push(canonical.as_os_str().as_encoded_bytes());
     material.push(&metadata.len().to_le_bytes());
     material.push(&crate::cache_key::metadata_mtime_ns(&metadata).to_le_bytes());
+    // Driver support may depend on its selected toolchain and environment.
+    let mut environment: Vec<_> = env
+        .vars_os()
+        .filter(|(name, _)| {
+            cc_memo_env_is_keyed(name)
+                || name.to_str().is_some_and(|name| {
+                    matches!(
+                        name.to_ascii_uppercase().as_str(),
+                        "PATH" | "PATHEXT" | "HOME" | "USERPROFILE" | "TMPDIR" | "TMP" | "TEMP"
+                    )
+                })
+        })
+        .collect();
+    environment.sort();
+    for (name, value) in environment {
+        material.push(name.as_encoded_bytes());
+        material.push(value.as_encoded_bytes());
+    }
     Some(material.digest())
 }
 
-fn cc_direct_probe(program: &str) -> bool {
+fn cc_direct_probe(program: &str, env: &InvocationEnv) -> bool {
     let Ok(dir) = tempfile::Builder::new()
         .prefix("kache-cc-direct-probe-")
-        .tempdir()
+        .tempdir_in(env.temp_dir())
     else {
         return false;
     };
@@ -6555,7 +6650,10 @@ fn cc_direct_probe(program: &str) -> bool {
     else {
         return false;
     };
-    let output = Command::new(program)
+    let Ok(mut command) = env.command(program) else {
+        return false;
+    };
+    let output = command
         .args([
             "-c",
             "probe.c",
@@ -6617,8 +6715,8 @@ fn cc_raw_assembler_hidden_input(text: &[u8]) -> Option<&'static str> {
     cc_assembler_text_hidden_input(&literals.text)
 }
 
-#[derive(Default)]
 pub struct CcCompiler {
+    invocation_env: InvocationEnv,
     /// User-declared flags (issue #95) that kache's built-in allow-list
     /// doesn't model but the user opted into caching. A flag here stops
     /// refusing and is folded verbatim into the cache key. Empty in the
@@ -6714,6 +6812,12 @@ fn is_unresolvable_bare_program(program: &str) -> bool {
     super::resolve_program_on_path(program).is_none()
 }
 
+impl Default for CcCompiler {
+    fn default() -> Self {
+        Self::with_extra_allowlist_flags(Vec::new())
+    }
+}
+
 impl CcCompiler {
     #[cfg(test)]
     pub fn new() -> Self {
@@ -6724,6 +6828,7 @@ impl CcCompiler {
     /// typically `config.cc_extra_allowlist_flags`.
     pub fn with_extra_allowlist_flags(extra_allowlist_flags: Vec<String>) -> Self {
         Self {
+            invocation_env: InvocationEnv::capture(),
             extra_allowlist_flags,
             cache_cc_links: false,
             base_dirs: Vec::new(),
@@ -6731,6 +6836,11 @@ impl CcCompiler {
             pending_include_dir_digest: RefCell::new(None),
             key_path_bound: Cell::new(false),
         }
+    }
+
+    pub(crate) fn with_invocation_env(mut self, env: &InvocationEnv) -> Self {
+        self.invocation_env = env.clone();
+        self
     }
 
     pub fn with_cache_cc_links(mut self, cache_cc_links: bool) -> Self {
@@ -6755,7 +6865,7 @@ impl CcCompiler {
         hasher.update(program_name.as_bytes());
         hasher.update(b"\n");
         let config_args = parsed.config_args();
-        let resolved = crate::probe::probe(
+        let resolved = crate::probe::probe_for(
             ctx.cache_dir,
             &crate::probe::CcProber,
             &crate::probe::ProbeRequest {
@@ -6765,12 +6875,13 @@ impl CcCompiler {
                 per_tu_paths: &[],
                 windows_aware: Self::cc_link_probe_is_windows_aware(parsed.family),
             },
+            &parsed.invocation_env,
         )?;
         hasher.update(b"compiler_version:");
         hasher.update(resolved.version_line.as_bytes());
         hasher.update(b"\n");
 
-        let expanded = expand_cc_response_files(&parsed.rest)?;
+        let expanded = expand_cc_response_files(&parsed.rest, &parsed.invocation_env)?;
         hasher.update(b"argv:");
         for arg in &expanded {
             hasher.update(ctx.path_normalizer.normalize(arg).as_bytes());
@@ -6786,7 +6897,12 @@ impl CcCompiler {
         for input in &inputs {
             let digest = ctx
                 .file_hasher
-                .hash(input)
+                .hash(
+                    &parsed
+                        .invocation_env
+                        .resolve(input)
+                        .context("resolving cc link input")?,
+                )
                 .with_context(|| format!("hashing link input {}", input.display()))?;
             hasher.update(digest.as_bytes());
             hasher.update(b" ");
@@ -6798,7 +6914,12 @@ impl CcCompiler {
             hasher.update(b"\n");
         }
         let key = hasher.finalize().to_hex().to_string();
-        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, "cc-link");
+        let key = crate::cache_key::apply_key_env_vars_in(
+            key,
+            ctx.key_env_vars,
+            "cc-link",
+            ctx.invocation_env,
+        );
         Ok(crate::cache_key::apply_key_salt(
             key,
             ctx.key_salt,
@@ -7126,13 +7247,14 @@ impl Compiler for CcCompiler {
     }
 
     fn parse(&self, args: &[String]) -> Result<CcArgs> {
-        let mut parsed = CcArgs::parse(args)?;
-        parsed.depinfo_roots = crate::path_normalizer::PathNormalizer::from_env(None)
-            .with_base_dirs(&self.base_dirs)
-            .depinfo_source_roots()
-            .into_iter()
-            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
-            .collect();
+        let mut parsed = CcArgs::parse_for(args, &self.invocation_env)?;
+        parsed.depinfo_roots =
+            crate::path_normalizer::PathNormalizer::from_invocation(None, &self.invocation_env)
+                .with_base_dirs(&self.base_dirs)
+                .depinfo_source_roots()
+                .into_iter()
+                .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+                .collect();
         Ok(parsed)
     }
 
@@ -7324,7 +7446,7 @@ impl CcCompiler {
         // parallel builds don't race on whose paths it holds (#keyrace).
         let per_tu_paths = cc_resolved_per_tu_paths(parsed);
         let trace_probe = crate::phase_trace::phase("cc_probe");
-        let resolved = crate::probe::probe(
+        let resolved = crate::probe::probe_for(
             ctx.cache_dir,
             &crate::probe::CcProber,
             &crate::probe::ProbeRequest {
@@ -7337,6 +7459,7 @@ impl CcCompiler {
                 // native paths → key stays path-literal (#299/#312).
                 windows_aware: parsed.family.dialect() != Dialect::Cl,
             },
+            &parsed.invocation_env,
         )?;
         drop(trace_probe);
         if resolved.resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
@@ -7681,8 +7804,10 @@ impl CcCompiler {
             (memo_hash.to_string(), Some(satisfied))
         } else if let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (&discovery, &memo_key)
             && cc_direct_key_eligible(parsed)
-            && std::env::current_dir()
-                .is_ok_and(|cwd| cc_memo_identity_portable(parsed, &cwd, &prefix_maps))
+            && parsed
+                .invocation_env
+                .cwd()
+                .is_some_and(|cwd| cc_memo_identity_portable(parsed, cwd, &prefix_maps))
             && !ctx.file_hasher.cc_preprocess_memo_recorded(memo_key)
         {
             // Nothing recorded for this invocation: the compile has to run,
@@ -7842,7 +7967,12 @@ impl CcCompiler {
             true,
             ctx.file_hasher,
         );
-        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, &trace_name);
+        let key = crate::cache_key::apply_key_env_vars_in(
+            key,
+            ctx.key_env_vars,
+            &trace_name,
+            ctx.invocation_env,
+        );
         let key = crate::cache_key::apply_key_salt(key, ctx.key_salt, &trace_name);
         tracing::trace!(
             target: "kache::cache_key",
@@ -7868,7 +7998,7 @@ impl CcCompiler {
         let private = if caller_depfile.is_none() {
             match tempfile::Builder::new()
                 .prefix("kache-cc-capture-")
-                .tempdir()
+                .tempdir_in(parsed.invocation_env.temp_dir())
             {
                 Ok(dir) => Some(dir),
                 Err(error) => {
@@ -7923,15 +8053,16 @@ impl CcCompiler {
         depfile: &Path,
         file_hasher: &crate::cache_key::FileHasher<'_>,
     ) -> Option<Vec<crate::cache_key::CcPreprocessMemoInput>> {
-        let raw = match fs::read_to_string(depfile) {
+        let depfile = parsed.invocation_env.resolve(depfile)?;
+        let raw = match fs::read_to_string(&depfile) {
             Ok(raw) => raw,
             Err(error) => {
                 tracing::debug!("cc capture depfile unreadable: {error}");
                 return None;
             }
         };
-        let cwd = std::env::current_dir().ok()?;
-        let mut paths = match parse_preprocess_dependencies(&raw, &cwd) {
+        let cwd = parsed.invocation_env.cwd()?;
+        let mut paths = match parse_preprocess_dependencies(&raw, cwd) {
             Ok(paths) => paths,
             Err(error) => {
                 tracing::debug!("cc capture depfile unusable: {error:#}");
@@ -7998,7 +8129,7 @@ impl CcCompiler {
         // user-supplied map for the same prefix.
         crate::opcounts::record_compiler_run();
         let _trace = crate::phase_trace::phase("cc_compile");
-        let mut command = Command::new(&parsed.program);
+        let mut command = parsed.invocation_env.command(&parsed.program)?;
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
         let mut appended = file_prefix_map_args(&prefix_maps);
         appended.extend(extra);
@@ -8010,7 +8141,7 @@ impl CcCompiler {
         // normalization (we already rewrite paths via -ffile-prefix-map); pinning
         // the date is the same stance. Opt out with
         // KACHE_CC_SOURCE_DATE_EPOCH=passthrough (#423).
-        if let Some(epoch) = effective_source_date_epoch() {
+        if let Some(epoch) = effective_source_date_epoch_for(&parsed.invocation_env) {
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         let output = command
@@ -8037,7 +8168,7 @@ impl CcCompiler {
             ArtifactSet::empty()
         };
         if exit_code == 0 && cc_expansion_is_stdout(parsed) {
-            match stage_cc_stdout_artifact(&output.stdout) {
+            match stage_cc_stdout_artifact(&output.stdout, &parsed.invocation_env) {
                 Ok((artifact, temp)) => {
                     artifacts = ArtifactSet::new(vec![artifact]);
                     keepalive.push(temp);
@@ -8053,6 +8184,7 @@ impl CcCompiler {
             // and store nothing. It only sees roots spelled out as plain bytes.
             let embeds = parsed
                 .object_output_path()
+                .and_then(|path| parsed.invocation_env.resolve(&path))
                 .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps));
             if bind_on_embedded_root && !artifacts.is_empty() && matches!(embeds, Some(Ok(true))) {
                 path_bound = true;
@@ -8084,11 +8216,14 @@ impl CcCompiler {
     }
 }
 
-fn stage_cc_stdout_artifact(bytes: &[u8]) -> Result<(Artifact, tempfile::TempPath)> {
+fn stage_cc_stdout_artifact(
+    bytes: &[u8],
+    env: &InvocationEnv,
+) -> Result<(Artifact, tempfile::TempPath)> {
     let mut staged = tempfile::Builder::new()
         .prefix("kache-cc-stdout-")
         .suffix(".i")
-        .tempfile()
+        .tempfile_in(env.temp_dir())
         .context("cc: creating -E stdout staging file")?;
     staged
         .write_all(bytes)
@@ -8108,15 +8243,18 @@ fn stage_cc_stdout_artifact(bytes: &[u8]) -> Result<(Artifact, tempfile::TempPat
     ))
 }
 
-fn expand_cc_response_files(args: &[String]) -> Result<Vec<String>> {
+fn expand_cc_response_files(args: &[String], env: &InvocationEnv) -> Result<Vec<String>> {
     let mut expanded = Vec::new();
     for arg in args {
         let Some(path) = arg.strip_prefix('@') else {
             expanded.push(arg.clone());
             continue;
         };
-        let body =
-            fs::read_to_string(path).with_context(|| format!("reading cc response file {path}"))?;
+        let body = fs::read_to_string(
+            env.resolve(Path::new(path))
+                .context("resolving cc response file")?,
+        )
+        .with_context(|| format!("reading cc response file {path}"))?;
         expanded.extend(body.split_whitespace().map(str::to_string));
     }
     Ok(expanded)
@@ -8213,6 +8351,7 @@ fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
 
     let Some(object) = parsed
         .object_output_path()
+        .and_then(|path| parsed.invocation_env.resolve(&path))
         .filter(|path| is_plain_file(path))
     else {
         return ArtifactSet::empty();
@@ -8237,6 +8376,7 @@ fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
 
     if let Some(depinfo) = parsed
         .depinfo_output_path()
+        .and_then(|path| parsed.invocation_env.resolve(&path))
         .filter(|path| is_plain_file(path))
     {
         outputs.push(Artifact {

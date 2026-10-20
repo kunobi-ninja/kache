@@ -30,6 +30,7 @@ mod incremental_policy;
 mod index_compact;
 #[cfg(unix)]
 mod init_shell;
+mod invocation;
 mod key_env;
 use kache_store::link;
 mod cache_remote;
@@ -1702,11 +1703,12 @@ fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) ->
     };
     let program = compiler::resolve_program_on_path(&args[0])
         .unwrap_or_else(|| std::path::PathBuf::from(&args[0]));
-    let mut command = std::process::Command::new(&program);
-    toolchain_dylib::apply(&mut command, &program);
+    let mut invocation_env = invocation::InvocationEnv::capture();
     if !incremental_preserved {
-        command.env("CARGO_INCREMENTAL", "0");
+        invocation_env.set("CARGO_INCREMENTAL", "0");
     }
+    let mut command = invocation_env.command(&program)?;
+    toolchain_dylib::apply_for(&mut command, &program, &invocation_env);
     if let Some(inner) = parsed
         .as_ref()
         .and_then(|parsed| parsed.inner_rustc.as_ref())
@@ -1766,6 +1768,11 @@ enum WrapperTarget {
 }
 
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
+    let _heartbeat = heartbeat::InvocationHeartbeatScope::enter();
+    let _restore_policy = link::InvocationLinkScope::enter();
+    let _accounting = opcounts::InvocationScope::enter(
+        opcounts::process_start().unwrap_or_else(std::time::Instant::now),
+    );
     // Re-entrancy guard. If a child compiler kache spawns is itself a
     // kache wrapper — e.g. `cc` on PATH shadowed by `kache cc` — the
     // nested invocation must run the real compiler directly instead of

@@ -1,3 +1,4 @@
+use crate::invocation::InvocationEnv;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
@@ -1516,6 +1517,18 @@ fn env_or_ignored(name: &str, ignore_env: bool) -> Result<String, std::env::VarE
     }
 }
 
+fn env_or_ignored_for(
+    invocation: &InvocationEnv,
+    name: &str,
+    ignore_env: bool,
+) -> Result<String, std::env::VarError> {
+    if ignore_env {
+        Err(std::env::VarError::NotPresent)
+    } else {
+        invocation.var(name)
+    }
+}
+
 /// The OUT_DIR alias setting from an env value, else the file, else on. Only
 /// `0` and `false` turn it off.
 fn out_dir_alias_setting(env: Option<&str>, file: Option<bool>) -> bool {
@@ -1536,11 +1549,11 @@ fn prefetch_enabled_from_env(value: &str) -> bool {
 /// ignored because the pinned config set `ignore_env = true`. The whole point
 /// of the feature is that a stray machine-global export (e.g. `KACHE_KEY_SALT`)
 /// can't *silently* shift the cache key — so make the suppression visible.
-fn warn_ignored_env_overrides() {
+fn warn_ignored_env_overrides_for(invocation: &InvocationEnv) {
     let present: Vec<&str> = IGNORE_ENV_GATED_VARS
         .iter()
         .copied()
-        .filter(|name| std::env::var_os(name).is_some())
+        .filter(|name| invocation.var_os(name).is_some())
         .collect();
     if !present.is_empty() {
         tracing::warn!(
@@ -1552,45 +1565,61 @@ fn warn_ignored_env_overrides() {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        Self::load_with_provenance().map(|(config, _)| config)
+        Self::load_for(&InvocationEnv::capture())
+    }
+
+    /// Resolve configuration using only this compiler invocation's environment.
+    pub(crate) fn load_for(invocation: &InvocationEnv) -> Result<Self> {
+        Self::load_with_provenance_for(invocation).map(|(config, _)| config)
     }
 
     /// Load config and the exact file snapshot used to select its values.
-    /// Daemon startup carries this sidecar into stats and the file watcher so
-    /// neither component re-resolves or re-reads a different config.
     pub(crate) fn load_with_provenance() -> Result<(Self, ConfigFileProvenance)> {
-        let path = normalize_config_path(resolve_config_path());
-        let (file_config, provenance) = Self::load_file_config_with_provenance(path);
-        let config = Self::load_resolved(file_config)?;
+        Self::load_with_provenance_for(&InvocationEnv::capture())
+    }
+
+    pub(crate) fn load_with_provenance_for(
+        invocation: &InvocationEnv,
+    ) -> Result<(Self, ConfigFileProvenance)> {
+        let path = resolve_config_path_for(invocation)?;
+        let (file_config, provenance) =
+            Self::load_file_config_with_provenance_for(invocation, path);
+        let config = Self::load_resolved_for(invocation, file_config)?;
         Ok((config, provenance))
     }
 
-    fn load_resolved(file_config: Result<FileConfig>) -> Result<Self> {
+    fn load_resolved_for(
+        invocation: &InvocationEnv,
+        file_config: Result<FileConfig>,
+    ) -> Result<Self> {
         let ignore_env = Self::ignore_env_enabled(&file_config);
         if ignore_env {
-            warn_ignored_env_overrides();
+            warn_ignored_env_overrides_for(invocation);
         }
 
         // NOTE: `KACHE_DISABLED` is intentionally NOT gated by `ignore_env` —
         // it's an operational kill switch, not a file-backed setting.
-        let disabled = std::env::var("KACHE_DISABLED")
+        let disabled = invocation
+            .var("KACHE_DISABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        let cache_dir = env_or_ignored("KACHE_CACHE_DIR", ignore_env)
-            .map(|s| shellexpand(&s))
+        let cache_dir = env_or_ignored_for(invocation, "KACHE_CACHE_DIR", ignore_env)
+            .map(|s| shellexpand_for(invocation, &s))
             .or_else(|_| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.local_store.as_ref())
-                    .map(|s| shellexpand(s))
+                    .map(|s| shellexpand_for(invocation, s))
                     .ok_or(())
             })
-            .unwrap_or_else(|_| default_cache_dir());
+            .unwrap_or_else(|_| default_cache_dir_for(invocation));
 
-        let readonly_store = env_or_ignored("KACHE_READONLY_STORE", ignore_env)
+        let cache_dir = resolve_invocation_path(invocation, &cache_dir)?;
+
+        let readonly_store = env_or_ignored_for(invocation, "KACHE_READONLY_STORE", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -1600,29 +1629,31 @@ impl Config {
                     .and_then(|c| c.readonly_store.clone())
             })
             .filter(|s| !s.is_empty())
-            .map(|s| shellexpand(&s));
+            .map(|s| resolve_invocation_path(invocation, &shellexpand_for(invocation, &s)))
+            .transpose()?;
 
         // Keep the historical single-directory layout unless explicitly split.
         // Resolve this once alongside `cache_dir`: wrappers and their daemon must
         // agree on every runtime path even if ambient env changes later.
-        let runtime_dir = env_or_ignored("KACHE_RUNTIME_DIR", ignore_env)
-            .map(|s| shellexpand(&s))
+        let runtime_dir = env_or_ignored_for(invocation, "KACHE_RUNTIME_DIR", ignore_env)
+            .map(|s| shellexpand_for(invocation, &s))
             .or_else(|_| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.runtime_dir.as_ref())
-                    .map(|s| shellexpand(s))
+                    .map(|s| shellexpand_for(invocation, s))
                     .ok_or(())
             })
             .unwrap_or_else(|_| cache_dir.clone());
+        let runtime_dir = resolve_invocation_path(invocation, &runtime_dir)?;
         let runtime_follows_cache = runtime_dir == cache_dir;
 
         // Trusted node-local L1 (#811): isolate the persistent store under a
         // single path-safe label. Invalid or unusable labels fail open to the
         // unscoped cache dir. Do not export this on public/fork jobs.
-        let trust_domain = std::env::var("KACHE_TRUST_DOMAIN").ok();
+        let trust_domain = invocation.var("KACHE_TRUST_DOMAIN").ok();
         let cache_dir = isolate_cache_dir_for_trust_domain(cache_dir, trust_domain.as_deref());
         let runtime_dir = if runtime_follows_cache {
             cache_dir.clone()
@@ -1634,9 +1665,9 @@ impl Config {
         // does not gate it. Snapshot once so ambient env cannot redirect a
         // manually constructed Config or change an existing Config mid-run.
         let socket_path_override =
-            resolve_socket_path_override(std::env::var_os("KACHE_SOCKET_PATH"));
+            resolve_socket_path_override(invocation.var_os("KACHE_SOCKET_PATH"));
 
-        let explicit_max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
+        let explicit_max_size = env_or_ignored_for(invocation, "KACHE_MAX_SIZE", ignore_env)
             .ok()
             .and_then(|s| parse_local_max_size(&s, "KACHE_MAX_SIZE"))
             .or_else(|| {
@@ -1650,18 +1681,19 @@ impl Config {
         let max_size = explicit_max_size
             .unwrap_or_else(|| disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes));
 
-        let cache_executables = env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env)
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or_else(|_| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.cache_executables)
-                    .unwrap_or(default_cache_executables())
-            });
+        let cache_executables =
+            env_or_ignored_for(invocation, "KACHE_CACHE_EXECUTABLES", ignore_env)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or_else(|_| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.cache_executables)
+                        .unwrap_or(default_cache_executables())
+                });
 
-        let cache_cc_links = env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env)
+        let cache_cc_links = env_or_ignored_for(invocation, "KACHE_CACHE_CC_LINKS", ignore_env)
             .map(|v| env_flag_one_or_true(&v))
             .unwrap_or_else(|_| {
                 file_config
@@ -1672,18 +1704,19 @@ impl Config {
                     .unwrap_or(false)
             });
 
-        let trust_codegen_backends = env_or_ignored("KACHE_TRUST_CODEGEN_BACKENDS", ignore_env)
-            .map(|v| env_flag_one_or_true(&v))
-            .unwrap_or_else(|_| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.trust_codegen_backends)
-                    .unwrap_or(false)
-            });
+        let trust_codegen_backends =
+            env_or_ignored_for(invocation, "KACHE_TRUST_CODEGEN_BACKENDS", ignore_env)
+                .map(|v| env_flag_one_or_true(&v))
+                .unwrap_or_else(|_| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.trust_codegen_backends)
+                        .unwrap_or(false)
+                });
 
-        let target_liveness = env_or_ignored("KACHE_TARGET_LIVENESS", ignore_env)
+        let target_liveness = env_or_ignored_for(invocation, "KACHE_TARGET_LIVENESS", ignore_env)
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|_| {
                 file_config
@@ -1694,38 +1727,41 @@ impl Config {
                     .unwrap_or(false)
             });
 
-        let clean_incremental = env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env)
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or_else(|_| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.clean_incremental)
-                    .unwrap_or(true)
-            });
+        let clean_incremental =
+            env_or_ignored_for(invocation, "KACHE_CLEAN_INCREMENTAL", ignore_env)
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or_else(|_| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.clean_incremental)
+                        .unwrap_or(true)
+                });
 
-        let preserve_incremental = env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env)
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or_else(|_| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.preserve_incremental)
-                    .unwrap_or(false)
-            });
+        let preserve_incremental =
+            env_or_ignored_for(invocation, "KACHE_PRESERVE_INCREMENTAL", ignore_env)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or_else(|_| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.preserve_incremental)
+                        .unwrap_or(false)
+                });
 
-        let adaptive_incremental = env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env)
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or_else(|_| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.adaptive_incremental)
-                    .unwrap_or(true)
-            });
+        let adaptive_incremental =
+            env_or_ignored_for(invocation, "KACHE_ADAPTIVE_INCREMENTAL", ignore_env)
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or_else(|_| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.adaptive_incremental)
+                        .unwrap_or(true)
+                });
 
         let seed_incremental = env_or_ignored("KACHE_SEED_INCREMENTAL", ignore_env)
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -1753,22 +1789,23 @@ impl Config {
             .and_then(|c| c.event_log_keep_lines)
             .unwrap_or(1000);
 
-        let compression_level = env_or_ignored("KACHE_COMPRESSION_LEVEL", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<i32>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.compression_level)
-            })
-            .unwrap_or(3)
-            .clamp(1, 22);
+        let compression_level =
+            env_or_ignored_for(invocation, "KACHE_COMPRESSION_LEVEL", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.compression_level)
+                })
+                .unwrap_or(3)
+                .clamp(1, 22);
 
         // Prefetch plan budgets (kunobi-ninja/kache#616). Guardrails against a
         // pathological plan, not tuned optima; 0 disables a dimension.
-        let prefetch_enabled = env_or_ignored("KACHE_PREFETCH_ENABLED", ignore_env)
+        let prefetch_enabled = env_or_ignored_for(invocation, "KACHE_PREFETCH_ENABLED", ignore_env)
             .map(|value| prefetch_enabled_from_env(&value))
             .unwrap_or_else(|_| {
                 file_config
@@ -1779,80 +1816,88 @@ impl Config {
                     .unwrap_or(DEFAULT_PREFETCH_ENABLED)
             });
         // Resolved against the remote below when neither sets it.
-        let explicit_remote_key_listing = env_or_ignored("KACHE_REMOTE_KEY_LISTING", ignore_env)
-            .ok()
-            .map(|value| prefetch_enabled_from_env(&value))
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|config| config.cache.as_ref())
-                    .and_then(|cache| cache.remote_key_listing)
-            });
-
-        let remote_key_cache_refresh_secs =
-            env_or_ignored("KACHE_REMOTE_KEY_CACHE_REFRESH_SECS", ignore_env)
+        let explicit_remote_key_listing =
+            env_or_ignored_for(invocation, "KACHE_REMOTE_KEY_LISTING", ignore_env)
                 .ok()
-                .and_then(|value| value.parse::<u64>().ok())
+                .map(|value| prefetch_enabled_from_env(&value))
                 .or_else(|| {
                     file_config
                         .as_ref()
                         .ok()
                         .and_then(|config| config.cache.as_ref())
-                        .and_then(|cache| cache.remote_key_cache_refresh_secs)
+                        .and_then(|cache| cache.remote_key_listing)
+                });
+
+        let remote_key_cache_refresh_secs = env_or_ignored_for(
+            invocation,
+            "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|config| config.cache.as_ref())
+                .and_then(|cache| cache.remote_key_cache_refresh_secs)
+        })
+        .unwrap_or(DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS);
+
+        let prefetch_max_keys =
+            env_or_ignored_for(invocation, "KACHE_PREFETCH_MAX_KEYS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.prefetch_max_keys)
                 })
-                .unwrap_or(DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS);
+                .unwrap_or(DEFAULT_PREFETCH_MAX_KEYS);
 
-        let prefetch_max_keys = env_or_ignored("KACHE_PREFETCH_MAX_KEYS", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.prefetch_max_keys)
-            })
-            .unwrap_or(DEFAULT_PREFETCH_MAX_KEYS);
+        let prefetch_max_bytes =
+            env_or_ignored_for(invocation, "KACHE_PREFETCH_MAX_BYTES", ignore_env)
+                .ok()
+                .and_then(|s| parse_size_checked(&s, "KACHE_PREFETCH_MAX_BYTES"))
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.prefetch_max_bytes.as_ref())
+                        .and_then(|s| parse_size_checked(s, "[cache] prefetch_max_bytes"))
+                })
+                .unwrap_or(DEFAULT_PREFETCH_MAX_BYTES);
 
-        let prefetch_max_bytes = env_or_ignored("KACHE_PREFETCH_MAX_BYTES", ignore_env)
-            .ok()
-            .and_then(|s| parse_size_checked(&s, "KACHE_PREFETCH_MAX_BYTES"))
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.prefetch_max_bytes.as_ref())
-                    .and_then(|s| parse_size_checked(s, "[cache] prefetch_max_bytes"))
-            })
-            .unwrap_or(DEFAULT_PREFETCH_MAX_BYTES);
+        let prefetch_deadline_secs =
+            env_or_ignored_for(invocation, "KACHE_PREFETCH_DEADLINE_SECS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.prefetch_deadline_secs)
+                })
+                .unwrap_or(DEFAULT_PREFETCH_DEADLINE_SECS);
 
-        let prefetch_deadline_secs = env_or_ignored("KACHE_PREFETCH_DEADLINE_SECS", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.prefetch_deadline_secs)
-            })
-            .unwrap_or(DEFAULT_PREFETCH_DEADLINE_SECS);
+        let min_store_compile_ms =
+            env_or_ignored_for(invocation, "KACHE_MIN_STORE_COMPILE_MS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.min_store_compile_ms)
+                })
+                .unwrap_or(DEFAULT_MIN_STORE_COMPILE_MS);
 
-        let min_store_compile_ms = env_or_ignored("KACHE_MIN_STORE_COMPILE_MS", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.min_store_compile_ms)
-            })
-            .unwrap_or(DEFAULT_MIN_STORE_COMPILE_MS);
-
-        let gc_max_age_hours = env_or_ignored("KACHE_GC_MAX_AGE_HOURS", ignore_env)
+        let gc_max_age_hours = env_or_ignored_for(invocation, "KACHE_GC_MAX_AGE_HOURS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -1864,7 +1909,7 @@ impl Config {
             })
             .unwrap_or(DEFAULT_GC_MAX_AGE_HOURS);
 
-        let s3_concurrency = env_or_ignored("KACHE_S3_CONCURRENCY", ignore_env)
+        let s3_concurrency = env_or_ignored_for(invocation, "KACHE_S3_CONCURRENCY", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .or_else(|| {
@@ -1876,32 +1921,34 @@ impl Config {
             })
             .unwrap_or(16);
 
-        let daemon_idle_timeout_secs = env_or_ignored("KACHE_DAEMON_IDLE_TIMEOUT", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.daemon_idle_timeout_secs)
-            })
-            .unwrap_or(DEFAULT_DAEMON_IDLE_TIMEOUT_SECS);
+        let daemon_idle_timeout_secs =
+            env_or_ignored_for(invocation, "KACHE_DAEMON_IDLE_TIMEOUT", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.daemon_idle_timeout_secs)
+                })
+                .unwrap_or(DEFAULT_DAEMON_IDLE_TIMEOUT_SECS);
 
-        let s3_pool_idle_secs = env_or_ignored("KACHE_S3_POOL_IDLE_SECS", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.s3_pool_idle_secs)
-            })
-            .unwrap_or(DEFAULT_S3_POOL_IDLE_SECS);
+        let s3_pool_idle_secs =
+            env_or_ignored_for(invocation, "KACHE_S3_POOL_IDLE_SECS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.s3_pool_idle_secs)
+                })
+                .unwrap_or(DEFAULT_S3_POOL_IDLE_SECS);
 
         let remote_restore_timeout_secs =
-            env_or_ignored("KACHE_REMOTE_RESTORE_TIMEOUT_SECS", ignore_env)
+            env_or_ignored_for(invocation, "KACHE_REMOTE_RESTORE_TIMEOUT_SECS", ignore_env)
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .or_else(|| {
@@ -1913,21 +1960,22 @@ impl Config {
                 })
                 .unwrap_or(DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS);
 
-        let remote_negative_ttl_secs = env_or_ignored("KACHE_REMOTE_NEGATIVE_TTL_SECS", ignore_env)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.remote_negative_ttl_secs)
-            })
-            .unwrap_or(DEFAULT_REMOTE_NEGATIVE_TTL_SECS);
+        let remote_negative_ttl_secs =
+            env_or_ignored_for(invocation, "KACHE_REMOTE_NEGATIVE_TTL_SECS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.remote_negative_ttl_secs)
+                })
+                .unwrap_or(DEFAULT_REMOTE_NEGATIVE_TTL_SECS);
 
         // Fallback compiler-wrapper for passed-through compiles. Env
         // wins over the file; empty / "off" / "none" disables it.
-        let fallback = env_or_ignored("KACHE_FALLBACK", ignore_env)
+        let fallback = env_or_ignored_for(invocation, "KACHE_FALLBACK", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -1943,7 +1991,7 @@ impl Config {
 
         // Cache-key salt. Env wins over the file; an empty / whitespace
         // value is treated as unset so it never silently shifts the key.
-        let key_salt = env_or_ignored("KACHE_KEY_SALT", ignore_env)
+        let key_salt = env_or_ignored_for(invocation, "KACHE_KEY_SALT", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -1959,7 +2007,7 @@ impl Config {
         // file: a set `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` (whitespace-separated,
         // possibly empty → disables) replaces the file list entirely.
         let cc_extra_allowlist_flags =
-            match env_or_ignored("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", ignore_env) {
+            match env_or_ignored_for(invocation, "KACHE_CC_EXTRA_ALLOWLIST_FLAGS", ignore_env) {
                 Ok(val) => normalize_cc_flags(val.split_whitespace().map(str::to_string)),
                 Err(_) => normalize_cc_flags(
                     file_config
@@ -1975,7 +2023,7 @@ impl Config {
         // Env wins over the file: a set `KACHE_PATH_ONLY_ENV_VARS`
         // (comma/whitespace-separated) replaces the file list entirely.
         let (path_only_env_vars, path_only_source) =
-            match env_or_ignored("KACHE_PATH_ONLY_ENV_VARS", ignore_env) {
+            match env_or_ignored_for(invocation, "KACHE_PATH_ONLY_ENV_VARS", ignore_env) {
                 Ok(val) => (
                     val.split([',', ' ', '\t', '\n'])
                         .filter(|p| !p.is_empty())
@@ -1999,24 +2047,25 @@ impl Config {
         // Env wins over the file: a set `KACHE_INCREMENTAL_CRATES`
         // (comma/whitespace-separated) replaces the file list entirely,
         // matching `path_only_env_vars` above.
-        let incremental_crates = match env_or_ignored("KACHE_INCREMENTAL_CRATES", ignore_env) {
-            Ok(val) => {
-                normalize_incremental_crates(val.split([',', ' ', '\t', '\n']).map(str::to_string))
-            }
-            Err(_) => normalize_incremental_crates(
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.incremental_crates.clone())
-                    .unwrap_or_default(),
-            ),
-        };
+        let incremental_crates =
+            match env_or_ignored_for(invocation, "KACHE_INCREMENTAL_CRATES", ignore_env) {
+                Ok(val) => normalize_incremental_crates(
+                    val.split([',', ' ', '\t', '\n']).map(str::to_string),
+                ),
+                Err(_) => normalize_incremental_crates(
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.incremental_crates.clone())
+                        .unwrap_or_default(),
+                ),
+            };
 
         // Env vars folded into the cache key (#635). Env wins over the file:
         // a set `KACHE_KEY_ENV_VARS` (comma/whitespace-separated) replaces the
         // file list entirely, matching `path_only_env_vars` above.
-        let key_env_vars = match env_or_ignored("KACHE_KEY_ENV_VARS", ignore_env) {
+        let key_env_vars = match env_or_ignored_for(invocation, "KACHE_KEY_ENV_VARS", ignore_env) {
             Ok(val) => normalize_key_env_vars(
                 val.split([',', ' ', '\t', '\n']).map(str::to_string),
                 "KACHE_KEY_ENV_VARS",
@@ -2053,40 +2102,54 @@ impl Config {
         // source so every consumer that treats `remote = None` as "no remote"
         // becomes a clean no-op — no S3 client, no uploads, no remote checks.
         // The planner is suppressed symmetrically in `load_planner_config`.
-        let local_only = Self::local_only_enabled(&file_config);
-        let mut remote_readonly = Self::remote_readonly_enabled(&file_config);
-        if let Some(forced) = crate::policy::forced_remote_readonly() {
+        let local_only = Self::local_only_enabled_for(invocation, &file_config);
+        let mut remote_readonly = Self::remote_readonly_enabled_for(invocation, &file_config);
+        if let Some(forced) =
+            crate::policy::forced_remote_readonly_with(|name| invocation.var(name).ok())
+        {
             tracing::debug!(
                 reason = %forced.reason,
                 "remote writes suppressed by CI policy"
             );
             remote_readonly = true;
         }
-        let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
-        let input_predictions = Self::input_predictions_enabled(&file_config);
-        let record_sessions = Self::record_sessions_enabled(&file_config);
-        let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
-        let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
-        let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
-        let out_dir_alias = Self::out_dir_alias_enabled(&file_config);
-        let deferred_durability = Self::deferred_durability_enabled(&file_config);
-        let daemon_publish = Self::daemon_publish_enabled(&file_config);
+        let modified_input_guard = Self::modified_input_guard_enabled_for(invocation, &file_config);
+        let input_predictions = Self::input_predictions_enabled_for(invocation, &file_config);
+        let record_sessions = Self::record_sessions_enabled_for(invocation, &file_config);
+        let windows_hardlink = Self::windows_hardlink_enabled_for(invocation, &file_config);
+        let shared_hardlink_restores =
+            Self::shared_hardlink_restores_enabled_for(invocation, &file_config);
+        let deferred_discovery = Self::deferred_discovery_enabled_for(invocation, &file_config);
+        let out_dir_alias = Self::out_dir_alias_enabled_for(invocation, &file_config);
+        let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
+        let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
         let project_rules = ProjectRules::from_file_config(&file_config);
-        let auto_gc = Self::auto_gc_enabled(&file_config);
-        let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
-        let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
-        let auto_share_target_files = Self::auto_share_target_files_enabled(&file_config);
-        let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
-        let auto_recover_min_free_bytes = Self::auto_recover_min_free_bytes(&file_config);
-        let auto_recover_targets = Self::auto_recover_targets_enabled(&file_config);
-        let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
-        let auto_clean_unused_units_days = Self::auto_clean_unused_units_days(&file_config);
-        let seed_new_targets = Self::seed_new_targets_enabled(&file_config);
-        let build_script_hermetic = Self::build_script_hermetic_enabled(&file_config);
-        let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
-        let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
-        let volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
-        let heartbeat_secs = env_or_ignored("KACHE_HEARTBEAT_SECS", ignore_env)
+        let auto_gc = Self::auto_gc_enabled_for(invocation, &file_config);
+        let index_auto_compact = Self::index_auto_compact_enabled_for(invocation, &file_config);
+        let auto_clean_orphaned_targets =
+            Self::auto_clean_orphaned_targets_enabled_for(invocation, &file_config);
+        let auto_share_target_files =
+            Self::auto_share_target_files_enabled_for(invocation, &file_config);
+        let auto_clean_idle_targets_days =
+            Self::auto_clean_idle_targets_days_for(invocation, &file_config);
+        let auto_recover_min_free_bytes =
+            Self::auto_recover_min_free_bytes_for(invocation, &file_config);
+        let auto_recover_targets = Self::auto_recover_targets_enabled_for(invocation, &file_config);
+        let scheduler_memory_pressure =
+            Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
+        let auto_clean_unused_units_days =
+            Self::auto_clean_unused_units_days_for(invocation, &file_config);
+        let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
+        let build_script_hermetic =
+            Self::build_script_hermetic_enabled_for(invocation, &file_config);
+        let gc_evict_shared = Self::gc_evict_shared_enabled_for(invocation, &file_config);
+        let storage_layout_advice =
+            Self::storage_layout_advice_enabled_for(invocation, &file_config);
+        let mut volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
+        for shard in &mut volume_stores {
+            shard.store = resolve_invocation_path(invocation, &shard.store)?;
+        }
+        let heartbeat_secs = env_or_ignored_for(invocation, "KACHE_HEARTBEAT_SECS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -2097,9 +2160,13 @@ impl Config {
                     .and_then(|c| c.heartbeat_secs)
             })
             .unwrap_or(DEFAULT_HEARTBEAT_SECS);
-        let explain_miss = Self::explain_miss_enabled(&file_config);
-        let scheduler = Self::scheduler_enabled(&file_config);
-        let test_lease = std::env::var_os(crate::scheduler::TEST_LEASE_ENV).map(PathBuf::from);
+        let explain_miss = Self::explain_miss_enabled_for(invocation, &file_config);
+        let scheduler = Self::scheduler_enabled_for(invocation, &file_config);
+        let test_lease = invocation
+            .var_os(crate::scheduler::TEST_LEASE_ENV)
+            .map(PathBuf::from)
+            .map(|path| resolve_invocation_path(invocation, &path))
+            .transpose()?;
         // A remote that cannot be resolved must NOT fail the build. `Config::load`
         // runs on the rustc-wrapper hot path (`run_wrapper_mode`), where returning
         // an error means the compiler never runs at all — a config typo would
@@ -2108,7 +2175,7 @@ impl Config {
         let (remote, remote_error) = if local_only {
             (None, None)
         } else {
-            match Self::load_remote_config(&file_config) {
+            match Self::load_remote_config_for(invocation, &file_config) {
                 Ok(remote) => (remote, None),
                 Err(error) => {
                     let reason = format!("{error:#}");
@@ -2123,43 +2190,47 @@ impl Config {
         };
         let remote_key_listing = explicit_remote_key_listing
             .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
-        let pull_request_prefix = if crate::policy::pull_request_job() {
-            remote.as_ref().and_then(|remote| {
-                if matches!(remote.backend, RemoteBackendConfig::Oci(_)) {
-                    tracing::warn!(
-                        "OCI pull request jobs stay read-only: tags in one repository share \
+        let pull_request_prefix =
+            if crate::policy::pull_request_job_with(|name| invocation.var(name).ok()) {
+                remote.as_ref().and_then(|remote| {
+                    if matches!(remote.backend, RemoteBackendConfig::Oci(_)) {
+                        tracing::warn!(
+                            "OCI pull request jobs stay read-only: tags in one repository share \
                          permissions, so pull_request_prefix cannot isolate writes"
-                    );
-                    return None;
-                }
-                let configured = env_or_ignored("KACHE_PULL_REQUEST_PREFIX", ignore_env)
-                    .ok()
-                    .or_else(|| {
-                        file_config
-                            .as_ref()
-                            .ok()
-                            .and_then(|config| config.cache.as_ref())
-                            .and_then(|cache| cache.remote.as_ref())
-                            .and_then(|remote| remote.pull_request_prefix.clone())
-                    })?;
-                match pull_request_prefix_for(&remote.prefix, &configured) {
-                    Ok(prefix) => prefix,
-                    Err(error) => {
-                        tracing::warn!("{error:#}; this pull request job stays read-only");
-                        None
+                        );
+                        return None;
                     }
-                }
-            })
-        } else {
-            None
-        };
-        if pull_request_prefix.is_some() && !Self::remote_readonly_enabled(&file_config) {
+                    let configured =
+                        env_or_ignored_for(invocation, "KACHE_PULL_REQUEST_PREFIX", ignore_env)
+                            .ok()
+                            .or_else(|| {
+                                file_config
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|config| config.cache.as_ref())
+                                    .and_then(|cache| cache.remote.as_ref())
+                                    .and_then(|remote| remote.pull_request_prefix.clone())
+                            })?;
+                    match pull_request_prefix_for(&remote.prefix, &configured) {
+                        Ok(prefix) => prefix,
+                        Err(error) => {
+                            tracing::warn!("{error:#}; this pull request job stays read-only");
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+        if pull_request_prefix.is_some()
+            && !Self::remote_readonly_enabled_for(invocation, &file_config)
+        {
             // The CI policy made this job read-only; writing to its own prefix
             // is the exception the configuration asked for.
             remote_readonly = false;
         }
 
-        let unstable = env_or_ignored("KACHE_UNSTABLE", ignore_env)
+        let unstable = env_or_ignored_for(invocation, "KACHE_UNSTABLE", ignore_env)
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|_| {
                 file_config
@@ -2219,19 +2290,24 @@ impl Config {
             adaptive_incremental,
             seed_incremental,
             unstable,
-            incremental_seed_from: env_or_ignored("KACHE_INCREMENTAL_SEED_FROM", ignore_env)
-                .ok()
-                .or_else(|| {
-                    file_config
-                        .as_ref()
-                        .ok()?
-                        .cache
-                        .as_ref()?
-                        .incremental_seed_from
-                        .clone()
-                })
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            incremental_seed_from: env_or_ignored_for(
+                invocation,
+                "KACHE_INCREMENTAL_SEED_FROM",
+                ignore_env,
+            )
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()?
+                    .cache
+                    .as_ref()?
+                    .incremental_seed_from
+                    .clone()
+            })
+            .filter(|value| !value.is_empty())
+            .map(|path| resolve_invocation_path(invocation, Path::new(&path)))
+            .transpose()?,
             event_log_max_size,
             event_log_keep_lines,
             compression_level,
@@ -2256,6 +2332,51 @@ impl Config {
             base_dirs,
             cc_extra_allowlist_flags,
         })
+    }
+
+    #[cfg(test)]
+    fn load_resolved(file_config: Result<FileConfig>) -> Result<Self> {
+        Self::load_resolved_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
+        Self::load_remote_config_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn input_predictions_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::input_predictions_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn record_sessions_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::record_sessions_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn deferred_discovery_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::deferred_discovery_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn daemon_publish_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::daemon_publish_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn out_dir_alias_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::out_dir_alias_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn deferred_durability_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::deferred_durability_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn shared_hardlink_restores_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::shared_hardlink_restores_enabled_for(&InvocationEnv::capture(), file_config)
     }
 
     /// Load a raw FileConfig, without env overrides or defaults, from an
@@ -2325,7 +2446,14 @@ impl Config {
     fn load_file_config_with_provenance(
         config_path: PathBuf,
     ) -> (Result<FileConfig>, ConfigFileProvenance) {
-        let host = read_host_config_snapshot();
+        Self::load_file_config_with_provenance_for(&InvocationEnv::capture(), config_path)
+    }
+
+    fn load_file_config_with_provenance_for(
+        invocation: &InvocationEnv,
+        config_path: PathBuf,
+    ) -> (Result<FileConfig>, ConfigFileProvenance) {
+        let host = read_host_config_snapshot_for(invocation);
         let host_layer = host_config_layer(host.as_ref());
         match std::fs::read(&config_path) {
             Ok(bytes) => {
@@ -2337,7 +2465,9 @@ impl Config {
                 );
                 let parsed = std::str::from_utf8(&bytes)
                     .context("reading kache config file as UTF-8")
-                    .and_then(|content| parse_layered_file_config(content, host_layer));
+                    .and_then(|content| {
+                        parse_layered_file_config_for(invocation, content, host_layer)
+                    });
                 (parsed, provenance)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2351,7 +2481,7 @@ impl Config {
                 // It already passed the schema check in `parse_host_config`.
                 let host_only = host_layer
                     .and_then(|mut table| {
-                        yield_host_tables_to_env(&mut table, None);
+                        yield_host_tables_to_env_for(invocation, &mut table, None);
                         toml::Value::Table(table).try_into().ok()
                     })
                     .unwrap_or_default();
@@ -2372,8 +2502,9 @@ impl Config {
     /// Legacy file-only load used by config helpers that do not need to carry
     /// provenance beyond this call. Includes the host layer.
     pub(crate) fn load_file_config() -> Result<FileConfig> {
-        let path = normalize_config_path(resolve_config_path());
-        Self::load_file_config_with_provenance(path).0
+        let invocation = InvocationEnv::capture();
+        let path = resolve_config_path_for(&invocation)?;
+        Self::load_file_config_with_provenance_for(&invocation, path).0
     }
 
     /// `[cache.remote] type = "gcs"`: a bucket, and optionally a prefix and an
@@ -2452,7 +2583,10 @@ impl Config {
         })
     }
 
-    fn load_remote_config(file_config: &Result<FileConfig>) -> Result<Option<RemoteConfig>> {
+    fn load_remote_config_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> Result<Option<RemoteConfig>> {
         let ignore_env = Self::ignore_env_enabled(file_config);
         let file_remote = file_config
             .as_ref()
@@ -2528,7 +2662,7 @@ impl Config {
                 .with_context(
                     || "[cache.remote] type = \"filesystem\" requires a non-empty path",
                 )?;
-            let root = shellexpand(path);
+            let root = shellexpand_for(invocation, path);
             if !root.is_absolute() {
                 anyhow::bail!(
                     "[cache.remote] filesystem path must be absolute: {}",
@@ -2540,7 +2674,7 @@ impl Config {
                 .and_then(|r| r.atomic_write_dir.as_deref())
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .map(shellexpand)
+                .map(|path| shellexpand_for(invocation, path))
                 .unwrap_or_else(|| root.join(".kache-tmp"));
             if !atomic_write_dir.is_absolute() {
                 anyhow::bail!(
@@ -2577,7 +2711,7 @@ impl Config {
         // inherited remote. Falling through to the file-configured bucket would
         // silently point that job at a different remote than it asked for, so an
         // explicit empty override disables the remote instead.
-        let env_bucket = env_or_ignored("KACHE_S3_BUCKET", ignore_env).ok();
+        let env_bucket = env_or_ignored_for(invocation, "KACHE_S3_BUCKET", ignore_env).ok();
         let file_bucket_is_usable = file_remote
             .and_then(|r| r.bucket.as_deref())
             .is_some_and(|bucket| !bucket.trim().is_empty());
@@ -2615,28 +2749,28 @@ impl Config {
             return Ok(None);
         };
 
-        let endpoint = env_or_ignored("KACHE_S3_ENDPOINT", ignore_env)
+        let endpoint = env_or_ignored_for(invocation, "KACHE_S3_ENDPOINT", ignore_env)
             .ok()
             .or_else(|| file_remote.and_then(|r| r.endpoint.clone()));
 
-        let region = env_or_ignored("KACHE_S3_REGION", ignore_env)
+        let region = env_or_ignored_for(invocation, "KACHE_S3_REGION", ignore_env)
             .ok()
             .or_else(|| file_remote.and_then(|r| r.region.clone()))
             .unwrap_or_else(|| "us-east-1".to_string());
 
-        let prefix = env_or_ignored("KACHE_S3_PREFIX", ignore_env)
+        let prefix = env_or_ignored_for(invocation, "KACHE_S3_PREFIX", ignore_env)
             .ok()
             .or_else(|| file_remote.and_then(|r| r.prefix.clone()))
             .unwrap_or_else(|| "artifacts".to_string());
         let prefix = resolve_remote_prefix(&prefix)?;
 
-        let profile = env_or_ignored("KACHE_S3_PROFILE", ignore_env)
+        let profile = env_or_ignored_for(invocation, "KACHE_S3_PROFILE", ignore_env)
             .ok()
             .or_else(|| file_remote.and_then(|r| r.profile.clone()))
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let user_agent = env_or_ignored("KACHE_S3_USER_AGENT", ignore_env)
+        let user_agent = env_or_ignored_for(invocation, "KACHE_S3_USER_AGENT", ignore_env)
             .ok()
             .or_else(|| file_remote.and_then(|r| r.user_agent.clone()))
             .map(|s| s.trim().to_string())
@@ -2676,9 +2810,12 @@ impl Config {
             .unwrap_or(false)
     }
 
-    fn local_only_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn local_only_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_LOCAL_ONLY", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_LOCAL_ONLY", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2689,9 +2826,12 @@ impl Config {
             .unwrap_or(false)
     }
 
-    fn remote_readonly_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn remote_readonly_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_REMOTE_READONLY", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_REMOTE_READONLY", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2705,9 +2845,12 @@ impl Config {
     /// Whether the opt-in too-new-input guard is active (kunobi-ninja/kache#324).
     /// Env wins over the file: `KACHE_MODIFIED_INPUT_GUARD=1`/`=true`, else
     /// `[cache] modified_input_guard`, else off.
-    fn modified_input_guard_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn modified_input_guard_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_MODIFIED_INPUT_GUARD", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_MODIFIED_INPUT_GUARD", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2721,9 +2864,12 @@ impl Config {
     /// Whether input-set predictions are recorded. Env wins over the file:
     /// `KACHE_INPUT_PREDICTIONS=1`/`=true`, else `[cache] input_predictions`,
     /// else on.
-    fn input_predictions_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn input_predictions_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_INPUT_PREDICTIONS", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_INPUT_PREDICTIONS", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2737,9 +2883,12 @@ impl Config {
     /// Whether every `kache report` records its session. Env wins over the
     /// file: `KACHE_RECORD_SESSIONS=1`/`=true`, else `[cache] record_sessions`,
     /// else off.
-    fn record_sessions_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn record_sessions_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_RECORD_SESSIONS", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_RECORD_SESSIONS", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2752,9 +2901,12 @@ impl Config {
 
     /// Windows hardlink-restore opt-in: `KACHE_WINDOWS_HARDLINK=1`/`true`, else
     /// `[cache] windows_hardlink`, else off. See [`Config::windows_hardlink`].
-    fn deferred_discovery_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn deferred_discovery_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_DEFERRED_DISCOVERY", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_DEFERRED_DISCOVERY", ignore_env) {
             return !(v == "0" || v.eq_ignore_ascii_case("false"));
         }
         file_config
@@ -2765,9 +2917,12 @@ impl Config {
             .unwrap_or(true)
     }
 
-    fn daemon_publish_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn daemon_publish_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_DAEMON_PUBLISH", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_DAEMON_PUBLISH", ignore_env) {
             return !(v == "0" || v.eq_ignore_ascii_case("false"));
         }
         file_config
@@ -2780,10 +2935,13 @@ impl Config {
 
     /// Shared read-only OUT_DIR: `KACHE_OUT_DIR_ALIAS` (env wins), else
     /// `[cache] out_dir_alias`, else on. See [`Config::out_dir_alias`].
-    fn out_dir_alias_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn out_dir_alias_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
         out_dir_alias_setting(
-            env_or_ignored("KACHE_OUT_DIR_ALIAS", ignore_env)
+            env_or_ignored_for(invocation, "KACHE_OUT_DIR_ALIAS", ignore_env)
                 .ok()
                 .as_deref(),
             file_config
@@ -2794,9 +2952,12 @@ impl Config {
         )
     }
 
-    fn deferred_durability_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn deferred_durability_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_DEFERRED_DURABILITY", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_DEFERRED_DURABILITY", ignore_env) {
             return !(v == "0" || v.eq_ignore_ascii_case("false"));
         }
         file_config
@@ -2807,9 +2968,13 @@ impl Config {
             .unwrap_or(true)
     }
 
-    fn shared_hardlink_restores_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn shared_hardlink_restores_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_SHARED_HARDLINK_RESTORES", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_SHARED_HARDLINK_RESTORES", ignore_env)
+        {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2820,9 +2985,12 @@ impl Config {
             .unwrap_or(false)
     }
 
-    fn windows_hardlink_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn windows_hardlink_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_WINDOWS_HARDLINK", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_WINDOWS_HARDLINK", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -2837,9 +3005,9 @@ impl Config {
     /// size pressure also runs for daemon-less, local-only builds.
     /// `KACHE_AUTO_GC=0`/`=false` (env wins), else `[cache] auto_gc`, else on.
     /// See [`Config::auto_gc`].
-    fn auto_gc_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn auto_gc_enabled_for(invocation: &InvocationEnv, file_config: &Result<FileConfig>) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_AUTO_GC", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_AUTO_GC", ignore_env) {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -2853,9 +3021,12 @@ impl Config {
     /// Daemon-side index compaction, on by default.
     /// `KACHE_INDEX_AUTO_COMPACT=0`/`=false` (env wins), else
     /// `[cache] index_auto_compact`, else on. See [`Config::index_auto_compact`].
-    fn index_auto_compact_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn index_auto_compact_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_INDEX_AUTO_COMPACT", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_INDEX_AUTO_COMPACT", ignore_env) {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -2869,9 +3040,14 @@ impl Config {
     /// Orphaned-target cleanup, on by default.
     /// `KACHE_AUTO_CLEAN_ORPHANED_TARGETS=0`/`=false` (env wins), else
     /// `[cache] auto_clean_orphaned_targets`, else on.
-    fn auto_clean_orphaned_targets_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn auto_clean_orphaned_targets_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", ignore_env) {
+        if let Ok(v) =
+            env_or_ignored_for(invocation, "KACHE_AUTO_CLEAN_ORPHANED_TARGETS", ignore_env)
+        {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -2885,9 +3061,12 @@ impl Config {
     /// Target-file sharing, on by default.
     /// `KACHE_AUTO_SHARE_TARGET_FILES=0`/`=false` (env wins), else
     /// `[cache] auto_share_target_files`, else on.
-    fn auto_share_target_files_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn auto_share_target_files_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_AUTO_SHARE_TARGET_FILES", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_AUTO_SHARE_TARGET_FILES", ignore_env) {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -2900,9 +3079,12 @@ impl Config {
 
     /// Target seeding, on by default. `KACHE_SEED_NEW_TARGETS=0`/`=false`
     /// (env wins), else `[cache] seed_new_targets`, else on.
-    fn seed_new_targets_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn seed_new_targets_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_SEED_NEW_TARGETS", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_SEED_NEW_TARGETS", ignore_env) {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -2916,9 +3098,12 @@ impl Config {
     /// Hermetic build-script runs, off by default.
     /// `KACHE_BUILD_SCRIPT_HERMETIC=1`/`=true` turns them on and any other
     /// value off (env wins), else `[cache] build_script_hermetic`, else off.
-    fn build_script_hermetic_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn build_script_hermetic_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_BUILD_SCRIPT_HERMETIC", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_BUILD_SCRIPT_HERMETIC", ignore_env) {
             return v == "1" || v == "true";
         }
         file_config
@@ -2932,9 +3117,12 @@ impl Config {
     /// Unused-unit cleanup age in days, `30` by default.
     /// `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` (env wins), else `[cache]
     /// auto_clean_unused_units_days`.
-    fn auto_clean_unused_units_days(file_config: &Result<FileConfig>) -> u64 {
+    fn auto_clean_unused_units_days_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        env_or_ignored("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", ignore_env)
+        env_or_ignored_for(invocation, "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -2950,9 +3138,13 @@ impl Config {
     /// Memory-pressure admission, on by default.
     /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` (env wins), else
     /// `[cache] scheduler_memory_pressure`, else on.
-    fn scheduler_memory_pressure_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn scheduler_memory_pressure_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_SCHEDULER_MEMORY_PRESSURE", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_SCHEDULER_MEMORY_PRESSURE", ignore_env)
+        {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -2966,9 +3158,12 @@ impl Config {
     /// Idle-target cleanup age in days, `0` (off) by default.
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` (env wins), else `[cache]
     /// auto_clean_idle_targets_days`.
-    fn auto_clean_idle_targets_days(file_config: &Result<FileConfig>) -> u64 {
+    fn auto_clean_idle_targets_days_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        env_or_ignored("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", ignore_env)
+        env_or_ignored_for(invocation, "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -2984,9 +3179,12 @@ impl Config {
     /// Free-space threshold for store and target recovery, `0` (off) by
     /// default. `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` (env wins), else
     /// `[cache] auto_recover_min_free_bytes`.
-    fn auto_recover_min_free_bytes(file_config: &Result<FileConfig>) -> u64 {
+    fn auto_recover_min_free_bytes_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        env_or_ignored("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", ignore_env)
+        env_or_ignored_for(invocation, "KACHE_AUTO_RECOVER_MIN_FREE_BYTES", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -2998,7 +3196,7 @@ impl Config {
             })
             .unwrap_or_else(|| {
                 default_recovery_floor(crate::policy::running_in_ci_with(|name| {
-                    std::env::var(name).ok()
+                    invocation.var(name).ok()
                 }))
             })
     }
@@ -3006,9 +3204,12 @@ impl Config {
     /// Target removal under the free-space floor, off by default.
     /// `KACHE_AUTO_RECOVER_TARGETS=1`/`=true` (env wins), else `[cache]
     /// auto_recover_targets`, else off.
-    fn auto_recover_targets_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn auto_recover_targets_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_AUTO_RECOVER_TARGETS", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_AUTO_RECOVER_TARGETS", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -3023,9 +3224,12 @@ impl Config {
     /// the older namespace-first policy for installations that require the
     /// registered store size to fall below `max_size` even when no filesystem
     /// blocks would be reclaimed.
-    fn gc_evict_shared_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn gc_evict_shared_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_GC_EVICT_SHARED", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_GC_EVICT_SHARED", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -3041,9 +3245,12 @@ impl Config {
     /// `KACHE_STORAGE_LAYOUT_ADVICE=0`/`=false` (env wins), else
     /// `[cache] storage_layout_advice`, else on.
     /// See [`Config::storage_layout_advice`].
-    fn storage_layout_advice_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn storage_layout_advice_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_STORAGE_LAYOUT_ADVICE", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_STORAGE_LAYOUT_ADVICE", ignore_env) {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -3057,9 +3264,12 @@ impl Config {
     /// Opt-in miss diagnostics (kunobi-ninja/kache#131). Env wins over the
     /// file: `KACHE_EXPLAIN_MISS=1`/`=true`, else `[cache] explain_miss`,
     /// else off. See [`Config::explain_miss`].
-    fn explain_miss_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn explain_miss_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_EXPLAIN_MISS", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_EXPLAIN_MISS", ignore_env) {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         file_config
@@ -3072,9 +3282,9 @@ impl Config {
 
     /// Machine-wide miss-path scheduler: on by default.
     /// `KACHE_SCHEDULER=0`/`=false` (env wins), else `[cache] scheduler`, else on.
-    fn scheduler_enabled(file_config: &Result<FileConfig>) -> bool {
+    fn scheduler_enabled_for(invocation: &InvocationEnv, file_config: &Result<FileConfig>) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        if let Ok(v) = env_or_ignored("KACHE_SCHEDULER", ignore_env) {
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_SCHEDULER", ignore_env) {
             return v != "0" && !v.eq_ignore_ascii_case("false");
         }
         file_config
@@ -3086,16 +3296,21 @@ impl Config {
     }
 
     pub fn load_planner_config() -> Option<PlannerConfig> {
-        let file_config = Self::load_file_config();
+        Self::load_planner_config_for(&InvocationEnv::capture())
+    }
+
+    pub(crate) fn load_planner_config_for(invocation: &InvocationEnv) -> Option<PlannerConfig> {
+        let path = resolve_config_path_for(invocation).ok()?;
+        let file_config = Self::load_file_config_with_provenance_for(invocation, path).0;
         let ignore_env = Self::ignore_env_enabled(&file_config);
 
         // Strict local-only mode (#221) suppresses the planner entirely —
         // symmetric with `remote` being forced to `None` in `load`.
-        if Self::local_only_enabled(&file_config) {
+        if Self::local_only_enabled_for(invocation, &file_config) {
             return None;
         }
 
-        let endpoint = env_or_ignored("KACHE_PLANNER_ENDPOINT", ignore_env)
+        let endpoint = env_or_ignored_for(invocation, "KACHE_PLANNER_ENDPOINT", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -3108,7 +3323,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
 
-        let timeout_ms = env_or_ignored("KACHE_PLANNER_TIMEOUT_MS", ignore_env)
+        let timeout_ms = env_or_ignored_for(invocation, "KACHE_PLANNER_TIMEOUT_MS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| {
@@ -3121,7 +3336,7 @@ impl Config {
             })
             .unwrap_or(DEFAULT_PLANNER_TIMEOUT_MS);
 
-        let token = env_or_ignored("KACHE_PLANNER_TOKEN", ignore_env)
+        let token = env_or_ignored_for(invocation, "KACHE_PLANNER_TOKEN", ignore_env)
             .ok()
             .or_else(|| {
                 file_config
@@ -3155,6 +3370,14 @@ impl Config {
         Self::match_volume_store(&self.volume_stores, &absolutize_volume_path(path))
     }
 
+    pub(crate) fn volume_store_for_invocation(
+        &self,
+        path: &Path,
+        env: &InvocationEnv,
+    ) -> Option<&Path> {
+        Self::match_volume_store(&self.volume_stores, &env.resolve(path)?)
+    }
+
     /// Cache dir the wrapper should open for artifacts produced at `path`.
     /// A mapped volume uses that shard; anything else uses the main store.
     pub fn cache_dir_for_path(&self, path: &Path) -> &Path {
@@ -3165,12 +3388,16 @@ impl Config {
     /// and remote settings stay on the main config so daemons and markers
     /// do not move with the shard.
     pub fn routed_for_path(&self, path: &Path) -> Config {
-        let dir = self.cache_dir_for_path(path);
-        if dir == self.cache_dir.as_path() {
-            return self.clone();
-        }
+        self.routed_for_path_for(path, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn routed_for_path_for(&self, path: &Path, invocation: &InvocationEnv) -> Config {
         let mut routed = self.clone();
-        routed.cache_dir = dir.to_path_buf();
+        if let Some(path) = invocation.resolve(path)
+            && let Some(store) = Self::match_volume_store(&self.volume_stores, &path)
+        {
+            routed.cache_dir = store.to_owned();
+        }
         routed
     }
 
@@ -3473,23 +3700,49 @@ impl ProjectRules {
 
     /// Return true when `source_path` matches one of the `exclude` globs.
     pub(crate) fn source_excluded(&self, source_path: &Path, roots: &[PathBuf]) -> bool {
-        source_excluded_by_patterns(&self.exclude, source_path, roots)
+        self.source_excluded_for(source_path, roots, &InvocationEnv::capture())
     }
 
-    /// First matching user bypass rule for this invocation, or `None`. See
-    /// [`Config::user_bypass_reason`].
-    pub(crate) fn user_bypass_reason(&self, crate_name: &str, argv: &[String]) -> Option<String> {
+    pub(crate) fn source_excluded_for(
+        &self,
+        source_path: &Path,
+        roots: &[PathBuf],
+        invocation: &InvocationEnv,
+    ) -> bool {
+        if self.exclude.is_empty() {
+            return false;
+        }
+        let candidates = source_candidates_for(source_path, roots, invocation);
+        self.exclude.iter().any(|pattern| {
+            let (expanded, _) = expand_exclude_pattern_collecting_for(pattern, invocation);
+            exclude_expanded_pattern_matches(&expanded, &candidates)
+        })
+    }
+
+    pub(crate) fn user_bypass_reason_for(
+        &self,
+        crate_name: &str,
+        argv: &[String],
+        invocation: &InvocationEnv,
+    ) -> Option<String> {
         Config::user_bypass_reason_with(
             crate_name,
             argv,
             &self.bypass_crates,
             &self.bypass_argv,
             &self.bypass_env,
-            |name| std::env::var(name).ok(),
+            |name| invocation.var(name).ok(),
         )
+    }
+
+    /// First matching user bypass rule for this invocation, or `None`. See
+    /// [`Config::user_bypass_reason`].
+    pub(crate) fn user_bypass_reason(&self, crate_name: &str, argv: &[String]) -> Option<String> {
+        self.user_bypass_reason_for(crate_name, argv, &InvocationEnv::capture())
     }
 }
 
+#[cfg(test)]
 fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &[PathBuf]) -> bool {
     if patterns.is_empty() {
         return false;
@@ -3546,16 +3799,46 @@ pub(crate) fn default_cache_executables() -> bool {
 /// without a loaded configuration use this; the configured `cache_dir` wins
 /// where one is at hand.
 pub(crate) fn probe_memo_dir() -> PathBuf {
-    std::env::var_os("KACHE_CACHE_DIR")
+    let invocation = InvocationEnv::capture();
+    probe_memo_dir_for(&invocation).unwrap_or_else(|_| {
+        invocation
+            .var_os("KACHE_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_cache_dir_for(&invocation))
+            .join("probes")
+    })
+}
+
+/// Probe memos belong to the invoking client's store selection.
+pub(crate) fn probe_memo_dir_for(invocation: &InvocationEnv) -> Result<PathBuf> {
+    let base = invocation
+        .var_os("KACHE_CACHE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(default_cache_dir)
-        .join("probes")
+        .unwrap_or_else(|| default_cache_dir_for(invocation));
+    Ok(resolve_invocation_path(invocation, &base)?.join("probes"))
 }
 
 pub(crate) fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("kache")
+}
+
+fn default_cache_dir_for(invocation: &InvocationEnv) -> PathBuf {
+    invocation
+        .cache_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("kache")
+}
+
+fn resolve_invocation_path(invocation: &InvocationEnv, path: &Path) -> Result<PathBuf> {
+    invocation.resolve(path).with_context(|| {
+        format!(
+            "cannot resolve relative config path {} without the invocation working directory",
+            path.display()
+        )
+    })
 }
 
 const PROJECT_CONFIG_NAME: &str = ".kache.toml";
@@ -3596,6 +3879,10 @@ const HOST_EXCLUDED_KEYS: &[(&[&str], &str)] = &[
 /// have no host layer unless a test points its own thread at a file with
 /// [`set_host_config_for_test`].
 pub(crate) fn host_config_path() -> Option<PathBuf> {
+    host_config_path_for(&InvocationEnv::capture())
+}
+
+pub(crate) fn host_config_path_for(invocation: &InvocationEnv) -> Option<PathBuf> {
     // A test that points its own thread at a host file wins over the
     // environment: the repository's cargo `[env]` sets KACHE_HOST_CONFIG to
     // empty for every test process.
@@ -3603,9 +3890,9 @@ pub(crate) fn host_config_path() -> Option<PathBuf> {
     if let Some(path) = HOST_CONFIG_FOR_TEST.with(|path| path.borrow().clone()) {
         return Some(path);
     }
-    match std::env::var("KACHE_HOST_CONFIG") {
+    match invocation.var("KACHE_HOST_CONFIG") {
         Ok(value) if value.is_empty() => None,
-        Ok(value) => Some(shellexpand(&value)),
+        Ok(value) => Some(shellexpand_for(invocation, &value)),
         #[cfg(test)]
         Err(_) => None,
         #[cfg(not(test))]
@@ -3652,7 +3939,11 @@ struct HostConfigSnapshot {
 /// so a machine without one resolves exactly as it did before the layer
 /// existed.
 fn read_host_config_snapshot() -> Option<HostConfigSnapshot> {
-    let path = host_config_path()?;
+    read_host_config_snapshot_for(&InvocationEnv::capture())
+}
+
+fn read_host_config_snapshot_for(invocation: &InvocationEnv) -> Option<HostConfigSnapshot> {
+    let path = invocation.resolve(&host_config_path_for(invocation)?)?;
     match std::fs::read(&path) {
         Ok(bytes) => Some(HostConfigSnapshot {
             path,
@@ -3732,7 +4023,11 @@ const HOST_TABLES_YIELDING_TO_ENV: &[(&str, &[&str])] =
 /// Drop each host table in [`HOST_TABLES_YIELDING_TO_ENV`] that the
 /// environment describes and the chosen file does not declare, so no host
 /// key for it applies.
-fn yield_host_tables_to_env(host: &mut toml::Table, chosen: Option<&toml::Table>) {
+fn yield_host_tables_to_env_for(
+    invocation: &InvocationEnv,
+    host: &mut toml::Table,
+    chosen: Option<&toml::Table>,
+) {
     let chosen_cache = chosen
         .and_then(|table| table.get("cache"))
         .and_then(toml::Value::as_table);
@@ -3749,7 +4044,7 @@ fn yield_host_tables_to_env(host: &mut toml::Table, chosen: Option<&toml::Table>
         if chosen_cache.is_some_and(|cache| cache.contains_key(*table)) {
             continue;
         }
-        let Some(var) = vars.iter().find(|name| std::env::var_os(name).is_some()) else {
+        let Some(var) = vars.iter().find(|name| invocation.var_os(name).is_some()) else {
             continue;
         };
         if remove_config_key(host, &["cache", table]) {
@@ -3909,12 +4204,16 @@ pub(crate) fn unusable_config_file() -> Option<(PathBuf, String)> {
 
 /// Parse the chosen file's content, laid over the host layer when there is
 /// one. With no host layer this is exactly the single-file parse.
-fn parse_layered_file_config(content: &str, host: Option<toml::Table>) -> Result<FileConfig> {
+fn parse_layered_file_config_for(
+    invocation: &InvocationEnv,
+    content: &str,
+    host: Option<toml::Table>,
+) -> Result<FileConfig> {
     let Some(mut merged) = host else {
         return toml::from_str(content).context("parsing kache config file");
     };
     let chosen: toml::Table = toml::from_str(content).context("parsing kache config file")?;
-    yield_host_tables_to_env(&mut merged, Some(&chosen));
+    yield_host_tables_to_env_for(invocation, &mut merged, Some(&chosen));
     merge_config_tables(&mut merged, chosen);
     toml::Value::Table(merged)
         .try_into()
@@ -4152,6 +4451,32 @@ pub(crate) fn resolve_config_path() -> PathBuf {
     )
 }
 
+fn resolve_config_path_for(invocation: &InvocationEnv) -> Result<PathBuf> {
+    let path = invocation
+        .var("KACHE_CONFIG")
+        .ok()
+        .map(|path| shellexpand_for(invocation, &path))
+        .or_else(|| nearest_project_config_path(invocation.cwd()))
+        .unwrap_or_else(|| config_file_path_for(invocation));
+    let absolute = resolve_invocation_path(invocation, &path)?;
+    // Absolute inputs do not need the process cwd. Preserve symlinks and `..`
+    // while matching the existing provenance identity for `.` components.
+    Ok(std::path::absolute(&absolute).unwrap_or(absolute))
+}
+
+fn config_file_path_for(invocation: &InvocationEnv) -> PathBuf {
+    let base = invocation
+        .var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            invocation
+                .home_dir()
+                .unwrap_or(Path::new("/tmp"))
+                .join(".config")
+        });
+    base.join("kache/config.toml")
+}
+
 /// A fingerprint of the *active config file* — its resolved path plus content,
 /// or a stable sentinel when the file is absent. The daemon records this at
 /// startup and self-restarts when it changes, so editing e.g. `local_max_size`
@@ -4276,6 +4601,18 @@ pub(crate) fn shellexpand(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+pub(crate) fn shellexpand_for(invocation: &InvocationEnv, s: &str) -> PathBuf {
+    if let Some(home) = invocation.home_dir() {
+        if s == "~" {
+            return home.to_owned();
+        }
+        if let Some(rest) = s.strip_prefix("~/") {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(s)
+}
+
 /// Core `$VAR` / `${VAR}` expander. Returns the expanded string plus the names
 /// of every referenced env var that was *unset* (no value and no
 /// [`default_env_var_value`]) and so was left as a literal `$VAR` in the output.
@@ -4288,6 +4625,14 @@ fn expand_env_vars_collecting<F>(s: &str, lookup: F) -> (String, Vec<String>)
 where
     F: Fn(&str) -> Option<String>,
 {
+    expand_env_vars_collecting_with_default(s, lookup, default_env_var_value)
+}
+
+fn expand_env_vars_collecting_with_default(
+    s: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+    default: impl Fn(&str) -> Option<String>,
+) -> (String, Vec<String>) {
     let mut out = String::with_capacity(s.len());
     let mut unset: Vec<String> = Vec::new();
     let mut note_unset = |key: &str| {
@@ -4311,7 +4656,7 @@ where
                 }
                 key.push(c);
             }
-            if let Some(value) = lookup(&key).or_else(|| default_env_var_value(&key)) {
+            if let Some(value) = lookup(&key).or_else(|| default(&key)) {
                 out.push_str(&value);
             } else {
                 note_unset(&key);
@@ -4333,7 +4678,7 @@ where
         }
         if key.is_empty() {
             out.push('$');
-        } else if let Some(value) = lookup(&key).or_else(|| default_env_var_value(&key)) {
+        } else if let Some(value) = lookup(&key).or_else(|| default(&key)) {
             out.push_str(&value);
         } else {
             note_unset(&key);
@@ -4353,6 +4698,7 @@ fn default_env_var_value(key: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn expand_exclude_pattern(pattern: &str) -> String {
     expand_exclude_pattern_collecting(pattern).0
 }
@@ -4368,21 +4714,52 @@ pub(crate) fn expand_exclude_pattern_collecting(pattern: &str) -> (String, Vec<S
     (s, unset)
 }
 
+pub(crate) fn expand_exclude_pattern_collecting_for(
+    pattern: &str,
+    invocation: &InvocationEnv,
+) -> (String, Vec<String>) {
+    let (expanded, unset) = expand_env_vars_collecting_with_default(
+        pattern,
+        |key| invocation.var(key).ok(),
+        |key| {
+            if key == "CARGO_HOME" {
+                invocation
+                    .home_dir()
+                    .map(|home| home.join(".cargo").to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        },
+    );
+    (
+        shellexpand_for(invocation, &expanded)
+            .to_string_lossy()
+            .into_owned(),
+        unset,
+    )
+}
+
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|p| p == &path) {
         paths.push(path);
     }
 }
 
+#[cfg(test)]
 fn source_candidates(source_path: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    source_candidates_for(source_path, roots, &InvocationEnv::capture())
+}
+
+fn source_candidates_for(
+    source_path: &Path,
+    roots: &[PathBuf],
+    invocation: &InvocationEnv,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     push_unique(&mut candidates, source_path.to_path_buf());
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let absolute = if source_path.is_absolute() {
-        source_path.to_path_buf()
-    } else {
-        cwd.join(source_path)
+    let Some(absolute) = invocation.resolve(source_path) else {
+        return candidates;
     };
     push_unique(&mut candidates, absolute.clone());
     if let Ok(canonical) = std::fs::canonicalize(&absolute) {
@@ -4390,10 +4767,8 @@ fn source_candidates(source_path: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
     }
 
     for root in roots {
-        let root_abs = if root.is_absolute() {
-            root.clone()
-        } else {
-            cwd.join(root)
+        let Some(root_abs) = invocation.resolve(root) else {
+            continue;
         };
         let root_forms = [
             root_abs.clone(),
@@ -4412,9 +4787,13 @@ fn source_candidates(source_path: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(test)]
 fn exclude_pattern_matches(pattern: &str, candidates: &[PathBuf]) -> bool {
-    let expanded = expand_exclude_pattern(pattern);
-    let Ok(pattern) = glob::Pattern::new(&expanded) else {
+    exclude_expanded_pattern_matches(&expand_exclude_pattern(pattern), candidates)
+}
+
+fn exclude_expanded_pattern_matches(expanded: &str, candidates: &[PathBuf]) -> bool {
+    let Ok(pattern) = glob::Pattern::new(expanded) else {
         tracing::warn!("ignoring invalid [cache].exclude glob pattern: {expanded}");
         return false;
     };
@@ -4569,3 +4948,208 @@ pub(crate) use tests::config_path_lock;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn snapshot(root: &Path, vars: &[(&str, &str)]) -> InvocationEnv {
+        let vars = vars
+            .iter()
+            .map(|(key, value)| (OsString::from(*key), OsString::from(*value)));
+        InvocationEnv::from_parts(
+            vars,
+            Some(root.to_owned()),
+            Some(root.join("home")),
+            root.join("tmp"),
+        )
+    }
+
+    #[test]
+    fn independent_invocations_resolve_paths_policy_and_rules_from_their_snapshots() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let content = r#"
+[cache]
+local_store = "~/store"
+runtime_dir = "run"
+readonly_store = "~/read"
+incremental_seed_from = "seed"
+local_max_size = "1GiB"
+exclude = ["$CARGO_HOME/**", "$CUSTOM/**"]
+bypass_env = ["SKIP=1"]
+[cache.remote]
+bucket = "test"
+prefix = "base"
+pull_request_prefix = "pr/42"
+"#;
+        for root in [first.path(), second.path()] {
+            std::fs::write(root.join(".kache.toml"), content).unwrap();
+        }
+        let one = snapshot(
+            first.path(),
+            &[
+                ("KACHE_HOST_CONFIG", ""),
+                ("KACHE_KEY_SALT", "first"),
+                ("KACHE_TRUST_DOMAIN", "one"),
+                ("SKIP", "1"),
+                ("GITHUB_ACTIONS", "true"),
+                ("GITHUB_EVENT_NAME", "pull_request"),
+            ],
+        );
+        let two = snapshot(
+            second.path(),
+            &[
+                ("KACHE_HOST_CONFIG", ""),
+                ("KACHE_KEY_SALT", "second"),
+                ("KACHE_TRUST_DOMAIN", "two"),
+            ],
+        );
+        let (a, a_provenance) = Config::load_with_provenance_for(&one).unwrap();
+        let (b, b_provenance) = Config::load_with_provenance_for(&two).unwrap();
+        assert_eq!(a.cache_dir, first.path().join("home/store/one"));
+        assert_eq!(b.cache_dir, second.path().join("home/store/two"));
+        assert_eq!(a.runtime_dir, first.path().join("run"));
+        assert_eq!(b.readonly_store, Some(second.path().join("home/read")));
+        assert_eq!(a.incremental_seed_from, Some(first.path().join("seed")));
+        assert_eq!(a.key_salt.as_deref(), Some("first"));
+        assert_eq!(b.key_salt.as_deref(), Some("second"));
+        assert_eq!(a.max_size, 1 << 30);
+        assert_eq!(a.auto_recover_min_free_bytes, 0);
+        assert_eq!(b.auto_recover_min_free_bytes, 10 << 30);
+        assert_eq!(a.pull_request_prefix.as_deref(), Some("pr/42"));
+        assert_eq!(b.pull_request_prefix, None);
+        assert_eq!(a_provenance.path, first.path().join(".kache.toml"));
+        assert_eq!(b_provenance.path, second.path().join(".kache.toml"));
+        assert_ne!(a_provenance.fingerprint, b_provenance.fingerprint);
+        assert!(
+            a.project_rules
+                .user_bypass_reason_for("unit", &[], &one)
+                .is_some()
+        );
+        assert!(
+            b.project_rules
+                .user_bypass_reason_for("unit", &[], &two)
+                .is_none()
+        );
+        assert!(a.project_rules.source_excluded_for(
+            &first.path().join("home/.cargo/lib.rs"),
+            &[],
+            &one
+        ));
+        assert!(!a.project_rules.source_excluded_for(
+            &first.path().join("home/.cargo/lib.rs"),
+            &[],
+            &two
+        ));
+        let (expanded, unset) =
+            expand_exclude_pattern_collecting_for("${CARGO_HOME}/$MISSING", &one);
+        assert_eq!(
+            expanded,
+            format!("{}/$MISSING", first.path().join("home/.cargo").display())
+        );
+        assert_eq!(unset, ["MISSING"]);
+        let mut routing = a.clone();
+        routing.volume_stores = vec![VolumeStore {
+            volume: Config::normalize_volume_root(first.path().to_str().unwrap()).unwrap(),
+            store: first.path().join("shard"),
+            max_size: None,
+        }];
+        assert_eq!(
+            routing
+                .routed_for_path_for(Path::new("artifact.o"), &one)
+                .cache_dir,
+            first.path().join("shard")
+        );
+        assert_eq!(
+            routing
+                .routed_for_path_for(Path::new("artifact.o"), &two)
+                .cache_dir,
+            a.cache_dir
+        );
+        let probe_one = snapshot(first.path(), &[("KACHE_CACHE_DIR", "probe-store")]);
+        let probe_two = snapshot(second.path(), &[("KACHE_CACHE_DIR", "probe-store")]);
+        assert_eq!(
+            probe_memo_dir_for(&probe_one).unwrap(),
+            first.path().join("probe-store/probes")
+        );
+        assert_eq!(
+            probe_memo_dir_for(&probe_two).unwrap(),
+            second.path().join("probe-store/probes")
+        );
+        // Loading another request cannot overwrite the original snapshot.
+        assert_eq!(Config::load_for(&one).unwrap().key_salt, a.key_salt);
+    }
+
+    #[test]
+    fn explicit_config_keeps_host_atomic_tables_and_ignore_env_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host.toml");
+        let host_remote = root.path().join("remote");
+        let content = format!(
+            r#"
+[cache]
+key_salt = "host"
+[cache.remote]
+type = "filesystem"
+path = {:?}
+"#,
+            host_remote.to_str().unwrap()
+        );
+        std::fs::write(&host, content).unwrap();
+        std::fs::write(
+            root.path().join("open.toml"),
+            "[cache]\nlocal_store = 'store'\nlocal_max_size = '1GiB'\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("locked.toml"), "[cache]\nignore_env = true\nlocal_store = 'locked'\nlocal_max_size = '1GiB'\nkey_salt = 'project'\n").unwrap();
+        let open = snapshot(
+            root.path(),
+            &[
+                ("KACHE_CONFIG", "open.toml"),
+                ("KACHE_HOST_CONFIG", host.to_str().unwrap()),
+                ("KACHE_KEY_SALT", "environment"),
+                ("KACHE_S3_BUCKET", "env-bucket"),
+            ],
+        );
+        let locked = snapshot(
+            root.path(),
+            &[
+                ("KACHE_CONFIG", "locked.toml"),
+                ("KACHE_HOST_CONFIG", host.to_str().unwrap()),
+                ("KACHE_KEY_SALT", "environment"),
+                ("KACHE_S3_BUCKET", "env-bucket"),
+                ("KACHE_DISABLED", "1"),
+            ],
+        );
+        let a = Config::load_for(&open).unwrap();
+        let b = Config::load_for(&locked).unwrap();
+        assert_eq!(a.key_salt.as_deref(), Some("environment"));
+        assert_eq!(b.key_salt.as_deref(), Some("project"));
+        assert!(b.disabled);
+        assert_eq!(b.cache_dir, root.path().join("locked"));
+        assert!(
+            matches!(a.remote.unwrap().backend, RemoteBackendConfig::S3(S3RemoteConfig { ref bucket, .. }) if bucket == "env-bucket")
+        );
+        assert!(
+            matches!(b.remote.unwrap().backend, RemoteBackendConfig::Filesystem(FilesystemRemoteConfig { ref root, .. }) if root == &host_remote)
+        );
+    }
+
+    #[test]
+    fn missing_request_cwd_cannot_resolve_a_relative_config_in_the_daemon_directory() {
+        let invocation = InvocationEnv::from_parts(
+            [("KACHE_CONFIG", "relative.toml"), ("KACHE_HOST_CONFIG", "")],
+            None,
+            None,
+            PathBuf::from("/tmp"),
+        );
+        assert!(
+            Config::load_for(&invocation)
+                .unwrap_err()
+                .to_string()
+                .contains("invocation working directory")
+        );
+    }
+}

@@ -1007,9 +1007,18 @@ fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
 
 /// Open the volume shard (or main store) plus the stores read after it: the
 /// main store when the route maps to a shard, then [`Config::readonly_store`].
+#[cfg(test)]
 fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Vec<Store>)> {
-    crate::link::set_mapped_target(config.volume_store_for(route).is_some());
-    let routed = config.routed_for_path(route);
+    open_primary_and_fallback_for(config, route, &crate::invocation::InvocationEnv::capture())
+}
+
+fn open_primary_and_fallback_for(
+    config: &Config,
+    route: &Path,
+    env: &crate::invocation::InvocationEnv,
+) -> Result<(Store, Vec<Store>)> {
+    crate::link::set_mapped_target(config.volume_store_for_invocation(route, env).is_some());
+    let routed = config.routed_for_path_for(route, env);
     let primary = Store::open(&routed)?;
     let mut fallbacks = Vec::new();
     if !volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
@@ -1310,6 +1319,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -1865,10 +1875,22 @@ fn nvcc_try_remote_hit(
 /// Local and remote hits share compiler-specific restoration. Miss-path
 /// flights, permits, and per-key build locks match rustc.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let _trace = crate::phase_trace::start("cc", wrapper_args);
+    run_cc_for(
+        config,
+        wrapper_args,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn run_cc_for(
+    config: &Config,
+    wrapper_args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<i32> {
+    let _trace = crate::phase_trace::start_for("cc", wrapper_args, env);
     let start = wrapper_entry();
     let invocation_start_ns = crate::cache_key::stamp_clock_ns();
-    run_cc_inner(config, wrapper_args, start, invocation_start_ns)
+    run_cc_inner(config, wrapper_args, start, invocation_start_ns, env)
 }
 
 /// A C compile that already ran because its key was deferred: the key is
@@ -1895,6 +1917,7 @@ fn run_cc_inner(
     wrapper_args: &[String],
     start: std::time::Instant,
     invocation_start_ns: i64,
+    env: &crate::invocation::InvocationEnv,
 ) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
@@ -1903,6 +1926,7 @@ fn run_cc_inner(
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
+        .with_invocation_env(env)
         .with_cache_cc_links(config.cache_cc_links)
         .with_base_dirs(config.base_dirs.clone());
     let trace_parse = crate::phase_trace::phase("cc_parse");
@@ -1910,7 +1934,7 @@ fn run_cc_inner(
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
     drop(trace_parse);
-    if crate::compiler::cc::cc_is_internal_key_probe() {
+    if crate::compiler::cc::cc_is_internal_key_probe_for(env) {
         let crate_name = parsed
             .sources
             .first()
@@ -1967,18 +1991,21 @@ fn run_cc_inner(
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = config
-        .project_rules
-        .user_bypass_reason(&crate_name, &parsed.rest)
+    if let Some(reason) =
+        config
+            .project_rules
+            .user_bypass_reason_for(&crate_name, &parsed.rest, env)
     {
         tracing::debug!("cc invocation bypassed by user rule: {reason}");
         return cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason);
     }
 
-    let current_dir = std::env::current_dir().ok();
+    let current_dir = env.cwd().map(Path::to_owned);
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
     if let Some(source) = parsed.sources.first()
-        && config.project_rules.source_excluded(source, &exclude_roots)
+        && config
+            .project_rules
+            .source_excluded_for(source, &exclude_roots, env)
     {
         tracing::debug!("cc source excluded from cache: {}", source.display());
         return cc_passthrough_with_event(
@@ -1994,7 +2021,7 @@ fn run_cc_inner(
 
     let trace_store_open = crate::phase_trace::phase("store_open");
     let (store, fallback_stores) =
-        match open_primary_and_fallback(config, &volume_route_path_cc(&parsed)) {
+        match open_primary_and_fallback_for(config, &volume_route_path_cc(&parsed), env) {
             Ok(pair) => {
                 drop(trace_store_open);
                 pair
@@ -2055,13 +2082,15 @@ fn run_cc_with_store(
     } = invocation;
     let start = *start;
     let invocation_start_ns = *invocation_start_ns;
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
+    let rebuilt_package = parsed.invocation_env.var("CARGO_PKG_NAME").ok();
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
     // fall back to passthrough, which runs the real compiler and
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
-    let mut file_hasher = store.file_hasher();
+    let mut file_hasher = store
+        .file_hasher()
+        .with_invocation_env(&parsed.invocation_env);
     // Flag inputs written since this invocation began. A deferred compile
     // fingerprints what it read afterwards and stores neither an entry nor
     // a memo once one is flagged. A key taken first is checked again once
@@ -2069,6 +2098,7 @@ fn run_cc_with_store(
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
+        invocation_env: &parsed.invocation_env,
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -2818,8 +2848,7 @@ fn cc_cache_entry_rejection_reason(
 }
 
 fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    cc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+    cc_depinfo_rewrite_root_from_cwd(parsed, parsed.invocation_env.cwd()?)
 }
 
 fn rustc_event_root(args: &RustcArgs) -> String {
@@ -2829,27 +2858,40 @@ fn rustc_event_root(args: &RustcArgs) -> String {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
     });
-    event_root_string(event_root_override().or_else(|| {
-        written_to
-            .as_deref()
-            .and_then(cargo_workspace_of)
-            .or_else(|| args.workspace_root())
-            .or_else(|| std::env::current_dir().ok())
-    }))
+    let env = args.invocation_env();
+    event_root_string_for(
+        event_root_override_for(env).or_else(|| {
+            written_to
+                .as_deref()
+                .and_then(|path| env.resolve(path))
+                .as_deref()
+                .and_then(cargo_workspace_of)
+                .or_else(|| args.workspace_root())
+                .or_else(|| env.cwd().map(Path::to_owned))
+        }),
+        env,
+    )
 }
 
 fn cc_event_root(parsed: &crate::compiler::cc::CcArgs) -> String {
-    cc_event_root_in(parsed, std::env::var_os("OUT_DIR"))
+    cc_event_root_in(parsed, parsed.invocation_env.var_os("OUT_DIR"))
 }
 
 fn cc_event_root_in(
     parsed: &crate::compiler::cc::CcArgs,
     out_dir: Option<std::ffi::OsString>,
 ) -> String {
-    event_root_string(
-        event_root_override()
-            .or_else(|| out_dir_workspace(out_dir))
-            .or_else(|| cc_depinfo_rewrite_root(parsed).or_else(|| std::env::current_dir().ok())),
+    let env = &parsed.invocation_env;
+    event_root_string_for(
+        event_root_override_for(env)
+            .or_else(|| {
+                out_dir
+                    .and_then(|dir| env.resolve(Path::new(&dir)))
+                    .as_deref()
+                    .and_then(cargo_workspace_of)
+            })
+            .or_else(|| cc_depinfo_rewrite_root(parsed).or_else(|| env.cwd().map(Path::to_owned))),
+        env,
     )
 }
 
@@ -2877,21 +2919,22 @@ fn out_dir_workspace(out_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
 }
 
 fn event_root_override() -> Option<PathBuf> {
-    std::env::var_os("KACHE_EVENT_ROOT")
+    event_root_override_for(&crate::invocation::InvocationEnv::capture())
+}
+
+fn event_root_override_for(env: &crate::invocation::InvocationEnv) -> Option<PathBuf> {
+    env.var_os("KACHE_EVENT_ROOT")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .and_then(|path| env.resolve(Path::new(&path)))
 }
 
 fn event_root_string(root: Option<PathBuf>) -> String {
-    let Some(root) = root else {
+    event_root_string_for(root, &crate::invocation::InvocationEnv::capture())
+}
+
+fn event_root_string_for(root: Option<PathBuf>, env: &crate::invocation::InvocationEnv) -> String {
+    let Some(abs) = root.and_then(|root| env.resolve(&root)) else {
         return String::new();
-    };
-    let abs = if root.is_absolute() {
-        root
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(root)
     };
     std::fs::canonicalize(&abs)
         .unwrap_or(abs)
@@ -3342,7 +3385,19 @@ fn cc_try_remote_hit(
 /// This is the hot path — called once per crate by cargo.
 /// Flow: parse args → compute cache key → check store → link on hit → compile on miss → store → link
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let _trace = crate::phase_trace::start("rustc", wrapper_args);
+    run_for(
+        config,
+        wrapper_args,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn run_for(
+    config: &Config,
+    wrapper_args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<i32> {
+    let _trace = crate::phase_trace::start_for("rustc", wrapper_args, env);
     let start = wrapper_entry();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
@@ -3358,7 +3413,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs
     // remains the canonical parsed shape; the trait gives us a stable contract
     // when adding gcc/clang.
-    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    let compiler = RustcCompiler::new_for(env).with_base_dirs(config.base_dirs.clone());
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
@@ -3366,8 +3421,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // drives the key and the final Cargo-facing dep-info, so a concurrent
     // config/glob change cannot make those two views disagree.
     let extra_inputs_key_start = std::time::Instant::now();
-    let mut extra_inputs_hasher =
-        crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    let mut extra_inputs_hasher = crate::cache_key::FileHasher::new()
+        .with_invocation_env(env)
+        .with_daemon(config.socket_path());
     if config.modified_input_guard {
         extra_inputs_hasher.arm_too_new_guard(invocation_start_ns, 0);
     }
@@ -3442,10 +3498,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 /// [`crate::build_script_inputs`]), judged before any route that can hand
 /// the compile to a fallback cache.
 fn build_script_declares_inputs(args: &RustcArgs) -> bool {
-    let cwd = std::env::current_dir().ok();
+    let cwd = args.invocation_env().cwd().map(Path::to_owned);
     crate::build_script_inputs::locate(
         args,
-        &|name: &str| std::env::var_os(name),
+        &|name: &str| args.invocation_env().var_os(name),
         cwd.as_deref(),
         crate::out_dir_alias::active_alias().is_some(),
     )
@@ -3468,7 +3524,9 @@ pub(crate) fn resolve_extra_inputs_for_passthrough(
     args: &RustcArgs,
 ) -> Result<Option<crate::extra_inputs::ExtraInputsSnapshot>> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    let hasher = crate::cache_key::FileHasher::new()
+        .with_invocation_env(args.invocation_env())
+        .with_daemon(config.socket_path());
     let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher)
         .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
     validate_extra_inputs_freshness_mode(args, snapshot.is_some())?;
@@ -3561,13 +3619,15 @@ fn resolve_build_script_inputs(
     let start = std::time::Instant::now();
     let Some(located) = crate::build_script_inputs::locate(
         args,
-        &|name: &str| std::env::var_os(name),
+        &|name: &str| args.invocation_env().var_os(name),
         cwd,
         crate::out_dir_alias::active_alias().is_some(),
     ) else {
         return Ok(BuildScriptInputs::default());
     };
-    let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    let mut file_hasher = store
+        .file_hasher_with_daemon(config.socket_path())
+        .with_invocation_env(args.invocation_env());
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let resolved = resolve_located_build_script_inputs(
         config,
@@ -3619,9 +3679,12 @@ fn resolve_located_build_script_inputs(
     let normalizer = std::cell::OnceCell::new();
     let outside = |path: &Path| {
         let normalizer = normalizer.get_or_init(|| {
-            crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-                .with_target_dir(args.target_dir().as_deref())
-                .with_base_dirs(&config.base_dirs)
+            crate::path_normalizer::PathNormalizer::from_invocation(
+                workspace_root,
+                args.invocation_env(),
+            )
+            .with_target_dir(args.target_dir().as_deref())
+            .with_base_dirs(&config.base_dirs)
         });
         crate::cache_key::source_path_identity(path, normalizer)
     };
@@ -3629,7 +3692,7 @@ fn resolve_located_build_script_inputs(
         located,
         &crate::build_script_inputs::Resolver {
             file_hasher,
-            var: &|name: &str| std::env::var_os(name),
+            var: &|name: &str| args.invocation_env().var_os(name),
             cache_dir: &config.cache_dir,
             excluded: &excluded,
             outside: &outside,
@@ -3653,7 +3716,9 @@ fn build_script_inputs_moved(
     };
     let _trace = crate::phase_trace::phase("build_script_inputs_verify");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    let file_hasher = store
+        .file_hasher_with_daemon(config.socket_path())
+        .with_invocation_env(args.invocation_env());
     match resolve_located_build_script_inputs(
         config,
         args,
@@ -3712,7 +3777,9 @@ fn extra_inputs_changed_during_compile(
     invocation_start_ns: i64,
 ) -> bool {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let mut hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    let mut hasher = crate::cache_key::FileHasher::new()
+        .with_invocation_env(args.invocation_env())
+        .with_daemon(config.socket_path());
     hasher.arm_too_new_guard(invocation_start_ns, 0);
     let after = match crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher) {
         Ok(snapshot) => snapshot,
@@ -3818,7 +3885,7 @@ fn run_parsed_rustc(
     let untrusted_codegen_backend =
         untrusted_codegen_backend(args.codegen_backend_dylib(), config.trust_codegen_backends);
     // The environment and working directory the key reads, taken once.
-    let key_env = KeyEnv::capture();
+    let key_env = KeyEnv::from_invocation(args.invocation_env());
     let current_dir = key_env.cwd().map(Path::to_path_buf);
     let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
@@ -3826,16 +3893,19 @@ fn run_parsed_rustc(
         .chain(current_dir.iter())
         .cloned()
         .collect();
-    let excluded_source = args
-        .source_file
-        .as_ref()
-        .filter(|source| config.project_rules.source_excluded(source, &exclude_roots));
+    let excluded_source = args.source_file.as_ref().filter(|source| {
+        config
+            .project_rules
+            .source_excluded_for(source, &exclude_roots, args.invocation_env())
+    });
     // User bypass rules (#222). Same fail-closed contract as `exclude`, and
     // gating the incremental fast path on it too: a bypassed unit must not
     // slip back into caching through the managed-incremental route.
-    let user_bypass = config
-        .project_rules
-        .user_bypass_reason(crate_name, &args.all_args);
+    let user_bypass = config.project_rules.user_bypass_reason_for(
+        crate_name,
+        &args.all_args,
+        args.invocation_env(),
+    );
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
@@ -3901,7 +3971,7 @@ fn run_parsed_rustc(
     let mut fallback_stores = Vec::new();
     let trace_store_open = crate::phase_trace::phase("store_open");
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
-        match open_primary_and_fallback(config, &rustc_route) {
+        match open_primary_and_fallback_for(config, &rustc_route, args.invocation_env()) {
             Ok((primary, fallbacks)) => {
                 fallback_stores = fallbacks;
                 Some(primary)
@@ -4242,7 +4312,7 @@ fn run_parsed_rustc(
         && let Err(e) = store.remember_target_root_built_by(
             &target_dir,
             workspace_root,
-            crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
+            crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).as_deref(),
         )
     {
         tracing::warn!(
@@ -6465,7 +6535,9 @@ fn compile_before_key(
     let emitted = args
         .dep_info_path()
         .zip(args.source_file.as_deref())
-        .map(|(path, source)| crate::cache_key::dep_info_from_emitted(&path, source));
+        .map(|(path, source)| {
+            crate::cache_key::dep_info_from_emitted_for(&path, source, args.invocation_env())
+        });
     let dep_info = match emitted {
         Some(Ok(dep_info)) => dep_info,
         other => {
@@ -6532,7 +6604,12 @@ fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
 /// reported that file complete.
 fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
     let path = args.dep_info_path()?;
-    crate::cache_key::dep_info_from_emitted(&path, args.source_file.as_deref()?).ok()
+    crate::cache_key::dep_info_from_emitted_for(
+        &path,
+        args.source_file.as_deref()?,
+        args.invocation_env(),
+    )
+    .ok()
 }
 
 /// Compile-before-key needs a miss the local store can prove, or a compile it
@@ -6602,7 +6679,9 @@ fn record_input_prediction(
     let Some(store) = store else {
         return;
     };
-    let file_hasher = store.file_hasher();
+    let file_hasher = store
+        .file_hasher()
+        .with_invocation_env(args.invocation_env());
     if !file_hasher.supports_input_predictions() {
         return;
     }
@@ -6621,7 +6700,8 @@ fn record_input_prediction(
         .as_ref()
         .filter(|guard| guard.held())
         .map(|guard| guard.digest.clone());
-    let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
+    let registry =
+        crate::cache_key::registry_src_of(&args.invocation_env().vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
     let workspace = crate::cache_key::workspace_record(args, dep_info, tree.as_deref());
@@ -6916,10 +6996,14 @@ fn compute_rustc_cache_key(
     if let KeyDiscovery::Emitted(dep_info, tree) = discovery {
         crate::cache_key::provide_dep_info(dep_info, tree);
     }
-    let emitted_sources = crate::cache_key::provided_dep_info_sources();
+    let emitted_sources = crate::cache_key::provided_dep_info_sources_for(args.invocation_env());
     let mut file_hasher = match store {
-        Some(store) => store.file_hasher_with_daemon(config.socket_path()),
-        None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
+        Some(store) => store
+            .file_hasher_with_daemon(config.socket_path())
+            .with_invocation_env(args.invocation_env()),
+        None => crate::cache_key::FileHasher::new()
+            .with_invocation_env(args.invocation_env())
+            .with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
     .with_prediction_flights(flight_dir)
@@ -6938,15 +7022,19 @@ fn compute_rustc_cache_key(
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
-    let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-        .with_target_dir(args.target_dir().as_deref())
-        .with_base_dirs(&config.base_dirs)
-        .with_path_only_env_vars(config.path_only_env_vars.clone())
-        .with_rust_src_rule(
-            crate::cache_key::get_rustc_sysroot(args).as_deref(),
-            crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
-        );
+    let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+        workspace_root,
+        args.invocation_env(),
+    )
+    .with_target_dir(args.target_dir().as_deref())
+    .with_base_dirs(&config.base_dirs)
+    .with_path_only_env_vars(config.path_only_env_vars.clone())
+    .with_rust_src_rule(
+        crate::cache_key::get_rustc_sysroot_for(args, args.invocation_env()).as_deref(),
+        crate::cache_key::get_rustc_commit_hash_for(&args.rustc, args.invocation_env()).as_deref(),
+    );
     let key_ctx = KeyCtx {
+        invocation_env: args.invocation_env(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -8056,10 +8144,10 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         )
     });
     let compile_start = std::time::Instant::now();
-    let mut compiler = RustcCompiler::new()
+    let mut compiler = RustcCompiler::new_for(args.invocation_env())
         .with_base_dirs(config.base_dirs.clone())
         .with_incremental_bootstrap(lease.worktree_bootstrap());
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
+    let rebuilt_package = args.invocation_env().var("CARGO_PKG_NAME").ok();
     // Only this attempt's dep-info may prove that source read our override.
     if lease.worktree_bootstrap() && !clear_incremental_bootstrap_dep_info(args) {
         if !lease.decline_worktree_bootstrap() {
@@ -8075,7 +8163,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             );
         }
         compiler_args = lease.compiler_args(args);
-        compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+        compiler = RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
     }
     let mut compile =
         if kind == crate::incremental_policy::LeaseKind::Immediate || lease.worktree_portable() {
@@ -8107,7 +8195,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             );
         }
         compiler_args = lease.compiler_args(args);
-        let native = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+        let native = RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
         compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
             native.execute_passthrough_preserving_incremental(args, &compiler_args)
         } else {
@@ -8333,7 +8421,7 @@ fn cc_compile_before_key(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     flight: Option<crate::store::StoreLock>,
 ) -> Result<i32> {
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
+    let rebuilt_package = invocation.parsed.invocation_env.var("CARGO_PKG_NAME").ok();
     let CcStoreInvocation {
         compiler,
         parsed,

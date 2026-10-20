@@ -1,5 +1,114 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn concurrent_clients_preprocess_and_compile_with_their_own_context() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let snapshot = |root: &Path, token: &str, epoch: &str| {
+        let root = root.canonicalize().unwrap();
+        for name in ["bin", "home", "tmp"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        fs::write(root.join("unit.c"), "int x;\n").unwrap();
+        kache_fs::testutil::write_executable(
+            &root.join("bin/client-cc"),
+            r#"#!/bin/sh
+mode=compile
+out=unit.o
+dep=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -E) mode=preprocess ;;
+        -o) out=$2; shift ;;
+        -MF) dep=$2; shift ;;
+    esac
+    shift
+done
+printf '%s\n' "$CLIENT_TOKEN" "$SOURCE_DATE_EPOCH" "$HOME" "$TMPDIR" "$PWD" > "$mode.context"
+if [ -n "$dep" ]; then
+    printf 'unit.o: unit.c\n' > "$dep"
+    printf '%s' "$dep" > "$mode.dep-location"
+fi
+if [ "$mode" = preprocess ]; then
+    test "$KACHE_CC_KEY_PROBE" = 1 || exit 7
+    printf 'int x = %s;\n' "$CLIENT_TOKEN"
+else
+    printf '%s:%s' "$CLIENT_TOKEN" "$SOURCE_DATE_EPOCH" > "$out"
+fi
+"#,
+        );
+        let home = root.join("home");
+        let temp = root.join("tmp");
+        InvocationEnv::from_parts(
+            [
+                ("PATH", "bin".into()),
+                ("CLIENT_TOKEN", token.into()),
+                ("SOURCE_DATE_EPOCH", epoch.into()),
+                ("HOME", home.as_os_str().to_owned()),
+                ("TMPDIR", temp.as_os_str().to_owned()),
+            ],
+            Some(root.to_path_buf()),
+            Some(home),
+            temp,
+        )
+    };
+    let first_env = snapshot(first.path(), "11", "13");
+    let second_env = snapshot(second.path(), "29", "31");
+    let compile = |env: &InvocationEnv| {
+        let compiler = CcCompiler::new().with_invocation_env(env);
+        let argv = s(&["client-cc", "-c", "unit.c", "-o", "unit.o"]);
+        let parsed = compiler.parse(&argv).unwrap();
+        assert_eq!(parsed.program, "client-cc");
+        assert_eq!(parsed.rest, argv[1..]);
+        assert_eq!(parsed.sources, vec![PathBuf::from("unit.c")]);
+        let maps = cc_prefix_maps(&parsed, &[]);
+        let expansion =
+            preprocess_hash(&parsed, &maps, &crate::cache_key::FileHasher::new(), true).unwrap();
+        let token = env.var("CLIENT_TOKEN").unwrap();
+        let epoch = env.var("SOURCE_DATE_EPOCH").unwrap();
+        assert_eq!(
+            expansion.hash,
+            blake3::hash(format!("int x = {token};\n").as_bytes())
+                .to_hex()
+                .to_string()
+        );
+        let root = env.cwd().unwrap();
+        let private_depfile = fs::read_to_string(root.join("preprocess.dep-location")).unwrap();
+        assert!(Path::new(&private_depfile).starts_with(env.temp_dir()));
+        let result = compiler.execute(&parsed).unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(
+            fs::read_to_string(root.join("unit.o")).unwrap(),
+            format!("{token}:{epoch}")
+        );
+        assert_eq!(result.artifacts.outputs().len(), 1);
+        assert_eq!(result.artifacts.outputs()[0].path, root.join("unit.o"));
+        let expected = format!(
+            "{token}\n{epoch}\n{}\n{}\n{}\n",
+            env.home_dir().unwrap().display(),
+            env.temp_dir().display(),
+            root.display()
+        );
+        for stage in ["preprocess", "compile"] {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("{stage}.context"))).unwrap(),
+                expected
+            );
+        }
+        expansion.hash
+    };
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| compile(&first_env));
+        let right = scope.spawn(|| compile(&second_env));
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    assert_ne!(
+        left, right,
+        "the expansion must depend on the requesting client's environment"
+    );
+}
+
 fn s(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| a.to_string()).collect()
 }
@@ -272,6 +381,7 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
             .cache_key(
                 &parse(flags),
                 &KeyCtx {
+                    invocation_env: &crate::invocation::InvocationEnv::capture(),
                     file_hasher: &file_hasher,
                     path_normalizer: &path_normalizer,
                     cache_dir: cache,
@@ -328,6 +438,7 @@ fn a_key_from_before_the_input_race_fixes_is_never_todays() {
         ])
         .unwrap();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &dir.path().join("cache"),
@@ -2785,6 +2896,7 @@ fn cache_key_for_link_changes_when_an_object_changes() {
     let file_hasher = crate::cache_key::FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: cache.path(),
@@ -3274,6 +3386,7 @@ fn wa_debug_prefix_map_changes_cache_key_issue_644() {
     let file_hasher = crate::cache_key::FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &cache,
@@ -3863,6 +3976,7 @@ fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
         let file_hasher = crate::cache_key::FileHasher::new();
         let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
         let ctx = KeyCtx {
+            invocation_env: &crate::invocation::InvocationEnv::capture(),
             file_hasher: &file_hasher,
             path_normalizer: &path_normalizer,
             cache_dir: cache.path(),
@@ -4555,15 +4669,17 @@ fn apply_cc_prefix_maps_to_bytes_skips_without_missing_a_prefix() {
 
 #[test]
 fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
-    let _lock = crate::test_support::process_state_test_lock();
     let compiler = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
         .into_owned();
     let parsed = CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
-    let key = || cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
-
-    let baseline = key();
+    let baseline = cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+    let key = |name: &str, value: &str| {
+        let mut invocation = parsed.clone();
+        invocation.invocation_env.set(name, value);
+        cc_preprocess_memo_key(&invocation, &[], "test compiler version").unwrap()
+    };
     for (name, value) in [
         ("_", "/usr/bin/whatever"),
         ("OLDPWD", "/somewhere/else"),
@@ -4584,14 +4700,11 @@ fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
         ("DEP_OPENSSL_INCLUDE", "/usr/include"),
         ("DEP_Z_INCLUDE", "/t/debug/build/libz-sys-1/out/include"),
     ] {
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe { std::env::set_var(name, value) };
         assert_eq!(
-            key(),
+            key(name, value),
             baseline,
             "{name} cannot change an expansion and must not change the memo key"
         );
-        unsafe { std::env::remove_var(name) };
     }
 
     for (name, value) in [
@@ -4602,10 +4715,7 @@ fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
         ("MY_SYSROOT", "/opt/sysroot"),
         ("CFLAGS", "-DEXTRA"),
     ] {
-        // SAFETY: as above.
-        unsafe { std::env::set_var(name, value) };
-        let changed = key();
-        unsafe { std::env::remove_var(name) };
+        let changed = key(name, value);
         assert_ne!(
             changed, baseline,
             "{name} can change which headers are found or how they expand and must be keyed"
@@ -6475,7 +6585,7 @@ fn execute_pins_source_date_epoch_on_real_compile() {
     let baked = fs::read_to_string(&obj).unwrap();
     // Robust against an ambient SOURCE_DATE_EPOCH in the test env: the child
     // must see exactly what the resolver computes (and never "UNSET").
-    let expected = effective_source_date_epoch()
+    let expected = effective_source_date_epoch_for(&parsed.invocation_env)
         .map(|v| v.to_string_lossy().into_owned())
         .unwrap_or_default();
     assert_eq!(
@@ -7584,16 +7694,19 @@ fn include_dir_digest_counts_an_empty_subdir_at_exact_cap() {
 
 #[test]
 fn include_dir_digest_ignores_empty_sdkroot() {
-    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
-    let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
-    unsafe { std::env::remove_var("SDKROOT") };
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(String, String)>(),
+        Some(temp.path().to_path_buf()),
+        None,
+        temp.path().to_path_buf(),
+    );
+    let mut parsed = CcArgs::parse_for(&s(&["cc", "-c", source.to_str().unwrap()]), &env).unwrap();
     let unset = digest_cc_include_dir_names(&parsed).unwrap();
-    unsafe { std::env::set_var("SDKROOT", "") };
+    parsed.invocation_env.set("SDKROOT", "");
     let empty = digest_cc_include_dir_names(&parsed).unwrap();
-    unsafe { std::env::remove_var("SDKROOT") };
     assert_eq!(
         unset, empty,
         "empty SDKROOT must not become an include root"
@@ -7776,6 +7889,7 @@ fn shadowing_header_changes_cc_cache_key() {
     let (file_hasher, cache) = include_dir_key_ctx(temp.path());
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &cache,
@@ -8566,7 +8680,6 @@ fn dependency_out_dir_maps_drop_the_metadata_hash() {
 /// two build directories share the memo, unmapped they do not.
 #[test]
 fn memo_key_maps_environment_values_like_arguments() {
-    let _lock = crate::test_support::process_state_test_lock();
     let compiler = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
@@ -8579,14 +8692,12 @@ fn memo_key_maps_environment_values_like_arguments() {
         }]
     };
     let key = |job: &str| {
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe {
-            std::env::set_var(
-                "CPATH",
-                format!("/work/{job}/target/debug/build/kt-sys-1/out/include"),
-            )
-        };
-        cc_preprocess_memo_key(&parsed, &maps_for(job), "test compiler version").unwrap()
+        let mut invocation = parsed.clone();
+        invocation.invocation_env.set(
+            "CPATH",
+            format!("/work/{job}/target/debug/build/kt-sys-1/out/include"),
+        );
+        cc_preprocess_memo_key(&invocation, &maps_for(job), "test compiler version").unwrap()
     };
     let a = key("job-a");
     let b = key("job-b");
@@ -8594,11 +8705,16 @@ fn memo_key_maps_environment_values_like_arguments() {
         a, b,
         "the mapped value is the same in both build directories"
     );
-    // SAFETY: as above.
-    unsafe { std::env::set_var("CPATH", "/elsewhere/include") };
-    let elsewhere =
-        cc_preprocess_memo_key(&parsed, &maps_for("job-a"), "test compiler version").unwrap();
-    unsafe { std::env::remove_var("CPATH") };
+    let mut elsewhere_invocation = parsed.clone();
+    elsewhere_invocation
+        .invocation_env
+        .set("CPATH", "/elsewhere/include");
+    let elsewhere = cc_preprocess_memo_key(
+        &elsewhere_invocation,
+        &maps_for("job-a"),
+        "test compiler version",
+    )
+    .unwrap();
     assert_ne!(
         elsewhere, a,
         "an include directory outside the maps still keys"
@@ -8610,29 +8726,21 @@ fn memo_key_maps_environment_values_like_arguments() {
 /// roots twice leaves one map per root.
 #[test]
 fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
-    let mut lock = crate::test_support::process_state_test_lock();
-    let dir = lock.enter();
-    let out = dir.as_path().join("target/debug/build/pkg-1/out");
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("target/debug/build/pkg-1/out");
     std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(dir.as_path().join("a.c"), "int a;\n").unwrap();
-    let parsed = CcArgs::parse(&s(&["cc", "-c", "a.c", "-o", "a.o"])).unwrap();
+    std::fs::write(dir.path().join("a.c"), "int a;\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        [
+            ("OUT_DIR", out.as_os_str().to_owned()),
+            ("SDKROOT", "".into()),
+        ],
+        Some(dir.path().to_path_buf()),
+        None,
+        dir.path().to_path_buf(),
+    );
+    let mut parsed = CcArgs::parse_for(&s(&["cc", "-c", "a.c", "-o", "a.o"]), &env).unwrap();
     let has = |maps: &[CcPrefixMap], to: &str| maps.iter().any(|m| m.to == to);
-    let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-        "OUT_DIR",
-        "SDKROOT",
-        "KACHE_CC_PATH_NORMALIZE",
-        "KACHE_BASE_DIR",
-    ]
-    .into_iter()
-    .map(|name| (name, std::env::var_os(name)))
-    .collect();
-    // SAFETY: the process-state lock serialises environment edits.
-    unsafe {
-        std::env::remove_var("KACHE_CC_PATH_NORMALIZE");
-        std::env::remove_var("KACHE_BASE_DIR");
-        std::env::set_var("OUT_DIR", &out);
-        std::env::set_var("SDKROOT", "");
-    }
     let maps = cc_prefix_maps(&parsed, &[]);
     assert!(has(&maps, CC_OUT_DIR_SENTINEL), "{maps:?}");
     assert!(has(&maps, CC_TARGET_SENTINEL), "{maps:?}");
@@ -8642,7 +8750,7 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     );
 
     let dep_include = dir
-        .as_path()
+        .path()
         .join("target/debug/build/libz-sys-0123456789abcdef/out/include");
     std::fs::create_dir_all(&dep_include).unwrap();
     for include_args in [
@@ -8663,10 +8771,10 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     let froms: std::collections::HashSet<&str> = maps.iter().map(|m| m.from.as_str()).collect();
     assert_eq!(froms.len(), maps.len(), "one map per root: {maps:?}");
 
-    unsafe { std::env::set_var("SDKROOT", dir.as_path().join("sdk")) };
+    parsed.invocation_env.set("SDKROOT", dir.path().join("sdk"));
     assert!(has(&cc_prefix_maps(&parsed, &[]), CC_SDKROOT_SENTINEL));
 
-    unsafe { std::env::set_var("OUT_DIR", "") };
+    parsed.invocation_env.set("OUT_DIR", "");
     let maps = cc_prefix_maps(&parsed, &[]);
     assert!(
         !has(&maps, CC_OUT_DIR_SENTINEL),
@@ -8674,19 +8782,17 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     );
     assert!(!has(&maps, CC_TARGET_SENTINEL));
 
-    unsafe {
-        std::env::set_var("OUT_DIR", &out);
-        std::env::set_var("KACHE_CC_PATH_NORMALIZE", "0");
-    }
+    parsed.invocation_env.set("OUT_DIR", out.as_os_str());
+    parsed.invocation_env.set("KACHE_CC_PATH_NORMALIZE", "0");
     assert!(
         cc_prefix_maps(&parsed, &[]).is_empty(),
         "no maps at all when normalization is off, OUT_DIR included"
     );
 
     let mut twice = Vec::new();
-    push_cargo_out_dir_maps(&mut twice, dir.as_path(), &out);
+    push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
     let once = twice.len();
-    push_cargo_out_dir_maps(&mut twice, dir.as_path(), &out);
+    push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
     assert_eq!(
         twice.len(),
         once,
@@ -8703,15 +8809,6 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
         (2..=4).contains(&once),
         "each root once per spelling, canonical or not: {twice:?}"
     );
-
-    unsafe {
-        for (name, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
 }
 
 /// The per-process memo of the prefix maps answers only for the same

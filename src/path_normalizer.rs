@@ -220,6 +220,16 @@ impl PathNormalizer {
     /// purely for relocate-style scenarios where build artifacts
     /// flow through tempdirs.
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
+        Self::from_invocation(workspace_root, &crate::invocation::InvocationEnv::capture())
+    }
+
+    /// Build rules from one compiler invocation, resolving relative roots
+    /// against its working directory rather than the serving process's.
+    pub(crate) fn from_invocation(
+        workspace_root: Option<&Path>,
+        env: &crate::invocation::InvocationEnv,
+    ) -> Self {
+        let resolve = |path: &Path| env.resolve(path).filter(|path| path.is_absolute());
         let mut rules = Vec::new();
         let mut source_restore_roots = Vec::new();
 
@@ -229,34 +239,40 @@ impl PathNormalizer {
         // checkout location. Covers paths the auto-derived rules below
         // can't see (container mounts, generated-file env-deps that point
         // outside the workspace, etc.).
-        let legacy_base_dir = std::env::var_os("KACHE_BASE_DIR");
+        let legacy_base_dir = env
+            .var_os("KACHE_BASE_DIR")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| resolve(Path::new(&value)));
         push_legacy_base_dir_rules(
             &mut rules,
             &mut source_restore_roots,
-            legacy_base_dir.as_deref(),
+            legacy_base_dir.as_deref().map(Path::as_os_str),
         );
 
-        if let Ok(current_dir) = std::env::current_dir() {
+        if let Some(current_dir) = env.cwd().filter(|path| path.is_absolute()) {
             push_path_rule_aliases(
                 &mut rules,
                 &mut source_restore_roots,
-                &current_dir,
+                current_dir,
                 "<WORKSPACE>",
                 "<CWD>",
             );
         }
 
-        if let Some(workspace_root) = workspace_root {
+        if let Some(workspace_root) = workspace_root.and_then(resolve) {
             push_path_rule_aliases(
                 &mut rules,
                 &mut source_restore_roots,
-                workspace_root,
+                &workspace_root,
                 "<WORKSPACE>",
                 "<WORKSPACE>",
             );
         }
 
-        if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        if let Some(target_dir) = env
+            .var_os("CARGO_TARGET_DIR")
+            .and_then(|value| resolve(Path::new(&value)))
+        {
             push_path_rule_aliases(
                 &mut rules,
                 &mut source_restore_roots,
@@ -268,9 +284,11 @@ impl PathNormalizer {
 
         // CARGO_HOME defaults to $HOME/.cargo if not set; honor that
         // so users with the default layout still get the substitution.
-        let cargo_home = std::env::var_os("CARGO_HOME")
+        let cargo_home = env
+            .var_os("CARGO_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")));
+            .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
+            .and_then(|path| resolve(&path));
         push_rule_with_variants(
             &mut rules,
             cargo_home.and_then(|p| canonical_string(&p)),
@@ -281,9 +299,11 @@ impl PathNormalizer {
         // appear in -L flags and toolchain refs — without this rule,
         // Dev A's `~alice/.rustup` and Dev B's `~bob/.rustup` would
         // produce different keys for byte-identical sources.
-        let rustup_home = std::env::var_os("RUSTUP_HOME")
+        let rustup_home = env
+            .var_os("RUSTUP_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".rustup")));
+            .or_else(|| env.home_dir().map(|home| home.join(".rustup")))
+            .and_then(|path| resolve(&path));
         push_rule_with_variants(
             &mut rules,
             rustup_home.and_then(|p| canonical_string(&p)),
@@ -292,7 +312,9 @@ impl PathNormalizer {
 
         push_rule_with_variants(
             &mut rules,
-            dirs::home_dir().and_then(|p| canonical_string(&p)),
+            env.home_dir()
+                .and_then(resolve)
+                .and_then(|path| canonical_string(&path)),
             "<HOME>",
         );
 
@@ -310,7 +332,9 @@ impl PathNormalizer {
         ] {
             push_rule_with_variants(
                 &mut rules,
-                std::env::var_os(env_key).and_then(|v| canonical_string(Path::new(&v))),
+                env.var_os(env_key)
+                    .and_then(|value| resolve(Path::new(&value)))
+                    .and_then(|path| canonical_string(&path)),
                 sentinel,
             );
         }
@@ -321,7 +345,7 @@ impl PathNormalizer {
         // for intermediate output.
         push_rule_with_variants(
             &mut rules,
-            canonical_string(&std::env::temp_dir()),
+            resolve(env.temp_dir()).and_then(|path| canonical_string(&path)),
             "<TMPDIR>",
         );
 
@@ -1146,8 +1170,8 @@ fn workspace_flag_target() -> &'static str {
 /// `cache_key::fold_unremapped_path_identity` — so opt-out artifacts don't
 /// leak across checkouts either.) Normalization stays ON by default: ordinary
 /// builds remain portable (kunobi-ninja/kache#480).
-pub fn rustc_path_normalize_enabled() -> bool {
-    parse_rustc_normalize_toggle(std::env::var("KACHE_RUSTC_PATH_NORMALIZE").ok().as_deref())
+pub(crate) fn rustc_path_normalize_enabled_for(env: &crate::invocation::InvocationEnv) -> bool {
+    parse_rustc_normalize_toggle(env.var("KACHE_RUSTC_PATH_NORMALIZE").ok().as_deref())
 }
 
 /// Pure parse of the `KACHE_RUSTC_PATH_NORMALIZE` value (env read separately so
@@ -1629,6 +1653,138 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn concurrent_invocation_normalizers_use_each_clients_paths() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let make_env = |dir: &Path| {
+            let root = PathBuf::from(canonical_string(dir).unwrap());
+            for name in [
+                "project",
+                "workspace",
+                "home",
+                "cargo",
+                "rustup",
+                "target",
+                "base",
+                "tmp",
+            ] {
+                fs::create_dir(root.join(name)).unwrap();
+            }
+            let home = root.join("home");
+            let temp = root.join("tmp");
+            crate::invocation::InvocationEnv::from_parts(
+                [
+                    ("HOME", home.as_os_str().to_owned()),
+                    ("CARGO_HOME", "../cargo".into()),
+                    ("RUSTUP_HOME", "../rustup".into()),
+                    ("CARGO_TARGET_DIR", "../target".into()),
+                    ("KACHE_BASE_DIR", "../base".into()),
+                    ("TMPDIR", temp.as_os_str().to_owned()),
+                ],
+                Some(root.join("project")),
+                Some(home),
+                temp,
+            )
+        };
+        let first_env = make_env(first.path());
+        let second_env = make_env(second.path());
+        let normalize = |env: &crate::invocation::InvocationEnv| {
+            let normalizer = PathNormalizer::from_invocation(Some(Path::new("../workspace")), env);
+            let cwd = env.cwd().unwrap();
+            let root = cwd.parent().unwrap();
+            let source = cwd.join("source.rs");
+            assert_eq!(
+                normalizer.source_path_identity(&source),
+                Some(b"<CWD>/source.rs".to_vec())
+            );
+            for (name, sentinel) in [
+                ("project", "<WORKSPACE>"),
+                ("workspace", "<WORKSPACE>"),
+                ("home", "<HOME>"),
+                ("cargo", "<CARGO_HOME>"),
+                ("rustup", "<RUSTUP_HOME>"),
+                ("target", "<TARGET>"),
+                ("base", "<BASE_DIR>"),
+                ("tmp", "<TMPDIR>"),
+            ] {
+                let path = root.join(name);
+                assert_eq!(normalizer.normalize(path.to_str().unwrap()), sentinel);
+                assert!(
+                    normalizer
+                        .depinfo_source_roots()
+                        .iter()
+                        .any(|owner| owner.root == path)
+                );
+            }
+            normalizer.normalize(source.to_str().unwrap())
+        };
+        let (first_key, second_key) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| normalize(&first_env));
+            let second = scope.spawn(|| normalize(&second_env));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(first_key, second_key);
+        assert_eq!(
+            first_key,
+            format!("<WORKSPACE>{}source.rs", std::path::MAIN_SEPARATOR)
+        );
+    }
+
+    #[test]
+    fn invocation_normalizer_uses_snapshot_home_defaults() {
+        let dir = TempDir::new().unwrap();
+        let home = PathBuf::from(canonical_string(dir.path()).unwrap());
+        fs::create_dir(home.join(".cargo")).unwrap();
+        fs::create_dir(home.join(".rustup")).unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            std::iter::empty::<(String, String)>(),
+            None,
+            Some(home.clone()),
+            home.join("missing-temp"),
+        );
+        let normalizer = PathNormalizer::from_invocation(None, &env);
+        for (name, sentinel) in [(".cargo", "<CARGO_HOME>"), (".rustup", "<RUSTUP_HOME>")] {
+            assert_eq!(
+                normalizer.normalize(home.join(name).to_str().unwrap()),
+                sentinel
+            );
+        }
+    }
+
+    #[test]
+    fn relative_invocation_roots_without_cwd_do_not_use_daemon_cwd() {
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [
+                ("KACHE_BASE_DIR", "."),
+                ("CARGO_HOME", "."),
+                ("RUSTUP_HOME", "."),
+                ("CARGO_TARGET_DIR", "."),
+                ("APPDATA", "."),
+            ],
+            None,
+            Some(".".into()),
+            ".".into(),
+        );
+        let normalizer = PathNormalizer::from_invocation(Some(Path::new(".")), &env);
+        assert!(normalizer.rules.is_empty());
+        assert!(normalizer.depinfo_source_roots().is_empty());
+    }
+
+    #[test]
+    fn rustc_path_normalize_toggle_is_invocation_local() {
+        let snapshot = |value| {
+            crate::invocation::InvocationEnv::from_parts(
+                [("KACHE_RUSTC_PATH_NORMALIZE", value)],
+                None,
+                None,
+                PathBuf::new(),
+            )
+        };
+        assert!(!rustc_path_normalize_enabled_for(&snapshot("off")));
+        assert!(rustc_path_normalize_enabled_for(&snapshot("on")));
+    }
 
     /// The `KACHE_RUSTC_PATH_NORMALIZE` opt-out mirrors the cc toggle
     /// (`KACHE_CC_PATH_NORMALIZE`): normalization is the default, and only an

@@ -68,10 +68,6 @@ fn is_trusted_gitlab_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
 /// Whether this process is a pull request job: a GitHub `pull_request` event
 /// or a GitLab merge request pipeline. `pull_request_target` is not one: it
 /// runs the base branch's workflow with its secrets, so it stays read-only.
-pub(crate) fn pull_request_job() -> bool {
-    pull_request_job_with(|name| std::env::var(name).ok())
-}
-
 pub(crate) fn pull_request_job_with(get_env: impl Fn(&str) -> Option<String>) -> bool {
     if env_truthy(get_env("GITHUB_ACTIONS")) {
         return get_env("GITHUB_EVENT_NAME").as_deref() == Some("pull_request");

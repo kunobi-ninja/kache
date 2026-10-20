@@ -31,6 +31,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::invocation::InvocationEnv;
 use crate::probe_memo::{self, Material};
 use kache_store::file_hash::hash_file;
 
@@ -87,30 +88,46 @@ pub(crate) fn probe_linux_crt_objects(
 /// added to or removed from any of them changes that stamp, so a name that
 /// would now place differently is probed again. Content is still hashed
 /// through `hash` on every call, as before.
+#[cfg(test)]
 pub(crate) fn probe_linux_crt_objects_memoized(
     memo_dir: &Path,
     driver: &Path,
     hash: impl Fn(&Path) -> Result<String>,
 ) -> Result<BTreeMap<String, String>> {
+    probe_linux_crt_objects_memoized_for(memo_dir, driver, hash, &InvocationEnv::capture())
+}
+
+pub(crate) fn probe_linux_crt_objects_memoized_for(
+    memo_dir: &Path,
+    driver: &Path,
+    hash: impl Fn(&Path) -> Result<String>,
+    env: &InvocationEnv,
+) -> Result<BTreeMap<String, String>> {
     let _trace = crate::phase_trace::phase("native_crt");
-    let placements = match crt_placement_memo(memo_dir, driver) {
+    let driver = env
+        .resolve_program(driver)
+        .context("resolving native linker driver")?;
+    let memo_dir = env
+        .resolve(memo_dir)
+        .context("resolving CRT memo directory")?;
+    let placements = match crt_placement_memo_for(&memo_dir, &driver, env) {
         Some(placed) => placed,
         None => {
-            let placed = place_linux_crt_objects(driver);
-            record_crt_placement_memo(memo_dir, driver, &placed);
+            let placed = place_linux_crt_objects(&driver, env);
+            record_crt_placement_memo(&memo_dir, &driver, &placed, env);
             placed
         }
     };
     probe_files_with_hash(LINUX_PROBES, |name| placements.get(name).cloned(), hash)
 }
 
-fn place_linux_crt_objects(driver: &Path) -> BTreeMap<String, PathBuf> {
+fn place_linux_crt_objects(driver: &Path, env: &InvocationEnv) -> BTreeMap<String, PathBuf> {
     LINUX_PROBES
         .startup
         .iter()
         .chain(LINUX_PROBES.libc)
         .chain(LINUX_PROBES.rest)
-        .filter_map(|name| Some((name.to_string(), print_file_name(driver, name)?)))
+        .filter_map(|name| Some((name.to_string(), print_file_name_for(driver, name, env)?)))
         .collect()
 }
 
@@ -127,10 +144,10 @@ struct CrtPlacementMemo {
 /// Variables that change where a GCC or Clang driver looks for files.
 const CRT_SEARCH_ENV: &[&str] = &["LIBRARY_PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH"];
 
-fn crt_memo_material(driver: &Path) -> Option<(PathBuf, String)> {
+fn crt_memo_material(driver: &Path, env: &InvocationEnv) -> Option<(PathBuf, String)> {
     let canonical = std::fs::canonicalize(driver).ok()?;
     let metadata = std::fs::metadata(&canonical).ok()?;
-    let mut material = Material::new("linux-crt-placements-v1");
+    let mut material = Material::new("linux-crt-placements-v2");
     // Both spellings: a driver that dispatches on its own name (`ccache`,
     // `clang` via `aarch64-linux-gnu-clang`) canonicalizes to one binary and
     // places differently under each name.
@@ -141,11 +158,14 @@ fn crt_memo_material(driver: &Path) -> Option<(PathBuf, String)> {
     for name in CRT_SEARCH_ENV {
         material.push(name.as_bytes());
         material.push(
-            &std::env::var_os(name)
+            &env.var_os(name)
                 .map(|value| value.as_encoded_bytes().to_vec())
                 .unwrap_or_default(),
         );
     }
+    // Relative search paths are interpreted in the requesting client's cwd.
+    material.push(env.cwd()?.as_os_str().as_encoded_bytes());
+    material.push(env.var_os("PATH").unwrap_or_default().as_encoded_bytes());
     Some((canonical, material.digest()))
 }
 
@@ -158,8 +178,17 @@ fn directory_stamp(directory: &Path) -> Option<String> {
     ))
 }
 
+#[cfg(all(test, unix))]
 fn crt_placement_memo(memo_dir: &Path, driver: &Path) -> Option<BTreeMap<String, PathBuf>> {
-    let (_, digest) = crt_memo_material(driver)?;
+    crt_placement_memo_for(memo_dir, driver, &InvocationEnv::capture())
+}
+
+fn crt_placement_memo_for(
+    memo_dir: &Path,
+    driver: &Path,
+    env: &InvocationEnv,
+) -> Option<BTreeMap<String, PathBuf>> {
+    let (_, digest) = crt_memo_material(driver, env)?;
     let path = probe_memo::memo_path(memo_dir, "crt-placements", "json", &digest);
     let body = probe_memo::read_verified(&path, &digest)?;
     let memo: CrtPlacementMemo = serde_json::from_str(&body).ok()?;
@@ -177,11 +206,16 @@ fn crt_placement_memo(memo_dir: &Path, driver: &Path) -> Option<BTreeMap<String,
         .then_some(memo.placed)
 }
 
-fn record_crt_placement_memo(memo_dir: &Path, driver: &Path, placed: &BTreeMap<String, PathBuf>) {
-    let Some((canonical, digest)) = crt_memo_material(driver) else {
+fn record_crt_placement_memo(
+    memo_dir: &Path,
+    driver: &Path,
+    placed: &BTreeMap<String, PathBuf>,
+    env: &InvocationEnv,
+) {
+    let Some((canonical, digest)) = crt_memo_material(driver, env) else {
         return;
     };
-    let mut directories: Vec<PathBuf> = driver_library_search_dirs(&canonical);
+    let mut directories: Vec<PathBuf> = driver_library_search_dirs_for(&canonical, env);
     directories.extend(
         placed
             .values()
@@ -213,8 +247,16 @@ fn record_crt_placement_memo(memo_dir: &Path, driver: &Path, placed: &BTreeMap<S
 }
 
 /// The `libraries:` line of `cc -print-search-dirs`, as directories that exist.
+#[cfg(all(test, unix))]
 fn driver_library_search_dirs(driver: &Path) -> Vec<PathBuf> {
-    let output = match Command::new(driver)
+    driver_library_search_dirs_for(driver, &InvocationEnv::capture())
+}
+
+fn driver_library_search_dirs_for(driver: &Path, env: &InvocationEnv) -> Vec<PathBuf> {
+    let Ok(mut command) = env.command(driver) else {
+        return Vec::new();
+    };
+    let output = match command
         .arg("-print-search-dirs")
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -290,9 +332,16 @@ fn probe_files_with_hash(
     Ok(resolved)
 }
 
+#[cfg(all(test, unix))]
 fn print_file_name(driver: &Path, name: &str) -> Option<PathBuf> {
+    print_file_name_for(driver, name, &InvocationEnv::capture())
+}
+
+fn print_file_name_for(driver: &Path, name: &str, env: &InvocationEnv) -> Option<PathBuf> {
     let _trace = crate::phase_trace::phase("native_crt_resolve");
-    let output = Command::new(driver)
+    let output = env
+        .command(driver)
+        .ok()?
         .arg(format!("-print-file-name={name}"))
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -324,23 +373,33 @@ fn print_file_name(driver: &Path, name: &str) -> Option<PathBuf> {
 /// only accepts a name such as `macosx`. When `xcrun` rejects a path that is
 /// still a real SDK directory, read the same version and build from
 /// `SystemVersion.plist` inside that root.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
+    sdk_identity_for_invocation(root, &InvocationEnv::capture())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn sdk_identity_for_invocation(
+    root: Option<String>,
+    env: &InvocationEnv,
+) -> Result<Option<String>> {
     let sdk = root.as_deref().unwrap_or("macosx");
-    if let Some(identity) = xcrun_identity(sdk) {
+    if let Some(identity) = xcrun_identity(sdk, env) {
         return Ok(Some(identity));
     }
-    let path = Path::new(sdk);
+    let path = env
+        .resolve(Path::new(sdk))
+        .context("resolving selected SDK root")?;
     if path.is_dir() {
-        return identity_from_sdk_root(path).map(Some);
+        return identity_from_sdk_root(&path).map(Some);
     }
     bail!("xcrun --show-sdk-version failed");
 }
 
 #[cfg(target_os = "macos")]
-fn xcrun_identity(sdk: &str) -> Option<String> {
-    let version = xcrun(&["--sdk", sdk, "--show-sdk-version"])?;
-    let build = xcrun(&["--sdk", sdk, "--show-sdk-build-version"])?;
+fn xcrun_identity(sdk: &str, env: &InvocationEnv) -> Option<String> {
+    let version = xcrun(&["--sdk", sdk, "--show-sdk-version"], env)?;
+    let build = xcrun(&["--sdk", sdk, "--show-sdk-build-version"], env)?;
     Some(format!("{version} ({build})"))
 }
 
@@ -384,14 +443,22 @@ fn plist_string(body: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
+    sdk_identity_for_invocation(root, &InvocationEnv::capture())
+}
+
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn sdk_identity_for(_root: Option<String>) -> Result<Option<String>> {
+pub(crate) fn sdk_identity_for_invocation(
+    _root: Option<String>,
+    _env: &InvocationEnv,
+) -> Result<Option<String>> {
     Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn xcrun(arguments: &[&str]) -> Option<String> {
-    let output = Command::new("xcrun").args(arguments).output().ok()?;
+fn xcrun(arguments: &[&str], env: &InvocationEnv) -> Option<String> {
+    let output = env.command("xcrun").ok()?.args(arguments).output().ok()?;
     output
         .status
         .success()
@@ -497,18 +564,78 @@ fn collect_unicode_environment(
 }
 
 impl WindowsProbeEnvironment {
+    #[cfg(test)]
     pub(crate) fn current() -> Result<Self> {
-        let variables = collect_unicode_environment(std::env::vars_os())?;
-        let path = std::env::var_os("PATH")
+        Self::from_invocation(&InvocationEnv::capture())
+    }
+
+    pub(crate) fn from_invocation(env: &InvocationEnv) -> Result<Self> {
+        let variables = collect_unicode_environment(env.vars_os())?;
+        let path = env
+            .var_os("PATH")
             .map(|value| std::env::split_paths(&value).collect())
             .unwrap_or_default();
-        let cwd = std::env::current_dir().ok();
+        let cwd = env.cwd().map(Path::to_path_buf);
         Ok(Self {
             variables,
             path,
             cwd,
             ..Self::default()
         })
+    }
+
+    fn root_invocation_paths(&mut self, env: &InvocationEnv) -> Result<()> {
+        self.path = self
+            .path
+            .iter()
+            .map(|path| {
+                env.resolve(path)
+                    .context("resolving Windows tool search directory")
+            })
+            .collect::<Result<_>>()?;
+        for name in [
+            "VCToolsInstallDir",
+            "WindowsSdkDir",
+            "UniversalCRTSdkDir",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+        ] {
+            if let Some(value) = self.var(name) {
+                let rooted = env
+                    .resolve(Path::new(value))
+                    .context("resolving Windows toolchain root")?;
+                self.variables
+                    .retain(|key, _| !key.eq_ignore_ascii_case(name));
+                self.variables.insert(
+                    name.to_string(),
+                    rooted
+                        .to_str()
+                        .context("Windows toolchain root is not Unicode")?
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(value) = self.var("LIB") {
+            let dirs = value
+                .split(';')
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    env.resolve(Path::new(value))
+                        .context("resolving Windows LIB directory")
+                        .and_then(|path| {
+                            path.to_str()
+                                .map(str::to_string)
+                                .context("Windows LIB directory is not Unicode")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.variables
+                .retain(|key, _| !key.eq_ignore_ascii_case("LIB"));
+            self.variables.insert("LIB".to_string(), dirs.join(";"));
+        }
+        Ok(())
     }
 
     fn var(&self, name: &str) -> Option<&str> {
@@ -573,10 +700,29 @@ impl WindowsProbeEnvironment {
     /// toolset default file, SDK registry roots, per-version eligibility),
     /// so a memo keyed on anything less would serve a stale selection.
     #[cfg(windows)]
-    fn augment_from_installed_msvc(&mut self, architecture: &str) -> Result<()> {
+    fn augment_from_installed_msvc(
+        &mut self,
+        architecture: &str,
+        env: &InvocationEnv,
+    ) -> Result<()> {
         self.validate_discovery_probe()?;
-        let linker = find_msvc_tools::find_tool(architecture, "link.exe");
-        let compiler = find_msvc_tools::find_tool(architecture, "cl.exe");
+        // find-msvc-tools' architecture fallback spawns cl.exe with inherited
+        // process state. Supply the result of our own isolated banner probe.
+        let needs_architecture = self.var("VSCMD_ARG_TGT_ARCH").is_none()
+            && (self.contains_var("VCINSTALLDIR")
+                || self.contains_var("VSTEL_MSBuildProjectFullPath"));
+        if needs_architecture && let Some(compiler) = path_lookup(self, "cl.exe") {
+            let banner = run_windows_tool_for(WindowsTool::Cl, &compiler, &[], env)?;
+            let selected = banner
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .filter_map(architecture_alias)
+                .next()
+                .context("cl.exe banner does not identify its target architecture")?;
+            self.set_var("VSCMD_ARG_TGT_ARCH", selected);
+        }
+        let getter = MsvcSnapshotGetter(self);
+        let linker = find_msvc_tools::find_tool_with_env(architecture, "link.exe", &getter);
+        let compiler = find_msvc_tools::find_tool_with_env(architecture, "cl.exe", &getter);
 
         // rustc applies the environment returned for link.exe, including for
         // an explicit MSVC linker. A separately discovered cl.exe environment
@@ -615,7 +761,11 @@ impl WindowsProbeEnvironment {
     }
 
     #[cfg(not(windows))]
-    fn augment_from_installed_msvc(&mut self, _architecture: &str) -> Result<()> {
+    fn augment_from_installed_msvc(
+        &mut self,
+        _architecture: &str,
+        _env: &InvocationEnv,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -625,6 +775,27 @@ impl WindowsProbeEnvironment {
             WindowsTool::Cl if self.compiler.as_deref() == Some(path) => &self.compiler_command_env,
             WindowsTool::Cl => &[],
         }
+    }
+}
+
+#[cfg(windows)]
+struct MsvcSnapshotGetter<'a>(&'a WindowsProbeEnvironment);
+
+#[cfg(windows)]
+impl find_msvc_tools::EnvGetter for MsvcSnapshotGetter<'_> {
+    fn get_env(&self, name: &'static str) -> Option<find_msvc_tools::Env> {
+        let value = if name.eq_ignore_ascii_case("PATH") {
+            std::env::join_paths(&self.0.path).ok()?
+        } else {
+            self.0
+                .variables
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))?
+                .1
+                .as_str()
+                .into()
+        };
+        Some(find_msvc_tools::Env::Owned(value))
     }
 }
 
@@ -1064,11 +1235,22 @@ fn validate_tool_banner(tool: WindowsTool, output: &str) -> Result<String> {
         .with_context(|| format!("{} returned an unrecognized version banner", tool.name()))
 }
 
+#[cfg(test)]
 fn windows_tool_command(
     tool: WindowsTool,
     path: &Path,
     environment: &[(OsString, OsString)],
 ) -> Command {
+    windows_tool_command_for(tool, path, environment, &InvocationEnv::capture())
+        .expect("test tool command has a working directory")
+}
+
+fn windows_tool_command_for(
+    tool: WindowsTool,
+    path: &Path,
+    environment: &[(OsString, OsString)],
+    env: &InvocationEnv,
+) -> Result<Command> {
     let arguments: &[&str] = match tool {
         // Without a flavor, `rust-lld` refuses to run and names the
         // flavored drivers instead.
@@ -1077,7 +1259,7 @@ fn windows_tool_command(
         WindowsTool::Link => &["/?"],
         WindowsTool::Cl => &["/Bv"],
     };
-    let mut command = Command::new(path);
+    let mut command = env.command(path)?;
     command
         .args(arguments)
         .envs(environment.iter().cloned())
@@ -1087,7 +1269,7 @@ fn windows_tool_command(
         .env_remove("_LINK_")
         .env("LC_ALL", "C")
         .env("LANG", "C");
-    command
+    Ok(command)
 }
 
 /// Run a tool for its banner, served from the on-disk memo when the same
@@ -1106,33 +1288,41 @@ fn windows_tool_command(
 /// for a launcher whose target lives in a sidecar file: package managers
 /// install `lld-link.exe` exactly that way (a scoop shim keeps its bytes
 /// across `scoop update llvm`), so `lld-link` is always probed fresh.
-fn run_windows_tool(
+fn run_windows_tool_for(
     tool: WindowsTool,
     path: &Path,
     environment: &[(OsString, OsString)],
+    env: &InvocationEnv,
 ) -> Result<String> {
-    run_windows_tool_in(
-        Some(&crate::config::default_cache_dir()),
-        tool,
-        path,
-        environment,
-    )
+    let memo = crate::config::probe_memo_dir_for(env).ok();
+    run_windows_tool_in_for(memo.as_deref(), tool, path, environment, env)
 }
 
-/// [`run_windows_tool`] with the memo directory chosen by the caller;
+/// [`run_windows_tool_for`] with the memo directory chosen by the caller;
 /// `None` never memoises.
+#[cfg(test)]
 fn run_windows_tool_in(
     memo_dir: Option<&Path>,
     tool: WindowsTool,
     path: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<String> {
+    run_windows_tool_in_for(memo_dir, tool, path, environment, &InvocationEnv::capture())
+}
+
+fn run_windows_tool_in_for(
+    memo_dir: Option<&Path>,
+    tool: WindowsTool,
+    path: &Path,
+    environment: &[(OsString, OsString)],
+    env: &InvocationEnv,
+) -> Result<String> {
     let before = (memo_dir.is_some() && memoises_banner(tool))
         .then(|| probe_memo::file_digest(path))
         .flatten();
     let memo = memo_dir
         .zip(before.as_deref())
-        .map(|(dir, digest)| banner_memo(dir, tool, path, digest, environment));
+        .map(|(dir, digest)| banner_memo_for(dir, tool, path, digest, environment, env));
     if let Some(banner) = memo
         .as_ref()
         .and_then(|(memo_path, key)| probe_memo::read_verified(memo_path, key))
@@ -1140,7 +1330,7 @@ fn run_windows_tool_in(
     {
         return Ok(banner);
     }
-    let output = windows_tool_command(tool, path, environment)
+    let output = windows_tool_command_for(tool, path, environment, env)?
         .output()
         .with_context(|| format!("running {} at {}", tool.name(), path.display()))?;
     let text = format!(
@@ -1158,13 +1348,14 @@ fn run_windows_tool_in(
 }
 
 /// Whether a tool's banner may be served from the memo; see
-/// [`run_windows_tool`].
+/// [`run_windows_tool_for`].
 fn memoises_banner(tool: WindowsTool) -> bool {
     matches!(tool, WindowsTool::Link | WindowsTool::Cl)
 }
 
 /// `<memo_dir>/msvc-banner-<digest>.txt` plus the full key digest for one
 /// tool's bytes under one command environment.
+#[cfg(test)]
 fn banner_memo(
     memo_dir: &Path,
     tool: WindowsTool,
@@ -1172,7 +1363,25 @@ fn banner_memo(
     file_digest: &str,
     environment: &[(OsString, OsString)],
 ) -> (PathBuf, String) {
-    let key = banner_memo_key(tool, path, file_digest, environment);
+    banner_memo_for(
+        memo_dir,
+        tool,
+        path,
+        file_digest,
+        environment,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn banner_memo_for(
+    memo_dir: &Path,
+    tool: WindowsTool,
+    path: &Path,
+    file_digest: &str,
+    environment: &[(OsString, OsString)],
+    env: &InvocationEnv,
+) -> (PathBuf, String) {
+    let key = banner_memo_key_for(tool, path, file_digest, environment, env);
     (
         probe_memo::memo_path(memo_dir, "msvc-banner", "txt", &key),
         key,
@@ -1183,11 +1392,28 @@ fn banner_memo(
 /// live, the environment the tool runs under, and the two inherited
 /// variables that change a banner: `PATH` (which DLLs load) and `VSLANG`
 /// (which language the banner prints in).
+#[cfg(test)]
 fn banner_memo_key(
     tool: WindowsTool,
     path: &Path,
     file_digest: &str,
     environment: &[(OsString, OsString)],
+) -> String {
+    banner_memo_key_for(
+        tool,
+        path,
+        file_digest,
+        environment,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn banner_memo_key_for(
+    tool: WindowsTool,
+    path: &Path,
+    file_digest: &str,
+    environment: &[(OsString, OsString)],
+    env: &InvocationEnv,
 ) -> String {
     let mut material = Material::new("msvc-banner.v1");
     material
@@ -1200,12 +1426,14 @@ fn banner_memo_key(
             .push(value.as_encoded_bytes());
     }
     for inherited in ["PATH", "VSLANG"] {
-        material.push(
-            std::env::var_os(inherited)
-                .unwrap_or_default()
-                .as_encoded_bytes(),
-        );
+        material.push(env.var_os(inherited).unwrap_or_default().as_encoded_bytes());
     }
+    material.push(
+        env.cwd()
+            .map(Path::as_os_str)
+            .unwrap_or_default()
+            .as_encoded_bytes(),
+    );
     material.digest()
 }
 
@@ -1315,6 +1543,18 @@ fn windows_library_dirs(
     ucrt_version: &str,
     linker_dirs: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
+    let cwd = environment
+        .cwd
+        .as_deref()
+        .context("current directory is unavailable for native link")?;
+    let rooted = |path: &Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+    };
+    let linker_dirs: Vec<_> = linker_dirs.iter().map(|path| rooted(path)).collect();
     if linker_dirs.iter().any(|path| !path.is_dir()) {
         bail!("a rustc/linker library search directory is unreadable");
     }
@@ -1323,7 +1563,7 @@ fn windows_library_dirs(
         .into_iter()
         .flat_map(|lib| lib.split(';'))
         .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
+        .map(|value| rooted(Path::new(value)))
         .collect::<Vec<_>>();
     if explicit.iter().any(|path| !path.is_dir()) {
         bail!("LIB contains an unreadable directory for MSVC {architecture}");
@@ -1341,14 +1581,14 @@ fn windows_library_dirs(
     dirs.extend(linker_dirs.iter().cloned());
     dirs.extend(explicit);
     if let Some(root) = environment.var("VCToolsInstallDir") {
-        dirs.push(PathBuf::from(root).join("lib").join(architecture));
+        dirs.push(rooted(Path::new(root)).join("lib").join(architecture));
     }
     for (root_variable, version) in [
         ("WindowsSdkDir", sdk_version),
         ("UniversalCRTSdkDir", ucrt_version),
     ] {
         if let Some(root) = environment.var(root_variable) {
-            let root = PathBuf::from(root);
+            let root = rooted(Path::new(root));
             dirs.push(
                 root.join("Lib")
                     .join(version)
@@ -1645,6 +1885,7 @@ fn hash_windows_runtime_libraries(
 /// that can shadow the environment's default CRT and direct `-l` libraries.
 /// `rustc_tool_dirs` are the tool directories of rustc's sysroots, searched
 /// before `PATH` for a linker named without a directory.
+#[cfg(test)]
 pub(crate) fn probe_windows_msvc_identity_with_library_dirs<HashLibrary>(
     linker: Option<&Path>,
     target_architecture: &str,
@@ -1657,26 +1898,67 @@ pub(crate) fn probe_windows_msvc_identity_with_library_dirs<HashLibrary>(
 where
     HashLibrary: Fn(&Path) -> Result<String>,
 {
-    let mut environment =
-        WindowsProbeEnvironment::current().context("capturing Windows MSVC environment")?;
+    probe_windows_msvc_identity_with_library_dirs_for(
+        linker,
+        target_architecture,
+        rustc_tool_dirs,
+        rustc_library_dirs,
+        linker_library_dirs,
+        link_libraries,
+        hash_library,
+        &InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
+    linker: Option<&Path>,
+    target_architecture: &str,
+    rustc_tool_dirs: &[PathBuf],
+    rustc_library_dirs: &[PathBuf],
+    linker_library_dirs: &[PathBuf],
+    link_libraries: &[String],
+    hash_library: HashLibrary,
+    env: &InvocationEnv,
+) -> Result<WindowsMsvcIdentity>
+where
+    HashLibrary: Fn(&Path) -> Result<String>,
+{
+    let resolve_paths = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| {
+                env.resolve(path)
+                    .context("resolving Windows native-link search directory")
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let rustc_tool_dirs = resolve_paths(rustc_tool_dirs)?;
+    let rustc_library_dirs = resolve_paths(rustc_library_dirs)?;
+    let linker_library_dirs = resolve_paths(linker_library_dirs)?;
+    let mut environment = WindowsProbeEnvironment::from_invocation(env)
+        .context("capturing Windows MSVC environment")?;
+    environment.root_invocation_paths(env)?;
     environment.rustc_tool_dirs = rustc_tool_dirs.to_vec();
-    environment.augment_from_installed_msvc(target_architecture)?;
+    environment.augment_from_installed_msvc(target_architecture, env)?;
+    environment.root_invocation_paths(env)?;
     let mut identity = probe_windows_msvc_identity_with(
         linker,
         target_architecture,
-        linker_library_dirs,
+        &linker_library_dirs,
         &environment,
-        |tool, path| run_windows_tool(tool, path, environment.command_environment(tool, path)),
+        |tool, path| {
+            run_windows_tool_for(tool, path, environment.command_environment(tool, path), env)
+        },
     )?;
     let directories = windows_library_dirs(
         &environment,
         &identity.architecture,
         &identity.sdk,
         &identity.ucrt,
-        linker_library_dirs,
+        &linker_library_dirs,
     )?;
     identity.libraries.extend(hash_windows_selected_libraries(
-        rustc_library_dirs,
+        &rustc_library_dirs,
         &directories,
         link_libraries,
         hash_library,
@@ -1919,6 +2201,151 @@ fn unwrap_windows_linker_wrapper(
 mod tests {
     use super::*;
     use crate::test_support::process_state_test_lock;
+
+    #[cfg(unix)]
+    #[test]
+    fn crt_probes_and_memos_keep_relative_search_paths_client_local() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let driver = root.join("driver-cc");
+        kache_fs::testutil::write_executable(
+            &driver,
+            r#"#!/bin/sh
+case "$1" in
+    -print-search-dirs) printf 'libraries: =%s/%s\n' "$PWD" "$LIBRARY_PATH" ;;
+    -print-file-name=*)
+        name=${1#-print-file-name=}
+        path=$PWD/$LIBRARY_PATH/$name
+        if [ -f "$path" ]; then printf '%s\n' "$path"; else printf '%s\n' "$name"; fi ;;
+esac
+"#,
+        );
+        let snapshot = |name: &str| {
+            let cwd = root.join(name);
+            std::fs::create_dir_all(cwd.join("lib")).unwrap();
+            for file in ["crt1.o", "libc.so", "crti.o"] {
+                std::fs::write(cwd.join("lib").join(file), format!("{name}:{file}")).unwrap();
+            }
+            InvocationEnv::from_parts([("LIBRARY_PATH", "lib")], Some(cwd.clone()), None, cwd)
+        };
+        let first = snapshot("first");
+        let second = snapshot("second");
+        let memo = root.join("memo");
+        let resolve = |env: &InvocationEnv| {
+            let result =
+                probe_linux_crt_objects_memoized_for(&memo, &driver, hash_file, env).unwrap();
+            for name in ["crt1.o", "libc.so", "crti.o"] {
+                assert_eq!(
+                    result[name],
+                    hash_file(&env.cwd().unwrap().join("lib").join(name)).unwrap()
+                );
+            }
+            result
+        };
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| resolve(&first));
+            let right = scope.spawn(|| resolve(&second));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_ne!(left, right);
+        assert_eq!(left, resolve(&first));
+        assert_eq!(right, resolve(&second));
+        assert!(crt_placement_memo_for(&memo, &driver, &first).is_some());
+        assert!(crt_placement_memo_for(&memo, &driver, &second).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_probes_select_each_clients_relative_path_and_lib() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let snapshot = |name: &str| {
+            let cwd = root.join(name);
+            std::fs::create_dir_all(cwd.join("tools")).unwrap();
+            std::fs::create_dir(cwd.join("libs")).unwrap();
+            for library in ["libcmt.lib", "libvcruntime.lib", "ucrt.lib"] {
+                std::fs::write(cwd.join("libs").join(library), format!("{name}:{library}"))
+                    .unwrap();
+            }
+            let cl_banner = compiler_banner("x64");
+            for (file, banner) in [("link.exe", LINK_BANNER), ("cl.exe", cl_banner.as_str())] {
+                kache_fs::testutil::write_executable(
+                    &cwd.join("tools").join(file),
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$CLIENT_NAME\" \"$PWD\" > {file}.context\nprintf '%s\\n' '{banner}'\n"
+                    ),
+                );
+            }
+            InvocationEnv::from_parts(
+                [
+                    ("PATH", "tools"),
+                    ("LIB", "libs"),
+                    ("CLIENT_NAME", name),
+                    ("VCToolsVersion", "14.44.35207"),
+                    ("WindowsSDKVersion", "10.0.26100.0"),
+                    ("UCRTVersion", "10.0.26100.0"),
+                    ("KACHE_CACHE_DIR", "cache"),
+                ],
+                Some(cwd.clone()),
+                None,
+                cwd,
+            )
+        };
+        let first = snapshot("first");
+        let second = snapshot("second");
+        let probe = |env: &InvocationEnv| {
+            let identity = probe_windows_msvc_identity_with_library_dirs_for(
+                None,
+                "x64",
+                &[],
+                &[],
+                &[],
+                &[],
+                hash_file,
+                env,
+            )
+            .unwrap();
+            let cwd = env.cwd().unwrap();
+            assert_eq!(
+                identity.libraries["libcmt.lib"],
+                hash_file(&cwd.join("libs/libcmt.lib")).unwrap()
+            );
+            let expected = format!("{}\n{}\n", env.var("CLIENT_NAME").unwrap(), cwd.display());
+            for file in ["link.exe.context", "cl.exe.context"] {
+                assert_eq!(std::fs::read_to_string(cwd.join(file)).unwrap(), expected);
+            }
+            identity.encode()
+        };
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| probe(&first));
+            let right = scope.spawn(|| probe(&second));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_ne!(
+            left, right,
+            "the selected runtime bytes belong to each client"
+        );
+    }
+
+    #[test]
+    fn windows_banner_memo_uses_snapshot_path_language_and_cwd() {
+        let snapshot = |path: &str, language: &str, cwd: &str| {
+            InvocationEnv::from_parts(
+                [("PATH", path), ("VSLANG", language)],
+                Some(cwd.into()),
+                None,
+                cwd.into(),
+            )
+        };
+        let key = |env: &InvocationEnv| {
+            banner_memo_key_for(WindowsTool::Link, Path::new("link.exe"), "bytes", &[], env)
+        };
+        let baseline = key(&snapshot("tools", "1033", "/first"));
+        assert_eq!(baseline, key(&snapshot("tools", "1033", "/first")));
+        assert_ne!(baseline, key(&snapshot("other-tools", "1033", "/first")));
+        assert_ne!(baseline, key(&snapshot("tools", "1031", "/first")));
+        assert_ne!(baseline, key(&snapshot("tools", "1033", "/second")));
+    }
 
     const LINK_BANNER: &str = "Microsoft (R) Incremental Linker Version 14.44.35207.0";
     const LLD_LINK_BANNER: &str = "LLD 19.1.0 COFF Linker";
@@ -2585,6 +3012,29 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn sdk_fallback_resolves_relative_roots_in_each_clients_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for (client, version) in [("first", "14.4"), ("second", "15.0")] {
+            let cwd = root.join(client);
+            let sdk = cwd.join("selected.sdk");
+            let plist = SYSTEM_VERSION_PLIST.replace("14.4", version);
+            write_system_version_plist(&sdk, &plist);
+            let env = InvocationEnv::from_parts(
+                [("PATH", cwd.join("no-tools").into_os_string())],
+                Some(cwd.clone()),
+                None,
+                cwd,
+            );
+            assert_eq!(
+                sdk_identity_for_invocation(Some("selected.sdk".into()), &env).unwrap(),
+                Some(format!("{version} (23E208)")),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn sdk_identity_reads_a_filesystem_sdkroot_when_xcrun_rejects_the_path() {
         let dir = tempfile::tempdir().unwrap();
         write_system_version_plist(dir.path(), SYSTEM_VERSION_PLIST);
@@ -2859,7 +3309,10 @@ mod tests {
             Some("C:\\sdk\\lib".as_ref())
         );
         for name in ["CL", "_CL_", "LINK", "_LINK_"] {
-            assert_eq!(environment.get(name), Some(&None), "{name}");
+            assert!(
+                environment.get(name).is_none_or(|value| value.is_none()),
+                "{name}"
+            );
         }
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),

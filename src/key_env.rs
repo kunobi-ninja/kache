@@ -50,7 +50,11 @@ pub(crate) struct KeyEnv {
 impl KeyEnv {
     /// Read the snapshot from this process.
     pub(crate) fn capture() -> Self {
-        Self::from_parts(std::env::vars_os(), std::env::current_dir().ok())
+        Self::from_invocation(&crate::invocation::InvocationEnv::capture())
+    }
+
+    pub(crate) fn from_invocation(env: &crate::invocation::InvocationEnv) -> Self {
+        Self::from_parts(env.vars_os(), env.cwd().map(Path::to_path_buf))
     }
 
     /// Build the snapshot from another process's environment and working

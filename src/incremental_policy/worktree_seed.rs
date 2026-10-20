@@ -34,7 +34,7 @@ impl Lease {
         if !enabled || args.inner_rustc.is_some() || path_exists(&self.bootstrap_env_marker()) {
             return isolated;
         }
-        let Ok(cwd) = std::env::current_dir() else {
+        let Some(cwd) = args.invocation_env().cwd().map(Path::to_owned) else {
             return isolated;
         };
         let Some(crate_name) = args.crate_name.as_deref() else {
@@ -57,14 +57,15 @@ impl Lease {
         if strip_incremental_refs(&normalized).len() == normalized.len() {
             return isolated;
         }
-        let current_bootstrap = std::env::var_os("RUSTC_BOOTSTRAP");
+        let current_bootstrap = args.invocation_env().var_os("RUSTC_BOOTSTRAP");
         let probe = |bootstrap, restrict| {
-            crate::cache_key::rustc_accepts_cwd_remap(
+            crate::cache_key::rustc_accepts_cwd_remap_for(
                 &args.rustc,
                 crate_name,
                 prefix,
                 bootstrap,
                 restrict,
+                args.invocation_env(),
             )
         };
         let inject_bootstrap = match probe(current_bootstrap.as_deref(), false) {
@@ -89,7 +90,8 @@ impl Lease {
             normalized.push("-Zallow-features=".into());
         }
         let Some(identity) =
-            crate::cache_key::rustc_version_text(&args.rustc).filter(|text| !text.is_empty())
+            crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env())
+                .filter(|text| !text.is_empty())
         else {
             return isolated;
         };

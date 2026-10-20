@@ -1264,10 +1264,11 @@ impl Compiler for NvccCompiler {
 
         let key = hasher.finalize().to_hex().to_string();
         let key = crate::cache_key::apply_key_salt(key, ctx.key_salt, "nvcc");
-        Ok(crate::cache_key::apply_key_env_vars(
+        Ok(crate::cache_key::apply_key_env_vars_in(
             key,
             ctx.key_env_vars,
             "nvcc",
+            ctx.invocation_env,
         ))
     }
 

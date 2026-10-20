@@ -61,15 +61,29 @@ pub fn crate_type_produces_metadata(crate_type: &str) -> bool {
     !matches!(crate_type, "bin" | "cdylib" | "staticlib")
 }
 
-#[derive(Default)]
 pub struct RustcCompiler {
     base_dirs: Vec<String>,
     incremental_bootstrap: bool,
+    invocation_env: crate::invocation::InvocationEnv,
+}
+
+impl Default for RustcCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RustcCompiler {
     pub fn new() -> Self {
-        Self::default()
+        Self::new_for(&crate::invocation::InvocationEnv::capture())
+    }
+
+    pub(crate) fn new_for(env: &crate::invocation::InvocationEnv) -> Self {
+        Self {
+            base_dirs: Vec::new(),
+            incremental_bootstrap: false,
+            invocation_env: env.clone(),
+        }
     }
 
     pub fn with_base_dirs(mut self, base_dirs: Vec<String>) -> Self {
@@ -267,13 +281,17 @@ impl RustcCompiler {
     ) -> Result<CompileResult> {
         // The invocation and key must use the same path-normalization rules.
         let workspace_root = parsed.path_normalization_root();
-        let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-            .with_target_dir(parsed.target_dir().as_deref())
-            .with_base_dirs(&self.base_dirs)
-            .with_rust_src_rule(
-                crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
-                crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
-            );
+        let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+            workspace_root,
+            &self.invocation_env,
+        )
+        .with_target_dir(parsed.target_dir().as_deref())
+        .with_base_dirs(&self.base_dirs)
+        .with_rust_src_rule(
+            crate::cache_key::get_rustc_sysroot_for(parsed, &self.invocation_env).as_deref(),
+            crate::cache_key::get_rustc_commit_hash_for(&parsed.rustc, &self.invocation_env)
+                .as_deref(),
+        );
         let skip_remap = skip_remap_override.unwrap_or_else(|| parsed.skip_path_remap());
         let injected: Vec<String> = [
             macos_oso_prefix_flag(parsed, all_args, lane),
@@ -288,6 +306,7 @@ impl RustcCompiler {
             Cow::Owned([all_args, injected.as_slice()].concat())
         };
         compile::run_rustc(
+            &self.invocation_env,
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),
             compiler_args.as_ref(),
@@ -314,11 +333,14 @@ impl Compiler for RustcCompiler {
     }
 
     fn parse(&self, args: &[String]) -> Result<RustcArgs> {
-        RustcArgs::parse(args)
+        RustcArgs::parse_for(args, &self.invocation_env)
     }
 
     fn refuse_reasons(&self, parsed: &RustcArgs) -> Vec<RefuseReason> {
-        let build_script_out_dir = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+        let build_script_out_dir = self
+            .invocation_env
+            .var_os("OUT_DIR")
+            .map(std::path::PathBuf::from);
         rustc_refuse_reasons(parsed, build_script_out_dir.as_deref())
     }
 
@@ -326,7 +348,8 @@ impl Compiler for RustcCompiler {
     /// The trait returns only the key, as it does for cc and nvcc; the
     /// wrapper keys rustc through [`RustcCompiler::cache_key_in`].
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
-        self.cache_key_in(parsed, ctx, &KeyEnv::capture()).0
+        self.cache_key_in(parsed, ctx, &KeyEnv::from_invocation(ctx.invocation_env))
+            .0
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {
@@ -370,7 +393,12 @@ fn finish_key(parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>, key: String) -> String {
         Some(digest) => crate::cache_key::fold_labeled(key, "build_script_inputs", digest),
         None => key,
     };
-    let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
+    let key = crate::cache_key::apply_key_env_vars_in(
+        key,
+        ctx.key_env_vars,
+        crate_name,
+        ctx.invocation_env,
+    );
     crate::cache_key::apply_key_salt(key, ctx.key_salt, crate_name)
 }
 
@@ -1676,6 +1704,7 @@ mod tests {
         let file_hasher = crate::cache_key::FileHasher::new();
         let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
         let ctx = KeyCtx {
+            invocation_env: &crate::invocation::InvocationEnv::capture(),
             file_hasher: &file_hasher,
             path_normalizer: &path_normalizer,
             cache_dir: dir.path(),
@@ -1709,6 +1738,7 @@ mod tests {
         let file_hasher = crate::cache_key::FileHasher::new();
         let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
         let base = KeyCtx {
+            invocation_env: &crate::invocation::InvocationEnv::capture(),
             file_hasher: &file_hasher,
             path_normalizer: &path_normalizer,
             cache_dir: std::path::Path::new("/cache"),
@@ -1773,6 +1803,7 @@ mod tests {
         let file_hasher = crate::cache_key::FileHasher::new();
         let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
         let ctx = KeyCtx {
+            invocation_env: &crate::invocation::InvocationEnv::capture(),
             file_hasher: &file_hasher,
             path_normalizer: &path_normalizer,
             cache_dir: dir.path(),

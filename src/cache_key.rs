@@ -1,4 +1,5 @@
 use crate::args::RustcArgs;
+use crate::invocation::InvocationEnv;
 use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
 pub(crate) use kache_format::{is_valid_cache_key, is_valid_crate_name};
@@ -439,12 +440,27 @@ pub(crate) fn apply_key_salt(base: String, salt: Option<&str>, label: &str) -> S
 /// Empty pattern list = feature off, key byte-identical to the undeclared case.
 /// The fold is union-only: a misdeclared pattern can cost a cache miss, never
 /// restore a wrong artifact.
+#[cfg(test)]
 pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str) -> String {
+    apply_key_env_vars_in(
+        base,
+        patterns,
+        label,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn apply_key_env_vars_in(
+    base: String,
+    patterns: &[String],
+    label: &str,
+    env: &crate::invocation::InvocationEnv,
+) -> String {
     if patterns.is_empty() {
         return base;
     }
 
-    let (matched, matched_names) = matching_key_env_vars(patterns);
+    let (matched, matched_names) = matching_key_env_vars(patterns, env.vars_os());
     let keyed = fold_labeled(base, "key_env_vars", &key_env_digest(patterns, matched));
     // Names only, never values: a declared var may legitimately hold a token or
     // another secret, and the trace log is what users paste into bug reports.
@@ -459,21 +475,31 @@ pub(crate) fn apply_key_env_vars(base: String, patterns: &[String], label: &str)
 /// for an adaptive-incremental unit identity. A changed value must select a new
 /// rustc state directory before the full artifact key is computed.
 pub(crate) fn key_env_guard(patterns: &[String]) -> Option<String> {
+    key_env_guard_in(patterns, &crate::invocation::InvocationEnv::capture())
+}
+
+pub(crate) fn key_env_guard_in(
+    patterns: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Option<String> {
     (!patterns.is_empty()).then(|| {
-        let (matched, _) = matching_key_env_vars(patterns);
+        let (matched, _) = matching_key_env_vars(patterns, env.vars_os());
         key_env_digest(patterns, matched)
     })
 }
 
 type RawEnvPair = (Vec<u8>, Vec<u8>);
 
-fn matching_key_env_vars(patterns: &[String]) -> (Vec<RawEnvPair>, Vec<String>) {
+fn matching_key_env_vars(
+    patterns: &[String],
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> (Vec<RawEnvPair>, Vec<String>) {
     // Matching runs on the lossy name because patterns are UTF-8; folding runs
     // on the raw bytes below, so a lossy collision here can only mis-select a
     // variable (a miss), never merge two variables into one key component.
     let mut matched: Vec<RawEnvPair> = Vec::new();
     let mut matched_names: Vec<String> = Vec::new();
-    for (name, value) in std::env::vars_os() {
+    for (name, value) in vars {
         let lossy = name.to_string_lossy();
         if !key_env_var_matches(patterns, &lossy) {
             continue;
@@ -929,12 +955,10 @@ fn stamp_roots(
             if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
                 // The memo stores UTF-8 paths. Lossy spellings could merge
                 // distinct names in the path-keyed batch result.
-                let absolute = if path.is_absolute() {
-                    path
-                } else {
-                    absolute_path(&path)
-                };
-                let Ok(path) = absolute.into_os_string().into_string() else {
+                if !path.is_absolute() {
+                    return;
+                }
+                let Ok(path) = path.into_os_string().into_string() else {
                     return;
                 };
                 small_files.push(FileFingerprint {
@@ -1052,8 +1076,11 @@ pub(crate) const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
 /// directory is unknown, unreadable, or too large to digest, which leaves the
 /// unit on the pre-pass.
 pub(crate) fn crate_tree_digest(file_hasher: &FileHasher<'_>) -> Option<String> {
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
-    let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+    let env = &file_hasher.invocation_env;
+    let manifest_dir = env.resolve(Path::new(&env.var_os("CARGO_MANIFEST_DIR")?))?;
+    let out_dir = env
+        .var_os("OUT_DIR")
+        .and_then(|path| env.resolve(Path::new(&path)));
     crate_tree_digest_in(manifest_dir, out_dir, file_hasher)
 }
 
@@ -1182,7 +1209,7 @@ fn tree_digest(
         roots,
         file_hasher,
         max_entries,
-        &crate::config::probe_memo_dir(),
+        &crate::config::probe_memo_dir_for(&file_hasher.invocation_env).ok()?,
         std::time::SystemTime::now(),
     )
 }
@@ -1269,6 +1296,7 @@ fn tree_digest_memoised(
     now: std::time::SystemTime,
 ) -> Option<String> {
     for root in &mut roots {
+        root.path = file_hasher.invocation_env.resolve(&root.path)?;
         root.own = own_dirs_within(&root.path, &file_hasher.own_dirs);
     }
     if roots.iter().any(|root| {
@@ -1634,14 +1662,16 @@ pub fn dep_info_provided() -> bool {
 
 /// The files of the closure [`provide_dep_info`] left for the next key,
 /// spelled as [`FileFingerprint`] records their paths.
-pub fn provided_dep_info_sources() -> Option<std::collections::HashSet<String>> {
+pub(crate) fn provided_dep_info_sources_for(
+    env: &InvocationEnv,
+) -> Option<std::collections::HashSet<String>> {
     PROVIDED_DEP_INFO.with(|cell| {
-        cell.borrow().as_ref().map(|(dep_info, _)| {
+        cell.borrow().as_ref().and_then(|(dep_info, _)| {
             dep_info
                 .source_files
                 .iter()
-                .map(|path| absolute_path(path).to_string_lossy().into_owned())
-                .collect()
+                .map(|path| Some(env.resolve(path)?.to_string_lossy().into_owned()))
+                .collect::<Option<_>>()
         })
     })
 }
@@ -1649,7 +1679,18 @@ pub fn provided_dep_info_sources() -> Option<std::collections::HashSet<String>> 
 /// The closure rustc wrote to `path` during the compile whose crate root is
 /// `source_file`: the same content the pre-pass reads from its own output.
 pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo> {
-    let content = read_dep_info_file(path)?;
+    dep_info_from_emitted_for(path, source_file, &InvocationEnv::capture())
+}
+
+pub(crate) fn dep_info_from_emitted_for(
+    path: &Path,
+    source_file: &Path,
+    env: &InvocationEnv,
+) -> Result<DepInfo> {
+    let path = env
+        .resolve(path)
+        .context("dep-info path requires the invocation working directory")?;
+    let content = read_dep_info_file(&path)?;
     let mut source_files = parse_dep_info(&content);
     if source_files.is_empty() {
         source_files.push(source_file.to_path_buf());
@@ -1692,7 +1733,7 @@ pub(crate) fn source_path_identity(
 /// or when the compiler's own version cannot be read — without it two
 /// toolchains would share one record, and their closures need not match.
 pub(crate) fn rustc_prediction_identity(args: &RustcArgs) -> Option<String> {
-    rustc_prediction_identity_in_env(args, std::env::vars_os().collect())
+    rustc_prediction_identity_in_env(args, args.invocation_env().vars_os().collect())
 }
 
 fn rustc_prediction_identity_in_env(
@@ -1708,12 +1749,12 @@ fn rustc_prediction_identity_with_args(
     closure_args: Option<Vec<String>>,
 ) -> Option<String> {
     let source_file = args.source_file.as_ref()?;
-    let rustc_version = get_rustc_version(&args.rustc).ok()?;
+    let rustc_version = get_rustc_version_for(&args.rustc, args.invocation_env()).ok()?;
     Some(prediction_identity_in_env(
         &PredictionIdentityParts {
             rustc_version: &rustc_version,
             inner_rustc: args.inner_rustc.as_deref(),
-            current_dir: std::env::current_dir().ok().as_deref(),
+            current_dir: args.invocation_env().cwd(),
             source_file,
             closure_args: &closure_args
                 .unwrap_or_else(|| closure_shaping_args(source_file, &args.all_args)),
@@ -1728,7 +1769,7 @@ fn rustc_prediction_identity_with_args(
 /// source paths, cfg values and environment retain their original identity.
 /// A record containing a source under target is never published here.
 pub(crate) fn rustc_shared_prediction_identity(args: &RustcArgs) -> Option<String> {
-    rustc_shared_prediction_identity_in(args, std::env::vars_os().collect())
+    rustc_shared_prediction_identity_in(args, args.invocation_env().vars_os().collect())
 }
 
 /// [`rustc_shared_prediction_identity`] against an environment snapshot.
@@ -1736,7 +1777,7 @@ fn rustc_shared_prediction_identity_in(
     args: &RustcArgs,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 ) -> Option<String> {
-    let target = args.target_dir()?;
+    let target = args.target_dir_from_args()?;
     let manifest_dir = env_var_in(&vars, "CARGO_MANIFEST_DIR").map(Path::new);
     if !target.is_absolute() || !shared_prediction_eligible(&args.externs, manifest_dir) {
         return None;
@@ -1883,7 +1924,10 @@ fn shared_prediction_args(args: &[String], target: &Path) -> Vec<String> {
 }
 
 pub(crate) fn shared_prediction_can_record(args: &RustcArgs, dep_info: &DepInfo) -> bool {
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let manifest_dir = args
+        .invocation_env()
+        .var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from);
     shared_prediction_can_record_in(args, dep_info, manifest_dir.as_deref())
 }
 
@@ -2151,7 +2195,7 @@ fn predicted_key_inputs(
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
     }
-    let vars: Vec<_> = std::env::vars_os().collect();
+    let vars: Vec<_> = file_hasher.invocation_env.vars_os().collect();
     let workspace = workspace_roots(args, &vars);
     let manifest_dir = env_var_in(&vars, "CARGO_MANIFEST_DIR").map(Path::new);
     // A unit under the tree guard is predictable only while the record carries
@@ -2213,9 +2257,19 @@ fn predicted_key_inputs(
     }
     let validated = validate_prediction(
         &record,
-        |path| std::fs::metadata(path).ok(),
-        |path| path.exists(),
-        |var| std::env::var_os(var),
+        |path| {
+            file_hasher
+                .invocation_env
+                .resolve(path)
+                .and_then(|path| std::fs::metadata(path).ok())
+        },
+        |path| {
+            file_hasher
+                .invocation_env
+                .resolve(path)
+                .is_some_and(|path| path.exists())
+        },
+        |var| file_hasher.invocation_env.var_os(var),
     );
     if let Some(shared) = from_remote {
         keep_remote_plain_row(file_hasher, shared, args, &record, &validated);
@@ -2260,10 +2314,10 @@ fn relocated_key_inputs(
     tree: Option<String>,
     tree_guard: &mut Option<TreeGuard>,
 ) -> std::result::Result<DepInfo, Rejection> {
-    let vars: Vec<_> = std::env::vars_os().collect();
+    let vars: Vec<_> = file_hasher.invocation_env.vars_os().collect();
     let out_dir = env_var_in(&vars, "OUT_DIR")
-        .and_then(std::ffi::OsStr::to_str)
-        .map(str::to_string);
+        .and_then(|value| file_hasher.invocation_env.resolve(Path::new(value)))
+        .and_then(|path| path.into_os_string().into_string().ok());
     let registry = registry_src_of(&vars);
     let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
     let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
@@ -2304,9 +2358,19 @@ fn portable_key_inputs(
             record,
             guard,
             places,
-            |path| std::fs::metadata(path).ok(),
-            |path| path.exists(),
-            |var| std::env::var_os(var),
+            |path| {
+                file_hasher
+                    .invocation_env
+                    .resolve(path)
+                    .and_then(|path| std::fs::metadata(path).ok())
+            },
+            |path| {
+                file_hasher
+                    .invocation_env
+                    .resolve(path)
+                    .is_some_and(|path| path.exists())
+            },
+            |var| file_hasher.invocation_env.var_os(var),
         )
     };
     if let Some(record) = file_hasher.portable_prediction(identity) {
@@ -2491,7 +2555,7 @@ fn workspace_roots(
     args: &RustcArgs,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Option<WorkspaceRoots> {
-    workspace_roots_in(args, vars, &std::env::current_dir().ok()?)
+    workspace_roots_in(args, vars, args.invocation_env().cwd()?)
 }
 
 /// The target directory of `args`, which a workspace unit's guard leaves
@@ -2505,7 +2569,7 @@ fn workspace_target_dir(args: &RustcArgs) -> Option<PathBuf> {
         .filter(|dir| crate::cargo_layout::per_unit_out_dir(dir).is_none())
         .and_then(crate::cargo_layout::build_script_dir_profile);
     match build_script_profile {
-        Some(profile) => profile.parent().map(Path::to_path_buf),
+        Some(profile) => args.invocation_env().resolve(profile.parent()?),
         None => args.target_dir(),
     }
 }
@@ -2519,7 +2583,11 @@ fn workspace_roots_in(
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
     current_dir: &Path,
 ) -> Option<WorkspaceRoots> {
-    let manifest_dir = Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?);
+    let manifest_dir = joined_under(
+        Some(current_dir),
+        Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?),
+    );
+    let manifest_dir = manifest_dir.as_path();
     if is_registry_package(manifest_dir) {
         return None;
     }
@@ -2543,7 +2611,8 @@ fn workspace_roots_in(
         cwd,
         canonical_root,
         canonical_target: std::fs::canonicalize(&target).ok()?,
-        out_dir: env_var_in(vars, "OUT_DIR").map(PathBuf::from),
+        out_dir: env_var_in(vars, "OUT_DIR")
+            .map(|path| joined_under(Some(current_dir), Path::new(path))),
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
         root,
@@ -2601,7 +2670,7 @@ fn workspace_prediction_identity(
             Some((name, format!("kache-workspace:{relative}").into()))
         })
         .collect::<Option<Vec<_>>>()?;
-    let rustc_version = get_rustc_version(&args.rustc).ok()?;
+    let rustc_version = get_rustc_version_for(&args.rustc, args.invocation_env()).ok()?;
     let identity = prediction_identity_in_env(
         &PredictionIdentityParts {
             rustc_version: &rustc_version,
@@ -2905,7 +2974,7 @@ fn resolve_key_inputs(
                 // rather than acted on.
                 if verifies_prediction(mode, args, env.cwd(), |var| env.var_os(var)) {
                     crate::phase_trace::decision("prediction", "verify-sampled");
-                    let discovered = dep_info_pre_pass(args)?;
+                    let discovered = dep_info_pre_pass_for(args, &file_hasher.invocation_env)?;
                     if discovered
                         .as_ref()
                         .is_some_and(|discovered| closures_agree(&dep_info, discovered))
@@ -2962,21 +3031,22 @@ fn resolve_key_inputs(
             }
         }
     }
-    dep_info_pre_pass(args)
+    dep_info_pre_pass_for(args, &file_hasher.invocation_env)
 }
 
 /// Spawn rustc to enumerate the closure. The slow, authoritative answer.
-fn dep_info_pre_pass(args: &RustcArgs) -> Result<Option<DepInfo>> {
+fn dep_info_pre_pass_for(args: &RustcArgs, env: &InvocationEnv) -> Result<Option<DepInfo>> {
     let _trace = crate::phase_trace::phase("dep-info");
     args.source_file
         .as_ref()
         .map(|source| {
-            run_dep_info_pass(
+            run_dep_info_pass_for(
                 &args.rustc,
                 args.inner_rustc.as_deref(),
                 source,
                 &args.all_args,
                 args.has_expanded_argfiles(),
+                env,
             )
             .with_context(|| {
                 format!(
@@ -3039,6 +3109,7 @@ fn compute_key_into(
     out: &mut KeyOutputs,
 ) -> Result<String> {
     let _trace = crate::phase_trace::phase("key");
+    let invocation = &file_hasher.invocation_env;
     // Grouped: the main digest is identical to a plain hasher's; the group
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
     let mut hasher = GroupedHasher::new("compiler");
@@ -3073,7 +3144,7 @@ fn compute_key_into(
     }
 
     // rustc version
-    let rustc_version = get_rustc_version(&args.rustc)?;
+    let rustc_version = get_rustc_version_for(&args.rustc, invocation)?;
     hasher.update(b"rustc_version:");
     hasher.update(rustc_version.as_bytes());
     hasher.update(b"\n");
@@ -3087,7 +3158,7 @@ fn compute_key_into(
     // arguments Cargo hands it through the environment all change what a
     // successful compile prints, and hits replay diagnostics.
     if args.is_clippy_chain() {
-        let identity = clippy_identity(&args.rustc, env)?;
+        let identity = clippy_identity_for(&args.rustc, env, invocation)?;
         fold_field(&mut hasher, b"clippy.v1:", identity.as_bytes());
         tracing::trace!(
             "[key:{}] clippy={}",
@@ -3513,10 +3584,10 @@ fn compute_key_into(
         // `all=` and bare/`native=` dirs all search native libs (rustc's `-L`
         // default kind is `all`); a `static=` lib can resolve in any of them.
         if matches!(kind, None | Some("native") | Some("all")) {
-            native_search_dirs.push(PathBuf::from(path));
+            native_search_dirs.push(file_hasher.resolve_path(Path::new(path))?);
         }
         if kind == Some("framework") {
-            framework_search_dirs.push(PathBuf::from(path));
+            framework_search_dirs.push(file_hasher.resolve_path(Path::new(path))?);
         }
         let normalized = path_normalizer.normalize(path);
         hasher.update(b"link_search:");
@@ -3554,25 +3625,25 @@ fn compute_key_into(
     }
     // Native MSVC links resolve their libraries and link-argument files in
     // the MSVC identity below, so the Unix rules here stay off for them.
-    let native_windows_msvc = is_native_windows_msvc_link(
-        args,
-        &rustc_version,
-        cfg!(target_os = "windows"),
-        get_rustc_version,
-    )?;
+    let native_windows_msvc =
+        is_native_windows_msvc_link(args, &rustc_version, cfg!(target_os = "windows"), |rustc| {
+            get_rustc_version_for(rustc, invocation)
+        })?;
     // Only a link searches for libraries, so only a link reads the host.
     let link_rustc_version = if args.invokes_linker() {
         Some(rustc_version_for_native_link(
             args,
             &rustc_version,
-            get_rustc_version,
+            |rustc| get_rustc_version_for(rustc, invocation),
         )?)
     } else {
         None
     };
     let rustc_host = link_rustc_version.as_deref().and_then(rustc_host_triple);
     let target = link_target(args.target.as_deref(), rustc_host);
-    let unit_out_dir = out_dir.map(PathBuf::from);
+    let unit_out_dir = out_dir
+        .map(|path| file_hasher.resolve_path(Path::new(&path)))
+        .transpose()?;
     let native_archives = fold_native_link_inputs(
         &mut hasher,
         args,
@@ -3587,7 +3658,10 @@ fn compute_key_into(
                 target,
                 rustc_host,
                 env.var_os("LIBRARY_PATH").as_deref(),
-            ),
+            )
+            .iter()
+            .map(|path| file_hasher.resolve_path(path))
+            .collect::<Result<Vec<_>>>()?,
             out_dir: unit_out_dir.as_deref(),
             build_tree: build_tree_roots(args),
             system_dirs: system_library_dirs(),
@@ -3639,7 +3713,7 @@ fn compute_key_into(
     // source can replace it without reporting a new version.
     if let Some(backend) = args.codegen_backend_name() {
         for (library, content) in
-            toolchain_codegen_backends(args, &rustc_version, backend, file_hasher)?
+            toolchain_codegen_backends_for(args, &rustc_version, backend, file_hasher, invocation)?
         {
             fold_field(
                 &mut hasher,
@@ -3771,7 +3845,9 @@ fn compute_key_into(
 
     // Linker identity for bin/dylib targets
     hasher.set_group("link");
-    fold_generic_linker_identity(&mut hasher, args, native_windows_msvc, get_linker_identity);
+    fold_generic_linker_identity(&mut hasher, args, native_windows_msvc, |args| {
+        get_linker_identity_for(args, invocation)
+    });
 
     // A native Linux linked artifact also depends on the host libc ABI. The
     // rustc host triple does not include the libc version, so two machines with
@@ -3782,12 +3858,13 @@ fn compute_key_into(
     // only destroy valid cross-machine hits without identifying that sysroot.
     // Probe failure is an error, making the wrapper pass through instead of
     // risking a shared-cache false hit.
-    fold_native_host_libc_signature(
+    fold_native_host_libc_signature_for(
         &mut hasher,
         args,
         &rustc_version,
         cfg!(target_os = "linux"),
-        probe_linux_libc_signature,
+        |family| probe_linux_libc_signature_for(family, invocation),
+        invocation,
     )?;
 
     // Stronger than the version string above: hash the CRT/startup objects and
@@ -3796,7 +3873,7 @@ fn compute_key_into(
     // different object bytes then miss instead of sharing. If none of the
     // essentials resolve, fail closed — passthrough rather than a key that
     // claims to have pinned a runtime neither host identified. v29.
-    fold_native_link_runtime_identity(
+    fold_native_link_runtime_identity_for(
         &mut hasher,
         args,
         &rustc_version,
@@ -3807,17 +3884,19 @@ fn compute_key_into(
             // are unchanged; content hashes are still reused only with an
             // unchanged file fingerprint, through the same guards as other
             // key inputs.
-            crate::native_link_key::probe_linux_crt_objects_memoized(
-                &crate::config::probe_memo_dir(),
+            crate::native_link_key::probe_linux_crt_objects_memoized_for(
+                &crate::config::probe_memo_dir_for(invocation)?,
                 driver,
                 |path| file_hasher.hash(path),
+                invocation,
             )
         },
-        |sdkroot| match crate::native_link_key::sdk_identity_for(sdkroot)? {
+        |sdkroot| match crate::native_link_key::sdk_identity_for_invocation(sdkroot, invocation)? {
             Some(identity) => Ok(identity),
             None => anyhow::bail!("the macOS SDK could not be identified"),
         },
         env,
+        invocation,
     )?;
 
     // Native Windows MSVC links depend on the selected COFF linker/compiler,
@@ -3828,24 +3907,26 @@ fn compute_key_into(
     // wrapper passes through rather than sharing an unidentified executable;
     // so does any `-C link-arg` that names an input file the identity does
     // not hash (see `windows_native_link_search_dirs`).
-    fold_native_windows_msvc_identity(
+    fold_native_windows_msvc_identity_for(
         &mut hasher,
         args,
         &rustc_version,
         cfg!(target_os = "windows"),
         |linker, architecture, host| {
             let search_dirs = windows_native_link_search_dirs(args)?;
-            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs(
+            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
                 linker,
                 architecture,
-                &rustc_tool_dirs(args, host)?,
+                &rustc_tool_dirs_for(args, host, invocation)?,
                 &search_dirs.rustc,
                 &search_dirs.linker,
                 &args.link_libs,
                 |path| file_hasher.hash_static_lib(path),
+                invocation,
             )
             .map(|identity| identity.encode())
         },
+        invocation,
     )?;
 
     // Path remapping status: kache injects multi-prefix
@@ -4286,8 +4367,19 @@ impl StaticLibUse {
 /// resolves to is read-only and has the same path in every target directory
 /// that shares it, so its bytes decide the link as much as a copy under the
 /// profile directory would.
+#[cfg(test)]
 fn hermetic_archive_under(archive: &Path, resolved: &Path, spelled_root: &Path) -> bool {
-    std::path::absolute(archive).is_ok_and(|spelled| spelled.starts_with(spelled_root))
+    hermetic_archive_under_for(archive, resolved, spelled_root, &InvocationEnv::capture())
+}
+
+fn hermetic_archive_under_for(
+    archive: &Path,
+    resolved: &Path,
+    spelled_root: &Path,
+    env: &InvocationEnv,
+) -> bool {
+    env.resolve(archive)
+        .is_some_and(|spelled| spelled.starts_with(spelled_root))
         && !resolved.starts_with(spelled_root)
         && crate::build_script::in_sealed_out_dir(resolved)
 }
@@ -4301,8 +4393,9 @@ fn oso_archive_use(
     spelled_root: &Path,
     root: &Path,
 ) -> StaticLibUse {
-    let resolved = resolved_path(archive);
-    if hermetic_archive_under(archive, &resolved, spelled_root) {
+    let resolved =
+        resolved_path_for(archive, args.invocation_env()).unwrap_or_else(|| archive.to_path_buf());
+    if hermetic_archive_under_for(archive, &resolved, spelled_root, args.invocation_env()) {
         linked_archive_use(args, archive, Some(spelled_root))
     } else {
         linked_archive_use(args, &resolved, Some(root))
@@ -4513,13 +4606,20 @@ fn dirs_outside_packages<'a>(
 /// The dirs among `dirs` inside `root`. Both are compared resolved: a build
 /// script can spell its OUT_DIR through a symlink the environment does not,
 /// and macOS reaches `/var` as `/private/var`.
+#[cfg(test)]
 fn dirs_under(dirs: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    dirs_under_for(dirs, root, &InvocationEnv::capture())
+}
+
+fn dirs_under_for(dirs: &[PathBuf], root: &Path, env: &InvocationEnv) -> Vec<PathBuf> {
     if dirs.is_empty() {
         return Vec::new();
     }
-    let root = resolved_path(root);
+    let Some(root) = resolved_path_for(root, env) else {
+        return Vec::new();
+    };
     dirs.iter()
-        .filter(|dir| resolved_path(dir).starts_with(&root))
+        .filter(|dir| resolved_path_for(dir, env).is_some_and(|path| path.starts_with(&root)))
         .cloned()
         .collect()
 }
@@ -4574,6 +4674,9 @@ fn build_tree_roots(args: &RustcArgs) -> Vec<PathBuf> {
         args.target.as_deref(),
         args.path_normalization_root(),
     )
+    .into_iter()
+    .filter_map(|path| args.resolve_invocation_path(&path))
+    .collect()
 }
 
 /// [`build_tree_roots`] from a unit's `--out-dir`, `--target` and workspace
@@ -4727,10 +4830,14 @@ fn fold_native_dir_archives<H: KeyFold>(
 }
 
 /// `path` with symlinks resolved, or made absolute when it does not exist.
+#[cfg(test)]
 fn resolved_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path)
-        .or_else(|_| std::path::absolute(path))
-        .unwrap_or_else(|_| path.to_path_buf())
+    resolved_path_for(path, &InvocationEnv::capture()).unwrap_or_else(|| path.to_path_buf())
+}
+
+fn resolved_path_for(path: &Path, env: &InvocationEnv) -> Option<PathBuf> {
+    let path = env.resolve(path).filter(|path| path.is_absolute())?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 /// Whether an rlib compile must pass the store-time bundle audit: it writes
@@ -4810,19 +4917,21 @@ struct NativeLinkContext<'a> {
 impl NativeLinkContext<'_> {
     /// Apple dylibs can reach the linker through dependency metadata, so
     /// inspect custom search dirs even when this unit has no `-l`.
-    fn apple_dynamic_dirs(&self, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    fn apple_dynamic_dirs_for(&self, dirs: &[PathBuf], env: &InvocationEnv) -> Vec<PathBuf> {
         let build_tree = std::cell::OnceCell::new();
         unique_dirs(dirs)
             .into_iter()
             .filter(|dir| {
-                let resolved = resolved_path(dir);
+                let Some(resolved) = resolved_path_for(dir, env) else {
+                    return false;
+                };
                 !is_under_any(&resolved, &self.system_dirs)
                     || is_under_any(
                         &resolved,
                         build_tree.get_or_init(|| {
                             self.build_tree
                                 .iter()
-                                .map(|root| resolved_path(root))
+                                .filter_map(|root| resolved_path_for(root, env))
                                 .collect::<Vec<_>>()
                         }),
                     )
@@ -4834,20 +4943,27 @@ impl NativeLinkContext<'_> {
     /// repeats: those outside Cargo's packages and outside the system library
     /// dirs, or inside the build tree. Each dir is compared resolved, and the
     /// build tree is resolved only for a dir under a system library dir.
+    #[cfg(test)]
     fn scanned_dirs(&self, dirs: &[PathBuf]) -> Vec<PathBuf> {
+        self.scanned_dirs_for(dirs, &InvocationEnv::capture())
+    }
+
+    fn scanned_dirs_for(&self, dirs: &[PathBuf], env: &InvocationEnv) -> Vec<PathBuf> {
         let unique = unique_dirs(dirs);
         let build_tree = std::cell::OnceCell::new();
         let resolved_build_tree = || {
             build_tree.get_or_init(|| {
                 self.build_tree
                     .iter()
-                    .map(|root| resolved_path(root))
+                    .filter_map(|root| resolved_path_for(root, env))
                     .collect::<Vec<_>>()
             })
         };
         dirs_outside_packages(&unique, |dir| self.path_normalizer.normalize(dir))
             .filter(|dir| {
-                let dir = resolved_path(dir);
+                let Some(dir) = resolved_path_for(dir, env) else {
+                    return false;
+                };
                 !is_under_any(&dir, &self.system_dirs) || is_under_any(&dir, resolved_build_tree())
             })
             .cloned()
@@ -4876,11 +4992,11 @@ fn native_scan_dirs(
     context: &NativeLinkContext<'_>,
 ) -> Vec<PathBuf> {
     if args.links_native_closure() {
-        context.scanned_dirs(dirs)
+        context.scanned_dirs_for(dirs, args.invocation_env())
     } else if args.emits_rlib()
         && let Some(out_dir) = context.out_dir
     {
-        dirs_under(&unique_dirs(dirs), out_dir)
+        dirs_under_for(&unique_dirs(dirs), out_dir, args.invocation_env())
     } else {
         Vec::new()
     }
@@ -4929,13 +5045,23 @@ fn fold_native_link_inputs<H: KeyFold>(
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let links = args.invokes_linker();
     let unix_link = links && !context.native_windows_msvc;
-    let link_arguments = if unix_link {
+    let mut link_arguments = if unix_link {
         unix_link_arguments(args)?
     } else {
         crate::native_link_key::LinkArgInputs::default()
     };
-    let spelled_oso_root = crate::compiler::rustc::oso_prefix_root_for_key(args);
-    let oso_root = spelled_oso_root.as_deref().map(resolved_path);
+    for path in link_arguments
+        .dirs
+        .iter_mut()
+        .chain(&mut link_arguments.files)
+    {
+        *path = file_hasher.resolve_path(path)?;
+    }
+    let spelled_oso_root = crate::compiler::rustc::oso_prefix_root_for_key(args)
+        .and_then(|path| args.resolve_invocation_path(&path));
+    let oso_root = spelled_oso_root
+        .as_deref()
+        .and_then(|path| resolved_path_for(path, args.invocation_env()));
     let archive_use = |path: &Path| match (spelled_oso_root.as_deref(), oso_root.as_deref()) {
         (Some(spelled_root), Some(root)) => oso_archive_use(args, path, spelled_root, root),
         _ => linked_archive_use(args, path, None),
@@ -4972,7 +5098,11 @@ fn fold_native_link_inputs<H: KeyFold>(
         fold_field(hasher, b"apple_install_names.v1:", b"");
         // ld64 embeds LC_ID_DYLIB (or a stub's install-name) verbatim. A
         // normalized -L path cannot identify an absolute build-tree name.
-        for (index, dir) in context.apple_dynamic_dirs(&library_dirs).iter().enumerate() {
+        for (index, dir) in context
+            .apple_dynamic_dirs_for(&library_dirs, args.invocation_env())
+            .iter()
+            .enumerate()
+        {
             for path in native_dir_entries(dir)? {
                 if path.is_file()
                     && path
@@ -4984,7 +5114,7 @@ fn fold_native_link_inputs<H: KeyFold>(
             }
         }
         for (index, dir) in context
-            .apple_dynamic_dirs(search.framework)
+            .apple_dynamic_dirs_for(search.framework, args.invocation_env())
             .iter()
             .enumerate()
         {
@@ -5023,7 +5153,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 let path = dir.join(name);
                 if path.is_file() {
                     if !context
-                        .apple_dynamic_dirs(std::slice::from_ref(dir))
+                        .apple_dynamic_dirs_for(std::slice::from_ref(dir), args.invocation_env())
                         .is_empty()
                         && !crate::native_archive::has_archive_magic(&path)?
                     {
@@ -5162,14 +5292,14 @@ fn fold_native_link_inputs<H: KeyFold>(
     if links {
         archives.extend(fold_native_dir_archives(
             hasher,
-            &context.scanned_dirs(search.framework),
+            &context.scanned_dirs_for(search.framework, args.invocation_env()),
             native_dir_static_frameworks,
             hash_archive,
         )?);
     }
     // Only an rlib's store runs the bundle audit.
     let audit_dirs = if args.emits_rlib() {
-        context.scanned_dirs(search.native)
+        context.scanned_dirs_for(search.native, args.invocation_env())
     } else {
         Vec::new()
     };
@@ -6250,7 +6380,16 @@ fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
 /// because linkers can expose `archive-path(member)`. Thin archives are
 /// uncacheable: rustc reads external members whose bytes are absent from the
 /// container.
-fn compute_static_lib_hash(path: &Path, usage: StaticLibUse) -> Result<String> {
+fn compute_static_lib_hash_for(
+    path: &Path,
+    usage: StaticLibUse,
+    env: &InvocationEnv,
+) -> Result<String> {
+    let absolute = env
+        .resolve(path)
+        .filter(|path| path.is_absolute())
+        .context("static library requires the invocation working directory")?;
+    let path = absolute.as_path();
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.starts_with(b"!<thin>\n") {
         anyhow::bail!(
@@ -6264,7 +6403,6 @@ fn compute_static_lib_hash(path: &Path, usage: StaticLibUse) -> Result<String> {
         return Ok(identity.digest);
     }
 
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let encoded_path = absolute.as_os_str().as_encoded_bytes();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kache.native-ar.path-bound-fallback.v1\0");
@@ -6566,7 +6704,12 @@ pub(crate) fn relocatable_record(
     dep_info: &DepInfo,
     tree: Option<&str>,
 ) -> Option<(String, PortablePrediction)> {
-    relocatable_record_in(args, dep_info, tree, std::env::vars_os().collect())
+    relocatable_record_in(
+        args,
+        dep_info,
+        tree,
+        args.invocation_env().vars_os().collect(),
+    )
 }
 
 /// [`relocatable_record`] against an environment snapshot.
@@ -6590,7 +6733,7 @@ pub(crate) fn same_checkout_guard(
     dep_info: &DepInfo,
     tree: Option<String>,
 ) -> Option<String> {
-    let workspace = workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>());
+    let workspace = workspace_roots(args, &args.invocation_env().vars_os().collect::<Vec<_>>());
     same_tree_guard(
         tree,
         workspace.is_some(),
@@ -6621,7 +6764,7 @@ pub(crate) fn workspace_record(
     dep_info: &DepInfo,
     tree: Option<&str>,
 ) -> Option<(String, PortablePrediction)> {
-    let vars: Vec<_> = std::env::vars_os().collect();
+    let vars: Vec<_> = args.invocation_env().vars_os().collect();
     let workspace = workspace_roots(args, &vars)?;
     let record = workspace_portable_prediction(dep_info, &workspace, tree)?;
     if !guard_covers(&dep_info.source_files, &workspace) {
@@ -6808,7 +6951,7 @@ fn portable_roots(
     args: &RustcArgs,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Option<PortableRoots> {
-    let out_dir = PathBuf::from(env_var_in(vars, "OUT_DIR")?);
+    let out_dir = args.resolve_invocation_path(Path::new(env_var_in(vars, "OUT_DIR")?))?;
     let target = args.target_dir()?;
     let registry_src = registry_src_root(Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?))?;
     Some(PortableRoots {
@@ -7103,6 +7246,7 @@ fn prediction_identity_in_env(
 /// with 30 crates that all depend on `serde`, the serde rlib gets hashed once
 /// instead of 30 times.
 pub struct FileHasher<'db> {
+    pub(crate) invocation_env: InvocationEnv,
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
     use_input_predictions: bool,
@@ -7231,6 +7375,7 @@ pub(crate) const CC_INPUT_CHANGED_WHILE_SCANNED: &str = "an input changed while 
 impl FileHasher<'static> {
     pub fn new() -> Self {
         FileHasher {
+            invocation_env: InvocationEnv::capture(),
             cache: None,
             daemon_socket: None,
             use_input_predictions: false,
@@ -7252,6 +7397,7 @@ impl FileHasher<'static> {
     pub fn persistent(index_db_path: &Path) -> Self {
         match FileHashCache::open(index_db_path) {
             Ok(cache) => FileHasher {
+                invocation_env: InvocationEnv::capture(),
                 cache: Some(cache),
                 daemon_socket: None,
                 use_input_predictions: false,
@@ -7329,6 +7475,7 @@ impl<'db> FileHasher<'db> {
 
     pub(crate) fn from_cache(cache: FileHashCache<'db>) -> Self {
         FileHasher {
+            invocation_env: InvocationEnv::capture(),
             cache: Some(cache),
             daemon_socket: None,
             use_input_predictions: false,
@@ -7349,6 +7496,18 @@ impl<'db> FileHasher<'db> {
     pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
         self.daemon_socket = Some(socket_path);
         self
+    }
+
+    pub(crate) fn with_invocation_env(mut self, env: &InvocationEnv) -> Self {
+        self.invocation_env = env.clone();
+        self
+    }
+
+    fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
+        self.invocation_env
+            .resolve(path)
+            .filter(|path| path.is_absolute())
+            .context("relative input requires the invocation working directory")
     }
 
     /// Let key computation derive its input set from a recorded closure
@@ -7775,7 +7934,10 @@ impl<'db> FileHasher<'db> {
         let candidates = resolve(&expected.name);
 
         for path in &candidates {
-            let Ok(current) = ObservedFingerprint::from_path(path) else {
+            let Some(resolved) = self.invocation_env.resolve(path) else {
+                continue;
+            };
+            let Ok(current) = ObservedFingerprint::from_path(&resolved) else {
                 continue;
             };
             self.note_too_new(&current.fingerprint);
@@ -7788,7 +7950,7 @@ impl<'db> FileHasher<'db> {
                 // any input the key hashed.
                 self.guard_input(&current);
                 self.recent_hashes.borrow_mut().insert(
-                    absolute_path(path),
+                    resolved.clone(),
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
@@ -7804,7 +7966,7 @@ impl<'db> FileHasher<'db> {
                 return Some(path.clone());
             }
             if !expected.mapped.is_empty()
-                && mapped_content(path).is_some_and(|read| read.mapped == expected.mapped)
+                && mapped_content(&resolved).is_some_and(|read| read.mapped == expected.mapped)
             {
                 return Some(path.clone());
             }
@@ -7837,6 +7999,10 @@ impl<'db> FileHasher<'db> {
         maps_key: &str,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
+        let paths = paths
+            .iter()
+            .map(|(name, path)| Some((name.clone(), self.invocation_env.resolve(path)?)))
+            .collect::<Option<Vec<_>>>()?;
         if paths.is_empty() {
             return None;
         }
@@ -7847,7 +8013,7 @@ impl<'db> FileHasher<'db> {
         // the compile's own header work did on macOS.
         let mut stamped: Vec<(&String, &PathBuf, ObservedFingerprint)> =
             Vec::with_capacity(paths.len());
-        for (name, path) in paths {
+        for (name, path) in &paths {
             let observed = match ObservedFingerprint::from_path(path) {
                 Ok(observed) => observed,
                 Err(error) => {
@@ -8117,7 +8283,10 @@ impl<'db> FileHasher<'db> {
 
         let mut requests = Vec::new();
         for path in paths {
-            let Ok(fingerprint) = FileFingerprint::from_path(path) else {
+            let Some(path) = self.invocation_env.resolve(path) else {
+                continue;
+            };
+            let Ok(fingerprint) = FileFingerprint::from_path(&path) else {
                 continue;
             };
             if fingerprint.size < MIN_PERSISTED_HASH_BYTES
@@ -8168,12 +8337,14 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         let (hash, observed) = self.hash_inner(path, true)?;
         if let Some(observed) = &observed {
             self.guard_input(observed);
         }
         self.recent_hashes.borrow_mut().insert(
-            absolute_path(path),
+            resolved.clone(),
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: observed.map(|observed| observed.fingerprint),
@@ -8205,14 +8376,16 @@ impl<'db> FileHasher<'db> {
         observed_ns: i64,
         memoised: &HashMap<FileFingerprint, String>,
     ) -> Result<String> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         #[cfg(unix)]
         {
-            if self.cache.is_none() || absolute_path(path).to_str().is_none() {
+            if self.cache.is_none() || path.to_str().is_none() {
                 return self.hash_unkeyed(path);
             }
             let observed = ObservedFingerprint {
                 fingerprint: FileFingerprint {
-                    path: absolute_path(path).to_string_lossy().into_owned(),
+                    path: path.to_string_lossy().into_owned(),
                     size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
                     mtime_ns: metadata_mtime_ns(metadata),
                     ctime_ns: metadata_ctime_ns(metadata),
@@ -8235,6 +8408,8 @@ impl<'db> FileHasher<'db> {
         path: &Path,
         memoised: &HashMap<FileFingerprint, String>,
     ) -> Result<String> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         let observed_ns = wall_clock_ns();
         let metadata = std::fs::symlink_metadata(path)?;
         self.guard_file_hash_from_metadata(path, &metadata, observed_ns, memoised)
@@ -8247,6 +8422,8 @@ impl<'db> FileHasher<'db> {
         observed: ObservedFingerprint,
         memoised: &HashMap<FileFingerprint, String>,
     ) -> Result<String> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         if !guard_file_memo_eligible(observed.fingerprint.size, observed.fingerprint.inode) {
             return self.hash_unkeyed(path);
         }
@@ -8273,6 +8450,8 @@ impl<'db> FileHasher<'db> {
         path: &Path,
         keyed: bool,
     ) -> Result<(String, Option<ObservedFingerprint>)> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         let Some(cache) = &self.cache else {
             // Read before any stat and before the bytes, so it is no later
             // than whichever stamp is returned.
@@ -8404,7 +8583,8 @@ impl<'db> FileHasher<'db> {
     /// Decisions are keyed by the already-computed content hash, so warm key
     /// construction can reuse them without opening the source again (#557).
     fn env_dep_use(&self, path: &Path, var: &str) -> Result<SourceEnvDepUse> {
-        let absolute = absolute_path(path);
+        let absolute = self.resolve_path(path)?;
+        let path = absolute.as_path();
         let recent = self.recent_hashes.borrow().get(&absolute).cloned();
         let recent = match recent {
             Some(recent) => recent,
@@ -8471,6 +8651,8 @@ impl<'db> FileHasher<'db> {
         var: &str,
         content_hash: &str,
     ) -> Result<SourceEnvDepUse> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         let key = (content_hash.to_string(), var.to_string());
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading {} for env-use scan", path.display()))?;
@@ -8513,13 +8695,15 @@ impl<'db> FileHasher<'db> {
 
     /// [`Self::hash_static_lib`] for a known [`StaticLibUse`].
     pub fn hash_static_lib_for(&self, path: &Path, usage: StaticLibUse) -> Result<String> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         // Without a persistent cache (daemonless / tests), compute directly —
         // still honoring the too-new guard.
         let Some(cache) = &self.cache else {
             if let Ok(fingerprint) = FileFingerprint::from_path(path) {
                 self.note_too_new(&fingerprint);
             }
-            return compute_static_lib_hash(path, usage);
+            return compute_static_lib_hash_for(path, usage, &self.invocation_env);
         };
         let ObservedFingerprint {
             fingerprint,
@@ -8531,7 +8715,7 @@ impl<'db> FileHasher<'db> {
                     "static-lib hash metadata lookup failed for {}: {e}",
                     path.display()
                 );
-                return compute_static_lib_hash(path, usage);
+                return compute_static_lib_hash_for(path, usage, &self.invocation_env);
             }
         };
         self.note_too_new(&fingerprint);
@@ -8540,7 +8724,7 @@ impl<'db> FileHasher<'db> {
         // archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES {
-            let hash = compute_static_lib_hash(path, usage)?;
+            let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
             self.record_miss(size);
             return Ok(hash);
         }
@@ -8574,7 +8758,7 @@ impl<'db> FileHasher<'db> {
             Ok(None) => {}
             Err(e) => tracing::debug!("static-lib hash cache lookup failed: {e}"),
         }
-        let hash = compute_static_lib_hash(path, usage)?;
+        let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
         self.record_miss(size);
         self.pending_memo.borrow_mut().push((
             ObservedFingerprint {
@@ -8617,6 +8801,8 @@ impl<'db> FileHasher<'db> {
         observed: &ObservedFingerprint,
         memoised: &HashMap<String, String>,
     ) -> Result<String> {
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
         if self.cache.is_none() {
             return self.hash(path);
         }
@@ -8652,7 +8838,7 @@ impl<'db> FileHasher<'db> {
         };
         self.guard_input(&reported);
         self.recent_hashes.borrow_mut().insert(
-            absolute_path(path),
+            resolved.clone(),
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),
@@ -8831,6 +9017,7 @@ fn is_panic_header(line: &str) -> bool {
 /// file, etc.). The caller MUST treat that as non-cacheable: `compute_cache_key`
 /// propagates the error so the wrapper passes through to the real compiler and
 /// never stores an entry keyed off an incomplete input set (kunobi-ninja/kache#323).
+#[cfg(test)]
 pub fn run_dep_info_pass(
     rustc: &Path,
     inner_rustc: Option<&Path>,
@@ -8838,13 +9025,34 @@ pub fn run_dep_info_pass(
     rustc_args: &[String],
     use_response_file: bool,
 ) -> Result<DepInfo> {
+    run_dep_info_pass_for(
+        rustc,
+        inner_rustc,
+        source_file,
+        rustc_args,
+        use_response_file,
+        &InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn run_dep_info_pass_for(
+    rustc: &Path,
+    inner_rustc: Option<&Path>,
+    source_file: &Path,
+    rustc_args: &[String],
+    use_response_file: bool,
+    env: &InvocationEnv,
+) -> Result<DepInfo> {
+    let temp_root = env
+        .resolve(env.temp_dir())
+        .context("temporary directory requires the invocation working directory")?;
     let temp_dir = tempfile::Builder::new()
         .prefix("kache-depinfo")
-        .tempdir()
+        .tempdir_in(&temp_root)
         .context("creating temp dir for dep-info")?;
     let dep_file = temp_dir.path().join("deps.d");
 
-    let mut cmd = std::process::Command::new(rustc);
+    let mut cmd = env.command(rustc)?;
     if let Some(inner_rustc) = inner_rustc {
         cmd.arg(inner_rustc);
     }
@@ -8852,7 +9060,8 @@ pub fn run_dep_info_pass(
     let dep_args = dep_info_pass_args(source_file, rustc_args, &dep_file);
 
     let response_file = if use_response_file {
-        let response = crate::compile::RustcResponseFile::new(
+        let response = crate::compile::RustcResponseFile::new_in(
+            &temp_root,
             dep_args.iter().map(std::string::String::as_str),
         )?;
         cmd.arg(response.argument());
@@ -8862,7 +9071,7 @@ pub fn run_dep_info_pass(
         None
     };
 
-    tracing::trace!("dep-info pre-pass: {:?}", cmd);
+    tracing::trace!("dep-info pre-pass: {} arguments", dep_args.len());
 
     let spawned = std::time::Instant::now();
     let output = cmd
@@ -9029,6 +9238,128 @@ fn unescape_env_dep_value(s: &str) -> String {
     out
 }
 
+#[cfg(all(test, unix))]
+mod invocation_core_tests {
+    use super::*;
+
+    #[test]
+    fn hashing_relative_inputs_without_request_cwd_fails_closed() {
+        let env = InvocationEnv::from_parts(
+            Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+        );
+        let hasher = FileHasher::new().with_invocation_env(&env);
+        assert!(hasher.hash(Path::new("Cargo.toml")).is_err());
+        assert!(hasher.hash_static_lib(Path::new("Cargo.toml")).is_err());
+    }
+
+    #[test]
+    fn concurrent_snapshots_keep_keys_predictions_hashes_and_depinfo_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let mut workers = Vec::new();
+        for (name, normalize, contents) in [
+            ("first", "on", "first source"),
+            ("second", "off", "second source"),
+        ] {
+            let cwd = root_path.join(name);
+            for directory in ["bin", "src", "tmp", "generated"] {
+                std::fs::create_dir_all(cwd.join(directory)).unwrap();
+            }
+            std::fs::write(cwd.join("src/lib.rs"), contents).unwrap();
+            std::fs::write(cwd.join("generated/value"), contents).unwrap();
+            kache_fs::testutil::write_executable(
+                &cwd.join("bin/rustc"),
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'rustc fixture\\ncommit-hash: fixture\\nhost: x86_64-unknown-linux-gnu\\n'; exit 0; fi\ncase \"$1\" in @*) response=${1#@}; set --; while IFS= read -r arg; do set -- \"$@\" \"$arg\"; done < \"$response\" ;; esac\nprevious=\noutput=\nfor arg do if [ \"$previous\" = -o ]; then output=$arg; break; fi; previous=$arg; done\n[ -n \"$output\" ] || exit 1\nprintf 'artifact: ./src/lib.rs\\n# env-dep:SNAPSHOT_TOKEN=%s\\n' \"$SNAPSHOT_TOKEN\" > \"$output\"\nprintf '%s\\n%s\\n' \"$PWD\" \"$output\" >> probe.log\n",
+            );
+            let env = InvocationEnv::from_parts(
+                [
+                    ("PATH", std::ffi::OsString::from("bin")),
+                    ("KACHE_CACHE_DIR", root_path.join("cache").into_os_string()),
+                    ("CARGO_MANIFEST_DIR", cwd.clone().into_os_string()),
+                    ("KACHE_RUSTC_PATH_NORMALIZE", normalize.into()),
+                    ("SNAPSHOT_TOKEN", name.into()),
+                ],
+                Some(cwd.clone()),
+                None,
+                cwd.join("tmp"),
+            );
+            workers.push(std::thread::spawn(move || {
+                let argv = [
+                    "rustc",
+                    "--crate-name",
+                    "fixture",
+                    "--crate-type=lib",
+                    "--emit=metadata",
+                    "--out-dir",
+                    "target/debug/deps",
+                    "./src/lib.rs",
+                ]
+                .map(String::from);
+                let parsed = RustcArgs::parse_for(&argv, &env).unwrap();
+                let hasher = FileHasher::new().with_invocation_env(&env);
+                let digest = hasher.hash(Path::new("./src/lib.rs")).unwrap();
+                assert_eq!(
+                    digest,
+                    blake3::hash(contents.as_bytes()).to_hex().to_string()
+                );
+                assert_eq!(
+                    parsed.source_file.as_deref(),
+                    Some(Path::new("./src/lib.rs"))
+                );
+                assert_eq!(
+                    rustc_shared_prediction_identity(&parsed),
+                    None,
+                    "a relative target spelling is ineligible"
+                );
+                let prediction = rustc_prediction_identity(&parsed).unwrap();
+                let normalizer =
+                    PathNormalizer::from_invocation(parsed.path_normalization_root(), &env);
+                let (key, outputs) = compute_cache_key_with_outputs(
+                    &parsed,
+                    &hasher,
+                    &normalizer,
+                    &KeyEnv::from_invocation(&env),
+                );
+                let key = key.unwrap();
+                let dep_info = outputs.dep_info.unwrap();
+                assert_eq!(dep_info.source_files, [PathBuf::from("./src/lib.rs")]);
+                assert_eq!(
+                    dep_info.env_deps,
+                    [("SNAPSHOT_TOKEN".to_owned(), Some(name.to_owned()))]
+                );
+                let response = run_dep_info_pass_for(
+                    Path::new("rustc"),
+                    None,
+                    Path::new("./src/lib.rs"),
+                    &parsed.all_args,
+                    true,
+                    &env,
+                )
+                .unwrap();
+                assert_eq!(response, dep_info);
+                let log = std::fs::read_to_string(cwd.join("probe.log")).unwrap();
+                let lines: Vec<_> = log.lines().collect();
+                assert_eq!(lines.len(), 4);
+                for pair in lines.as_chunks::<2>().0 {
+                    assert_eq!(Path::new(pair[0]), cwd);
+                    assert!(Path::new(pair[1]).starts_with(cwd.join("tmp")));
+                }
+                let tree = out_dir_tree_digest(Path::new("generated"), &hasher).unwrap();
+                (prediction, digest, key, tree)
+            }));
+        }
+        let first = workers.remove(0).join().unwrap();
+        let second = workers.remove(0).join().unwrap();
+        assert_ne!(first.0, second.0);
+        assert_ne!(first.1, second.1);
+        assert_ne!(first.2, second.2);
+        assert_ne!(first.3, second.3);
+    }
+}
+
 /// Get rustc version string, cached to a file keyed by binary mtime.
 ///
 /// Every wrapper invocation needs this, but the output only changes when rustc
@@ -9037,12 +9368,18 @@ fn unescape_env_dep_value(s: &str) -> String {
 /// rest read it back in <1 ms.
 /// `rustc -vV` of `rustc`, as the cache key reads it (cached per binary), or
 /// `None` when it cannot be run.
+#[cfg(test)]
 pub(crate) fn rustc_version_text(rustc: &Path) -> Option<String> {
     get_rustc_version(rustc).ok()
 }
 
+pub(crate) fn rustc_version_text_for(rustc: &Path, env: &InvocationEnv) -> Option<String> {
+    get_rustc_version_for(rustc, env).ok()
+}
+
 /// Whether this compiler accepts cwd remapping for this crate and bootstrap
 /// environment. No source is compiled. Transient faults are not memoized.
+#[cfg(test)]
 pub(crate) fn rustc_accepts_cwd_remap(
     rustc: &Path,
     crate_name: &str,
@@ -9050,10 +9387,28 @@ pub(crate) fn rustc_accepts_cwd_remap(
     bootstrap: Option<&OsStr>,
     restrict_features: bool,
 ) -> Option<bool> {
-    use std::process::{Command, Stdio};
+    rustc_accepts_cwd_remap_for(
+        rustc,
+        crate_name,
+        prefix,
+        bootstrap,
+        restrict_features,
+        &InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn rustc_accepts_cwd_remap_for(
+    rustc: &Path,
+    crate_name: &str,
+    prefix: &str,
+    bootstrap: Option<&OsStr>,
+    restrict_features: bool,
+    env: &InvocationEnv,
+) -> Option<bool> {
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
     let mut material = crate::probe_memo::Material::new("rustc-cwd-remap-v1");
-    if let Some(path) = program_path(rustc, std::env::var_os("PATH").as_deref())
+    if let Some(path) = env.resolve_program(rustc)
         && let Ok(meta) = std::fs::metadata(path)
     {
         material.push(&meta.len().to_le_bytes());
@@ -9078,13 +9433,13 @@ pub(crate) fn rustc_accepts_cwd_remap(
         }
     }
     let memo = format!("rustc-cwd-{}", material.digest());
-    match read_tool_version_cache(rustc, &memo).as_deref() {
+    match read_tool_version_cache_for(rustc, &memo, env).as_deref() {
         Some("yes") => return Some(true),
         Some("no") => return Some(false),
         _ => {}
     }
-    let mut command = Command::new(rustc);
-    crate::toolchain_dylib::apply(&mut command, rustc);
+    let mut command = env.command(rustc).ok()?;
+    crate::toolchain_dylib::apply_for(&mut command, rustc, env);
     command
         .args(["--crate-name", crate_name, "--print", "cfg"])
         .arg(format!("-Zremap-cwd-prefix={prefix}"))
@@ -9106,7 +9461,12 @@ pub(crate) fn rustc_accepts_cwd_remap(
             Ok(Some(status)) => {
                 status.code()?;
                 let accepted = status.success();
-                write_tool_version_cache(rustc, &memo, if accepted { "yes" } else { "no" });
+                write_tool_version_cache_for(
+                    rustc,
+                    &memo,
+                    if accepted { "yes" } else { "no" },
+                    env,
+                );
                 return Some(accepted);
             }
             Ok(None) if cwd_remap_probe_within_deadline(start.elapsed()) => {
@@ -9126,30 +9486,42 @@ fn cwd_remap_probe_within_deadline(elapsed: std::time::Duration) -> bool {
     elapsed < std::time::Duration::from_secs(2)
 }
 
+#[cfg(test)]
 fn get_rustc_version(rustc: &Path) -> Result<String> {
+    get_rustc_version_for(rustc, &InvocationEnv::capture())
+}
+
+pub(crate) fn get_rustc_version_for(rustc: &Path, env: &InvocationEnv) -> Result<String> {
     let _trace = crate::phase_trace::phase("compiler_identity");
-    if let Some(cached) = read_tool_version_cache(rustc, "rustc-ver") {
+    if let Some(cached) = read_tool_version_cache_for(rustc, "rustc-ver", env) {
         return Ok(cached);
     }
 
-    let output = std::process::Command::new(rustc)
+    let output = env
+        .command(rustc)?
         .arg("--version")
         .arg("--verbose")
         .output()
         .context("running rustc --version --verbose")?;
 
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    write_tool_version_cache(rustc, "rustc-ver", &version);
+    write_tool_version_cache_for(rustc, "rustc-ver", &version, env);
     Ok(version)
 }
 
 /// `clippy-driver --version` (`clippy 0.1.98 (hash date)`), file-cached like
 /// the rustc version. `-vV` only reports the underlying rustc.
+#[cfg(test)]
 fn get_clippy_version(driver: &Path) -> Result<String> {
-    if let Some(cached) = read_tool_version_cache(driver, "clippy-ver") {
+    get_clippy_version_for(driver, &InvocationEnv::capture())
+}
+
+fn get_clippy_version_for(driver: &Path, env: &InvocationEnv) -> Result<String> {
+    if let Some(cached) = read_tool_version_cache_for(driver, "clippy-ver", env) {
         return Ok(cached);
     }
-    let output = std::process::Command::new(driver)
+    let output = env
+        .command(driver)?
         .arg("--version")
         .output()
         .context("running clippy-driver --version")?;
@@ -9158,7 +9530,7 @@ fn get_clippy_version(driver: &Path) -> Result<String> {
         !version.is_empty(),
         "clippy-driver --version printed nothing"
     );
-    write_tool_version_cache(driver, "clippy-ver", &version);
+    write_tool_version_cache_for(driver, "clippy-ver", &version, env);
     Ok(version)
 }
 
@@ -9167,6 +9539,7 @@ fn get_clippy_version(driver: &Path) -> Result<String> {
 /// or `clippy.toml`, searched from `CLIPPY_CONF_DIR`, else the manifest
 /// directory, upwards) and the lint arguments `cargo clippy` passes through
 /// the environment. Content, not location, so two checkouts share keys.
+#[cfg(test)]
 pub(crate) fn clippy_identity(driver: &Path, env: &KeyEnv) -> Result<String> {
     clippy_identity_in(
         driver,
@@ -9175,28 +9548,60 @@ pub(crate) fn clippy_identity(driver: &Path, env: &KeyEnv) -> Result<String> {
     )
 }
 
+pub(crate) fn clippy_identity_for(
+    driver: &Path,
+    env: &KeyEnv,
+    invocation: &InvocationEnv,
+) -> Result<String> {
+    clippy_identity_with_version(
+        get_clippy_version_for(driver, invocation)?,
+        |name| env.var_os(name),
+        invocation.cwd().map(Path::to_path_buf),
+    )
+}
+
+#[cfg(test)]
 fn clippy_identity_in(
     driver: &Path,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     current_dir: Option<PathBuf>,
 ) -> Result<String> {
-    let mut identity = get_clippy_version(driver)?;
+    clippy_identity_with_version(get_clippy_version(driver)?, env, current_dir)
+}
+
+fn clippy_identity_with_version(
+    mut identity: String,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    current_dir: Option<PathBuf>,
+) -> Result<String> {
     identity.push('\n');
     // The `cargo` lint group reads the package manifest, which rustc's
     // dep-info never lists.
     if let Some(manifest_dir) = env("CARGO_MANIFEST_DIR") {
         let manifest = PathBuf::from(manifest_dir).join("Cargo.toml");
-        match std::fs::read(&manifest) {
-            Ok(content) => {
+        let manifest = if manifest.is_absolute() {
+            Some(manifest)
+        } else {
+            current_dir.as_ref().map(|cwd| cwd.join(manifest))
+        };
+        match manifest.and_then(|path| std::fs::read(path).ok()) {
+            Some(content) => {
                 identity.push_str(&format!("manifest:{}\n", blake3::hash(&content).to_hex()))
             }
-            Err(_) => identity.push_str("manifest:none\n"),
+            None => identity.push_str("manifest:none\n"),
         }
     }
     let start = env("CLIPPY_CONF_DIR")
         .or_else(|| env("CARGO_MANIFEST_DIR"))
         .map(PathBuf::from)
-        .or(current_dir);
+        .map(|path| {
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                current_dir.as_ref().map(|cwd| cwd.join(path))
+            }
+        })
+        .unwrap_or(current_dir);
     match start.and_then(|start| selected_clippy_config(&start)) {
         Some(path) => {
             let content = std::fs::read(&path)
@@ -9244,8 +9649,8 @@ fn selected_clippy_config(start: &Path) -> Option<PathBuf> {
 /// process spawn. Returns `None` for a locally-built rustc whose `commit-hash`
 /// is absent or `unknown`; the `<RUST_SRC>` rule is then skipped and std paths
 /// stay virtual (see [`crate::path_normalizer::PathNormalizer::with_rust_src_rule`]).
-pub(crate) fn get_rustc_commit_hash(rustc: &Path) -> Option<String> {
-    let vv = get_rustc_version(rustc).ok()?;
+pub(crate) fn get_rustc_commit_hash_for(rustc: &Path, env: &InvocationEnv) -> Option<String> {
+    let vv = get_rustc_version_for(rustc, env).ok()?;
     vv.lines()
         .find_map(|l| l.strip_prefix("commit-hash:"))
         .map(|h| h.trim().to_string())
@@ -9261,20 +9666,27 @@ pub(crate) fn get_rustc_commit_hash(rustc: &Path) -> Option<String> {
 /// toolchain-selection state, so a shim redirected to another toolchain
 /// re-probes instead of serving a stale sysroot (see
 /// [`toolchain_selector_fingerprint`]).
+#[cfg(test)]
 pub(crate) fn get_rustc_sysroot(args: &RustcArgs) -> Option<PathBuf> {
+    get_rustc_sysroot_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn get_rustc_sysroot_for(args: &RustcArgs, env: &InvocationEnv) -> Option<PathBuf> {
     if let Some(sysroot) = &args.sysroot {
-        return Some(sysroot.clone());
+        return env.resolve(sysroot);
     }
-    default_rustc_sysroot(&args.rustc)
+    default_rustc_sysroot_for(&args.rustc, env)
 }
 
 /// `rustc --print sysroot` without `--sysroot`: the toolchain's own sysroot,
 /// file-cached like the version probe.
-fn default_rustc_sysroot(rustc: &Path) -> Option<PathBuf> {
-    if let Some(cached) = read_tool_version_cache(rustc, "rustc-sysroot") {
+fn default_rustc_sysroot_for(rustc: &Path, env: &InvocationEnv) -> Option<PathBuf> {
+    if let Some(cached) = read_tool_version_cache_for(rustc, "rustc-sysroot", env) {
         return Some(PathBuf::from(cached));
     }
-    let output = std::process::Command::new(rustc)
+    let output = env
+        .command(rustc)
+        .ok()?
         .arg("--print")
         .arg("sysroot")
         .output()
@@ -9286,8 +9698,9 @@ fn default_rustc_sysroot(rustc: &Path) -> Option<PathBuf> {
     if sysroot.is_empty() {
         return None;
     }
-    write_tool_version_cache(rustc, "rustc-sysroot", &sysroot);
-    Some(PathBuf::from(sysroot))
+    let sysroot = env.resolve(Path::new(&sysroot))?;
+    write_tool_version_cache_for(rustc, "rustc-sysroot", &sysroot.to_string_lossy(), env);
+    Some(sysroot)
 }
 
 /// Where rustc looks first for a linker named without a directory, such as
@@ -9296,13 +9709,22 @@ fn default_rustc_sysroot(rustc: &Path) -> Option<PathBuf> {
 /// for the linker it runs. In a double-wrapper invocation the sysroot is
 /// the inner rustc's, like the host triple. Without the toolchain's sysroot
 /// the lookup could find a different linker than rustc, so that is an error.
+#[cfg(test)]
 fn rustc_tool_dirs(args: &RustcArgs, host: &str) -> Result<Vec<PathBuf>> {
+    rustc_tool_dirs_for(args, host, &InvocationEnv::capture())
+}
+
+pub(crate) fn rustc_tool_dirs_for(
+    args: &RustcArgs,
+    host: &str,
+    env: &InvocationEnv,
+) -> Result<Vec<PathBuf>> {
     let rustc = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
-    let sysroot = default_rustc_sysroot(rustc).context("rustc --print sysroot failed")?;
+    let sysroot = default_rustc_sysroot_for(rustc, env).context("rustc --print sysroot failed")?;
     Ok(args
         .sysroot
         .iter()
-        .cloned()
+        .filter_map(|root| env.resolve(root))
         .chain([sysroot])
         .map(|sysroot| crate::native_link_key::rustc_tool_dir(&sysroot, host))
         .collect())
@@ -9313,18 +9735,19 @@ fn rustc_tool_dirs(args: &RustcArgs, host: &str) -> Result<Vec<PathBuf>> {
 /// sysroot. Both are hashed because which one rustc searches first depends on
 /// its release. Finding none is an error, so the compile is not cached under a
 /// key that describes no backend.
-fn toolchain_codegen_backends(
+pub(crate) fn toolchain_codegen_backends_for(
     args: &RustcArgs,
     rustc_version: &str,
     name: &str,
     file_hasher: &FileHasher,
+    env: &InvocationEnv,
 ) -> Result<Vec<(String, String)>> {
     let host = rustc_host_triple(rustc_version).context("rustc -vV reports no host")?;
     let sysroots = args
         .sysroot
         .iter()
-        .cloned()
-        .chain(default_rustc_sysroot(&args.rustc));
+        .filter_map(|root| env.resolve(root))
+        .chain(default_rustc_sysroot_for(&args.rustc, env));
     let found = codegen_backend_libraries(sysroots, host, name, file_hasher)?;
     anyhow::ensure!(
         !found.is_empty(),
@@ -9386,8 +9809,13 @@ fn is_codegen_backend_library(file: &str, stem: &str) -> bool {
 
 /// Read a cached tool-version string.  Returns `None` on any failure (missing
 /// file, stale mtime, I/O error) so the caller falls back to running the tool.
+#[cfg(test)]
 fn read_tool_version_cache(binary: &Path, prefix: &str) -> Option<String> {
-    let cache_file = tool_version_cache_path(binary, prefix)?;
+    read_tool_version_cache_for(binary, prefix, &InvocationEnv::capture())
+}
+
+fn read_tool_version_cache_for(binary: &Path, prefix: &str, env: &InvocationEnv) -> Option<String> {
+    let cache_file = tool_version_cache_path_for(binary, prefix, env)?;
     std::fs::read_to_string(cache_file)
         .ok()
         .filter(|s| !s.is_empty())
@@ -9395,8 +9823,13 @@ fn read_tool_version_cache(binary: &Path, prefix: &str) -> Option<String> {
 
 /// Persist a tool-version string for later reads.  Best-effort — errors are
 /// silently ignored because the fallback (running the tool) is always available.
+#[cfg(test)]
 fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
-    if let Some(cache_file) = tool_version_cache_path(binary, prefix) {
+    write_tool_version_cache_for(binary, prefix, version, &InvocationEnv::capture());
+}
+
+fn write_tool_version_cache_for(binary: &Path, prefix: &str, version: &str, env: &InvocationEnv) {
+    if let Some(cache_file) = tool_version_cache_path_for(binary, prefix, env) {
         // The cache directory may not exist yet (a fresh machine, or a CI
         // runner whose store lives elsewhere); without it nothing was ever
         // persisted and every process re-ran the probe.
@@ -9404,22 +9837,35 @@ fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
     }
 }
 
-/// Build the cache-file path: `<cache_dir>/<prefix>-<hash>.txt` where the hash
+/// Build the cache-file path: `<cache_dir>/probes/<prefix>-<hash>.txt` where the hash
 /// is derived from the binary's canonical path + mtime so it auto-invalidates
 /// when the toolchain is updated, plus the rustup toolchain-selection state
 /// (see [`toolchain_selector_fingerprint`]) and the installed toolchains
 /// (see [`installed_toolchains_fingerprint`]).
+#[cfg(test)]
 fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
-    tool_version_cache_path_in(binary, prefix, std::env::var_os("PATH").as_deref())
+    tool_version_cache_path_for(binary, prefix, &InvocationEnv::capture())
 }
 
 /// [`tool_version_cache_path`] with `PATH` given.
+#[cfg(test)]
 fn tool_version_cache_path_in(
     binary: &Path,
     prefix: &str,
     path_var: Option<&OsStr>,
 ) -> Option<std::path::PathBuf> {
-    let canon = std::fs::canonicalize(program_path(binary, path_var)?).ok()?;
+    let mut env = InvocationEnv::capture();
+    env.set("PATH", path_var.unwrap_or_else(|| OsStr::new("")));
+    let resolved = program_path(binary, path_var)?;
+    tool_version_cache_path_for(&resolved, prefix, &env)
+}
+
+fn tool_version_cache_path_for(
+    binary: &Path,
+    prefix: &str,
+    env: &InvocationEnv,
+) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(env.resolve_program(binary)?).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?
         .modified()
@@ -9427,14 +9873,14 @@ fn tool_version_cache_path_in(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let rustup_home = rustup_home();
+    let rustup_home = rustup_home_for(env);
     let key = format!(
         "{}:{}:{}:{}",
         canon.display(),
         mtime,
         toolchain_selector_fingerprint(
-            std::env::var_os("RUSTUP_TOOLCHAIN").as_deref(),
-            std::env::current_dir().ok().as_deref(),
+            env.var_os("RUSTUP_TOOLCHAIN").as_deref(),
+            env.cwd(),
             rustup_home
                 .as_ref()
                 .map(|home| home.join("settings.toml"))
@@ -9448,7 +9894,11 @@ fn tool_version_cache_path_in(
         )
     );
     let hash = blake3::hash(key.as_bytes()).to_hex();
-    Some(crate::config::default_cache_dir().join(format!("{}-{}.txt", prefix, &hash[..16])))
+    Some(crate::config::probe_memo_dir_for(env).ok()?.join(format!(
+        "{}-{}.txt",
+        prefix,
+        &hash[..16]
+    )))
 }
 
 /// The rustup toolchain-selection state that can redirect an unchanged shim
@@ -9542,10 +9992,16 @@ fn installed_toolchains_fingerprint(toolchains: Option<&Path>) -> String {
 
 /// `$RUSTUP_HOME` (or its `~/.rustup` default): `settings.toml` records the
 /// `rustup default` toolchain, `toolchains/` holds the installed ones.
+#[cfg(test)]
 fn rustup_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("RUSTUP_HOME")
+    rustup_home_for(&InvocationEnv::capture())
+}
+
+fn rustup_home_for(env: &InvocationEnv) -> Option<PathBuf> {
+    env.var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))
+        .or_else(|| env.home_dir().map(|home| home.join(".rustup")))
+        .and_then(|home| env.resolve(&home))
 }
 
 /// Content digest of a small selector file, or `None` if unreadable.
@@ -9650,12 +10106,34 @@ where
 ///
 /// The injected probe keeps the gating independently testable without running
 /// host tools or depending on the test runner's libc.
+#[cfg(test)]
 fn fold_native_host_libc_signature<H: KeyFold, F>(
     hasher: &mut H,
     args: &RustcArgs,
     rustc_version: &str,
     running_on_linux: bool,
     probe: F,
+) -> Result<()>
+where
+    F: FnOnce(LinuxLibcFamily) -> Result<String>,
+{
+    fold_native_host_libc_signature_for(
+        hasher,
+        args,
+        rustc_version,
+        running_on_linux,
+        probe,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn fold_native_host_libc_signature_for<H: KeyFold, F>(
+    hasher: &mut H,
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_linux: bool,
+    probe: F,
+    invocation: &InvocationEnv,
 ) -> Result<()>
 where
     F: FnOnce(LinuxLibcFamily) -> Result<String>,
@@ -9668,7 +10146,9 @@ where
     if !running_on_linux || !args.is_executable_output() || !emits_link {
         return Ok(());
     }
-    let rustc_version = rustc_version_for_native_link(args, rustc_version, get_rustc_version)?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, |rustc| {
+        get_rustc_version_for(rustc, invocation)
+    })?;
 
     let Some(family) = native_linux_libc_family(args, &rustc_version, running_on_linux)? else {
         return Ok(());
@@ -9695,6 +10175,7 @@ where
 /// Fold hashed CRT/startup/libc objects (Linux) and SDK identity (macOS)
 /// into linked-output keys. Injected probes keep the gating testable without
 /// running host tools.
+#[cfg(test)]
 fn fold_native_link_runtime_identity<H, Crt, Sdk>(
     hasher: &mut H,
     args: &RustcArgs,
@@ -9710,6 +10191,35 @@ where
     Crt: FnOnce(&Path) -> Result<BTreeMap<String, String>>,
     Sdk: FnOnce(Option<String>) -> Result<String>,
 {
+    fold_native_link_runtime_identity_for(
+        hasher,
+        args,
+        rustc_version,
+        running_on_linux,
+        running_on_macos,
+        crt_probe,
+        sdk_probe,
+        env,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn fold_native_link_runtime_identity_for<H, Crt, Sdk>(
+    hasher: &mut H,
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_linux: bool,
+    running_on_macos: bool,
+    crt_probe: Crt,
+    sdk_probe: Sdk,
+    env: &KeyEnv,
+    invocation: &InvocationEnv,
+) -> Result<()>
+where
+    H: KeyFold,
+    Crt: FnOnce(&Path) -> Result<BTreeMap<String, String>>,
+    Sdk: FnOnce(Option<String>) -> Result<String>,
+{
     let emits_link = args.emit.is_empty() || args.emit.iter().any(|kind| kind == "link");
     if !args.is_executable_output() || !emits_link {
         return Ok(());
@@ -9717,7 +10227,9 @@ where
     if !running_on_linux && !running_on_macos {
         return Ok(());
     }
-    let rustc_version = rustc_version_for_native_link(args, rustc_version, get_rustc_version)?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, |rustc| {
+        get_rustc_version_for(rustc, invocation)
+    })?;
     let host = rustc_host_triple(&rustc_version)
         .context("wrapped rustc -vV output has no host triple; cannot key native link runtime")?;
     let effective_target = args.target.as_deref().unwrap_or(host);
@@ -9726,7 +10238,7 @@ where
     }
 
     if running_on_linux && host.split('-').any(|component| component == "linux") {
-        let driver = resolve_link_driver(args)
+        let driver = resolve_link_driver_for(args, invocation)
             .context("native Linux link has no cc/linker driver; cannot key CRT objects")?;
         let objects = crt_probe(&driver).context("determining native Linux CRT/libc identity")?;
         let encoded = crate::native_link_key::encode_crt_objects(&objects);
@@ -9889,6 +10401,7 @@ where
 /// key. The probe is injected so the admission gate can be tested without a
 /// Windows toolchain; production supplies the real tool/library discovery.
 /// It gets the selected linker, the MSVC architecture and rustc's host.
+#[cfg(test)]
 fn fold_native_windows_msvc_identity<H, Probe>(
     hasher: &mut H,
     args: &RustcArgs,
@@ -9900,10 +10413,34 @@ where
     H: KeyFold,
     Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
 {
+    fold_native_windows_msvc_identity_for(
+        hasher,
+        args,
+        rustc_version,
+        running_on_windows,
+        probe,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn fold_native_windows_msvc_identity_for<H, Probe>(
+    hasher: &mut H,
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_windows: bool,
+    probe: Probe,
+    invocation: &InvocationEnv,
+) -> Result<()>
+where
+    H: KeyFold,
+    Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
+{
     if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
         return Ok(());
     }
-    let rustc_version = rustc_version_for_native_link(args, rustc_version, get_rustc_version)?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, |rustc| {
+        get_rustc_version_for(rustc, invocation)
+    })?;
     let host = rustc_host_triple(&rustc_version)
         .context("wrapped rustc -vV output has no host triple; cannot key native Windows link")?;
     let effective_target = args.target.as_deref().unwrap_or(host);
@@ -9952,14 +10489,9 @@ where
     Ok(())
 }
 
-fn resolve_link_driver(args: &RustcArgs) -> Option<PathBuf> {
+pub(crate) fn resolve_link_driver_for(args: &RustcArgs, env: &InvocationEnv) -> Option<PathBuf> {
     let linker = args.get_codegen_opt("linker").unwrap_or("cc");
-    let linker_path = Path::new(linker);
-    if linker_path.is_absolute() {
-        Some(linker_path.to_path_buf())
-    } else {
-        resolve_in_path(linker)
-    }
+    env.resolve_program(Path::new(linker))
 }
 
 fn is_libc_version(version: &str) -> bool {
@@ -10019,10 +10551,19 @@ fn parse_ldd_libc(text: &str) -> Option<(LinuxLibcFamily, String)> {
 /// requested by #127. `ldd --version` is a fallback for minimal GNU systems and
 /// the primary musl signal. A family mismatch or unparseable result fails
 /// closed; the caller then treats the compile as uncacheable.
+#[cfg(all(test, target_os = "linux"))]
 fn probe_linux_libc_signature(expected: LinuxLibcFamily) -> Result<String> {
+    probe_linux_libc_signature_for(expected, &InvocationEnv::capture())
+}
+
+fn probe_linux_libc_signature_for(
+    expected: LinuxLibcFamily,
+    env: &InvocationEnv,
+) -> Result<String> {
     let _trace = crate::phase_trace::phase("native_libc_signature");
     if expected == LinuxLibcFamily::Gnu
-        && let Ok(output) = std::process::Command::new("getconf")
+        && let Ok(mut command) = env.command("getconf")
+        && let Ok(output) = command
             .arg("GNU_LIBC_VERSION")
             .env("LC_ALL", "C")
             .env("LANG", "C")
@@ -10033,11 +10574,12 @@ fn probe_linux_libc_signature(expected: LinuxLibcFamily) -> Result<String> {
         return Ok(version);
     }
 
-    if let Ok(output) = std::process::Command::new("ldd")
-        .arg("--version")
-        .env("LC_ALL", "C")
-        .env("LANG", "C")
-        .output()
+    if let Ok(mut command) = env.command("ldd")
+        && let Ok(output) = command
+            .arg("--version")
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .output()
     {
         // musl commonly writes its banner to stderr (and may return non-zero),
         // so parse both streams before considering the exit status.
@@ -10060,47 +10602,43 @@ fn probe_linux_libc_signature(expected: LinuxLibcFamily) -> Result<String> {
 }
 
 /// Get linker identity string for cache key, with file-based caching.
+#[cfg(test)]
 fn get_linker_identity(args: &RustcArgs) -> Option<String> {
+    get_linker_identity_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn get_linker_identity_for(args: &RustcArgs, env: &InvocationEnv) -> Option<String> {
     let _trace = crate::phase_trace::phase("linker_identity");
     let linker = args.get_codegen_opt("linker").unwrap_or("cc");
-    let linker_path = Path::new(linker);
+    let resolved = env.resolve_program(Path::new(linker))?;
 
-    // If it's already an absolute path, use it directly; otherwise try to
-    // resolve via PATH so we can key the cache on the binary's mtime.
-    let resolved = if linker_path.is_absolute() {
-        linker_path.to_path_buf()
-    } else {
-        resolve_in_path(linker)?
-    };
-
-    if let Some(cached) = read_tool_version_cache(&resolved, "linker-ver") {
+    if let Some(cached) = read_tool_version_cache_for(&resolved, "linker-ver", env) {
         return Some(cached);
     }
 
-    let output = std::process::Command::new(linker)
+    let output = env
+        .command(&resolved)
+        .ok()?
         .arg("--version")
         .output()
         .ok()?;
 
     let version = String::from_utf8_lossy(&output.stdout);
     let first_line = version.lines().next()?.to_string();
-    write_tool_version_cache(&resolved, "linker-ver", &first_line);
+    write_tool_version_cache_for(&resolved, "linker-ver", &first_line, env);
     Some(first_line)
-}
-
-/// Resolve a bare command name to a full path by searching PATH.
-fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
-    resolve_in(name, &std::env::var_os("PATH")?)
 }
 
 /// The first file named `name` in `path_var` that a spawn could run: on
 /// Unix, one with an execute bit, as `execvp` skips the others.
+#[cfg(all(test, unix))]
 fn resolve_in(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {
     std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
         .find(|p| runnable_file(p))
 }
 
+#[cfg(all(test, unix))]
 fn runnable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -10123,6 +10661,7 @@ fn runnable_file(path: &Path) -> bool {
 /// the working directory fails. Windows searches the wrapper's own directory
 /// and adds `.exe` first, so a bare name there is not resolved and the
 /// caller runs the tool as before.
+#[cfg(test)]
 fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a, Path>> {
     let mut components = binary.components();
     match (components.next(), components.next()) {
@@ -10135,6 +10674,7 @@ fn program_path<'a>(binary: &'a Path, path_var: Option<&OsStr>) -> Option<Cow<'a
 
 /// One function with a cfg block per platform, so the Linux mutation lane
 /// mutates the body it compiles and tests.
+#[cfg(test)]
 fn bare_program_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
@@ -10149,3 +10689,92 @@ fn bare_program_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<std::path
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod tool_probe_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_probes_and_memos_stay_with_their_invocation() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let mut invocations = Vec::new();
+        for name in ["first", "second"] {
+            let cwd = root.path().join(name);
+            std::fs::create_dir_all(cwd.join("bin")).unwrap();
+            kache_fs::testutil::write_executable(
+                &cwd.join("bin/rustc"),
+                "#!/bin/sh\nprintf 'probe\\n' >> calls.log\ncase \"$1\" in\n--version) printf 'rustc %s\\ncommit-hash: %s-commit\\nhost: fixture-host\\n' \"$PROBE_TOKEN\" \"$PROBE_TOKEN\" ;;\n--print) printf '%s/sysroot-%s\\n' \"$PWD\" \"$PROBE_TOKEN\" ;;\n*) exit 1 ;;\nesac\n",
+            );
+            let env = InvocationEnv::from_parts(
+                [
+                    ("PATH", std::ffi::OsString::from("bin")),
+                    ("KACHE_CACHE_DIR", cache.clone().into_os_string()),
+                    ("RUSTUP_HOME", ".rustup".into()),
+                    ("PROBE_TOKEN", name.into()),
+                ],
+                Some(cwd.clone()),
+                Some(cwd.join("home")),
+                root.path().to_path_buf(),
+            );
+            invocations.push((cwd, env, name));
+        }
+        let argv = ["rustc", "--crate-name", "fixture", "lib.rs"].map(String::from);
+        for (cwd, env, name) in &invocations {
+            let parsed = RustcArgs::parse_for(&argv, env).unwrap();
+            let version = get_rustc_version_for(Path::new("rustc"), env).unwrap();
+            assert!(version.starts_with(&format!("rustc {name}\n")));
+            assert_eq!(
+                get_rustc_commit_hash_for(Path::new("rustc"), env),
+                Some(format!("{name}-commit"))
+            );
+            let sysroot = cwd.canonicalize().unwrap().join(format!("sysroot-{name}"));
+            assert_eq!(get_rustc_sysroot_for(&parsed, env), Some(sysroot.clone()));
+            assert_eq!(get_rustc_sysroot_for(&parsed, env), Some(sysroot));
+            assert_eq!(
+                get_rustc_version_for(Path::new("rustc"), env).unwrap(),
+                version
+            );
+            assert_eq!(
+                std::fs::read_to_string(cwd.join("calls.log")).unwrap(),
+                "probe\nprobe\n"
+            );
+            assert_eq!(rustup_home_for(env), Some(cwd.join(".rustup")));
+        }
+        let first = tool_version_cache_path_for(Path::new("rustc"), "rustc-ver", &invocations[0].1)
+            .unwrap();
+        let second =
+            tool_version_cache_path_for(Path::new("rustc"), "rustc-ver", &invocations[1].1)
+                .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(cache.join("probes").as_path()));
+        assert_eq!(second.parent(), first.parent());
+
+        // The same compiler path can change selection without its metadata
+        // changing. Both client env and nearest toolchain files invalidate it.
+        let (cwd, original, _) = &invocations[0];
+        let mut changed = original.clone();
+        changed.set("RUSTUP_TOOLCHAIN", "nightly");
+        changed.set("PROBE_TOKEN", "nightly");
+        assert!(
+            get_rustc_version_for(Path::new("rustc"), &changed)
+                .unwrap()
+                .starts_with("rustc nightly\n")
+        );
+        std::fs::write(
+            cwd.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel='beta'\n",
+        )
+        .unwrap();
+        changed.set("PROBE_TOKEN", "beta");
+        assert!(
+            get_rustc_version_for(Path::new("rustc"), &changed)
+                .unwrap()
+                .starts_with("rustc beta\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("calls.log")).unwrap(),
+            "probe\nprobe\nprobe\nprobe\n"
+        );
+    }
+}

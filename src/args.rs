@@ -122,7 +122,7 @@ impl RustcArgfileExpander {
         option == "shell-argfiles" || option.starts_with("shell-argfiles=")
     }
 
-    fn expand_arg(&mut self, arg: &str) -> Result<()> {
+    fn expand_arg(&mut self, arg: &str, env: &crate::invocation::InvocationEnv) -> Result<()> {
         let Some(path) = arg.strip_prefix('@') else {
             self.push(arg.to_string());
             return Ok(());
@@ -132,7 +132,10 @@ impl RustcArgfileExpander {
             bail!("rustc shell-style response files are not yet supported");
         }
 
-        let contents = std::fs::read_to_string(path)
+        let resolved = env
+            .resolve(Path::new(path))
+            .context("rustc response file requires the invocation working directory")?;
+        let contents = std::fs::read_to_string(&resolved)
             .with_context(|| format!("reading rustc response file `{path}`"))?;
         // Match rustc exactly: each line is one argument, whitespace and blank
         // lines are preserved, and lines originating in a response file are
@@ -170,14 +173,17 @@ impl RustcArgfileExpander {
 /// files. Expansion is atomic: any read/UTF-8/shell-style/lossless-transport
 /// failure makes the whole invocation unsupported so the wrapper can pass the
 /// original argv to rustc for its authoritative diagnostic.
-fn expand_rustc_argfiles(args: &[String]) -> Result<Option<Vec<String>>> {
+fn expand_rustc_argfiles(
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<Option<Vec<String>>> {
     if !args.iter().any(|arg| arg.starts_with('@')) {
         return Ok(None);
     }
 
     let mut expander = RustcArgfileExpander::default();
     for arg in args {
-        expander.expand_arg(arg)?;
+        expander.expand_arg(arg, env)?;
     }
 
     // Kache snapshots the effective argv into its own standard response file
@@ -296,6 +302,9 @@ pub struct RustcArgs {
     /// rustc injection, and dep-info transport all reuse this frozen value so
     /// filesystem drift cannot make them observe different remap rules.
     path_normalization_root: Option<PathBuf>,
+    /// Caller cwd for resolving derived paths without changing source or argv
+    /// spellings, which rustc embeds in artifacts and diagnostics.
+    invocation_env: crate::invocation::InvocationEnv,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +367,14 @@ impl RustcArgs {
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
     pub fn parse(args: &[String]) -> Result<Self> {
+        Self::parse_for(args, &crate::invocation::InvocationEnv::capture())
+    }
+
+    /// Parse using the requesting compiler process's environment and cwd.
+    pub(crate) fn parse_for(
+        args: &[String],
+        env: &crate::invocation::InvocationEnv,
+    ) -> Result<Self> {
         if args.len() < 2 {
             bail!("expected at least rustc path as first argument");
         }
@@ -374,7 +391,7 @@ impl RustcArgs {
             (None, &args[1..])
         };
 
-        let (parse_args, raw_args, argfile_state) = match expand_rustc_argfiles(rustc_args) {
+        let (parse_args, raw_args, argfile_state) = match expand_rustc_argfiles(rustc_args, env) {
             Ok(Some(expanded)) => (
                 Cow::Owned(expanded),
                 Some(rustc_args.to_vec()),
@@ -427,8 +444,9 @@ impl RustcArgs {
             diagnostic_arg_indices: Vec::new(),
             is_test: false,
             is_primary: false,
-            path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
+            path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled_for(env),
             path_normalization_root: None,
+            invocation_env: env.clone(),
         };
         // Some rustc queries accept a crate name and source path but only print
         // information to stdout; they deliberately emit no cacheable artifacts.
@@ -688,9 +706,9 @@ impl RustcArgs {
         parsed.features.sort();
         parsed.is_primary =
             !is_query && parsed.crate_name.is_some() && parsed.source_file.is_some();
-        parsed.path_normalization_root = std::env::current_dir()
-            .ok()
-            .map(|cwd| parsed.select_path_normalization_root(&cwd));
+        parsed.path_normalization_root = env
+            .cwd()
+            .map(|cwd| parsed.select_path_normalization_root(cwd));
 
         Ok(parsed)
     }
@@ -815,7 +833,13 @@ impl RustcArgs {
     }
 
     pub fn verified_workspace_root(&self, cwd: &Path) -> Option<PathBuf> {
-        let candidate = self.workspace_root()?;
+        let target = self.target_dir_from_args()?;
+        let candidate = target.parent()?;
+        let candidate = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            cwd.join(candidate)
+        };
         if !candidate.join("Cargo.toml").is_file() {
             return None;
         }
@@ -823,7 +847,7 @@ impl RustcArgs {
         let canonical_cwd = cwd.canonicalize().ok()?;
         canonical_cwd
             .starts_with(&canonical_candidate)
-            .then(|| std::path::absolute(&candidate).unwrap_or(candidate))
+            .then_some(candidate)
     }
 
     /// Workspace anchor shared by cache-key construction and rustc remapping.
@@ -869,6 +893,18 @@ impl RustcArgs {
     /// `rustc -o /tmp/prog`), so dep-info rewriting is skipped rather than
     /// anchored to a wrong directory.
     pub fn target_dir(&self) -> Option<PathBuf> {
+        self.resolve_invocation_path(&self.target_dir_from_args()?)
+    }
+
+    pub(crate) fn invocation_env(&self) -> &crate::invocation::InvocationEnv {
+        &self.invocation_env
+    }
+
+    pub(crate) fn resolve_invocation_path(&self, path: &Path) -> Option<PathBuf> {
+        self.invocation_env.resolve(path)
+    }
+
+    pub(crate) fn target_dir_from_args(&self) -> Option<PathBuf> {
         let is_cross = self.target.is_some();
         if let Some(od) = &self.out_dir {
             let profile = match crate::cargo_layout::per_unit_out_dir(od) {
@@ -908,7 +944,9 @@ impl RustcArgs {
     /// pass them through so expected probe failures do not appear as kache
     /// cache errors.
     pub fn is_build_script_probe(&self, build_script_out_dir: Option<&Path>) -> bool {
-        let Some(build_script_out_dir) = build_script_out_dir else {
+        let Some(build_script_out_dir) =
+            build_script_out_dir.and_then(|dir| self.resolve_invocation_path(dir))
+        else {
             return false;
         };
         let metadata_only = !self.emit.is_empty() && !self.emit.iter().any(|e| e == "link");
@@ -918,11 +956,13 @@ impl RustcArgs {
 
         self.out_dir
             .as_deref()
-            .is_some_and(|out_dir| out_dir.starts_with(build_script_out_dir))
+            .and_then(|path| self.resolve_invocation_path(path))
+            .is_some_and(|out_dir| out_dir.starts_with(&build_script_out_dir))
             || self
                 .source_file
                 .as_deref()
-                .is_some_and(|source| source.starts_with(build_script_out_dir))
+                .and_then(|path| self.resolve_invocation_path(path))
+                .is_some_and(|source| source.starts_with(&build_script_out_dir))
     }
 
     /// Output filename stem (`crate_name` + optional `extra_filename`).
@@ -978,7 +1018,9 @@ impl RustcArgs {
             "{}.d",
             format_crate_output_stem(name, self.extra_filename.as_deref().unwrap_or(""))
         );
-        self.out_dir.as_ref().map(|dir| dir.join(file_name))
+        self.out_dir
+            .as_ref()
+            .and_then(|dir| self.resolve_invocation_path(&dir.join(file_name)))
     }
 
     /// Cargo checksum freshness asks rustc to annotate every dep-info input.
@@ -1557,6 +1599,117 @@ mod tests {
                 .iter()
                 .any(|arg| arg == &format!("@{}", response.display()))
         );
+    }
+
+    #[test]
+    fn response_files_use_independent_invocation_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let argv = ["rustc", "@rustc.args"].map(String::from);
+        let mut snapshots = Vec::new();
+        for (name, normalize, opt) in [("first", "on", "1"), ("second", "off", "3")] {
+            let cwd = root.path().join(name);
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::write(cwd.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::write(
+                cwd.join("rustc.args"),
+                format!(
+                    "--crate-name\n{name}\n./src/lib.rs\n--crate-type=lib\n--emit=dep-info,link\n--out-dir\ntarget/debug/deps\n-Copt-level={opt}\n"
+                ),
+            )
+            .unwrap();
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [("KACHE_RUSTC_PATH_NORMALIZE", normalize)],
+                Some(cwd.clone()),
+                None,
+                root.path().to_path_buf(),
+            );
+            snapshots.push((cwd, env));
+        }
+
+        let first = RustcArgs::parse_for(&argv, &snapshots[0].1).unwrap();
+        let second = RustcArgs::parse_for(&argv, &snapshots[1].1).unwrap();
+        for (parsed, (cwd, _), name, opt, disabled) in [
+            (&first, &snapshots[0], "first", "1", false),
+            (&second, &snapshots[1], "second", "3", true),
+        ] {
+            assert!(parsed.has_expanded_argfiles());
+            assert_eq!(parsed.crate_name.as_deref(), Some(name));
+            assert_eq!(parsed.get_codegen_opt("opt-level"), Some(opt));
+            assert_eq!(parsed.path_normalize_disabled, disabled);
+            assert_eq!(parsed.skip_path_remap(), disabled);
+            assert_eq!(
+                parsed.source_file.as_deref(),
+                Some(Path::new("./src/lib.rs"))
+            );
+            assert_eq!(
+                parsed.out_dir.as_deref(),
+                Some(Path::new("target/debug/deps"))
+            );
+            assert_eq!(parsed.path_normalization_root(), Some(cwd.as_path()));
+            assert_eq!(parsed.workspace_root(), Some(cwd.clone()));
+            assert_eq!(parsed.target_dir(), Some(cwd.join("target")));
+            assert_eq!(
+                parsed.dep_info_path(),
+                Some(cwd.join(format!("target/debug/deps/{name}.d")))
+            );
+            assert_eq!(parsed.raw_args(), &["@rustc.args".to_owned()]);
+            assert!(parsed.all_args.iter().any(|arg| arg == "./src/lib.rs"));
+        }
+    }
+
+    #[test]
+    fn relative_output_and_workspace_discovery_use_snapshot_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let argv = ["rustc", "@rustc.args"].map(String::from);
+        for (name, opt) in [("first", "1"), ("second", "3")] {
+            let workspace = root.path().join(name);
+            let cwd = workspace.join("member");
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::write(
+                cwd.join("rustc.args"),
+                format!(
+                    "--crate-name\n{name}\n../target/debug/build/pkg/out/probe.rs\n--emit=metadata\n-o\n../target/debug/build/pkg/build_script_build\n-Copt-level={opt}\n"
+                ),
+            )
+            .unwrap();
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [("KACHE_RUSTC_PATH_NORMALIZE", "on")],
+                Some(cwd.clone()),
+                None,
+                root.path().to_path_buf(),
+            );
+            let parsed = RustcArgs::parse_for(&argv, &env).unwrap();
+            assert_eq!(parsed.crate_name.as_deref(), Some(name));
+            assert_eq!(parsed.get_codegen_opt("opt-level"), Some(opt));
+            assert_eq!(
+                parsed.path_normalization_root(),
+                Some(cwd.join("..").as_path())
+            );
+            assert_eq!(parsed.target_dir(), Some(cwd.join("../target")));
+            assert_eq!(
+                parsed.output.as_deref(),
+                Some(Path::new("../target/debug/build/pkg/build_script_build"))
+            );
+            assert!(parsed.is_build_script_probe(Some(&cwd.join("../target/debug/build/pkg/out"))));
+            assert!(!parsed.is_build_script_probe(Some(&root.path().join("unrelated"))));
+            assert_eq!(parsed.raw_args(), &["@rustc.args".to_owned()]);
+        }
+    }
+
+    #[test]
+    fn relative_response_file_without_snapshot_cwd_fails_closed() {
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("KACHE_RUSTC_PATH_NORMALIZE", "on")],
+            None,
+            None,
+            PathBuf::from("/tmp"),
+        );
+        let argv = ["rustc", "@rustc.args"].map(String::from);
+        let parsed = RustcArgs::parse_for(&argv, &env).unwrap();
+        assert!(parsed.argfile_expansion_failed());
+        assert_eq!(parsed.raw_args(), &["@rustc.args".to_owned()]);
+        assert_eq!(parsed.path_normalization_root(), None);
     }
 
     #[test]

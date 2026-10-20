@@ -157,6 +157,8 @@ impl RefuseReason {
 
 /// Compiler-agnostic context passed to [`Compiler::cache_key`].
 pub struct KeyCtx<'a, 'db> {
+    /// Client environment captured for this compilation, including declared key inputs.
+    pub invocation_env: &'a crate::invocation::InvocationEnv,
     pub file_hasher: &'a crate::cache_key::FileHasher<'db>,
     /// Strips machine-local path prefixes from key inputs so the same
     /// source produces the same key across hosts and worktrees. Lives
@@ -852,7 +854,7 @@ pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBu
     resolve_program_on_path_with(program, path.as_deref(), pathext.as_deref())
 }
 
-fn resolve_program_on_path_with(
+pub(crate) fn resolve_program_on_path_with(
     program: &str,
     path: Option<&std::ffi::OsStr>,
     pathext: Option<&std::ffi::OsStr>,

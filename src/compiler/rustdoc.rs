@@ -108,11 +108,12 @@ impl Compiler for RustdocCompiler {
         let version = rustdoc_version(&parsed.program)?;
         let base = cache_key_with(parsed, &version, None)?;
         let label = parsed.crate_name.as_deref().unwrap_or("doc-merge");
-        Ok(finish_rustdoc_key(
+        Ok(finish_rustdoc_key_in(
             base,
             label,
             ctx.key_env_vars,
             ctx.key_salt,
+            ctx.invocation_env,
         ))
     }
 
@@ -252,13 +253,30 @@ fn hash_file_bytes(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
 
 /// Env vars, then the salt. Empty env vars leave the key unchanged. The salt
 /// sees the env fold, matching rustc.
+#[cfg(test)]
 fn finish_rustdoc_key(
     base: String,
     label: &str,
     key_env_vars: &[String],
     salt: Option<&str>,
 ) -> String {
-    let keyed = crate::cache_key::apply_key_env_vars(base, key_env_vars, label);
+    finish_rustdoc_key_in(
+        base,
+        label,
+        key_env_vars,
+        salt,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+fn finish_rustdoc_key_in(
+    base: String,
+    label: &str,
+    key_env_vars: &[String],
+    salt: Option<&str>,
+    env: &crate::invocation::InvocationEnv,
+) -> String {
+    let keyed = crate::cache_key::apply_key_env_vars_in(base, key_env_vars, label, env);
     crate::cache_key::apply_key_salt(keyed, salt, label)
 }
 
@@ -1482,6 +1500,7 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
     let file_hasher = store.file_hasher();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,

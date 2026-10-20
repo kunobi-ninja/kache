@@ -44,8 +44,18 @@ pub(crate) struct Invocation(bool);
 pub(crate) struct Phase(Option<(&'static str, u64)>);
 
 pub(crate) fn start(adapter: &'static str, args: &[String]) -> Invocation {
+    start_for(adapter, args, &crate::invocation::InvocationEnv::capture())
+}
+
+pub(crate) fn start_for(
+    adapter: &'static str,
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Invocation {
     start_at(
-        std::env::var_os("KACHE_PHASE_TRACE_DIR").map(PathBuf::from),
+        env.var_os("KACHE_PHASE_TRACE_DIR")
+            .filter(|value| !value.is_empty())
+            .and_then(|path| env.resolve(std::path::Path::new(&path))),
         adapter,
         args,
     )

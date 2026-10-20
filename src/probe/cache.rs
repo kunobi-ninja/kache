@@ -2,11 +2,12 @@
 //!
 //! Each [`ResolvedConfig`] is one small JSON file under
 //! `<cache_dir>/probes/<key>.json`. The key is the compiler binary's
-//! identity (see [`probe_key`]); writes are atomic (temp file +
+//! identity (see [`probe_key_for`]); writes are atomic (temp file +
 //! rename) so concurrent `make -j` processes never observe a partial
 //! file — a late writer simply wins.
 
 use super::{PROBE_SCHEMA_VERSION, ProbeRequest, ResolvedConfig};
+use crate::invocation::InvocationEnv;
 use std::fs::Metadata;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,11 +24,29 @@ const PROBE_SUBDIR: &str = "probes";
 /// preserve `mtime` but always bumps `ctime`, so the pair catches a
 /// compiler change `mtime` alone would miss. Deriving the key is a
 /// `stat`, not a process fork.
+#[cfg(test)]
 pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
-    probe_key_with_env(
+    probe_key_for(prober_id, req, &InvocationEnv::capture())
+}
+
+/// A probe belongs to the client's compiler selection, environment and cwd.
+/// Keep the cwd even for absolute compiler paths: a driver wrapper can select
+/// tools or read configuration relative to its current directory.
+pub(crate) fn probe_key_for(
+    prober_id: &str,
+    req: &ProbeRequest<'_>,
+    env: &InvocationEnv,
+) -> Option<String> {
+    let resolved = env
+        .resolve_program(Path::new(req.compiler))?
+        .canonicalize()
+        .ok()?;
+    probe_key_from_parts(
         prober_id,
         req,
-        std::env::vars_os().map(fingerprint_env_pair),
+        &resolved,
+        env.vars_os().map(fingerprint_env_pair),
+        Some(env.cwd()?),
     )
 }
 
@@ -64,13 +83,24 @@ fn fingerprint_text(text: std::ffi::OsString) -> String {
 /// Content-addressed key for a probe evaluated against an explicit
 /// environment. Split from [`probe_key`] so key stability and variance
 /// are testable without racing against concurrent environment mutations.
+#[cfg(test)]
 pub(crate) fn probe_key_with_env(
     prober_id: &str,
     req: &ProbeRequest<'_>,
     env_vars: impl Iterator<Item = (String, String)>,
 ) -> Option<String> {
     let resolved = resolve_program(req.compiler)?;
-    let meta = std::fs::metadata(&resolved).ok()?;
+    probe_key_from_parts(prober_id, req, &resolved, env_vars, None)
+}
+
+fn probe_key_from_parts(
+    prober_id: &str,
+    req: &ProbeRequest<'_>,
+    resolved: &Path,
+    env_vars: impl Iterator<Item = (String, String)>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    let meta = std::fs::metadata(resolved).ok()?;
     let fingerprint = compiler_fingerprint(&meta);
     let env_fp = fingerprint_env(env_vars);
 
@@ -94,26 +124,29 @@ pub(crate) fn probe_key_with_env(
     }
     h.update(b"\nenv:");
     h.update(env_fp.as_bytes());
+    if let Some(cwd) = cwd {
+        h.update(b"\ncwd:\n");
+        h.update(fingerprint_text(cwd.as_os_str().to_owned()).as_bytes());
+    }
     Some(h.finalize().to_hex().to_string())
 }
 
-/// A narrower key for probes that don't depend on the process environment or
-/// arguments (e.g. `cc-family` detecting `__clang__` vs `__GNUC__`).
+/// Test adapter for the family probe's empty-argument request. The family
+/// memo also includes the client's selectors: a driver wrapper can change its
+/// reported family without its own executable changing.
+#[cfg(test)]
 pub fn probe_key_isolated(prober_id: &str, program: &str) -> Option<String> {
-    let resolved = resolve_program(program)?;
-    let meta = std::fs::metadata(&resolved).ok()?;
-    let fingerprint = compiler_fingerprint(&meta);
-
-    let mut h = blake3::Hasher::new();
-    h.update(b"probe_schema:");
-    h.update(PROBE_SCHEMA_VERSION.to_string().as_bytes());
-    h.update(b"\nprober:");
-    h.update(prober_id.as_bytes());
-    h.update(b"\ncompiler_path:");
-    h.update(resolved.to_string_lossy().as_bytes());
-    h.update(b"\ncompiler_stat:");
-    h.update(fingerprint.as_bytes());
-    Some(h.finalize().to_hex().to_string())
+    probe_key_for(
+        prober_id,
+        &ProbeRequest {
+            compiler: program,
+            args: &[],
+            key_args: &[],
+            per_tu_paths: &[],
+            windows_aware: true,
+        },
+        &InvocationEnv::capture(),
+    )
 }
 
 /// Hash every `VAR=value` pair in `vars`, sorted for determinism, after
@@ -217,6 +250,7 @@ fn compiler_fingerprint(meta: &Metadata) -> String {
 /// [`probe_key`] returned `None` and the probe was never memoized —
 /// re-running on every build (the #201 warm `probe_runs=1`). No-op on
 /// Unix where `EXE_SUFFIX` is empty.
+#[cfg(test)]
 fn resolve_program(program: &str) -> Option<PathBuf> {
     let p = Path::new(program);
     let has_separator = p.parent().is_some_and(|par| !par.as_os_str().is_empty());
@@ -234,6 +268,7 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
 /// `path` followed by `path` + `exe_suffix` (when the suffix is non-empty
 /// and not already present), in priority order. Pure — used by both the
 /// PATH search and the explicit-path branch of [`resolve_program`].
+#[cfg(test)]
 fn with_exe_suffix(path: PathBuf, exe_suffix: &str) -> Vec<PathBuf> {
     let already = path
         .extension()
@@ -250,6 +285,7 @@ fn with_exe_suffix(path: PathBuf, exe_suffix: &str) -> Vec<PathBuf> {
 /// First existing file matching `program` (then `program+exe_suffix`) in
 /// any of `dirs`, in PATH order. Split out so the suffix logic is
 /// testable on any host.
+#[cfg(test)]
 fn find_program_in_dirs(program: &str, dirs: &[PathBuf], exe_suffix: &str) -> Option<PathBuf> {
     dirs.iter().find_map(|dir| {
         with_exe_suffix(dir.join(program), exe_suffix)
@@ -283,6 +319,31 @@ mod tests {
             per_tu_paths: &[],
             windows_aware: true,
         }
+    }
+
+    #[test]
+    fn client_probe_keys_include_snapshot_env_and_cwd() {
+        let root = TempDir::new().unwrap();
+        let compiler = NamedTempFile::new().unwrap();
+        let request = req(compiler.path().to_str().unwrap());
+        let first = InvocationEnv::from_parts(
+            [("SDKROOT", "/sdk/first")],
+            Some(root.path().join("first-project")),
+            None,
+            root.path().join("tmp"),
+        );
+        let other_cwd = InvocationEnv::from_parts(
+            [("SDKROOT", "/sdk/first")],
+            Some(root.path().join("second-project")),
+            None,
+            root.path().join("tmp"),
+        );
+        let mut other_env = first.clone();
+        other_env.set("SDKROOT", "/sdk/second");
+        let key = probe_key_for("cc", &request, &first).unwrap();
+        assert_eq!(probe_key_for("cc", &request, &first), Some(key.clone()));
+        assert_ne!(probe_key_for("cc", &request, &other_cwd), Some(key.clone()));
+        assert_ne!(probe_key_for("cc", &request, &other_env), Some(key));
     }
 
     #[test]

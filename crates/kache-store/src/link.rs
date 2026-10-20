@@ -1,10 +1,103 @@
 use anyhow::{Context, Result};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Process-global: restore via hardlink on a non-CoW Windows volume (NTFS)
+struct LinkPolicy {
+    windows_hardlink_restore: Cell<bool>,
+    shared_hardlink_restores: Cell<bool>,
+    cow_warn_marker: OnceCell<PathBuf>,
+    storage_layout_advice: Cell<bool>,
+    mapped_target: Cell<bool>,
+    layout_advice_to_log: Cell<bool>,
+}
+
+impl Default for LinkPolicy {
+    fn default() -> Self {
+        Self {
+            windows_hardlink_restore: Cell::new(false),
+            shared_hardlink_restores: Cell::new(false),
+            cow_warn_marker: OnceCell::new(),
+            storage_layout_advice: Cell::new(true),
+            mapped_target: Cell::new(false),
+            layout_advice_to_log: Cell::new(false),
+        }
+    }
+}
+
+thread_local! {
+    static INVOCATION_LINK_POLICY: RefCell<Option<Rc<LinkPolicy>>> = const { RefCell::new(None) };
+}
+
+/// Own restore and advisory settings for one synchronous compiler invocation.
+///
+/// Each scope starts from defaults, independent of legacy process settings.
+/// Nested scopes restore their parent on drop. The guard cannot move between
+/// threads and must not span an async suspension or task switch.
+pub struct InvocationLinkScope {
+    previous: Option<Rc<LinkPolicy>>,
+    _current: Rc<LinkPolicy>,
+}
+
+impl InvocationLinkScope {
+    pub fn enter() -> Self {
+        let current = Rc::new(LinkPolicy::default());
+        let previous = INVOCATION_LINK_POLICY.with(|slot| slot.replace(Some(Rc::clone(&current))));
+        Self {
+            previous,
+            _current: current,
+        }
+    }
+}
+
+impl Drop for InvocationLinkScope {
+    fn drop(&mut self) {
+        INVOCATION_LINK_POLICY.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn set_policy_bool(global: &AtomicBool, field: fn(&LinkPolicy) -> &Cell<bool>, value: bool) {
+    INVOCATION_LINK_POLICY.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            field(current).set(value);
+        } else {
+            global.store(value, Ordering::Relaxed);
+        }
+    });
+}
+
+fn policy_bool(global: &AtomicBool, field: fn(&LinkPolicy) -> &Cell<bool>) -> bool {
+    INVOCATION_LINK_POLICY.with(|slot| {
+        slot.borrow().as_ref().map_or_else(
+            || global.load(Ordering::Relaxed),
+            |current| field(current).get(),
+        )
+    })
+}
+
+fn cow_warn_marker() -> Option<PathBuf> {
+    INVOCATION_LINK_POLICY.with(|slot| {
+        slot.borrow().as_ref().map_or_else(
+            || COW_WARN_MARKER.get().cloned(),
+            |current| current.cow_warn_marker.get().cloned(),
+        )
+    })
+}
+
+fn shared_hardlink_restores_enabled() -> bool {
+    policy_bool(&SHARED_HARDLINK_RESTORES, |policy| {
+        &policy.shared_hardlink_restores
+    })
+}
+
+fn mapped_target() -> bool {
+    policy_bool(&MAPPED_TARGET, |policy| &policy.mapped_target)
+}
+
+/// Legacy process default: restore via hardlink on a non-CoW Windows volume (NTFS)
 /// instead of the default copy (#429). Set once from `config.windows_hardlink`
 /// at wrapper entry; read on the Windows restore path. Off everywhere else.
 static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
@@ -12,13 +105,17 @@ static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
 static SHARED_HARDLINK_RESTORES: AtomicBool = AtomicBool::new(false);
 
 /// Let restores hardlink a blob that another target directory already links
-/// (`[cache] shared_hardlink_restores`). Call once per process before
-/// restoring.
+/// (`[cache] shared_hardlink_restores`). Call before restoring in an invocation
+/// scope, or once per process for legacy callers.
 pub fn set_shared_hardlink_restores(enabled: bool) {
-    SHARED_HARDLINK_RESTORES.store(enabled, Ordering::Relaxed);
+    set_policy_bool(
+        &SHARED_HARDLINK_RESTORES,
+        |policy| &policy.shared_hardlink_restores,
+        enabled,
+    );
 }
 
-/// Process-global: marker file used to dedup storage-layout advisories across
+/// Legacy process default: marker file used to dedup storage-layout advisories across
 /// the hundreds of wrapper processes a single build spawns (#508, #835). Set
 /// at wrapper entry; if unset the advisory falls back to once-per-process.
 ///
@@ -28,29 +125,41 @@ pub fn set_shared_hardlink_restores(enabled: bool) {
 static COW_WARN_MARKER: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the Windows hardlink-restore opt-in (from `Config::windows_hardlink`).
-/// Call once per process before restoring. No effect off Windows.
+/// Call before restoring. No effect off Windows.
 pub fn set_windows_hardlink_restore(enabled: bool) {
-    WINDOWS_HARDLINK_RESTORE.store(enabled, Ordering::Relaxed);
+    set_policy_bool(
+        &WINDOWS_HARDLINK_RESTORE,
+        |policy| &policy.windows_hardlink_restore,
+        enabled,
+    );
 }
 
-/// Is the `[cache] windows_hardlink` opt-in active for this process?
+/// Is the `[cache] windows_hardlink` opt-in active for the current invocation?
 /// The store's insert-side blob hardlinking keys off the same flag as
 /// restore: without it, a hardlink would propagate the blob's read-only
 /// attribute to the build's own output (shared MFT record, #429).
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 pub fn windows_hardlink_enabled() -> bool {
-    WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed)
+    policy_bool(&WINDOWS_HARDLINK_RESTORE, |policy| {
+        &policy.windows_hardlink_restore
+    })
 }
 
-/// Set the cross-process dedup marker for storage-layout advisories. Call once
-/// per process before restoring. The marker itself is inert; each advisory
+/// Set the cross-process dedup marker for storage-layout advisories. The first
+/// call in an invocation scope (or legacy process) wins. Each advisory
 /// derives a per-bucket path via [`bucket_marker`] so severities dedup
 /// independently.
 pub fn set_cow_warn_marker(path: std::path::PathBuf) {
-    let _ = COW_WARN_MARKER.set(path);
+    INVOCATION_LINK_POLICY.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            let _ = current.cow_warn_marker.set(path);
+        } else {
+            let _ = COW_WARN_MARKER.set(path);
+        }
+    });
 }
 
-/// Process-global: surface storage-*layout* advisories ("no CoW",
+/// Legacy process default: surface storage-*layout* advisories ("no CoW",
 /// "cross-volume") on copy-restores (#551). On by default; set once from
 /// `Config::storage_layout_advice` at wrapper entry. Muting this never mutes
 /// fault reports (`UnexpectedOnCowVolume`) — advice and faults have different
@@ -58,9 +167,13 @@ pub fn set_cow_warn_marker(path: std::path::PathBuf) {
 static STORAGE_LAYOUT_ADVICE: AtomicBool = AtomicBool::new(true);
 
 /// Set the storage-layout advisory toggle (from `Config::storage_layout_advice`).
-/// Call once per process before restoring.
+/// Call before restoring.
 pub fn set_storage_layout_advice(enabled: bool) {
-    STORAGE_LAYOUT_ADVICE.store(enabled, Ordering::Relaxed);
+    set_policy_bool(
+        &STORAGE_LAYOUT_ADVICE,
+        |policy| &policy.storage_layout_advice,
+        enabled,
+    );
 }
 
 /// A mapped target may intentionally restore from the main-store fallback.
@@ -68,15 +181,17 @@ pub fn set_storage_layout_advice(enabled: bool) {
 static MAPPED_TARGET: AtomicBool = AtomicBool::new(false);
 
 pub fn set_mapped_target(mapped: bool) {
-    MAPPED_TARGET.store(mapped, Ordering::Relaxed);
+    set_policy_bool(&MAPPED_TARGET, |policy| &policy.mapped_target, mapped);
 }
 
-/// Is `[cache] storage_layout_advice` active for this process?
+/// Is `[cache] storage_layout_advice` active for the current invocation?
 fn storage_layout_advice_enabled() -> bool {
-    STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
+    policy_bool(&STORAGE_LAYOUT_ADVICE, |policy| {
+        &policy.storage_layout_advice
+    })
 }
 
-/// Process-global: send storage-layout advice to stderr (the default, for CLI
+/// Legacy process default: send storage-layout advice to stderr (the default, for CLI
 /// commands) or to the tracing log. Wrapper entries pick the log: a
 /// `RUSTC_WRAPPER`'s stderr is rustc's stderr to cargo and to every tool that
 /// reads it, so advice there looks like compiler output and can fail builds
@@ -84,15 +199,19 @@ fn storage_layout_advice_enabled() -> bool {
 /// (`UnexpectedOnCowVolume`) always use stderr.
 static LAYOUT_ADVICE_TO_LOG: AtomicBool = AtomicBool::new(false);
 
-/// Route storage-layout advice to the tracing log instead of stderr. Call once
-/// per process before restoring or storing.
+/// Route storage-layout advice to the tracing log instead of stderr. Call
+/// before restoring or storing.
 pub fn set_layout_advice_to_log(enabled: bool) {
-    LAYOUT_ADVICE_TO_LOG.store(enabled, Ordering::Relaxed);
+    set_policy_bool(
+        &LAYOUT_ADVICE_TO_LOG,
+        |policy| &policy.layout_advice_to_log,
+        enabled,
+    );
 }
 
-/// Where storage-layout advice goes in this process.
+/// Where storage-layout advice goes for the current invocation.
 fn layout_advice_sink() -> crate::markers::WarnSink {
-    if LAYOUT_ADVICE_TO_LOG.load(Ordering::Relaxed) {
+    if policy_bool(&LAYOUT_ADVICE_TO_LOG, |policy| &policy.layout_advice_to_log) {
         crate::markers::WarnSink::Log
     } else {
         crate::markers::WarnSink::Stderr
@@ -220,9 +339,7 @@ pub(crate) fn warn_hardlink_fallback_once(
         );
         return;
     }
-    if !storage_layout_advice_enabled()
-        || reason.mapped_volume_advice(MAPPED_TARGET.load(Ordering::Relaxed))
-    {
+    if !storage_layout_advice_enabled() || reason.mapped_volume_advice(mapped_target()) {
         tracing::debug!(
             "hardlink failed ({:?}; layout advice muted): {} -> {}",
             reason,
@@ -268,9 +385,9 @@ pub(crate) fn warn_hardlink_fallback_once(
         }
     };
     let sink = layout_advice_sink();
-    match COW_WARN_MARKER.get() {
+    match cow_warn_marker() {
         Some(base) => {
-            let marker = bucket_marker(base, bucket);
+            let marker = bucket_marker(&base, bucket);
             let _warned = crate::markers::warn_once_per_session_to(
                 &marker,
                 crate::markers::WARN_SESSION_SECS,
@@ -381,7 +498,7 @@ fn link_to_target_via(
             // hardlinking — reflink/hardlink there are writable or CoW-isolated.
             #[cfg(windows)]
             LinkStrategy::Hardlink => {
-                if WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed) {
+                if windows_hardlink_enabled() {
                     // Opt-in (#429 / `[cache] windows_hardlink`): the caller accepts
                     // that this build never deletes/rewrites a restored object, so
                     // trade the read-only-output risk for working-tree dedup.
@@ -493,7 +610,7 @@ fn hardlink_or_copy_with_prelink_hook(
     // a copy preserves isolation and lets the ordinary read report any real
     // source failure.
     #[cfg_attr(not(unix), allow(unused_variables))]
-    let shared = SHARED_HARDLINK_RESTORES.load(Ordering::Relaxed);
+    let shared = shared_hardlink_restores_enabled();
     // Every fallback below copies the same way, so an executable stays
     // runnable whichever check sends it there.
     let copy_instead = || copy_hardlink_fallback(store_path, target_path, bytes, executable);
@@ -892,7 +1009,7 @@ fn warn_no_cow_restore_once(
     // their layout is intentional (#551). Either way this mutes only the
     // *advice*: a genuine clone fault still reports (see `layout_advice`).
     if cause.mute_advice(
-        MAPPED_TARGET.load(Ordering::Relaxed),
+        mapped_target(),
         layout_advice,
         storage_layout_advice_enabled(),
     ) {
@@ -907,11 +1024,11 @@ fn warn_no_cow_restore_once(
     }
 
     let sink = cause.warn_sink();
-    match COW_WARN_MARKER.get() {
+    match cow_warn_marker() {
         Some(base) => {
             // Separate bucket per severity: a layout advisory must never mute a
             // fault report (and vice versa).
-            let marker = bucket_marker(base, cause.warn_bucket());
+            let marker = bucket_marker(&base, cause.warn_bucket());
             let _warned = crate::markers::warn_once_per_session_to(
                 &marker,
                 crate::markers::WARN_SESSION_SECS,
@@ -2215,6 +2332,148 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    fn configure_invocation_policy(enabled: bool, marker: &Path) {
+        set_windows_hardlink_restore(enabled);
+        set_shared_hardlink_restores(enabled);
+        set_cow_warn_marker(marker.to_path_buf());
+        set_storage_layout_advice(!enabled);
+        set_mapped_target(enabled);
+        set_layout_advice_to_log(enabled);
+    }
+
+    fn assert_invocation_policy(enabled: bool, marker: &Path) {
+        assert_eq!(windows_hardlink_enabled(), enabled);
+        assert_eq!(shared_hardlink_restores_enabled(), enabled);
+        assert_eq!(cow_warn_marker().as_deref(), Some(marker));
+        assert_eq!(storage_layout_advice_enabled(), !enabled);
+        assert_eq!(mapped_target(), enabled);
+        assert_eq!(
+            layout_advice_sink(),
+            if enabled {
+                crate::markers::WarnSink::Log
+            } else {
+                crate::markers::WarnSink::Stderr
+            }
+        );
+    }
+
+    fn assert_default_invocation_policy() {
+        assert!(!windows_hardlink_enabled());
+        assert!(!shared_hardlink_restores_enabled());
+        assert_eq!(cow_warn_marker(), None);
+        assert!(storage_layout_advice_enabled());
+        assert!(!mapped_target());
+        assert_eq!(layout_advice_sink(), crate::markers::WarnSink::Stderr);
+    }
+
+    #[test]
+    fn concurrent_invocations_keep_opposite_link_policies_separate() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for enabled in [false, true] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let _scope = InvocationLinkScope::enter();
+                    let dir = tempfile::tempdir().unwrap();
+                    let marker = dir.path().join("advice-marker");
+                    configure_invocation_policy(enabled, &marker);
+                    barrier.wait();
+                    assert_invocation_policy(enabled, &marker);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        let blob = dir.path().join("blob.rlib");
+                        let first = dir.path().join("first.rlib");
+                        let second = dir.path().join("second.rlib");
+                        fs::write(&blob, b"cache bytes").unwrap();
+                        fs::hard_link(&blob, &first).unwrap();
+                        hardlink_or_copy(&blob, &second, 11).unwrap();
+                        assert_eq!(
+                            fs::metadata(&blob).unwrap().ino()
+                                == fs::metadata(&second).unwrap().ino(),
+                            enabled,
+                            "only the shared policy may link a blob with an existing consumer"
+                        );
+                        assert_eq!(fs::read(&second).unwrap(), b"cache bytes");
+                    }
+                    assert_invocation_policy(enabled, &marker);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn nested_link_scopes_restore_parent_and_worker_reuse_starts_fresh() {
+        std::thread::spawn(|| {
+            for enabled in [true, false] {
+                let _scope = InvocationLinkScope::enter();
+                assert_default_invocation_policy();
+                let marker = Path::new("parent-marker");
+                configure_invocation_policy(enabled, marker);
+                {
+                    let _nested = InvocationLinkScope::enter();
+                    assert_default_invocation_policy();
+                    configure_invocation_policy(!enabled, Path::new("child-marker"));
+                    set_cow_warn_marker(PathBuf::from("ignored-second-marker"));
+                    assert_invocation_policy(!enabled, Path::new("child-marker"));
+                }
+                assert_invocation_policy(enabled, marker);
+                let _ = std::panic::catch_unwind(|| {
+                    let _nested = InvocationLinkScope::enter();
+                    configure_invocation_policy(!enabled, Path::new("panicking-marker"));
+                    panic!("test panic");
+                });
+                assert_invocation_policy(enabled, marker);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn scoped_advisory_policy_controls_marker_mapped_gate_and_sink() {
+        let _scope = InvocationLinkScope::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("advice-marker");
+        set_cow_warn_marker(marker.clone());
+        set_layout_advice_to_log(true);
+        let source = dir.path().join("cache-blob");
+        let target = dir.path().join("target-artifact");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let cross_device = std::io::Error::from(std::io::ErrorKind::CrossesDevices);
+        let _ = crate::markers::take_emitted();
+        set_storage_layout_advice(false);
+        warn_hardlink_fallback_once(&source, &target, HardlinkIoReason::Permission, &denied);
+        assert!(!bucket_marker(&marker, "hardlink-eperm").exists());
+        assert!(crate::markers::take_emitted().is_empty());
+        set_storage_layout_advice(true);
+        set_mapped_target(true);
+        warn_hardlink_fallback_once(
+            &source,
+            &target,
+            HardlinkIoReason::CrossDevice,
+            &cross_device,
+        );
+        assert!(!bucket_marker(&marker, "hardlink-exdev").exists());
+        assert!(crate::markers::take_emitted().is_empty());
+        warn_hardlink_fallback_once(&source, &target, HardlinkIoReason::Permission, &denied);
+        assert!(bucket_marker(&marker, "hardlink-eperm").exists());
+        let emitted = crate::markers::take_emitted();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, crate::markers::WarnSink::Log);
+        set_mapped_target(false);
+        warn_hardlink_fallback_once(
+            &source,
+            &target,
+            HardlinkIoReason::CrossDevice,
+            &cross_device,
+        );
+        assert!(bucket_marker(&marker, "hardlink-exdev").exists());
+        let emitted = crate::markers::take_emitted();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, crate::markers::WarnSink::Log);
+    }
 
     #[test]
     fn a_mapped_volume_mutes_only_cross_volume_advice() {

@@ -1,7 +1,80 @@
 //! Bytes materialized by the store and its consumers.
+//!
+//! Byte totals use the current invocation scope when present and process totals
+//! otherwise. Thread snapshots always accumulate for before/after deltas.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Default)]
+struct InvocationBytes {
+    reflinked: Cell<u64>,
+    hardlinked: Cell<u64>,
+    copied: Cell<u64>,
+    store_reflinked: Cell<u64>,
+    store_hardlinked: Cell<u64>,
+    store_copied: Cell<u64>,
+    store_copy_cross_device: Cell<u64>,
+    store_copy_permission: Cell<u64>,
+    store_copy_ineligible: Cell<u64>,
+    store_copy_other: Cell<u64>,
+    restore_copy_cross_device: Cell<u64>,
+    restore_copy_permission: Cell<u64>,
+    restore_copy_exclusive: Cell<u64>,
+    restore_copy_other: Cell<u64>,
+}
+
+thread_local! {
+    static INVOCATION_BYTES: RefCell<Option<Rc<InvocationBytes>>> = const { RefCell::new(None) };
+}
+
+/// Own byte accounting for one synchronous invocation on the current thread.
+///
+/// Nested scopes restore their parent on drop. The guard cannot move between
+/// threads and must not span an async suspension or task switch. Thread byte
+/// snapshots remain cumulative so before/after deltas retain their meaning.
+pub struct InvocationByteScope {
+    previous: Option<Rc<InvocationBytes>>,
+    _current: Rc<InvocationBytes>,
+}
+
+impl InvocationByteScope {
+    pub fn enter() -> Self {
+        let current = Rc::new(InvocationBytes::default());
+        let previous = INVOCATION_BYTES.with(|slot| slot.replace(Some(Rc::clone(&current))));
+        Self {
+            previous,
+            _current: current,
+        }
+    }
+}
+
+impl Drop for InvocationByteScope {
+    fn drop(&mut self) {
+        INVOCATION_BYTES.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn record_bytes(global: &AtomicU64, field: fn(&InvocationBytes) -> &Cell<u64>, bytes: u64) {
+    INVOCATION_BYTES.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            let counter = field(current);
+            counter.set(counter.get() + bytes);
+        } else {
+            global.fetch_add(bytes, Ordering::Relaxed);
+        }
+    });
+}
+
+fn bytes(global: &AtomicU64, field: fn(&InvocationBytes) -> &Cell<u64>) -> u64 {
+    INVOCATION_BYTES.with(|slot| {
+        slot.borrow().as_ref().map_or_else(
+            || global.load(Ordering::Relaxed),
+            |current| field(current).get(),
+        )
+    })
+}
 
 static REFLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
 static HARDLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -14,34 +87,34 @@ thread_local! {
 
 /// Record `bytes` restored from cache by a CoW reflink.
 pub fn record_reflinked(bytes: u64) {
-    REFLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(&REFLINKED_BYTES, |counts| &counts.reflinked, bytes);
     THREAD_REFLINKED.with(|slot| slot.set(slot.get() + bytes));
 }
 
 /// Record `bytes` restored by a hardlink (reflink unavailable).
 pub fn record_hardlinked(bytes: u64) {
-    HARDLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(&HARDLINKED_BYTES, |counts| &counts.hardlinked, bytes);
 }
 
 /// Record `bytes` restored by a full physical copy (no reflink, no hardlink).
 pub fn record_copied(bytes: u64) {
-    COPIED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(&COPIED_BYTES, |counts| &counts.copied, bytes);
     THREAD_COPIED.with(|slot| slot.set(slot.get() + bytes));
 }
 
 /// Bytes restored by CoW reflink so far in this process.
 pub fn reflinked_bytes() -> u64 {
-    REFLINKED_BYTES.load(Ordering::Relaxed)
+    bytes(&REFLINKED_BYTES, |counts| &counts.reflinked)
 }
 
 /// Bytes restored by hardlink so far in this process.
 pub fn hardlinked_bytes() -> u64 {
-    HARDLINKED_BYTES.load(Ordering::Relaxed)
+    bytes(&HARDLINKED_BYTES, |counts| &counts.hardlinked)
 }
 
 /// Bytes restored by a full copy so far in this process.
 pub fn copied_bytes() -> u64 {
-    COPIED_BYTES.load(Ordering::Relaxed)
+    bytes(&COPIED_BYTES, |counts| &counts.copied)
 }
 
 /// Reflink bytes recorded on this thread. Other tests increment the process
@@ -105,7 +178,11 @@ pub fn record_store_reflinked(bytes: u64) {
         value.reflinked += bytes;
         counter.set(value);
     });
-    STORE_REFLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &STORE_REFLINKED_BYTES,
+        |counts| &counts.store_reflinked,
+        bytes,
+    );
 }
 
 /// Record `bytes` ingested into the store by a hardlink (shares an inode
@@ -116,7 +193,11 @@ pub fn record_store_hardlinked(bytes: u64) {
         value.hardlinked += bytes;
         counter.set(value);
     });
-    STORE_HARDLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &STORE_HARDLINKED_BYTES,
+        |counts| &counts.store_hardlinked,
+        bytes,
+    );
 }
 
 /// Record `bytes` ingested into the store by a full physical copy (no
@@ -127,22 +208,22 @@ pub fn record_store_copied(bytes: u64) {
         value.copied += bytes;
         counter.set(value);
     });
-    STORE_COPIED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(&STORE_COPIED_BYTES, |counts| &counts.store_copied, bytes);
 }
 
 /// Bytes ingested into the store by CoW reflink so far in this process.
 pub fn store_reflinked_bytes() -> u64 {
-    STORE_REFLINKED_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_REFLINKED_BYTES, |counts| &counts.store_reflinked)
 }
 
 /// Bytes ingested into the store by hardlink so far in this process.
 pub fn store_hardlinked_bytes() -> u64 {
-    STORE_HARDLINKED_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_HARDLINKED_BYTES, |counts| &counts.store_hardlinked)
 }
 
 /// Bytes ingested into the store by a full copy so far in this process.
 pub fn store_copied_bytes() -> u64 {
-    STORE_COPIED_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_COPIED_BYTES, |counts| &counts.store_copied)
 }
 
 // ── Hardlink-fallback reason byte counters (#835) ─────────────────────────────
@@ -177,7 +258,11 @@ pub fn record_store_copy_cross_device(bytes: u64) {
         value.copy_cross_device += bytes;
         counter.set(value);
     });
-    STORE_COPY_CROSS_DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &STORE_COPY_CROSS_DEVICE_BYTES,
+        |counts| &counts.store_copy_cross_device,
+        bytes,
+    );
 }
 
 /// Record `bytes` copied into the store because `link(2)` failed with
@@ -188,7 +273,11 @@ pub fn record_store_copy_permission(bytes: u64) {
         value.copy_permission += bytes;
         counter.set(value);
     });
-    STORE_COPY_PERMISSION_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &STORE_COPY_PERMISSION_BYTES,
+        |counts| &counts.store_copy_permission,
+        bytes,
+    );
 }
 
 /// Record `bytes` copied into the store because a hardlink was never
@@ -201,7 +290,11 @@ pub fn record_store_copy_ineligible(bytes: u64) {
         value.copy_ineligible += bytes;
         counter.set(value);
     });
-    STORE_COPY_INELIGIBLE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &STORE_COPY_INELIGIBLE_BYTES,
+        |counts| &counts.store_copy_ineligible,
+        bytes,
+    );
 }
 
 /// Record `bytes` copied into the store because `link(2)` failed with any
@@ -212,19 +305,31 @@ pub fn record_store_copy_other(bytes: u64) {
         value.copy_other += bytes;
         counter.set(value);
     });
-    STORE_COPY_OTHER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &STORE_COPY_OTHER_BYTES,
+        |counts| &counts.store_copy_other,
+        bytes,
+    );
 }
 
 /// Record `bytes` restored by copy because `link(2)` failed with
 /// `CrossesDevices`.
 pub fn record_restore_copy_cross_device(bytes: u64) {
-    RESTORE_COPY_CROSS_DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &RESTORE_COPY_CROSS_DEVICE_BYTES,
+        |counts| &counts.restore_copy_cross_device,
+        bytes,
+    );
 }
 
 /// Record `bytes` restored by copy because `link(2)` failed with
 /// `PermissionDenied`.
 pub fn record_restore_copy_permission(bytes: u64) {
-    RESTORE_COPY_PERMISSION_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &RESTORE_COPY_PERMISSION_BYTES,
+        |counts| &counts.restore_copy_permission,
+        bytes,
+    );
 }
 
 /// Record `bytes` restored by copy because of the exclusive-carrier rule
@@ -233,51 +338,195 @@ pub fn record_restore_copy_permission(bytes: u64) {
 /// mtime stamp reach another. Unix-only: link counts do not exist on Windows.
 #[cfg(unix)]
 pub fn record_restore_copy_exclusive(bytes: u64) {
-    RESTORE_COPY_EXCLUSIVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &RESTORE_COPY_EXCLUSIVE_BYTES,
+        |counts| &counts.restore_copy_exclusive,
+        bytes,
+    );
 }
 
 /// Record `bytes` restored by copy because `link(2)` failed with any other
 /// errno, or the blob's link count could not be verified.
 pub fn record_restore_copy_other(bytes: u64) {
-    RESTORE_COPY_OTHER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    record_bytes(
+        &RESTORE_COPY_OTHER_BYTES,
+        |counts| &counts.restore_copy_other,
+        bytes,
+    );
 }
 
 /// Bytes copied into the store after an EXDEV hardlink failure.
 pub fn store_copy_cross_device_bytes() -> u64 {
-    STORE_COPY_CROSS_DEVICE_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_COPY_CROSS_DEVICE_BYTES, |counts| {
+        &counts.store_copy_cross_device
+    })
 }
 
 /// Bytes copied into the store after an EPERM/EACCES hardlink failure.
 pub fn store_copy_permission_bytes() -> u64 {
-    STORE_COPY_PERMISSION_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_COPY_PERMISSION_BYTES, |counts| {
+        &counts.store_copy_permission
+    })
 }
 
 /// Bytes copied into the store without attempting a hardlink (kind-ineligible).
 pub fn store_copy_ineligible_bytes() -> u64 {
-    STORE_COPY_INELIGIBLE_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_COPY_INELIGIBLE_BYTES, |counts| {
+        &counts.store_copy_ineligible
+    })
 }
 
 /// Bytes copied into the store after any other hardlink errno.
 pub fn store_copy_other_bytes() -> u64 {
-    STORE_COPY_OTHER_BYTES.load(Ordering::Relaxed)
+    bytes(&STORE_COPY_OTHER_BYTES, |counts| &counts.store_copy_other)
 }
 
 /// Bytes restored by copy after an EXDEV hardlink failure.
 pub fn restore_copy_cross_device_bytes() -> u64 {
-    RESTORE_COPY_CROSS_DEVICE_BYTES.load(Ordering::Relaxed)
+    bytes(&RESTORE_COPY_CROSS_DEVICE_BYTES, |counts| {
+        &counts.restore_copy_cross_device
+    })
 }
 
 /// Bytes restored by copy after an EPERM/EACCES hardlink failure.
 pub fn restore_copy_permission_bytes() -> u64 {
-    RESTORE_COPY_PERMISSION_BYTES.load(Ordering::Relaxed)
+    bytes(&RESTORE_COPY_PERMISSION_BYTES, |counts| {
+        &counts.restore_copy_permission
+    })
 }
 
 /// Bytes restored by copy for the exclusive-carrier rule (#794).
 pub fn restore_copy_exclusive_bytes() -> u64 {
-    RESTORE_COPY_EXCLUSIVE_BYTES.load(Ordering::Relaxed)
+    bytes(&RESTORE_COPY_EXCLUSIVE_BYTES, |counts| {
+        &counts.restore_copy_exclusive
+    })
 }
 
 /// Bytes restored by copy after any other hardlink failure.
 pub fn restore_copy_other_bytes() -> u64 {
-    RESTORE_COPY_OTHER_BYTES.load(Ordering::Relaxed)
+    bytes(&RESTORE_COPY_OTHER_BYTES, |counts| {
+        &counts.restore_copy_other
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_invocation_bytes(bytes: u64) {
+        record_reflinked(bytes);
+        record_hardlinked(bytes + 1);
+        record_copied(bytes + 2);
+        record_store_reflinked(bytes + 3);
+        record_store_hardlinked(bytes + 4);
+        record_store_copied(bytes + 5);
+        record_store_copy_cross_device(bytes + 6);
+        record_store_copy_permission(bytes + 7);
+        record_store_copy_ineligible(bytes + 8);
+        record_store_copy_other(bytes + 9);
+        record_restore_copy_cross_device(bytes + 10);
+        record_restore_copy_permission(bytes + 11);
+        #[cfg(unix)]
+        record_restore_copy_exclusive(bytes + 12);
+        record_restore_copy_other(bytes + 13);
+    }
+
+    fn assert_invocation_bytes(bytes: u64) {
+        assert_eq!(reflinked_bytes(), bytes);
+        assert_eq!(hardlinked_bytes(), bytes + 1);
+        assert_eq!(copied_bytes(), bytes + 2);
+        assert_eq!(store_reflinked_bytes(), bytes + 3);
+        assert_eq!(store_hardlinked_bytes(), bytes + 4);
+        assert_eq!(store_copied_bytes(), bytes + 5);
+        assert_eq!(store_copy_cross_device_bytes(), bytes + 6);
+        assert_eq!(store_copy_permission_bytes(), bytes + 7);
+        assert_eq!(store_copy_ineligible_bytes(), bytes + 8);
+        assert_eq!(store_copy_other_bytes(), bytes + 9);
+        assert_eq!(restore_copy_cross_device_bytes(), bytes + 10);
+        assert_eq!(restore_copy_permission_bytes(), bytes + 11);
+        #[cfg(unix)]
+        assert_eq!(restore_copy_exclusive_bytes(), bytes + 12);
+        #[cfg(not(unix))]
+        assert_eq!(restore_copy_exclusive_bytes(), 0);
+        assert_eq!(restore_copy_other_bytes(), bytes + 13);
+    }
+
+    fn assert_empty_invocation() {
+        assert_eq!(reflinked_bytes(), 0);
+        assert_eq!(hardlinked_bytes(), 0);
+        assert_eq!(copied_bytes(), 0);
+        assert_eq!(store_reflinked_bytes(), 0);
+        assert_eq!(store_hardlinked_bytes(), 0);
+        assert_eq!(store_copied_bytes(), 0);
+        assert_eq!(store_copy_cross_device_bytes(), 0);
+        assert_eq!(store_copy_permission_bytes(), 0);
+        assert_eq!(store_copy_ineligible_bytes(), 0);
+        assert_eq!(store_copy_other_bytes(), 0);
+        assert_eq!(restore_copy_cross_device_bytes(), 0);
+        assert_eq!(restore_copy_permission_bytes(), 0);
+        assert_eq!(restore_copy_exclusive_bytes(), 0);
+        assert_eq!(restore_copy_other_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_invocations_separate_every_restore_and_store_counter() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for bytes in [11, 37] {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let _scope = InvocationByteScope::enter();
+                    barrier.wait();
+                    record_invocation_bytes(bytes);
+                    assert_invocation_bytes(bytes);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn nested_scopes_and_worker_reuse_keep_byte_accounting_separate() {
+        std::thread::spawn(|| {
+            for bytes in [13, 41] {
+                let _scope = InvocationByteScope::enter();
+                assert_empty_invocation();
+                record_invocation_bytes(bytes);
+                {
+                    let _nested = InvocationByteScope::enter();
+                    assert_empty_invocation();
+                    record_invocation_bytes(71);
+                    assert_invocation_bytes(71);
+                }
+                assert_invocation_bytes(bytes);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn thread_snapshots_include_nested_work_for_publication_deltas() {
+        let before = store_thread_bytes();
+        let reflink_before = thread_reflinked_bytes();
+        let copied_before = thread_copied_bytes();
+        {
+            let _scope = InvocationByteScope::enter();
+            record_invocation_bytes(10);
+            {
+                let _nested = InvocationByteScope::enter();
+                record_invocation_bytes(20);
+            }
+            assert_invocation_bytes(10);
+        }
+        let after = store_thread_bytes();
+        assert_eq!(after.reflinked - before.reflinked, 36);
+        assert_eq!(after.hardlinked - before.hardlinked, 38);
+        assert_eq!(after.copied - before.copied, 40);
+        assert_eq!(after.copy_cross_device - before.copy_cross_device, 42);
+        assert_eq!(after.copy_permission - before.copy_permission, 44);
+        assert_eq!(after.copy_ineligible - before.copy_ineligible, 46);
+        assert_eq!(after.copy_other - before.copy_other, 48);
+        assert_eq!(thread_reflinked_bytes() - reflink_before, 30);
+        assert_eq!(thread_copied_bytes() - copied_before, 34);
+    }
 }

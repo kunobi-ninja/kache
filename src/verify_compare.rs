@@ -853,6 +853,8 @@ mod tests {
 
     fn rustc_emit_lib(out_dir: &Path, src: &Path) {
         let status = std::process::Command::new("rustc")
+            // Other tests change the process cwd while these compilers run.
+            .current_dir(src.parent().unwrap())
             .args([
                 "--crate-name",
                 "foo",

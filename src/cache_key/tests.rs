@@ -13337,7 +13337,14 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     let memo = dir.path().join("memo");
     let (workspace, out) = (dir.path().join("w"), dir.path().join("out"));
     write_file(&workspace.join("Cargo.toml"), "[workspace]\n");
-    write_file(&workspace.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    let source = workspace.join("kt/src/lib.rs");
+    write_file(&source, "pub fn a() {}\n");
+    // Same-size edits must move the stamp even on coarse filesystem clocks.
+    filetime::set_file_mtime(
+        &source,
+        filetime::FileTime::from_unix_time(1_000_000_000, 0),
+    )
+    .unwrap();
     write_file(&out.join("gen.rs"), "// gen\n");
     // Recreating a file can reuse its inode and coarse times. Give the two
     // identical files distinct mtimes so the OUT_DIR entry stamp must move.
@@ -13383,7 +13390,12 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     assert_eq!(guard(true).1, 0);
     assert!(!taken.held(), "the OUT_DIR moved");
     assert!(again.held());
-    write_file(&workspace.join("kt/src/lib.rs"), "pub fn b() {}\n");
+    write_file(&source, "pub fn b() {}\n");
+    filetime::set_file_mtime(
+        &source,
+        filetime::FileTime::from_unix_time(1_000_000_001, 0),
+    )
+    .unwrap();
     assert!(!again.held(), "the workspace moved");
 }
 

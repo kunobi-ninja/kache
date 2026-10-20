@@ -5707,7 +5707,9 @@ fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
             if byte == b'\n' {
                 line.clear();
             }
-            i += 1;
+            let next = i + 1;
+            debug_assert!(next > i, "header probe reader must advance");
+            i = next;
             continue;
         }
         if byte == b'/' && matches!(text.get(i + 1), Some(b'*' | b'/')) {
@@ -5752,7 +5754,8 @@ fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
                     name: PathBuf::from(name),
                     quoted,
                 });
-                i = after + 1;
+                // The lexer consumes the closing parenthesis as punctuation.
+                i = after;
                 continue;
             }
         }
@@ -5767,13 +5770,15 @@ fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
 
 fn cc_skip_probe_trivia(text: &[u8], mut i: usize) -> usize {
     while let Some(&byte) = text.get(i) {
-        if byte.is_ascii_whitespace() {
-            i += 1;
+        let next = if byte.is_ascii_whitespace() {
+            i + 1
         } else if byte == b'/' && matches!(text.get(i + 1), Some(b'*' | b'/')) {
-            i = cc_skip_comment(text, i);
+            cc_skip_comment(text, i)
         } else {
             break;
-        }
+        };
+        debug_assert!(next > i, "header probe trivia reader must advance");
+        i = next;
     }
     i
 }

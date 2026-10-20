@@ -6981,6 +6981,46 @@ fn include_shadowing_refuses_a_probe_through_a_macro() {
 }
 
 #[test]
+fn header_probe_scanner_keeps_each_probe_in_an_expression() {
+    for text in [
+        "#if __has_include(\"first.h\") || __has_include(<second.h>)\n",
+        "#if __has_include_next(\"first.h\") && __has_include(<second.h>)\n",
+    ] {
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![
+                CcHeaderProbe {
+                    name: "first.h".into(),
+                    quoted: true,
+                },
+                CcHeaderProbe {
+                    name: "second.h".into(),
+                    quoted: false,
+                },
+            ]),
+            "{text}",
+        );
+    }
+}
+
+#[test]
+fn header_probe_scanner_does_not_treat_arithmetic_as_comments() {
+    for text in [
+        "#if 4 / 2 && __has_include(<optional.h>)\n",
+        "#if 2*2 && __has_include(<optional.h>)\n",
+    ] {
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![CcHeaderProbe {
+                name: "optional.h".into(),
+                quoted: false,
+            }]),
+            "{text}",
+        );
+    }
+}
+
+#[test]
 fn header_probe_scanner_reads_tokens_and_comments() {
     let text = br##"// __has_include(MACRO)
         /* __has_include(OTHER) */

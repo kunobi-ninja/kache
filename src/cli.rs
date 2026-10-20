@@ -7594,68 +7594,205 @@ pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
 }
 
 /// The directory a build of the current working directory writes its artifacts
-/// to: the target dir Cargo would choose for it.
+/// to: the target dir Cargo would choose for it, or the build dir when Cargo
+/// splits the two.
 ///
 /// `kache doctor` probes this rather than the working directory. What the store
-/// hardlinks into is the target dir, never the source tree, so probing the
+/// hardlinks into is the build tree, never the source tree, so probing the
 /// working directory reports EXDEV for a project whose `build.target-dir` sits
 /// on the store's mount, and a pass for one whose artifacts get copied.
-fn cargo_target_dir() -> std::path::PathBuf {
-    cargo_target_dir_from(
+fn cargo_output_dir() -> std::path::PathBuf {
+    cargo_output_dir_from(
         &std::env::current_dir().unwrap_or_default(),
-        std::env::var_os("CARGO_TARGET_DIR"),
-        std::env::var_os("CARGO_HOME"),
-        std::env::var_os("HOME"),
+        &CargoEnvironment {
+            target_dir: std::env::var_os("CARGO_TARGET_DIR"),
+            build_target_dir: std::env::var_os("CARGO_BUILD_TARGET_DIR"),
+            build_dir: std::env::var_os("CARGO_BUILD_BUILD_DIR"),
+            cargo_home: std::env::var_os("CARGO_HOME"),
+            // The home directory is where `.cargo` lives when `CARGO_HOME` is
+            // unset, and it is not `$HOME` on every platform.
+            home: dirs::home_dir().unwrap_or_default(),
+        },
     )
 }
 
-/// [`cargo_target_dir`] with the environment passed in, so the search can be
-/// tested without mutating the one the suite shares.
-fn cargo_target_dir_from(
-    cwd: &std::path::Path,
+/// The environment Cargo resolves the output directory from, passed in so the
+/// search can be tested without mutating the one the suite shares.
+#[derive(Default)]
+struct CargoEnvironment {
+    /// `CARGO_TARGET_DIR`, which names the target dir directly.
     target_dir: Option<std::ffi::OsString>,
+    /// `CARGO_BUILD_TARGET_DIR`, the environment name of `build.target-dir`.
+    build_target_dir: Option<std::ffi::OsString>,
+    /// `CARGO_BUILD_BUILD_DIR`, the environment name of `build.build-dir`.
+    build_dir: Option<std::ffi::OsString>,
+    /// `CARGO_HOME`.
     cargo_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> std::path::PathBuf {
-    use std::path::PathBuf;
-    // Cargo gives the environment its own precedence, above every config file.
-    if let Some(dir) = target_dir.filter(|dir| !dir.is_empty()) {
-        return closest_existing(PathBuf::from(dir));
-    }
-    // Cargo reads the config of every ancestor of the working directory,
-    // nearest first, and $CARGO_HOME/config.toml last, so the first config
-    // naming a target dir wins.
-    let mut configs: Vec<PathBuf> = cwd
-        .ancestors()
-        .map(|dir| dir.join(".cargo").join("config.toml"))
-        .collect();
-    // $CARGO_HOME defaults to ~/.cargo, so leaving it unset still has a file.
-    let cargo_home = cargo_home
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".cargo")));
-    if let Some(cargo_home) = cargo_home {
-        configs.push(cargo_home.join("config.toml"));
-    }
-    for config in configs {
-        if let Some(target) = configured_target_dir(&config) {
-            return closest_existing(target);
-        }
-    }
-    closest_existing(cwd.join("target"))
+    /// The platform's home directory, empty when the platform has none.
+    home: std::path::PathBuf,
 }
 
-/// `[build] target-dir` from a Cargo config, resolved the way Cargo resolves it:
-/// a relative value is relative to the parent of the `.cargo` directory holding
-/// the file, not to the working directory.
-fn configured_target_dir(config: &std::path::Path) -> Option<std::path::PathBuf> {
-    let settings: toml::Value = toml::from_str(&std::fs::read_to_string(config).ok()?).ok()?;
-    let target = std::path::PathBuf::from(settings.get("build")?.get("target-dir")?.as_str()?);
-    let relative_to = config.parent()?.parent()?;
-    Some(if target.is_absolute() {
-        target
-    } else {
-        relative_to.join(target)
-    })
+/// [`cargo_output_dir`] with the environment passed in, so the search can be
+/// tested without mutating the one the suite shares.
+fn cargo_output_dir_from(cwd: &std::path::Path, env: &CargoEnvironment) -> std::path::PathBuf {
+    let workspace = cargo_workspace_root(cwd);
+    let cargo_home = cargo_home_dir_from(env, cwd);
+
+    // Cargo gives the environment precedence over every config file, and an
+    // environment path is relative to the working directory.
+    let environment = [env.target_dir.as_deref(), env.build_target_dir.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|dir| !dir.is_empty())
+        .map(|dir| cwd.join(dir));
+
+    let mut build = None;
+    let target = match environment {
+        Some(target) => target,
+        None => {
+            // Cargo merges the config of every ancestor of the working
+            // directory and the one in $CARGO_HOME, the closest one winning.
+            let mut configured = workspace.join("target");
+            for (directory, base) in cargo_config_dirs(cwd, &cargo_home) {
+                let Some(settings) = cargo_build_settings(&directory) else {
+                    continue;
+                };
+                // A config path is relative to the parent of the `.cargo`
+                // directory holding the file, not to the working directory.
+                if let Some(value) = settings
+                    .get("target-dir")
+                    .and_then(toml::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    configured = base.join(value);
+                }
+                if let Some(value) = settings.get("build-dir").and_then(toml::Value::as_str)
+                    && let Some(expanded) = expand_build_dir(&base, value, &workspace, &cargo_home)
+                {
+                    build = Some(expanded);
+                }
+            }
+            configured
+        }
+    };
+    if let Some(dir) = env.build_dir.as_deref().filter(|dir| !dir.is_empty())
+        && let Some(value) = dir.to_str()
+    {
+        build = expand_build_dir(cwd, value, &workspace, &cargo_home);
+    }
+    // The build dir holds the intermediates the store hardlinks; the target
+    // dir holds them when Cargo keeps both together.
+    closest_existing(build.unwrap_or(target))
+}
+
+/// The directories Cargo reads a config from, with the directory a relative
+/// path in it resolves against, in the order their settings apply: `$CARGO_HOME`
+/// first, then every ancestor of the working directory from the outermost
+/// inwards, so the closest one wins.
+fn cargo_config_dirs(
+    cwd: &std::path::Path,
+    cargo_home: &std::path::Path,
+) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    // A relative path in the cargo home's own config resolves against the
+    // parent of the `.cargo` directory holding it, like every other config.
+    let mut directories: Vec<(std::path::PathBuf, std::path::PathBuf)> = cargo_home
+        .parent()
+        .map(|base| (cargo_home.to_path_buf(), base.to_path_buf()))
+        .into_iter()
+        .collect();
+    directories.extend(
+        cwd.ancestors()
+            .map(|dir| (dir.join(".cargo"), dir.to_path_buf()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    );
+    directories
+}
+
+/// The `[build]` table of the Cargo config in `directory`, if it has one.
+///
+/// Cargo keeps the extensionless name for compatibility and reads it in
+/// preference to `config.toml` when both exist.
+fn cargo_build_settings(directory: &std::path::Path) -> Option<toml::Table> {
+    for name in ["config", "config.toml"] {
+        let path = directory.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let table: toml::Table = text.parse().ok()?;
+        return table.get("build")?.as_table().cloned();
+    }
+    None
+}
+
+/// `$CARGO_HOME`, falling back to the platform's home directory (cargo's
+/// documented default), the way [`cargo_home_dir`] does.
+fn cargo_home_dir_from(env: &CargoEnvironment, cwd: &std::path::Path) -> std::path::PathBuf {
+    match env.cargo_home.as_deref().filter(|value| !value.is_empty()) {
+        Some(cargo_home) => {
+            let cargo_home = std::path::PathBuf::from(cargo_home);
+            if cargo_home.is_absolute() {
+                cargo_home
+            } else {
+                cwd.join(cargo_home)
+            }
+        }
+        None => env.home.join(".cargo"),
+    }
+}
+
+/// The directory Cargo would put the default `target` dir under: the
+/// workspace root, or the package root for a package outside a workspace.
+///
+/// Cargo reads the workspace from the manifest rather than from the lockfile,
+/// so a workspace that has not been built yet still resolves.
+fn cargo_workspace_root(cwd: &std::path::Path) -> std::path::PathBuf {
+    let mut package = None;
+    for dir in cwd.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        if package.is_none() {
+            package = Some(dir);
+        }
+        if cargo_manifest_is_workspace(&manifest) {
+            return dir.to_path_buf();
+        }
+    }
+    package.map_or_else(|| cwd.to_path_buf(), std::path::Path::to_path_buf)
+}
+
+/// Whether the manifest at `path` declares a workspace.
+fn cargo_manifest_is_workspace(manifest: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    table.contains_key("workspace")
+}
+
+/// A `build-dir` value, with the templates Cargo expands in it.
+fn expand_build_dir(
+    base: &std::path::Path,
+    value: &str,
+    workspace: &std::path::Path,
+    cargo_home: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if value.is_empty() {
+        return None;
+    }
+    let value = value
+        .replace("{workspace-root}", workspace.to_str()?)
+        .replace("{cargo-cache-home}", cargo_home.to_str()?);
+    if value.contains(['{', '}']) {
+        return None;
+    }
+    Some(base.join(value))
 }
 
 /// The probe writes a temp file, so it needs a directory that exists. A target
@@ -7952,7 +8089,7 @@ pub fn doctor(
             });
         }
         checks.extend(doctor_shards(cfg));
-        let build_dir = cargo_target_dir();
+        let build_dir = cargo_output_dir();
         checks.push(doctor_link_layout(cfg, &build_dir));
     }
 

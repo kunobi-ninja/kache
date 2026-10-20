@@ -2063,6 +2063,43 @@ fn doctor_runs_readonly_diagnostics() {
     e.cmd().arg("doctor").assert().success();
 }
 
+/// The store hardlinks the build tree into its staging area, so the link
+/// layout check has to probe the directory a build writes to, not the
+/// directory the command was run from.
+#[test]
+fn doctor_probes_the_cargo_target_dir_for_the_link_layout() {
+    let e = env();
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".cargo")).unwrap();
+    std::fs::create_dir_all(project.path().join("target")).unwrap();
+    // A relative target dir, so the config holds no path to escape.
+    std::fs::write(
+        project.path().join(".cargo/config.toml"),
+        "[build]\ntarget-dir = \"target\"\n",
+    )
+    .unwrap();
+
+    let output = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache)
+        // The environment names the target dir too, and the check has to read
+        // the config this test writes.
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .arg("doctor")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let check = text
+        .lines()
+        .find(|line| line.contains("Link layout"))
+        .unwrap_or_else(|| panic!("the doctor reported no link layout check: {text}"));
+    assert!(
+        check.contains(&project.path().join("target").display().to_string()),
+        "the link layout check probed the wrong directory: {check}"
+    );
+}
+
 #[test]
 fn doctor_does_not_prescribe_obsolete_build_script_for_extra_inputs() {
     let e = env();

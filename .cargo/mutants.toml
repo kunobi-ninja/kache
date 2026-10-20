@@ -257,6 +257,12 @@ exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # The doctor's target-dir resolver reads the process environment, which the
+    # suite shares: a test that sets one of these variables races the rest of
+    # the run. The resolver itself takes the environment as an argument, so
+    # `cargo_output_dir_from` and the helpers it calls stay in scope and are
+    # tested with the environment passed in.
+    "src/cli.rs:.* in cargo_output_dir$",
     # When another start wins the race, `daemon start` asks the running daemon
     # for its version with a short deadline. A past deadline only drops the
     # version from "already running"; the race is not reproducible in tests.

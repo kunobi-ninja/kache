@@ -45,22 +45,20 @@ fn sweep(
     }
     // Profiles can outlive their last Cargo fingerprint. Look at both the
     // native and target-triple layouts without descending into graph data.
-    for entry in walkdir::WalkDir::new(target)
-        .min_depth(1)
-        .max_depth(2)
-        .follow_links(false)
+    for profile in crate::unit_prune::subdirectories(target)
         .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_dir())
+        .flat_map(|profile| {
+            let nested = crate::unit_prune::subdirectories(&profile);
+            std::iter::once(profile).chain(nested)
+        })
     {
-        let profile = entry.path();
         let auto_root = profile.join(AUTO_ROOT);
         let root = auto_root.join(POLICY_VERSION);
         if !real_directory(&auto_root) || !real_directory(&root) {
             continue;
         }
         let _profile_locks = if remove {
-            let Some(held) = crate::unit_prune::hold(profile) else {
+            let Some(held) = crate::unit_prune::hold(&profile) else {
                 continue;
             };
             Some(held)

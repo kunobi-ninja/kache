@@ -651,7 +651,7 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     entries(dir)
         .into_iter()
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))

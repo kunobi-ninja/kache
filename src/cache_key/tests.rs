@@ -12083,6 +12083,120 @@ fn mapped_hashes_are_memoised_by_content_and_map_set() {
     assert_eq!(reads.get(), 6);
 }
 
+#[test]
+fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let paths: Vec<_> = ["a.h", "twin.h"]
+        .iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+    for path in &paths {
+        std::fs::write(path, "#if __has_include(<optional.h>)\n#endif\n").unwrap();
+    }
+    let scans = std::cell::Cell::new(0);
+    let scan = |path: &Path| -> anyhow::Result<(String, String)> {
+        scans.set(scans.get() + 1);
+        let bytes = std::fs::read(path)?;
+        Ok((blake3::hash(&bytes).to_hex().to_string(), "probe".into()))
+    };
+    let first = FileHasher::persistent(&db);
+    assert_eq!(
+        first.cc_header_scans(&paths, 1, &scan).unwrap(),
+        ["probe", "probe"]
+    );
+    assert_eq!(scans.get(), 1, "identical files share a scan");
+    let mut inputs = first
+        .cc_preprocess_fingerprints(
+            &paths
+                .iter()
+                .map(|path| (path.to_string_lossy().into_owned(), path.clone()))
+                .collect::<Vec<_>>(),
+            "",
+            &no_mapping,
+        )
+        .unwrap();
+    // Model a settled recording without sleeping. The bytes and stamps are
+    // real; only the observation clock advances beyond their settle window.
+    for input in &mut inputs {
+        input.observed_ns = input.fingerprint.mtime_ns.max(input.fingerprint.ctime_ns)
+            + kache_store::file_hash::HASH_SETTLE_NS;
+    }
+    first.cc_preprocess_memo_record_if_unchanged("memo", &"a".repeat(64), &inputs, &no_mapping);
+    let warm = FileHasher::persistent(&db);
+    let (_, satisfied) = warm
+        .cc_preprocess_memo_lookup("memo", no_remap, &no_mapping)
+        .unwrap();
+    assert_eq!(warm.stats().bytes_hashed, 0);
+    assert_eq!(
+        warm.cc_header_scans(&satisfied, 1, &scan).unwrap(),
+        ["probe", "probe"]
+    );
+    assert_eq!(scans.get(), 1, "the scan survives a fresh FileHasher");
+    assert_eq!(
+        warm.stats().bytes_hashed,
+        0,
+        "memo-validated small headers must not be hashed again"
+    );
+    warm.cc_header_scans(&satisfied, 2, &scan).unwrap();
+    assert_eq!(
+        scans.get(),
+        2,
+        "a new scanner version must rescan the bytes"
+    );
+    let changed = |path: &Path| -> anyhow::Result<(String, String)> {
+        std::fs::write(path, "different bytes")?;
+        Ok(("0".repeat(64), "wrong".into()))
+    };
+    assert!(warm.cc_header_scans(&paths[..1], 3, &changed).is_err());
+    let cache = warm.cache.as_ref().unwrap();
+    assert!(
+        cache
+            .get_cc_header_scans(3, &[&inputs[0].content])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn memo_hash_validation_accepts_resolution_proofs_and_rejects_malformed_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let path = dir.path().join("input.c");
+    std::fs::write(&path, "int x;\n").unwrap();
+    let hasher = FileHasher::persistent(&db);
+    let inputs = hasher
+        .cc_preprocess_fingerprints(
+            &[(path.to_string_lossy().into_owned(), path.clone())],
+            "",
+            &no_mapping,
+        )
+        .unwrap();
+    for (index, (hash, valid)) in [
+        (format!("{}@{}", "a".repeat(64), "b".repeat(64)), true),
+        (format!("pb:{}@{}", "a".repeat(64), "b".repeat(64)), true),
+        (format!("{}@", "a".repeat(64)), false),
+        (format!("{}@{}", "a".repeat(64), "z".repeat(64)), false),
+        (
+            format!("{}@{}@{}", "a".repeat(64), "b".repeat(64), "c".repeat(64)),
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = index.to_string();
+        hasher.cc_preprocess_memo_record_if_unchanged(&key, &hash, &inputs, &no_mapping);
+        assert_eq!(
+            hasher
+                .cc_preprocess_memo_lookup(&key, no_remap, &no_mapping)
+                .is_some(),
+            valid,
+            "{hash}"
+        );
+    }
+}
+
 /// The assembler scan runs once per distinct content and its verdict is
 /// memoised across processes; an unreadable file is skipped and not
 /// recorded.

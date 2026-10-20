@@ -393,9 +393,26 @@ fn cc_header_availability_creation_uses_current_compiler_output() {
                 format!("{prefix}int main(void) {{ return VALUE; }}\n"),
             )
             .unwrap();
-            for (phase, expected) in [("cold", 11), ("warm", 11), ("created", 23)] {
-                if phase == "created" {
-                    fs::write(root.join("optional.h"), "#define VALUE 23\n").unwrap();
+            for (phase, expected) in [
+                ("cold", 11),
+                ("warm", 11),
+                ("created", 23),
+                ("created-warm", 23),
+                ("modified", 31),
+                ("modified-warm", 31),
+                ("removed", 11),
+                ("recreated", 47),
+            ] {
+                match phase {
+                    "created" | "modified" | "recreated" => {
+                        fs::write(
+                            root.join("optional.h"),
+                            format!("#define VALUE {expected}\n"),
+                        )
+                        .unwrap();
+                    }
+                    "removed" => fs::remove_file(root.join("optional.h")).unwrap(),
+                    _ => {}
                 }
                 let _ = fs::remove_file(root.join("unit.o"));
                 let compiled = cacheable_cc_command(&root)
@@ -470,9 +487,8 @@ fn compile_and_run_unit(root: &std::path::Path, discovery: &str, args: &[&str]) 
     (event["cache_key"].as_str().unwrap().to_string(), value)
 }
 
-/// Run `unit.c` in `root` before and after `inc/optional.h` appears. The
-/// key must hold while the header is absent and change when it appears,
-/// and the program must return `absent` and then 23.
+/// Exercise the optional header lifecycle in both discovery modes. A newly
+/// discovered header must join the memo read set so later edits invalidate it.
 fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], absent: i32) {
     for discovery in ["0", "1"] {
         let _ = fs::remove_file(root.join("inc/optional.h"));
@@ -493,6 +509,27 @@ fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], a
             "discovery={discovery}: the probed header appearing must change the key"
         );
         assert_eq!(value, 23, "discovery={discovery}: created");
+        fs::write(root.join("inc/optional.h"), "#define VALUE 31\n").unwrap();
+        let (modified, value) = compile_and_run_unit(root, discovery, args);
+        assert_ne!(
+            modified, created,
+            "the newly read header must enter the memo"
+        );
+        assert_eq!(value, 31);
+        let (warm_modified, value) = compile_and_run_unit(root, discovery, args);
+        assert_eq!(warm_modified, modified);
+        assert_eq!(value, 31);
+        assert_eq!(last_cc_event(root)["result"], "local_hit");
+        fs::remove_file(root.join("inc/optional.h")).unwrap();
+        let (_, value) = compile_and_run_unit(root, discovery, args);
+        assert_eq!(
+            value, absent,
+            "removing the header must restore the fallback"
+        );
+        fs::write(root.join("inc/optional.h"), "#define VALUE 47\n").unwrap();
+        let (recreated, value) = compile_and_run_unit(root, discovery, args);
+        assert_ne!(recreated, created);
+        assert_eq!(value, 47);
     }
 }
 
@@ -512,7 +549,9 @@ fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
          int main(void) { return VALUE; }\n",
     )
     .unwrap();
-    assert_probe_follows_optional_header(&root, &["-Iinc"], 11);
+    for args in [["-Iinc"], ["-isysteminc"], ["-idirafterinc"]] {
+        assert_probe_follows_optional_header(&root, &args, 11);
+    }
 }
 
 /// A header outside every user directory, as a system header is, probes
@@ -540,6 +579,85 @@ fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
     )
     .unwrap();
     assert_probe_follows_optional_header(&root, &["-isystem", "system", "-Iinc"], 5);
+}
+
+#[test]
+fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    fs::create_dir(root.join("elsewhere")).unwrap();
+    fs::write(root.join("elsewhere/probe.h"),
+        "#if __has_include(\"optional.h\")\n#include \"optional.h\"\n#else\n#define VALUE 11\n#endif\n").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"elsewhere/probe.h\"\nint main(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    for discovery in ["0", "1"] {
+        let _ = fs::remove_file(root.join("elsewhere/optional.h"));
+        let _ = fs::remove_dir_all(root.join("cache"));
+        assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
+        assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
+        for value in [23, 31] {
+            fs::write(
+                root.join("elsewhere/optional.h"),
+                format!("#define VALUE {value}\n"),
+            )
+            .unwrap();
+            assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, value);
+        }
+        fs::remove_file(root.join("elsewhere/optional.h")).unwrap();
+        assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
+    }
+}
+
+#[test]
+fn a_header_created_after_preprocessing_cannot_publish_an_incomplete_read_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    fs::write(root.join("unit.c"),
+        "#if __has_include(<optional.h>)\n#include <optional.h>\n#else\n#define VALUE 11\n#endif\nint main(void) { return VALUE; }\n").unwrap();
+    let compiler = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        concat!(
+            "#!/bin/sh\n",
+            "preprocess=0; unit=0\n",
+            "for arg in \"$@\"; do case \"$arg\" in -E) preprocess=1;; unit.c) unit=1;; esac; done\n",
+            "/usr/bin/cc \"$@\"\nstatus=$?\n",
+            "if [ \"$status:$preprocess:$unit\" = '0:1:1' ]; then\n",
+            "  printf '#define VALUE 23\n' > inc/optional.h\n",
+            "  : > injected\nfi\nexit \"$status\"\n",
+        ),
+    );
+    let compiled = cacheable_cc_command(&root)
+        .args([
+            compiler.to_str().unwrap(),
+            "-c",
+            "unit.c",
+            "-Iinc",
+            "-o",
+            "unit.o",
+        ])
+        .env("HOME", root.join("home"))
+        .env("KACHE_DEFERRED_DISCOVERY", "0")
+        .env("KACHE_DAEMON_PUBLISH", "0")
+        .env("KACHE_MIN_STORE_COMPILE_MS", "0")
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{compiled:?}");
+    assert!(
+        root.join("injected").is_file(),
+        "the header must appear after the unit's preprocess"
+    );
+    assert_eq!(index_rows(&root, "cc_preprocess_memos"), 0);
+    assert_eq!(index_rows(&root, "entries"), 0);
 }
 
 fn cacheable_cc_command(root: &std::path::Path) -> Command {

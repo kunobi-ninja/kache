@@ -685,15 +685,19 @@ impl FileFingerprint {
     pub fn from_path(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("reading metadata for {}", path.display()))?;
-        let absolute_path = absolute_path(path);
+        Ok(Self::from_metadata(path, &metadata))
+    }
 
-        Ok(Self {
+    /// Identity from an existing stat, including a symlink's own metadata.
+    pub fn from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Self {
+        let absolute_path = absolute_path(path);
+        Self {
             path: absolute_path.to_string_lossy().into_owned(),
             size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            mtime_ns: metadata_mtime_ns(&metadata),
-            ctime_ns: metadata_ctime_ns(&metadata),
-            inode: metadata_inode(&metadata),
-        })
+            mtime_ns: metadata_mtime_ns(metadata),
+            ctime_ns: metadata_ctime_ns(metadata),
+            inode: metadata_inode(metadata),
+        }
     }
 }
 

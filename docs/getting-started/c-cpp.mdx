@@ -150,6 +150,10 @@ KACHE_BASE_DIR="$PWD" cmake --build build
 
 A configured remote publishes GCC and Clang objects the same way it publishes Rust entries. clang-cl debug objects stay on the machine because CodeView records paths that clang-cl does not remap.
 
+Literal `__has_include` and `__has_include_next` probes track header availability in user include directories, explicit system include directories, and include-path environment variables. Quoted probes also check beside the file containing the probe. When a header appears or disappears, Kache rediscovers the dependencies before reusing the preprocessing memo. Headers actually included then invalidate the memo when their contents change.
+
+Kache caches the source analysis by content hash. A settled warm memo reuses that analysis without reading every header again. Direct probes whose header name comes from a macro, explicit aliases of the probe operator, and trigraph line continuations pass through.
+
 ## Passthroughs
 
 Kache currently passes through:
@@ -164,6 +168,7 @@ Kache currently passes through:
 - assembly, including inline `asm` in C, that reads another file with `.incbin` or `.include`
 - assembly that uses macros or repetitions (`.macro`, `.irp`, `.irpc`, `.rept`, `.altmacro`) able to generate those directives
 - inline `asm` whose text is a computed expression rather than a string literal
+- header availability probes with macro header names, operator aliases, or trigraph line continuations
 - flags it has not classified
 
 With link caching enabled, explicit archive inputs such as `libvalue.a` remain eligible for caching. Links that select libraries by name (`-l`, `--library`) or read response files pass through because the link key cannot track their selected library inputs. Search-directory options such as `-L` and GNU ld's `--library-path` alone do not select a named library.

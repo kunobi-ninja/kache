@@ -154,6 +154,11 @@ pub(crate) fn ensure_mapped_hash_schema(db: &Connection) -> rusqlite::Result<()>
             content TEXT PRIMARY KEY,
             construct TEXT NOT NULL,
             rule INTEGER NOT NULL DEFAULT 0
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS cc_header_scans (
+            content TEXT PRIMARY KEY,
+            scan TEXT NOT NULL,
+            version INTEGER NOT NULL
          ) WITHOUT ROWID;",
     )
 }
@@ -229,7 +234,8 @@ fn purge(db: &Connection) -> rusqlite::Result<()> {
          DELETE FROM cc_preprocess_memos;
          DELETE FROM cc_memo_inputs;
          DELETE FROM cc_mapped_hashes;
-         DELETE FROM cc_asm_scans;",
+         DELETE FROM cc_asm_scans;
+         DELETE FROM cc_header_scans;",
     )
 }
 
@@ -238,6 +244,58 @@ fn purge(db: &Connection) -> rusqlite::Result<()> {
 const MEMO_LOOKUP_CHUNK: usize = 256;
 
 impl FileHashCache<'_> {
+    /// Header availability scans, shared by files with identical bytes.
+    /// The scanner owns the version and the serialized result.
+    pub fn get_cc_header_scans(
+        &self,
+        version: i64,
+        contents: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let mut found = std::collections::HashMap::new();
+        for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = self.db().prepare_cached(&format!(
+                "SELECT content, scan FROM cc_header_scans
+                 WHERE version = ?1 AND content IN ({placeholders})"
+            ))?;
+            let args = std::iter::once(rusqlite::types::Value::Integer(version)).chain(
+                chunk
+                    .iter()
+                    .map(|content| rusqlite::types::Value::Text((*content).into())),
+            );
+            let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (content, scan) = row?;
+                found.insert(content, scan);
+            }
+        }
+        Ok(found)
+    }
+
+    pub fn put_cc_header_scans(
+        &self,
+        version: i64,
+        pairs: &[(String, String)],
+    ) -> rusqlite::Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        {
+            let mut put = tx.prepare_cached(
+                "INSERT INTO cc_header_scans(content, scan, version) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(content) DO UPDATE SET scan = excluded.scan, version = excluded.version
+                 WHERE cc_header_scans.version != excluded.version",
+            )?;
+            for (content, scan) in pairs {
+                put.execute(params![content, scan, version])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Memoised mapped hashes for `contents` under the map set `maps`,
     /// recorded under `CC_MEMO_RULE` or a later rule.
     pub fn get_cc_mapped_hashes(
@@ -513,6 +571,11 @@ impl FileHashCache<'_> {
              (SELECT 1 FROM cc_memo_input_refs WHERE input_id = cc_memo_inputs.id)",
             [],
         )?;
+        tx.execute(
+            "DELETE FROM cc_header_scans WHERE content NOT IN
+             (SELECT content FROM cc_memo_inputs)",
+            [],
+        )?;
         tx.commit()?;
         Ok((memos, inputs))
     }
@@ -559,18 +622,60 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn header_scans_are_versioned_batched_and_pruned_with_their_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let pairs: Vec<_> = (0..MEMO_LOOKUP_CHUNK + 2)
+            .map(|index| (format!("content-{index}"), format!("scan-{index}")))
+            .collect();
+        cache.put_cc_header_scans(1, &pairs).unwrap();
+        cache.put_cc_header_scans(1, &[]).unwrap();
+        let contents: Vec<_> = pairs.iter().map(|(content, _)| content.as_str()).collect();
+        let found = cache.get_cc_header_scans(1, &contents).unwrap();
+        assert_eq!(found.len(), pairs.len());
+        for (content, scan) in &pairs {
+            assert_eq!(found[content], *scan);
+        }
+        assert!(cache.get_cc_header_scans(2, &contents).unwrap().is_empty());
+        assert!(cache.get_cc_header_scans(1, &[]).unwrap().is_empty());
+        cache
+            .put_cc_header_scans(2, &[("content-0".into(), "new".into())])
+            .unwrap();
+        assert_eq!(
+            cache.get_cc_header_scans(2, &["content-0"]).unwrap()["content-0"],
+            "new"
+        );
+        assert!(
+            cache
+                .get_cc_header_scans(1, &["content-0"])
+                .unwrap()
+                .is_empty()
+        );
+        cache
+            .put_cc_preprocess_memo_inputs("live", "hash", &[input("a.h", "content-0")])
+            .unwrap();
+        cache.prune_cc_preprocess_memos().unwrap();
+        assert_eq!(count(&cache, "cc_header_scans"), 1);
+        assert_eq!(
+            cache.get_cc_header_scans(2, &["content-0"]).unwrap()["content-0"],
+            "new"
+        );
+    }
+
     /// Every process that opens an older index looks for the rule columns
     /// before it takes the write lock, and each that finds one missing goes
     /// on to take it. Only the first may purge: by the time a later one holds
     /// the lock, the columns are there and the rows under them are current.
     #[test]
     fn the_purge_runs_once_however_many_openers_found_a_column_missing() {
-        const MEMO_TABLES: [&str; 5] = [
+        const MEMO_TABLES: [&str; 6] = [
             "cc_preprocess_memos",
             "cc_memo_inputs",
             "cc_memo_input_refs",
             "cc_mapped_hashes",
             "cc_asm_scans",
+            "cc_header_scans",
         ];
         let dir = tempfile::tempdir().unwrap();
         let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
@@ -583,6 +688,9 @@ mod tests {
                 .unwrap();
             cache
                 .put_cc_asm_scans(&[("one".into(), String::new())])
+                .unwrap();
+            cache
+                .put_cc_header_scans(1, &[("one".into(), "[]".into())])
                 .unwrap();
         };
         let rows = |cache: &FileHashCache<'_>| MEMO_TABLES.map(|table| count(cache, table));
@@ -600,14 +708,14 @@ mod tests {
         // The first opener to take the lock adds the columns and purges.
         ensure_rule(cache.db()).unwrap();
         assert!(has_rule_columns(cache.db()).unwrap());
-        assert_eq!(rows(&cache), [0; 5]);
+        assert_eq!(rows(&cache), [0; 6]);
 
         // A second opener found a column missing before that, and takes the
         // lock only now, after rows were recorded under the columns.
         record(&cache);
-        assert_eq!(rows(&cache), [1; 5]);
+        assert_eq!(rows(&cache), [1; 6]);
         add_rule_columns(cache.db()).unwrap();
-        assert_eq!(rows(&cache), [1; 5], "the purge runs once");
+        assert_eq!(rows(&cache), [1; 6], "the purge runs once");
     }
 
     #[test]

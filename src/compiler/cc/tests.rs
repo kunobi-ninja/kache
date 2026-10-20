@@ -4290,6 +4290,17 @@ fn a_memo_key_from_before_the_settle_rules_is_never_todays() {
         today, content_only,
         "a memo storing a content-only digest must not answer the current read-set key"
     );
+    let unguarded = cc_preprocess_memo_key_as(
+        b"cc-preprocess-memo-v7",
+        &parsed,
+        &[],
+        "test compiler version",
+    )
+    .unwrap();
+    assert_ne!(
+        today, unguarded,
+        "an old memo has no include-resolution proof"
+    );
 }
 
 #[test]
@@ -6942,6 +6953,161 @@ fn include_shadowing_refuses_a_probe_through_a_macro() {
 }
 
 #[test]
+fn header_probe_scanner_reads_tokens_and_comments() {
+    let text = br##"// __has_include(MACRO)
+        /* __has_include(OTHER) */
+        const char *s = "__has_include(STRING)";
+        const char *r = R"tag(__has_include(RAW))tag";
+        int prefix__has_include(int);
+        # /* comment */ define __has_include(x) 0
+        #if defined /* feature */ (__has_include)
+        #if __has_include /* gap */ ( /* arg */ <a.h> /* close */ )
+        #elif __has_include_next("b.h")
+        #endif
+    "##;
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![
+            CcHeaderProbe {
+                name: "a.h".into(),
+                quoted: false
+            },
+            CcHeaderProbe {
+                name: "b.h".into(),
+                quoted: true
+            },
+        ])
+    );
+    for text in [
+        "#define CHECK __has_include\n#if CHECK(HEADER)\n",
+        "#if __has_include(/* comment */ HEADER)\n",
+        "#if __has_include(\"unterminated)\n",
+        "#if __has_include(<bad.h> EXTRA)\n",
+        "#if __has_inc??/\nlude(<optional.h>)\n",
+    ] {
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{text}");
+    }
+}
+
+#[test]
+fn quoted_probe_outside_user_dirs_and_relocated_probe_have_the_same_resolution() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let mut digests = Vec::new();
+    for copy in ["a", "b"] {
+        let root = temp.path().join(copy);
+        fs::create_dir_all(&root).unwrap();
+        let (parsed, source, _) = probing_unit(&root, "int x;\n");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let header = elsewhere.join("probe.h");
+        fs::write(&header, "#if __has_include(\"optional.h\")\n#endif\n").unwrap();
+        let inputs = [source, header];
+        let names =
+            cc_shadowing_names(&parsed, &inputs, &crate::cache_key::FileHasher::new()).unwrap();
+        let before = digest_cc_shadowing_names(&parsed, &names).unwrap();
+        let optional = elsewhere.join("optional.h");
+        fs::write(&optional, "#define VALUE 23\n").unwrap();
+        let after = digest_cc_shadowing_names(&parsed, &names).unwrap();
+        assert_ne!(
+            before, after,
+            "quoted probes search the enclosing header's directory"
+        );
+        fs::write(&optional, "#define VALUE 31\n").unwrap();
+        assert_eq!(
+            after,
+            digest_cc_shadowing_names(&parsed, &names).unwrap(),
+            "availability alone does not depend on header contents"
+        );
+        digests.push((before, after));
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "local lookup paths must not bind a portable key"
+    );
+}
+
+#[test]
+fn include_next_notices_a_later_candidate_even_when_the_first_still_exists() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let (mut parsed, source, first) = probing_unit(
+        temp.path(),
+        "#if __has_include_next(<optional.h>)\n#endif\n",
+    );
+    let later = temp.path().join("later");
+    fs::create_dir(&later).unwrap();
+    parsed.includes.push(later.clone());
+    fs::write(first.join("optional.h"), "int x;\n").unwrap();
+    let names =
+        cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
+    let before = digest_cc_shadowing_names(&parsed, &names).unwrap();
+    fs::write(later.join("optional.h"), "int y;\n").unwrap();
+    assert_ne!(before, digest_cc_shadowing_names(&parsed, &names).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) =
+        probing_unit(temp.path(), "#if __has_include(<optional.h>)\n#endif\n");
+    let target = temp.path().join("target");
+    std::os::unix::fs::symlink(&target, include.join("optional.h")).unwrap();
+    let names =
+        cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
+    let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
+    assert!(
+        stamps.is_none(),
+        "a directory stamp cannot prove symlink target availability"
+    );
+    let compiler = CcCompiler::new();
+    compiler
+        .pending_include_dir_digest
+        .replace(Some(PendingIncludeDirDigest {
+            digest,
+            names: Some(names),
+            stamps,
+        }));
+    assert!(compiler.include_dir_names_still_match(&parsed));
+    fs::write(&target, "int value;\n").unwrap();
+    assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[test]
+fn a_header_appearing_during_key_discovery_blocks_publication_without_reading_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("optional.h");
+    let mut hasher = crate::cache_key::FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    assert!(!cc_header_probe_available(&path, Some(&hasher)).unwrap());
+    assert!(!hasher.inputs_changed_since_keyed());
+    fs::write(&path, "#define VALUE 23\n").unwrap();
+    assert!(cc_header_probe_available(&path, Some(&hasher)).unwrap());
+    assert!(hasher.inputs_changed_since_keyed());
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_symlink_to_an_old_header_also_blocks_memo_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("old.h");
+    let link = temp.path().join("optional.h");
+    fs::write(&target, "int value;\n").unwrap();
+    crate::test_support::settle_writes(&[&target]);
+    let mut hasher = crate::cache_key::FileHasher::new();
+    hasher.arm_too_new_guard(crate::cache_key::stamp_clock_ns(), 0);
+    assert!(cc_header_probe_available(&target, Some(&hasher)).unwrap());
+    assert!(!hasher.inputs_changed_since_keyed());
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(cc_header_probe_available(&link, Some(&hasher)).unwrap());
+    assert!(hasher.inputs_changed_since_keyed());
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+}
+
+#[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first");
@@ -7544,6 +7710,7 @@ fn settle(dir: &Path) {
 #[cfg(unix)]
 #[test]
 fn a_stamped_recheck_notices_a_header_added_after_the_key() {
+    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first");
     let second = temp.path().join("second");
@@ -7563,10 +7730,15 @@ fn a_stamped_recheck_notices_a_header_added_after_the_key() {
         second.to_str().unwrap(),
     ]))
     .unwrap();
-    let names = cc_shadowing_names(&parsed, &[source.clone(), read]).unwrap();
+    let names = cc_shadowing_names(
+        &parsed,
+        &[source.clone(), read],
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
     let compiler = CcCompiler::new();
     let key = |compiler: &CcCompiler| {
-        let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names).unwrap();
+        let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
         let stamped = stamps.is_some();
         compiler
             .pending_include_dir_digest

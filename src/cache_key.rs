@@ -7513,7 +7513,9 @@ impl<'db> FileHasher<'db> {
         })
     }
 
-    fn note_too_new(&self, fingerprint: &FileFingerprint) {
+    /// Include availability can change the read set even when the newly
+    /// available header was not read. Its stamp uses the same write guard.
+    pub(crate) fn note_too_new(&self, fingerprint: &FileFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
             let since = self
                 .too_new
@@ -7721,10 +7723,16 @@ impl<'db> FileHasher<'db> {
             .preprocessed_hash
             .strip_prefix("pb:")
             .unwrap_or(&record.preprocessed_hash);
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        // New C memos append the include-resolution digest after `@`.
+        // Older callers still store a single digest. Validate both parts;
+        // the compiler checks the resolution before trusting the read set.
+        if digest.split('@').count() > 2
+            || !digest.split('@').all(|part| {
+                part.len() == 64
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
         {
             tracing::debug!("cc preprocess memo hash is invalid");
             return None;
@@ -7922,6 +7930,69 @@ impl<'db> FileHasher<'db> {
         inputs.sort_by(|a, b| a.name.cmp(&b.name));
         inputs.dedup_by(|a, b| a.name == b.name);
         Some(inputs)
+    }
+
+    /// Scan each distinct input content once, reusing results across wrapper
+    /// processes. Hashes come from the existing file-hash memo; a scan must
+    /// report the hash of the bytes it read so a racing save cannot poison it.
+    pub(crate) fn cc_header_scans(
+        &self,
+        paths: &[PathBuf],
+        version: i64,
+        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut contents = Vec::with_capacity(paths.len());
+        for path in paths {
+            let recent = self
+                .recent_hashes
+                .borrow()
+                .get(&absolute_path(path))
+                .cloned();
+            let content = match recent {
+                Some(RecentHash {
+                    hash,
+                    fingerprint: Some(expected),
+                }) if FileFingerprint::from_path(path).is_ok_and(|now| now == expected) => hash,
+                _ => self.hash(path)?,
+            };
+            contents.push(content);
+        }
+        let mut known = match &self.cache {
+            Some(cache) => cache
+                .get_cc_header_scans(
+                    version,
+                    &contents.iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|error| {
+                    tracing::debug!("cc header scan lookup failed: {error}");
+                    Default::default()
+                }),
+            None => Default::default(),
+        };
+        let mut learned = Vec::new();
+        let mut results = Vec::with_capacity(paths.len());
+        for (path, content) in paths.iter().zip(contents) {
+            let result = if let Some(result) = known.get(&content) {
+                result.clone()
+            } else {
+                let (raw, result) = scan(path)?;
+                anyhow::ensure!(
+                    raw == content,
+                    "cc: input changed while scanning header probes: {}",
+                    path.display()
+                );
+                known.insert(content.clone(), result.clone());
+                learned.push((content, result.clone()));
+                result
+            };
+            results.push(result);
+        }
+        if let Some(cache) = &self.cache
+            && let Err(error) = cache.put_cc_header_scans(version, &learned)
+        {
+            tracing::debug!("cc header scan update failed: {error}");
+        }
+        Ok(results)
     }
 
     /// The first input whose raw text hides a file the assembler would read,

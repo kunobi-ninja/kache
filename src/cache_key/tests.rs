@@ -12187,6 +12187,7 @@ fn header_scans_keep_the_key_snapshot_and_the_write_guard_detects_a_later_save()
     let first = FileHasher::persistent(&db);
     assert_eq!(first.cc_header_scans(paths, 1, &scan).unwrap(), ["old\n"]);
     let mut keyed = FileHasher::persistent(&db);
+    crate::test_support::settle_writes(&[&header]);
     keyed.arm_too_new_guard(stamp_clock_ns(), 0);
     keyed.hash(&header).unwrap();
     assert!(!keyed.inputs_changed_since_keyed());

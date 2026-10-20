@@ -6874,6 +6874,34 @@ fn include_shadowing_keys_every_literal_probe_form() {
     }
 }
 
+#[test]
+fn an_absolute_header_probe_tracks_availability_without_search_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("unit.c");
+    let optional = temp.path().join("optional.h");
+    fs::write(
+        &source,
+        format!(
+            "#if __has_include(<{}>)\n#endif\nint x;\n",
+            optional.display()
+        ),
+    )
+    .unwrap();
+    let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+    let before = digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source)).unwrap();
+    fs::write(&optional, "#define VALUE 23\n").unwrap();
+    let after = digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source)).unwrap();
+    assert_ne!(
+        before, after,
+        "an absolute probe needs no include search root"
+    );
+    fs::remove_file(optional).unwrap();
+    assert_eq!(
+        before,
+        digest_cc_include_shadowing(&parsed, &[source]).unwrap()
+    );
+}
+
 /// The preprocessor joins a backslash-newline before it reads the probe, so
 /// a probe split across lines still tests its header.
 #[test]

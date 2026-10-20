@@ -554,6 +554,27 @@ fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
     }
 }
 
+#[test]
+fn absolute_angle_header_probe_follows_its_optional_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    let optional = root.join("inc/optional.h");
+    fs::write(
+        root.join("unit.c"),
+        format!(
+            "#if __has_include(<{0}>)\n#include <{0}>\n\
+             #else\n#define VALUE 11\n#endif\n\
+             int main(void) {{ return VALUE; }}\n",
+            optional.display()
+        ),
+    )
+    .unwrap();
+    assert_probe_follows_optional_header(&root, &[], 11);
+}
+
 /// A header outside every user directory, as a system header is, probes
 /// for a header and carries the macOS SDK's fallback definition of the
 /// operator. The unit keeps a key, and the key follows the probe when the

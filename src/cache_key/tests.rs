@@ -12159,6 +12159,47 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
 }
 
 #[test]
+fn header_scans_keep_the_key_snapshot_and_the_write_guard_detects_a_later_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let header = dir.path().join("header.h");
+    std::fs::write(&header, "old\n").unwrap();
+    let scans = std::cell::Cell::new(0);
+    let scan = |path: &Path| -> anyhow::Result<(String, String)> {
+        scans.set(scans.get() + 1);
+        let bytes = std::fs::read(path)?;
+        Ok((
+            blake3::hash(&bytes).to_hex().to_string(),
+            String::from_utf8(bytes)?,
+        ))
+    };
+    let paths = std::slice::from_ref(&header);
+    let first = FileHasher::persistent(&db);
+    assert_eq!(first.cc_header_scans(paths, 1, &scan).unwrap(), ["old\n"]);
+    let mut keyed = FileHasher::persistent(&db);
+    keyed.arm_too_new_guard(stamp_clock_ns(), 0);
+    keyed.hash(&header).unwrap();
+    assert!(!keyed.inputs_changed_since_keyed());
+    std::fs::write(&header, "new bytes\n").unwrap();
+    assert_eq!(keyed.cc_header_scans(paths, 1, &scan).unwrap(), ["old\n"]);
+    assert_eq!(
+        scans.get(),
+        1,
+        "analysis belongs to the selected content hash"
+    );
+    assert!(
+        keyed.inputs_changed_since_keyed(),
+        "the save blocks publication"
+    );
+    let next = FileHasher::persistent(&db);
+    assert_eq!(
+        next.cc_header_scans(paths, 1, &scan).unwrap(),
+        ["new bytes\n"]
+    );
+    assert_eq!(scans.get(), 2, "a new invocation observes the new content");
+}
+
+#[test]
 fn memo_hash_validation_accepts_resolution_proofs_and_rejects_malformed_ones() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("idx.sqlite");

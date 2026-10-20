@@ -7932,9 +7932,11 @@ impl<'db> FileHasher<'db> {
         Some(inputs)
     }
 
-    /// Scan each distinct input content once, reusing results across wrapper
-    /// processes. Hashes come from the existing file-hash memo; a scan must
-    /// report the hash of the bytes it read so a racing save cannot poison it.
+    /// Scan the input content already selected for this key, reusing results
+    /// across wrapper processes. Memo validation and hashing register the
+    /// snapshot for the write guard; do not stat every input a second time.
+    /// A new scan must report the hash of its bytes so a racing save cannot
+    /// poison the content-addressed result.
     pub(crate) fn cc_header_scans(
         &self,
         paths: &[PathBuf],
@@ -7943,17 +7945,15 @@ impl<'db> FileHasher<'db> {
     ) -> anyhow::Result<Vec<String>> {
         let mut contents = Vec::with_capacity(paths.len());
         for path in paths {
-            let recent = self
-                .recent_hashes
-                .borrow()
-                .get(&absolute_path(path))
-                .cloned();
-            let content = match recent {
-                Some(RecentHash {
-                    hash,
-                    fingerprint: Some(expected),
-                }) if FileFingerprint::from_path(path).is_ok_and(|now| now == expected) => hash,
-                _ => self.hash(path)?,
+            let selected = {
+                let recent = self.recent_hashes.borrow();
+                recent
+                    .get(&absolute_path(path))
+                    .and_then(|recent| recent.fingerprint.as_ref().map(|_| recent.hash.clone()))
+            };
+            let content = match selected {
+                Some(content) => content,
+                None => self.hash(path)?,
             };
             contents.push(content);
         }

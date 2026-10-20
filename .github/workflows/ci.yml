@@ -916,7 +916,7 @@ jobs:
           esac
           dir="$RUNNER_TOOL_CACHE/kache/$version/$arch"
           mkdir -p "$dir"
-          cp target/debug/kache "$dir/"
+          cp target/debug/kache target/debug/kache-engine "$dir/"
           touch "$dir.complete"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Start RustFS

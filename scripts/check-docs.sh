@@ -56,12 +56,12 @@ for page in pages:
     if "/docs/kache/" in page.read_text():
         errors.append(f"{page}: upstream links must use /docs/...; kunobi-web adds the /kache product slug")
 
-main = root.joinpath("src/main.rs").read_text()
-after_commands = main.split("enum Commands {", 1)[1]
-# TargetCommands is declared before DaemonCommands. Stopping at DaemonCommands
-# treats `Share` as a top-level command and demands `kache share`.
+command_schema = root.joinpath("crates/kache-client/src/commands.rs").read_text()
+after_commands = command_schema.split("enum Commands {", 1)[1]
 command_block = after_commands.split("\n}\n", 1)[0]
 variants = re.findall(r"^    ([A-Z][A-Za-z0-9]+)(?:\s*\{|,)", command_block, re.MULTILINE)
+if not variants:
+    errors.append("engine command schema contains no commands")
 
 def kebab(name: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "-", name).lower()
@@ -71,9 +71,11 @@ for command in map(kebab, variants):
     if f"`kache {command}`" not in reference:
         errors.append(f"command reference is missing source command: {command}")
 
-config = root.joinpath("src/config.rs").read_text()
+config = root.joinpath("crates/kache-config/src/config.rs").read_text()
 cache_block = config.split("struct CacheFileConfig {", 1)[1].split("/// Deliberately NOT", 1)[0]
-cache_fields = re.findall(r"pub\(crate\) ([a-z0-9_]+):", cache_block)
+cache_fields = re.findall(r"^    pub(?:\(crate\))? ([a-z0-9_]+):", cache_block, re.MULTILINE)
+if not cache_fields:
+    errors.append("cache configuration schema contains no fields")
 config_doc = root.joinpath("docs/getting-started/configuration.mdx").read_text()
 for field in cache_fields:
     if f"cache.{field}" not in config_doc:

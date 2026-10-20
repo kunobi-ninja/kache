@@ -32,10 +32,11 @@ The root package still builds one `kache` executable plus the embedded
 build-script launcher. This extraction does not change process routing,
 installation, signatures, or which process performs cache work.
 
-The full request and response envelopes still depend on application-owned
-publication events, prediction rows, and aggregate storage reports. Those
-payloads need owners before the envelopes can move into `kache-protocol`.
-They must retain their JSON names, omitted fields, and compatibility defaults.
+The complete request and response envelopes live in `kache-protocol`, including
+publication events, prediction rows, and aggregate storage reports. Store memo
+inputs convert at the application boundary; storage access and validation remain
+with the application. JSON names, omitted fields, and compatibility defaults
+remain unchanged.
 
 Compiler invocation code also reads and modifies process-wide environment and
 uses global state. Moving it into a concurrent server requires explicit

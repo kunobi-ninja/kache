@@ -4,21 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::daemon::StatsEntry;
 use crate::store::{BlobStats, Store};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct StoreSummary {
-    pub path: PathBuf,
-    pub bytes: u64,
-    pub max_size: u64,
-    pub entries: usize,
-    pub blob_stats: Option<BlobStats>,
-    pub error: Option<String>,
-}
+pub(crate) use kache_protocol::StoreSummary;
 
 #[derive(Default)]
 pub(crate) struct StoreView {

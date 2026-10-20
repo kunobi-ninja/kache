@@ -6359,26 +6359,11 @@ pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 102;
 /// checkout, and only when `OUT_DIR` holds what it held for the recorder:
 /// `tree` is a digest of it, and the reader refuses the row without an equal
 /// one.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PortablePrediction {
-    pub(crate) schema: u32,
-    pub(crate) sources: Vec<Portable>,
-    pub(crate) env_deps: Vec<(String, Option<Portable>)>,
-    pub(crate) tree: String,
-}
+pub(crate) use kache_protocol::PortablePrediction;
 
 /// One recorded path or env value: as spelled, or as the bytes after
 /// `OUT_DIR` ([`out_dir_suffix`]) or after the workspace root.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Portable {
-    Literal(String),
-    OutDir(String),
-    Workspace(String),
-    /// The bytes after `<CARGO_HOME>/registry/src`. Written only for a row
-    /// that travels through the remote ([`crate::prediction_share`]), so it
-    /// carries no local path.
-    Registry(String),
-}
+pub(crate) use kache_protocol::Portable;
 
 /// Where a portable record's relative entries land for this invocation. A
 /// record with an entry whose place this invocation lacks is not used.
@@ -6469,12 +6454,16 @@ fn portable_env_value(value: &str, roots: &PortableRoots) -> Option<Portable> {
     Some(Portable::Literal(value.to_string()))
 }
 
-impl PortablePrediction {
+trait ResolvePortablePrediction {
+    fn resolve(&self, places: &Places<'_>) -> Option<InputPrediction>;
+}
+
+impl ResolvePortablePrediction for PortablePrediction {
     /// The record this invocation would have made: each relocated entry gets
     /// its root's bytes in front of its suffix. The result is then checked
     /// like any other record, raw env values included. `None` when an entry
     /// is relative to a root `places` does not have.
-    pub(crate) fn resolve(&self, places: &Places<'_>) -> Option<InputPrediction> {
+    fn resolve(&self, places: &Places<'_>) -> Option<InputPrediction> {
         let place = |portable: &Portable| match portable {
             Portable::Literal(value) => Some(value.clone()),
             Portable::OutDir(suffix) => Some(format!("{}{suffix}", places.out_dir?)),

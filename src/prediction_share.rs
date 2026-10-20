@@ -40,22 +40,11 @@ pub(crate) const SHARED_ROW_SCHEMA: u32 = 1;
 pub(crate) const SHARED_ROW_MAX_BYTES: u64 = 256 * 1024;
 
 /// A row that may travel, in the shape its identity calls for.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SharedPrediction {
-    Portable(PortablePrediction),
-    Plain(PlainRow),
-}
+pub(crate) use kache_protocol::SharedPrediction;
 
 /// A registry unit's shared row ([`InputPrediction`]) as it travels, with its
 /// registry paths made relative.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PlainRow {
-    pub(crate) schema: u32,
-    pub(crate) sources: Vec<Portable>,
-    pub(crate) env_deps: Vec<(String, Option<Portable>)>,
-    pub(crate) tree: Option<String>,
-}
+pub(crate) use kache_protocol::PlainRow;
 
 /// One path or value as it may travel: a path under `registry` made relative
 /// to it, anything else with no root kept, and `None` for any other absolute
@@ -159,19 +148,14 @@ pub(crate) fn plain_from_remote(row: &PlainRow, registry: &Path) -> Option<Input
     })
 }
 
-impl SharedPrediction {
-    /// Is this the kind of row `identity` is filed with, in the format this
-    /// build reads?
-    fn fits(&self, identity: &str) -> bool {
-        match self {
-            SharedPrediction::Portable(row) => {
-                crate::cache_key::is_portable_identity(identity)
-                    && row.schema == PORTABLE_PREDICTION_SCHEMA
-            }
-            SharedPrediction::Plain(row) => {
-                crate::cache_key::is_shared_target_identity(identity)
-                    && row.schema == PREDICTION_SCHEMA
-            }
+fn fits(row: &SharedPrediction, identity: &str) -> bool {
+    match row {
+        SharedPrediction::Portable(row) => {
+            crate::cache_key::is_portable_identity(identity)
+                && row.schema == PORTABLE_PREDICTION_SCHEMA
+        }
+        SharedPrediction::Plain(row) => {
+            crate::cache_key::is_shared_target_identity(identity) && row.schema == PREDICTION_SCHEMA
         }
     }
 }
@@ -194,7 +178,7 @@ pub(crate) fn object_name(identity: &str) -> String {
 /// The bytes to store for `row` under `identity`, or `None` when the row may
 /// not travel: the wrong kind for the identity, or too large to be read back.
 pub(crate) fn encode(identity: &str, row: &SharedPrediction) -> Option<Vec<u8>> {
-    if !row.fits(identity) {
+    if !fits(row, identity) {
         return None;
     }
     let bytes = serde_json::to_vec(&SharedRow {
@@ -214,8 +198,10 @@ pub(crate) fn decode(bytes: &[u8], identity: &str) -> Option<SharedPrediction> {
         return None;
     }
     let shared: SharedRow = serde_json::from_slice(bytes).ok()?;
-    (shared.schema == SHARED_ROW_SCHEMA && shared.identity == identity && shared.row.fits(identity))
-        .then_some(shared.row)
+    (shared.schema == SHARED_ROW_SCHEMA
+        && shared.identity == identity
+        && fits(&shared.row, identity))
+    .then_some(shared.row)
 }
 
 #[cfg(test)]

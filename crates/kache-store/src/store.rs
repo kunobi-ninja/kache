@@ -6624,13 +6624,7 @@ fn holds_last_reference(rc: i64, held: i64) -> bool {
 }
 
 /// Content-dedup statistics.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct BlobStats {
-    pub total_blobs: usize,
-    pub total_blob_size: u64,
-    pub total_logical_size: u64,
-    pub savings: u64,
-}
+pub use kache_format::BlobStats;
 
 /// Statistics from a blob migration run.
 #[derive(Debug, Default)]

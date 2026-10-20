@@ -8803,7 +8803,10 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
     let memo = compiler.captured_preprocess_memo().unwrap();
     assert_eq!(memo.memo_key, "k".repeat(64));
     assert_eq!(memo.preprocessed_hash, "p".repeat(64));
-    assert_eq!(memo.inputs, vec![input.clone()]);
+    assert_eq!(
+        memo.inputs,
+        vec![crate::daemon_publish::memo_input_for_wire(&input)]
+    );
     // Handing it over leaves it pending until the daemon has taken it.
     assert!(compiler.pending_preprocess_memo.borrow().is_some());
 

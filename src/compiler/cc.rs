@@ -6853,7 +6853,11 @@ impl CcCompiler {
         Some(crate::daemon_publish::CcMemoHandoff {
             memo_key: pending.memo_key.clone(),
             preprocessed_hash: pending.preprocessed_hash.clone(),
-            inputs: pending.fingerprints.clone(),
+            inputs: pending
+                .fingerprints
+                .iter()
+                .map(crate::daemon_publish::memo_input_for_wire)
+                .collect(),
         })
     }
 

@@ -32,7 +32,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::daemon::{Daemon, Response, UploadJob};
@@ -60,52 +59,52 @@ pub(crate) const PUBLISH_HANDOFF_TIMEOUT: Duration = Duration::from_millis(25);
 pub(crate) const HANDOFF_DIR: &str = "handoff";
 
 /// One output the wrapper snapshotted for the daemon.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct HandoffFile {
-    /// Absolute path of the snapshot, under the store's handoff directory.
-    pub path: String,
-    /// Name the file takes in the entry.
-    pub store_name: String,
-}
+pub(crate) use kache_protocol::HandoffFile;
 
 /// A wrapper's request that the daemon store a cc compile it has finished.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct PublishCcRequest {
-    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
-    /// is newer than their own; later daemons ignore it.
-    #[serde(default)]
-    pub client_epoch: u64,
-    /// Release requesting an upgrade. Absent from legacy and read-only requests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_version: Option<String>,
-    pub cache_key: String,
-    pub crate_name: String,
-    pub target: String,
-    pub files: Vec<HandoffFile>,
-    pub stdout: String,
-    pub stderr: String,
-    pub compile_time_ms: u64,
-    /// Whether the entry may be uploaded to a writable remote.
-    pub publishes_to_remote: bool,
-    /// The build event the wrapper would have logged, with the store fields
-    /// still empty. The daemon fills them in and writes it.
-    pub event: BuildEvent,
-    /// The read-set memo of a deferred compile, recorded here instead of in
-    /// the wrapper: a hundred-row write transaction the next compile of the
-    /// build script would otherwise wait for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memo: Option<CcMemoHandoff>,
-}
+pub(crate) use kache_protocol::PublishCcRequest;
 
 /// A preprocess memo as the wrapper captured it: the fingerprints and
 /// content hashes of everything the compile read, under the key of its
 /// arguments. Each input carries the time it was observed, and the store
 /// records its stamp only if the stamp had settled by then.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct CcMemoHandoff {
-    pub memo_key: String,
-    pub preprocessed_hash: String,
-    pub inputs: Vec<crate::cache_key::CcPreprocessMemoInput>,
+pub(crate) use kache_protocol::CcMemoHandoff;
+
+/// Convert observed inputs at the application boundary; the wire crate owns no store.
+pub(crate) fn memo_input_for_wire(
+    input: &crate::cache_key::CcPreprocessMemoInput,
+) -> kache_protocol::CcPreprocessMemoInput {
+    kache_protocol::CcPreprocessMemoInput {
+        name: input.name.clone(),
+        fingerprint: kache_protocol::FileFingerprint {
+            path: input.fingerprint.path.clone(),
+            size: input.fingerprint.size,
+            mtime_ns: input.fingerprint.mtime_ns,
+            ctime_ns: input.fingerprint.ctime_ns,
+            inode: input.fingerprint.inode,
+        },
+        content: input.content.clone(),
+        mapped: input.mapped.clone(),
+        observed_ns: input.observed_ns,
+    }
+}
+
+fn memo_input_from_wire(
+    input: &kache_protocol::CcPreprocessMemoInput,
+) -> crate::cache_key::CcPreprocessMemoInput {
+    crate::cache_key::CcPreprocessMemoInput {
+        name: input.name.clone(),
+        fingerprint: crate::store::file_hash::FileFingerprint {
+            path: input.fingerprint.path.clone(),
+            size: input.fingerprint.size,
+            mtime_ns: input.fingerprint.mtime_ns,
+            ctime_ns: input.fingerprint.ctime_ns,
+            inode: input.fingerprint.inode,
+        },
+        content: input.content.clone(),
+        mapped: input.mapped.clone(),
+        observed_ns: input.observed_ns,
+    }
 }
 
 /// A job the handler accepted: the request plus the key lock it holds.
@@ -440,7 +439,11 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
                 && let Err(error) = store.file_hash_cache().put_cc_preprocess_memo_inputs(
                     &memo.memo_key,
                     &memo.preprocessed_hash,
-                    &memo.inputs,
+                    &memo
+                        .inputs
+                        .iter()
+                        .map(memo_input_from_wire)
+                        .collect::<Vec<_>>(),
                 )
             {
                 tracing::debug!("daemon could not record the cc memo: {error}");
@@ -1110,7 +1113,10 @@ mod tests {
         let memo = CcMemoHandoff {
             memo_key: "m".repeat(64),
             preprocessed_hash: "p".repeat(64),
-            inputs: vec![settled.clone(), unobserved.clone()],
+            inputs: vec![
+                memo_input_for_wire(&settled),
+                memo_input_for_wire(&unobserved),
+            ],
         };
         request.memo = Some(memo.clone());
         request.event.schema = 26;

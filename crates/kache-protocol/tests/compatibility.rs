@@ -106,3 +106,72 @@ fn old_transfer_records_keep_their_schema_and_direction() {
     assert!(transfer.accounting.is_none());
     assert!(transfer.prefetch.is_none());
 }
+
+#[test]
+fn complete_envelopes_keep_legacy_gc_and_prediction_shapes() {
+    use kache_protocol::{GcRequestMode, Request, SharedPrediction};
+    let request: Request = from_value(json!({"gc": {"max_age_hours": 12}})).unwrap();
+    let Request::Gc(gc) = &request else {
+        panic!("expected legacy gc")
+    };
+    assert_eq!(gc.mode, GcRequestMode::Legacy);
+    assert_eq!(gc.effective_max_age_hours, None);
+    assert!(!request.is_build_activity());
+    assert_eq!(
+        to_value(request).unwrap(),
+        json!({
+            "gc": {"max_age_hours": 12, "mode": "legacy"}
+        })
+    );
+    let wire = json!({"prediction_publish": {"identity": "unit", "row": {"plain": {
+        "schema": 1, "sources": [{"Registry": "/pkg/lib.rs"}],
+        "env_deps": [["UNSET", null]], "tree": null
+    }}}});
+    let request: Request = from_value(wire.clone()).unwrap();
+    let Request::PredictionPublish(ref prediction) = request else {
+        panic!("expected prediction")
+    };
+    assert!(matches!(prediction.row, SharedPrediction::Plain(_)));
+    assert_eq!(to_value(request).unwrap(), wire);
+}
+
+#[test]
+fn complete_responses_accept_older_daemons_and_omit_absent_fields() {
+    use kache_protocol::Response;
+    let response: Response = from_value(json!({"ok": true, "found": true})).unwrap();
+    assert!(!response.skipped);
+    assert!(response.gc.is_none());
+    assert!(response.health.is_none());
+    assert_eq!(
+        to_value(response).unwrap(),
+        json!({"ok": true, "found": true})
+    );
+    let wire = json!({"ok": true, "prediction": {"portable": {
+        "schema": 1, "sources": [{"OutDir": "/generated.rs"}],
+        "env_deps": [], "tree": "digest"
+    }}});
+    assert_eq!(
+        to_value(from_value::<Response>(wire.clone()).unwrap()).unwrap(),
+        wire
+    );
+}
+
+#[test]
+fn publication_memos_keep_flattened_fingerprints_and_old_defaults() {
+    use kache_protocol::CcPreprocessMemoInput;
+    let input: CcPreprocessMemoInput = from_value(json!({
+        "name": "header.h", "path": "/src/header.h", "size": 5,
+        "mtime_ns": 7, "ctime_ns": 9, "inode": 11, "content": "digest"
+    }))
+    .unwrap();
+    assert_eq!(input.observed_ns, 0);
+    assert_eq!(input.mapped, "");
+    assert_eq!(
+        to_value(input).unwrap(),
+        json!({
+            "name": "header.h", "path": "/src/header.h", "size": 5,
+            "mtime_ns": 7, "ctime_ns": 9, "inode": 11, "content": "digest",
+            "mapped": "", "observed_ns": 0
+        })
+    );
+}

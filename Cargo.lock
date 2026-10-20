@@ -2387,7 +2387,9 @@ version = "1.2.2"
 name = "kache-protocol"
 version = "1.2.2"
 dependencies = [
+ "chrono",
  "kache-core",
+ "kache-format",
  "serde",
  "serde_json",
 ]

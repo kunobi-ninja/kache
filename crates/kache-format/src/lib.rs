@@ -342,3 +342,11 @@ mod tests {
         assert!(mk(&["link"]).covers_requested_emit(&req(&["link", "future-exotic"])));
     }
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BlobStats {
+    pub total_blobs: usize,
+    pub total_blob_size: u64,
+    pub total_logical_size: u64,
+    pub savings: u64,
+}

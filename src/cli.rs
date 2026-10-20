@@ -7799,11 +7799,12 @@ fn expand_build_dir(
 /// dir no build has created yet has none of its own, and its nearest existing
 /// ancestor is on the filesystem the artifacts will land on.
 fn closest_existing(path: std::path::PathBuf) -> std::path::PathBuf {
-    let mut current = path.as_path();
-    while !current.exists() {
-        current = current.parent().unwrap_or(std::path::Path::new("/"));
-    }
-    current.to_path_buf()
+    path.ancestors()
+        .find(|candidate| candidate.exists())
+        .map_or_else(
+            || std::path::PathBuf::from("/"),
+            std::path::Path::to_path_buf,
+        )
 }
 
 fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {

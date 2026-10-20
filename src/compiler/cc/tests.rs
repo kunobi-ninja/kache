@@ -7021,6 +7021,18 @@ fn header_probe_scanner_does_not_treat_arithmetic_as_comments() {
 }
 
 #[test]
+fn header_probe_scanner_refuses_empty_or_multiline_names() {
+    for text in [
+        "#if __has_include(\"\")\n",
+        "#if __has_include(<>)\n",
+        "#if __has_include(\"first\nsecond.h\")\n",
+        "#if __has_include(<first\nsecond.h>)\n",
+    ] {
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{text}");
+    }
+}
+
+#[test]
 fn header_probe_scanner_reads_tokens_and_comments() {
     let text = br##"// __has_include(MACRO)
         /* __has_include(OTHER) */
@@ -7141,6 +7153,22 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
     assert!(compiler.include_dir_names_still_match(&parsed));
     fs::write(&target, "int value;\n").unwrap();
     assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[cfg(unix)]
+#[test]
+fn header_probe_availability_preserves_filesystem_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let link = temp.path().join("loop");
+    std::os::unix::fs::symlink(&link, &link).unwrap();
+    let nested = link.join("optional.h");
+    for candidate in [&link, &nested] {
+        assert!(
+            cc_header_probe_available(candidate, None).is_err(),
+            "a symlink loop is not a missing header: {}",
+            candidate.display(),
+        );
+    }
 }
 
 #[test]

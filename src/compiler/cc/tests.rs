@@ -7261,6 +7261,10 @@ fn joined_quote_and_after_dirs_can_start_with_a_hyphen() {
 #[test]
 fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
     let _lock = crate::test_support::process_state_test_lock();
+    let shadowing_digest = |parsed: &CcArgs, inputs: &[PathBuf]| {
+        let names = cc_shadowing_names(parsed, inputs, &crate::cache_key::FileHasher::new())?;
+        digest_cc_shadowing_names(parsed, &names)
+    };
     // A relative joined value must begin with `-` to exercise this spelling.
     // Use a unique directory in the current directory without changing the
     // process cwd, which would race other tests.
@@ -7287,13 +7291,13 @@ fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
     .unwrap();
     assert!(parsed.refuse_reasons(&[]).is_empty());
     let inputs = vec![source.clone(), read.clone()];
-    let before = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+    let before = shadowing_digest(&parsed, &inputs).unwrap();
     let walked_before = digest_cc_include_dir_names(&parsed).unwrap();
 
     let shadow = quote.path().join("header.h");
     fs::write(&shadow, "#define VALUE 2\n").unwrap();
     assert_ne!(
-        digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+        shadowing_digest(&parsed, &inputs).unwrap(),
         before,
         "a joined quote directory must invalidate an old header resolution"
     );
@@ -7304,10 +7308,7 @@ fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
     );
     assert_eq!(fs::read_to_string(&read).unwrap(), "#define VALUE 1\n");
     fs::remove_file(shadow).unwrap();
-    assert_eq!(
-        digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
-        before
-    );
+    assert_eq!(shadowing_digest(&parsed, &inputs).unwrap(), before);
     assert_eq!(digest_cc_include_dir_names(&parsed).unwrap(), walked_before);
 }
 

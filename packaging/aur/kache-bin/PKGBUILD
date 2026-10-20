@@ -27,6 +27,9 @@ package() {
   ./kache completions elvish > kache.elvish
 
   install -Dm0755 kache        "$pkgdir/usr/bin/kache"
+  if [[ -f kache-engine ]]; then
+    install -Dm0755 kache-engine "$pkgdir/usr/bin/kache-engine"
+  fi
   install -Dm0644 kache.bash   "$pkgdir/usr/share/bash-completion/completions/kache"
   install -Dm0644 kache.zsh    "$pkgdir/usr/share/zsh/site-functions/_kache"
   install -Dm0644 kache.fish   "$pkgdir/usr/share/fish/vendor_completions.d/kache.fish"

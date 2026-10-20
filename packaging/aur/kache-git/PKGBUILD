@@ -37,6 +37,9 @@ build() {
 package() {
   cd "$srcdir/kache"
   install -Dm0755 target/release/kache "$pkgdir/usr/bin/kache"
+  if [[ -f target/release/kache-engine ]]; then
+    install -Dm0755 target/release/kache-engine "$pkgdir/usr/bin/kache-engine"
+  fi
 
   local shell
   for shell in bash zsh fish elvish; do

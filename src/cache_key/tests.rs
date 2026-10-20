@@ -12106,6 +12106,16 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
         ["probe", "probe"]
     );
     assert_eq!(scans.get(), 1, "identical files share a scan");
+    let without_memo = FileHasher::persistent(&db);
+    assert_eq!(
+        without_memo.cc_header_scans(&paths, 1, &scan).unwrap(),
+        ["probe", "probe"]
+    );
+    assert_eq!(
+        scans.get(),
+        1,
+        "scan reuse also works before a read-set memo exists"
+    );
     let mut inputs = first
         .cc_preprocess_fingerprints(
             &paths

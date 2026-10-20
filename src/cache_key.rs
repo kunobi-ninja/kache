@@ -7196,6 +7196,7 @@ struct PrefetchedHash {
 struct RecentHash {
     hash: String,
     fingerprint: Option<FileFingerprint>,
+    header_scan: Option<(i64, String)>,
 }
 
 /// [`hash_file`], for a read that follows a stat of the same file.
@@ -7745,8 +7746,13 @@ impl<'db> FileHasher<'db> {
         // would have discovered by preprocessing, and the caller needs them to
         // resolve include shadowing without a fresh dependency capture.
         let mut satisfied = Vec::with_capacity(inputs.len());
-        for expected in &inputs {
-            satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
+        for (expected, scan) in inputs.iter().zip(&record.header_scans) {
+            satisfied.push(self.memo_input_is_unchanged(
+                expected,
+                scan,
+                &resolve,
+                mapped_content,
+            )?);
         }
         if record.needs_touch
             && let Err(error) = cache.touch_cc_preprocess_memo(memo_key)
@@ -7765,6 +7771,7 @@ impl<'db> FileHasher<'db> {
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
+        header_scan: &Option<(i64, String)>,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
@@ -7795,6 +7802,7 @@ impl<'db> FileHasher<'db> {
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
+                        header_scan: header_scan.clone(),
                     },
                 );
                 return Some(path.clone());
@@ -7944,31 +7952,41 @@ impl<'db> FileHasher<'db> {
         scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
     ) -> anyhow::Result<Vec<String>> {
         let mut contents = Vec::with_capacity(paths.len());
+        let mut known = std::collections::HashMap::new();
         for path in paths {
             let selected = {
                 let recent = self.recent_hashes.borrow();
-                recent
-                    .get(&absolute_path(path))
-                    .and_then(|recent| recent.fingerprint.as_ref().map(|_| recent.hash.clone()))
+                recent.get(&absolute_path(path)).and_then(|recent| {
+                    recent
+                        .fingerprint
+                        .as_ref()
+                        .map(|_| (recent.hash.clone(), recent.header_scan.clone()))
+                })
             };
             let content = match selected {
-                Some(content) => content,
+                Some((content, analysis)) => {
+                    if let Some((scan_version, scan)) = analysis
+                        && scan_version == version
+                    {
+                        known.insert(content.clone(), scan);
+                    }
+                    content
+                }
                 None => self.hash(path)?,
             };
             contents.push(content);
         }
-        let mut known = match &self.cache {
-            Some(cache) => cache
-                .get_cc_header_scans(
-                    version,
-                    &contents.iter().map(String::as_str).collect::<Vec<_>>(),
-                )
-                .unwrap_or_else(|error| {
-                    tracing::debug!("cc header scan lookup failed: {error}");
-                    Default::default()
-                }),
-            None => Default::default(),
-        };
+        let missing: Vec<_> = contents
+            .iter()
+            .filter(|content| !known.contains_key(*content))
+            .map(String::as_str)
+            .collect();
+        if let Some(cache) = &self.cache {
+            match cache.get_cc_header_scans(version, &missing) {
+                Ok(found) => known.extend(found),
+                Err(error) => tracing::debug!("cc header scan lookup failed: {error}"),
+            }
+        }
         let mut learned = Vec::new();
         let mut results = Vec::with_capacity(paths.len());
         for (path, content) in paths.iter().zip(contents) {
@@ -8086,6 +8104,7 @@ impl<'db> FileHasher<'db> {
             if self
                 .memo_input_is_unchanged(
                     expected,
+                    &None,
                     &|_: &str| vec![recorded_path.clone()],
                     mapped_content,
                 )
@@ -8168,6 +8187,7 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: observed.map(|observed| observed.fingerprint),
+                header_scan: None,
             },
         );
         Ok(hash)
@@ -8646,6 +8666,7 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),
+                header_scan: None,
             },
         );
         Ok(hash)

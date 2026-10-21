@@ -83,7 +83,7 @@ def check(binary, rustc, root, mounts):
     cargo_home = root / "cargo-home"
     cargo_home.mkdir()
     env.update(KACHE_CONFIG=str(config), KACHE_HOST_CONFIG="", KACHE_FALLBACK="off",
-               CARGO_HOME=str(cargo_home), HOME=str(root))
+               CARGO_HOME=str(cargo_home))
 
     def kache(*args, cwd=root):
         return run([binary, *args], env=env, cwd=cwd)

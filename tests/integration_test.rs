@@ -3314,6 +3314,15 @@ cache_executables = true
     );
     std::fs::write(&config_path, config_content).unwrap();
 
+    // The first build started a daemon with the original GC policy. Restart
+    // it so the second build's budget also governs background eviction.
+    common::stop_daemon(
+        hermetic_command(kache_binary(), cache_dir.path(), Some(&config_path))
+            .args(["daemon", "stop"]),
+        cache_dir.path(),
+    );
+    common::wait_for_daemon_exit(cache_dir.path(), std::time::Duration::ZERO).unwrap();
+
     std::fs::write(
         src_dir.join("main.rs"),
         r#"fn main() {

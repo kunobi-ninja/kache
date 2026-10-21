@@ -5,6 +5,8 @@ mod common;
 use common::{build_kache, hermetic_command, isolated_config_path, kache_binary, settle_writes};
 
 fn write_config(cache: &Path, readonly: Option<&Path>) -> PathBuf {
+    // These cases edit metadata as soon as compilation returns, so the entry
+    // must be committed here rather than queued for background publication.
     std::fs::create_dir_all(cache).unwrap();
     let path = isolated_config_path(cache);
     let quote = |path: &Path| toml::Value::String(path.to_string_lossy().into_owned());
@@ -14,7 +16,7 @@ fn write_config(cache: &Path, readonly: Option<&Path>) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = false\nlocal_store = {}\nruntime_dir = {}\n{fallback}",
+            "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = false\ndaemon_publish = false\nlocal_store = {}\nruntime_dir = {}\n{fallback}",
             quote(cache), quote(cache),
         ),
     ).unwrap();
@@ -91,6 +93,8 @@ fn rejected_readonly_hits_are_recompiled_and_cached_locally() {
         let root = tempfile::tempdir().unwrap();
         let host = root.path().join("host-cache");
         let job = root.path().join("job-cache");
+        let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
+        let _job_daemon = common::DaemonGuard::new(kache_binary(), &job);
         let source = root.path().join("lib.rs");
         std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
         let host_config = write_config(&host, None);
@@ -168,6 +172,8 @@ fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
     .unwrap();
     let host = root.path().join("host-cache");
     let job = root.path().join("job-cache");
+    let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
+    let _job_daemon = common::DaemonGuard::new(kache_binary(), &job);
     let host_config = write_config(&host, None);
     compile_cc(&work, &host, &host_config);
     let cold = last_event_for(&host, "readonly_probe.c");
@@ -213,6 +219,7 @@ fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passth
         )
         .unwrap();
         let host = root.path().join("host-cache");
+        let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
         let host_config = write_config(&host, None);
         compile_cc(&work, &host, &host_config);
         let seed = last_event_for(&host, "readonly_probe.c");
@@ -246,6 +253,7 @@ fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passth
         } else {
             host.clone()
         };
+        let _job_daemon = read_only.then(|| common::DaemonGuard::new(kache_binary(), &cache));
         let config = if read_only {
             write_config(&cache, Some(&host))
         } else {

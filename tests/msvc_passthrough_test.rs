@@ -44,6 +44,7 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
     );
 
     let cache = dir.path().join("cache");
+    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
     let config = dir.path().join("kache.toml");
     fs::write(&config, "").unwrap();
     let args = [
@@ -88,8 +89,19 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
             assert_eq!(fs::read_to_string(&log).unwrap(), expected, "{mode}");
         }
     }
-    assert!(
-        !cache.join("store").exists(),
-        "MSVC must not enter the cache adapter"
-    );
+    // Starting the daemon creates its store even for uncached compilers.
+    let index = cache.join("index.db");
+    let entries: u64 = if index.is_file() {
+        let index = rusqlite::Connection::open_with_flags(
+            index,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        index
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap()
+    } else {
+        0
+    };
+    assert_eq!(entries, 0, "MSVC must not publish a cache entry");
 }

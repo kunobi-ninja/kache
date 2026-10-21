@@ -2514,7 +2514,7 @@ mod tests {
 
                 // Model a power loss that retained the durable pre-compile
                 // marker but lost the later atomic completion rename.
-                fs::write(&unit.state_path, busy).unwrap();
+                crate::atomic::atomic_replace_deferrable(&unit.state_path, &busy, false).unwrap();
                 assert!(unit.try_active_at(15).is_none());
                 assert!(!path_exists(&unit.rustc_dir));
                 assert!(unit.try_immediate_at(16).is_some());

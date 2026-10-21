@@ -876,7 +876,8 @@ mod tests {
         publish(&donor, Some(&key));
         drop(abandoned);
         assert!(!import(&receiver, &profile, &key));
-        fs::write(&donor.state_path, b"invalid state").unwrap();
+        crate::atomic::atomic_replace_deferrable(&donor.state_path, b"invalid state", false)
+            .unwrap();
         assert!(!import(&receiver, &profile, &key));
         fs::remove_file(&donor.state_path).unwrap();
 

@@ -225,6 +225,7 @@ impl RustcCompiler {
         parsed: &RustcArgs,
         isolated_args: &[String],
     ) -> Result<CompileResult> {
+        let mut stderr = std::io::stderr();
         self.execute_with_args(
             parsed,
             isolated_args,
@@ -233,7 +234,13 @@ impl RustcCompiler {
             },
             Some(true),
             LinkLane::Passthrough,
-            Some(&mut std::io::stderr()),
+            // An injected bootstrap attempt may be retried with the caller's
+            // environment. Do not expose diagnostics from a discarded attempt.
+            if self.incremental_bootstrap {
+                None
+            } else {
+                Some(&mut stderr)
+            },
             None,
         )
     }

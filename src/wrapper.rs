@@ -147,6 +147,15 @@ fn adaptive_policy_guard(config: &Config) -> [u8; 32] {
 
     let mut hasher = blake3::Hasher::new();
     fold(&mut hasher, b"policy", b"adaptive-incremental-v1");
+    fold(
+        &mut hasher,
+        b"worktree-seeding",
+        if config.seed_incremental {
+            b"on"
+        } else {
+            b"off"
+        },
+    );
     if let Some(salt) = config.key_salt.as_deref() {
         fold(&mut hasher, b"key-salt", salt.as_bytes());
     }
@@ -3866,6 +3875,27 @@ fn run_parsed_rustc(
                 None,
                 key_record,
             );
+        } else if automatic_seeding_enabled(config, args)
+            && let Some(mut lease) = adaptive_unit
+                .as_ref()
+                .and_then(AdaptiveUnit::try_source_changed_seed)
+        {
+            let _ = prepare_worktree_compiler_args(config, args, &mut lease);
+            if lease.worktree_portable() && !lease.needs_worktree_donor() {
+                return adaptive_incremental_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    lease,
+                    "automatic worktree seed",
+                    None,
+                    key_record,
+                );
+            }
+            // No compatible donor: preserve learning and use the usual key.
+            let _ = lease.finish(CompileOutcome::CompileError);
         }
     }
     let rustc_route = volume_route_path_rustc(args);
@@ -7835,10 +7865,91 @@ fn intentional_passthrough_with_event<R: Into<String>>(
     passthrough_with_event(config, args, crate_name, root, start, reason, key_record)
 }
 
-/// Compile with policy-owned incremental state and never publish the result
-/// under Kache's normal artifact key. The lease serializes users of that
-/// unit's private rustc state through the child lifetime; lock contention
-/// falls back to the normal cache path.
+/// Only a fresh dep-info file can identify observations in this attempt.
+fn clear_incremental_bootstrap_dep_info(args: &RustcArgs) -> bool {
+    let Some(path) = args.dep_info_path() else {
+        return false;
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn prepare_worktree_compiler_args(
+    config: &Config,
+    args: &RustcArgs,
+    lease: &mut Lease,
+) -> Vec<String> {
+    let automatic = automatic_seeding_enabled(config, args);
+    if !automatic {
+        return lease.worktree_compiler_args(
+            args,
+            config.incremental_seed_from.as_deref(),
+            config.unstable,
+        );
+    }
+    let donors = if let Some(profile) = &config.incremental_seed_from {
+        vec![profile.clone()]
+    } else if lease.needs_worktree_donor() {
+        automatic_worktree_donors(config, args)
+    } else {
+        Vec::new()
+    };
+    lease.worktree_compiler_args_from(args, &donors, true)
+}
+
+fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
+    config.seed_incremental
+        && args.inner_rustc.is_none()
+        && crate::cache_key::rustc_version_text(&args.rustc).is_some_and(|version| {
+            crate::incremental_policy::compiler_supports_automatic_seed(&version)
+        })
+}
+
+fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> {
+    let Some(target) = args.target_dir() else {
+        return Vec::new();
+    };
+    let Some(profile) = args.incremental.as_deref().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let Ok(suffix) = profile.strip_prefix(&target) else {
+        return Vec::new();
+    };
+    let routed = config.routed_for_path(&volume_route_path_rustc(args));
+    let Ok(store) = Store::open(&routed) else {
+        return Vec::new();
+    };
+    if let Some(workspace) = args.path_normalization_root()
+        && owns_its_target(
+            workspace,
+            crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
+        )
+    {
+        let _ = store.remember_target_root_built_by(
+            &target,
+            workspace,
+            crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
+        );
+    }
+    let Ok(targets) = store.tracked_target_roots(0) else {
+        return Vec::new();
+    };
+    targets
+        .into_iter()
+        .rev()
+        .filter(|entry| {
+            !entry.discovered
+                && entry.path != target
+                && kache_store::filesystem::directory_identity(&entry.path) == Some(entry.identity)
+        })
+        .map(|entry| entry.path.join(suffix))
+        .take(8)
+        .collect()
+}
+
+/// Compile under the private lease; no result enters the artifact cache.
 #[allow(clippy::too_many_arguments)]
 fn adaptive_incremental_with_event<R: Into<String>>(
     config: &Config,
@@ -7853,11 +7964,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
-    let compiler_args = lease.worktree_compiler_args(
-        args,
-        config.incremental_seed_from.as_deref(),
-        config.unstable,
-    );
+    let mut compiler_args = prepare_worktree_compiler_args(config, args, &mut lease);
     let permit = adaptive_lane_takes_permit(kind).then(|| {
         scheduler::begin_keyless_compile(
             &config.cache_dir,
@@ -7868,15 +7975,61 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         )
     });
     let compile_start = std::time::Instant::now();
-    let compiler = RustcCompiler::new()
+    let mut compiler = RustcCompiler::new()
         .with_base_dirs(config.base_dirs.clone())
         .with_incremental_bootstrap(lease.worktree_bootstrap());
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
-    let compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
-        compiler.execute_passthrough_preserving_incremental(args, &compiler_args)
-    } else {
-        compiler.execute_preserving_incremental(args, &compiler_args)
-    };
+    // Only this attempt's dep-info may prove that source read our override.
+    if lease.worktree_bootstrap() && !clear_incremental_bootstrap_dep_info(args) {
+        if !lease.decline_worktree_bootstrap() {
+            let _ = lease.finish(CompileOutcome::Abnormal);
+            return passthrough_with_event(
+                config,
+                args,
+                crate_name,
+                root,
+                start,
+                "cannot prepare private bootstrap dep-info",
+                key_record,
+            );
+        }
+        compiler_args = lease.compiler_args(args);
+        compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    }
+    let mut compile =
+        if kind == crate::incremental_policy::LeaseKind::Immediate || lease.worktree_portable() {
+            compiler.execute_passthrough_preserving_incremental(args, &compiler_args)
+        } else {
+            compiler.execute_preserving_incremental(args, &compiler_args)
+        };
+    if compile.is_ok()
+        && lease.worktree_bootstrap()
+        && emitted_dep_info(args).is_some_and(|info| {
+            info.env_deps
+                .iter()
+                .any(|(name, _)| name == "RUSTC_BOOTSTRAP")
+        })
+    {
+        if !lease.decline_worktree_bootstrap() {
+            let _ = lease.finish(CompileOutcome::Abnormal);
+            return passthrough_with_event(
+                config,
+                args,
+                crate_name,
+                root,
+                start,
+                "cannot retire bootstrap-observing private state",
+                key_record,
+            );
+        }
+        compiler_args = lease.compiler_args(args);
+        let native = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+        compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
+            native.execute_passthrough_preserving_incremental(args, &compiler_args)
+        } else {
+            native.execute_preserving_incremental(args, &compiler_args)
+        };
+    }
     if let (Some(permit), Ok(_)) = (&permit, &compile) {
         permit.record_compile_rss(crate_name);
     }

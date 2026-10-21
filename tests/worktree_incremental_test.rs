@@ -108,6 +108,178 @@ fn graph_contents(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf,
     files
 }
 
+fn automatic_supported() -> bool {
+    let output = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let release = text.split_whitespace().nth(1).unwrap_or("");
+    let mut parts = release.split('.');
+    let major = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    (major, minor) >= (1, 98) && supports_cwd_remap()
+}
+
+fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool) -> Output {
+    let mut command = common::hermetic_command("cargo", cache, Some(&cache.join("absent.toml")));
+    command
+        .current_dir(root)
+        .args(["build", "--offline", "--quiet"])
+        .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_kache"))
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("CARGO_INCREMENTAL", "1")
+        .env("KACHE_BASE_DIR", root)
+        .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
+        .env("KACHE_PRESERVE_INCREMENTAL", "0")
+        .env("KACHE_LOCAL_ONLY", "1")
+        .env("KACHE_VERIFY_INPUT_PREDICTIONS", "always")
+        .env_remove("KACHE_UNSTABLE")
+        .env_remove("KACHE_INCREMENTAL_SEED_FROM")
+        .env_remove("RUSTC_BOOTSTRAP")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", "");
+    if enabled {
+        command.env_remove("KACHE_SEED_INCREMENTAL");
+    } else {
+        command.env("KACHE_SEED_INCREMENTAL", "0");
+    }
+    if force {
+        command.env("KACHE_INCREMENTAL_CRATES", "worktree_probe");
+    } else {
+        command.env_remove("KACHE_INCREMENTAL_CRATES");
+    }
+    command.output().unwrap()
+}
+
+fn automatic_project(root: &Path, answer: u64) {
+    project(root, answer);
+    fs::write(
+        root.join("src/main.rs"),
+        format!("fn main() {{ println!(\"{{}}\", std::hint::black_box({answer}u64)); }}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let cache = root.join("cache");
+    let donor = root.join("donor");
+    let receiver = root.join("receiver");
+    let opted_out = root.join("opted-out");
+    for answer in [0, 1, 2] {
+        automatic_project(&donor, answer);
+        let output = automatic_build(&donor, &cache, true, false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let original = graph_contents(&donor.join("target/debug/incremental.kache-auto"));
+    for (repo, enabled) in [(&receiver, true), (&opted_out, false)] {
+        automatic_project(repo, 0);
+        let output = automatic_build(repo, &cache, enabled, false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        automatic_project(repo, 3);
+        let output = automatic_build(repo, &cache, enabled, false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let binary = std::process::Command::new(repo.join("target/debug/worktree-probe"))
+            .output()
+            .unwrap();
+        assert!(binary.status.success());
+        assert_eq!(String::from_utf8(binary.stdout).unwrap().trim(), "3");
+    }
+    assert_eq!(
+        graph_contents(&donor.join("target/debug/incremental.kache-auto")),
+        original
+    );
+    let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["root"] == receiver.to_str().unwrap()
+                && event["result"] == "local_hit"),
+        "unchanged receiver must restore"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["root"] == receiver.to_str().unwrap()
+                && event["passthrough_reason"] == "automatic worktree seed"),
+        "edited receiver must import"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["root"] == opted_out.to_str().unwrap()
+                && event["passthrough_reason"] == "automatic worktree seed"),
+        "opt-out must not import"
+    );
+}
+
+#[test]
+fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_errors() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let cache = root.join("cache");
+    project(&root, 0);
+    for suffix in ["first", "second"] {
+        fs::write(root.join("src/main.rs"), format!(
+            "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\nfn main() {{ println!(\"{suffix}:{{}}\", option_env!(\"RUSTC_BOOTSTRAP\").unwrap_or(\"native\")); }}\n"
+        )).unwrap();
+        let output = automatic_build(&root, &cache, true, true);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("E0080"));
+        let binary = std::process::Command::new(root.join("target/debug/worktree-probe"))
+            .output()
+            .unwrap();
+        assert!(binary.status.success());
+        assert_eq!(
+            String::from_utf8(binary.stdout).unwrap().trim(),
+            format!("{suffix}:native")
+        );
+    }
+    assert!(
+        graph_contents(&root.join("target/debug/incremental.kache-auto"))
+            .keys()
+            .any(|path| path
+                .file_name()
+                .is_some_and(|name| name == "bootstrap-env-dep"))
+    );
+}
+
 #[test]
 fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
     if !supports_cwd_remap() {

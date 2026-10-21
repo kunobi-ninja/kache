@@ -185,7 +185,10 @@ pub struct Config {
     /// artifact caching. Enabled by default; `preserve_incremental` remains the
     /// explicit force mode.
     pub adaptive_incremental: bool,
-    /// Optional donor profile for worktree incremental seeds in unstable mode.
+    /// Seed private incremental state from compatible local Cargo targets.
+    /// Enabled by default; `KACHE_SEED_INCREMENTAL=0` opts out.
+    pub seed_incremental: bool,
+    /// Optional explicit donor profile for worktree incremental seeds.
     pub incremental_seed_from: Option<PathBuf>,
     /// Enable all current and future experiments before they become defaults.
     /// `KACHE_UNSTABLE=1` / `[cache] unstable = true`. Off by default.
@@ -951,6 +954,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
+    pub(crate) seed_incremental: Option<bool>,
     pub(crate) incremental_seed_from: Option<String>,
     pub(crate) unstable: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
@@ -1313,6 +1317,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_PRESERVE_INCREMENTAL",
     "KACHE_ADAPTIVE_INCREMENTAL",
+    "KACHE_SEED_INCREMENTAL",
     "KACHE_INCREMENTAL_SEED_FROM",
     "KACHE_UNSTABLE",
     "KACHE_COMPRESSION_LEVEL",
@@ -1393,6 +1398,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
     ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
+    ("KACHE_SEED_INCREMENTAL", "cache.seed_incremental"),
     ("KACHE_INCREMENTAL_SEED_FROM", "cache.incremental_seed_from"),
     ("KACHE_UNSTABLE", "cache.unstable"),
     ("KACHE_COMPRESSION_LEVEL", "cache.compression_level"),
@@ -1718,6 +1724,17 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.adaptive_incremental)
+                    .unwrap_or(true)
+            });
+
+        let seed_incremental = env_or_ignored("KACHE_SEED_INCREMENTAL", ignore_env)
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.seed_incremental)
                     .unwrap_or(true)
             });
 
@@ -2200,6 +2217,7 @@ impl Config {
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,
+            seed_incremental,
             unstable,
             incremental_seed_from: env_or_ignored("KACHE_INCREMENTAL_SEED_FROM", ignore_env)
                 .ok()

@@ -1,5 +1,4 @@
-//! Explicit, local donor import for experiments with rustc's cwd remapping.
-//! The normal cache and adaptive learning policy do not select donors.
+//! Import compatible local rustc state without sharing a writable session.
 
 use super::*;
 use std::io;
@@ -17,12 +16,22 @@ impl Lease {
         &mut self,
         args: &RustcArgs,
         donor_profile: Option<&Path>,
-        unstable: bool,
+        enabled: bool,
+    ) -> Vec<String> {
+        let donors: Vec<_> = donor_profile.into_iter().map(Path::to_path_buf).collect();
+        self.worktree_compiler_args_from(args, &donors, enabled)
+    }
+
+    pub(crate) fn worktree_compiler_args_from(
+        &mut self,
+        args: &RustcArgs,
+        donor_profiles: &[PathBuf],
+        enabled: bool,
     ) -> Vec<String> {
         self.worktree_seed_key = None;
         self.worktree_bootstrap = false;
         let isolated = self.compiler_args(args);
-        if !unstable || self.kind != LeaseKind::Immediate || args.inner_rustc.is_some() {
+        if !enabled || args.inner_rustc.is_some() || path_exists(&self.bootstrap_env_marker()) {
             return isolated;
         }
         let Ok(cwd) = std::env::current_dir() else {
@@ -91,11 +100,13 @@ impl Lease {
             bootstrap,
             &identity,
         );
-        if let Some(donor_profile) = donor_profile
-            && empty_directory(&self.unit.rustc_dir)
-        {
-            let imported = import(&self.unit, donor_profile, &key);
-            tracing::debug!(imported, "experimental worktree incremental seed");
+        if empty_directory(&self.unit.rustc_dir) {
+            for donor_profile in donor_profiles {
+                if import(&self.unit, donor_profile, &key) {
+                    tracing::debug!(donor = %donor_profile.display(), "imported worktree incremental seed");
+                    break;
+                }
+            }
         }
         self.worktree_seed_key = Some(key);
         self.worktree_bootstrap = inject_bootstrap;
@@ -105,10 +116,55 @@ impl Lease {
     pub(crate) fn worktree_bootstrap(&self) -> bool {
         self.worktree_bootstrap
     }
+
+    pub(crate) fn worktree_portable(&self) -> bool {
+        self.worktree_seed_key.is_some()
+    }
+
+    pub(crate) fn needs_worktree_donor(&self) -> bool {
+        !path_exists(&self.bootstrap_env_marker()) && empty_directory(&self.unit.rustc_dir)
+    }
+
+    fn bootstrap_env_marker(&self) -> PathBuf {
+        self.unit.unit_dir.join("bootstrap-env-dep")
+    }
+
+    /// A source that reads bootstrap must see the caller's original value.
+    /// Remember the refusal so later edits need no speculative attempt.
+    pub(crate) fn decline_worktree_bootstrap(&mut self) -> bool {
+        self.worktree_seed_key = None;
+        self.worktree_bootstrap = false;
+        let Ok(mut marker) = tempfile::NamedTempFile::new_in(&self.unit.unit_dir) else {
+            return false;
+        };
+        use std::io::Write;
+        marker.write_all(b"source reads RUSTC_BOOTSTRAP\n").is_ok()
+            && marker.persist(self.bootstrap_env_marker()).is_ok()
+            && remove_path_safely(&self.unit.rustc_dir)
+            && ensure_real_directory(&self.unit.rustc_dir)
+    }
+}
+
+pub(crate) fn compiler_supports_automatic_seed(version: &str) -> bool {
+    let mut words = version.split_whitespace();
+    if words.next() != Some("rustc") {
+        return false;
+    }
+    let Some(release) = words.next() else {
+        return false;
+    };
+    let mut parts = release.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    match (major.parse::<u64>(), minor.parse::<u64>()) {
+        (Ok(major), Ok(minor)) => (major, minor) >= (1, 98),
+        _ => false,
+    }
 }
 
 fn bootstrap_override_allowed(current: Option<&std::ffi::OsStr>, flags: &[String]) -> bool {
-    current.is_none_or(|value| value.is_empty())
+    current.is_none()
         && flags
             .iter()
             .all(|flag| flag.starts_with("remap-cwd-prefix=") || flag == "incremental-info")
@@ -261,7 +317,7 @@ fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<V
     (remap_count == 1 && saw_source).then_some(result)
 }
 
-fn empty_directory(path: &Path) -> bool {
+pub(super) fn empty_directory(path: &Path) -> bool {
     real_directory(path) && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
@@ -734,8 +790,7 @@ mod tests {
     fn bootstrap_opt_in_never_overrides_an_existing_selection() {
         use std::ffi::OsStr;
         assert!(bootstrap_override_allowed(None, &[]));
-        assert!(bootstrap_override_allowed(Some(OsStr::new("")), &[]));
-        for value in ["-1", "0", "other_crate", "1"] {
+        for value in ["", "-1", "0", "other_crate", "1"] {
             assert!(!bootstrap_override_allowed(Some(OsStr::new(value)), &[]));
         }
         for flag in ["remap-cwd-prefix=/src", "incremental-info"] {
@@ -780,7 +835,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn inner_wrappers_and_adaptive_leases_cannot_prepare_worktree_seeds() {
+    fn inner_wrappers_decline_but_adaptive_leases_prepare_portable_state() {
         let _lock = crate::test_support::process_state_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let _cache = crate::config::tests::set_env_for_test(
@@ -805,10 +860,56 @@ mod tests {
             let mut lease = unit.try_immediate().unwrap();
             lease.kind = kind;
             let isolated = lease.compiler_args(&args);
-            assert_eq!(lease.worktree_compiler_args(&args, None, true), isolated);
-            assert!(lease.worktree_seed_key.is_none());
+            let portable = lease.worktree_compiler_args(&args, None, true);
+            if kind == LeaseKind::Immediate {
+                assert_eq!(portable, isolated);
+                assert!(!lease.worktree_portable());
+            } else {
+                assert_ne!(portable, isolated);
+                assert!(lease.worktree_portable());
+            }
             assert!(!lease.worktree_bootstrap());
         }
+    }
+
+    #[test]
+    fn automatic_seed_requires_rustc_198_or_later() {
+        for version in [
+            "rustc 1.98.0",
+            "rustc 1.98.0-beta.2",
+            "rustc 1.99.0-nightly",
+            "rustc 2.0.0",
+        ] {
+            assert!(compiler_supports_automatic_seed(version), "{version}");
+        }
+        for version in [
+            "rustc 1.97.1",
+            "rustc 1.97.0-nightly",
+            "rustc unknown",
+            "rustc",
+            "clang 19.0.0",
+            "rustc 1.unknown.0",
+        ] {
+            assert!(!compiler_supports_automatic_seed(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_observation_disables_portable_state_for_later_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (args, unit) = fixture(temp.path());
+        let mut lease = unit.try_immediate().unwrap();
+        fs::write(unit.rustc_dir.join("graph.bin"), b"override").unwrap();
+        lease.worktree_bootstrap = true;
+        lease.worktree_seed_key = Some("a".repeat(64));
+        assert!(lease.decline_worktree_bootstrap());
+        assert!(empty_directory(&unit.rustc_dir));
+        assert!(!lease.worktree_bootstrap());
+        assert!(!lease.worktree_portable());
+        assert!(!lease.needs_worktree_donor());
+        let isolated = lease.compiler_args(&args);
+        assert_eq!(lease.worktree_compiler_args(&args, None, true), isolated);
+        assert!(lease.bootstrap_env_marker().is_file());
     }
 
     #[test]

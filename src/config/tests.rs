@@ -2724,6 +2724,44 @@ fn test_incremental_seed_from_is_explicit_and_respects_ignore_env() {
 }
 
 #[test]
+fn worktree_seeding_defaults_on_and_respects_file_env_and_ignore_env() {
+    let _guard = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _env = NamedEnvGuard::remove("KACHE_SEED_INCREMENTAL");
+    std::fs::write(&path, "[cache]\n").unwrap();
+    assert!(Config::load().unwrap().seed_incremental);
+    std::fs::write(&path, "[cache]\nseed_incremental = false\n").unwrap();
+    assert!(!Config::load().unwrap().seed_incremental);
+    for value in ["1", "true", "TRUE"] {
+        let _env = NamedEnvGuard::set("KACHE_SEED_INCREMENTAL", value);
+        assert!(Config::load().unwrap().seed_incremental, "{value}");
+    }
+    std::fs::write(&path, "[cache]\nseed_incremental = true\n").unwrap();
+    for value in ["0", "false", "FALSE"] {
+        let _env = NamedEnvGuard::set("KACHE_SEED_INCREMENTAL", value);
+        assert!(!Config::load().unwrap().seed_incremental, "{value}");
+        assert_eq!(
+            env_override_for(&["cache".into(), "seed_incremental".into()], false),
+            Some("KACHE_SEED_INCREMENTAL")
+        );
+    }
+    std::fs::write(
+        &path,
+        "[cache]\nignore_env = true\nseed_incremental = false\n",
+    )
+    .unwrap();
+    let _env = NamedEnvGuard::set("KACHE_SEED_INCREMENTAL", "true");
+    assert!(!Config::load().unwrap().seed_incremental);
+    assert_eq!(
+        env_override_for(&["cache".into(), "seed_incremental".into()], true),
+        None
+    );
+    assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_SEED_INCREMENTAL"));
+}
+
+#[test]
 fn unstable_mode_defaults_off_and_respects_file_env_and_ignore_env() {
     let _guard = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3094,6 +3132,7 @@ fn test_config_store_dir() {
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        seed_incremental: true,
         incremental_seed_from: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
@@ -3176,6 +3215,7 @@ fn test_config_index_db_path() {
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        seed_incremental: true,
         incremental_seed_from: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
@@ -3254,6 +3294,7 @@ fn test_config_event_log_path() {
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        seed_incremental: true,
         incremental_seed_from: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
@@ -3351,6 +3392,7 @@ fn test_config_socket_path() {
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        seed_incremental: true,
         incremental_seed_from: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
@@ -4081,6 +4123,7 @@ fn test_save_and_load_file_config() {
             clean_incremental: None,
             preserve_incremental: None,
             adaptive_incremental: None,
+            seed_incremental: None,
             incremental_seed_from: None,
             unstable: Default::default(),
             exclude: None,

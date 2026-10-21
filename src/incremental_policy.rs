@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod cleanup;
 mod worktree_seed;
 pub(crate) use cleanup::{preview_stale, prune_stale};
+pub(crate) use worktree_seed::compiler_supports_automatic_seed;
 
 /// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
 const AUTO_ROOT: &str = "incremental.kache-auto";
@@ -38,6 +39,7 @@ const MAX_STATE_BYTES: u64 = 64 * 1024;
 /// One standard Cargo unit that is safe to manage automatically.
 #[derive(Clone, Debug)]
 pub(crate) struct AdaptiveUnit {
+    source_file: Option<PathBuf>,
     original_incremental: PathBuf,
     policy_guard: Vec<u8>,
     unit_key: String,
@@ -174,6 +176,9 @@ struct Observation {
     stable: String,
     sources_externs: String,
     at_secs: u64,
+    /// A cheap edit signal for a private compile, never an artifact key.
+    #[serde(default)]
+    primary_source: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -254,6 +259,13 @@ impl AdaptiveUnit {
         let unit_key = unit_key(args, original_incremental, policy_guard);
         let unit_dir = profile.join(AUTO_ROOT).join(POLICY_VERSION).join(&unit_key);
         Some(Self {
+            source_file: args.source_file.as_ref().and_then(|path| {
+                if path.is_absolute() {
+                    Some(path.clone())
+                } else {
+                    std::env::current_dir().ok().map(|cwd| cwd.join(path))
+                }
+            }),
             original_incremental: original_incremental.clone(),
             policy_guard: policy_guard.to_vec(),
             state_path: unit_dir.join("state.json"),
@@ -272,6 +284,74 @@ impl AdaptiveUnit {
     /// Try an intentional passthrough without teaching or activating policy.
     pub(crate) fn try_immediate(&self) -> Option<Lease> {
         self.try_immediate_at(now_secs())
+    }
+
+    /// A changed primary source can select a private compile before dep-info
+    /// discovery. The caller must import a compatible donor or cancel this
+    /// lease with CompileError before running any compiler.
+    pub(crate) fn try_source_changed_seed(&self) -> Option<Lease> {
+        if definitely_missing(&self.state_path) {
+            return None;
+        }
+        let current = self.primary_source_fingerprint()?;
+        let lock = self.lock()?;
+        let previous = match self.load_state() {
+            LoadedState::Valid(state) if !state.in_flight && state.phase == Phase::Learning => {
+                state
+            }
+            _ => return None,
+        };
+        let mut observation = previous.observation.clone()?;
+        if observation.primary_source.as_deref()? == current {
+            return None;
+        }
+        observation.primary_source = Some(current);
+        let now = now_secs();
+        observation.at_secs = now;
+        if !ensure_real_directory(&self.rustc_dir)
+            || !worktree_seed::empty_directory(&self.rustc_dir)
+        {
+            return None;
+        }
+        let busy = DiskState {
+            schema: STATE_SCHEMA,
+            unit_key: self.unit_key.clone(),
+            phase: Phase::Seed,
+            observation: Some(observation.clone()),
+            active_leases: 0,
+            last_used_secs: now,
+            in_flight: true,
+        };
+        if !self.store_state(&busy, true) {
+            return None;
+        }
+        Some(Lease {
+            unit: self.clone(),
+            kind: LeaseKind::Seed,
+            completion: Completion::Seed {
+                observation,
+                previous,
+            },
+            worktree_seed_key: None,
+            worktree_bootstrap: false,
+            _lock: lock,
+        })
+    }
+
+    fn primary_source_fingerprint(&self) -> Option<String> {
+        let mut input = File::open(self.source_file.as_ref()?).ok()?;
+        if !input.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update_reader(&mut input).ok()?;
+        Some(hash.finalize().to_hex().to_string())
+    }
+
+    fn observation(&self, fingerprint: &KeyFingerprint, now: u64) -> Observation {
+        let mut observation = fingerprint.at(now);
+        observation.primary_source = self.primary_source_fingerprint();
+        observation
     }
 
     /// On a normal cache miss, try to seed or renew incremental state.
@@ -460,7 +540,7 @@ impl AdaptiveUnit {
             return None;
         }
 
-        let observation = fingerprint.at(now);
+        let observation = self.observation(&fingerprint, now);
         let busy = DiskState {
             schema: STATE_SCHEMA,
             unit_key: self.unit_key.clone(),
@@ -510,7 +590,7 @@ impl AdaptiveUnit {
             schema: STATE_SCHEMA,
             unit_key: self.unit_key.clone(),
             phase: Phase::Learning,
-            observation: Some(fingerprint.at(now)),
+            observation: Some(self.observation(&fingerprint, now)),
             active_leases: 0,
             last_used_secs: now,
             in_flight: false,
@@ -658,7 +738,7 @@ impl Lease {
             return false;
         }
 
-        let observation = fingerprint.at(now);
+        let observation = self.unit.observation(&fingerprint, now);
         let busy = DiskState {
             schema: STATE_SCHEMA,
             unit_key: self.unit.unit_key.clone(),
@@ -775,6 +855,7 @@ impl KeyFingerprint {
             stable: self.stable.clone(),
             sources_externs: self.sources_externs.clone(),
             at_secs,
+            primary_source: None,
         }
     }
 }
@@ -844,7 +925,11 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
     if let Some(observation) = &state.observation
         && (!valid_hex_digest(&observation.cache_key)
             || !valid_hex_digest(&observation.stable)
-            || !valid_hex_digest(&observation.sources_externs))
+            || !valid_hex_digest(&observation.sources_externs)
+            || observation
+                .primary_source
+                .as_deref()
+                .is_some_and(|hash| !valid_hex_digest(hash)))
     {
         return false;
     }
@@ -2273,6 +2358,7 @@ mod tests {
             stable: cache_key("stable"),
             sources_externs: cache_key("dynamic"),
             at_secs: 100,
+            primary_source: None,
         };
         let mut state = DiskState {
             schema: STATE_SCHEMA,
@@ -2501,6 +2587,38 @@ mod tests {
 
         assert!(unit.reset());
         assert!(!unit.state_path.exists());
+    }
+
+    #[test]
+    fn a_changed_primary_source_can_prepare_only_a_learning_seed() {
+        let (temp, _args, mut unit) = fixture();
+        let source = temp.path().join("edited.rs");
+        fs::write(&source, b"original").unwrap();
+        unit.source_file = Some(source.clone());
+        teach(&unit, 100);
+        let original = fs::read(&unit.state_path).unwrap();
+        assert!(unit.try_source_changed_seed().is_none());
+        fs::write(&source, b"original").unwrap();
+        assert!(unit.try_source_changed_seed().is_none());
+        fs::write(&source, b"edited").unwrap();
+        let lease = unit.try_source_changed_seed().unwrap();
+        assert_eq!(lease.kind(), LeaseKind::Seed);
+        assert!(
+            unit.try_source_changed_seed().is_none(),
+            "receiver lock is held"
+        );
+        assert!(lease.finish(CompileOutcome::CompileError));
+        assert_eq!(fs::read(&unit.state_path).unwrap(), original);
+        let lease = unit.try_source_changed_seed().unwrap();
+        fs::write(unit.rustc_dir.join("graph"), b"imported").unwrap();
+        assert!(lease.finish(CompileOutcome::Success));
+        assert_eq!(read_state(&unit).phase, Phase::Active);
+        assert!(
+            unit.try_source_changed_seed().is_none(),
+            "active lease limits still apply"
+        );
+        assert!(unit.reset());
+        assert!(unit.try_source_changed_seed().is_none(), "no observation");
     }
 
     #[test]

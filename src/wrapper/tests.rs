@@ -2695,6 +2695,10 @@ fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
     let mut config = test_config(dir.path().join("cache"));
     let baseline = adaptive_policy_guard(&config);
 
+    config.seed_incremental = false;
+    assert_ne!(adaptive_policy_guard(&config), baseline);
+    config.seed_incremental = true;
+
     config.key_salt = Some("salt-a".to_string());
     assert_ne!(adaptive_policy_guard(&config), baseline);
     config.key_salt = None;

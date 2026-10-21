@@ -128,6 +128,18 @@ fn automatic_supported() -> bool {
 }
 
 fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool, library: bool) -> Output {
+    managed_command(root, cache, enabled, force, library)
+        .output()
+        .unwrap()
+}
+
+fn managed_command(
+    root: &Path,
+    cache: &Path,
+    enabled: bool,
+    force: bool,
+    library: bool,
+) -> std::process::Command {
     let mut command = common::hermetic_command("cargo", cache, Some(&cache.join("absent.toml")));
     command
         .current_dir(root)
@@ -168,7 +180,7 @@ fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool, librar
     } else {
         command.env_remove("KACHE_INCREMENTAL_CRATES");
     }
-    command.output().unwrap()
+    command
 }
 
 fn edited_project(root: &Path, answer: u64) {
@@ -422,7 +434,7 @@ fn failed_bootstrap_dep_info_cleanup_keeps_the_native_compile_accounted() {
 }
 
 #[test]
-fn deferred_source_error_does_not_retry_a_stale_bootstrap_observation() {
+fn deferred_compiler_error_does_not_retry_a_stale_bootstrap_observation() {
     if !automatic_supported() {
         return;
     }
@@ -430,8 +442,30 @@ fn deferred_source_error_does_not_retry_a_stale_bootstrap_observation() {
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
     project(&root, 0);
+    let output = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rustc = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+        .join("bin/rustc");
+    let compiler = root.join("tool/rustc");
+    fs::create_dir(compiler.parent().unwrap()).unwrap();
+    kache_fs::testutil::write_executable(
+        &compiler,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n case \"$arg\" in src/lib.rs)\n  if test -f \"$WORKTREE_PROBE_STOP\"; then\n   echo 'error: controlled compiler stop before dep-info' >&2\n   exit 1\n  fi;;\n esac\ndone\nexec \"$WORKTREE_PROBE_RUSTC\" \"$@\"\n",
+    );
+    let stop = root.join("stop-compiler");
+    let build = || {
+        managed_command(&root, &cache, true, false, true)
+            .env("RUSTC", &compiler)
+            .env("WORKTREE_PROBE_RUSTC", &rustc)
+            .env("WORKTREE_PROBE_STOP", &stop)
+            .output()
+            .unwrap()
+    };
     fs::write(root.join("src/lib.rs"), "pub fn answer() -> u64 { 0 }\n").unwrap();
-    let output = automatic_build(&root, &cache, true, false, true);
+    let output = build();
     assert!(
         output.status.success(),
         "{}",
@@ -449,12 +483,13 @@ fn deferred_source_error_does_not_retry_a_stale_bootstrap_observation() {
         })
         .unwrap();
     fs::write(&dep_info, "# env-dep:RUSTC_BOOTSTRAP=stale\n").unwrap();
+    fs::write(&stop, b"stop before touching dep-info").unwrap();
     fs::write(
         root.join("src/lib.rs"),
         "mod missing; pub fn answer() -> u64 { missing::answer() }\n",
     )
     .unwrap();
-    let output = automatic_build(&root, &cache, true, false, true);
+    let output = build();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("inputs=compile-while-keying"), "{stderr}");

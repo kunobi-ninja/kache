@@ -204,7 +204,10 @@ pub(super) async fn handle(
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
     let (send, mut calls) = tokio::sync::mpsc::channel(8);
-    let broker = Arc::new(Broker::new(send, peer, prepared.env.clone()));
+    // At most 64 frontend-owned children can be pending. Their final drops
+    // can happen on this async task, so cleanup has a nonblocking channel.
+    let (finish, mut finished) = tokio::sync::mpsc::unbounded_channel();
+    let broker = Arc::new(Broker::new(send, finish, peer, prepared.env.clone()));
     let context = InvocationContext {
         daemon: Some(Arc::clone(daemon)),
         env: prepared.env,
@@ -233,23 +236,30 @@ pub(super) async fn handle(
     });
     let mut unexpected = [0u8; 1];
     let result = loop {
-        tokio::select! {
-            result = &mut worker => break result,
-            Some(call) = calls.recv() => {
-                if let Err(error) = service_call(stream, reader, call).await {
-                    drop(calls);
-                    cancellation.cancel();
-                    let _ = worker.await;
-                    return Err(error);
-                }
-            }
+        let call = tokio::select! {
+            biased;
             disconnected = reader.read(&mut unexpected) => {
                 let _ = disconnected;
                 drop(calls);
+                drop(finished);
                 cancellation.cancel();
                 let _ = worker.await;
                 return Ok(());
             }
+            // Reap completed owners before admitting another native spawn.
+            Some(id) = finished.recv() => Call {
+                command: kache_protocol::execution::windows::Command::Finish { id },
+                result: None,
+            },
+            Some(call) = calls.recv() => call,
+            result = &mut worker => break result,
+        };
+        if let Err(error) = service_call(stream, reader, call).await {
+            drop(calls);
+            drop(finished);
+            cancellation.cancel();
+            let _ = worker.await;
+            return Err(error);
         }
     };
     let reply = match result {

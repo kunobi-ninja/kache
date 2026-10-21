@@ -671,6 +671,11 @@ mod windows_tests {
     #[test]
     #[ignore = "isolated primary token for named-pipe server admission"]
     fn weaker_server_fixture() {
+        // `--include-ignored` must not change the calling test process token.
+        let Some(root) = std::env::var_os("KACHE_WEAKER_PEER_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::Foundation::{GetLastError, LUID, SetLastError};
         use windows_sys::Win32::Security::{
@@ -728,7 +733,6 @@ mod windows_tests {
             "the fixture must remove its privilege"
         );
         drop(token);
-        let root = std::path::PathBuf::from(std::env::var_os("KACHE_WEAKER_PEER_ROOT").unwrap());
         let socket = root.join("control");
         let listener = crate::ListenerOptions::new()
             .name(crate::socket_name(&socket).unwrap())

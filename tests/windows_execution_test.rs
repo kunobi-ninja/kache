@@ -400,6 +400,76 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
 }
 
 #[test]
+#[cfg(target_env = "msvc")]
+fn parallel_msvc_debug_compiles_complete_through_warm_frontends() {
+    use kache_protocol::execution::{NativeString, windows::Discovery};
+    let fixture = Fixture::new();
+    let tools = kache_ipc::windows_msvc::discover(&Discovery {
+        architecture: format!("{}-pc-windows-msvc", std::env::consts::ARCH),
+        env: fixture
+            .host
+            .iter()
+            .map(|(key, value)| (NativeString::capture(key), NativeString::capture(value)))
+            .collect(),
+    })
+    .unwrap();
+    let compiler = tools
+        .compiler
+        .expect("native MSVC acceptance requires cl.exe");
+    let compiler_path = compiler.path.decode().unwrap();
+    let compiler_env = compiler
+        .env
+        .iter()
+        .map(|(key, value)| (key.decode().unwrap(), value.decode().unwrap()))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        fixture.path("work/short.c"),
+        "int short_compile(void) {return 1;}\n",
+    )
+    .unwrap();
+    let source = (0..512)
+        .map(|i| format!("struct item_{i} {{int value;}}; int value_{i}(struct item_{i} x) {{return x.value;}}\n"))
+        .collect::<String>();
+    std::fs::write(fixture.path("work/long.c"), source).unwrap();
+    fixture.success(
+        fixture
+            .command(fixture.path("install/kache.exe"))
+            .args(["daemon", "start"]),
+    );
+    let pid = fixture.daemon_pid();
+    let barrier = std::sync::Barrier::new(2);
+    // /FS routes both /Zi writers through MSPDBSRV. Each test owns its PDB;
+    // no pre-existing server is stopped or assigned a different lifetime.
+    std::thread::scope(|threads| {
+        for name in ["short", "long"] {
+            let fixture = &fixture;
+            let compiler_path = &compiler_path;
+            let compiler_env = &compiler_env;
+            let barrier = &barrier;
+            threads.spawn(move || {
+                let mut command = fixture.command(fixture.path("frontend-only/kache.exe"));
+                command
+                    .arg(compiler_path)
+                    .args(["/nologo", "/c", "/Zi", "/FS", "/Fdshared.pdb"])
+                    .arg(format!("/Fo{name}.obj"))
+                    .arg(format!("{name}.c"))
+                    .envs(compiler_env.iter().cloned());
+                barrier.wait();
+                fixture.success(&mut command);
+                assert!(fixture.path(&format!("work/{name}.obj")).is_file());
+            });
+        }
+    });
+    assert!(
+        std::fs::metadata(fixture.path("work/shared.pdb"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    assert_eq!(fixture.daemon_pid(), pid);
+}
+
+#[test]
 #[ignore = "isolated Windows console for native diagnostic replay acceptance"]
 fn native_console_fixture() {
     use windows_sys::Win32::System::Console::{

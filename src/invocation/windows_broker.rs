@@ -17,6 +17,7 @@ pub(crate) struct Call {
 
 pub(crate) struct Broker {
     sender: tokio::sync::mpsc::Sender<Call>,
+    finished: tokio::sync::mpsc::UnboundedSender<u64>,
     peer: Arc<PeerProcess>,
     env: InvocationEnv,
 }
@@ -33,10 +34,16 @@ impl Broker {
     }
     pub(crate) fn new(
         sender: tokio::sync::mpsc::Sender<Call>,
+        finished: tokio::sync::mpsc::UnboundedSender<u64>,
         peer: Arc<PeerProcess>,
         env: InvocationEnv,
     ) -> Self {
-        Self { sender, peer, env }
+        Self {
+            sender,
+            finished,
+            peer,
+            env,
+        }
     }
 
     pub(crate) fn spawn(
@@ -75,17 +82,20 @@ impl Broker {
             Err(error) => {
                 // The frontend resumed the child before describing its handles.
                 // Complete the rollback before another operation can start.
-                self.done(Command::Abort { id: child.id })?;
+                if let Err(cleanup) = self.done(Command::Abort { id: child.id }) {
+                    return Err(io::Error::other(format!(
+                        "native handle transfer failed: {error}; abort failed: {cleanup}"
+                    )));
+                }
                 Err(error)
             }
         }
     }
 
     pub(crate) fn finish(&self, id: u64) {
-        let _ = self.sender.blocking_send(Call {
-            command: Command::Finish { id },
-            result: None,
-        });
+        // The last process owner can drop on an async cancellation task.
+        // Cleanup must not block that task or compete for a full RPC queue.
+        let _ = self.finished.send(id);
     }
 
     pub(crate) fn write(&self, output: Output, bytes: &[u8]) -> io::Result<()> {
@@ -169,8 +179,47 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn async_cleanup_survives_a_full_rpc_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let (_client, server) = connection(root.path());
+        let peer = Arc::new(PeerProcess::for_connection(&server, std::process::id()).unwrap());
+        let (sender, _calls) = tokio::sync::mpsc::channel(1);
+        assert!(
+            sender
+                .try_send(Call {
+                    command: Command::Flush {
+                        output: Output::Stderr
+                    },
+                    result: None
+                })
+                .is_ok()
+        );
+        assert_eq!(sender.capacity(), 0);
+        let (finished, mut cleanup) = tokio::sync::mpsc::unbounded_channel();
+        let env = InvocationEnv::from_parts(
+            Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        let broker = Broker::new(sender, finished, peer, env);
+        broker.finish(7);
+        assert_eq!(cleanup.try_recv().unwrap(), 7);
+        assert!(cleanup.try_recv().is_err());
+    }
+
     #[test]
     fn a_failed_native_handle_transfer_is_aborted_before_spawn_returns() {
+        failed_native_transfer(false);
+    }
+
+    #[test]
+    fn an_abort_error_preserves_the_native_handle_transfer_error() {
+        failed_native_transfer(true);
+    }
+
+    fn failed_native_transfer(abort_error: bool) {
         let root = tempfile::tempdir().unwrap();
         let (_client, server) = connection(root.path());
         let peer = Arc::new(PeerProcess::for_connection(&server, std::process::id()).unwrap());
@@ -181,7 +230,8 @@ mod tests {
             None,
             root.path().to_owned(),
         );
-        let broker = Broker::new(sender, peer, env);
+        let (finished, _finished) = tokio::sync::mpsc::unbounded_channel();
+        let broker = Broker::new(sender, finished, peer, env);
         let ready = root.path().join("ready");
         let child_ready = ready.clone();
         let frontend = std::thread::spawn(move || {
@@ -236,14 +286,31 @@ mod tests {
                 unsafe { WaitForSingleObject(child.as_raw_handle(), 0) },
                 WAIT_OBJECT_0
             );
-            abort.result.unwrap().send(Ok(Reply::Done)).unwrap();
+            let reply = if abort_error {
+                Err(io::Error::other("fixture abort acknowledgement failed"))
+            } else {
+                Ok(Reply::Done)
+            };
+            abort.result.unwrap().send(reply).unwrap();
         });
         let result = broker.spawn(
             &ProcessCommand::new(std::env::current_exe().unwrap()),
             Stdio::OUTPUT,
         );
         drop(broker);
-        assert!(result.is_err());
+        let error = result
+            .err()
+            .expect("invalid stream handle must be rejected");
+        assert!(error.to_string().contains("invalid compiler stream handle"));
+        if abort_error {
+            assert!(
+                error
+                    .to_string()
+                    .contains("fixture abort acknowledgement failed")
+            );
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
         frontend.join().unwrap();
         assert!(ready.exists(), "the child ran before the transfer failed");
     }

@@ -12254,7 +12254,12 @@ fn non_utf8_env_scan_replaces_version_five_memos() {
     let db = dir.path().join("idx.sqlite");
     let cache = FileHashCache::open(&db).unwrap();
     cache
-        .put_source_env_dep_use(&hash, "OUT_DIR", 5, SourceEnvDepUse::IncludeLocator.memo_code())
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            5,
+            SourceEnvDepUse::IncludeLocator.memo_code(),
+        )
         .unwrap();
     drop(cache);
 
@@ -12317,7 +12322,11 @@ fn non_utf8_files_cannot_supply_proof_but_retain_runtime_vetoes() {
     let false_proof = dir.path().join("template.rs");
     std::fs::write(&false_proof, b"\xff include!(env!(\"OUT_DIR\"));").unwrap();
     let binary_value = dir.path().join("binary.bin");
-    std::fs::write(&binary_value, b"\xff pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    std::fs::write(
+        &binary_value,
+        b"\xff pub const OUT: &str = env!(\"OUT_DIR\");",
+    )
+    .unwrap();
     let text_value = dir.path().join("text.bin");
     std::fs::write(&text_value, b"pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
     let unused = dir.path().join("unused.bin");
@@ -12464,7 +12473,9 @@ fn non_utf8_env_scan_checks_content_before_classification() {
         .scan_env_dep_use(&blob, "OUT_DIR", &old_hash)
         .unwrap_err();
     assert!(
-        error.to_string().contains("changed between content hashing"),
+        error
+            .to_string()
+            .contains("changed between content hashing"),
         "unexpected error: {error:#}"
     );
 }
@@ -17961,22 +17972,138 @@ fn concurrent_key_env_snapshots_do_not_use_the_servers_values() {
 
 #[test]
 fn non_utf8_proc_macro_template_keeps_runtime_env_absolute() {
+    let _lock = key_test_lock();
+    let invocation = InvocationEnv::capture();
+    let rustc = invocation.var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiler = || {
+        let mut command = invocation.command(&rustc).expect("resolve native rustc");
+        for name in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    };
+    fn run(command: &mut std::process::Command) -> std::process::Output {
+        use crate::invocation::process::CommandExt as _;
+        let output = command.invocation_output().expect("run compiler control");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("lib.rs");
+    let root = dir.path().canonicalize().unwrap();
+    let decoder = root.join("decoder.rs");
     std::fs::write(
-        &source,
-        b"decoder::decode!(); const _: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/payload.bin\"));",
+        &decoder,
+        r#"extern crate proc_macro;
+#[proc_macro]
+pub fn decode(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let path = std::path::Path::new(&root).join("template.bin");
+    let bytes = std::fs::read(&path).unwrap();
+    let decoded = String::from_utf8_lossy(&bytes);
+    format!("const _: &[u8] = include_bytes!({:?});\n{}", path.to_str().unwrap(), decoded)
+        .parse().unwrap()
+}
+"#,
     )
     .unwrap();
-    let template = dir.path().join("template.bin");
+    let template = root.join("template.bin");
     std::fs::write(
         &template,
         b"//\xff\npub const OUT_VALUE: &str = env!(\"OUT_DIR\");\n",
     )
     .unwrap();
-    assert_eq!(
-        env_dep_source_decision("OUT_DIR", &[source, template], &FileHasher::new()),
-        EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse,
-        "the prepared compiler control checks that the tracked template emits an env value"
-    );
+    let source = root.join("main.rs");
+    std::fs::write(
+        &source,
+        r#"decoder::decode!();
+const _: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload.bin"));
+fn main() { println!("{OUT_VALUE}"); }
+"#,
+    )
+    .unwrap();
+    let library = root.join(format!(
+        "{}decoder{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    run(compiler()
+        .args([
+            "--edition=2021",
+            "--crate-type=proc-macro",
+            "--crate-name=decoder",
+        ])
+        .arg(&decoder)
+        .arg("-o")
+        .arg(&library));
+
+    let normalizer = PathNormalizer::empty().with_base_dirs(&[root.to_string_lossy().into_owned()]);
+    let mut values = Vec::new();
+    for location in ["a", "b"] {
+        let build = root.join(location);
+        let out = build.join("consumer-0123456789abcdef/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let payload = out.join("payload.bin");
+        std::fs::write(&payload, b"same payload").unwrap();
+        let dep_file = build.join("consumer.d");
+        let binary = build.join(format!("consumer{}", std::env::consts::EXE_SUFFIX));
+        run(compiler()
+            .args(["--edition=2021", "--crate-name=consumer"])
+            .arg(&source)
+            .arg("--extern")
+            .arg(format!("decoder={}", library.display()))
+            .arg(format!("--emit=link,dep-info={}", dep_file.display()))
+            .arg("-o")
+            .arg(&binary)
+            .env("CARGO_MANIFEST_DIR", &root)
+            .env("OUT_DIR", &out));
+
+        let printed = run(&mut invocation.command(&binary).unwrap());
+        let printed = String::from_utf8(printed.stdout).unwrap();
+        let expected = out.to_str().unwrap();
+        assert_eq!(printed.trim_end(), expected);
+        let dep_info = read_dep_info_file(&dep_file).unwrap();
+        let sources = parse_dep_info(&dep_info);
+        for input in [&source, &template, &payload] {
+            assert!(
+                sources
+                    .iter()
+                    .any(|path| path_probe(path) == path_probe(input)),
+                "rustc did not track {}: {dep_info}",
+                input.display()
+            );
+        }
+        assert_eq!(
+            parse_env_dep_info(&dep_info)
+                .into_iter()
+                .find(|(name, _)| name == "OUT_DIR")
+                .expect("rustc tracked OUT_DIR")
+                .1,
+            Some(expected.to_string())
+        );
+        let normalized = normalize_env_dep_value_in(
+            "consumer",
+            "OUT_DIR",
+            expected,
+            &sources,
+            &normalizer,
+            Some(out.as_os_str()),
+        );
+        assert_eq!(
+            normalized.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+        );
+        assert_eq!(normalized.value, expected);
+        values.push(normalized.value);
+    }
+    assert_ne!(values[0], values[1]);
 }

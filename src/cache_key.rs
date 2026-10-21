@@ -6348,11 +6348,13 @@ fn first_lossy_char_len(bytes: &[u8]) -> Option<usize> {
     let prefix = &bytes[..bytes.len().min(4)];
     match std::str::from_utf8(prefix) {
         Ok(text) => text.chars().next().map(char::len_utf8),
-        Err(error) if error.valid_up_to() > 0 => std::str::from_utf8(&prefix[..error.valid_up_to()])
-            .ok()?
-            .chars()
-            .next()
-            .map(char::len_utf8),
+        Err(error) if error.valid_up_to() > 0 => {
+            std::str::from_utf8(&prefix[..error.valid_up_to()])
+                .ok()?
+                .chars()
+                .next()
+                .map(char::len_utf8)
+        }
         Err(error) => Some(error.error_len().unwrap_or(prefix.len())),
     }
 }

@@ -2714,6 +2714,43 @@ fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
     assert_ne!(adaptive_policy_guard(&config), baseline);
 }
 
+#[test]
+fn bootstrap_retry_requires_fresh_dep_info_and_retires_discarded_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-name".into(),
+        "probe".into(),
+        "src/lib.rs".into(),
+        "--out-dir".into(),
+        temp.path().display().to_string(),
+        "-Cextra-filename=-1234abcd".into(),
+        "--emit=dep-info,metadata".into(),
+    ])
+    .unwrap();
+    let dep_info = args.dep_info_path().unwrap();
+    std::fs::write(&dep_info, b"old bootstrap observation").unwrap();
+    assert!(clear_incremental_bootstrap_dep_info(&args));
+    assert!(!dep_info.exists());
+    assert!(clear_incremental_bootstrap_dep_info(&args));
+    std::fs::create_dir(&dep_info).unwrap();
+    assert!(!clear_incremental_bootstrap_dep_info(&args));
+    let no_dep_info = RustcArgs::parse(&["rustc".into(), "src/main.rs".into()]).unwrap();
+    assert!(!clear_incremental_bootstrap_dep_info(&no_dep_info));
+
+    let output = temp.path().join("discarded-program");
+    std::fs::write(&output, b"bootstrap-dependent output").unwrap();
+    let artifacts =
+        ArtifactSet::from_output_files(vec![(output.clone(), "program".into())], |_| {
+            ArtifactKind::Executable
+        });
+    assert!(discard_bootstrap_outputs(&artifacts));
+    assert!(!output.exists());
+    assert!(discard_bootstrap_outputs(&artifacts));
+    std::fs::create_dir(output).unwrap();
+    assert!(!discard_bootstrap_outputs(&artifacts));
+}
+
 fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
     crate::store::EntryMeta {
         cache_key: "k".to_string(),

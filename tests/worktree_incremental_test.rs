@@ -278,6 +278,24 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
                 .file_name()
                 .is_some_and(|name| name == "bootstrap-env-dep"))
     );
+
+    let failing = root.join("native-error");
+    project(&failing, 0);
+    fs::write(
+        failing.join("src/main.rs"),
+        "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_some());\nfn main() {}\n",
+    )
+    .unwrap();
+    let output = automatic_build(&failing, &cache, true, true);
+    assert!(
+        !output.status.success(),
+        "native compile error must remain an error"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("E0080"));
+    assert!(
+        !failing.join("target/debug/worktree-probe").exists(),
+        "discarded bootstrap binary must not survive the failed native retry"
+    );
 }
 
 #[test]

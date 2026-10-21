@@ -4075,6 +4075,7 @@ fn run_parsed_rustc(
     // A learning unit has no graph to reuse. Reserve a cold private compile
     // before discovery, then qualify its seed from rustc's emitted closure.
     let mut deferred_seed = if adaptive_policy_for_invocation
+        && !automatic_seeding_enabled(config, args)
         && precompiled.is_none()
         && stop_on_hit_allowed(args)
         && deferral_allowed(config, args, false, extra_inputs)
@@ -7876,6 +7877,17 @@ fn clear_incremental_bootstrap_dep_info(args: &RustcArgs) -> bool {
     }
 }
 
+fn discard_bootstrap_outputs(outputs: &ArtifactSet) -> bool {
+    for artifact in outputs.outputs() {
+        if let Err(error) = std::fs::remove_file(&artifact.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn prepare_worktree_compiler_args(
     config: &Config,
     args: &RustcArgs,
@@ -8010,7 +8022,10 @@ fn adaptive_incremental_with_event<R: Into<String>>(
                 .any(|(name, _)| name == "RUSTC_BOOTSTRAP")
         })
     {
-        if !lease.decline_worktree_bootstrap() {
+        let cleared = compile
+            .as_ref()
+            .is_ok_and(|result| discard_bootstrap_outputs(&result.artifacts));
+        if !cleared || !lease.decline_worktree_bootstrap() {
             let _ = lease.finish(CompileOutcome::Abnormal);
             return passthrough_with_event(
                 config,

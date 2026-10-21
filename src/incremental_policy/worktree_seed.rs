@@ -866,7 +866,7 @@ mod tests {
                 assert_eq!(portable, isolated);
                 assert!(!lease.worktree_portable());
             } else {
-                assert_ne!(portable, isolated);
+                assert_eq!(portable, isolated);
                 assert!(lease.worktree_portable());
             }
             assert!(!lease.worktree_bootstrap());

@@ -5915,6 +5915,7 @@ fn env_text_key_bytes_preserves_utf8_and_distinguishes_invalid() {
 /// (a sandboxed build with no writable home).
 #[test]
 fn tool_version_cache_write_is_read_back() {
+    let _lock = key_test_lock();
     let cache_dir = crate::config::default_cache_dir();
     if std::fs::create_dir_all(&cache_dir).is_err() || tempfile::tempfile_in(&cache_dir).is_err() {
         eprintln!("skipping: {} is not writable", cache_dir.display());

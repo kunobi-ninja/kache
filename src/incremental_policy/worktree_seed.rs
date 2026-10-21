@@ -429,13 +429,39 @@ fn finalized_session(path: &Path, depth: usize) -> bool {
         }))
 }
 
+fn session_timestamp(path: &Path, depth: usize) -> Option<u64> {
+    if !finalized_session(path, depth) {
+        return None;
+    }
+    u64::from_str_radix(path.file_name()?.to_str()?.split('-').nth(1)?, 36).ok()
+}
+
+/// rustc selects the greatest base-36 timestamp in the session name. Keep
+/// unfamiliar layouts intact, and retain ties rather than choosing between them.
+fn newest_session(entries: &[fs::DirEntry], depth: usize) -> Option<u64> {
+    if depth != 1 {
+        return None;
+    }
+    let mut newest = None;
+    for entry in entries {
+        if entry.file_type().ok()?.is_dir() {
+            let timestamp = session_timestamp(&entry.path(), depth + 1)?;
+            newest = Some(newest.map_or(timestamp, |current: u64| current.max(timestamp)));
+        }
+    }
+    newest
+}
+
 fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) -> io::Result<()> {
     if depth > 8 {
         return Err(io::Error::other("incremental tree too deep"));
     }
     let finalized = finalized_session(source, depth);
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+    let entries = fs::read_dir(source)?
+        .take(budget.files.saturating_add(1))
+        .collect::<io::Result<Vec<_>>>()?;
+    let newest = newest_session(&entries, depth);
+    for entry in entries {
         let meta = fs::symlink_metadata(entry.path())?;
         let name = entry.file_name();
         if name.to_string_lossy().ends_with("-working") {
@@ -447,6 +473,12 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
             .ok_or_else(|| io::Error::other("too many incremental files"))?;
         let target = dest.join(name);
         if meta.is_dir() {
+            if let Some(newest) = newest
+                && session_timestamp(&entry.path(), depth + 1)
+                    .is_some_and(|timestamp| timestamp < newest)
+            {
+                continue;
+            }
             fs::create_dir(&target)?;
             copy_tree(&entry.path(), &target, budget, depth + 1)?;
         } else if meta.is_file() {
@@ -484,6 +516,95 @@ mod tests {
     use super::*;
 
     const VIRTUAL_PREFIX: &str = if cfg!(windows) { r"C:\src" } else { "/src" };
+
+    #[test]
+    fn imports_newest_session_by_numeric_name_and_retains_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let krate = source.join("crate");
+        for name in ["s-z-abc-old", "s-10-abc-new", "s-10-other-tied"] {
+            let session = krate.join(name);
+            fs::create_dir_all(&session).unwrap();
+            fs::write(session.join("dep-graph.bin"), name).unwrap();
+        }
+        fs::write(krate.join("s-z-abc.lock"), b"private lock").unwrap();
+        let entries = fs::read_dir(&krate)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(newest_session(&entries, 1), Some(36));
+        assert_eq!(newest_session(&entries, 0), None);
+        assert_eq!(newest_session(&entries, 2), None);
+        let mut budget = CopyBudget {
+            files: 16,
+            bytes: 1024,
+        };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        assert!(!dest.join("crate/s-z-abc-old").exists());
+        for name in ["s-10-abc-new", "s-10-other-tied"] {
+            assert_eq!(
+                fs::read(dest.join("crate").join(name).join("dep-graph.bin")).unwrap(),
+                name.as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(dest.join("crate/s-z-abc.lock")).unwrap(),
+            b"private lock"
+        );
+        assert!(krate.join("s-z-abc-old/dep-graph.bin").exists());
+    }
+
+    #[test]
+    fn unknown_session_layouts_keep_all_state_and_working_sessions_still_decline() {
+        for unknown in [
+            "unfamiliar",
+            "s-zzzzzzzzzzzzzzzzzzzz-abc-hash",
+            "s-20-abc-working",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let dest = temp.path().join("dest");
+            fs::create_dir(&dest).unwrap();
+            for name in ["s-z-abc-old", "s-10-abc-new", unknown] {
+                let session = source.join("crate").join(name);
+                fs::create_dir_all(&session).unwrap();
+                fs::write(session.join("dep-graph.bin"), name).unwrap();
+            }
+            let mut budget = CopyBudget {
+                files: 16,
+                bytes: 1024,
+            };
+            let result = copy_tree(&source, &dest, &mut budget, 0);
+            if unknown.ends_with("-working") {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                for name in ["s-z-abc-old", "s-10-abc-new", unknown] {
+                    assert_eq!(
+                        fs::read(dest.join("crate").join(name).join("dep-graph.bin")).unwrap(),
+                        name.as_bytes()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn entry_budget_cannot_silently_truncate_a_wide_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("one"), b"1").unwrap();
+        fs::write(source.join("two"), b"2").unwrap();
+        for files in [0, 1] {
+            let dest = temp.path().join(format!("dest-{files}"));
+            fs::create_dir(&dest).unwrap();
+            let mut budget = CopyBudget { files, bytes: 8 };
+            assert!(copy_tree(&source, &dest, &mut budget, 0).is_err());
+        }
+    }
 
     fn fixture(root: &Path) -> (RustcArgs, AdaptiveUnit) {
         let profile = root.join("target/debug");

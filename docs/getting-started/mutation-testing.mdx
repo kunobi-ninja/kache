@@ -55,6 +55,10 @@ copies. A busy donor, incompatible flags, unsupported arguments or unfinished
 state leaves the receiver compiling without an imported seed. Each candidate
 import is limited to 1 GiB, 65,536 entries and 256 donor units.
 
+For recognized rustc layouts, the import keeps the newest finalized session
+per crate, using the timestamp in its name. Tied timestamps and unfamiliar
+layouts retain their existing copying behavior.
+
 To disable automatic seeding for one build:
 
 ```bash

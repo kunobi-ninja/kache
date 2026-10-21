@@ -1545,6 +1545,65 @@ source = "git+https://example.com/gitdep#abc"
     }
 
     #[test]
+    fn a_cancelled_request_does_not_seed_and_another_can_reuse_the_donor() {
+        use crate::invocation::process::{Cancellation, CancellationScope};
+
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "donor", layout);
+            let cache = no_runs();
+            let cancelled_target = checkout(dir.path(), "cancelled");
+            let cancelled = Cancellation::default();
+            cancelled.cancel();
+            {
+                let _scope = CancellationScope::enter(Some(cancelled));
+                assert_eq!(
+                    seed(
+                        &cancelled_target,
+                        VERSION,
+                        std::slice::from_ref(&donor),
+                        cache.path(),
+                        later(),
+                    ),
+                    Seeded::default(),
+                    "{layout:?}"
+                );
+            }
+            assert!(
+                !marker(
+                    &cancelled_target.target_dir.join(PROFILE),
+                    layout,
+                    &unit("dep", HASH)
+                )
+                .exists(),
+                "{layout:?}"
+            );
+            let healthy_target = checkout(dir.path(), "healthy");
+            {
+                let _scope = CancellationScope::enter(Some(Cancellation::default()));
+                let seeded = seed(
+                    &healthy_target,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    cache.path(),
+                    later(),
+                );
+                assert_eq!(seeded.units, 1, "{layout:?}");
+                assert_eq!(seeded.donor, Some(donor.workspace_root.clone()));
+            }
+            assert!(
+                marker(
+                    &healthy_target.target_dir.join(PROFILE),
+                    layout,
+                    &unit("dep", HASH)
+                )
+                .is_dir(),
+                "{layout:?}"
+            );
+        }
+    }
+
+    #[test]
     fn seeds_both_layouts_and_keeps_modification_times() {
         for layout in [Layout::PerUnit, Layout::Shared] {
             let dir = tempfile::tempdir().unwrap();

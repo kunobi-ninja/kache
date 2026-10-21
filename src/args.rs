@@ -2555,14 +2555,19 @@ mod tests {
         assert!(opted_out.skip_path_remap());
     }
 
+    fn layout_path(path: &str) -> PathBuf {
+        let root = if cfg!(windows) { "C:/" } else { "/" };
+        Path::new(root).join(path.trim_start_matches('/'))
+    }
+
     #[test]
     fn test_target_dir_from_out_dir() {
         // Lib/bin compiles: --out-dir is `<target>/<profile>/deps`.
         let args = RustcArgs {
-            out_dir: Some(PathBuf::from("/work/proj/target/debug/deps")),
+            out_dir: Some(layout_path("/work/proj/target/debug/deps")),
             ..Default::default()
         };
-        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+        assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
     }
 
     #[test]
@@ -2570,12 +2575,12 @@ mod tests {
         // Build scripts: -o is
         // `<target>/<profile>/build/<pkg>/build_script_build-<hash>`.
         let args = RustcArgs {
-            output: Some(PathBuf::from(
+            output: Some(layout_path(
                 "/work/proj/target/debug/build/serde-abc123/build_script_build-abc123",
             )),
             ..Default::default()
         };
-        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+        assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
     }
 
     #[test]
@@ -2583,13 +2588,13 @@ mod tests {
         // Cargo passes both --out-dir and -o for a lib/bin; --out-dir is
         // the reliable `<target>/<profile>/deps` shape, so it wins.
         let args = RustcArgs {
-            out_dir: Some(PathBuf::from("/work/proj/target/release/deps")),
-            output: Some(PathBuf::from(
+            out_dir: Some(layout_path("/work/proj/target/release/deps")),
+            output: Some(layout_path(
                 "/work/proj/target/release/deps/libfoo-abc.rlib",
             )),
             ..Default::default()
         };
-        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+        assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
     }
 
     #[test]
@@ -2597,7 +2602,7 @@ mod tests {
         // An ad-hoc `rustc -o /tmp/prog` has no cargo layout to anchor
         // to — return None so dep-info rewriting is skipped.
         let args = RustcArgs {
-            output: Some(PathBuf::from("/tmp/somewhere/myprog")),
+            output: Some(layout_path("/tmp/somewhere/myprog")),
             ..Default::default()
         };
         assert_eq!(args.target_dir(), None);
@@ -2613,13 +2618,13 @@ mod tests {
         let args = RustcArgs {
             crate_name: Some("serde".to_string()),
             extra_filename: Some("-abc123".to_string()),
-            out_dir: Some(PathBuf::from("/work/proj/target/debug/deps")),
+            out_dir: Some(layout_path("/work/proj/target/debug/deps")),
             emit: vec!["dep-info".to_string(), "metadata".to_string()],
             ..Default::default()
         };
         assert_eq!(
             args.dep_info_path(),
-            Some(PathBuf::from("/work/proj/target/debug/deps/serde-abc123.d"))
+            Some(layout_path("/work/proj/target/debug/deps/serde-abc123.d"))
         );
     }
 
@@ -2647,7 +2652,7 @@ mod tests {
     fn dep_info_path_is_none_when_not_requested() {
         let args = RustcArgs {
             crate_name: Some("x".to_string()),
-            out_dir: Some(PathBuf::from("/tmp/out")),
+            out_dir: Some(layout_path("/tmp/out")),
             emit: vec!["metadata".to_string()],
             ..Default::default()
         };
@@ -2708,12 +2713,12 @@ mod tests {
     fn test_target_dir_cross_compiling() {
         let args = RustcArgs {
             target: Some("aarch64-unknown-linux-gnu".to_string()),
-            out_dir: Some(PathBuf::from(
+            out_dir: Some(layout_path(
                 "/work/proj/target/aarch64-unknown-linux-gnu/debug/deps",
             )),
             ..Default::default()
         };
-        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+        assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
     }
 
     #[test]
@@ -2721,24 +2726,24 @@ mod tests {
         // Cargo's new build-dir layout: every unit's --out-dir is
         // `<target>/<profile>/build/<pkg>/<hash>/out`.
         let args = RustcArgs {
-            out_dir: Some(PathBuf::from(
+            out_dir: Some(layout_path(
                 "/work/proj/target/debug/build/aws-lc-rs/c83877ccb1f76231/out",
             )),
             ..Default::default()
         };
-        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+        assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
     }
 
     #[test]
     fn test_target_dir_from_new_build_dir_layout_cross_compiling() {
         let args = RustcArgs {
             target: Some("x86_64-unknown-linux-gnu".to_string()),
-            out_dir: Some(PathBuf::from(
+            out_dir: Some(layout_path(
                 "/work/proj/target/x86_64-unknown-linux-gnu/debug/build/aws-lc-rs/955404036238599c/out",
             )),
             ..Default::default()
         };
-        assert_eq!(args.target_dir(), Some(PathBuf::from("/work/proj/target")));
+        assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
     }
 
     #[test]
@@ -2746,23 +2751,23 @@ mod tests {
         // An `out` directory three levels below something other than `build`
         // (an old-layout build-script probe's OUT_DIR) keeps the walk up 2.
         let probe = RustcArgs {
-            out_dir: Some(PathBuf::from(
+            out_dir: Some(layout_path(
                 "/work/proj/target/debug/build/serde-abc123/out",
             )),
             ..Default::default()
         };
         assert_eq!(
             probe.target_dir(),
-            Some(PathBuf::from("/work/proj/target/debug/build"))
+            Some(layout_path("/work/proj/target/debug/build"))
         );
         // A `build` ancestor three levels up without a final `out` does too.
         let not_out = RustcArgs {
-            out_dir: Some(PathBuf::from("/work/proj/build/a/b/c")),
+            out_dir: Some(layout_path("/work/proj/build/a/b/c")),
             ..Default::default()
         };
         assert_eq!(
             not_out.target_dir(),
-            Some(PathBuf::from("/work/proj/build/a"))
+            Some(layout_path("/work/proj/build/a"))
         );
     }
 
@@ -2770,12 +2775,12 @@ mod tests {
     fn test_workspace_root_cross_compiling() {
         let args = RustcArgs {
             target: Some("aarch64-unknown-linux-gnu".to_string()),
-            out_dir: Some(PathBuf::from(
+            out_dir: Some(layout_path(
                 "/work/proj/target/aarch64-unknown-linux-gnu/debug/deps",
             )),
             ..Default::default()
         };
-        assert_eq!(args.workspace_root(), Some(PathBuf::from("/work/proj")));
+        assert_eq!(args.workspace_root(), Some(layout_path("/work/proj")));
     }
 
     #[test]

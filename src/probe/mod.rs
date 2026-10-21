@@ -536,7 +536,9 @@ fn run_family_probe_for(program: &str, env: &InvocationEnv) -> Result<Option<Pro
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    let mut child = child_cmd.invocation_spawn_in_group().map_err(|_| ())?;
+    let mut child = child_cmd
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::STDOUT)
+        .map_err(|_| ())?;
     let mut stdout_handle = child.stdout.take().ok_or(())?;
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -1421,7 +1423,9 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
         let bare = family_probe_cache_dir();
         unsafe { std::env::set_var("KACHE_CACHE_DIR", "~/kache-cache") };
         let nested = family_probe_cache_dir();
-        unsafe { std::env::set_var("KACHE_CACHE_DIR", "/abs/kache-cache") };
+        let dir = tempfile::tempdir().unwrap();
+        let expected_absolute = dir.path().join("kache-cache");
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", &expected_absolute) };
         let absolute = family_probe_cache_dir();
 
         unsafe {
@@ -1434,7 +1438,7 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
 
         assert_eq!(bare, home, "bare tilde must expand to the home dir");
         assert_eq!(nested, home.join("kache-cache"));
-        assert_eq!(absolute, std::path::PathBuf::from("/abs/kache-cache"));
+        assert_eq!(absolute, expected_absolute);
     }
 
     struct TestCacheDirGuard {
@@ -1685,6 +1689,32 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
             res = run_family_probe(script.to_str().unwrap());
         }
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_probe_waits_for_exit_after_stdout_eof_and_enforces_its_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("probe");
+        kache_fs::testutil::write_executable(
+            &program,
+            "#!/bin/sh\nprintf KACHE_PROBE_GNU\nexec 1>&-\nexec sleep \"$PROBE_DELAY\"\n",
+        );
+        let mut env = InvocationEnv::from_parts(
+            [("PATH", env!("PATH")), ("PROBE_DELAY", "1")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        assert_eq!(
+            run_family_probe_for(program.to_str().unwrap(), &env),
+            Ok(Some(ProbedFamily::Gnu))
+        );
+        env.set("PROBE_DELAY", "6");
+        assert_eq!(
+            run_family_probe_for(program.to_str().unwrap(), &env),
+            Err(())
+        );
     }
 
     #[cfg(unix)]

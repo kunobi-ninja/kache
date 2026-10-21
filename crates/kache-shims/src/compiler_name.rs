@@ -78,3 +78,96 @@ fn basename(program: &str) -> &str {
         name
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drivers_keep_the_family_of_versioned_and_cross_compilers() {
+        for (name, expected) in [
+            ("cc", "cc"),
+            ("c++", "c++"),
+            ("gcc-14.2", "gcc"),
+            ("g++-12", "g++"),
+            ("clang-19", "clang"),
+            ("clang++-20.1", "clang++"),
+            ("clang-cl", "clang-cl"),
+            ("aarch64-linux-gnu-gcc", "gcc"),
+            ("x86_64-w64-mingw32-g++-posix-14.2", "g++"),
+            ("x86_64-w64-mingw32-gcc-14.2-win32", "gcc"),
+            ("aarch64-unknown-linux-clang++-19", "clang++"),
+        ] {
+            assert_eq!(compiler_driver(name), Some(expected), "{name}");
+        }
+        for name in [
+            "",
+            "rustc",
+            "notgcc",
+            "clang-posix",
+            "clang-cl-win32",
+            "gcc-14.x",
+            "gcc-14..2",
+            "gcc-14-15",
+            "gcc-posix-win32",
+            "-gcc",
+            "---gcc",
+            "gcc-",
+            "gcc-.1",
+        ] {
+            assert_eq!(compiler_driver(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn compiler_shims_take_priority_only_for_compiler_names() {
+        for program in [
+            "cc",
+            "GCC.EXE",
+            "clang++-19",
+            "zigcc",
+            "zigcc-aarch64",
+            "/opt/toolchains/clang-cl",
+            r"C:\tools\G++.ExE",
+        ] {
+            assert!(is_cc_compiler_name(program), "{program}");
+            assert!(is_compiler_shim_name(program), "{program}");
+        }
+        for program in ["rustdoc", "RUSTDOC.EXE", r"C:\tools\rustdoc.exe"] {
+            assert!(!is_cc_compiler_name(program), "{program}");
+            assert!(is_compiler_shim_name(program), "{program}");
+        }
+        for program in [
+            "",
+            "c",
+            "cl",
+            "rustc",
+            "cargo",
+            "zig",
+            "zigccx",
+            "other.exe",
+            "gcc-debug",
+        ] {
+            assert!(!is_cc_compiler_name(program), "{program}");
+            assert!(!is_compiler_shim_name(program), "{program}");
+        }
+    }
+
+    #[test]
+    fn executable_suffix_and_native_path_separators_do_not_change_the_name() {
+        for (program, expected) in [
+            ("cc", "cc"),
+            ("c", "c"),
+            ("", ""),
+            (".exe", ""),
+            ("clang.exe", "clang"),
+            ("GCC.ExE", "GCC"),
+            ("/tools/clang++", "clang++"),
+            (r"C:\tools\gcc.exe", "gcc"),
+            ("gcc.exe.bak", "gcc.exe.bak"),
+            ("/tools/", ""),
+        ] {
+            assert_eq!(basename(program), expected, "{program}");
+        }
+    }
+}

@@ -4451,6 +4451,15 @@ pub fn resolve_config_path_for(invocation: &InvocationEnv) -> Result<PathBuf> {
     let absolute = resolve_invocation_path(invocation, &path)?;
     // Absolute inputs do not need the process cwd. Preserve symlinks and `..`
     // while matching the existing provenance identity for `.` components.
+    // Windows absolute() collapses parent components, which would hide an
+    // ambiguous workspace-rule root before extra_inputs can reject it.
+    #[cfg(windows)]
+    if absolute
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Ok(absolute);
+    }
     Ok(std::path::absolute(&absolute).unwrap_or(absolute))
 }
 
@@ -4957,6 +4966,19 @@ mod invocation_tests {
     }
 
     #[test]
+    fn request_config_preserves_parent_components_for_workspace_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let env = snapshot(root.path(), &[("KACHE_CONFIG", "nested/../.kache.toml")]);
+        let config = resolve_config_path_for(&env).unwrap();
+        assert_eq!(config, root.path().join("nested/../.kache.toml"));
+        assert!(
+            config
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        );
+    }
+
+    #[test]
     fn independent_invocations_resolve_paths_policy_and_rules_from_their_snapshots() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
@@ -5037,7 +5059,10 @@ pull_request_prefix = "pr/42"
             expand_exclude_pattern_collecting_for("${CARGO_HOME}/$MISSING", &one);
         assert_eq!(
             expanded,
-            format!("{}/$MISSING", first.path().join("home/.cargo").display())
+            format!(
+                "{}/$MISSING",
+                first.path().join("home").join(".cargo").display()
+            )
         );
         assert_eq!(unset, ["MISSING"]);
         let mut routing = a.clone();

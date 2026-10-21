@@ -1436,7 +1436,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             })
             .unwrap_or_else(|| "kache".to_owned()),
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         let config = config::Config::load_for(&context.env)?;
         if let Some(exit) =
@@ -1466,7 +1466,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
 
 /// Decide whether raw argv can enter the compiler pipeline without probing a
 /// program. Ambiguous entry points remain available to the local engine.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn original_compiler_request(args: &[String], env: &invocation::InvocationEnv) -> bool {
     if args.is_empty()
         || env.var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some()
@@ -1491,7 +1491,7 @@ fn original_compiler_request(args: &[String], env: &invocation::InvocationEnv) -
         || compiler::cc::CcCompiler::recognizes_family_probe(after)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn run_original_compiler_invocation(
     args: &[String],
     context: invocation::InvocationContext,
@@ -1778,6 +1778,115 @@ fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn original_compiler_requests_use_only_the_supplied_arguments_and_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let env = invocation::InvocationEnv::from_parts(
+            Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        for arguments in [
+            vec!["cc", "-c", "source.c"],
+            vec!["kache", "rustc", "--version"],
+            vec!["kache", "rustdoc", "--version"],
+            vec!["kache", "nvcc", "--version"],
+            vec!["kache", "cc", "-c", "source.c"],
+            vec!["kache", "/client/workspace-wrapper", "rustc", "--version"],
+            vec!["kache", "-E", "probe.c"],
+        ] {
+            let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(original_compiler_request(&arguments, &env), "{arguments:?}");
+        }
+        for arguments in [
+            vec![],
+            vec!["kache"],
+            vec!["kache", "stats"],
+            vec!["cargo", "rustc"],
+            vec!["kache", "unrecognized-tool", "--version"],
+        ] {
+            let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                !original_compiler_request(&arguments, &env),
+                "{arguments:?}"
+            );
+        }
+        let custom = ["kache", "custom-rust-compiler", "--version"].map(str::to_owned);
+        let mut configured = env.clone();
+        configured.set("RUSTC", "custom-rust-compiler");
+        assert!(original_compiler_request(&custom, &configured));
+        assert!(!original_compiler_request(&custom, &env));
+        let rustc = ["kache", "rustc", "--version"].map(str::to_owned);
+        for (name, value) in [
+            ("KACHE_FAMILY_PROBE_ACTIVE", "1"),
+            (build_script::SHIM_PATH_ENV, "shim"),
+            (platform::SELF_SPAWN_ENV, "rustc"),
+        ] {
+            let mut blocked = env.clone();
+            blocked.set(name, value);
+            assert!(!original_compiler_request(&rustc, &blocked), "{name}");
+        }
+        assert!(original_compiler_request(&rustc, &env));
+    }
+
+    #[test]
+    fn wrapper_file_logging_requires_an_explicit_filter() {
+        let root = tempfile::tempdir().unwrap();
+        let mut env = invocation::InvocationEnv::from_parts(
+            [("KACHE_LOG", "off"), ("KACHE_LOG_FILE_PATH", "wrapper.log")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        {
+            let logging = logging_dispatch(LogMode::Wrapper, &env);
+            let _logging = tracing::dispatcher::set_default(&logging);
+            tracing::info!(target: "kache::request", "without-file-opt-in");
+        }
+        assert!(!root.path().join("wrapper.log").exists());
+        env.set("KACHE_LOG_FILE", "kache=info");
+        {
+            let logging = logging_dispatch(LogMode::Wrapper, &env);
+            let _logging = tracing::dispatcher::set_default(&logging);
+            tracing::info!(target: "kache::request", "with-file-opt-in");
+        }
+        let logged = std::fs::read_to_string(root.path().join("wrapper.log")).unwrap();
+        assert!(logged.contains("with-file-opt-in"));
+        assert!(!logged.contains("without-file-opt-in"));
+    }
+
+    #[test]
+    fn default_diagnostic_logs_use_the_clients_home_or_cache_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("client-home");
+        let cache = root.path().join("client-cache");
+        let env = invocation::InvocationEnv::from_parts(
+            [("KACHE_LOG", "off")],
+            Some(root.path().to_owned()),
+            Some(home.clone()),
+            root.path().to_owned(),
+        )
+        .with_cache_dir(Some(cache.clone()));
+        let expected = if cfg!(target_os = "macos") {
+            home.join("Library/Logs/kache/kache.log")
+        } else {
+            cache.join("kache/kache.log")
+        };
+        assert_eq!(diagnostic_log_path_for(&env), expected);
+        {
+            let logging = logging_dispatch(LogMode::Cli, &env);
+            let _logging = tracing::dispatcher::set_default(&logging);
+            tracing::info!(target: "kache::request", "client-default-log");
+        }
+        assert!(
+            std::fs::read_to_string(expected)
+                .unwrap()
+                .contains("client-default-log")
+        );
+    }
+
     #[test]
     fn client_routes_every_engine_command_and_alias_without_loading_config() {
         for command in Cli::command().get_subcommands() {
@@ -1794,6 +1903,8 @@ mod tests {
     #[ignore = "subprocess fixture for invocation_logging_keeps_log_bridge_request_local"]
     fn invocation_logging_bridge_fixture() {
         init_logging(LogMode::Wrapper);
+        assert!(diagnostic_log_path().is_absolute());
+        assert!(diagnostic_log_path().ends_with("kache.log"));
         let root = PathBuf::from(std::env::var_os("KACHE_TEST_LOG_ROOT").unwrap());
         let env = invocation::InvocationEnv::from_parts(
             [("KACHE_LOG", "kache=debug")],

@@ -140,39 +140,49 @@ impl InvocationEnv {
             let cwd = self.cwd().filter(|cwd| cwd.is_absolute())?;
             #[cfg(windows)]
             if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
-                // A drive-relative path needs that drive's client directory.
-                // Never let a server's per-drive state resolve it implicitly.
-                use std::path::{Component, Prefix};
-                let drive = match prefix.kind() {
-                    Prefix::Disk(drive) => drive,
-                    _ => return None,
-                };
-                let same_drive = matches!(cwd.components().next(),
-                    Some(Component::Prefix(cwd_prefix))
-                    if matches!(cwd_prefix.kind(), Prefix::Disk(cwd_drive) | Prefix::VerbatimDisk(cwd_drive)
-                        if cwd_drive.eq_ignore_ascii_case(&drive)));
-                let base = if same_drive {
-                    cwd.to_owned()
-                } else {
-                    let base = PathBuf::from(self.var_os(&format!("={}:", char::from(drive)))?);
-                    if !base.is_absolute() {
-                        return None;
-                    }
-                    match base.components().next()? {
-                        Component::Prefix(base_prefix)
-                            if matches!(base_prefix.kind(), Prefix::Disk(base_drive)
-                                if base_drive.eq_ignore_ascii_case(&drive)) =>
-                        {
-                            base
-                        }
-                        _ => return None,
-                    }
-                };
-                return Some(base.join(path.strip_prefix(prefix.as_os_str()).ok()?));
+                return self.resolve_drive_relative(path, cwd, prefix);
             }
             let resolved = cwd.join(path);
             resolved.is_absolute().then_some(resolved)
         }
+    }
+
+    #[cfg(windows)]
+    fn resolve_drive_relative(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        prefix: std::path::PrefixComponent<'_>,
+    ) -> Option<PathBuf> {
+        // A drive-relative path needs that drive's client directory.
+        // Never let a server's per-drive state resolve it implicitly.
+        use std::path::{Component, Prefix};
+        let drive = match prefix.kind() {
+            Prefix::Disk(drive) => drive,
+            _ => return None,
+        };
+        let same_drive = matches!(cwd.components().next(),
+            Some(Component::Prefix(cwd_prefix))
+            if matches!(cwd_prefix.kind(), Prefix::Disk(cwd_drive) | Prefix::VerbatimDisk(cwd_drive)
+                if cwd_drive.eq_ignore_ascii_case(&drive)));
+        let base = if same_drive {
+            cwd.to_owned()
+        } else {
+            let base = PathBuf::from(self.var_os(&format!("={}:", char::from(drive)))?);
+            if !base.is_absolute() {
+                return None;
+            }
+            match base.components().next()? {
+                Component::Prefix(base_prefix)
+                    if matches!(base_prefix.kind(), Prefix::Disk(base_drive)
+                        if base_drive.eq_ignore_ascii_case(&drive)) =>
+                {
+                    base
+                }
+                _ => return None,
+            }
+        };
+        Some(base.join(path.strip_prefix(prefix.as_os_str()).ok()?))
     }
 
     /// Apply an invocation-local rewrite, such as an OUT_DIR alias.
@@ -313,8 +323,75 @@ mod tests {
             PathBuf::new(),
         );
         let debug = format!("{env:?}");
+        assert!(debug.starts_with("InvocationEnv"));
+        assert!(debug.contains("variable_count: 1"));
         assert!(!debug.contains("PRIVATE_TOKEN"));
         assert!(!debug.contains("a-secret-value"));
+    }
+
+    #[test]
+    fn validation_rejects_an_invalid_directory_even_when_the_other_is_absolute() {
+        let root = tempfile::tempdir().unwrap();
+        let mut env = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        env.validate().unwrap();
+        env.temp = "relative-temp".into();
+        assert_eq!(
+            env.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        env.temp = root.path().to_owned();
+        env.cwd = Some("relative-cwd".into());
+        assert_eq!(
+            env.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn explicit_program_paths_and_missing_search_paths_keep_their_native_meaning() {
+        let root = tempfile::tempdir().unwrap();
+        let env = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        assert_eq!(
+            env.resolve_program(Path::new("relative/compiler")),
+            Some(root.path().join("relative/compiler"))
+        );
+        assert_eq!(
+            env.resolve_program(root.path()),
+            Some(root.path().to_owned())
+        );
+        assert_eq!(env.resolve_program(Path::new("missing-compiler")), None);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                env.resolve_program(Path::new("/")),
+                Some(PathBuf::from("/"))
+            );
+            assert_eq!(
+                env.command("missing-compiler").unwrap().get_program(),
+                "missing-compiler"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            env.command("missing-compiler").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let mut missing_cwd = env;
+        missing_cwd.cwd = None;
+        assert_eq!(
+            missing_cwd.command("relative/compiler").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[cfg(windows)]
@@ -340,6 +417,36 @@ mod tests {
         );
         assert_eq!(env.resolve(Path::new(r"E:out")), None);
         assert!(env.command(r"E:compiler.exe").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_directories_must_be_absolute_and_match_the_requested_drive() {
+        let mut env = InvocationEnv::from_parts(
+            [("=D:", r"D:\other-client")],
+            Some(PathBuf::from(r"C:\client")),
+            None,
+            PathBuf::from(r"C:\temp"),
+        );
+        for invalid in [
+            r"relative",
+            r"D:relative",
+            r"E:\wrong-drive",
+            r"\\server\share",
+        ] {
+            env.set("=D:", invalid);
+            assert_eq!(env.resolve(Path::new(r"D:out")), None, "{invalid}");
+        }
+        env.set("=D:", r"d:\lowercase");
+        assert_eq!(
+            env.resolve(Path::new(r"D:out")),
+            Some(PathBuf::from(r"d:\lowercase\out"))
+        );
+        env.cwd = Some(PathBuf::from(r"\\?\C:\client"));
+        assert_eq!(
+            env.resolve(Path::new(r"c:out")),
+            Some(PathBuf::from(r"\\?\C:\client\out"))
+        );
     }
 
     #[cfg(unix)]

@@ -227,6 +227,7 @@ struct Fixture {
     workspace: PathBuf,
     home: PathBuf,
     cache: PathBuf,
+    targets: TempDir,
 }
 
 fn fixture() -> Fixture {
@@ -245,17 +246,28 @@ fn fixture_from(write: fn(&Path)) -> Fixture {
         workspace: workspace.path().to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),
+        targets: TempDir::new().unwrap(),
         _dirs: vec![workspace, home, cache],
     }
 }
 
 fn target(fixture: &Fixture, name: &str) -> PathBuf {
-    let dir = fixture.cache.parent().unwrap().join(format!(
-        "kache-target-{}-{name}",
-        fixture.cache.file_name().unwrap().to_string_lossy()
-    ));
+    let dir = fixture.targets.path().join(name);
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+#[test]
+fn fixture_target_directories_are_removed_when_the_fixture_drops() {
+    let dir = {
+        let fixture = fixture();
+        let dir = target(&fixture, "cold");
+        assert!(!dir.starts_with(&fixture.workspace));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("artifact"), b"compiled").unwrap();
+        dir
+    };
+    assert!(!dir.exists());
 }
 
 /// Two `cargo check`s of the same workspace at once, each with its own
@@ -929,6 +941,7 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
         workspace: root.to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),
+        targets: TempDir::new().unwrap(),
         _dirs: vec![workspace, home, cache],
     };
 

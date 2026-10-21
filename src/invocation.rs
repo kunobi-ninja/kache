@@ -1,7 +1,9 @@
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod execution;
 pub(crate) mod io;
 pub(crate) mod process;
+#[cfg(windows)]
+pub(crate) mod windows_broker;
 
 /// Inputs and timing transferred to one synchronous compiler request.
 pub(crate) struct InvocationContext {

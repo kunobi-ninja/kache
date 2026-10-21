@@ -650,6 +650,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_keeps_terminal_jobserver_and_environment_in_their_own_slots() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixStream;
+
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_provenance(
+            super::super::tests::test_config(root.path()),
+            &crate::config::ConfigFileProvenance {
+                path: root.path().join("config.toml"),
+                fingerprint: "fixture".to_owned(),
+            },
+        ));
+        for terminal in [false, true] {
+            for with_jobserver in [false, true] {
+                let name = format!("slots-{terminal}-{with_jobserver}");
+                let (args, mut context) = fixture(root.path(), &name);
+                let (read, write) = UnixStream::pair().unwrap();
+                let mut jobs = Vec::new();
+                if with_jobserver {
+                    context.env.set(
+                        "CARGO_MAKEFLAGS",
+                        format!(
+                            "-j --jobserver-auth={},{}",
+                            read.as_raw_fd(),
+                            write.as_raw_fd()
+                        ),
+                    );
+                    jobs = vec![
+                        (read.as_raw_fd(), OwnedFd::from(read.try_clone().unwrap())),
+                        (write.as_raw_fd(), OwnedFd::from(write.try_clone().unwrap())),
+                    ];
+                    jobs.sort_by_key(|(original, _)| *original);
+                }
+                let mut request = request(&args, &context);
+                request.env.extend([
+                    (
+                        NativeString::Unix(b"DUPLICATE".to_vec()),
+                        NativeString::Unix(b"first".to_vec()),
+                    ),
+                    (
+                        NativeString::Unix(b"DUPLICATE".to_vec()),
+                        NativeString::Unix(b"second".to_vec()),
+                    ),
+                    (
+                        NativeString::Unix(b"NATIVE_VALUE".to_vec()),
+                        NativeString::Unix(vec![255]),
+                    ),
+                ]);
+                request.channels = ExecutionChannels::Unix {
+                    terminal,
+                    jobserver: jobs.iter().map(|(original, _)| *original).collect(),
+                };
+                let prepared = Prepared::decode(request, crate::VERSION).unwrap();
+                let directory = context.env.cwd().unwrap();
+                let paths =
+                    ["input", "output", "error", "terminal"].map(|name| directory.join(name));
+                let count = if terminal { 4 } else { 3 };
+                let mut descriptors = paths[..count]
+                    .iter()
+                    .map(|path| OwnedFd::from(File::create(path).unwrap()))
+                    .collect::<Vec<_>>();
+                let job_numbers = jobs
+                    .iter()
+                    .map(|(original, received)| (*original, received.as_raw_fd()))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                descriptors.extend(jobs.into_iter().map(|(_, file)| file));
+                let (_, _, _, received) = prepared
+                    .receive(descriptors, Cancellation::default(), daemon.clone())
+                    .unwrap();
+                let (files, has_terminal) = received.io.transfer_files().unwrap();
+                assert_eq!(has_terminal, terminal);
+                assert_eq!(files.len(), count);
+                for (file, path) in files.iter().zip(&paths) {
+                    let actual = file.metadata().unwrap();
+                    let expected = std::fs::metadata(path).unwrap();
+                    assert_eq!(
+                        (actual.dev(), actual.ino()),
+                        (expected.dev(), expected.ino())
+                    );
+                }
+                assert_eq!(
+                    received.jobserver.files().len(),
+                    if with_jobserver { 2 } else { 0 }
+                );
+                if with_jobserver {
+                    assert_eq!(
+                        received.env.var("CARGO_MAKEFLAGS").unwrap(),
+                        format!(
+                            "-j --jobserver-auth={},{}",
+                            job_numbers[&read.as_raw_fd()],
+                            job_numbers[&write.as_raw_fd()]
+                        )
+                    );
+                }
+                assert_eq!(
+                    received
+                        .env
+                        .vars_os()
+                        .filter(|(key, _)| key == "DUPLICATE")
+                        .map(|(_, value)| value)
+                        .collect::<Vec<_>>(),
+                    vec![OsString::from("first"), OsString::from("second")]
+                );
+                assert_eq!(
+                    received.env.var_os("NATIVE_VALUE").unwrap().as_bytes(),
+                    &[255]
+                );
+                {
+                    let _io = crate::invocation::io::InvocationIoScope::enter(received.io.clone());
+                    crate::invocation::io::stdout()
+                        .write_all(b"stdout")
+                        .unwrap();
+                    crate::invocation::io::stderr()
+                        .write_all(b"stderr")
+                        .unwrap();
+                    let writer = crate::invocation::io::terminal();
+                    if terminal {
+                        writer.unwrap().write_all(b"terminal").unwrap();
+                    } else {
+                        assert!(writer.is_none());
+                    }
+                }
+                assert_eq!(std::fs::read(&paths[0]).unwrap(), b"");
+                assert_eq!(std::fs::read(&paths[1]).unwrap(), b"stdout");
+                assert_eq!(std::fs::read(&paths[2]).unwrap(), b"stderr");
+                if terminal {
+                    assert_eq!(std::fs::read(&paths[3]).unwrap(), b"terminal");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_the_connection_task_cancels_only_its_compiler_request() {
+        use crate::invocation::process::{CancellationScope, CommandExt};
+
+        let cancellation = Cancellation::default();
+        let worker_token = cancellation.clone();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = CancelOnDrop(worker_token);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        {
+            let _scope = CancellationScope::borrow(Some(cancellation));
+            assert_eq!(
+                std::process::Command::new("missing-cancelled-compiler")
+                    .invocation_spawn()
+                    .err()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        let _other = CancellationScope::borrow(Some(Cancellation::default()));
+        crate::invocation::process::check().unwrap();
+    }
+
+    #[tokio::test]
     async fn only_accepted_execution_marks_build_activity() {
         if !native_execution_available() {
             return;
@@ -813,6 +981,7 @@ mod tests {
                     stdin: 1,
                     stdout: 2,
                     stderr: 3,
+                    process_broker: false,
                 }
             }),
             ("argv", |r| r.argv.clear()),

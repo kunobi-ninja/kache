@@ -155,8 +155,12 @@ pub fn profile_from_rustc_args(args: &RustcArgs) -> String {
     {
         return profile.to_string();
     }
-    if let (Some(out_dir), Some(target_dir)) = (args.out_dir.as_deref(), args.target_dir())
-        && let Some(profile) = profile_between(&target_dir, out_dir, args.target.is_some())
+    if let (Some(out_dir), Some(target_dir)) = (
+        args.out_dir
+            .as_deref()
+            .and_then(|path| args.resolve_invocation_path(path)),
+        args.target_dir(),
+    ) && let Some(profile) = profile_between(&target_dir, &out_dir, args.target.is_some())
     {
         return profile;
     }
@@ -664,6 +668,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(profile_from_rustc_args(&args), "release");
+        let relative = crate::args::RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            "target/release/deps".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(profile_from_rustc_args(&relative), "release");
         let new_layout = crate::args::RustcArgs::parse(&[
             "rustc".to_string(),
             "--out-dir".to_string(),

@@ -72,7 +72,7 @@ impl RequestClock {
         self.idle_at(Instant::now())
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn begin_activity(self: &Arc<Self>) -> BuildActivity {
         self.active.fetch_add(1, Ordering::AcqRel);
         self.touch(Instant::now());
@@ -81,10 +81,10 @@ impl RequestClock {
 }
 
 /// Keeps maintenance busy for accepted work, including queued or silent work.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) struct BuildActivity(Arc<RequestClock>);
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl Drop for BuildActivity {
     fn drop(&mut self) {
         self.0.touch(Instant::now());

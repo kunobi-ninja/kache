@@ -726,42 +726,73 @@ impl WindowsProbeEnvironment {
                 .context("cl.exe banner does not identify its target architecture")?;
             self.set_var("VSCMD_ARG_TGT_ARCH", selected);
         }
-        let getter = MsvcSnapshotGetter(self);
-        let linker = find_msvc_tools::find_tool_with_env(architecture, "link.exe", &getter);
-        let compiler = find_msvc_tools::find_tool_with_env(architecture, "cl.exe", &getter);
-
-        // rustc applies the environment returned for link.exe, including for
-        // an explicit MSVC linker. A separately discovered cl.exe environment
-        // is only relevant while running our compiler banner probe.
-        if let Some(tool) = linker.as_ref() {
-            for (name, value) in tool.env() {
-                let name = name
-                    .to_str()
-                    .context("MSVC discovery returned a non-Unicode environment name")?;
-                let value = value
-                    .to_str()
-                    .context("MSVC discovery returned a non-Unicode environment value")?;
-                self.set_var(name, value);
+        use kache_protocol::execution::{NativeString, windows::Discovery};
+        let mut variables = self
+            .variables
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("PATH"))
+            .map(|(name, value)| {
+                (
+                    NativeString::capture(name.as_ref()),
+                    NativeString::capture(value.as_ref()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let path = std::env::join_paths(&self.path).context("encoding MSVC discovery PATH")?;
+        variables.push((
+            NativeString::capture("PATH".as_ref()),
+            NativeString::capture(&path),
+        ));
+        let request = Discovery {
+            architecture: architecture.to_owned(),
+            env: variables,
+        };
+        let tools = if let Some(broker) = crate::invocation::io::current().broker() {
+            broker.discover_msvc(request)?
+        } else {
+            kache_ipc::windows_msvc::discover(&request)?
+        };
+        let decode_tool = |tool: kache_protocol::execution::windows::Tool| -> Result<_> {
+            let path = PathBuf::from(tool.path.decode()?);
+            let environment = tool
+                .env
+                .into_iter()
+                .map(|(name, value)| Ok((name.decode()?, value.decode()?)))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((path, environment))
+        };
+        let linker = tools.linker.map(decode_tool).transpose()?;
+        let compiler = tools.compiler.map(decode_tool).transpose()?;
+        // rustc applies link.exe's discovered environment even for an explicit
+        // linker. The compiler environment belongs only to its banner probe.
+        if let Some((path, environment)) = linker.as_ref() {
+            for (name, value) in environment {
+                self.set_var(
+                    name.to_str()
+                        .context("MSVC discovery environment name is not Unicode")?,
+                    value
+                        .to_str()
+                        .context("MSVC discovery environment value is not Unicode")?,
+                );
             }
             self.refresh_path();
-            if let Some(version) = path_version(&tool.path().to_string_lossy(), "MSVC") {
+            if let Some(version) = path_version(&path.to_string_lossy(), "MSVC") {
                 self.set_var_if_missing("VCToolsVersion", version);
             }
-            if let Some(sdk) = find_msvc_tools::find_windows_sdk(architecture) {
-                self.set_var_if_missing("WindowsSDKVersion", sdk.sdk_version());
+            if let Some(version) = tools.sdk_version {
+                self.set_var_if_missing("WindowsSDKVersion", version);
             }
-            if let Some((_, version)) = find_msvc_tools::get_ucrt_dir() {
+            if let Some(version) = tools.ucrt_version {
                 self.set_var_if_missing("UCRTVersion", version);
             }
         }
-
-        if let Some(tool) = linker {
-            self.default_linker = Some(tool.path().to_path_buf());
-            self.linker_command_env = tool.env().into_iter().cloned().collect();
+        if let Some((path, environment)) = linker {
+            self.default_linker = Some(path);
+            self.linker_command_env = environment;
         }
-        if let Some(tool) = compiler {
-            self.compiler = Some(tool.path().to_path_buf());
-            self.compiler_command_env = tool.env().into_iter().cloned().collect();
+        if let Some((path, environment)) = compiler {
+            self.compiler = Some(path);
+            self.compiler_command_env = environment;
         }
         Ok(())
     }
@@ -781,27 +812,6 @@ impl WindowsProbeEnvironment {
             WindowsTool::Cl if self.compiler.as_deref() == Some(path) => &self.compiler_command_env,
             WindowsTool::Cl => &[],
         }
-    }
-}
-
-#[cfg(windows)]
-struct MsvcSnapshotGetter<'a>(&'a WindowsProbeEnvironment);
-
-#[cfg(windows)]
-impl find_msvc_tools::EnvGetter for MsvcSnapshotGetter<'_> {
-    fn get_env(&self, name: &'static str) -> Option<find_msvc_tools::Env> {
-        let value = if name.eq_ignore_ascii_case("PATH") {
-            std::env::join_paths(&self.0.path).ok()?
-        } else {
-            self.0
-                .variables
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))?
-                .1
-                .as_str()
-                .into()
-        };
-        Some(find_msvc_tools::Env::Owned(value))
     }
 }
 
@@ -2444,6 +2454,66 @@ esac
     }
 
     #[test]
+    fn windows_probe_roots_client_paths_without_removing_other_variables() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let invocation = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(cwd.clone()),
+            None,
+            cwd.clone(),
+        );
+        let names = [
+            "VCToolsInstallDir",
+            "WindowsSdkDir",
+            "UniversalCRTSdkDir",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+        ];
+        let mut environment = WindowsProbeEnvironment {
+            variables: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.to_ascii_lowercase(), format!("root-{i}")))
+                .collect(),
+            path: vec![PathBuf::from("tools"), PathBuf::from("fallback")],
+            cwd: Some(cwd.clone()),
+            ..WindowsProbeEnvironment::default()
+        };
+        environment
+            .variables
+            .insert("LIB".into(), "first;second".into());
+        environment
+            .variables
+            .insert("CLIENT_MARKER".into(), "preserved".into());
+        environment.root_invocation_paths(&invocation).unwrap();
+        assert_eq!(environment.var("CLIENT_MARKER"), Some("preserved"));
+        assert_eq!(environment.path, [cwd.join("tools"), cwd.join("fallback")]);
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                environment.var(name),
+                cwd.join(format!("root-{i}")).to_str()
+            );
+        }
+        assert_eq!(
+            environment.var("LIB"),
+            Some(
+                format!(
+                    "{};{}",
+                    cwd.join("first").display(),
+                    cwd.join("second").display()
+                )
+                .as_str()
+            )
+        );
+        let rooted = environment.variables.clone();
+        environment.root_invocation_paths(&invocation).unwrap();
+        assert_eq!(environment.variables, rooted);
+    }
+
+    #[test]
     fn windows_discovery_refuses_implicit_compiler_inputs_only_when_it_must_run_cl() {
         for input in ["CL", "_CL_"] {
             for marker_value in ["C:\\Visual Studio\\VC", ""] {
@@ -3304,9 +3374,10 @@ esac
 
     #[test]
     fn windows_tool_commands_clear_ambient_msvc_option_variables() {
+        let directory = tempfile::tempdir().unwrap();
         let command = windows_tool_command(
             WindowsTool::Cl,
-            Path::new("cl.exe"),
+            &directory.path().join("cl.exe"),
             &[(OsString::from("LIB"), OsString::from("C:\\sdk\\lib"))],
         );
         let environment = command
@@ -3343,7 +3414,7 @@ esac
             ),
             (WindowsTool::Link, "link.exe", &["/?"]),
         ] {
-            let command = windows_tool_command(tool, Path::new(path), &[]);
+            let command = windows_tool_command(tool, &directory.path().join(path), &[]);
             assert_eq!(
                 command.get_args().collect::<Vec<_>>(),
                 arguments
@@ -3781,7 +3852,7 @@ esac
         assert_eq!(
             rustc_selected["link:0"],
             file_hasher
-                .hash_static_lib(&root.path().join("rustc-first/libfoo.a"))
+                .hash_static_lib(&root.path().join("rustc-first").join("libfoo.a"))
                 .unwrap()
         );
 

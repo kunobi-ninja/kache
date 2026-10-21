@@ -50,6 +50,17 @@ rustPlatform.buildRustPackage {
     # The regular macOS CI job runs both against real allowed/denied processes.
     "--skip=fallback::macos::tests::policy_distinguishes_denied_and_allowed_output"
     "--skip=sandbox_preflight_bypasses_denied_server_but_keeps_allowed_server"
+    # Compiler handoff requires an unrestricted client. These fixtures run
+    # in the regular macOS job; Nix's Seatbelt policy requires local execution.
+    "--skip=daemon::execution::tests::disconnected_accepted_compiler_is_cancelled_and_reaped"
+    "--skip=daemon::execution::tests::draining_before_commit_releases_worker_without_starting_a_compiler"
+    "--skip=daemon::execution::tests::execution_handoff_streams_two_compilers_without_serializing_or_mixing_clients"
+    "--skip=daemon::execution::tests::execution_jobserver_descriptors_reach_only_the_compiler"
+    "--skip=daemon::execution::tests::execution_keeps_a_silent_compiler_alive_past_the_daemon_idle_timeout"
+    "--skip=daemon::execution::tests::only_accepted_execution_marks_build_activity"
+    "--skip=daemon::execution::tests::original_compiler_shim_uses_the_clients_relative_path"
+    "--skip=daemon::execution::tests::prepared_compiler_never_runs_without_commit_and_releases_its_resources"
+    "--skip=daemon::execution::tests::execution_rejects_sandboxed_client_using_kernel_identity"
   ];
 
   # planner_client / remote_backend tests bind 127.0.0.1. Darwin's Nix sandbox

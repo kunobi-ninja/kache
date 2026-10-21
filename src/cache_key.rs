@@ -9128,7 +9128,7 @@ pub(crate) fn run_dep_info_pass_for(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .invocation_capture()
+        .invocation_capture_with_io(kache_protocol::execution::windows::Stdio::STDERR)
         .context("running rustc --emit=dep-info")?;
     // One extra rustc start per invocation, hit or miss. Counted and timed so
     // the event log can show what removing it would buy (`dep_info_runs`,
@@ -9652,7 +9652,9 @@ pub(crate) fn rustc_accepts_cwd_remap_for(
     if restrict_features {
         command.arg("-Zallow-features=");
     }
-    let mut child = command.invocation_spawn_in_group().ok()?;
+    let mut child = command
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::QUIET)
+        .ok()?;
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -9736,15 +9738,6 @@ fn get_clippy_version_for(driver: &Path, env: &InvocationEnv) -> Result<String> 
 /// or `clippy.toml`, searched from `CLIPPY_CONF_DIR`, else the manifest
 /// directory, upwards) and the lint arguments `cargo clippy` passes through
 /// the environment. Content, not location, so two checkouts share keys.
-#[cfg(all(test, unix))]
-pub(crate) fn clippy_identity(driver: &Path, env: &KeyEnv) -> Result<String> {
-    clippy_identity_in(
-        driver,
-        |name| env.var_os(name),
-        env.cwd().map(Path::to_path_buf),
-    )
-}
-
 pub(crate) fn clippy_identity_for(
     driver: &Path,
     env: &KeyEnv,

@@ -23,7 +23,7 @@ pub fn run(version: &str) -> Result<i32> {
     {
         return forward_engine(&executable, version, &args, started_at);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let env = kache_config::InvocationEnv::capture();
         if env
@@ -32,7 +32,10 @@ pub fn run(version: &str) -> Result<i32> {
         {
             let prepared = (|| -> Result<_> {
                 let config = kache_config::Config::load_for(&env)?;
+                #[cfg(unix)]
                 let (files, terminal) = crate::Stdio::capture()?.into_files();
+                #[cfg(windows)]
+                let (files, terminal) = (Vec::new(), false);
                 Ok((config.socket_path(), files, terminal))
             })();
             if let Ok((socket, files, terminal)) = prepared
@@ -148,3 +151,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "frontend/tests.rs"]
+mod boundary_tests;

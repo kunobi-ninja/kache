@@ -1032,8 +1032,23 @@ fn key_first_cc_caches_a_header_stamped_ahead_of_the_clock() {
 }
 
 fn index_rows(root: &std::path::Path, table: &str) -> i64 {
-    rusqlite::Connection::open(root.join("cache/index.db"))
-        .unwrap()
+    let index = rusqlite::Connection::open_with_flags(
+        root.join("cache/index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    // Passthrough may open the hash memo without initializing entry tables.
+    let exists: bool = index
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !exists {
+        return 0;
+    }
+    index
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
         })

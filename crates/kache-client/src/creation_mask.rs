@@ -98,3 +98,38 @@ mod tests {
         assert_eq!(creation_mask(), Some(before));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    #[test]
+    #[ignore = "isolated process with a known file creation mask"]
+    fn inherited_mask_fixture() {
+        let mask =
+            u32::from_str_radix(&std::env::var("KACHE_TEST_CREATION_MASK").unwrap(), 8).unwrap();
+        unsafe {
+            libc::umask(mask);
+        }
+        assert_eq!(super::creation_mask(), Some(mask));
+        assert_eq!(unsafe { libc::umask(mask) }, mask);
+    }
+
+    #[test]
+    fn file_creation_policy_is_read_without_changing_the_parent_mask() {
+        for mask in ["027", "137"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "creation_mask::linux_tests::inherited_mask_fixture",
+                ])
+                .env("KACHE_TEST_CREATION_MASK", mask)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

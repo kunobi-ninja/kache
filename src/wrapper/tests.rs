@@ -2135,6 +2135,8 @@ fn only_a_workspace_records_the_target_it_builds_into() {
 
 #[test]
 fn prestage_target_dir_is_the_target_root_for_every_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let target_root = dir.path().join("target");
     let parse = |out_dir: &str, target: Option<&str>| {
         let mut argv = vec![
             "rustc".to_string(),
@@ -2142,20 +2144,20 @@ fn prestage_target_dir_is_the_target_root_for_every_unit() {
             "build_script_build".to_string(),
             "build.rs".to_string(),
             "--out-dir".to_string(),
-            out_dir.to_string(),
+            target_root.join(out_dir).to_string_lossy().into_owned(),
         ];
         if let Some(target) = target {
             argv.extend(["--target".to_string(), target.to_string()]);
         }
         RustcArgs::parse(&argv).unwrap()
     };
-    let root = Some(PathBuf::from("/w/target"));
+    let root = Some(target_root.clone());
     for (out_dir, target) in [
-        ("/w/target/debug/build/app-0123456789abcdef", None),
-        ("/w/target/debug/build/app/0123456789abcdef/out", None),
-        ("/w/target/debug/deps", None),
+        ("debug/build/app-0123456789abcdef", None),
+        ("debug/build/app/0123456789abcdef/out", None),
+        ("debug/deps", None),
         (
-            "/w/target/x86_64-unknown-linux-gnu/debug/deps",
+            "x86_64-unknown-linux-gnu/debug/deps",
             Some("x86_64-unknown-linux-gnu"),
         ),
     ] {
@@ -2166,8 +2168,8 @@ fn prestage_target_dir_is_the_target_root_for_every_unit() {
         );
     }
     assert_eq!(
-        parse("/w/target/debug/build/app-0123456789abcdef", None).target_dir(),
-        Some(PathBuf::from("/w/target/debug")),
+        parse("debug/build/app-0123456789abcdef", None).target_dir(),
+        Some(target_root.join("debug")),
         "the case prestage_target_dir corrects"
     );
 }
@@ -7035,6 +7037,41 @@ fn nvcc_passthrough_propagates_exit_code_and_reasons() {
     );
 }
 
+#[test]
+fn nvcc_event_root_uses_each_clients_out_dir_before_its_working_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let caller = root.path().join("caller");
+    std::fs::create_dir(&caller).unwrap();
+    for name in ["one", "two"] {
+        tagged_target(&root.path().join(name));
+    }
+    let mut first = crate::invocation::InvocationEnv::from_parts(
+        [("OUT_DIR", "../one/target/debug/build/pkg/out")],
+        Some(caller.clone()),
+        None,
+        root.path().to_owned(),
+    );
+    let mut second = first.clone();
+    second.set("OUT_DIR", "../two/target/debug/build/pkg/out");
+    let expected = |name| {
+        root.path()
+            .join(name)
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(nvcc_event_root_for(&first), expected("one"));
+    assert_eq!(nvcc_event_root_for(&second), expected("two"));
+    first.set("OUT_DIR", "");
+    assert_eq!(
+        nvcc_event_root_for(&first),
+        caller.canonicalize().unwrap().to_string_lossy()
+    );
+    second.set("KACHE_EVENT_ROOT", "../one");
+    assert_eq!(nvcc_event_root_for(&second), expected("one"));
+}
+
 /// Write the fake nvcc toolchain with baked-in paths (no
 /// environment needed, so tests stay parallel): `nvcc` answers
 /// `--version`, `--dryrun` (naming `host`), `-M` (the source plus
@@ -8593,6 +8630,48 @@ fn log_event_persists_same_key_lookup_rejection() {
         event.verify_compare.is_empty(),
         "lookup rejection must not invent a verify_compare class"
     );
+}
+
+#[test]
+fn daemon_publications_are_counted_only_for_the_request_that_stored_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let daemon = std::sync::Arc::new(crate::daemon::Daemon::new(config.clone()));
+    let env = crate::invocation::InvocationEnv::from_parts(
+        Vec::<(OsString, OsString)>::new(),
+        Some(dir.path().to_owned()),
+        None,
+        dir.path().to_owned(),
+    );
+    let stored = StorePutResult {
+        output_blobs: 1,
+        duplicate_blobs: 0,
+        new_blobs: 1,
+    };
+    let write = |result, put| {
+        log_event(
+            &config,
+            EventInputs::new("/repo", "foo.c", result, 1).store_put(put),
+        );
+    };
+    let _standalone = InvocationWrapperScope::enter_for(&env, None);
+    write(EventResult::Miss, stored);
+    {
+        let _delegated = InvocationWrapperScope::enter_for(&env, Some(daemon));
+        write(EventResult::Miss, stored);
+        write(EventResult::LocalHit, StorePutResult::default());
+        write(EventResult::Miss, StorePutResult::default());
+    }
+    write(EventResult::Miss, stored);
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.store_handed_off)
+            .collect::<Vec<_>>(),
+        [false, true, false, false, false]
+    );
+    assert!(events.iter().all(|event| event.daemon_store_ms == 0));
 }
 
 /// `verify_compare` (schema 16) is read from the hit-qualification stash.
@@ -10677,11 +10756,10 @@ fn event_root_string_relative_path_is_joined_to_cwd_and_absolute() {
 fn event_root_override_reads_kache_event_root_env() {
     // KACHE_EVENT_ROOT, when set and non-empty, overrides the event root.
     let _lock = crate::test_support::process_state_test_lock();
-    let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/some/forest/root");
-    assert_eq!(
-        event_root_override(),
-        Some(PathBuf::from("/some/forest/root"))
-    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("forest/root");
+    let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", root.to_str().unwrap());
+    assert_eq!(event_root_override(), Some(root));
     // Empty value is treated as unset.
     unsafe {
         std::env::set_var("KACHE_EVENT_ROOT", "");

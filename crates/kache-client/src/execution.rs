@@ -57,6 +57,7 @@ impl Execution<'_> {
     }
 
     fn prepare(&self) -> Result<Prepared> {
+        #[cfg(unix)]
         anyhow::ensure!(
             self.files.len() == 3 + usize::from(self.terminal),
             "invalid compiler stream manifest"
@@ -77,11 +78,20 @@ impl Execution<'_> {
         #[cfg(windows)]
         let channels = {
             use std::os::windows::io::AsRawHandle;
-            anyhow::ensure!(!self.terminal, "Windows terminals require local execution");
+            anyhow::ensure!(
+                self.files.is_empty() || self.files.len() == 3,
+                "invalid Windows compiler stream manifest"
+            );
+            let handle = |index: usize| {
+                self.files
+                    .get(index)
+                    .map_or(0, |file| file.as_raw_handle() as usize as u64)
+            };
             ExecutionChannels::Windows {
-                stdin: self.files[0].as_raw_handle() as usize as u64,
-                stdout: self.files[1].as_raw_handle() as usize as u64,
-                stderr: self.files[2].as_raw_handle() as usize as u64,
+                stdin: handle(0),
+                stdout: handle(1),
+                stderr: handle(2),
+                process_broker: true,
             }
         };
         let native_path = |path: &Path| NativeString::capture(path.as_os_str());
@@ -127,6 +137,121 @@ impl Execution<'_> {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn accepted_request_transfers_owned_streams_and_returns_the_daemons_exit_code() {
+        use kache_protocol::execution::{DescriptorTicket, ExecutionCommand, ExecutionReply};
+        use std::io::{BufRead, Read, Seek, Write};
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        use std::time::Duration;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = root.path().join("control");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = root.path().join("descriptors");
+        let datagram = UnixDatagram::bind(&endpoint).unwrap();
+        datagram
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut files = (0..3)
+            .map(|_| tempfile::tempfile().unwrap())
+            .collect::<Vec<_>>();
+        files[0].write_all(b"client-input").unwrap();
+        files[0].rewind().unwrap();
+        let env = InvocationEnv::from_parts(
+            [("CLIENT", "one-invocation")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        std::thread::scope(|threads| {
+            let server = threads.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => panic!("client did not connect: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let kache_protocol::Request::ExecuteV1(request) =
+                    serde_json::from_str(&line).unwrap()
+                else {
+                    panic!("wrong execution request");
+                };
+                assert_eq!(request.client_version, "fixture-client");
+                assert_eq!(request.client_pid, std::process::id());
+                assert_eq!(request.env.len(), 1);
+                assert_eq!(request.env[0].1.decode().unwrap(), "one-invocation");
+                let mut reply = |reply: &ExecutionReply| {
+                    serde_json::to_writer(&mut stream, reply).unwrap();
+                    stream.write_all(b"\n").unwrap();
+                };
+                let ticket = DescriptorTicket {
+                    endpoint: NativeString::capture(endpoint.as_os_str()),
+                    key: [11; 16],
+                };
+                reply(&ExecutionReply::Ready {
+                    version: EXECUTION_VERSION,
+                    descriptors: Some(ticket.clone()),
+                });
+                let mut transferred =
+                    kache_ipc::descriptors::receive(datagram.as_fd(), &ticket.key, 3)
+                        .unwrap()
+                        .into_iter()
+                        .map(File::from)
+                        .collect::<Vec<_>>();
+                let mut input = Vec::new();
+                transferred[0].read_to_end(&mut input).unwrap();
+                assert_eq!(input, b"client-input");
+                transferred[1].write_all(b"daemon-output").unwrap();
+                transferred[2].write_all(b"daemon-error").unwrap();
+                reply(&ExecutionReply::Prepared);
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<ExecutionCommand>(&line).unwrap(),
+                    ExecutionCommand::Commit
+                );
+                reply(&ExecutionReply::Accepted);
+                reply(&ExecutionReply::Complete { exit_code: 23 });
+            });
+            let result = Execution {
+                entry: ExecutionEntry::Original,
+                args: &["compiler".into()],
+                env: &env,
+                executable: &root.path().join("kache"),
+                started_at: Instant::now(),
+                files: &files,
+                terminal: false,
+                client_version: "fixture-client",
+            }
+            .try_execute(&socket);
+            assert_eq!(result.unwrap(), Some(23));
+            server.join().unwrap();
+        });
+        for (file, expected) in files[1..]
+            .iter_mut()
+            .zip([b"daemon-output", b"daemon-error".as_slice()])
+        {
+            file.rewind().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        }
+    }
 
     #[test]
     fn concurrent_clients_encode_only_their_owned_inputs() {
@@ -261,6 +386,7 @@ mod windows_tests {
                 stdin: files[0].as_raw_handle() as usize as u64,
                 stdout: files[1].as_raw_handle() as usize as u64,
                 stderr: files[2].as_raw_handle() as usize as u64,
+                process_broker: true,
             }
         );
         for file in files {

@@ -71,7 +71,7 @@ CATEGORIES = (
         (
             r"^packaging/",
             r"^flake\.(nix|lock)$",
-            r"^scripts/(apt|aur|ci)/",
+            r"^scripts/(apt|aur|ci|winget)/",
             r"^scripts/(check-version-consistency\.sh|crates-io\.py|test-crates-io\.py)$",
             r"^\.github/workflows/(package-publish|service-image)\.yml$",
             r"^\.github/workflows/publish-crates\.yaml$",

@@ -3,10 +3,13 @@ title: Daemon overview
 description: What the background daemon owns and what still works without it
 ---
 
-The daemon keeps network and maintenance work away from compiler processes. Local cache lookup and storage do not require it.
+The daemon keeps compiler cache pipelines, network connections and maintenance
+state warm across invocations. The local engine can still use the cache when
+compiler delegation is unavailable.
 
 ## Responsibilities
 
+- Run concurrent cache pipelines for delegated compiler invocations.
 - Download an exact entry after a local miss.
 - Store completed C/C++ compiles handed over by wrappers.
 - Upload newly stored entries in the background.
@@ -26,9 +29,17 @@ The daemon keeps network and maintenance work away from compiler processes. Loca
 - On macOS, exclude the cache directory from Spotlight and Time Machine.
 - Exit when its config file changes, so the next start loads the new settings.
 
-With `cache.daemon_publish` enabled (the default), a C/C++ wrapper can hand its private output snapshots to the daemon. The compiler still runs in the wrapper. If the daemon cannot accept the work within 25 ms, the wrapper keeps the local publication path. A compile whose store is a `[cache.volumes]` shard always stores from the wrapper.
+For delegated compiles, the daemon's pipeline already owns publication. A local
+C/C++ engine can also hand its private output snapshots to the daemon when
+`cache.daemon_publish` is enabled (the default). If the daemon cannot accept that
+handoff within 25 ms, the engine publishes locally. Local execution using a
+`[cache.volumes]` shard publishes from the engine.
 
-Report JSON marks daemon publication attempts with `store_handed_off` and records their background time in `daemon_store_ms`. That time is separate from the wrapper's `store_ms`. A daemon crash can lose queued cache entries; the compiler outputs remain available to the build.
+Report JSON marks daemon-owned publication with `store_handed_off`. Queued
+publication records its background time in `daemon_store_ms`, separately from
+`store_ms`. A delegated pipeline that stores directly has no queued background
+time. A daemon crash can lose queued cache entries; the compiler outputs remain
+available to the build.
 
 Set `cache.prefetch_enabled = false` or `KACHE_PREFETCH_ENABLED=0` to disable speculative prefetch while retaining exact remote checks and uploads.
 
@@ -36,7 +47,11 @@ The daemon lists the remote's keys only when `cache.remote_key_listing` is on. I
 
 ## When it is required
 
-Local-only caching works with no daemon. Compiler-driven remote reads, writes, and prefetch need the daemon. `kache sync` can transfer entries directly without it. If the daemon is unavailable, the wrapper continues with the local store and compiles an exact remote miss locally.
+Local-only caching works with no daemon. Compiler-driven remote reads, writes,
+and prefetch need the daemon. `kache sync` can transfer entries directly without
+it. If delegation is unavailable before Commit, the engine continues with the
+local store. After Commit, a lost daemon connection fails the invocation; see
+[Architecture](/docs/how-it-works/architecture).
 
 ## Endpoint placement
 

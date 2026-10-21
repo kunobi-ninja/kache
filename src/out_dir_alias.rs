@@ -2112,6 +2112,7 @@ mod tests {
         struct Layout {
             _tmp: tempfile::TempDir,
             root: PathBuf,
+            manifest_dir: PathBuf,
             out_dir: PathBuf,
             env: Vec<(OsString, OsString)>,
             args: RustcArgs,
@@ -2169,6 +2170,7 @@ mod tests {
                 .unwrap();
             Layout {
                 root: base.join("cache/out-dirs"),
+                manifest_dir: manifest,
                 _tmp: tmp,
                 out_dir,
                 env,
@@ -2188,18 +2190,9 @@ mod tests {
         }
 
         fn invocation_for_layout(layout: &Layout) -> InvocationEnv {
-            let cwd = PathBuf::from(
-                layout
-                    .env
-                    .iter()
-                    .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
-                    .unwrap()
-                    .1
-                    .clone(),
-            );
             InvocationEnv::from_parts(
                 layout.env.clone(),
-                Some(cwd),
+                Some(layout.manifest_dir.clone()),
                 None,
                 layout._tmp.path().to_path_buf(),
             )

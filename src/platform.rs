@@ -402,7 +402,8 @@ mod tests {
         std::thread::scope(|threads| {
             let worker = threads.spawn(|| {
                 super::host_output(std::process::Command::new("/bin/sh")
-                    .args(["-c", "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do /bin/sleep .01; done"])
+                    .args(["-c", "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do sleep .01; done"])
+                    .env("PATH", env!("PATH"))
                     .env("READY", &ready).env("RELEASE", &release)).unwrap()
             });
             let started = std::time::Instant::now();

@@ -5,6 +5,10 @@ use std::io;
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 
+#[cfg(windows)]
+#[path = "stdio_windows.rs"]
+mod windows;
+
 pub struct Stdio {
     pub input: File,
     pub output: File,
@@ -13,51 +17,32 @@ pub struct Stdio {
 }
 
 impl Stdio {
-    #[cfg(unix)]
     pub fn capture() -> io::Result<Self> {
-        fn duplicate(fd: libc::c_int) -> io::Result<File> {
-            // Closed standard descriptors are errors, without creating a
-            // borrowed handle for an invalid descriptor.
-            let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-            if owned < 0 {
-                return Err(io::Error::last_os_error());
+        #[cfg(unix)]
+        {
+            fn duplicate(fd: libc::c_int) -> io::Result<File> {
+                // Closed standard descriptors are errors, without creating a
+                // borrowed handle for an invalid descriptor.
+                let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+                if owned == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(unsafe { File::from_raw_fd(owned) })
             }
-            Ok(unsafe { File::from_raw_fd(owned) })
+            Ok(Self {
+                input: duplicate(0)?,
+                output: duplicate(1)?,
+                error: duplicate(2)?,
+                terminal: std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/tty")
+                    .ok(),
+            })
         }
-        Ok(Self {
-            input: duplicate(0)?,
-            output: duplicate(1)?,
-            error: duplicate(2)?,
-            terminal: std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/tty")
-                .ok(),
-        })
-    }
-
-    #[cfg(windows)]
-    pub fn capture() -> io::Result<Self> {
-        use std::io::IsTerminal;
-        use windows_sys::Win32::System::Console::{
-            STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-        };
-        let input = duplicate_standard(STD_INPUT_HANDLE)?;
-        let output = duplicate_standard(STD_OUTPUT_HANDLE)?;
-        let error = duplicate_standard(STD_ERROR_HANDLE)?;
-        // Console handles and Unicode conversion remain with the local
-        // engine until the client can proxy them without attaching the daemon.
-        if input.is_terminal() || output.is_terminal() || error.is_terminal() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "console handles require local execution",
-            ));
+        #[cfg(windows)]
+        {
+            windows::capture()
         }
-        Ok(Self {
-            input,
-            output,
-            error,
-            terminal: None,
-        })
     }
 
     pub fn into_files(self) -> (Vec<File>, bool) {
@@ -68,36 +53,101 @@ impl Stdio {
     }
 }
 
-#[cfg(windows)]
-fn duplicate_standard(which: u32) -> io::Result<File> {
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::System::Console::GetStdHandle;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
 
-    let handle = unsafe { GetStdHandle(which) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::other("standard handle unavailable"));
+    #[test]
+    #[ignore = "isolated standard descriptors for the Unix stream capture test"]
+    fn capture_fixture() {
+        if std::env::var("KACHE_TEST_STDIO").unwrap() == "closed" {
+            assert_eq!(unsafe { libc::close(0) }, 0);
+            assert_eq!(
+                Stdio::capture().err().unwrap().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            return;
+        }
+        let mut captured = Stdio::capture().unwrap();
+        for file in [&captured.input, &captured.output, &captured.error] {
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        let mut input = Vec::new();
+        captured.input.read_to_end(&mut input).unwrap();
+        assert_eq!(input, b"native-input-\xff");
+        captured.output.write_all(b"owned-output-\xfe").unwrap();
+        captured.error.write_all(b"owned-error-\xfd").unwrap();
     }
-    let process = unsafe { GetCurrentProcess() };
-    let mut owned = std::ptr::null_mut();
-    if unsafe {
-        DuplicateHandle(
-            process,
-            handle,
-            process,
-            &mut owned,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+
+    #[test]
+    fn stream_capture_preserves_bytes_and_rejects_closed_standard_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        std::fs::write(&input, b"native-input-\xff").unwrap();
+        for mode in ["capture", "closed"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "stdio::unix_tests::capture_fixture"])
+                .env("KACHE_TEST_STDIO", mode)
+                .stdin(File::open(&input).unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if mode == "capture" {
+                assert!(
+                    output
+                        .stdout
+                        .windows(b"owned-output-\xfe".len())
+                        .any(|bytes| bytes == b"owned-output-\xfe")
+                );
+                assert!(
+                    output
+                        .stderr
+                        .windows(b"owned-error-\xfd".len())
+                        .any(|bytes| bytes == b"owned-error-\xfd")
+                );
+                assert!(
+                    !output
+                        .stdout
+                        .windows(b"owned-error-\xfd".len())
+                        .any(|bytes| bytes == b"owned-error-\xfd")
+                );
+            }
+        }
     }
-    Ok(unsafe { File::from_raw_handle(owned) })
+
+    #[test]
+    fn transfer_manifest_orders_standard_streams_before_an_optional_terminal() {
+        for has_terminal in [false, true] {
+            let mut originals = (0..4)
+                .map(|_| tempfile::tempfile().unwrap())
+                .collect::<Vec<_>>();
+            let captured = Stdio {
+                input: originals[0].try_clone().unwrap(),
+                output: originals[1].try_clone().unwrap(),
+                error: originals[2].try_clone().unwrap(),
+                terminal: has_terminal.then(|| originals[3].try_clone().unwrap()),
+            };
+            let (mut files, terminal) = captured.into_files();
+            assert_eq!(terminal, has_terminal);
+            assert_eq!(files.len(), if has_terminal { 4 } else { 3 });
+            for (index, file) in files.iter_mut().enumerate() {
+                let expected = format!("stream-{index}");
+                file.write_all(expected.as_bytes()).unwrap();
+                originals[index].rewind().unwrap();
+                let mut actual = String::new();
+                originals[index].read_to_string(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

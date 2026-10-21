@@ -9338,7 +9338,12 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         object_output,
         package,
         store_error,
-        store_handed_off: false,
+        store_handed_off: store_put.output_blobs != 0
+            && INVOCATION_SETTINGS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|settings| settings.daemon.is_some())
+            }),
         daemon_store_ms: 0,
         lookup_rejection,
         verify_compare: crate::verify_compare::take_last_report(),

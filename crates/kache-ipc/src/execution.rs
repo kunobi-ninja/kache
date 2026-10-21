@@ -1,5 +1,6 @@
 //! Synchronous compiler handoff with fallback rights ending at the first Commit write.
 
+#[cfg(all(test, windows))]
 use crate::prelude::*;
 use anyhow::{Result, bail, ensure};
 use kache_protocol::execution::{
@@ -14,7 +15,21 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
 const MAX_REPLY_BYTES: u64 = 64 << 10;
+#[cfg(windows)]
+const MAX_REPLY_BYTES: u64 = 8 << 20;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+mod windows_client;
+#[cfg(windows)]
+use windows::Connection;
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix::Connection;
 
 /// `None` permits local execution. An error means Commit may have reached the
 /// daemon and the caller must not run the compiler again.
@@ -48,6 +63,8 @@ fn exchange(
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
     committed: &mut bool,
 ) -> Result<i32> {
+    #[cfg(windows)]
+    let mut client = windows_client::Client::default();
     let stream = Connection::connect(socket)?;
     write_message(
         &mut &stream,
@@ -89,153 +106,28 @@ fn exchange(
 
     stream.prepare_commit()?;
     send_commit(&mut &stream, committed)?;
+    #[cfg(windows)]
     stream.commit_written()?;
     ensure!(
         matches!(read_reply(&mut reader)?, ExecutionReply::Accepted),
         "daemon did not acknowledge compiler execution"
     );
+    #[cfg(windows)]
+    loop {
+        match read_reply(&mut reader)? {
+            ExecutionReply::Complete { exit_code } => return Ok(exit_code),
+            ExecutionReply::Failed { message } => bail!("{message}"),
+            ExecutionReply::WindowsControl { command } => {
+                write_message(&mut &stream, &client.execute(command))?;
+            }
+            reply => bail!("invalid compiler completion: {reply:?}"),
+        }
+    }
+    #[cfg(not(windows))]
     match read_reply(&mut reader)? {
         ExecutionReply::Complete { exit_code } => Ok(exit_code),
         ExecutionReply::Failed { message } => bail!("{message}"),
         reply => bail!("invalid compiler completion: {reply:?}"),
-    }
-}
-
-/// Windows pipes have no socket timeout API. Preparation uses nonblocking
-/// reads/writes under one deadline, then completion waits in the kernel.
-struct Connection {
-    inner: crate::SyncStream,
-    #[cfg(windows)]
-    deadline: std::cell::Cell<Option<std::time::Instant>>,
-}
-
-impl Connection {
-    fn connect(socket: &Path) -> Result<Self> {
-        #[cfg(unix)]
-        let inner = crate::SyncStream::connect(crate::socket_name(socket)?)?;
-        #[cfg(windows)]
-        let (inner, deadline): (crate::SyncStream, std::time::Instant) = {
-            use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
-            let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
-            // The generic local-socket adapter in interprocess 2.4.4 ignores
-            // ConnectOptions::wait_mode on Windows. Keep its native pipe's
-            // bounded connect, then wrap the same owned handle.
-            let path = format!(r"\\.\pipe\{}", crate::daemon_endpoint(socket));
-            let pipe = DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
-                path,
-                interprocess::ConnectWaitMode::Timeout(PREPARE_TIMEOUT),
-            )?;
-            let handle: std::os::windows::io::OwnedHandle = pipe
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("new named pipe unexpectedly has shared ownership"))?;
-            let inner =
-                interprocess::os::windows::named_pipe::local_socket::Stream::try_from(handle)
-                    .map_err(|error| anyhow::anyhow!("wrapping compiler named pipe: {error:?}"))?;
-            (inner.into(), deadline)
-        };
-        #[cfg(unix)]
-        {
-            use interprocess::local_socket::traits::StreamCommon as _;
-            crate::require_self_peer(inner.peer_creds()?.euid())?;
-            inner.set_recv_timeout(Some(PREPARE_TIMEOUT))?;
-            inner.set_send_timeout(Some(PREPARE_TIMEOUT))?;
-        }
-        #[cfg(windows)]
-        {
-            use kunobi_daemon::local::peer::PeerCredentials as _;
-            let peer = inner.credentials()?;
-            ensure!(
-                peer.same_user && peer.pid.is_some(),
-                "compiler endpoint belongs to another user or has no peer identity"
-            );
-            inner.set_nonblocking(true)?;
-        }
-        Ok(Self {
-            inner,
-            #[cfg(windows)]
-            deadline: std::cell::Cell::new(Some(deadline)),
-        })
-    }
-
-    fn prepare_commit(&self) -> Result<()> {
-        #[cfg(unix)]
-        self.inner.set_recv_timeout(None)?;
-        Ok(())
-    }
-
-    fn commit_written(&self) -> Result<()> {
-        #[cfg(windows)]
-        {
-            // This fallible transition is after Commit: failure is final,
-            // never permission to run the compiler a second time.
-            self.inner.set_nonblocking(false)?;
-            self.deadline.set(None);
-        }
-        Ok(())
-    }
-}
-
-impl Read for &Connection {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        #[cfg(unix)]
-        {
-            (&self.inner).read(bytes)
-        }
-        #[cfg(windows)]
-        {
-            let deadline = self.deadline.get();
-            if deadline.is_none() || bytes.is_empty() {
-                return (&self.inner).read(bytes);
-            }
-            use std::os::windows::io::{AsHandle, AsRawHandle};
-            use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-            retry_until(deadline, || {
-                let crate::SyncStream::NamedPipe(pipe) = &self.inner;
-                let mut available = 0;
-                if unsafe {
-                    PeekNamedPipe(
-                        pipe.as_handle().as_raw_handle(),
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut available,
-                        std::ptr::null_mut(),
-                    )
-                } == 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if available == 0 {
-                    return Err(std::io::ErrorKind::WouldBlock.into());
-                }
-                // One reader owns this byte stream. Request no more than the
-                // bytes already queued, so the setup read cannot block.
-                let count = bytes.len().min(available as usize);
-                (&self.inner).read(&mut bytes[..count])
-            })
-        }
-    }
-}
-
-impl Write for &Connection {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        #[cfg(unix)]
-        {
-            (&self.inner).write(bytes)
-        }
-        #[cfg(windows)]
-        {
-            retry_until(self.deadline.get(), || match (&self.inner).write(bytes) {
-                // PIPE_NOWAIT may report a successful zero-byte write when
-                // its byte buffer is full; retry it under the same deadline.
-                Ok(0) if !bytes.is_empty() => Err(std::io::ErrorKind::WouldBlock.into()),
-                result => result,
-            })
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        (&self.inner).flush()
     }
 }
 
@@ -255,9 +147,7 @@ fn retry_until<T>(
                 if deadline.is_some_and(|until| std::time::Instant::now() >= until) {
                     return Err(std::io::ErrorKind::TimedOut.into());
                 }
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                std::thread::sleep(Duration::from_millis(1));
             }
             result => return result,
         }
@@ -540,10 +430,11 @@ mod protocol_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use anyhow::Context as _;
     use interprocess::local_socket::ListenerNonblockingMode;
     use kache_protocol::execution::{ExecutionChannels, ExecutionEntry, NativeString};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Peer {
         Complete,
         BeforePrepared,
@@ -577,18 +468,22 @@ mod windows_tests {
                 stdin: 0,
                 stdout: 0,
                 stderr: 0,
+                process_broker: true,
             },
         };
         let server = std::thread::spawn(move || -> Result<()> {
             let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
-            let inner = retry_until(Some(deadline), || listener.accept())?;
+            let inner = retry_until(Some(deadline), || listener.accept())
+                .context("accepting the execution client")?;
             let connection = Connection {
                 inner,
                 deadline: std::cell::Cell::new(Some(deadline)),
             };
             let mut reader = std::io::BufReader::new(&connection);
             let mut line = String::new();
-            reader.read_line(&mut line)?;
+            reader
+                .read_line(&mut line)
+                .context("reading the execution request")?;
             ensure!(
                 matches!(
                     serde_json::from_str::<kache_protocol::Request>(&line)?,
@@ -614,7 +509,9 @@ mod windows_tests {
             std::thread::sleep(Duration::from_millis(4));
             write_message(&mut &connection, &ExecutionReply::Prepared)?;
             line.clear();
-            reader.read_line(&mut line)?;
+            reader
+                .read_line(&mut line)
+                .context("reading the execution commit")?;
             ensure!(
                 serde_json::from_str::<ExecutionCommand>(&line)? == ExecutionCommand::Commit,
                 "expected commit"
@@ -629,8 +526,17 @@ mod windows_tests {
             )?;
             Ok(())
         });
-        let result = try_execute(&path, &request);
-        server.join().expect("named-pipe peer panicked")?;
+        // A complete peer must expose preparation errors, rather than letting
+        // the availability fallback hide them behind the server's timeout.
+        let result = if matches!(peer, Peer::Complete) {
+            exchange(&path, &request, &mut false).map(Some)
+        } else {
+            try_execute(&path, &request)
+        };
+        server
+            .join()
+            .expect("named-pipe peer panicked")
+            .with_context(|| format!("peer {peer:?}; client returned {result:?}"))?;
         result
     }
 

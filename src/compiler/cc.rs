@@ -5316,16 +5316,6 @@ fn useful_cc_prefix(path: &Path) -> bool {
         >= 3
 }
 
-#[cfg(test)]
-fn stable_cc_common_root(common: &Path, cwd: &Path, source_parent: &Path) -> bool {
-    stable_cc_common_root_for(
-        common,
-        cwd,
-        source_parent,
-        InvocationEnv::capture().temp_dir(),
-    )
-}
-
 fn stable_cc_common_root_for(common: &Path, cwd: &Path, source_parent: &Path, temp: &Path) -> bool {
     if common == cwd || common == source_parent {
         return true;
@@ -5610,7 +5600,6 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
 /// Both halves of the shadowing digest, as the key computes them.
 #[cfg(test)]
 fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Result<String> {
-    let _lock = crate::test_support::process_state_test_lock();
     digest_cc_shadowing_names(
         parsed,
         &cc_shadowing_names(parsed, read_inputs, &crate::cache_key::FileHasher::new())?,
@@ -5639,15 +5628,18 @@ fn cc_shadowing_names(
     read_inputs: &[PathBuf],
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<CcShadowingNames> {
-    let cwd = parsed.invocation_env.cwd().context("C/C++ invocation has no working directory")?;
-    let dirs = cc_user_include_dirs(parsed, &cwd);
+    let cwd = parsed
+        .invocation_env
+        .cwd()
+        .context("cc invocation has no working directory")?;
+    let dirs = cc_user_include_dirs(parsed, cwd);
     let mut probe_dirs = dirs.clone();
-    probe_dirs.extend(cc_system_include_dirs(parsed, &cwd));
+    probe_dirs.extend(cc_system_include_dirs(parsed, cwd));
     for flag in ["-idirafter", "/imsvc", "-imsvc"] {
         probe_dirs.extend(
             cc_flag_dir_values(&parsed.rest, flag)
                 .into_iter()
-                .map(|value| absolutize_path(&cwd, Path::new(value))),
+                .map(|value| absolutize_path(cwd, Path::new(value))),
         );
     }
     for variable in [
@@ -5659,12 +5651,16 @@ fn cc_shadowing_names(
         "INCLUDE",
         "EXTERNAL_INCLUDE",
     ] {
-        if let Some(value) = std::env::var_os(variable) {
+        if let Some(value) = parsed.invocation_env.var_os(variable) {
             probe_dirs
-                .extend(std::env::split_paths(&value).map(|path| absolutize_path(&cwd, &path)));
+                .extend(std::env::split_paths(&value).map(|path| absolutize_path(cwd, &path)));
         }
     }
-    let scans = file_hasher.cc_header_scans(read_inputs, 1, &|path| {
+    let read_inputs = read_inputs
+        .iter()
+        .map(|path| absolutize_path(cwd, path))
+        .collect::<Vec<_>>();
+    let scans = file_hasher.cc_header_scans(&read_inputs, 1, &|path| {
         let bytes = fs::read(path)
             .with_context(|| format!("reading header availability input {}", path.display()))?;
         let probes = cc_header_probes(&cc_splice_lines(&bytes));
@@ -5675,7 +5671,7 @@ fn cc_shadowing_names(
     })?;
     let mut result = CcShadowingNames::default();
     for (input, scan) in read_inputs.iter().zip(scans) {
-        let absolute = absolutize_path(&cwd, input);
+        let absolute = absolutize_path(cwd, input);
         // Keep the ordinary shadowing names as before: the most specific
         // relative path and the basename can both be used by an include.
         if let Some(relative) = dirs

@@ -23,6 +23,9 @@ pub(crate) use lifecycle_client::Ensured;
 #[cfg(unix)]
 #[path = "daemon_execution.rs"]
 mod execution;
+#[cfg(windows)]
+#[path = "daemon_execution_windows.rs"]
+mod execution;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
 use serde::{Deserialize, Serialize};
@@ -1840,7 +1843,7 @@ pub(crate) struct Daemon {
     readonly_skip_warned: Mutex<Option<Instant>>,
     /// Keep compile workers below the connection cap, leaving RPC capacity
     /// for their own remote checks and publication requests.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
 }
 
@@ -1981,7 +1984,7 @@ impl Daemon {
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             execution_workers: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism()
                     .map_or(1, usize::from)
@@ -7766,14 +7769,14 @@ async fn handle_connection_started_at(
 
         let resp = match parsed {
             Ok(Request::ExecuteV1(req)) => {
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 {
                     let result =
                         execution::handle(&stream, &mut reader, *req, daemon, lifecycle).await;
                     retire_for_newer_client(daemon, lifecycle, client_version.as_deref());
                     return result;
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, windows)))]
                 {
                     let _ = req;
                     Response::err("compiler execution is unavailable on this platform")

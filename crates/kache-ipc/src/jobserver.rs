@@ -24,7 +24,7 @@ impl Descriptors {
         }
         for file in &files {
             let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-            if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+            if flags == -1 || flags & libc::FD_CLOEXEC == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "parent jobserver descriptors must be close-on-exec",
@@ -74,7 +74,7 @@ pub fn configure(command: &mut Command) {
             for descriptor in descriptors.0.iter() {
                 let fd = descriptor.as_raw_fd();
                 let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -169,7 +169,7 @@ pub fn capture(env: &[(OsString, OsString)]) -> io::Result<(Vec<i32>, Descriptor
     let mut files = Vec::with_capacity(originals.len());
     for fd in &originals {
         let owned = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if owned < 0 {
+        if owned == -1 {
             return Err(io::Error::last_os_error());
         }
         files.push(unsafe { OwnedFd::from_raw_fd(owned) });
@@ -219,6 +219,100 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, Write};
     use std::process::Stdio;
+
+    #[test]
+    fn jobserver_scope_restores_the_owned_manifest_after_a_panic() {
+        let first = tempfile::tempfile().unwrap();
+        let second = tempfile::tempfile().unwrap();
+        let expected_first = first.as_raw_fd();
+        let expected_second = second.as_raw_fd();
+        let descriptors = Descriptors::new(vec![first.into(), second.into()]).unwrap();
+        assert_eq!(descriptors.files().len(), 2);
+        assert_eq!(descriptors.files()[0].as_raw_fd(), expected_first);
+        assert_eq!(descriptors.files()[1].as_raw_fd(), expected_second);
+        assert!(CURRENT.with(|slot| slot.borrow().files().is_empty()));
+        {
+            let _outer = Scope::enter(descriptors);
+            let result = std::panic::catch_unwind(|| {
+                let _nested = Scope::enter(Descriptors::default());
+                assert!(CURRENT.with(|slot| slot.borrow().files().is_empty()));
+                panic!("nested invocation failed");
+            });
+            assert!(result.is_err());
+            CURRENT.with(|slot| {
+                let current = slot.borrow();
+                assert_eq!(current.files().len(), 2);
+                assert_eq!(current.files()[0].as_raw_fd(), expected_first);
+                assert_eq!(current.files()[1].as_raw_fd(), expected_second);
+            });
+        }
+        assert!(CURRENT.with(|slot| slot.borrow().files().is_empty()));
+    }
+
+    #[test]
+    fn capture_rejects_a_numeric_endpoint_that_is_not_an_open_descriptor() {
+        let error = capture(&[(
+            "MAKEFLAGS".into(),
+            "--jobserver-auth=2147483647,2147483647".into(),
+        )])
+        .err()
+        .unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn only_jobserver_variables_participate_in_descriptor_transfer() {
+        for key in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
+            let env = vec![
+                (
+                    key.into(),
+                    "--jobserver-auth=9,7 --jobserver-fds=7,9".into(),
+                ),
+                ("UNRELATED".into(), "--jobserver-auth=invalid".into()),
+            ];
+            assert_eq!(original_fds(&env).unwrap(), [7, 9]);
+        }
+        for key in ["", "MAKEFLAGS_EXTRA", "CARGO_MAKEFLAGS_", "OTHER"] {
+            assert!(
+                original_fds(&[(key.into(), "--jobserver-auth=invalid".into())])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn jobserver_capacity_leaves_room_for_standard_streams_and_terminal() {
+        let flags = (0..30)
+            .map(|index| format!("--jobserver-auth={},{}", index * 2, index * 2 + 1))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            original_fds(&[("MAKEFLAGS".into(), flags.clone().into())]).unwrap(),
+            (0..60).collect::<Vec<_>>()
+        );
+        let overflow = format!("{flags} --jobserver-auth=60,0");
+        assert_eq!(
+            original_fds(&[("MAKEFLAGS".into(), overflow.into())])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_an_incomplete_or_misattributed_descriptor_manifest() {
+        let env = vec![("MAKEFLAGS".into(), "--jobserver-auth=7,9".into())];
+        let short = Descriptors::new(vec![tempfile::tempfile().unwrap().into()]).unwrap();
+        assert!(rewrite(&env, &[7, 9], &short).is_err());
+        let complete = Descriptors::new(vec![
+            tempfile::tempfile().unwrap().into(),
+            tempfile::tempfile().unwrap().into(),
+        ])
+        .unwrap();
+        assert!(rewrite(&env, &[8, 9], &complete).is_err());
+        assert!(rewrite(&env, &[7, 9], &complete).is_ok());
+    }
 
     #[test]
     fn parent_descriptors_must_be_close_on_exec() {

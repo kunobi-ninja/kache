@@ -1,98 +1,134 @@
-//! Assign compiler children to a job before their first instruction executes.
+//! Windows compiler process and cancellation-job ownership.
 
+pub(super) use kache_ipc::windows_process::{Job, spawn};
+
+use crate::invocation::windows_broker::Broker;
+use kache_ipc::windows_handles::CompilerHandles;
 use std::io;
-use std::mem::{size_of, zeroed};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::os::windows::process::CommandExt;
-use std::process::{Child, Command};
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
-};
-use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-};
+use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::process::ExitStatusExt;
+use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
+use std::sync::Arc;
 
-pub(super) struct Job(OwnedHandle);
+enum Process {
+    Local(std::process::Child),
+    Remote {
+        handle: OwnedHandle,
+        id: u64,
+        pid: u32,
+        broker: Arc<Broker>,
+    },
+}
 
-impl Job {
-    fn new() -> io::Result<Self> {
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
+pub(super) struct Child {
+    process: Process,
+    pub(super) stdin: Option<ChildStdin>,
+    pub(super) stdout: Option<ChildStdout>,
+    pub(super) stderr: Option<ChildStderr>,
+}
+
+impl Child {
+    pub(super) fn local(mut child: std::process::Child) -> Self {
+        Self {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            process: Process::Local(child),
         }
-        let job = Self(unsafe { OwnedHandle::from_raw_handle(handle) });
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if unsafe {
-            SetInformationJobObject(
-                job.0.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(job)
     }
 
-    pub(super) fn kill(&self) -> io::Result<()> {
-        if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+    pub(super) fn remote(
+        id: u64,
+        pid: u32,
+        handles: CompilerHandles,
+        broker: Arc<Broker>,
+    ) -> (Self, Job) {
+        (
+            Self {
+                process: Process::Remote {
+                    handle: handles.process,
+                    id,
+                    pid,
+                    broker,
+                },
+                stdin: handles.stdin,
+                stdout: handles.stdout,
+                stderr: handles.stderr,
+            },
+            handles.job,
+        )
+    }
+
+    pub(super) fn id(&self) -> u32 {
+        match &self.process {
+            Process::Local(child) => child.id(),
+            Process::Remote { pid, .. } => *pid,
+        }
+    }
+
+    pub(super) fn kill(&mut self) -> io::Result<()> {
+        match &mut self.process {
+            Process::Local(child) => child.kill(),
+            Process::Remote { handle, .. } => {
+                if unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(
+                        handle.as_raw_handle(),
+                        1,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match &mut self.process {
+            Process::Local(child) => child.try_wait(),
+            Process::Remote { handle, .. } => wait(handle, 0),
+        }
+    }
+
+    pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
+        match &mut self.process {
+            Process::Local(child) => child.wait(),
+            Process::Remote { handle, .. } => wait(handle, u32::MAX)?
+                .ok_or_else(|| io::Error::other("compiler wait did not complete")),
         }
     }
 }
 
-pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Job)> {
-    let job = Job::new()?;
-    let mut child = command
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED)
-        .spawn()?;
-    let start = || {
-        if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), child.as_raw_handle()) } == 0 {
-            return Err(io::Error::last_os_error());
+impl AsRawHandle for Child {
+    fn as_raw_handle(&self) -> RawHandle {
+        match &self.process {
+            Process::Local(child) => child.as_raw_handle(),
+            Process::Remote { handle, .. } => handle.as_raw_handle(),
         }
-        // std::Child does not expose the primary thread on stable Rust. The
-        // suspended process cannot create another thread before this resume.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-        let mut entry: THREADENTRY32 = unsafe { zeroed() };
-        entry.dwSize = size_of::<THREADENTRY32>() as u32;
-        let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
-        while found {
-            if entry.th32OwnerProcessID == child.id() {
-                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if thread.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-                if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-                    return Err(io::Error::last_os_error());
-                }
-                return Ok(());
-            }
-            found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
-        }
-        Err(io::Error::other("suspended compiler thread unavailable"))
-    };
-    if let Err(error) = start() {
-        // Assignment/resume failures must never leave a suspended process or
-        // let a compiler run outside the request's job.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
     }
-    Ok((child, job))
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if let Process::Remote { id, broker, .. } = &self.process {
+            broker.finish(*id);
+        }
+    }
+}
+
+fn wait(handle: &OwnedHandle, timeout: u32) -> io::Result<Option<ExitStatus>> {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), timeout) } {
+        WAIT_TIMEOUT => Ok(None),
+        WAIT_OBJECT_0 => {
+            let mut status = 0;
+            if unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut status) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Some(ExitStatus::from_raw(status)))
+        }
+        _ => Err(io::Error::last_os_error()),
+    }
 }

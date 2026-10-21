@@ -134,9 +134,6 @@ regex-automata = { version = "0.4", default-features = false, features = ["std",
 # `#[mutants::skip]` on the Win32 volume query. The attribute is a no-op;
 # cargo-mutants reads it so a body Linux never compiles is not a survivor.
 mutants = "0.0.4"
-# Use the same Visual Studio and Windows SDK discovery path as Rust build
-# tooling, including shells where VsDevCmd has not populated PATH/LIB.
-find-msvc-tools = "0.1.12"
 # `pure` drops blake3's C SIMD (`c/blake3_neon.c` / SSE intrinsics), whose
 # arm64 NEON path doesn't cross-compile under cargo-xwin's clang + MSVC
 # sysroot. Windows-only so native/Linux/macOS keep the fast C SIMD backend.
@@ -170,6 +167,9 @@ predicates = "3"
 proptest = { version = "1.11.0", default-features = false, features = ["std", "handle-panics"] }
 serde_json = "1"
 bytes = "1"
+
+[target.'cfg(windows)'.dev-dependencies]
+jobserver = "0.1.35"
 
 # `{ archive-suffix }` resolves from each target's pkg-fmt (".tar.gz" for
 # tgz, ".zip" for zip) — never hardcode the extension here: the release

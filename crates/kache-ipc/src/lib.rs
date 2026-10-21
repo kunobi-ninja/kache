@@ -357,13 +357,19 @@ mod tests {
                 .await
                 .expect("connect")
         });
-        let (stream, _client) = tokio::join!(listener.accept(), client);
+        let (stream, client) = tokio::join!(listener.accept(), client);
 
         // The test client runs under the same effective UID as the "daemon",
         // so the credential gate must accept it. Rejection of foreign UIDs is
         // not unit-testable without privilege switching.
         let stream = stream.expect("accept");
         require_self_peer(peer_euid(&stream)).expect("same-user peer accepted");
+        let client = client.expect("client task");
+        require_self_peer(peer_euid(&client)).expect("same-user server accepted");
+        #[cfg(target_os = "linux")]
+        for connection in [&stream, &client] {
+            assert_eq!(peer_pid(connection), Some(std::process::id()));
+        }
     }
 }
 
@@ -381,3 +387,9 @@ pub mod jobserver;
 
 #[cfg(any(unix, windows))]
 pub mod execution;
+#[cfg(windows)]
+pub mod windows_msvc;
+#[cfg(windows)]
+pub mod windows_process;
+#[cfg(windows)]
+mod windows_security;

@@ -977,7 +977,7 @@ fn collect_files(out: &mut Vec<(String, PathBuf)>, root: &Path, dir: &Path) -> R
 
 #[cfg(test)]
 fn parse_args(args: &[String]) -> RustdocArgs {
-    parse_args_for(args, &InvocationEnv::capture())
+    RustdocCompiler.parse(args).unwrap()
 }
 
 fn parse_args_for(args: &[String], env: &InvocationEnv) -> RustdocArgs {
@@ -3381,8 +3381,8 @@ mod tests {
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|threads| {
             for (root, client) in [(first.path(), "first"), (second.path(), "second")] {
-                for dir in ["bin", "src", "deps", "tmp"] {
-                    std::fs::create_dir(root.join(dir)).unwrap();
+                for dir in ["bin", "src", "deps", "tmp", "doc/demo", "parts"] {
+                    std::fs::create_dir_all(root.join(dir)).unwrap();
                 }
                 std::fs::write(
                     root.join("src/lib.rs"),
@@ -3395,7 +3395,7 @@ mod tests {
                 std::fs::write(root.join("header.html"), client).unwrap();
                 kache_fs::testutil::write_executable(
                     &root.join("bin/rustdoc"),
-                    "#!/bin/sh\nmkdir -p doc/demo parts\nprintf '%s' \"$CLIENT\" > doc/demo/index.html\nprintf '{}' > parts/demo.json\nprintf 'doc: src/lib.rs\\n' > output.d\nprintf '%s' \"$CLIENT\"\n",
+                    "#!/bin/sh\nprintf '%s' \"$CLIENT\" > doc/demo/index.html\nprintf '{}' > parts/demo.json\nprintf 'doc: src/lib.rs\\n' > output.d\nprintf '%s' \"$CLIENT\"\n",
                 );
                 let barrier = &barrier;
                 threads.spawn(move || {
@@ -3516,6 +3516,21 @@ mod tests {
         };
         let first = key(&env).unwrap();
         assert_eq!(key(&env).unwrap(), first);
+        let resolved = crate::probe::probe_for(
+            &config.cache_dir,
+            &RustdocProber,
+            &crate::probe::ProbeRequest {
+                compiler: "rustdoc",
+                args: &[],
+                key_args: &[],
+                per_tu_paths: &[],
+                windows_aware: false,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(resolved.prober, "rustdoc");
+        assert_eq!(resolved.version_line, "rustdoc first");
         assert_eq!(std::fs::read(root.join("probe-count")).unwrap(), b"x");
         let mut other = env.clone();
         other.set("DOC_VERSION", "rustdoc second");

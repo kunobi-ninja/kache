@@ -1,5 +1,67 @@
 use super::*;
 
+#[test]
+fn header_availability_uses_each_clients_relative_paths_and_include_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let mut clients = Vec::new();
+    for name in ["first", "second"] {
+        let cwd = root.path().join(name);
+        fs::create_dir_all(cwd.join("src")).unwrap();
+        fs::create_dir(cwd.join("include")).unwrap();
+        fs::write(
+            cwd.join("src/unit.c"),
+            "#if __has_include(<optional.h>)\n#endif\nint x;\n",
+        )
+        .unwrap();
+        let env =
+            InvocationEnv::from_parts([("CPATH", "include")], Some(cwd.clone()), None, cwd.clone());
+        let parsed =
+            CcArgs::parse_for(&s(&["cc", "-c", "src/unit.c", "-o", "unit.o"]), &env).unwrap();
+        clients.push((cwd, parsed));
+    }
+    fs::write(clients[0].0.join("include/optional.h"), "/* present */\n").unwrap();
+    let inputs = [PathBuf::from("src/unit.c")];
+    let digests = std::thread::scope(|threads| {
+        clients
+            .iter()
+            .map(|(cwd, parsed)| {
+                let inputs = &inputs;
+                threads.spawn(move || {
+                    let names =
+                        cc_shadowing_names(parsed, inputs, &crate::cache_key::FileHasher::new())
+                            .unwrap();
+                    assert_eq!(names.probes.len(), 1);
+                    assert!(
+                        names.probes[0]
+                            .candidates
+                            .contains(&cwd.join("include/optional.h"))
+                    );
+                    assert!(
+                        names.probes[0]
+                            .candidates
+                            .iter()
+                            .all(|path| path.is_absolute())
+                    );
+                    digest_cc_shadowing_names(parsed, &names).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_ne!(digests[0], digests[1]);
+    fs::write(
+        clients[1].0.join("include/optional.h"),
+        "/* now present */\n",
+    )
+    .unwrap();
+    assert_ne!(
+        digest_cc_include_shadowing(&clients[1].1, &inputs).unwrap(),
+        digests[1]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn concurrent_clients_preprocess_and_compile_with_their_own_context() {
@@ -601,6 +663,43 @@ fn clang_cl_firefox_style_invocation_is_cacheable() {
 }
 
 // ── recognize ────────────────────────────────────────────────
+
+#[test]
+fn unresolved_bare_compilers_follow_each_clients_search_path() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    let empty = root.path().join("empty");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&empty).unwrap();
+    let program = "custom-client-compiler";
+    let file = bin.join(if cfg!(windows) {
+        "custom-client-compiler.exe"
+    } else {
+        program
+    });
+    kache_fs::testutil::write_executable(&file, "#!/bin/sh\nexit 0\n");
+    let client = |path: &Path| {
+        InvocationEnv::from_parts(
+            [("PATH", path.as_os_str())],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let first = client(&bin);
+    let second = client(&empty);
+    assert!(!is_unresolvable_bare_program(program, &first));
+    assert!(is_unresolvable_bare_program(program, &second));
+    assert!(is_unresolvable_bare_program(
+        "missing-client-compiler",
+        &first
+    ));
+    for explicit in ["tools/compiler", r"tools\compiler", file.to_str().unwrap()] {
+        assert!(!is_unresolvable_bare_program(explicit, &first));
+        assert!(!is_unresolvable_bare_program(explicit, &second));
+    }
+    assert!(!is_unresolvable_bare_program(program, &first));
+}
 
 #[test]
 fn recognizes_canonical_command_names() {
@@ -5009,17 +5108,28 @@ fn cc_prefix_maps_keep_shallow_in_tree_relocated_builds_stable() {
 
 #[test]
 fn cc_prefix_maps_accept_generated_tempdir_common_root() {
-    let root = tempfile::TempDir::new().unwrap();
-    let root = root.path();
-
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("client/deep/temp");
+    let project = temp.join("project");
+    let cwd = project.join("obj");
+    let source_parent = project.join("src");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir(&source_parent).unwrap();
     assert!(
-        stable_cc_common_root(root, &root.join("obj"), &root.join("src")),
+        stable_cc_common_root_for(&project, &cwd, &source_parent, &temp),
         "generated temp project roots should be stable common roots"
     );
     assert!(
-        !stable_cc_common_root(&std::env::temp_dir(), &root.join("obj"), &root.join("src")),
+        !stable_cc_common_root_for(&temp, &cwd, &source_parent, &temp),
         "the temp directory itself is too broad to use as a common root"
     );
+    assert!(stable_cc_common_root_for(
+        &temp,
+        &temp,
+        &source_parent,
+        &temp
+    ));
+    assert!(stable_cc_common_root_for(&temp, &cwd, &temp, &temp));
 }
 
 #[test]
@@ -6542,11 +6652,33 @@ fn resolve_source_date_epoch_honors_build_value_verbatim() {
 }
 
 #[test]
-fn resolve_source_date_epoch_passthrough_disables_default_pin() {
-    // Opt-out with no build value → pin nothing; the unpinned probe yields a
-    // time-dependent key, so a wall-clock object is very unlikely to be
-    // reused.
-    assert_eq!(resolve_source_date_epoch(None, true), None);
+fn source_date_epoch_policy_uses_the_clients_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let default = InvocationEnv::from_parts(
+        [] as [(&str, &str); 0],
+        Some(root.path().to_owned()),
+        None,
+        root.path().to_owned(),
+    );
+    assert_eq!(
+        effective_source_date_epoch_for(&default).as_deref(),
+        Some(OsStr::new("0"))
+    );
+    for policy in ["passthrough", "wallclock", "off", " PASSTHROUGH "] {
+        let mut client = default.clone();
+        client.set("KACHE_CC_SOURCE_DATE_EPOCH", policy);
+        assert_eq!(effective_source_date_epoch_for(&client), None, "{policy}");
+        client.set("SOURCE_DATE_EPOCH", " 1700000000 ");
+        assert_eq!(
+            effective_source_date_epoch_for(&client).as_deref(),
+            Some(OsStr::new(" 1700000000 ")),
+            "the build value takes precedence and remains untrimmed"
+        );
+    }
+    assert_eq!(
+        effective_source_date_epoch_for(&default).as_deref(),
+        Some(OsStr::new("0"))
+    );
 }
 
 #[cfg(unix)]
@@ -8143,6 +8275,45 @@ fn direct_keying_applies_to_gnu_object_compiles_with_complete_depfiles() {
         !cc_direct_key_shape_ok(&parse(&["clang-cl", "/c", "a.c", "/Foa.obj"])),
         "the private capture flags are GNU spellings"
     );
+}
+
+#[test]
+fn direct_probe_material_separates_clients_paths_and_include_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let compiler = root.path().join("compiler.exe");
+    fs::write(&compiler, b"compiler image").unwrap();
+    let variables = [
+        ("PATH", root.path().join("first-bin").into_os_string()),
+        ("CPATH", "first-include".into()),
+    ];
+    let client = |vars| {
+        InvocationEnv::from_parts(
+            vars,
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let first = client(variables.clone().into_iter());
+    let material =
+        |env: &InvocationEnv| cc_direct_probe_material(compiler.to_str().unwrap(), env).unwrap();
+    let expected = material(&first);
+    for (name, value) in [
+        ("PATH", root.path().join("second-bin").into_os_string()),
+        ("CPATH", "second-include".into()),
+    ] {
+        let mut second = first.clone();
+        second.set(name, value);
+        assert_ne!(material(&second), expected, "{name}");
+    }
+    let mut unrelated = first.clone();
+    unrelated.set("CLIENT_NOTE", "unrelated client value");
+    assert_eq!(material(&unrelated), expected);
+    let mut reversed_variables = variables;
+    reversed_variables.reverse();
+    let reversed = client(reversed_variables.into_iter());
+    assert_eq!(material(&reversed), expected);
+    assert_eq!(material(&first), expected);
 }
 
 /// The driver probe vouches for the capture flags once per binary: a

@@ -278,8 +278,9 @@ pub struct BuildEvent {
     /// Empty on every normal outcome, so it costs nothing on the wire.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub store_error: String,
-    /// The store put ran in the daemon (`daemon_publish`); the store
-    /// counters above describe that publication attempt. Schema 20.
+    /// The store put ran in the daemon, either after a publication handoff
+    /// or inside a delegated compile. The store counters describe that put.
+    /// Schema 20.
     #[serde(default, skip_serializing_if = "is_false")]
     pub store_handed_off: bool,
     /// Background publication time; excluded from wrapper phase totals.

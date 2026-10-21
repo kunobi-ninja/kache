@@ -9,6 +9,7 @@ pub(crate) fn try_execute(
     args: &[String],
     context: &InvocationContext,
 ) -> Result<Option<i32>> {
+    #[cfg(unix)]
     let (files, terminal) = match context.io.transfer_files() {
         Ok(files) => files,
         Err(error) => {
@@ -16,6 +17,8 @@ pub(crate) fn try_execute(
             return Ok(None);
         }
     };
+    #[cfg(windows)]
+    let (files, terminal) = (Vec::new(), false);
     let executable = match crate::platform::frontend_executable() {
         Ok(path) => path,
         Err(error) => {

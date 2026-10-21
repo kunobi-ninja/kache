@@ -248,7 +248,24 @@ gitignore = true
 # The sccache preflight adapter calls Darwin-only process and sandbox APIs.
 # Its decision logic lives in src/fallback/sandbox.rs and stays in this Linux
 # lane. Test (macOS) covers the native adapter with allowed/denied subprocesses.
-exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
+# The Linux mutation runner does not compile these Windows modules. Native
+# process, token, console and pipe behavior belongs to the required Windows
+# test job. Portable execution DTOs, retry policy and Unix transport stay here.
+exclude_globs = [
+    "crates/kache-fs/src/apfs.rs",
+    "src/fallback/macos.rs",
+    "crates/kache-client/src/stdio_windows.rs",
+    "crates/kache-ipc/src/windows_handles.rs",
+    "crates/kache-ipc/src/windows_process.rs",
+    "crates/kache-ipc/src/windows_security.rs",
+    "crates/kache-ipc/src/windows_msvc.rs",
+    "crates/kache-ipc/src/execution/windows.rs",
+    "crates/kache-ipc/src/execution/windows_client.rs",
+    "src/invocation/windows_broker.rs",
+    "src/invocation/process/windows.rs",
+    "src/daemon_execution_windows.rs",
+    "tests/windows_execution_test.rs",
+]
 # `notice::show`, `notice::show_requested` and `notice::terminal` open the
 # controlling terminal, and the lane has none: `terminal` already returns
 # None (and Windows never compiles a terminal at all), `show` already logs and
@@ -257,6 +274,31 @@ exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # Drive-prefix components are a Windows Path API. The native Windows
+    # tests check client drive selection and invalid per-drive directories.
+    # InvocationEnv's shared resolution and command policy stay in scope.
+    "crates/kache-config/src/invocation.rs:.*InvocationEnv::resolve_drive_relative",
+    # Like join_inflight_download's deadline: observing < versus <= needs
+    # an exact Instant equality. The EOF/exit test covers an alive child
+    # both before and beyond the deadline, including the true/== mutants.
+    "src/probe/mod.rs:.*replace < with <= in run_family_probe_for",
+    # Cargo metadata uses the same deadline comparison after stdout closes.
+    "src/build_intent.rs:.*replace < with <= in run_bounded",
+    # This replacement names the inactive non-Unix terminal stub on Linux.
+    # Keep the real Unix terminal opener and its viable mutations in scope.
+    "src/invocation/io.rs:.*replace process_terminal -> Option<File> with Some\\(Default::default\\(\\)\\)",
+    # These functions are selected only on macOS. Keep creation_mask's Linux
+    # reader and the shared request/descriptor policy in mutation scope.
+    "crates/kache-client/src/creation_mask.rs:.*(native_getter|inherited_mask)( ->|$)",
+    "crates/kache-ipc/src/lib.rs:.*(PeerAuditToken::pid|peer_audit_token)",
+    "src/fallback.rs:.*compiler_peer_unrestricted",
+    "src/compiler/platform.rs:.*MacOsPlatform::codesign",
+    "src/compiler/platform.rs:.*replace <impl Platform for MacOsPlatform>::ensure_binary_loadable -> .* with Ok\\(Default::default\\(\\)\\)",
+    "crates/kache-ipc/src/execution.rs:.*windows_tests::",
+    "crates/kache-protocol/src/execution.rs:.*delete match arm Self::Windows",
+    # interprocess 2.4.4's Unix socket flush is already Ok(()). Socket writes
+    # are unbuffered; the Windows pipe flush stays in its native test job.
+    "crates/kache-ipc/src/execution/unix.rs:.*::flush -> .* with Ok\\(\\(\\)\\)",
     # When another start wins the race, `daemon start` asks the running daemon
     # for its version with a short deadline. A past deadline only drops the
     # version from "already running"; the race is not reproducible in tests.
@@ -384,7 +426,9 @@ exclude_re = [
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",
     "src/cache_fs.rs:.*replace volume_total_bytes_windows",
-    "src/native_link_key.rs:.*replace WindowsProbeEnvironment::augment_from_installed_msvc .* with Ok",
+    # Only the Windows body performs discovery. The non-Windows body is the
+    # constant Ok(()) stub. Snapshot/path/probe validation stays in scope.
+    "src/native_link_key.rs:.*WindowsProbeEnvironment::augment_from_installed_msvc",
     "SqlitePlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
     "crates/kache-store/src/link.rs:.*replace warn_no_cow_restore_once with \\(\\)",
     # Build-script execution cache. The non-Unix `install` is a stub that

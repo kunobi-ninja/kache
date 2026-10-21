@@ -14,6 +14,8 @@ enum Source {
     Process,
     Owned(Arc<Streams>),
     Borrowed(Weak<Streams>),
+    #[cfg(windows)]
+    Windows(Arc<super::windows_broker::Broker>),
 }
 
 struct Streams {
@@ -46,6 +48,18 @@ impl Output {
 }
 
 impl InvocationIo {
+    #[cfg(windows)]
+    pub(crate) fn from_broker(broker: Arc<super::windows_broker::Broker>) -> Self {
+        Self(Source::Windows(broker))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn broker(&self) -> Option<Arc<super::windows_broker::Broker>> {
+        match &self.0 {
+            Source::Windows(broker) => Some(Arc::clone(broker)),
+            _ => None,
+        }
+    }
     /// Preserve inherited streams for standalone calls without captured handles.
     pub(crate) fn process() -> Self {
         Self(Source::Process)
@@ -78,6 +92,8 @@ impl InvocationIo {
             Source::Process => Self::process(),
             Source::Owned(streams) => Self(Source::Borrowed(Arc::downgrade(streams))),
             Source::Borrowed(_) => self.clone(),
+            #[cfg(windows)]
+            Source::Windows(_) => self.clone(),
         }
     }
 
@@ -88,6 +104,10 @@ impl InvocationIo {
             Source::Borrowed(streams) => streams.upgrade().map(Some).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "compiler invocation finished")
             }),
+            #[cfg(windows)]
+            Source::Windows(_) => Err(io::Error::other(
+                "frontend-owned Windows streams require a native IO plan",
+            )),
         }
     }
 
@@ -180,6 +200,11 @@ enum Sink {
     Error,
     File(Arc<Output>),
     Closed,
+    #[cfg(windows)]
+    Windows(
+        Arc<super::windows_broker::Broker>,
+        kache_protocol::execution::windows::Output,
+    ),
 }
 
 pub(crate) struct InvocationWriter(Sink);
@@ -191,6 +216,11 @@ impl Write for InvocationWriter {
             Sink::Error => io::stderr().write(bytes),
             Sink::File(output) => output.with_writer(|file| file.write(bytes)),
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
+            #[cfg(windows)]
+            Sink::Windows(broker, output) => {
+                broker.write(*output, bytes)?;
+                Ok(bytes.len())
+            }
         }
     }
 
@@ -200,6 +230,8 @@ impl Write for InvocationWriter {
             Sink::Error => io::stderr().write_all(bytes),
             Sink::File(output) => output.with_writer(|file| file.write_all(bytes)),
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
+            #[cfg(windows)]
+            Sink::Windows(broker, output) => broker.write(*output, bytes),
         }
     }
 
@@ -209,6 +241,8 @@ impl Write for InvocationWriter {
             Sink::Error => io::stderr().write_fmt(args),
             Sink::File(output) => output.with_writer(|file| file.write_fmt(args)),
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
+            #[cfg(windows)]
+            Sink::Windows(broker, output) => broker.write(*output, args.to_string().as_bytes()),
         }
     }
 
@@ -218,11 +252,20 @@ impl Write for InvocationWriter {
             Sink::Error => io::stderr().flush(),
             Sink::File(output) => output.with_writer(|file| file.flush()),
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
+            #[cfg(windows)]
+            Sink::Windows(broker, output) => broker.flush(*output),
         }
     }
 }
 
 pub(crate) fn stdout() -> InvocationWriter {
+    #[cfg(windows)]
+    if let Some(broker) = current().broker() {
+        return InvocationWriter(Sink::Windows(
+            broker,
+            kache_protocol::execution::windows::Output::Stdout,
+        ));
+    }
     InvocationWriter(match current().streams() {
         Ok(Some(streams)) => Sink::File(Arc::clone(&streams.output)),
         Ok(None) => Sink::Output,
@@ -231,6 +274,13 @@ pub(crate) fn stdout() -> InvocationWriter {
 }
 
 pub(crate) fn stderr() -> InvocationWriter {
+    #[cfg(windows)]
+    if let Some(broker) = current().broker() {
+        return InvocationWriter(Sink::Windows(
+            broker,
+            kache_protocol::execution::windows::Output::Stderr,
+        ));
+    }
     InvocationWriter(match current().streams() {
         Ok(Some(streams)) => Sink::File(Arc::clone(&streams.error)),
         Ok(None) => Sink::Error,
@@ -263,6 +313,13 @@ fn process_terminal() -> Option<File> {
 /// Only inherited-stream executions use this. Captured-output probes and
 /// compiles keep their explicit pipe/null setup and replay through the writers.
 pub(crate) fn status(command: &mut Command) -> io::Result<ExitStatus> {
+    #[cfg(windows)]
+    if current().broker().is_some() {
+        use super::process::CommandExt as _;
+        return command
+            .invocation_spawn_with_io(kache_protocol::execution::windows::Stdio::INHERIT)?
+            .wait();
+    }
     current().configure(command)?;
     super::process::status(command)
 }
@@ -354,6 +411,8 @@ mod tests {
         {
             let _scope = InvocationIoScope::enter(io);
             stdout().write_all(b"request output").unwrap();
+            stdout().flush().unwrap();
+            stderr().flush().unwrap();
         }
         let _late = InvocationIoScope::enter(borrowed);
         let mut received = Vec::new();
@@ -365,6 +424,14 @@ mod tests {
         );
         assert_eq!(
             stderr().write_all(b"late").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            stdout().flush().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            stderr().flush().unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
         assert!(terminal().is_none());

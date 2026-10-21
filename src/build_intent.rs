@@ -373,7 +373,7 @@ fn run_bounded(
     use std::io::Read;
 
     let mut child = command
-        .invocation_spawn_in_group()
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::STDOUT)
         .map_err(|_| DiscoveryFailure::Spawn)?;
     let Some(mut stdout) = child.stdout.take() else {
         return Err(DiscoveryFailure::Spawn);
@@ -1007,6 +1007,40 @@ printf '{"workspace_root":"%s/project","packages":[{"name":"%s"}]}' "$CLIENT_ROO
     #[cfg(unix)]
     fn soon(millis: u64) -> Instant {
         Instant::now() + Duration::from_millis(millis)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_metadata_waits_for_exit_after_stdout_eof_and_enforces_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = fake_cargo(
+            dir.path(),
+            "printf '%s' \"$METADATA_JSON\"\nexec 1>&-\nexec /bin/sleep \"$METADATA_DELAY\"",
+        );
+        let mut env = InvocationEnv::from_parts(
+            [
+                (
+                    "METADATA_JSON",
+                    r#"{"workspace_root":"/workspace","packages":[{"name":"early-eof"}]}"#,
+                ),
+                ("METADATA_DELAY", "1"),
+            ],
+            Some(dir.path().to_owned()),
+            None,
+            dir.path().to_owned(),
+        );
+        let discovered = run_cargo_metadata_for(cargo.as_os_str(), None, soon(3000), &env).unwrap();
+        assert_eq!(discovered.crate_names, ["early-eof"]);
+        assert_eq!(
+            discovered.workspace_root.as_deref(),
+            Some(Path::new("/workspace"))
+        );
+
+        env.set("METADATA_DELAY", "5");
+        assert_eq!(
+            run_cargo_metadata_for(cargo.as_os_str(), None, soon(3000), &env).err(),
+            Some(DiscoveryFailure::Timeout)
+        );
     }
 
     #[cfg(unix)]

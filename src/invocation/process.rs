@@ -1,5 +1,6 @@
 //! Compiler children owned by a cancellable request.
 
+use kache_protocol::execution::windows::{Stdio as ChildIo, Stream as ChildStream};
 use std::cell::RefCell;
 use std::io::{self, Read};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
@@ -101,7 +102,10 @@ pub(crate) fn check() -> io::Result<()> {
 }
 
 struct Running {
+    #[cfg(not(windows))]
     child: std::process::Child,
+    #[cfg(windows)]
+    child: windows::Child,
     controlled: bool,
     status: Option<ExitStatus>,
     #[cfg(unix)]
@@ -287,76 +291,88 @@ impl Drop for Child {
 
 pub(crate) trait CommandExt {
     fn invocation_spawn(&mut self) -> io::Result<Child>;
-    fn invocation_spawn_in_group(&mut self) -> io::Result<Child>;
+    fn invocation_spawn_with_io(&mut self, io: ChildIo) -> io::Result<Child>;
+    fn invocation_spawn_in_group_with_io(&mut self, io: ChildIo) -> io::Result<Child>;
     /// Captured-output compiler commands use null stdin and two output pipes.
     fn invocation_output(&mut self) -> io::Result<Output>;
     /// Collect only streams the caller explicitly configured as pipes.
+    #[cfg(all(test, unix))]
     fn invocation_capture(&mut self) -> io::Result<Output>;
+    fn invocation_capture_with_io(&mut self, io: ChildIo) -> io::Result<Output>;
 }
 
 impl CommandExt for Command {
     fn invocation_spawn(&mut self) -> io::Result<Child> {
-        spawn(self, false)
+        spawn(self, false, None)
     }
 
-    fn invocation_spawn_in_group(&mut self) -> io::Result<Child> {
-        spawn(self, true)
+    fn invocation_spawn_with_io(&mut self, io: ChildIo) -> io::Result<Child> {
+        spawn(self, false, Some(io))
+    }
+
+    fn invocation_spawn_in_group_with_io(&mut self, io: ChildIo) -> io::Result<Child> {
+        spawn(self, true, Some(io))
     }
 
     fn invocation_output(&mut self) -> io::Result<Output> {
-        self.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .invocation_capture()
+        capture(self, Some(ChildIo::OUTPUT))
     }
 
+    #[cfg(all(test, unix))]
     fn invocation_capture(&mut self) -> io::Result<Output> {
-        let mut child = self.invocation_spawn()?;
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        std::thread::scope(|scope| {
-            let running = Arc::clone(&child.running);
-            let out = scope.spawn(move || {
-                let mut bytes = Vec::new();
-                let result = match stdout.as_mut() {
-                    Some(pipe) => pipe.read_to_end(&mut bytes).map(|_| bytes),
-                    None => Ok(bytes),
-                };
-                if result.is_err() {
-                    let _ = running
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .kill();
-                }
-                result
-            });
-            let mut err = Vec::new();
-            let err_result = match stderr.as_mut() {
-                Some(pipe) => pipe.read_to_end(&mut err),
-                None => Ok(0),
-            };
-            if err_result.is_err() {
-                let _ = child.kill();
-            }
-            let out_result = out.join();
-            let status = child.wait();
-            let stdout =
-                out_result.map_err(|_| io::Error::other("child stdout reader panicked"))??;
-            err_result?;
-            Ok(Output {
-                status: status?,
-                stdout,
-                stderr: err,
-            })
-        })
+        capture(self, None)
     }
+
+    fn invocation_capture_with_io(&mut self, io: ChildIo) -> io::Result<Output> {
+        capture(self, Some(io))
+    }
+}
+
+fn capture(command: &mut Command, io: Option<ChildIo>) -> io::Result<Output> {
+    let mut child = spawn(command, false, io)?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    std::thread::scope(|scope| {
+        let running = Arc::clone(&child.running);
+        let out = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            let result = match stdout.as_mut() {
+                Some(pipe) => pipe.read_to_end(&mut bytes).map(|_| bytes),
+                None => Ok(bytes),
+            };
+            if result.is_err() {
+                let _ = running
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .kill();
+            }
+            result
+        });
+        let mut err = Vec::new();
+        let err_result = match stderr.as_mut() {
+            Some(pipe) => pipe.read_to_end(&mut err),
+            None => Ok(0),
+        };
+        if err_result.is_err() {
+            let _ = child.kill();
+        }
+        let out_result = out.join();
+        let status = child.wait();
+        let stdout = out_result.map_err(|_| io::Error::other("child stdout reader panicked"))??;
+        err_result?;
+        Ok(Output {
+            status: status?,
+            stdout,
+            stderr: err,
+        })
+    })
 }
 
 pub(crate) fn status(command: &mut Command) -> io::Result<ExitStatus> {
     command.invocation_spawn()?.wait()
 }
 
-fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
+fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::Result<Child> {
     #[cfg(unix)]
     kache_ipc::jobserver::configure(command);
     let cancellation = CURRENT.with(|slot| slot.borrow().clone());
@@ -367,6 +383,17 @@ fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
         return Err(cancelled());
     }
     let controlled = force_group || request.is_some();
+    if let Some(io) = io {
+        let stream = |mode| match mode {
+            ChildStream::Inherit => Stdio::inherit(),
+            ChildStream::Null => Stdio::null(),
+            ChildStream::Pipe => Stdio::piped(),
+        };
+        command
+            .stdin(stream(io.stdin))
+            .stdout(stream(io.stdout))
+            .stderr(stream(io.stderr));
+    }
     #[cfg(unix)]
     if controlled {
         crate::platform::configure_process_group(command);
@@ -376,11 +403,20 @@ fn spawn(command: &mut Command, force_group: bool) -> io::Result<Child> {
     #[cfg(unix)]
     let descriptor_admission = kache_ipc::descriptors::spawn_guard();
     #[cfg(windows)]
-    let (mut child, tree) = if controlled {
-        let (child, job) = windows::spawn(command)?;
+    let (mut child, tree) = if let Some(broker) = crate::invocation::io::current().broker() {
+        let (id, pid, handles) = broker.spawn(
+            command,
+            io.ok_or_else(|| {
+                io::Error::other("delegated compiler command requires an explicit IO plan")
+            })?,
+        )?;
+        let (child, job) = windows::Child::remote(id, pid, handles, broker);
         (child, Some(job))
+    } else if controlled {
+        let (child, job) = windows::spawn(command)?;
+        (windows::Child::local(child), Some(job))
     } else {
-        (command.spawn()?, None)
+        (windows::Child::local(command.spawn()?), None)
     };
     #[cfg(not(windows))]
     let mut child = command.spawn()?;
@@ -446,7 +482,7 @@ mod tests {
     #[cfg(unix)]
     fn shell(script: &str) -> Command {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", script]);
+        command.args(["-c", script]).env("PATH", env!("PATH"));
         command
     }
 
@@ -474,7 +510,7 @@ mod tests {
         std::thread::scope(|threads| {
             let first_worker = threads.spawn(|| {
                 let _scope = CancellationScope::enter(Some(first.clone()));
-                let output = shell("printf 'a-start\\n'; (/bin/sleep 4; printf 'a-descendant\\n') & printf ready > \"$READY\"; wait; printf 'a-end\\n'")
+                let output = shell("printf 'a-start\\n'; (sleep 4; printf 'a-descendant\\n') & printf ready > \"$READY\"; wait; printf 'a-end\\n'")
                     .env("READY", &ready_a).invocation_output().unwrap();
                 assert!(!output.status.success());
                 assert_eq!(output.stdout, b"a-start\n");
@@ -483,7 +519,7 @@ mod tests {
             });
             let second_worker = threads.spawn(|| {
                 let _scope = CancellationScope::enter(Some(second.clone()));
-                shell("printf ready > \"$READY\"; i=0; while [ ! -e \"$RELEASE\" ] && [ $i -lt 40 ]; do /bin/sleep .1; i=$((i+1)); done; printf 'b-output\\n'; printf 'b-error\\n' >&2; exit 7")
+                shell("printf ready > \"$READY\"; i=0; while [ ! -e \"$RELEASE\" ] && [ $i -lt 40 ]; do sleep .1; i=$((i+1)); done; printf 'b-output\\n'; printf 'b-error\\n' >&2; exit 7")
                     .env("READY", &ready_b).env("RELEASE", &release_b).invocation_output().unwrap()
             });
             wait_for_file(&ready_a);
@@ -525,6 +561,103 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn child_id_matches_the_native_process_before_and_after_reaping() {
+        let _scope = CancellationScope::enter(Some(Cancellation::default()));
+        let mut child = shell("printf '%s\\n' \"$$\"; exit 23")
+            .stdout(Stdio::piped())
+            .invocation_spawn()
+            .unwrap();
+        let reported_id = child.id();
+        assert_eq!(child.wait().unwrap().code(), Some(23));
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        let native_id: u32 = output.trim().parse().unwrap();
+        assert!(native_id > 1);
+        assert_eq!(reported_id, native_id);
+        assert_eq!(child.id(), native_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_an_uncontrolled_child_leaves_it_running() {
+        use std::io::Write;
+
+        let _scope = CancellationScope::enter(None);
+        let root = tempfile::tempdir().unwrap();
+        let finished = root.path().join("finished");
+        let mut child = shell(
+            "IFS= read -r line; [ \"$line\" = release ] || exit 39; printf survived > \"$FINISHED\"; exit 17",
+        )
+        .env("FINISHED", &finished)
+        .stdin(Stdio::piped())
+        .invocation_spawn()
+        .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Retain the native owner so the test can reap it after the wrapper drops.
+        let running = Arc::clone(&child.running);
+        drop(child);
+        let release = writeln!(stdin, "release");
+        drop(stdin);
+        let status = running.lock().unwrap().child.wait();
+        release.unwrap();
+        assert_eq!(status.unwrap().code(), Some(17));
+        assert_eq!(std::fs::read(&finished).unwrap(), b"survived");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waiting_for_an_externally_reaped_child_returns_an_error() {
+        let mut fixture = crate::platform::host_spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "invocation::process::tests::externally_reaped_child_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if fixture.try_wait().unwrap().is_some() {
+                let output = fixture.wait_with_output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(5) {
+                fixture.kill().unwrap();
+                let output = fixture.wait_with_output().unwrap();
+                panic!("wait retried an unrecoverable error: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture for bounded native wait-error coverage"]
+    fn externally_reaped_child_fixture() {
+        let _scope = CancellationScope::enter(None);
+        let mut child = shell("exit 7").invocation_spawn().unwrap();
+        assert_eq!(
+            child.running.lock().unwrap().child.wait().unwrap().code(),
+            Some(7)
+        );
+        assert_eq!(
+            child.try_wait().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn polling_a_running_child_does_not_record_a_memory_sample() {
         let root = tempfile::tempdir().unwrap();
         let ready = root.path().join("ready");
@@ -532,7 +665,7 @@ mod tests {
         let _counts = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
         let _cancel = CancellationScope::enter(Some(Cancellation::default()));
         let mut child = shell(
-            "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do /bin/sleep .01; done; exit 6",
+            "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do sleep .01; done; exit 6",
         )
         .env("READY", &ready)
         .env("RELEASE", &release)
@@ -562,7 +695,7 @@ mod tests {
         let token = Cancellation::default();
         let _scope = CancellationScope::enter(Some(token.clone()));
         let started = std::time::Instant::now();
-        let child = shell("exec /bin/sleep 4").invocation_spawn().unwrap();
+        let child = shell("exec sleep 4").invocation_spawn().unwrap();
         let pid = child.id();
         drop(child);
         assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 0);
@@ -589,7 +722,7 @@ mod tests {
         std::thread::scope(|threads| {
             let worker = threads.spawn(|| {
                 let _scope = CancellationScope::enter(Some(token.clone()));
-                status(shell("printf ready > \"$READY\"; exec /bin/sleep 4").env("READY", &ready))
+                status(shell("printf ready > \"$READY\"; exec sleep 4").env("READY", &ready))
                     .unwrap()
             });
             wait_for_file(&ready);
@@ -611,7 +744,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(9));
         assert_eq!(output.stdout, b"\xffout");
         assert_eq!(output.stderr, b"\xfeerr");
-        let mut child = shell("exec /bin/cat >/dev/null")
+        let mut child = shell("exec cat >/dev/null")
             .stdin(Stdio::piped())
             .invocation_spawn()
             .unwrap();

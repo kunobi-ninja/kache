@@ -161,67 +161,20 @@ fn receive_with(
             return Err(error);
         }
     };
-    let mut files = Vec::with_capacity(expected);
-    let filled = (message.msg_controllen as usize).min(size_of_val(&storage));
-    let header_size = unsafe { libc::CMSG_LEN(0) } as usize;
-    let mut offset = 0usize;
-    let mut invalid = false;
-    while filled.saturating_sub(offset) >= size_of::<libc::cmsghdr>() {
-        let header = unsafe {
-            storage
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset)
-                .cast::<libc::cmsghdr>()
-                .read_unaligned()
-        };
-        let length: usize = header.cmsg_len as _;
-        if length < header_size {
-            invalid = true;
-            break;
-        }
-        let remaining = filled - offset;
-        // Darwin leaves cmsg_len untruncated under MSG_CTRUNC. Only the bytes
-        // actually copied into our control buffer can contain received fds.
-        let bounded = length.min(remaining);
-        invalid |= length > remaining;
-        let payload = bounded.saturating_sub(header_size);
-        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
-            invalid |= !payload.is_multiple_of(size_of::<libc::c_int>());
-            let data = unsafe {
-                storage
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(offset + header_size)
-                    .cast::<libc::c_int>()
-            };
-            for index in 0..payload / size_of::<libc::c_int>() {
-                let fd = unsafe { data.add(index).read_unaligned() };
-                if fd < 0 {
-                    invalid = true;
-                    continue;
-                }
-                files.push(unsafe { OwnedFd::from_raw_fd(fd) });
-            }
-        } else {
-            invalid = true;
-        }
-        if length > remaining {
-            break;
-        }
-        let step = unsafe { libc::CMSG_SPACE((length - header_size) as u32) } as usize;
-        if step == 0 || step > remaining {
-            break;
-        }
-        offset += step;
-    }
+    let (descriptors, invalid) = parse_control(&storage, message.msg_controllen as usize);
+    // recvmsg transfers a distinct owned descriptor for each SCM_RIGHTS item.
+    // Own all of them before rejecting the packet or setting close-on-exec.
+    let files = descriptors
+        .into_iter()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .collect::<Vec<_>>();
     // The guard also covers test-induced pauses in the non-atomic interval.
     admitted();
     for file in &files {
         let current = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        if current < 0
+        if current == -1
             || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, current | libc::FD_CLOEXEC) }
-                < 0
+                == -1
         {
             return Err(io::Error::last_os_error());
         }
@@ -241,6 +194,50 @@ fn receive_with(
     Ok(files)
 }
 
+/// Read the initialized control buffer without taking ownership of its fds.
+/// Padding and truncated records never extend the accessible byte slice.
+fn parse_control(storage: &[usize], filled: usize) -> (Vec<libc::c_int>, bool) {
+    // usize has no invalid representations; every byte in storage is initialized.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), size_of_val(storage)) };
+    let mut control = &bytes[..filled.min(bytes.len())];
+    let header_size = unsafe { libc::CMSG_LEN(0) } as usize;
+    let mut descriptors = Vec::new();
+    let mut invalid = false;
+    while control.len() >= size_of::<libc::cmsghdr>() {
+        let header = unsafe { control.as_ptr().cast::<libc::cmsghdr>().read_unaligned() };
+        let length: usize = header.cmsg_len as _;
+        if length < header_size {
+            invalid = true;
+            break;
+        }
+        // Darwin leaves cmsg_len untruncated under MSG_CTRUNC. Only the bytes
+        // actually copied into our control buffer can contain received fds.
+        let bounded = length.min(control.len());
+        invalid |= length > control.len();
+        let payload = bounded.saturating_sub(header_size);
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            invalid |= !payload.is_multiple_of(size_of::<libc::c_int>());
+            for bytes in control[header_size..bounded]
+                .as_chunks::<{ size_of::<libc::c_int>() }>()
+                .0
+            {
+                let fd = libc::c_int::from_ne_bytes(*bytes);
+                if fd < 0 {
+                    invalid = true;
+                    continue;
+                }
+                descriptors.push(fd);
+            }
+        } else {
+            invalid = true;
+        }
+        let step = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+        control = control.get(step..).unwrap_or_default();
+    }
+    (descriptors, invalid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +247,225 @@ mod tests {
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     const TICKET: [u8; 16] = [7; 16];
+
+    fn control_record(level: libc::c_int, kind: libc::c_int, payload: &[u8]) -> Vec<u8> {
+        let length = unsafe { libc::CMSG_SPACE(payload.len() as u32) } as usize;
+        let mut bytes = vec![0; length];
+        unsafe {
+            let header = bytes.as_mut_ptr().cast::<libc::cmsghdr>();
+            std::ptr::addr_of_mut!((*header).cmsg_len)
+                .write_unaligned(libc::CMSG_LEN(payload.len() as u32) as _);
+            std::ptr::addr_of_mut!((*header).cmsg_level).write_unaligned(level);
+            std::ptr::addr_of_mut!((*header).cmsg_type).write_unaligned(kind);
+        }
+        let start = unsafe { libc::CMSG_LEN(0) } as usize;
+        bytes[start..start + payload.len()].copy_from_slice(payload);
+        bytes
+    }
+
+    fn control_words(bytes: &[u8]) -> Vec<usize> {
+        let mut storage = vec![0; bytes.len().div_ceil(size_of::<usize>())];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                storage.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        storage
+    }
+
+    fn parse_records(bytes: &[u8]) -> (Vec<libc::c_int>, bool) {
+        parse_control(&control_words(bytes), bytes.len())
+    }
+
+    fn rights(descriptors: &[libc::c_int]) -> Vec<u8> {
+        let payload = descriptors
+            .iter()
+            .flat_map(|fd| fd.to_ne_bytes())
+            .collect::<Vec<_>>();
+        control_record(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload)
+    }
+
+    #[test]
+    fn control_records_preserve_zero_and_positive_descriptors_in_order() {
+        let record = rights(&[0, 5, 19]);
+        assert_eq!(parse_records(&record), (vec![0, 5, 19], false));
+        assert_eq!(parse_records(&rights(&[0, 5])), (vec![0, 5], false));
+        assert_eq!(parse_control(&[], usize::MAX), (vec![], false));
+        let storage = control_words(&record);
+        assert_eq!(parse_control(&storage, 0), (vec![], false));
+        assert_eq!(
+            parse_control(&storage, usize::MAX),
+            (vec![0, 5, 19], false),
+            "the reported size cannot extend beyond initialized storage"
+        );
+    }
+
+    #[test]
+    fn control_records_distinguish_short_and_empty_headers() {
+        let header_size = unsafe { libc::CMSG_LEN(0) } as usize;
+        for length in [0, header_size - 1] {
+            let mut record = rights(&[]);
+            unsafe {
+                std::ptr::addr_of_mut!((*record.as_mut_ptr().cast::<libc::cmsghdr>()).cmsg_len)
+                    .write_unaligned(length as _);
+            }
+            assert_eq!(parse_records(&record), (vec![], true), "length={length}");
+        }
+        assert_eq!(parse_records(&rights(&[])), (vec![], false));
+        assert!(
+            parse_records(&rights(&[9])[..size_of::<libc::cmsghdr>() - 1])
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unrecognized_control_records_do_not_hide_later_descriptors() {
+        for (level, kind) in [
+            (libc::SOL_SOCKET + 1, libc::SCM_RIGHTS),
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS + 1),
+            (libc::SOL_SOCKET + 1, libc::SCM_RIGHTS + 1),
+        ] {
+            let mut bytes = control_record(level, kind, &17i32.to_ne_bytes());
+            bytes.extend(rights(&[0, 7]));
+            assert_eq!(parse_records(&bytes), (vec![0, 7], true));
+        }
+    }
+
+    #[test]
+    fn partial_control_payloads_retain_every_complete_descriptor() {
+        for payload in [
+            vec![0xff],
+            [0i32.to_ne_bytes().as_slice(), &[0xff]].concat(),
+        ] {
+            let mut bytes = control_record(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload);
+            bytes.extend(rights(&[11]));
+            let expected = if payload.len() == 1 {
+                vec![11]
+            } else {
+                vec![0, 11]
+            };
+            assert_eq!(parse_records(&bytes), (expected, true));
+        }
+        let mut bytes = rights(&[-1, 0, -7, 13]);
+        bytes.extend(rights(&[23]));
+        assert_eq!(parse_records(&bytes), (vec![0, 13, 23], true));
+    }
+
+    #[test]
+    fn untruncated_control_lengths_only_read_the_delivered_bytes() {
+        let mut bytes = rights(&[0, 17]);
+        let actual = unsafe { libc::CMSG_LEN(8) } as usize;
+        bytes.truncate(actual);
+        unsafe {
+            std::ptr::addr_of_mut!((*bytes.as_mut_ptr().cast::<libc::cmsghdr>()).cmsg_len)
+                .write_unaligned((actual + 64) as _);
+        }
+        assert_eq!(parse_records(&bytes), (vec![0, 17], true));
+        bytes.truncate(actual - 1);
+        assert_eq!(parse_records(&bytes), (vec![0], true));
+    }
+
+    #[test]
+    fn aligned_control_records_are_visited_once_without_reading_padding() {
+        let mut bytes = rights(&[0]);
+        let first_length = unsafe { libc::CMSG_LEN(4) } as usize;
+        bytes[first_length..].fill(0xff);
+        bytes.extend(rights(&[5, 19]));
+        bytes.extend(rights(&[23]));
+        assert_eq!(parse_records(&bytes), (vec![0, 5, 19, 23], false));
+    }
+
+    #[test]
+    fn a_full_nonblocking_send_queue_returns_its_error_without_retrying() {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let packet = [0; PACKET_BYTES];
+        let full_error = loop {
+            match sender.send(&packet) {
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::ENOBUFS) =>
+                {
+                    break error.raw_os_error();
+                }
+                Err(error) => panic!("filling datagram queue: {error}"),
+            }
+        };
+        let source = tempfile::tempfile().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|threads| {
+            threads.spawn(|| {
+                result_tx
+                    .send(send(sender.as_fd(), &TICKET, &[source.as_fd()]))
+                    .unwrap();
+            });
+            match result_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Release an erroneous retry loop so it fails its assertion.
+                    let mut packet = [0; PACKET_BYTES];
+                    while receiver.recv(&mut packet).is_ok() {}
+                    result_rx
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap()
+                }
+                Err(error) => panic!("descriptor sender ended without a result: {error}"),
+            }
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), full_error);
+    }
+
+    #[test]
+    fn invalid_packet_headers_and_truncation_close_received_descriptors() {
+        for variant in ["marker", "short", "truncated"] {
+            let (sender, receiver) = UnixDatagram::pair().unwrap();
+            let (writer, mut reader) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut ticket = TICKET;
+            ticket[15] = 0;
+            let mut packet = vec![MARKER];
+            packet.extend_from_slice(&ticket);
+            match variant {
+                "marker" => packet[0] = b'X',
+                "short" => {
+                    packet.pop();
+                }
+                "truncated" => packet.push(0xff),
+                _ => unreachable!(),
+            }
+            let control = rights(&[writer.as_raw_fd()]);
+            let mut storage = control_words(&control);
+            let mut vector = libc::iovec {
+                iov_base: packet.as_mut_ptr().cast(),
+                iov_len: packet.len(),
+            };
+            let mut message: libc::msghdr = unsafe { zeroed() };
+            message.msg_iov = &mut vector;
+            message.msg_iovlen = 1;
+            message.msg_control = storage.as_mut_ptr().cast();
+            message.msg_controllen = control.len() as _;
+            assert_eq!(
+                unsafe { libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
+                packet.len() as isize
+            );
+            assert_eq!(
+                receive(receiver.as_fd(), &ticket, 1).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{variant}"
+            );
+            drop(writer);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty(), "{variant}");
+        }
+    }
 
     #[test]
     fn transferred_files_are_owned_close_on_exec_and_share_their_open_description() {
@@ -317,6 +533,34 @@ mod tests {
             receive(stream.as_fd(), &TICKET, 1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn an_empty_nonblocking_socket_returns_would_block_without_waiting_for_a_sender() {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let (file, _other) = UnixStream::pair().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|threads| {
+            threads.spawn(move || {
+                result_tx
+                    .send(receive(receiver.as_fd(), &TICKET, 1))
+                    .unwrap();
+            });
+            match result_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Unblock an erroneous retry loop, so this regression
+                    // fails with a result instead of leaving a busy worker.
+                    send(sender.as_fd(), &TICKET, &[file.as_fd()]).unwrap();
+                    result_rx
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap()
+                }
+                Err(error) => panic!("descriptor receiver ended without a result: {error}"),
+            }
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]

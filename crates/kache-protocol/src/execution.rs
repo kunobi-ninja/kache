@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 
+pub mod windows;
+
 pub const EXECUTION_VERSION: u32 = 1;
 
 /// Native strings retain Unix bytes or Windows UTF-16, including values that
@@ -118,6 +120,9 @@ pub enum ExecutionChannels {
         stdin: u64,
         stdout: u64,
         stderr: u64,
+        /// Native children and console writes remain in the original client.
+        #[serde(default)]
+        process_broker: bool,
     },
 }
 
@@ -141,6 +146,10 @@ pub enum ExecutionReply {
     },
     Failed {
         message: String,
+    },
+    /// Windows launches native children in the client's security/console context.
+    WindowsControl {
+        command: windows::Command,
     },
 }
 
@@ -198,6 +207,41 @@ mod tests {
         assert!(!debug.contains("TOKEN"));
         assert!(debug.contains("argv_count: 2"));
         assert!(debug.contains("env_count: 1"));
+        let envelope = crate::Request::ExecuteV1(Box::new(request));
+        assert_eq!(envelope.client_version(), Some("fixture"));
+        assert!(!envelope.is_build_activity());
+        assert_eq!(crate::Request::Health.client_version(), None);
+        assert!(
+            crate::Request::CompileFinished(crate::CompileFinishedRequest {
+                pid: 42,
+                started_at_ms: 123,
+            })
+            .is_build_activity()
+        );
+    }
+
+    #[test]
+    fn native_string_errors_explain_why_a_request_cannot_be_transferred() {
+        assert_eq!(
+            NativeStringError::ForeignEncoding.to_string(),
+            "native string encoding belongs to another platform"
+        );
+        assert_eq!(
+            NativeStringError::Nul.to_string(),
+            "native string contains a NUL"
+        );
+    }
+
+    #[test]
+    fn descriptor_ticket_debug_keeps_the_endpoint_and_redacts_the_one_use_key() {
+        let ticket = DescriptorTicket {
+            endpoint: NativeString::capture("descriptor-endpoint".as_ref()),
+            key: [173; 16],
+        };
+        let debug = format!("{ticket:?}");
+        assert!(debug.starts_with("DescriptorTicket"));
+        assert!(debug.contains("endpoint"));
+        assert!(!debug.contains("173"));
     }
 
     #[test]

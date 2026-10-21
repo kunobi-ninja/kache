@@ -7786,7 +7786,7 @@ fn linked_dwarf_archive_stays_path_bound() {
     assert_ne!(linked, hash_in("b", &dwarf, StaticLibUse::Linked));
     // The unqualified method is the linked reading.
     assert_eq!(
-        fh.hash_static_lib(&dir.path().join("a/libprobe.a"))
+        fh.hash_static_lib(&dir.path().join("a").join("libprobe.a"))
             .unwrap(),
         linked
     );
@@ -8790,18 +8790,23 @@ fn build_tree_roots_are_the_target_dir_and_the_workspace() {
 
 #[test]
 fn build_tree_roots_read_the_unit_out_dir_and_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
     let args = RustcArgs::parse(&[
         "rustc".to_string(),
         "src/main.rs".to_string(),
         "--out-dir".to_string(),
-        "/w/target/x86_64-unknown-linux-gnu/debug/deps".to_string(),
+        target
+            .join("x86_64-unknown-linux-gnu/debug/deps")
+            .to_string_lossy()
+            .into_owned(),
         "--target".to_string(),
         "x86_64-unknown-linux-gnu".to_string(),
     ])
     .unwrap();
     assert_eq!(
         build_tree_roots(&args).first(),
-        Some(&PathBuf::from("/w/target")),
+        Some(&target),
         "the target dir comes from --out-dir and --target"
     );
 }
@@ -16856,28 +16861,36 @@ fn a_guarded_record_is_refused_when_the_tree_changed() {
 #[cfg(unix)]
 #[test]
 fn clippy_identity_reads_the_snapshot() {
-    let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let driver = dir.path().join("clippy-driver");
     kache_fs::testutil::write_executable(
         &driver,
-        "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
+        "#!/bin/sh\nread -r expected < clippy-version\n[ \"$expected\" = \"$CLIENT_VERSION\" ] || exit 17\nprintf '%s\\n' \"$CLIENT_VERSION\"\n",
     );
     let member = dir.path().join("member");
     std::fs::create_dir_all(&member).unwrap();
     std::fs::write(member.join("clippy.toml"), "msrv = \"1.70\"\n").unwrap();
-
-    let from_manifest = clippy_identity(
-        &driver,
-        &KeyEnv::from_parts(
+    let other_member = dir.path().join("other-member");
+    std::fs::create_dir_all(&other_member).unwrap();
+    let other_config = "msrv = \"1.80\"\n";
+    std::fs::write(other_member.join("clippy.toml"), other_config).unwrap();
+    let invocation = |cwd: &Path, version: &str| {
+        std::fs::write(cwd.join("clippy-version"), format!("{version}\n")).unwrap();
+        InvocationEnv::from_parts(
             [
-                ("CARGO_MANIFEST_DIR", member.as_os_str()),
-                ("CLIPPY_ARGS", OsStr::new("-Dwarnings")),
+                ("CLIENT_VERSION", std::ffi::OsString::from(version)),
+                ("KACHE_CACHE_DIR", cwd.join("cache").into_os_string()),
             ],
+            Some(cwd.to_owned()),
             None,
-        ),
-    )
-    .unwrap();
+            cwd.to_owned(),
+        )
+    };
+    let mut first = invocation(dir.path(), "clippy 0.1.98 (abc 2026-09-01)");
+    first.set("CARGO_MANIFEST_DIR", "member");
+    first.set("CLIPPY_ARGS", "-Dwarnings");
+    let first_key = KeyEnv::from_invocation(&first);
+    let from_manifest = clippy_identity_for(&driver, &first_key, &first).unwrap();
     assert!(
         from_manifest.starts_with("clippy 0.1.98"),
         "{from_manifest}"
@@ -16891,14 +16904,73 @@ fn clippy_identity_reads_the_snapshot() {
         "{from_manifest}"
     );
 
-    // With no manifest dir, the search starts at the working directory.
-    let from_cwd = clippy_identity(
-        &driver,
-        &KeyEnv::from_parts([] as [(&str, &str); 0], Some(member.clone())),
-    )
-    .unwrap();
-    assert!(from_cwd.contains("config:clippy.toml:"), "{from_cwd}");
+    let second = invocation(&other_member, "clippy 0.1.99 (def 2026-10-01)");
+    let from_cwd =
+        clippy_identity_for(&driver, &KeyEnv::from_invocation(&second), &second).unwrap();
+    assert!(from_cwd.starts_with("clippy 0.1.99"), "{from_cwd}");
+    assert!(
+        from_cwd.contains(&format!(
+            "config:clippy.toml:{}",
+            blake3::hash(other_config.as_bytes()).to_hex()
+        )),
+        "{from_cwd}"
+    );
     assert!(from_cwd.contains("CLIPPY_ARGS unset"), "{from_cwd}");
+    assert_eq!(
+        clippy_identity_for(&driver, &first_key, &first).unwrap(),
+        from_manifest
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn libc_probes_use_the_clients_programs_and_expected_family() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("client-marker"), "").unwrap();
+    let script = |name: &str, body: &str| {
+        let prefix = "#!/bin/sh\n[ -f client-marker ] && [ \"$LC_ALL\" = C ] && [ \"$LANG\" = C ] || exit 41\n";
+        kache_fs::testutil::write_executable(&root.path().join(name), format!("{prefix}{body}"));
+    };
+    script(
+        "getconf",
+        "[ \"$1\" = GNU_LIBC_VERSION ] || exit 42\nprintf 'glibc %s\\n' \"$GNU_VERSION\"\nexit \"${GNU_PROBE_EXIT:-0}\"\n",
+    );
+    script(
+        "ldd",
+        "[ \"$1\" = --version ] || exit 43\nprintf 'musl libc\\nVersion %s\\n' \"$MUSL_VERSION\" >&2\nexit 1\n",
+    );
+    let client = InvocationEnv::from_parts(
+        [
+            ("PATH", root.path().as_os_str().to_owned()),
+            ("GNU_VERSION", "2.37".into()),
+            ("MUSL_VERSION", "1.2.5".into()),
+            ("LC_ALL", "client-locale".into()),
+            ("LANG", "client-locale".into()),
+        ],
+        Some(root.path().to_owned()),
+        None,
+        root.path().to_owned(),
+    );
+    assert_eq!(
+        probe_linux_libc_signature_for(LinuxLibcFamily::Gnu, &client).unwrap(),
+        "2.37"
+    );
+    assert_eq!(
+        probe_linux_libc_signature_for(LinuxLibcFamily::Musl, &client).unwrap(),
+        "1.2.5"
+    );
+    let mut other = client.clone();
+    other.set("GNU_VERSION", "2.40");
+    assert_eq!(
+        probe_linux_libc_signature_for(LinuxLibcFamily::Gnu, &other).unwrap(),
+        "2.40"
+    );
+    other.set("GNU_PROBE_EXIT", "1");
+    assert!(probe_linux_libc_signature_for(LinuxLibcFamily::Gnu, &other).is_err());
+    assert_eq!(
+        probe_linux_libc_signature_for(LinuxLibcFamily::Gnu, &client).unwrap(),
+        "2.37"
+    );
 }
 
 #[cfg(target_os = "linux")]

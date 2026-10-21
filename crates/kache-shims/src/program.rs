@@ -46,3 +46,56 @@ pub fn resolve_program_on_path_with(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_paths_do_not_require_a_search_path() {
+        for program in ["tools/compiler", r"tools\compiler.exe"] {
+            assert_eq!(
+                resolve_program_on_path_with(program, None, None),
+                Some(program.into())
+            );
+        }
+        assert_eq!(resolve_program_on_path_with("compiler", None, None), None);
+    }
+
+    #[test]
+    fn supplied_path_selects_the_first_executable_and_never_the_process_path() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = [root.path().join("first"), root.path().join("second")];
+        for dir in &dirs {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let file_name = if cfg!(windows) {
+            "test-driver.exe"
+        } else {
+            "test-driver"
+        };
+        for dir in &dirs {
+            let path = dir.join(file_name);
+            std::fs::write(&path, b"fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let path = std::env::join_paths(&dirs).unwrap();
+        assert_eq!(
+            resolve_program_on_path_with("test-driver", Some(&path), None),
+            Some(dirs[0].join(file_name))
+        );
+        std::fs::remove_file(dirs[0].join(file_name)).unwrap();
+        assert_eq!(
+            resolve_program_on_path_with("test-driver", Some(&path), None),
+            Some(dirs[1].join(file_name))
+        );
+        assert_eq!(
+            resolve_program_on_path_with("missing-driver", Some(&path), None),
+            None
+        );
+    }
+}

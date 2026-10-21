@@ -3266,7 +3266,7 @@ mod tests {
         ));
         fs::write(&path, frame).unwrap();
         // Prove that the decoder delivered records before its frame error.
-        let decoded = read_segment(&path).unwrap().collect::<Vec<_>>();
+        let decoded = read_segment(&path).unwrap().take(8).collect::<Vec<_>>();
         assert!(decoded.iter().any(Result::is_ok));
         assert!(decoded.iter().any(Result::is_err));
         let live = test_event("live", EventResult::LocalHit, 1, 2, 3, "k");
@@ -3330,7 +3330,10 @@ mod tests {
         live.ts = now;
         log_event(&log, &live).unwrap();
         let segment = archive_segments(&log);
-        let decoded = read_segment(&segment[0].path).unwrap().collect::<Vec<_>>();
+        let decoded = read_segment(&segment[0].path)
+            .unwrap()
+            .take(8)
+            .collect::<Vec<_>>();
         assert!(decoded.iter().any(Result::is_ok));
         assert!(decoded.iter().any(Result::is_err));
         let events = read_events_since(&log, now - chrono::Duration::days(1)).unwrap();

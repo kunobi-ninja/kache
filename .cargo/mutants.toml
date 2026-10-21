@@ -514,6 +514,6 @@ exclude_re = [
     " in offer_target_recovery$",
     # Windows startup releases its inherited cwd; native compiler acceptance
     # checks directory removal while the daemon stays alive.
-    " in release_daemon_working_directory$",
+    "release_daemon_working_directory",
 
 ]

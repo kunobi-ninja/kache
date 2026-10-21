@@ -100,6 +100,72 @@ class Policy(unittest.TestCase):
             )
 
 
+class SeedBinaries(unittest.TestCase):
+    def stage_producer(self, root, binary, **inputs):
+        args = SimpleNamespace(
+            mode="seed", root=root / "measurement", output=root / "result",
+            binary=binary, **inputs,
+        )
+        with patch.object(q, "environment", side_effect=RuntimeError("staging complete")):
+            with patch.object(q.subprocess, "run", side_effect=AssertionError(
+                "staging must not query the checkout or execute supplied binaries"
+            )):
+                with self.assertRaisesRegex(RuntimeError, "staging complete"):
+                    q.measure_inner(args, None, "a" * 40)
+        return args.root / "bundle"
+
+    def test_local_legacy_input_keeps_exact_custom_file_and_ignores_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chosen = root / "older-custom-build"
+            chosen.write_bytes(b"chosen legacy revision")
+            (root / "kache").write_bytes(b"different canonical frontend")
+            (root / "kache-engine").write_bytes(b"unrelated newer engine")
+            bundle = self.stage_producer(root, chosen)
+            self.assertEqual({path.name for path in bundle.iterdir()}, {"kache", "remote"})
+            self.assertEqual((bundle / "kache").read_bytes(), chosen.read_bytes())
+            self.assertEqual((bundle / "kache").stat().st_mode & 0o777, 0o755)
+
+    def test_producer_stages_the_explicit_pair_instead_of_canonical_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chosen = root / "custom-frontend"
+            engine = root / "custom-engine"
+            chosen.write_bytes(b"chosen frontend")
+            engine.write_bytes(b"matching engine")
+            (root / "kache").write_bytes(b"other frontend")
+            (root / "kache-engine").write_bytes(b"stale engine")
+            bundle = self.stage_producer(root, chosen, engine=engine)
+            self.assertEqual((bundle / "kache").read_bytes(), chosen.read_bytes())
+            self.assertEqual((bundle / "kache-engine").read_bytes(), engine.read_bytes())
+            for name in ("kache", "kache-engine"):
+                self.assertEqual((bundle / name).stat().st_mode & 0o777, 0o755)
+
+    def test_explicit_missing_engine_fails_without_borrowing_a_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chosen = root / "custom-frontend"
+            chosen.write_bytes(b"frontend")
+            (root / "kache-engine").write_bytes(b"stale engine")
+            with self.assertRaises(FileNotFoundError):
+                q.stage_seed_binaries(chosen, root / "bundle", root / "missing-engine")
+
+    def test_experiment_cli_retains_explicit_inputs_and_optional_engine(self):
+        for engine in (None, "/build/custom-engine"):
+            argv = [
+                "qualification", "experiment", "--binary", "/old/custom-build",
+                "--revision", "a" * 40,
+            ]
+            if engine is not None:
+                argv += ["--engine", engine]
+            with patch.object(sys, "argv", argv), patch.object(q, "experiment") as run:
+                q.main()
+            args = run.call_args.args[0]
+            self.assertEqual(args.binary, Path("/old/custom-build"))
+            self.assertEqual(args.revision, "a" * 40)
+            self.assertEqual(args.engine, Path(engine) if engine else None)
+
+
 class Integrity(unittest.TestCase):
     def test_local_experiment_seed_is_rejected_by_ci(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,6 +216,46 @@ class Integrity(unittest.TestCase):
                     tar.add(path, arcname=path.name)
             with self.assertRaisesRegex(ValueError, "hash mismatch"):
                 q.unpack(archive, root / "bad")
+
+    def test_paired_archive_restores_execute_bits_and_rejects_engine_tampering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frontend, engine = root / "frontend", root / "engine"
+            frontend.write_bytes(b"frontend bytes")
+            engine.write_bytes(b"matching engine bytes")
+            bundle = root / "bundle"
+            q.stage_seed_binaries(frontend, bundle, engine)
+            remote = bundle / "remote"
+            remote.mkdir()
+            (remote / "kache-engine").write_bytes(b"remote data, not an entrypoint")
+            manifest = {
+                "project": q.PROJECT,
+                "toolchain": q.TOOLCHAIN,
+                "trusted_push": True,
+                "files": q.files(bundle),
+            }
+            q.dump(bundle / "manifest.json", manifest)
+            archive = root / "seed.tar.gz"
+
+            def pack():
+                with tarfile.open(archive, "w:gz") as tar:
+                    for path in bundle.iterdir():
+                        tar.add(path, arcname=path.name)
+
+            pack()
+            restored = root / "consumer"
+            self.assertEqual(q.unpack(archive, restored), manifest)
+            self.assertEqual(q.files(restored), manifest["files"])
+            for name, expected in (("kache", frontend), ("kache-engine", engine)):
+                self.assertEqual((restored / name).read_bytes(), expected.read_bytes())
+                self.assertEqual((restored / name).stat().st_mode & 0o777, 0o755)
+            self.assertEqual((restored / "remote/kache-engine").stat().st_mode & 0o111, 0)
+
+            (bundle / "kache-engine").write_bytes(b"tampered engine")
+            pack()
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                q.unpack(archive, root / "corrupt")
+            self.assertEqual((root / "corrupt/kache-engine").stat().st_mode & 0o111, 0)
 
     def test_archive_traversal_and_links_are_rejected(self):
         for name, kind in (

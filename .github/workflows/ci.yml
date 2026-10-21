@@ -1028,7 +1028,16 @@ jobs:
           cargo test -p kache --test integration_test test_rust_restored_outputs_allow_build_without_wrapper
           cargo test -p kache-fs --all-features
           cargo test -p kache-store --lib
-          cargo test -p kache --bins -- store:: wrapper::tests::materialize_cached_artifact
+          library_tests=(cargo test -p kache --lib)
+          for filter in store:: wrapper::tests::materialize_cached_artifact; do
+            selected=$("${library_tests[@]}" -- --list "$filter")
+            printf '%s\n' "$selected"
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No kache library tests selected by $filter"
+              exit 1
+            fi
+          done
+          "${library_tests[@]}" -- store:: wrapper::tests::materialize_cached_artifact
       - name: Report mount usage
         if: always()
         run: df -h /mnt/cow || true

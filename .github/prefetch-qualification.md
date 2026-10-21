@@ -6,9 +6,9 @@ Linux benchmark runners. The backend is an isolated filesystem remote. These
 results do not model R2 latency.
 
 A protected `main` push changing the qualification files creates an immutable
-seed containing the Kache binary and remote packs/indexes. After its build the
-seed runs `kache save-manifest`, as kache-action's post step does, so the remote
-holds the build's identity manifest and namespace shards. Every job sets the
+seed containing the Kache frontend, its matching engine and remote packs/indexes.
+After its build the seed runs `kache save-manifest`, as kache-action's post step
+does, so the remote holds the build's identity manifest and namespace shards. Every job sets the
 same `KACHE_PROFILE` and `KACHE_NAMESPACE`, so an arm plans from what a CI job
 with a manifest key and namespace would find. Without them the plan came from
 crate names alone and covered 2–9 of 337 demanded keys (#1264). Six fresh consumer
@@ -24,6 +24,14 @@ credentials, planner endpoint or storage are involved. A manual run on `main`
 must name an existing seed run. Authorization checks its repository, workflow,
 push event, main ancestry and successful producer job. Every arm uses the seed's
 recorded binary revision; regenerate the seed to qualify a newer binary.
+
+For a local `experiment`, `--binary` selects the exact supplied file, even if it
+has a custom filename or comes from an older revision. Pass `--engine` from the
+same build for split-binary revisions; omit it for single-binary revisions.
+The harness copies those inputs as `kache` and `kache-engine`. The seed records
+a hash for each supplied entrypoint and restores execute bits after archive
+validation. Inputs come from the supplied paths rather than the harness
+checkout or other files in the binary's directory.
 
 After the workflow and prerequisites merge, its protected-main push seeds and
 runs all controls. To repeat an existing seed:

@@ -62,7 +62,7 @@ jobs:
           install_args: rust
           cache: false
           reshim: false
-      - name: Build the shared Kache binary
+      - name: Build the shared Kache binaries
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kache-producer-target
           RUSTC_WRAPPER: ''
@@ -75,7 +75,8 @@ jobs:
           python3 scripts/prefetch-qualification.py seed \
             --root "$RUNNER_TEMP/prefetch-producer" \
             --output "$RUNNER_TEMP/prefetch-seed-result" \
-            --binary "$RUNNER_TEMP/kache-producer-target/release/kache"
+            --binary "$RUNNER_TEMP/kache-producer-target/release/kache" \
+            --engine "$RUNNER_TEMP/kache-producer-target/release/kache-engine"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: prefetch-qualification-seed

@@ -446,6 +446,19 @@ for (const [repo, privateRepo] of [
 {
   const qualification = files["prefetch-qualification.yml"].jobs;
   const consumer = files["prefetch-qualification-consumer.yml"].jobs.consume;
+  const producer = qualification.seed.steps.find(
+    (step) => step.name === "Produce isolated immutable remote",
+  ).run;
+  for (const [flag, name] of [
+    ["binary", "kache"],
+    ["engine", "kache-engine"],
+  ]) {
+    eq(
+      producer.includes(`--${flag} "$RUNNER_TEMP/kache-producer-target/release/${name}"`),
+      true,
+      `producer supplies its built ${name}`,
+    );
+  }
   for (const repository of publicRepos) {
     for (const ref of ["refs/heads/main", "refs/heads/topic", "refs/pull/1/merge"]) {
       const ctx = context(repository, false, {}, "workflow_dispatch");

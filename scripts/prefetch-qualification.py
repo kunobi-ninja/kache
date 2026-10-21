@@ -182,6 +182,19 @@ class Run:
             dump(self.output / "phases.json", self.phases)
 
 
+def stage_seed_binaries(binary, destination, engine=None):
+    """Copy the exact supplied entrypoints, without selecting sibling builds."""
+    destination.mkdir()
+    sources = {"kache": binary}
+    if engine is not None:
+        sources["kache-engine"] = engine
+    for name, source in sources.items():
+        target = destination / name
+        shutil.copy2(source, target)
+        target.chmod(0o755)
+    return destination / "kache"
+
+
 def unpack(archive, destination, *, local=False):
     require(not destination.exists(), "Seed destination must be fresh")
     with tarfile.open(archive, "r:gz") as tar:
@@ -212,6 +225,10 @@ def unpack(archive, destination, *, local=False):
         local or manifest["trusted_push"] is True,
         "Seed was not produced by a trusted push",
     )
+    for name in ("kache", "kache-engine"):
+        binary = destination / name
+        if binary.is_file():
+            binary.chmod(0o755)
     return manifest
 
 
@@ -1066,9 +1083,7 @@ def measure_inner(args, stack, local_revision):
             "Seed requires a protected main push",
         )
         bundle = root / "bundle"
-        bundle.mkdir()
-        binary = bundle / "kache"
-        shutil.copy2(args.binary, binary)
+        binary = stage_seed_binaries(args.binary, bundle, getattr(args, "engine", None))
         remote = bundle / "remote"
         remote.mkdir()
         manifest = {}
@@ -1080,7 +1095,6 @@ def measure_inner(args, stack, local_revision):
         binary, remote = bundle / "kache", bundle / "remote"
         # Preserve verified identity even if setup, compilation or admission fails.
         dump(output / "identity.json", manifest)
-    binary.chmod(0o755)
     env = environment(root, binary)
     runner = Run(root, output, env)
     cache, runtime = root / "cache", root / "runtime"
@@ -1583,6 +1597,11 @@ def main():
     parser.add_argument("--root", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--binary", type=Path)
+    parser.add_argument(
+        "--engine",
+        type=Path,
+        help="Engine built from the same revision as --binary; omit for single-binary revisions",
+    )
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--arm", choices=ARMS, default="off-1")
     parser.add_argument("--seed-run-id", default="")

@@ -15039,3 +15039,33 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     .unwrap()
     .unwrap();
 }
+
+#[test]
+fn daemon_stats_include_rotated_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let log = config.event_log_path();
+    let mut hit = events::BuildEvent::new_for_test("archived", events::EventResult::LocalHit);
+    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    for _ in 0..12 {
+        events::log_event(&log, &hit).unwrap();
+    }
+    let max_size = std::fs::metadata(&log).unwrap().len() / 2;
+    events::rotate_events_if_needed(&log, max_size, 1, &config.cache_dir).unwrap();
+    assert!(events::read_events(&log).unwrap().len() < 12);
+    let miss = events::BuildEvent::new_for_test("live", events::EventResult::Miss);
+    events::log_event(&log, &miss).unwrap();
+    let daemon = Daemon::new(config);
+    let request = StatsRequest {
+        include_entries: false,
+        include_summaries: false,
+        sort_by: None,
+        event_hours: Some(24),
+        event_secs: None,
+        client_epoch: 0,
+        client_version: None,
+    };
+    let snapshot = daemon.handle_stats(&request).stats.unwrap();
+    assert_eq!(snapshot.events.local_hits, 12);
+    assert_eq!(snapshot.events.misses, 1);
+}

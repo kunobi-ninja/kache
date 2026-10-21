@@ -1230,7 +1230,10 @@ pub fn generate_report_with_filter(
     if let Some(cut) = events::session_cut_by_rotation(&config.event_log_path())
         && build_events.iter().any(|event| event.session_id == cut)
     {
-        suggestions.insert(0, rotation_cut_notice(config.event_log_max_size));
+        suggestions.insert(
+            0,
+            rotation_cut_notice(config.event_log_max_size, filter.last_build),
+        );
     }
 
     // Storage: restore side — how cache-hit restores landed on disk
@@ -2384,7 +2387,14 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
 
 /// The report covers a build whose early events the event log rotated
 /// away (kunobi-ninja/kache#1209).
-fn rotation_cut_notice(max_size: u64) -> String {
+fn rotation_cut_notice(max_size: u64, last_build: bool) -> String {
+    if !last_build {
+        return format!(
+            "this build outgrew the event log ({}); counts include retained archives, but \
+             expired or unreadable events may be missing",
+            bytesize::ByteSize(max_size)
+        );
+    }
     format!(
         "this build outgrew the event log ({}), so its earliest events were rotated away and \
          the counts above are incomplete; raise [cache] event_log_max_size",

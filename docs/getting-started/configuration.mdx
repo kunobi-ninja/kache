@@ -113,7 +113,7 @@ local_max_size = "200GiB"
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
-| none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size, and moves the dropped lines to `events.jsonl.archive/` (up to 8 days and 512 MiB) |
+| none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size, and moves the dropped lines to `events.jsonl.archive/`, pruned at each rotation to 8 days and 512 MiB |
 | none | `cache.event_log_keep_lines` | `1000` | Minimum lines retained when the event log rotates |
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |

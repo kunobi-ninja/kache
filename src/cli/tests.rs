@@ -11073,3 +11073,25 @@ fn an_explicit_workspace_must_have_a_valid_workspace_manifest() {
     fs::write(member.join("Cargo.toml"), "[package").unwrap();
     assert_eq!(cargo_output_dir_from(&member, &environment()), None);
 }
+
+#[test]
+fn direct_stats_include_rotated_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let log = config.event_log_path();
+    let mut hit =
+        crate::events::BuildEvent::new_for_test("archived", crate::events::EventResult::LocalHit);
+    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    for _ in 0..12 {
+        crate::events::log_event(&log, &hit).unwrap();
+    }
+    let max_size = std::fs::metadata(&log).unwrap().len() / 2;
+    crate::events::rotate_events_if_needed(&log, max_size, 1, &config.cache_dir).unwrap();
+    assert!(crate::events::read_events(&log).unwrap().len() < 12);
+    let miss = crate::events::BuildEvent::new_for_test("live", crate::events::EventResult::Miss);
+    crate::events::log_event(&log, &miss).unwrap();
+
+    let snap = snapshot_from_direct_reads(&config, false, "size", SinceWindow::DEFAULT, false);
+    assert_eq!(snap.event_stats.local_hits, 12);
+    assert_eq!(snap.event_stats.misses, 1);
+}

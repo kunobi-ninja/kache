@@ -91,7 +91,7 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
     }
     // Starting the daemon creates its store even for uncached compilers.
     let index = cache.join("index.db");
-    let entries: u64 = if index.is_file() {
+    let entries: i64 = if index.is_file() {
         let index = rusqlite::Connection::open_with_flags(
             index,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

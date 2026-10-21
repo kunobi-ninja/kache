@@ -2,42 +2,134 @@
 
 use super::{PREPARE_TIMEOUT, retry_until};
 use crate::prelude::*;
-use anyhow::{Result, ensure};
-use std::io::{Read, Write};
+use anyhow::Result;
+use std::io::{self, Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
+use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, WAIT_TIMEOUT};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, SECURITY_IDENTIFICATION,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
 
 pub(super) struct Connection {
     pub(super) inner: crate::SyncStream,
     pub(super) deadline: std::cell::Cell<Option<std::time::Instant>>,
+    peer: PeerSecurity,
+}
+
+/// Pin the peer before trusting its process-creation requests. Credentials
+/// for the server use the kernel pipe PID and a process lookup, rather than the
+/// connection-bound client SID required when duplicating client handles.
+struct PeerSecurity {
+    process: OwnedHandle,
+    pid: u32,
+}
+
+impl PeerSecurity {
+    fn open(stream: &crate::SyncStream) -> io::Result<Self> {
+        use kunobi_daemon::local::peer::PeerCredentials as _;
+        let peer = stream.credentials()?;
+        let pid = peer
+            .pid
+            .map(|pid| pid.get())
+            .filter(|_| peer.same_user)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "compiler endpoint has no same-user process identity",
+                )
+            })?;
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let peer = Self {
+            process: unsafe { OwnedHandle::from_raw_handle(process) },
+            pid,
+        };
+        peer.verify(stream)?;
+        Ok(peer)
+    }
+
+    fn verify(&self, stream: &crate::SyncStream) -> io::Result<()> {
+        use kunobi_daemon::local::peer::PeerCredentials as _;
+        let peer = stream.credentials()?;
+        if !peer.same_user || peer.pid.map(|pid| pid.get()) != Some(self.pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "compiler endpoint identity changed",
+            ));
+        }
+        if unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } != WAIT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "compiler endpoint process exited",
+            ));
+        }
+        if !crate::windows_security::matches_daemon(self.process.as_handle())? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "compiler endpoint security context differs",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Connection {
     pub(super) fn connect(socket: &Path) -> Result<Self> {
         use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
-        use kunobi_daemon::local::peer::PeerCredentials as _;
         let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
-        // interprocess 2.4.4's generic local-socket connector ignores
-        // ConnectOptions::wait_mode. Wrap the same bounded native pipe.
         let path = format!(r"\\.\pipe\{}", crate::daemon_endpoint(socket));
-        let pipe = DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
-            path,
-            interprocess::ConnectWaitMode::Timeout(PREPARE_TIMEOUT),
-        )?;
+        // Identification lets the server inspect our SID without acting with
+        // our token, including while its identity is still being checked.
+        let handle = retry_until(Some(deadline), || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(&path)
+                .map(OwnedHandle::from)
+                .map_err(|error| {
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
+                        io::ErrorKind::WouldBlock.into()
+                    } else {
+                        error
+                    }
+                })
+        })?;
+        let pipe = DuplexPipeStream::<Bytes>::try_from(handle).map_err(io::Error::other)?;
         let inner = interprocess::os::windows::named_pipe::local_socket::Stream::from(pipe);
-        let inner: crate::SyncStream = inner.into();
-        let peer = inner.credentials()?;
-        ensure!(
-            peer.same_user && peer.pid.is_some(),
-            "compiler endpoint belongs to another user or has no peer identity"
-        );
+        Self::from_stream(inner.into(), deadline)
+    }
+
+    pub(super) fn from_stream(
+        inner: crate::SyncStream,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        let peer = PeerSecurity::open(&inner)?;
         inner.set_nonblocking(true)?;
         Ok(Self {
             inner,
             deadline: std::cell::Cell::new(Some(deadline)),
+            peer,
         })
     }
 
     pub(super) fn prepare_commit(&self) -> Result<()> {
+        self.peer.verify(&self.inner)?;
         crate::windows_process::protect_current_process()?;
         Ok(())
     }

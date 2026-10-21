@@ -442,15 +442,9 @@ mod windows_tests {
         Legacy,
     }
 
-    fn exchange_with(peer: Peer) -> Result<Option<i32>> {
-        let root = tempfile::tempdir()?;
-        let path = root.path().join("control");
-        let listener = crate::ListenerOptions::new()
-            .name(crate::socket_name(&path)?)
-            .nonblocking(ListenerNonblockingMode::Both)
-            .create_sync()?;
+    fn request(root: &Path) -> ExecutionRequest {
         let native = |value: &std::ffi::OsStr| NativeString::capture(value);
-        let request = ExecutionRequest {
+        ExecutionRequest {
             version: EXECUTION_VERSION,
             entry: ExecutionEntry::Compiler,
             client_version: "fixture".into(),
@@ -458,11 +452,11 @@ mod windows_tests {
             creation_mask: None,
             argv: vec![native("compiler".as_ref())],
             env: vec![],
-            cwd: native(root.path().as_os_str()),
+            cwd: native(root.as_os_str()),
             home: None,
-            temp: native(root.path().as_os_str()),
+            temp: native(root.as_os_str()),
             cache: None,
-            executable: native(std::env::current_exe()?.as_os_str()),
+            executable: native(std::env::current_exe().unwrap().as_os_str()),
             startup_micros: 0,
             channels: ExecutionChannels::Windows {
                 stdin: 0,
@@ -470,15 +464,22 @@ mod windows_tests {
                 stderr: 0,
                 process_broker: true,
             },
-        };
+        }
+    }
+
+    fn exchange_with(peer: Peer) -> Result<Option<i32>> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("control");
+        let listener = crate::ListenerOptions::new()
+            .name(crate::socket_name(&path)?)
+            .nonblocking(ListenerNonblockingMode::Both)
+            .create_sync()?;
+        let request = request(root.path());
         let server = std::thread::spawn(move || -> Result<()> {
             let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
             let inner = retry_until(Some(deadline), || listener.accept())
                 .context("accepting the execution client")?;
-            let connection = Connection {
-                inner,
-                deadline: std::cell::Cell::new(Some(deadline)),
-            };
+            let connection = Connection::from_stream(inner, deadline)?;
             let mut reader = std::io::BufReader::new(&connection);
             let mut line = String::new();
             reader
@@ -491,6 +492,7 @@ mod windows_tests {
                 ),
                 "expected execution request"
             );
+            assert_identification_only(&connection)?;
             if matches!(peer, Peer::Legacy) {
                 write_message(&mut &connection, &kache_protocol::Response::ok())?;
                 return Ok(());
@@ -548,5 +550,211 @@ mod windows_tests {
         }
         let error = exchange_with(Peer::AfterCommit).unwrap_err();
         assert!(error.to_string().contains("will not be run again locally"));
+    }
+
+    fn assert_identification_only(connection: &Connection) -> Result<()> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, SecurityIdentification, TOKEN_QUERY, TokenImpersonationLevel,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        let crate::SyncStream::NamedPipe(pipe) = &connection.inner;
+        let _impersonation = pipe.inner().impersonate_client()?;
+        let mut token = std::ptr::null_mut();
+        ensure!(
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut level = 0i32;
+        let mut size = 0u32;
+        ensure!(
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenImpersonationLevel,
+                    (&mut level as *mut i32).cast(),
+                    std::mem::size_of::<i32>() as u32,
+                    &mut size,
+                )
+            } != 0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        ensure!(
+            level == SecurityIdentification,
+            "the pipe server must not act with the compiler client's token"
+        );
+        Ok(())
+    }
+
+    struct PeerChild(std::process::Child);
+    impl Drop for PeerChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_weaker_same_user_server_receives_no_request_or_commit() {
+        use kunobi_daemon::local::peer::PeerCredentials as _;
+        use std::os::windows::io::AsHandle;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control");
+        let mut child = PeerChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "execution::windows_tests::weaker_server_fixture",
+                    "--nocapture",
+                ])
+                .env("KACHE_WEAKER_PEER_ROOT", root.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !root.path().join("ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "weaker pipe fixture exited before listening"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "weaker pipe fixture did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::windows_security::matches_daemon(child.0.as_handle()).unwrap());
+        // Establish that a same-SID-only check would accept this real peer.
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
+        let pipe = DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
+            format!(r"\\.\pipe\{}", crate::daemon_endpoint(&socket)),
+            interprocess::ConnectWaitMode::Timeout(PREPARE_TIMEOUT),
+        )
+        .unwrap();
+        let probe: crate::SyncStream =
+            interprocess::os::windows::named_pipe::local_socket::Stream::from(pipe).into();
+        assert!(probe.credentials().unwrap().same_user);
+        assert_eq!(
+            probe.credentials().unwrap().pid.unwrap().get(),
+            child.0.id()
+        );
+        drop(probe);
+
+        let mut committed = false;
+        let error = exchange(&socket, &request(root.path()), &mut committed).unwrap_err();
+        assert!(!committed);
+        assert!(
+            format!("{error:#}").contains("security context differs"),
+            "{error:#}"
+        );
+        assert_eq!(try_execute(&socket, &request(root.path())).unwrap(), None);
+        while child.0.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "weaker pipe fixture did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child.0.wait().unwrap().success());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("received")).unwrap(),
+            "0,0,0"
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated primary token for named-pipe server admission"]
+    fn weaker_server_fixture() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{GetLastError, LUID, SetLastError};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+            SE_PRIVILEGE_REMOVED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    &mut token,
+                )
+            },
+            0
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let name = "SeChangeNotifyPrivilege"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut luid: LUID = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) },
+            0
+        );
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_REMOVED,
+            }],
+        };
+        unsafe {
+            SetLastError(0);
+        }
+        assert_ne!(
+            unsafe {
+                AdjustTokenPrivileges(
+                    token.as_raw_handle(),
+                    0,
+                    &privileges,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { GetLastError() },
+            0,
+            "the fixture must remove its privilege"
+        );
+        drop(token);
+        let root = std::path::PathBuf::from(std::env::var_os("KACHE_WEAKER_PEER_ROOT").unwrap());
+        let socket = root.join("control");
+        let listener = crate::ListenerOptions::new()
+            .name(crate::socket_name(&socket).unwrap())
+            .nonblocking(ListenerNonblockingMode::Both)
+            .create_sync()
+            .unwrap();
+        std::fs::write(root.join("ready"), b"ready").unwrap();
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
+            let stream = retry_until(Some(deadline), || listener.accept()).unwrap();
+            let mut byte = [0u8; 1];
+            let count = retry_until(Some(deadline), || (&stream).read(&mut byte))
+                .or_else(|error| {
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                    ) {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+                .unwrap();
+            received.push(count.to_string());
+        }
+        std::fs::write(root.join("received"), received.join(",")).unwrap();
     }
 }

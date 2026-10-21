@@ -14,6 +14,9 @@ environment or working directory to serve a client.
 On Unix, the daemon starts native compiler children. On Windows, the client
 starts them at the daemon's request, preserving the client's token, job objects
 and console. The cache pipeline stays in the daemon on both platforms.
+Both Windows peers compare process-token context before committing execution.
+The client opens the pipe with identification-only security, so the server can
+inspect its identity without acting with its token.
 
 The engine starts a missing daemon on the first cache-enabled compile. If
 preparation fails or the client's process restrictions cannot be preserved, the

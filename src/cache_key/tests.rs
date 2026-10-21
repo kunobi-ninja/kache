@@ -12391,6 +12391,15 @@ fn byte_env_scan_matches_lossy_char_boundaries() {
                 SourceEnvDepUse::Unused,
             ),
             (b"'; env!(\"OUT_DIR\");", SourceEnvDepUse::RuntimeValue),
+            // An incomplete UTF-8 suffix must not widen the preceding char.
+            (
+                b"'\xe2'\"'; env!(\"OUT_DIR\");",
+                SourceEnvDepUse::RuntimeValue,
+            ),
+            (
+                b"'\xe2\x82'\"'; env!(\"OUT_DIR\");",
+                SourceEnvDepUse::RuntimeValue,
+            ),
         ] {
             let source = [b"'".as_slice(), *character, tail].concat();
             assert_eq!(

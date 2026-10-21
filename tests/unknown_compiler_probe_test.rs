@@ -8,6 +8,18 @@ fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
 }
 
+fn process_is_running(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    if fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status
+            .lines()
+            .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
+    }) {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 #[test]
 fn probe_recovers_when_wrapper_fork_bombs() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,15 +106,13 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
     if let Ok(pid_str) = fs::read_to_string(&pid_file)
         && let Ok(pid) = pid_str.trim().parse::<i32>()
     {
-        // The process-group SIGKILL has been sent before kache returns, but an
-        // orphaned descendant can remain visible as a zombie until init reaps
-        // it. Give that asynchronous reap a small bounded window before
-        // treating the process as still alive.
+        // A container's init may retain a killed descendant as a zombie.
+        // It cannot run or hold stdout open, so only a live process fails.
         let deadline = Instant::now() + Duration::from_secs(2);
-        while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < deadline {
+        while process_is_running(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let still_alive = unsafe { libc::kill(pid, 0) == 0 };
+        let still_alive = process_is_running(pid);
         assert!(
             !still_alive,
             "descendant process {} should have been killed",

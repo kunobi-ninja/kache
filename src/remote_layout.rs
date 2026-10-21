@@ -713,6 +713,12 @@ fn extract_entry_pack_until<R: std::io::Read>(
         };
         std::io::copy(&mut entry, &mut writer)
             .with_context(|| format!("extracting {}", path.display()))?;
+        // Flushed before the import takes the store lock, so the import's own
+        // fsync of each blob has nothing left to write while others wait.
+        writer
+            .inner
+            .sync_all()
+            .with_context(|| format!("flushing {}", path.display()))?;
         computed_hashes.insert(path, writer.hasher.finalize().to_hex().to_string());
     }
 

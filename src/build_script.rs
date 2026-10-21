@@ -1543,13 +1543,23 @@ impl Run {
             prepared.push((
                 link::prepare_writable_target_from_file(&blob, &target)?,
                 cached.executable,
+                cached.hash.as_str(),
             ));
         }
-        for (artifact, executable) in prepared {
+        // Each file published here is a verbatim copy of its blob, so the
+        // blob's name is its hash: memoised at the stamp the file has once
+        // its mode is set, the units that read it next (a static library a
+        // crate links) take the hash from the memo instead of reading it.
+        let mut restored = Vec::with_capacity(prepared.len());
+        for (artifact, executable, hash) in prepared {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
             set_executable(&target, executable)?;
+            if let Ok(fingerprint) = kache_store::file_hash::FileFingerprint::from_path(&target) {
+                restored.push((fingerprint, hash));
+            }
         }
+        self.store.record_verified_file_hashes(&restored);
         for (blob, target, executable) in texts {
             std::fs::write(
                 &target,
@@ -4171,6 +4181,88 @@ mod tests {
             pc(out)
         );
         assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
+    }
+
+    /// A restored `OUT_DIR` file is a copy of its blob, so its hash is known:
+    /// the unit that reads it next (a crate linking the static library)
+    /// takes it from the memo. A file changed after the restore is read.
+    #[test]
+    fn restored_out_dir_files_are_memoised_at_their_stamp() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run_in = |target: &str| {
+            let environment =
+                checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
+            std::fs::create_dir_all(&environment.manifest_dir).unwrap();
+            std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment,
+                start: std::time::Instant::now(),
+            }
+        };
+        let archive = vec![b'a'; 128 * 1024];
+        let mut a = run_in("a/target");
+        a.start = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        std::fs::create_dir_all(a.environment.out_dir.join("lib")).unwrap();
+        std::fs::write(a.environment.out_dir.join("lib/libz.a"), &archive).unwrap();
+        let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(
+            b"cargo:rerun-if-changed=build.rs\n",
+            b"",
+            1_300,
+            after_the_run,
+        )
+        .unwrap();
+
+        let b = run_in("b/target");
+        let prediction = b.prediction().unwrap().unwrap();
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        b.restore(&meta).unwrap();
+        let restored = b.environment.out_dir.join("lib/libz.a");
+        assert_eq!(std::fs::read(&restored).unwrap(), archive);
+
+        let hasher = b.store.file_hasher();
+        assert_eq!(
+            hasher.hash(&restored).unwrap(),
+            kache_store::file_hash::hash_file(&restored).unwrap()
+        );
+        assert_eq!(
+            hasher.stats().bytes_hashed,
+            0,
+            "the restored file's hash comes from the memo"
+        );
+
+        #[cfg(unix)]
+        {
+            let before = std::fs::metadata(&restored).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&restored)
+                .unwrap();
+            std::io::Write::write_all(&mut file, &vec![b'w'; archive.len()]).unwrap();
+            drop(file);
+            filetime::set_file_mtime(
+                &restored,
+                filetime::FileTime::from_last_modification_time(&before),
+            )
+            .unwrap();
+            let hasher = b.store.file_hasher();
+            assert_eq!(
+                hasher.hash(&restored).unwrap(),
+                kache_store::file_hash::hash_file(&restored).unwrap(),
+                "a write that kept size and mtime is read, not served"
+            );
+            assert_eq!(hasher.stats().bytes_hashed, archive.len() as u64);
+        }
     }
 
     fn stored_manifest(run: &Run, meta: &EntryMeta) -> Manifest {

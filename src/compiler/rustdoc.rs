@@ -797,7 +797,7 @@ fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
             break;
         }
         let byte = bytes[index];
-        let whitespace = rust_whitespace_len(bytes, index);
+        let whitespace = non_ascii_rust_whitespace_len(bytes, index);
         if whitespace > 0 {
             index += whitespace;
             continue;
@@ -873,8 +873,11 @@ fn is_ident_continue(byte: u8) -> bool {
 }
 
 fn skip_ident_bytes(bytes: &[u8], mut index: usize) -> usize {
-    while let Some(&byte) = bytes.get(index) {
-        if !is_ident_continue(byte) || rust_whitespace_len(bytes, index) > 0 {
+    for _ in index..bytes.len() {
+        let Some(&byte) = bytes.get(index) else {
+            break;
+        };
+        if !is_ident_continue(byte) || non_ascii_rust_whitespace_len(bytes, index) > 0 {
             break;
         }
         index += 1;
@@ -882,11 +885,10 @@ fn skip_ident_bytes(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
-// Keep Rust whitespace separate from UTF-8 identifier bytes.
-// This matches the source scanner in cache_key.
-fn rust_whitespace_len(bytes: &[u8], index: usize) -> usize {
+// Non-ASCII Rust whitespace must not join identifier bytes.
+// ASCII whitespace already fails is_ident_continue.
+fn non_ascii_rust_whitespace_len(bytes: &[u8], index: usize) -> usize {
     match bytes.get(index..).unwrap_or_default() {
-        [b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r' | b' ', ..] => 1,
         [0xC2, 0x85, ..] => 2,
         [0xE2, 0x80, 0x8E | 0x8F | 0xA8 | 0xA9, ..] => 3,
         [0xEF, 0xBB, 0xBF, ..] => 3,
@@ -897,7 +899,10 @@ fn rust_whitespace_len(bytes: &[u8], index: usize) -> usize {
 fn skip_block_comment(bytes: &[u8], index: usize) -> usize {
     let mut cursor = index + 2;
     let mut depth = 1usize;
-    while cursor + 1 < bytes.len() {
+    for _ in index..bytes.len() {
+        if cursor + 1 >= bytes.len() {
+            break;
+        }
         match &bytes[cursor..cursor + 2] {
             b"/*" => {
                 depth += 1;
@@ -2556,6 +2561,7 @@ mod tests {
     fn nested_comments_and_c_strings_do_not_hide_environment_macros() {
         for prefix in [
             "/* /* */ \" */",
+            "/* padding /* */ */",
             r###"const DATA: &std::ffi::CStr = cr"\";"###,
             r###"const DATA: &std::ffi::CStr = cr#"a"b"#;"###,
             r###"const DATA: &std::ffi::CStr = c"\"";"###,
@@ -2670,9 +2676,9 @@ mod tests {
         assert_eq!(skip_ident_bytes("1écr".as_bytes(), 0), 5);
         assert_eq!(skip_ident_bytes(b"", 0), 0);
         assert_eq!(skip_ident_bytes(b";", 0), 0);
-        assert_eq!(rust_whitespace_len(b"\xC2", 0), 0);
-        assert_eq!(rust_whitespace_len(b"\xE2\x80", 0), 0);
-        assert_eq!(rust_whitespace_len(b"x", 1), 0);
+        assert_eq!(non_ascii_rust_whitespace_len(b"\xC2", 0), 0);
+        assert_eq!(non_ascii_rust_whitespace_len(b"\xE2\x80", 0), 0);
+        assert_eq!(non_ascii_rust_whitespace_len(b"x", 1), 0);
         for separator in [" ", "\t", "\n", "\r", "\x0B", "\x0C"] {
             let source = format!("forward!(1{separator}env!(\"DOC_TEXT\"));");
             assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");

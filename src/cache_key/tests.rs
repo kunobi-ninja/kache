@@ -17397,3 +17397,178 @@ fn conditional_include_proof_still_requires_a_rust_source() {
         );
     }
 }
+
+/// One checkout, two target directories inside it (`target/` and
+/// `target/integrate-clippy`): a build script's `-L native=$OUT_DIR` keys by
+/// its path below the unit's own target directory, not by the directory's
+/// name. A search dir in some other target directory keeps its path.
+#[test]
+fn link_search_into_the_units_own_target_dir_ignores_its_name() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+    let key_in = |target: &Path, native_in: &Path| {
+        let target = target.to_string_lossy();
+        let out_dir = format!("{target}/debug/deps");
+        let native = format!(
+            "native={}/debug/build/foo-sys-fedcba9876543210/out",
+            native_in.to_string_lossy()
+        );
+        let argv: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "mylib",
+            &source.to_string_lossy(),
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            &out_dir,
+            "-L",
+            &format!("dependency={target}/debug/deps"),
+            "-L",
+            &native,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let args = RustcArgs::parse(&argv).unwrap();
+        let pn = PathNormalizer::from_env(Some(&workspace))
+            .with_target_dir(args.target_dir().as_deref());
+        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
+    };
+
+    let plain = workspace.join("target");
+    let clippy = workspace.join("target/integrate-clippy");
+    assert_eq!(key_in(&plain, &plain), key_in(&clippy, &clippy));
+    assert_ne!(
+        key_in(&plain, &workspace.join("target/a")),
+        key_in(&plain, &workspace.join("target/b")),
+        "a search dir outside the unit's target dir keeps its path"
+    );
+    let other = |sub: &str| {
+        let argv = [
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--out-dir".to_string(),
+            plain.join("debug/deps").to_string_lossy().to_string(),
+            "-L".to_string(),
+            format!("native={}", plain.join(sub).to_string_lossy()),
+        ];
+        let args = RustcArgs::parse(&argv).unwrap();
+        let pn = PathNormalizer::from_env(Some(&workspace))
+            .with_target_dir(args.target_dir().as_deref());
+        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
+    };
+    assert_ne!(
+        other("debug/build/x/out"),
+        other("debug/build/y/out"),
+        "different dirs below the target dir key apart"
+    );
+}
+
+/// A source the unit's build script generated (`include!` from OUT_DIR) is
+/// keyed by its path below OUT_DIR and Cargo's unit dir, so one unit in two
+/// target directories of one checkout shares a key; its bytes and its unit
+/// hash still key it apart.
+#[test]
+fn out_dir_sources_key_by_their_unit_not_the_target_dir() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(
+        &source,
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));",
+    )
+    .unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "mylib".to_string(),
+        source.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+
+    let key = |target: &str, unit: &str, generated: &str| {
+        let out_dir = workspace
+            .join(target)
+            .join("debug/build")
+            .join(unit)
+            .join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let gen_rs = out_dir.join("gen.rs");
+        std::fs::write(&gen_rs, generated).unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone(), gen_rs],
+                env_deps: vec![(
+                    "OUT_DIR".into(),
+                    Some(out_dir.to_str().unwrap().to_string()),
+                )],
+            },
+            None,
+        );
+        let env = KeyEnv::from_parts([("OUT_DIR", out_dir.as_path())], Some(workspace.clone()));
+        let (key, _) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new(),
+            &PathNormalizer::from_env(Some(&workspace)),
+            &env,
+        );
+        key.unwrap()
+    };
+
+    let unit = "mylib-0123456789abcdef";
+    let a = key("target", unit, "pub fn g() {}");
+    assert_eq!(a, key("target/integrate-clippy", unit, "pub fn g() {}"));
+    assert_ne!(
+        a,
+        key("target/integrate-clippy", unit, "pub fn h() {}"),
+        "other bytes"
+    );
+    assert_ne!(
+        a,
+        key("target", "mylib-fedcba9876543210", "pub fn g() {}"),
+        "another unit"
+    );
+}
+
+#[test]
+fn out_dir_source_identity_needs_a_file_below_an_absolute_out_dir() {
+    let out = if cfg!(windows) {
+        "C:/t/debug/build/p-1/out"
+    } else {
+        "/t/debug/build/p-1/out"
+    };
+    let id = |file: &str, out_dir: Option<&str>| {
+        out_dir_source_identity(Path::new(file), out_dir.map(OsStr::new))
+            .map(|v| String::from_utf8(v).unwrap())
+    };
+    assert_eq!(
+        id(&format!("{out}/a/b.rs"), Some(out)).as_deref(),
+        Some("<OUT_DIR:p-1>/a/b.rs")
+    );
+    assert_eq!(id(&format!("{out}/a/b.rs"), None), None);
+    assert_eq!(id(out, Some(out)), None, "OUT_DIR itself is no source");
+    assert_eq!(id("/elsewhere/b.rs", Some(out)), None);
+    assert_eq!(
+        id("rel/out/b.rs", Some("rel/out")),
+        None,
+        "a relative OUT_DIR"
+    );
+    assert_eq!(
+        id(&format!("{out}/../x.rs"), Some(out)),
+        None,
+        "leaves OUT_DIR"
+    );
+    assert_eq!(id("/out/b.rs", Some("/out")), None, "no unit dir");
+}

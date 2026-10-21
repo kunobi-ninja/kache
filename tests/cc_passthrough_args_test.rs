@@ -182,14 +182,36 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
                 "{phase}: {name}"
             );
         }
-        assert!(
-            !spans.iter().any(|span| matches!(
-                span["name"].as_str(),
-                Some("handoff_snapshot" | "handoff_event")
-            )),
-            "execution inside the daemon must not hand publication back to itself"
-        );
-        assert!(!cache.join("store/staging/handoff").exists());
+        let status = common::hermetic_command(kache_binary(), &cache, Some(&config))
+            .args(["daemon", "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["daemon_running"], true, "{status}");
+        let state =
+            std::path::Path::new(status["socket"].as_str().unwrap()).with_extension("state.json");
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+        let daemon_pid = state["pid"].as_u64().unwrap();
+        let pipeline_pid = spans
+            .iter()
+            .find(|span| span["name"] == "cc_parse")
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap();
+        eprintln!("{phase}: pipeline pid={pipeline_pid}, daemon pid={daemon_pid}");
+        // Sandboxed clients keep compilation local. They may still hand off
+        // publication, while daemon-owned compilation must publish directly.
+        if pipeline_pid == daemon_pid {
+            assert!(
+                !spans.iter().any(|span| matches!(
+                    span["name"].as_str(),
+                    Some("handoff_snapshot" | "handoff_event")
+                )),
+                "execution inside the daemon must not hand publication back to itself"
+            );
+            assert!(!cache.join("store/staging/handoff").exists());
+        }
         if phase == "cold" {
             assert!(
                 spans.iter().any(|span| span["name"] == "cc_capture"),

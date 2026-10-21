@@ -8,6 +8,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 const FIXTURE: &str = "frontend::boundary_tests::frontend_process_fixture";
+const IMAGES: &str = "frontend::boundary_tests::frontend_images_fixture";
 
 struct ChildGuard {
     child: Child,
@@ -55,9 +56,10 @@ fn frontend_process_fixture() {
     std::process::exit(run("fixture-version").unwrap());
 }
 
-fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) -> i32 {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
-    let directory = root.path().canonicalize().unwrap();
+#[test]
+#[ignore = "prepares executable images without inheritable write handles in the parent"]
+fn frontend_images_fixture() {
+    let directory = std::path::PathBuf::from(std::env::var_os("KACHE_FRONTEND_IMAGES").unwrap());
     let frontend = directory.join("kache");
     std::fs::copy(std::env::current_exe().unwrap(), &frontend).unwrap();
     let engine = directory.join("kache-engine");
@@ -67,6 +69,20 @@ fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) -> 
     )
     .unwrap();
     std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) -> i32 {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = root.path().canonicalize().unwrap();
+    // Another test's fork must never inherit a writable frontend or engine FD.
+    let prepared = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", IMAGES, "--ignored", "--nocapture"])
+        .env_clear()
+        .env("KACHE_FRONTEND_IMAGES", &directory)
+        .output()
+        .unwrap();
+    assert!(prepared.status.success(), "{prepared:?}");
+    let frontend = directory.join("kache");
     let config = directory.join("config.toml");
     std::fs::write(&config, "").unwrap();
     let socket = directory.join("control");

@@ -1743,6 +1743,16 @@ fn upload_retry_and_idle_timeout_truth_tables() {
     assert_eq!(daemon_idle_timeout(60), Some(Duration::from_secs(60)));
 }
 
+#[test]
+fn foreground_startup_rejects_a_file_in_place_of_the_runtime_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.runtime_dir = dir.path().join("runtime");
+    fs::write(&config.runtime_dir, b"not a directory").unwrap();
+    let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+    assert!(run_server(&config, &provenance, None).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_main_binds_socket_and_handles_shutdown() {
     let dir = tempfile::tempdir().unwrap();

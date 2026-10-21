@@ -159,7 +159,7 @@ fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool) -> Out
     command.output().unwrap()
 }
 
-fn automatic_project(root: &Path, answer: u64) {
+fn edited_project(root: &Path, answer: u64) {
     project(root, answer);
     fs::write(
         root.join("src/main.rs"),
@@ -180,7 +180,7 @@ fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
     let receiver = root.join("receiver");
     let opted_out = root.join("opted-out");
     for answer in [0, 1, 2] {
-        automatic_project(&donor, answer);
+        edited_project(&donor, answer);
         let output = automatic_build(&donor, &cache, true, false);
         assert!(
             output.status.success(),
@@ -190,14 +190,14 @@ fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
     }
     let original = graph_contents(&donor.join("target/debug/incremental.kache-auto"));
     for (repo, enabled) in [(&receiver, true), (&opted_out, false)] {
-        automatic_project(repo, 0);
+        edited_project(repo, 0);
         let output = automatic_build(repo, &cache, enabled, false);
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        automatic_project(repo, 3);
+        edited_project(repo, 3);
         let output = automatic_build(repo, &cache, enabled, false);
         assert!(
             output.status.success(),
@@ -436,6 +436,7 @@ fn automatic_command(
         .env("KACHE_PRESERVE_INCREMENTAL", "0")
         .env("KACHE_INCREMENTAL_CRATES", "worktree_probe")
         .env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+        .env("KACHE_SEED_INCREMENTAL", "0")
         .env("KACHE_UNSTABLE", unstable)
         .env("KACHE_INCREMENTAL_SEED_FROM", root.join("target/debug"))
         .env_remove("RUSTFLAGS")
@@ -527,10 +528,10 @@ fn automatic_mode_scopes_bootstrap_and_preserves_explicit_selections() {
     );
     assert_eq!(
         automatic_output(&project),
-        "1|unset",
-        "Cargo and build scripts must not receive Kache's override"
+        "unset|unset",
+        "source observations, Cargo and build scripts retain the caller environment"
     );
-    assert_eq!(marker_count(&project), 1);
+    assert_eq!(marker_count(&project), 0);
     let project = root.join("source-features");
     automatic_project(&project);
     fs::write(

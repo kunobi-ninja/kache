@@ -85,6 +85,29 @@ fn supports_cwd_remap() -> bool {
     String::from_utf8_lossy(&help.stdout).contains("remap-cwd-prefix")
 }
 
+fn graph_contents(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn collect(
+        root: &Path,
+        path: &Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                collect(root, &entry.path(), files);
+            } else {
+                files.insert(
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    collect(root, root, &mut files);
+    files
+}
+
 #[test]
 fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
     if !supports_cwd_remap() {
@@ -104,6 +127,8 @@ fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
     let profile = donor.join("target/debug");
     assert!(!reused(&build(&donor, Some(&profile), "")));
     check_binary(&donor, 1);
+    let donor_graph = profile.join("incremental.kache-auto");
+    let original = graph_contents(&donor_graph);
     let seeded = build(&receiver, Some(&profile), "");
     assert!(
         reused(&seeded),
@@ -111,6 +136,15 @@ fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
         String::from_utf8_lossy(&seeded.stderr)
     );
     check_binary(&receiver, 2);
+    project(&receiver, 3);
+    assert!(reused(&build(&receiver, Some(&profile), "")));
+    check_binary(&receiver, 3);
+    assert_eq!(
+        graph_contents(&donor_graph),
+        original,
+        "receiver changed the donor graph"
+    );
+    check_binary(&donor, 1);
     assert!(!reused(&build(
         &incompatible,
         Some(&profile),

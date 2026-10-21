@@ -357,10 +357,26 @@ struct CopyBudget {
     bytes: u64,
 }
 
+fn finalized_session(path: &Path, depth: usize) -> bool {
+    if depth != 2 {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let parts: Vec<_> = name.split('-').collect();
+    matches!(parts.as_slice(), ["s", time, random, hash]
+    if *hash != "working"
+        && [time, random, hash].into_iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }))
+}
+
 fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) -> io::Result<()> {
     if depth > 8 {
         return Err(io::Error::other("incremental tree too deep"));
     }
+    let finalized = finalized_session(source, depth);
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let meta = fs::symlink_metadata(entry.path())?;
@@ -381,9 +397,17 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
                 .bytes
                 .checked_sub(meta.len())
                 .ok_or_else(|| io::Error::other("incremental state too large"))?;
-            // Copy, including lock files: no mutable inode is shared with
-            // another checkout. This also works across filesystems.
-            fs::copy(entry.path(), target)?;
+            let path = entry.path();
+            // rustc never changes finalized sessions. Share only their graph
+            // and codegen data; locks and unfamiliar files keep private inodes.
+            let immutable = finalized
+                && matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("bin" | "o" | "obj" | "bc")
+                );
+            if !immutable || fs::hard_link(&path, &target).is_err() {
+                fs::copy(path, target)?;
+            }
         } else {
             return Err(io::Error::other("non-regular incremental entry"));
         }
@@ -808,6 +832,76 @@ mod tests {
             bytes: 32,
         };
         assert!(copy_tree(&source, &refused, &mut budget, 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_files_share_only_finalized_graphs_and_codegen() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let cases = [
+            ("crate/s-123-456-abcdef/dep-graph.bin", true),
+            ("crate/s-123-456-abcdef/unit.o", true),
+            ("crate/s-123-456-abcdef/unit.obj", true),
+            ("crate/s-123-456-abcdef/unit.bc", true),
+            ("crate/s-123-456-abcdef/session.lock", false),
+            ("crate/s-123-456-abcdef/unknown.txt", false),
+            ("s-123-456-abcdef/dep-graph.bin", false),
+            ("crate/s-123-finished/dep-graph.bin", false),
+            ("crate/unknown/dep-graph.bin", false),
+            ("crate/s-123-456-bad_name/dep-graph.bin", false),
+            ("crate/s--456-abcdef/dep-graph.bin", false),
+        ];
+        for (name, _) in cases {
+            let input = source.join(name);
+            fs::create_dir_all(input.parent().unwrap()).unwrap();
+            fs::write(&input, b"original").unwrap();
+        }
+        let mut budget = CopyBudget {
+            files: 128,
+            bytes: 4096,
+        };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        for (name, shared) in cases {
+            let input = source.join(name);
+            let output = dest.join(name);
+            assert_eq!(fs::read(&output).unwrap(), b"original");
+            assert_eq!(
+                fs::metadata(&input).unwrap().ino() == fs::metadata(&output).unwrap().ino(),
+                shared,
+                "{name}"
+            );
+            if !shared {
+                fs::write(&output, b"receiver").unwrap();
+                assert_eq!(fs::read(&input).unwrap(), b"original", "{name}");
+            }
+        }
+        assert!(!finalized_session(Path::new("s-123-456-working"), 2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalized_seed_copies_when_donor_is_on_another_filesystem() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        if fs::metadata(temp.path()).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
+            return;
+        }
+        let source = temp.path().join("s-123-456-abcdef");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("dep-graph.bin"), b"original").unwrap();
+        let mut budget = CopyBudget { files: 1, bytes: 8 };
+        copy_tree(&source, other.path(), &mut budget, 2).unwrap();
+        fs::write(other.path().join("dep-graph.bin"), b"receiver").unwrap();
+        assert_eq!(fs::read(source.join("dep-graph.bin")).unwrap(), b"original");
     }
 
     #[cfg(unix)]

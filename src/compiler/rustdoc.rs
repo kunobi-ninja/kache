@@ -2657,12 +2657,7 @@ mod tests {
     #[test]
     fn unicode_separators_do_not_join_numeric_suffixes_or_identifiers() {
         for separator in [
-            "\u{0085}",
-            "\u{200E}",
-            "\u{200F}",
-            "\u{2028}",
-            "\u{2029}",
-            "\u{FEFF}",
+            "\u{0085}", "\u{200E}", "\u{200F}", "\u{2028}", "\u{2029}", "\u{FEFF}",
         ] {
             let source = format!("forward!(1{separator}env!(\"DOC_TEXT\"));");
             for c_strings in [false, true] {

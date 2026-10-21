@@ -168,7 +168,10 @@ fn environment_macros_in_prefix_macro_arguments_refresh_documentation() {
         (None, numeric_source.replace("1cr", "1ér")),
     ];
     for separator in ["\u{0085}", "\u{200E}", "\u{2028}"] {
-        cases.push((Some("2021"), whitespace_source.replace("SEPARATOR", separator)));
+        cases.push((
+            Some("2021"),
+            whitespace_source.replace("SEPARATOR", separator),
+        ));
     }
     for (edition, source) in cases {
         let fixture = DocFixture::with_edition(&source, edition);
@@ -176,7 +179,10 @@ fn environment_macros_in_prefix_macro_arguments_refresh_documentation() {
             for marker in ["OLD_MARKER", "NEW_MARKER"] {
                 fixture.run(wrapped, marker);
                 let html = fixture.function_documentation();
-                assert!(html.contains(marker), "edition={edition:?}, wrapped={wrapped}");
+                assert!(
+                    html.contains(marker),
+                    "edition={edition:?}, wrapped={wrapped}"
+                );
                 if marker == "NEW_MARKER" {
                     assert!(!html.contains("OLD_MARKER"));
                 }

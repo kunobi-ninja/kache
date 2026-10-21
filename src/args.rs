@@ -216,8 +216,8 @@ pub struct RustcArgs {
     /// Emit types (--emit): dep-info, metadata, link, etc.
     pub emit: Vec<String>,
     /// Explicit output path from `--emit=dep-info=<path>`, when present.
-    /// Cargo normally leaves this implicit; direct-rustc layouts are retained
-    /// so cache admission can force a safe passthrough.
+    /// Cargo normally leaves this implicit. Keep it separate from Cargo's
+    /// default dep-info path so streaming does not watch a custom output.
     pub dep_info_output: Option<PathBuf>,
     /// Any explicit per-kind emit destination needs compiler-owned placement.
     pub explicit_emit_output: bool,
@@ -1295,6 +1295,7 @@ mod tests {
         out_dir: Option<PathBuf>,
         emit: Vec<String>,
         dep_info_output: Option<PathBuf>,
+        explicit_emit_output: bool,
         source_file: Option<PathBuf>,
         externs: Vec<(String, Option<PathBuf>)>,
         target: Option<String>,
@@ -1339,6 +1340,7 @@ mod tests {
             out_dir: parsed.out_dir.clone(),
             emit: parsed.emit.clone(),
             dep_info_output: parsed.dep_info_output.clone(),
+            explicit_emit_output: parsed.explicit_emit_output,
             source_file: parsed.source_file.clone(),
             externs: parsed
                 .externs
@@ -2646,6 +2648,40 @@ mod tests {
             args.dep_info_path(),
             Some(layout_path("/work/proj/target/debug/deps/serde-abc123.d"))
         );
+    }
+
+    #[test]
+    fn explicit_emit_destinations_survive_repeated_flags_and_response_files() {
+        let _process_state = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("rustc.args");
+        for flags in [
+            vec!["--emit=metadata=out/custom.rmeta", "--emit=link"],
+            vec!["--emit=link", "--emit", "metadata=out/custom.rmeta"],
+            vec!["--emit=metadata=", "--emit=link"],
+            vec!["--emit=metadata=-", "--emit=link"],
+            vec!["--emit=metadata=out/name=with-equals.rmeta"],
+        ] {
+            let mut direct = vec!["rustc".to_string(), "input.rs".to_string()];
+            direct.extend(flags.iter().map(|flag| (*flag).to_string()));
+            std::fs::write(&response, format!("{}\n", direct[1..].join("\n"))).unwrap();
+            let parsed = RustcArgs::parse(&direct).unwrap();
+            let expanded = RustcArgs::parse(&[
+                "rustc".to_string(),
+                format!("@{}", response.display()),
+            ])
+            .unwrap();
+            assert!(parsed.explicit_emit_output, "{flags:?}");
+            assert!(expanded.explicit_emit_output, "{flags:?}");
+            assert_eq!(semantic_fingerprint(&parsed), semantic_fingerprint(&expanded));
+        }
+        let defaults = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "input.rs".to_string(),
+            "--emit=metadata,link".to_string(),
+        ])
+        .unwrap();
+        assert!(!defaults.explicit_emit_output);
     }
 
     #[test]

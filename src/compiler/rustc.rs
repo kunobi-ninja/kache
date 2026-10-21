@@ -967,7 +967,9 @@ mod tests {
     #[test]
     fn refuse_reasons_refuses_explicit_emit_destinations_but_allows_defaults() {
         let compiler = RustcCompiler::new();
-        for kind in ["metadata", "link", "obj", "dep-info"] {
+        for kind in [
+            "metadata", "link", "obj", "dep-info", "asm", "llvm-ir", "llvm-bc", "mir",
+        ] {
             for separated in [false, true] {
                 let mut args = s(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
                 let emit = format!("metadata,{kind}=custom/artifact");

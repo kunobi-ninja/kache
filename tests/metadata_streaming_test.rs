@@ -205,12 +205,7 @@ fn changing_diagnostic_format_preserves_requested_output_and_reuse() {
 #[test]
 fn explicit_metadata_destinations_are_materialized_without_cache_replay() {
     build_kache();
-    let temp_root = if cfg!(target_os = "macos") {
-        "/private/tmp".into()
-    } else {
-        std::env::temp_dir()
-    };
-    let fixture = tempfile::tempdir_in(temp_root).unwrap();
+    let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
     let cache = project.join("cache");
     let home = project.join("home");
@@ -219,7 +214,11 @@ fn explicit_metadata_destinations_are_materialized_without_cache_replay() {
     fs::create_dir(&home).unwrap();
     fs::create_dir(&out).unwrap();
     let config = isolated_config_path(&cache);
-    fs::write(&config, "[cache]\nlocal_only = true\nscheduler = false\ndeferred_discovery = false\nauto_gc = false\ndaemon_publish = false\n").unwrap();
+    fs::write(
+        &config,
+        "[cache]\nlocal_only = true\nscheduler = false\ndeferred_discovery = false\nauto_gc = false\ndaemon_publish = false\n",
+    )
+    .unwrap();
     fs::write(project.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let rustup_home = std::env::var_os("RUSTUP_HOME")

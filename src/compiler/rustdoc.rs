@@ -374,7 +374,14 @@ fn source_records(sources: &[PathBuf], env: &InvocationEnv) -> Result<Vec<Source
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for source in sources {
-        collect_source_for(source, &crate_dir, true, false, &mut seen, &mut files, env)?;
+        collect_source_for(
+            source,
+            &crate_dir,
+            true,
+            false,
+            (&mut seen, &mut files),
+            env,
+        )?;
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
     let mut records = Vec::with_capacity(files.len() + 1);
@@ -400,8 +407,7 @@ fn collect_source(
         crate_dir,
         required,
         module_file,
-        seen,
-        out,
+        (seen, out),
         &InvocationEnv::capture(),
     )
 }
@@ -411,8 +417,7 @@ fn collect_source_for(
     crate_dir: &Path,
     required: bool,
     module_file: bool,
-    seen: &mut BTreeSet<(PathBuf, bool)>,
-    out: &mut Vec<SourceRecord>,
+    (seen, out): (&mut BTreeSet<(PathBuf, bool)>, &mut Vec<SourceRecord>),
     env: &InvocationEnv,
 ) -> Result<()> {
     let absolute = lexical_absolute_for(path, env)?;
@@ -460,12 +465,12 @@ fn collect_source_for(
     for found in scan_rust(&bytes)? {
         match found {
             Found::Include(rel) => {
-                collect_source_for(&parent.join(rel), crate_dir, false, false, seen, out, env)?;
+                collect_source_for(&parent.join(rel), crate_dir, false, false, (seen, out), env)?;
             }
             Found::Module { path, name } => {
                 let dir = if path.is_some() { parent } else { &module_dir };
                 if let Some(next) = resolve_module_for(dir, path.as_deref(), &name, env)? {
-                    collect_source_for(&next, crate_dir, false, path.is_none(), seen, out, env)?;
+                    collect_source_for(&next, crate_dir, false, path.is_none(), (seen, out), env)?;
                 }
             }
         }
@@ -2466,7 +2471,7 @@ mod tests {
         std::fs::write(root.join("renamed.rs"), "mod child;\n").unwrap();
         std::fs::write(root.join("child.rs"), "pub fn thing() {}\n").unwrap();
         std::fs::write(root.join("renamed/child.rs"), "pub fn decoy() {}\n").unwrap();
-        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2482,7 +2487,7 @@ mod tests {
         std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
         std::fs::write(root.join("foo/mod.rs"), "mod child;\n").unwrap();
         std::fs::write(root.join("foo/child.rs"), "pub fn thing() {}\n").unwrap();
-        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2506,7 +2511,7 @@ mod tests {
         for file in ["child.rs", "note.txt", "renamed.rs"] {
             std::fs::write(root.join(file), "pub fn decoy() {}\n").unwrap();
         }
-        let records = source_records(&[root.join("entry.rs")]).unwrap();
+        let records = source_records(&[root.join("entry.rs")], &InvocationEnv::capture()).unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2540,22 +2545,31 @@ mod tests {
             for child in ["child.rs", "foo/child.rs"] {
                 std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
             }
-            let records = source_records(std::slice::from_ref(&lib)).unwrap();
+            let env = InvocationEnv::from_parts(
+                std::iter::empty::<(&str, &str)>(),
+                Some(root.to_path_buf()),
+                None,
+                root.to_path_buf(),
+            );
+            let records = source_records(&[PathBuf::from("lib.rs")], &env).unwrap();
             let names: Vec<_> = records
                 .iter()
                 .map(|record| record.relative.as_str())
                 .collect();
             assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
-            let parsed = parse(&[
-                "rustdoc",
-                "--merge=none",
-                "--crate-name=roles",
-                &lib.to_string_lossy(),
-                "-o",
-                "/out",
-                "--parts-out-dir",
-                "/parts",
-            ]);
+            let parsed = parse_args_for(
+                &argv(&[
+                    "rustdoc",
+                    "--merge=none",
+                    "--crate-name=roles",
+                    "lib.rs",
+                    "-o",
+                    "out",
+                    "--parts-out-dir",
+                    "parts",
+                ]),
+                &env,
+            );
             let original = cache_key_with(&parsed, "v", None).unwrap();
             for child in ["child.rs", "foo/child.rs"] {
                 std::fs::write(root.join(child), "pub fn changed() {}\n").unwrap();
@@ -2584,7 +2598,7 @@ mod tests {
         for child in ["child.rs", "foo/child.rs"] {
             std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
         }
-        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2601,7 +2615,7 @@ mod tests {
         std::fs::write(root.join("foo.rs"), "mod inline { mod leaf; }\n").unwrap();
         std::fs::write(root.join("foo/inline/leaf/mod.rs"), "mod child;\n").unwrap();
         std::fs::write(root.join("foo/inline/leaf/child.rs"), "pub fn thing() {}\n").unwrap();
-        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())

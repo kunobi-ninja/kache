@@ -11824,33 +11824,47 @@ fn test_coverage_keys_consistent_across_remap_forms() {
 #[test]
 fn rust_keys_reject_the_legacy_explicit_emit_recipe() {
     let _lock = key_test_lock();
-    let args = RustcArgs::parse(&[
-        "rustc".to_string(),
-        "--crate-name=emit_compatibility".to_string(),
-        "--crate-type=rlib".to_string(),
-        "--emit=metadata".to_string(),
-    ])
+    let invocation = InvocationEnv::capture();
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".to_string(),
+            "--crate-name=emit_compatibility".to_string(),
+            "--crate-type=rlib".to_string(),
+            "--emit=metadata".to_string(),
+        ],
+        &invocation,
+    )
     .unwrap();
     let (key, outputs) = compute_cache_key_with_outputs(
         &args,
-        &FileHasher::new(),
+        &FileHasher::new_for(&invocation),
         &PathNormalizer::empty(),
         &KeyEnv::default(),
     );
     key.unwrap();
 
-    // Schema 32 stored explicit destinations under this same compiler prefix.
-    // Reconstruct those bytes independently so deleting the compatibility
-    // field makes the current recipe collide with the historical one.
-    let legacy = format!(
-        "key_version:32\nrustc_version:{}\ntarget:{}\n",
-        get_rustc_version(&args.rustc).unwrap(),
+    // Reconstruct the compiler prefix with the same invocation snapshot as
+    // production, including only the emit marker beyond the historical recipe.
+    let identity = format!(
+        "rustc_version:{}\ntarget:{}\n",
+        get_rustc_version_for(&args.rustc, &invocation).unwrap(),
         host_target_triple(),
     );
+    let mut expected = blake3::Hasher::new();
+    expected.update(b"key_version:32\nemit_placement.v1:");
+    expected.update(&14_u64.to_le_bytes());
+    expected.update(b"compiler-owned");
+    expected.update(identity.as_bytes());
+    let fields = outputs.fields.unwrap();
+    let compiler = &fields["compiler"];
+    assert_eq!(compiler, &expected.finalize().to_hex()[..16]);
+
+    // Deleting only the emit marker must restore this unsafe schema-32 prefix.
+    let legacy = format!("key_version:32\n{identity}");
     let legacy_compiler = blake3::hash(legacy.as_bytes()).to_hex();
     assert_ne!(
-        outputs.fields.unwrap()["compiler"],
-        legacy_compiler[..16],
+        compiler,
+        &legacy_compiler[..16],
         "normal outputs must not reuse entries from explicit emit destinations",
     );
 }

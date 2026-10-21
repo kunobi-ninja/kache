@@ -2715,6 +2715,46 @@ fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
 }
 
 #[test]
+fn automatic_donors_require_built_live_targets_and_keep_the_recent_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let current = temp.path().join("current");
+    std::fs::create_dir(&current).unwrap();
+    let entry = |path: PathBuf, discovered| crate::store::TrackedTargetRoot {
+        identity: kache_store::filesystem::directory_identity(&path).unwrap(),
+        workspace_root: temp.path().to_path_buf(),
+        path,
+        first_seen: 0,
+        last_seen: 0,
+        rustc: None,
+        discovered,
+    };
+    let mut targets = Vec::new();
+    for index in 0..10 {
+        let path = temp.path().join(format!("target-{index}"));
+        std::fs::create_dir(&path).unwrap();
+        targets.push(entry(path, false));
+    }
+    let discovered = temp.path().join("discovered");
+    std::fs::create_dir(&discovered).unwrap();
+    targets.push(entry(discovered, true));
+    let stale = temp.path().join("replaced");
+    std::fs::create_dir(&stale).unwrap();
+    let mut stale = entry(stale, false);
+    stale.identity.inode = stale.identity.inode.wrapping_add(1);
+    targets.push(stale);
+    targets.push(entry(current.clone(), false));
+    targets.push(entry(current.join("."), false));
+    let chosen = worktree_donor_profiles(&current, Path::new("debug"), targets.clone());
+    assert_eq!(chosen.len(), 8);
+    assert_eq!(chosen[0], temp.path().join("target-9/debug"));
+    assert_eq!(chosen[7], temp.path().join("target-2/debug"));
+    assert!(
+        worktree_donor_profiles(&temp.path().join("missing"), Path::new("debug"), targets)
+            .is_empty()
+    );
+}
+
+#[test]
 fn bootstrap_retry_requires_fresh_dep_info_and_retires_discarded_outputs() {
     let temp = tempfile::tempdir().unwrap();
     let args = RustcArgs::parse(&[

@@ -1,11 +1,12 @@
 //! Conservative policy for isolated incremental rustc passthroughs.
 //!
-//! A normal cache hit is always preferred. After a build of a Cargo unit (a
+//! An unchanged checkout checks the artifact cache. After a build of a Cargo unit (a
 //! hit or a miss) and a later miss in the same target where only
 //! source/extern key groups changed, however far apart, the miss may seed a
 //! private incremental directory. Successful seeds enable a small, time-bounded run
 //! of early passthroughs before Kache probes the cache again. An explicit crate force-list can request the same managed
-//! directory without the learning step. Every decision is target-local and
+//! directory without the learning step. A changed primary source can also
+//! prepare a compatible donor before key discovery. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
 //!
 //! A compile error keeps the private state. rustc compiles in a copy of its
@@ -2705,13 +2706,14 @@ mod tests {
         teach(&unit, 10);
         let state = read_state(&unit);
 
-        for field in ["cache", "stable", "dynamic"] {
+        for field in ["cache", "stable", "dynamic", "primary_source"] {
             let mut invalid = state.clone();
             let observation = invalid.observation.as_mut().unwrap();
             match field {
                 "cache" => observation.cache_key = "not-a-digest".into(),
                 "stable" => observation.stable = "not-a-digest".into(),
                 "dynamic" => observation.sources_externs = "not-a-digest".into(),
+                "primary_source" => observation.primary_source = Some("not-a-digest".into()),
                 _ => unreachable!(),
             }
             assert!(!valid_state(&invalid, &unit.unit_key), "accepted {field}");

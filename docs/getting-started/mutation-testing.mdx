@@ -38,79 +38,71 @@ KACHE_INCREMENTAL_CRATES=my_crate cargo mutants
 
 A mutant that fails to compile keeps the crate's incremental state, so the next mutant still compiles incrementally.
 
-## Experimental incremental seeds between worktrees
+<a id="experimental-incremental-seeds-between-worktrees" />
 
-Set `[cache] unstable = true` or `KACHE_UNSTABLE=1` to enable the experimental
-behavior. This one switch includes future experiments as Kache adds them.
-Kache prepares portable incremental state for crates selected by
-`KACHE_INCREMENTAL_CRATES`, with `KACHE_PRESERVE_INCREMENTAL` off. An optional
-donor Cargo profile, such as `/work/previous/target/debug`, seeds the first
-incremental compile in another checkout. Adaptive builds still learn within
-their own target.
+## Incremental seeds between worktrees
+
+With rustc 1.98 or later, Kache can start an edited crate from another checkout's
+finished incremental state. This is enabled by default for managed incremental
+builds. An unchanged checkout still uses the artifact cache. Registry
+dependencies and build scripts keep their existing compilation paths.
+
+Kache looks for compatible donors among eight recently built target directories
+in the local cache index. Each receiver keeps its own compiler state and lock.
+The import hard-links finalized rustc graph and codegen files when possible;
+locks and unfamiliar files are private copies. Failed hard links fall back to
+copies. A busy donor, incompatible flags, unsupported arguments or unfinished
+state leaves the receiver compiling without an imported seed. Each candidate
+import is limited to 1 GiB, 65,536 entries and 256 donor units.
+
+To disable automatic seeding for one build:
 
 ```bash
-# Run in the donor checkout first.
-export KACHE_UNSTABLE=1
-export KACHE_PRESERVE_INCREMENTAL=0
-export KACHE_INCREMENTAL_CRATES=my_crate
-cargo build
-
-# In the new checkout, point at the donor's absolute, canonical profile path.
-cd /work/new-checkout
-KACHE_INCREMENTAL_SEED_FROM=/work/previous/target/debug cargo build
+KACHE_SEED_INCREMENTAL=0 cargo build
 ```
 
-The file equivalent for the receiver is:
+Or set it in the config file:
 
 ```toml
 [cache]
-unstable = true
-preserve_incremental = false
-incremental_crates = ["my_crate"]
-incremental_seed_from = "/work/previous/target/debug"
+seed_incremental = false
 ```
 
-Kache probes the selected compiler for `-Zremap-cwd-prefix`, with the current
-crate name and bootstrap environment. The probe compiles no source, is bounded
-to two seconds, and is memoized per compiler and environment. Probe faults leave
-the compile without an imported seed. Kache adds `-Zremap-cwd-prefix=/src` when
-it is absent and the compiler accepts it. An explicit absolute prefix is kept;
-both checkouts must use the same value.
+This keeps target-local adaptive incremental compilation enabled. To choose a
+donor explicitly, set `KACHE_INCREMENTAL_SEED_FROM` or
+`[cache] incremental_seed_from` to its absolute, canonical Cargo profile path,
+such as `/work/previous/target/debug`.
 
-Unstable mode also permits Kache to try bootstrap when a stable compiler needs
-it for these managed compiles. Bootstrap is set only in the selected rustc
-child. Cargo, unselected dependency compiles and build scripts keep their
-original environment. Kache never replaces an existing nonempty
-`RUSTC_BOOTSTRAP`, including `-1` and crate selectors. Its own override adds
-`-Zallow-features=` so source `#![feature(...)]` attributes remain forbidden.
-Other user-supplied unstable compiler flags prevent Kache from adding bootstrap,
-except `incremental-info`. A user-supplied bootstrap setting retains its existing
-behavior. The compiler must support the required flags; bootstrap cannot add
-missing compiler features. The prototype was tested on Linux with rustc 1.99.0.
+### Compiler behavior
 
-Unstable mode is off by default. `[cache] ignore_env` also gates `KACHE_UNSTABLE`.
-These experimental compiler behaviors lack Rust's stable compatibility
-guarantees.
+Portable private compilations use `-Zremap-cwd-prefix=/src`. Debug information
+records that virtual working directory; a debugger started elsewhere may need a
+source mapping. Relative source operands keep relative `file!()` values.
+Absolute source operands retain native path behavior and do not import a seed.
 
-On stable, let Kache insert the remapping flag. Putting `-Z` options in
-`RUSTFLAGS` can make Cargo's compiler queries fail before this managed compile
-path runs; Kache's bootstrap permission does not apply to those queries.
+Kache probes compiler support before using the flag. On stable and beta it sets
+`RUSTC_BOOTSTRAP=1` only in the selected rustc child and adds
+`-Zallow-features=` so source feature attributes remain forbidden. Cargo and
+build scripts keep the caller's environment. Existing `RUSTC_BOOTSTRAP`
+settings, including an empty value and `-1`, take precedence. Other unstable
+compiler flags can prevent Kache from adding bootstrap.
 
-The receiver imports compatible state while holding donor and receiver locks.
-It hard-links finalized rustc graph and codegen files when possible, and copies
-locks and other files. Failed hard links fall back to copies.
-rustc checks changed inputs. Kache copies no Cargo fingerprints or cached
-artifacts and publishes no normal artifact-cache entry from this path. Compiler
-identity, effective bootstrap, flags and cache policy must match. A busy donor,
-incompatible flags, an unsupported argument or incomplete state leaves the
-receiver without an imported seed. Imports are limited to 1 GiB and 65,536
-entries, and scanning to 256 donor units.
+If rustc reports that source read `RUSTC_BOOTSTRAP`, Kache discards that attempt's
+outputs and diagnostics, retries with the caller's environment, and remembers
+not to inject bootstrap for that unit. Genuine compile errors remain errors.
+A proc macro using untracked environment reads can still observe the child
+override; disable seeding if that distinction matters to your macro.
 
-Use the same relative package layout in both checkouts. Targets outside the
-compiler's working directory usually retain different absolute paths and cannot
-share a seed. Absolute source operands keep target-local state because
-rewriting them changes `file!()` output. Builds with unstable mode off
-keep their existing behavior.
+An edit to the primary source can select a compatible private graph before
+cache-key discovery. A previously cached variant may compile during that
+private run. The existing limit of eight builds or 15 minutes of inactivity
+still returns the unit to a cache check. These private outputs are never stored
+or uploaded as ordinary artifact-cache entries.
+
+Use the same relative package layout in both checkouts. Target paths outside
+the compiler's working directory can prevent compatibility. Older compilers
+retain target-local incremental behavior. `KACHE_UNSTABLE=1` still enables
+experimental compiler probing independently of the automatic-seeding setting.
 
 ## What to expect
 

@@ -296,6 +296,19 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
         !failing.join("target/debug/worktree-probe").exists(),
         "discarded bootstrap binary must not survive the failed native retry"
     );
+    assert!(
+        !fs::read_dir(failing.join("target/debug/deps"))
+            .unwrap()
+            .any(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("worktree_probe-")
+                    && path.extension().is_none()
+            }),
+        "discarded rustc executable must not survive in deps either"
+    );
 }
 
 #[test]

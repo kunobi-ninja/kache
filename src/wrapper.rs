@@ -7948,12 +7948,23 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
     let Ok(targets) = store.tracked_target_roots(0) else {
         return Vec::new();
     };
+    worktree_donor_profiles(&target, suffix, targets)
+}
+
+fn worktree_donor_profiles(
+    target: &Path,
+    suffix: &Path,
+    targets: Vec<crate::store::TrackedTargetRoot>,
+) -> Vec<PathBuf> {
+    let Some(current) = kache_store::filesystem::directory_identity(target) else {
+        return Vec::new();
+    };
     targets
         .into_iter()
         .rev()
         .filter(|entry| {
             !entry.discovered
-                && entry.path != target
+                && entry.identity != current
                 && kache_store::filesystem::directory_identity(&entry.path) == Some(entry.identity)
         })
         .map(|entry| entry.path.join(suffix))

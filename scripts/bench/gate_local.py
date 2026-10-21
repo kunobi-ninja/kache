@@ -23,12 +23,15 @@ measured is HEAD, not the dirty tree. Commit first.
 import argparse
 import contextlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from .binaries import stage
 
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
@@ -70,7 +73,7 @@ def resolve(ref):
 
 @contextlib.contextmanager
 def at_commit(commit, package, binary, label):
-    """Build one binary from `commit` in a throwaway worktree.
+    """Build a binary, or the complete Kache package, in a throwaway worktree.
 
     A worktree rather than `git switch`: the gate owns a clean checkout and can
     switch freely, but here the caller's tree is very likely dirty, and
@@ -88,8 +91,9 @@ def at_commit(commit, package, binary, label):
         # kache through kache would put the thing under test in its own
         # baseline.
         environment = dict(os.environ, RUSTC_WRAPPER="", RUSTUP_TOOLCHAIN="")
+        targets = ["--bins"] if package == "kache" else ["--bin", binary]
         subprocess.run(
-            ["cargo", "build", "--release", "-p", package, "--bin", binary],
+            ["cargo", "build", "--release", "-p", package, *targets],
             cwd=tree,
             env=environment,
             check=True,
@@ -102,7 +106,18 @@ def at_commit(commit, package, binary, label):
 
 def build(commit, package, binary, into, label):
     with at_commit(commit, package, binary, label) as tree:
-        shutil.copy2(tree / "target" / "release" / binary, into)
+        if package == "kache":
+            metadata = subprocess.run(
+                ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                cwd=tree,
+                env=dict(os.environ, RUSTC_WRAPPER="", RUSTUP_TOOLCHAIN=""),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            stage(json.loads(metadata.stdout), tree / "target" / "release", into.parent, package)
+        else:
+            shutil.copy2(tree / "target" / "release" / binary, into)
     return into
 
 

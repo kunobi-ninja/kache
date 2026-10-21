@@ -46,6 +46,18 @@ class WorktreeTests(unittest.TestCase):
                     self.assertTrue(str(tree).endswith("tree"))
         self.assertEqual(calls[-1][:2], ("worktree", "remove"))
 
+    def test_kache_builds_all_binaries_but_the_instrument_builds_its_selected_binary(self):
+        for package, binary, targets in [
+            ("kache", "kache", ["--bins"]),
+            ("kache-e2e", "kache-scenario", ["--bin", "kache-scenario"]),
+        ]:
+            with self.subTest(package=package):
+                with patch.object(local, "git", return_value=""):
+                    with patch.object(local.subprocess, "run") as run:
+                        with local.at_commit("abc123", package, binary, "build"):
+                            pass
+                self.assertEqual(run.call_args.args[0][5:], targets)
+
 
 class StagingTests(unittest.TestCase):
     def test_staged_entry_points_run_from_the_staging_directory(self):

@@ -351,10 +351,10 @@ jobs:
         run: |
           set -euo pipefail
           git switch --detach "$MERGE_BASE"
-          cargo build --release -p kache
+          cargo build --release -p kache --bins
           # cc-rs recognizes wrappers by filename, including CMake dependencies.
-          mkdir -p "$RUNNER_TEMP/base"
-          cp target/release/kache "$RUNNER_TEMP/base/kache"
+          cargo metadata --no-deps --format-version 1 |
+            python3 "$RUNNER_TEMP/instrument/bench/binaries.py" target/release "$RUNNER_TEMP/base"
 
       - name: Build kache from the PR head
         env:
@@ -363,9 +363,9 @@ jobs:
         run: |
           set -euo pipefail
           git switch --detach "$HEAD_SHA"
-          cargo build --release -p kache
-          mkdir -p "$RUNNER_TEMP/head"
-          cp target/release/kache "$RUNNER_TEMP/head/kache"
+          cargo build --release -p kache --bins
+          cargo metadata --no-deps --format-version 1 |
+            python3 "$RUNNER_TEMP/instrument/bench/binaries.py" target/release "$RUNNER_TEMP/head"
           "$RUNNER_TEMP/base/kache" --version
           "$RUNNER_TEMP/head/kache" --version
 

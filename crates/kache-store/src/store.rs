@@ -1820,7 +1820,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    a release records is served. An index can carry 9 and still lack a
 ///    column (`file_hash::has_rule_columns`), so the open checks them too.
 /// 10: persistent compile-cost backfill state and its pending-work index.
-const INDEX_SCHEMA_GENERATION: i64 = 10;
+/// 11: `cc_header_scans` (#1638 added the table without a bump, so an index
+///    already at 10 never gained it, and every C/C++ preprocess memo read,
+///    which joins it, failed there).
+const INDEX_SCHEMA_GENERATION: i64 = 11;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's

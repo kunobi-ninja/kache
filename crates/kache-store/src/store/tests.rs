@@ -13741,3 +13741,29 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
         1
     );
 }
+
+/// An index stamped 10 by a release from before the header-scan memo
+/// (#1638) has no `cc_header_scans`: opening it must add the table, or
+/// every C/C++ preprocess memo read (which joins it) and the memo pruning
+/// fail on that store for good.
+#[test]
+fn an_index_from_before_the_header_scan_memo_gains_its_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch("DROP TABLE cc_header_scans").unwrap();
+    db.pragma_update(None, "user_version", 10_i64).unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cc_header_scans'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "cc_header_scans was not created");
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    assert!(cache.get_cc_preprocess_memo("absent").unwrap().is_none());
+}

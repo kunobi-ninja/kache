@@ -10502,7 +10502,7 @@ fn the_target_dir_environment_beats_every_config_file() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         from_env,
         "Cargo gives the environment precedence over every config file"
     );
@@ -10522,7 +10522,7 @@ fn the_build_target_dir_environment_is_read_when_the_target_dir_one_is_unset() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         from_env,
         "CARGO_BUILD_TARGET_DIR names the target dir as well"
     );
@@ -10543,14 +10543,14 @@ fn the_target_dir_environment_wins_over_the_build_target_dir_one() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         from_target_dir,
         "CARGO_TARGET_DIR is the older name for the same setting"
     );
 }
 
 #[test]
-fn an_empty_target_dir_environment_is_ignored() {
+fn an_empty_target_dir_environment_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     fs::create_dir_all(&project).unwrap();
@@ -10560,11 +10560,7 @@ fn an_empty_target_dir_environment_is_ignored() {
         target_dir: os(std::path::Path::new("")),
         ..environment()
     };
-    assert_eq!(
-        cargo_output_dir_from(&project, &env),
-        target,
-        "an empty CARGO_TARGET_DIR is no setting at all"
-    );
+    assert_eq!(cargo_output_dir_from(&project, &env), None);
 }
 
 #[test]
@@ -10577,7 +10573,7 @@ fn a_relative_target_dir_environment_resolves_against_the_working_directory() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         project.join("target"),
         "an environment path is relative to the working directory"
     );
@@ -10594,7 +10590,7 @@ fn the_nearest_config_wins_over_an_outer_one() {
     cargo_config(&outer, &outer_target);
     cargo_config(&outer.join("crates"), &nearest_target);
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         nearest_target,
         "Cargo merges ancestor configs nearest first"
     );
@@ -10619,7 +10615,7 @@ fn the_cargo_home_config_is_read_when_no_ancestor_names_one() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         target,
         "Cargo reads $CARGO_HOME/config.toml after the per-directory ones"
     );
@@ -10646,7 +10642,7 @@ fn cargo_home_defaults_to_the_home_directory() {
         home: home.clone(),
         ..environment()
     };
-    assert_eq!(cargo_output_dir_from(&project, &env), target);
+    assert_eq!(cargo_output_dir_from(&project, &env).unwrap(), target);
 }
 
 #[test]
@@ -10669,7 +10665,7 @@ fn an_empty_cargo_home_falls_back_to_the_home_directory() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         target,
         "an empty CARGO_HOME is no setting at all"
     );
@@ -10682,7 +10678,7 @@ fn a_relative_target_dir_resolves_against_the_config_that_names_it() {
     fs::create_dir_all(&project).unwrap();
     cargo_config(&project, std::path::Path::new("build/output"));
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         project.join("build/output"),
         "Cargo resolves a relative target-dir against the parent of .cargo"
     );
@@ -10701,7 +10697,7 @@ fn a_target_dir_no_build_has_created_yet_probes_its_nearest_existing_ancestor() 
     )
     .unwrap();
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         project,
         "the probe needs a directory it can write a temp file into"
     );
@@ -10713,7 +10709,7 @@ fn a_project_with_nothing_configured_probes_its_working_directory() {
     let project = dir.path().join("project");
     fs::create_dir_all(project.join("target")).unwrap();
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         project.join("target"),
         "without a setting Cargo uses target below the working directory"
     );
@@ -10737,7 +10733,7 @@ fn a_workspace_member_probes_the_workspace_target_dir() {
     .unwrap();
     fs::create_dir_all(workspace.join("target")).unwrap();
     assert_eq!(
-        cargo_output_dir_from(&member, &environment()),
+        cargo_output_dir_from(&member, &environment()).unwrap(),
         workspace.join("target"),
         "Cargo puts the default target dir below the workspace root"
     );
@@ -10765,7 +10761,7 @@ fn the_legacy_config_file_wins_over_the_modern_one() {
     )
     .unwrap();
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         legacy,
         "Cargo reads the extensionless config in preference to config.toml"
     );
@@ -10786,7 +10782,7 @@ fn the_build_dir_environment_selects_the_probe_directory() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         build,
         "the store hardlinks the intermediates, which live in the build dir"
     );
@@ -10807,7 +10803,7 @@ fn the_build_dir_config_selects_the_probe_directory() {
     )
     .unwrap();
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         build,
         "a split build dir holds the intermediates the store hardlinks"
     );
@@ -10834,14 +10830,14 @@ fn a_build_dir_template_expands_to_the_workspace_root() {
     .unwrap();
     fs::create_dir_all(workspace.join("intermediate")).unwrap();
     assert_eq!(
-        cargo_output_dir_from(&member, &environment()),
+        cargo_output_dir_from(&member, &environment()).unwrap(),
         workspace.join("intermediate"),
         "Cargo expands the workspace root in a build dir"
     );
 }
 
 #[test]
-fn an_unknown_build_dir_template_is_ignored() {
+fn an_unknown_build_dir_template_leaves_the_probe_unresolved() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     fs::create_dir_all(project.join(".cargo")).unwrap();
@@ -10855,15 +10851,11 @@ fn an_unknown_build_dir_template_is_ignored() {
         ]),
     )
     .unwrap();
-    assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
-        target,
-        "a template Cargo does not know leaves the target dir in place"
-    );
+    assert_eq!(cargo_output_dir_from(&project, &environment()), None);
 }
 
 #[test]
-fn an_empty_build_dir_is_ignored() {
+fn an_empty_build_dir_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     fs::create_dir_all(project.join(".cargo")).unwrap();
@@ -10873,15 +10865,11 @@ fn an_empty_build_dir_is_ignored() {
         cargo_build_config(&[("build-dir", std::path::Path::new(""))]),
     )
     .unwrap();
-    assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
-        project.join("target"),
-        "an empty build dir names no directory at all"
-    );
+    assert_eq!(cargo_output_dir_from(&project, &environment()), None);
 }
 
 #[test]
-fn an_empty_build_dir_environment_leaves_the_configured_one() {
+fn an_empty_build_dir_environment_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     fs::create_dir_all(project.join(".cargo")).unwrap();
@@ -10896,15 +10884,11 @@ fn an_empty_build_dir_environment_leaves_the_configured_one() {
         build_dir: os(std::path::Path::new("")),
         ..environment()
     };
-    assert_eq!(
-        cargo_output_dir_from(&project, &env),
-        build,
-        "an empty CARGO_BUILD_BUILD_DIR is no setting at all"
-    );
+    assert_eq!(cargo_output_dir_from(&project, &env), None);
 }
 
 #[test]
-fn an_empty_target_dir_in_a_config_is_ignored() {
+fn an_empty_target_dir_in_a_config_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     fs::create_dir_all(project.join(".cargo")).unwrap();
@@ -10914,11 +10898,7 @@ fn an_empty_target_dir_in_a_config_is_ignored() {
         cargo_build_config(&[("target-dir", std::path::Path::new(""))]),
     )
     .unwrap();
-    assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
-        project.join("target"),
-        "an empty target dir names no directory at all"
-    );
+    assert_eq!(cargo_output_dir_from(&project, &environment()), None);
 }
 
 #[test]
@@ -10929,24 +10909,20 @@ fn a_config_without_a_build_table_is_skipped() {
     fs::create_dir_all(project.join("target")).unwrap();
     fs::write(project.join(".cargo/config.toml"), "[net]\nretry = 2\n").unwrap();
     assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
+        cargo_output_dir_from(&project, &environment()).unwrap(),
         project.join("target"),
         "a config that names no target dir leaves the default in place"
     );
 }
 
 #[test]
-fn a_malformed_config_is_skipped() {
+fn a_malformed_config_leaves_the_probe_unresolved() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     fs::create_dir_all(project.join(".cargo")).unwrap();
     fs::create_dir_all(project.join("target")).unwrap();
     fs::write(project.join(".cargo/config.toml"), "[build\n").unwrap();
-    assert_eq!(
-        cargo_output_dir_from(&project, &environment()),
-        project.join("target"),
-        "a config Cargo cannot read leaves the default in place"
-    );
+    assert_eq!(cargo_output_dir_from(&project, &environment()), None);
 }
 
 #[test]
@@ -10962,7 +10938,7 @@ fn a_package_outside_a_workspace_probes_its_own_target_dir() {
     .unwrap();
     fs::create_dir_all(package.join("target")).unwrap();
     assert_eq!(
-        cargo_output_dir_from(&source, &environment()),
+        cargo_output_dir_from(&source, &environment()).unwrap(),
         package.join("target"),
         "Cargo puts the default target dir below the package root"
     );
@@ -10987,8 +10963,82 @@ fn a_relative_cargo_home_resolves_against_the_working_directory() {
         ..environment()
     };
     assert_eq!(
-        cargo_output_dir_from(&project, &env),
+        cargo_output_dir_from(&project, &env).unwrap(),
         target,
         "a relative cargo home is relative to the working directory"
     );
+}
+
+#[test]
+fn a_configured_build_dir_survives_an_environment_target_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let target = dir.path().join("environment-target");
+    let build = project.join("intermediate");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&build).unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        cargo_build_config(&[("build-dir", std::path::Path::new("intermediate"))]),
+    )
+    .unwrap();
+    for env in [
+        CargoEnvironment {
+            target_dir: os(&target),
+            ..environment()
+        },
+        CargoEnvironment {
+            build_target_dir: os(&target),
+            ..environment()
+        },
+    ] {
+        assert_eq!(cargo_output_dir_from(&project, &env), Some(build.clone()));
+    }
+}
+
+#[test]
+fn a_member_can_name_a_workspace_outside_its_ancestors() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let member = dir.path().join("member");
+    fs::create_dir_all(workspace.join("target")).unwrap();
+    fs::create_dir_all(member.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"../member\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nworkspace = \"../workspace\"\n",
+    )
+    .unwrap();
+    fs::write(member.join("src/lib.rs"), "").unwrap();
+    assert_eq!(
+        cargo_output_dir_from(&member, &environment()),
+        Some(workspace.canonicalize().unwrap().join("target"))
+    );
+}
+
+#[test]
+fn an_unresolved_include_or_file_target_never_probes_a_different_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        "include = [\"other.toml\"]\n",
+    )
+    .unwrap();
+    assert_eq!(cargo_output_dir_from(&project, &environment()), None);
+    fs::remove_file(project.join(".cargo/config.toml")).unwrap();
+    let target = project.join("file-target");
+    fs::write(&target, b"keep this file").unwrap();
+    let env = CargoEnvironment {
+        target_dir: os(&target),
+        ..environment()
+    };
+    assert_eq!(cargo_output_dir_from(&project, &env), None);
+    assert_eq!(fs::read(target).unwrap(), b"keep this file");
 }

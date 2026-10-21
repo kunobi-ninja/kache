@@ -136,6 +136,18 @@ pub(crate) fn new_target(
     })
 }
 
+/// Resolve Cargo's intermediate directory for diagnostics as well as seeding.
+/// The shared resolver keeps target and build overrides independent.
+pub(crate) fn configured_output_dir(
+    cwd: &Path,
+    workspace: &Path,
+    cargo_home: &Path,
+    target_env: Option<&std::ffi::OsStr>,
+    build_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    placement::resolve(cwd, workspace, cargo_home, target_env, build_env)
+}
+
 fn workspace_root(cwd: &Path) -> Option<&Path> {
     cwd.ancestors()
         .find(|dir| dir.join("Cargo.lock").is_file() && dir.join("Cargo.toml").is_file())

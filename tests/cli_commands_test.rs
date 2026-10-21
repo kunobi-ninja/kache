@@ -2101,6 +2101,27 @@ fn doctor_probes_the_cargo_target_dir_for_the_link_layout() {
 }
 
 #[test]
+fn doctor_reports_an_unresolved_output_directory_without_claiming_link_support() {
+    let e = env();
+    let project = TempDir::new().unwrap();
+    let output = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache)
+        .env("CARGO_TARGET_DIR", "")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .arg("doctor")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let check = text
+        .lines()
+        .find(|line| line.contains("Link layout"))
+        .unwrap_or_else(|| panic!("missing link-layout result: {text}"));
+    assert!(check.contains("could not be resolved"), "{check}");
+    assert!(check.contains("probe skipped"), "{check}");
+}
+
+#[test]
 fn doctor_does_not_prescribe_obsolete_build_script_for_extra_inputs() {
     let e = env();
     let project = TempDir::new().unwrap();

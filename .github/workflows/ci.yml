@@ -1594,33 +1594,16 @@ jobs:
         cargo-windows,
         version-consistency,
       ]
-    # IN-ORG MIRROR of zondax/_workflows@7f61511 (v11) — a byte-identical import.
-    # The macOS legs run on the self-hosted signing runners, whose runner group
-    # restricts which workflows may use it. GitHub matches that allowlist against
-    # the workflow a job is DEFINED in (not the caller), and an org-owned group
-    # cannot name a workflow from another org — so while this pointed at
-    # `zondax/`, no allowlist entry could authorize the Darwin jobs. They queued
-    # forever against online, idle runners with no error anywhere; v0.14.0 lost
-    # ~2h to exactly that. See kunobi-ninja/_workflows for the full rationale.
-    #
-    # The signing-runners allowlist pins THIS SHA. Bumping the pin without
-    # updating that group's selected_workflows breaks releases SILENTLY — move
-    # both in one change; the mirror's README has the one-liner.
-    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@f675b9a98c59e06177df7bc0cf4f7c06e71b183d
+    # In-org mirror of the shared release workflow, pinned to its merged commit.
+    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@5c4d21956396270698b589ba5808dc51b33ffbd2
     with:
       binary_name: kache
+      companion_binary: kache-engine
       cache_windows_sysroot: true
-      # Build .deb assets (kache_<version>_{amd64,arm64}.deb) for the apt repo,
-      # consumed by .github/workflows/package-publish.yml after release publish.
-      # NOTE: requires the _workflows `build_deb` change merged AND the `v10` tag
-      # moved to include it first — so THIS PR must merge AFTER that _workflows PR.
+      # Include both binaries in Debian packages and release archives.
       build_deb: true
-      # Also publish the bare signed kache.exe per Windows arch as a first-class
-      # release asset (kache-<triple>-pc-windows-msvc.exe), so winget can install
-      # it as InstallerType: portable (see package-publish.yml). Same merge-order
-      # caveat as build_deb: needs the _workflows `upload_windows_exe` change in
-      # `v10` first. The .zip is still produced (cargo-binstall consumes it).
-      upload_windows_exe: true
+      # Winget installs the ZIP so kache-engine stays beside the frontend.
+      upload_windows_exe: false
       # Both Windows targets (x64 + arm64) ship as `-pc-windows-msvc`, cross-built
       # on the Linux runner via cargo-xwin: clang-cl + lld-link against the MSVC
       # CRT and Windows SDK that `xwin` downloads. TLS uses the `ring` crypto

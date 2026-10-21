@@ -200,7 +200,7 @@ mod tests {
         let (send, receive) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let chunks = output_chunks(&bytes)
-                .take(bytes.len() + 1)
+                .take(8)
                 .map(<[u8]>::to_vec)
                 .collect();
             let _ = send.send(chunks);

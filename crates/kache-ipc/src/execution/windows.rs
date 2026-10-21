@@ -110,7 +110,7 @@ impl Connection {
                     }
                 })
         })?;
-        let pipe = DuplexPipeStream::<Bytes>::try_from(handle).map_err(io::Error::other)?;
+        let pipe = DuplexPipeStream::<Bytes>::try_from(handle).map_err(io::Error::from)?;
         let inner = interprocess::os::windows::named_pipe::local_socket::Stream::from(pipe);
         Self::from_stream(inner.into(), deadline)
     }

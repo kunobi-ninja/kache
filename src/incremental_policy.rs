@@ -2661,6 +2661,34 @@ mod tests {
     }
 
     #[test]
+    fn changed_source_cannot_borrow_busy_or_active_state_even_with_an_empty_graph() {
+        for (phase, in_flight) in [
+            (Phase::Learning, true),
+            (Phase::Seed, true),
+            (Phase::Active, false),
+            (Phase::Active, true),
+        ] {
+            let (temp, _args, mut unit) = fixture();
+            let source = temp.path().join("edited.rs");
+            fs::write(&source, b"original").unwrap();
+            unit.source_file = Some(source.clone());
+            teach(&unit, 100);
+            let mut state = read_state(&unit);
+            state.phase = phase;
+            state.in_flight = in_flight;
+            write_state(&unit, &state);
+            fs::create_dir(&unit.rustc_dir).unwrap();
+            fs::write(source, b"edited").unwrap();
+            let before = fs::read(&unit.state_path).unwrap();
+            assert!(
+                unit.try_source_changed_seed().is_none(),
+                "{phase:?}, {in_flight}"
+            );
+            assert_eq!(fs::read(&unit.state_path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn only_recorded_policy_state_can_seed() {
         let (_temp, _args, unit) = fixture();
         assert!(!unit.has_policy_state());

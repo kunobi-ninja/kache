@@ -282,6 +282,25 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
             String::from_utf8(binary.stdout).unwrap().trim(),
             format!("{suffix}:native")
         );
+        let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let event = events
+            .iter()
+            .rev()
+            .find(|event| event["crate_name"] == "worktree_probe")
+            .unwrap();
+        assert_eq!(
+            event["passthrough_reason"], "incremental force-list: worktree_probe",
+            "{event:#}"
+        );
+        assert_eq!(
+            event["compiler_runs"],
+            if suffix == "first" { 2 } else { 1 },
+            "{event:#}"
+        );
     }
     assert!(
         graph_contents(&root.join("target/debug/incremental.kache-auto"))
@@ -320,6 +339,146 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
                     && path.extension().is_none()
             }),
         "discarded rustc executable must not survive in deps either"
+    );
+}
+
+#[test]
+fn bootstrap_retry_keeps_absolute_include_paths_in_explicit_passthroughs() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    project(&root, 0);
+    fs::write(
+        root.join("native_path.rs"),
+        "fn native_path() -> &'static str { file!() }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/native_path.rs\"));\nfn main() { println!(\"{}\", native_path()); }\n").unwrap();
+    let output = automatic_build(&root, &root.join("cache"), true, true, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::process::Command::new(root.join("target/debug/worktree-probe"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        root.join("native_path.rs").to_str().unwrap()
+    );
+}
+
+#[test]
+fn failed_bootstrap_dep_info_cleanup_keeps_the_native_compile_accounted() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let cache = root.join("cache");
+    edited_project(&root, 0);
+    let output = automatic_build(&root, &cache, true, true, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dep_info = fs::read_dir(root.join("target/debug/deps"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("worktree_probe-")
+                && path.extension().is_some_and(|extension| extension == "d")
+        })
+        .unwrap();
+    fs::remove_file(&dep_info).unwrap();
+    fs::create_dir(&dep_info).unwrap();
+    edited_project(&root, 1);
+    let output = automatic_build(&root, &cache, true, true, false);
+    assert!(!output.status.success());
+    let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = events
+        .iter()
+        .rev()
+        .find(|event| event["crate_name"] == "worktree_probe")
+        .unwrap();
+    assert_eq!(event["exit_code"], 1, "{event:#}");
+    assert_eq!(
+        event["passthrough_reason"], "incremental force-list: worktree_probe",
+        "{event:#}"
+    );
+    assert_eq!(event["compiler_runs"], 1, "{event:#}");
+}
+
+#[test]
+fn deferred_source_error_does_not_retry_a_stale_bootstrap_observation() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let cache = root.join("cache");
+    project(&root, 0);
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> u64 { 0 }\n").unwrap();
+    let output = automatic_build(&root, &cache, true, false, true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dep_info = fs::read_dir(root.join("target/debug/deps"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("worktree_probe-")
+                && path.extension().is_some_and(|extension| extension == "d")
+        })
+        .unwrap();
+    fs::write(&dep_info, "# env-dep:RUSTC_BOOTSTRAP=stale\n").unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "mod missing; pub fn answer() -> u64 { missing::answer() }\n",
+    )
+    .unwrap();
+    let output = automatic_build(&root, &cache, true, false, true);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("inputs=compile-while-keying"), "{stderr}");
+    let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = events
+        .iter()
+        .rev()
+        .find(|event| event["crate_name"] == "worktree_probe")
+        .unwrap();
+    assert_eq!(event["passthrough_reason"], "adaptive seed", "{event:#}");
+    assert_eq!(
+        event["compiler_runs"], 1,
+        "a stale observation must not cause another compile: {event:#}"
+    );
+    assert!(
+        !graph_contents(&root.join("target/debug/incremental.kache-auto"))
+            .keys()
+            .any(|path| path
+                .file_name()
+                .is_some_and(|name| name == "bootstrap-env-dep"))
     );
 }
 

@@ -6028,7 +6028,7 @@ const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceEnvDepUse {
     /// No env macro names the var, and none has a name the scanner cannot read
-    /// outside an include argument.
+    /// outside an include argument, or the file is not UTF-8 and was not scanned.
     Unused,
     /// At least one `env!(var)` / `option_env!(var)` inside an `include*!`
     /// argument, and no use outside one.

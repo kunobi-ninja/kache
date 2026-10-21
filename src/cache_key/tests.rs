@@ -12246,6 +12246,86 @@ fn env_use_scan_treats_non_utf8_data_as_unused() {
 }
 
 #[test]
+fn non_utf8_env_scan_replaces_version_five_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("template.rs");
+    std::fs::write(&blob, b"\xff include!(env!(\"OUT_DIR\"));").unwrap();
+    let hash = hash_file(&blob).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(&hash, "OUT_DIR", 5, SourceEnvDepUse::IncludeLocator.memo_code())
+        .unwrap();
+    drop(cache);
+
+    let hasher = FileHasher::persistent(&db);
+    assert_eq!(
+        hasher.env_dep_use(&blob, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::Unused,
+        "the lossy scanner's version-five answer must be rescanned"
+    );
+    drop(hasher);
+
+    let cache = FileHashCache::open(&db).unwrap();
+    assert_eq!(
+        cache.get_source_env_dep_use(&hash, "OUT_DIR", 6).unwrap(),
+        Some(SourceEnvDepUse::Unused.memo_code())
+    );
+    drop(cache);
+
+    // A new wrapper can reuse the updated answer without reading the blob.
+    std::fs::remove_file(&blob).unwrap();
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use_for_hash(&blob, "OUT_DIR", &hash)
+            .unwrap(),
+        SourceEnvDepUse::Unused
+    );
+}
+
+#[test]
+fn non_utf8_files_neither_supply_nor_veto_include_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"include_bytes!(env!(\"OUT_DIR\"));").unwrap();
+    let false_proof = dir.path().join("template.rs");
+    std::fs::write(&false_proof, b"\xff include!(env!(\"OUT_DIR\"));").unwrap();
+    let binary_value = dir.path().join("binary.bin");
+    std::fs::write(&binary_value, b"\xff pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    let text_value = dir.path().join("text.bin");
+    std::fs::write(&text_value, b"pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    let hasher = FileHasher::new();
+
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[false_proof], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source.clone(), binary_value], &hasher),
+        EnvDepNormalizationDecision::NormalizedPathOnly
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source, text_value], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+    );
+}
+
+#[test]
+fn non_utf8_env_scan_checks_content_before_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob.bin");
+    std::fs::write(&blob, b"\xff").unwrap();
+    let old_hash = blake3::hash(b"previous contents").to_hex().to_string();
+    let error = FileHasher::new()
+        .scan_env_dep_use(&blob, "OUT_DIR", &old_hash)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed between content hashing"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn cc_preprocess_memo_support_requires_persistent_cache() {
     assert!(!FileHasher::new().supports_cc_preprocess_memo());
 

@@ -127,7 +127,7 @@ fn automatic_supported() -> bool {
     (major, minor) >= (1, 98) && supports_cwd_remap()
 }
 
-fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool) -> Output {
+fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool, library: bool) -> Output {
     let mut command = common::hermetic_command("cargo", cache, Some(&cache.join("absent.toml")));
     command
         .current_dir(root)
@@ -139,13 +139,21 @@ fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool) -> Out
         .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
         .env("KACHE_PRESERVE_INCREMENTAL", "0")
         .env("KACHE_LOCAL_ONLY", "1")
+        .env("KACHE_CACHE_EXECUTABLES", "1")
         .env("KACHE_VERIFY_INPUT_PREDICTIONS", "always")
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
+        .env_remove("KACHE_FALLBACK")
+        .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_KEY_ENV_VARS")
         .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env("RUSTFLAGS", "");
+    if library {
+        command.arg("--lib");
+    }
     if enabled {
         command.env_remove("KACHE_SEED_INCREMENTAL");
     } else {
@@ -181,7 +189,7 @@ fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
     let opted_out = root.join("opted-out");
     for answer in [0, 1, 2] {
         edited_project(&donor, answer);
-        let output = automatic_build(&donor, &cache, true, false);
+        let output = automatic_build(&donor, &cache, true, false, false);
         assert!(
             output.status.success(),
             "{}",
@@ -191,14 +199,14 @@ fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
     let original = graph_contents(&donor.join("target/debug/incremental.kache-auto"));
     for (repo, enabled) in [(&receiver, true), (&opted_out, false)] {
         edited_project(repo, 0);
-        let output = automatic_build(repo, &cache, enabled, false);
+        let output = automatic_build(repo, &cache, enabled, false, false);
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         edited_project(repo, 3);
-        let output = automatic_build(repo, &cache, enabled, false);
+        let output = automatic_build(repo, &cache, enabled, false, false);
         assert!(
             output.status.success(),
             "{}",
@@ -255,7 +263,7 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
         fs::write(root.join("src/main.rs"), format!(
             "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\nfn main() {{ println!(\"{suffix}:{{}}\", option_env!(\"RUSTC_BOOTSTRAP\").unwrap_or(\"native\")); }}\n"
         )).unwrap();
-        let output = automatic_build(&root, &cache, true, true);
+        let output = automatic_build(&root, &cache, true, true, false);
         assert!(
             output.status.success(),
             "{}",
@@ -286,7 +294,7 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
         "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_some());\nfn main() {}\n",
     )
     .unwrap();
-    let output = automatic_build(&failing, &cache, true, true);
+    let output = automatic_build(&failing, &cache, true, true, false);
     assert!(
         !output.status.success(),
         "native compile error must remain an error"
@@ -309,6 +317,90 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
             }),
         "discarded rustc executable must not survive in deps either"
     );
+}
+
+#[test]
+fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let cache = root.join("cache");
+    project(&root, 0);
+    for answer in [0, 1] {
+        fs::write(root.join("src/lib.rs"), format!(
+            "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\npub fn answer() -> u64 {{ {answer} }}\n"
+        )).unwrap();
+        let output = automatic_build(&root, &cache, true, false, true);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("E0080"));
+    }
+    let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let seed = events
+        .iter()
+        .rev()
+        .find(|event| event["crate_name"] == "worktree_probe")
+        .unwrap();
+    assert_eq!(seed["passthrough_reason"], "adaptive seed", "{seed:#}");
+    assert_eq!(
+        seed["dep_info_runs"], 0,
+        "no separate dep-info pre-pass: {seed:#}"
+    );
+    assert!(
+        graph_contents(&root.join("target/debug/incremental.kache-auto"))
+            .keys()
+            .any(|path| path
+                .file_name()
+                .is_some_and(|name| name == "bootstrap-env-dep"))
+    );
+    let deps = root.join("target/debug/deps");
+    let rlib = fs::read_dir(&deps)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("libworktree_probe-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "rlib")
+        })
+        .unwrap();
+    let source = root.join("consumer.rs");
+    let binary = root.join("consumer");
+    fs::write(
+        &source,
+        "fn main() { println!(\"{}\", worktree_probe::answer()); }\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new("rustc")
+        .arg(&source)
+        .args(["--edition", "2024", "--extern"])
+        .arg(format!("worktree_probe={}", rlib.display()))
+        .arg("-L")
+        .arg(&deps)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::process::Command::new(binary).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "1");
 }
 
 #[test]

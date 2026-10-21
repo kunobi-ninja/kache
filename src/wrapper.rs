@@ -4075,7 +4075,6 @@ fn run_parsed_rustc(
     // A learning unit has no graph to reuse. Reserve a cold private compile
     // before discovery, then qualify its seed from rustc's emitted closure.
     let mut deferred_seed = if adaptive_policy_for_invocation
-        && !automatic_seeding_enabled(config, args)
         && precompiled.is_none()
         && stop_on_hit_allowed(args)
         && deferral_allowed(config, args, false, extra_inputs)
@@ -6167,7 +6166,18 @@ fn adaptive_compile_before_key(
         ctx.args.invokes_linker(),
         ctx.config.test_lease.as_deref(),
     );
-    let compiler_args = lease.compiler_args(ctx.args);
+    let mut compiler_args = prepare_worktree_compiler_args(ctx.config, ctx.args, &mut lease);
+    let bootstrap = std::cell::Cell::new(lease.worktree_bootstrap());
+    let bootstrap_observed = std::cell::Cell::new(false);
+    let ready = !bootstrap.get()
+        || clear_incremental_bootstrap_dep_info(ctx.args)
+        || if lease.decline_worktree_bootstrap() {
+            bootstrap.set(false);
+            compiler_args = lease.compiler_args(ctx.args);
+            true
+        } else {
+            false
+        };
     let mut hit_closure = None;
     let mut observed = None;
     let mut lookup_ms = 0_u64;
@@ -6176,6 +6186,15 @@ fn adaptive_compile_before_key(
         let Some(dep_info) = emitted_dep_info(ctx.args) else {
             return true;
         };
+        if bootstrap.get()
+            && dep_info
+                .env_deps
+                .iter()
+                .any(|(name, _)| name == "RUSTC_BOOTSTRAP")
+        {
+            bootstrap_observed.set(true);
+            return false;
+        }
         let Ok(keyed) =
             emitted_compile_key(ctx, dep_info.clone(), tree_guard.clone(), &mut key_record)
         else {
@@ -6199,7 +6218,6 @@ fn adaptive_compile_before_key(
             }
             Ok(_) => {
                 if let Some(fields) = &keyed.outputs.fields {
-                    let _ = lease.qualify_deferred_seed(&keyed.cache_key, fields);
                     observed = Some((keyed.cache_key, fields.clone()));
                 }
                 true
@@ -6207,11 +6225,52 @@ fn adaptive_compile_before_key(
             Err(_) => true,
         }
     };
-    let executed = ctx.compiler.execute_preserving_incremental_until_dep_info(
-        ctx.args,
-        &compiler_args,
-        &mut on_dep_info,
-    );
+    let portable = RustcCompiler::new()
+        .with_base_dirs(ctx.config.base_dirs.clone())
+        .with_incremental_bootstrap(bootstrap.get());
+    let mut executed = if !ready {
+        Err(anyhow::anyhow!("cannot prepare private bootstrap dep-info"))
+    } else if lease.worktree_portable() {
+        portable.execute_portable_incremental(ctx.args, &compiler_args, Some(&mut on_dep_info))
+    } else {
+        ctx.compiler.execute_preserving_incremental_until_dep_info(
+            ctx.args,
+            &compiler_args,
+            &mut on_dep_info,
+        )
+    };
+    if bootstrap.get()
+        && (bootstrap_observed.get()
+            || emitted_dep_info(ctx.args).is_some_and(|info| {
+                info.env_deps
+                    .iter()
+                    .any(|(name, _)| name == "RUSTC_BOOTSTRAP")
+            }))
+    {
+        let cleared = executed
+            .as_ref()
+            .is_ok_and(|result| discard_bootstrap_outputs(&result.artifacts));
+        if cleared && lease.decline_worktree_bootstrap() {
+            bootstrap.set(false);
+            compiler_args = lease.compiler_args(ctx.args);
+            executed = ctx.compiler.execute_preserving_incremental_until_dep_info(
+                ctx.args,
+                &compiler_args,
+                &mut on_dep_info,
+            );
+        } else {
+            executed = Err(anyhow::anyhow!(
+                "cannot retire bootstrap-observing private state"
+            ));
+        }
+    }
+    if hit_closure.is_none()
+        && let Some((cache_key, fields)) = &observed
+    {
+        // The original in-flight marker and receiver lock cover the child.
+        // Qualify only the final attempt, after any bootstrap retry.
+        let _ = lease.qualify_deferred_seed(cache_key, fields);
+    }
     if hit_closure.is_none() && executed.is_ok() {
         permit.record_compile_rss(ctx.crate_name);
     }

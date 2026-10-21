@@ -225,6 +225,15 @@ impl RustcCompiler {
         parsed: &RustcArgs,
         isolated_args: &[String],
     ) -> Result<CompileResult> {
+        self.execute_portable_incremental(parsed, isolated_args, None)
+    }
+
+    pub(crate) fn execute_portable_incremental(
+        &self,
+        parsed: &RustcArgs,
+        isolated_args: &[String],
+        on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<CompileResult> {
         let mut stderr = std::io::stderr();
         self.execute_with_args(
             parsed,
@@ -241,7 +250,7 @@ impl RustcCompiler {
             } else {
                 Some(&mut stderr)
             },
-            None,
+            on_dep_info,
         )
     }
 

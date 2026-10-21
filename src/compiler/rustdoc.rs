@@ -797,12 +797,9 @@ fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
             break;
         }
         let byte = bytes[index];
-        if byte.is_ascii_whitespace() {
-            let skip = bytes[index..]
-                .iter()
-                .take_while(|byte| byte.is_ascii_whitespace())
-                .count();
-            index += skip;
+        let whitespace = rust_whitespace_len(bytes, index);
+        if whitespace > 0 {
+            index += whitespace;
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
@@ -820,10 +817,7 @@ fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
         }
         // A numeric suffix belongs to the number, not a string prefix.
         if byte.is_ascii_digit() {
-            index += bytes[index..]
-                .iter()
-                .take_while(|byte| is_ident_continue(**byte))
-                .count();
+            index = skip_ident_bytes(bytes, index);
             continue;
         }
         if (byte == b'b' || (c_strings && byte == b'c'))
@@ -851,11 +845,7 @@ fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
         }
         if is_ident_start(byte) {
             let start = index;
-            let len = bytes[index..]
-                .iter()
-                .take_while(|byte| is_ident_continue(**byte))
-                .count();
-            index += len;
+            index = skip_ident_bytes(bytes, index);
             out.push(Tok::Ident(
                 String::from_utf8_lossy(&bytes[start..index]).into_owned(),
             ));
@@ -875,11 +865,33 @@ fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
 }
 
 fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
+    byte.is_ascii_alphabetic() || byte == b'_' || !byte.is_ascii()
 }
 
 fn is_ident_continue(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+    is_ident_start(byte) || byte.is_ascii_digit()
+}
+
+fn skip_ident_bytes(bytes: &[u8], mut index: usize) -> usize {
+    while let Some(&byte) = bytes.get(index) {
+        if !is_ident_continue(byte) || rust_whitespace_len(bytes, index) > 0 {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+// Keep Rust whitespace separate from UTF-8 identifier bytes.
+// This matches the source scanner in cache_key.
+fn rust_whitespace_len(bytes: &[u8], index: usize) -> usize {
+    match bytes.get(index..).unwrap_or_default() {
+        [b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r' | b' ', ..] => 1,
+        [0xC2, 0x85, ..] => 2,
+        [0xE2, 0x80, 0x8E | 0x8F | 0xA8 | 0xA9, ..] => 3,
+        [0xEF, 0xBB, 0xBF, ..] => 3,
+        _ => 0,
+    }
 }
 
 fn skip_block_comment(bytes: &[u8], index: usize) -> usize {
@@ -2624,8 +2636,50 @@ mod tests {
             };
         }
         document! { 1cr#"a" env!("DOC_TEXT"), "#" }"###;
-        for prefix in ["1cr", "1br", "1r", "12cr", "0x12cr"] {
+        for prefix in [
+            "1cr",
+            "1br",
+            "1r",
+            "12cr",
+            "0x12cr",
+            "1écr",
+            "1a\u{0301}cr",
+            "1ér",
+            "1ébr",
+        ] {
             let source = source.replace("1cr", prefix);
+            for c_strings in [false, true] {
+                assert!(scan_rust(source.as_bytes(), c_strings).is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_separators_do_not_join_numeric_suffixes_or_identifiers() {
+        for separator in [
+            "\u{0085}",
+            "\u{200E}",
+            "\u{200F}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{FEFF}",
+        ] {
+            let source = format!("forward!(1{separator}env!(\"DOC_TEXT\"));");
+            for c_strings in [false, true] {
+                assert!(scan_rust(source.as_bytes(), c_strings).is_err(), "{source}");
+            }
+            assert_eq!(module_names(&format!("mod{separator}real;")), ["real"]);
+        }
+        assert!(scan_rust("éenv!(\"DOC_TEXT\");".as_bytes(), true).is_ok());
+        assert!(scan_rust("a\u{0301}env!(\"DOC_TEXT\");".as_bytes(), true).is_ok());
+        assert_eq!(skip_ident_bytes("1écr".as_bytes(), 0), 5);
+        assert_eq!(skip_ident_bytes(b"", 0), 0);
+        assert_eq!(skip_ident_bytes(b";", 0), 0);
+        assert_eq!(rust_whitespace_len(b"\xC2", 0), 0);
+        assert_eq!(rust_whitespace_len(b"\xE2\x80", 0), 0);
+        assert_eq!(rust_whitespace_len(b"x", 1), 0);
+        for separator in [" ", "\t", "\n", "\r", "\x0B", "\x0C"] {
+            let source = format!("forward!(1{separator}env!(\"DOC_TEXT\"));");
             assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
         }
     }

@@ -2476,6 +2476,7 @@ fn test_file_config_roundtrip() {
             clean_incremental: Some(false),
             preserve_incremental: Some(true),
             adaptive_incremental: Some(false),
+            seed_incremental: None,
             incremental_seed_from: None,
             unstable: Default::default(),
             exclude: Some(vec!["vendor/problem/**".to_string()]),

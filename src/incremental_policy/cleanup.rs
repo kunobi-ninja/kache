@@ -77,6 +77,7 @@ fn sweep(
             }
             let unit_dir = entry.path();
             let unit = AdaptiveUnit {
+                source_file: None,
                 original_incremental: profile.join("incremental"),
                 policy_guard: Vec::new(),
                 unit_key: key,

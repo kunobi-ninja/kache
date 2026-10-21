@@ -345,6 +345,7 @@ fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
             continue;
         }
         let donor = AdaptiveUnit {
+            source_file: None,
             original_incremental: profile.join("incremental"),
             unit_key: name,
             unit_dir: entry.path(),

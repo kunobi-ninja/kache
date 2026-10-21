@@ -49,7 +49,7 @@ Identical output bytes share one blob. Restores first try copy-on-write cloning.
 
 See [Deduplication](/docs/deduplication) for platform details.
 
-A miss stores its outputs without waiting for an fsync. The daemon flushes the new blobs and metadata to disk on a two-second sweep and marks those entries durable, and a GC run flushes whatever is still pending. Without a reachable daemon the wrapper flushes the entry itself, so a store used without a daemon does not accumulate unflushed entries. Until an entry is flushed, a hit on it verifies every blob against its content hash before restoring, so a crash in between costs a recompile, never a wrong artifact. `[cache] deferred_durability = false` flushes inside the compile instead.
+A miss stores its outputs without waiting for an fsync, and an entry downloaded from the remote is imported the same way. The daemon flushes the new blobs and metadata to disk on a two-second sweep, up to 64 entries per sweep in the main store and in each volume shard, and marks those entries durable, and a GC run flushes whatever is still pending. Without a reachable daemon the wrapper flushes the entry itself, and `kache sync` flushes every pending entry after its pull, so a store used without a daemon does not accumulate unflushed entries. Until an entry is flushed, a hit on it verifies every blob against its content hash before restoring, so a crash in between costs a recompile or a new download, never a wrong artifact. `[cache] deferred_durability = false` flushes inside the compile or download instead.
 
 ## Daemon
 

@@ -3018,9 +3018,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         // Phase 1: move each *new* blob into the content-addressed store and make
-        // it durable. For blobs that already exist (shared), keep the downloaded
+        // it durable, or leave that to the flush of an entry recorded as not yet
+        // durable. For blobs that already exist (shared), keep the downloaded
         // copy in the entry dir for now — it's the fallback Phase 2 restores from
         // if a concurrent remove unlinks the blob.
+        let durable = self.durable_writes();
         for cached_file in &meta.files {
             let blob = self.blob_path(&cached_file.hash);
             if !blob.is_file() {
@@ -3033,7 +3035,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         file_path.display()
                     )
                 })?;
-                crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                if durable {
+                    crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                }
                 set_blob_readonly(&blob);
             }
         }
@@ -3082,14 +3086,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         file_path.display()
                     )
                 })?;
-                crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                if durable {
+                    crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
+                }
                 set_blob_readonly(&blob);
             }
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, unixepoch(), 1)",
-            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, unixepoch(), 1)",
+            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema, durable],
         )?;
         tx.commit()?;
 
@@ -3191,7 +3197,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             fs::create_dir_all(blob.parent().expect("blob path has a parent"))?;
             fs::rename(&artifact, &blob)?;
-            crate::atomic::fsync_file(&blob)?;
+            if self.durable_writes() {
+                crate::atomic::fsync_file(&blob)?;
+            }
             set_blob_readonly(&blob);
         }
         Ok(())
@@ -3265,8 +3273,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         // Make every content-addressed blob durable before the database can
-        // advertise a reference to it. Existing blobs leave the extracted copy
+        // advertise a reference to it, or leave that to the flush of entries
+        // recorded as not yet durable. Existing blobs leave the extracted copy
         // in place as the in-transaction race fallback below.
+        let durable = self.durable_writes();
         for entry in entries {
             let entry_dir = self.entry_dir(&entry.cache_key);
             for file in &entry.meta.files {
@@ -3281,8 +3291,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                             artifact.display()
                         )
                     })?;
-                    crate::atomic::fsync_file(&blob)
-                        .context("flushing verified restored blob to disk")?;
+                    if durable {
+                        crate::atomic::fsync_file(&blob)
+                            .context("flushing verified restored blob to disk")?;
+                    }
                     set_blob_readonly(&blob);
                 }
             }
@@ -3327,7 +3339,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )?;
             tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, unixepoch(), 1)",
+                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, unixepoch(), 1)",
                 params![
                     entry.cache_key,
                     meta.crate_name,
@@ -3337,7 +3349,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     total_size as i64,
                     content_hash,
                     meta.compile_time_ms as i64,
-                    meta.key_schema
+                    meta.key_schema,
+                    durable
                 ],
             )?;
             if inserted == 0 {

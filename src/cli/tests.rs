@@ -6984,6 +6984,51 @@ async fn sync_with_client_pull_downloads_and_imports_entry() {
 }
 
 #[tokio::test]
+async fn sync_with_client_pull_flushes_deferred_imports_without_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+
+    let key = sync_test_cache_key("deferred-pull");
+    let pack = build_entry_pack(&key, "serde");
+    let backend = TestBackend::memory();
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/serde/{key}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+    backend
+        .seed(&format!("prefix/v3/packs/serde/{key}.tar.zst"), pack)
+        .await;
+
+    sync_with_client(
+        &as_cache_remote(as_remote_backend(&backend), &remote),
+        &config,
+        &store,
+        None,
+        true,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("pull sync should succeed");
+
+    assert!(store.contains(&key));
+    assert_eq!(
+        store.pending_durability().unwrap(),
+        0,
+        "no daemon will flush the pulled entry, so the pull does"
+    );
+}
+
+#[tokio::test]
 async fn sync_with_client_pull_recovers_uncommitted_extracted_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));

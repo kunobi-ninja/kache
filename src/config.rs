@@ -473,11 +473,12 @@ pub struct Config {
     /// default on Unix; `KACHE_OUT_DIR_ALIAS=0` or
     /// `[cache] out_dir_alias = false` turns it off.
     pub out_dir_alias: bool,
-    /// Store new entries without an fsync on the build path. The daemon (or
-    /// the next `kache gc`) flushes them shortly after; until then a hit on
-    /// such an entry verifies its bytes before restoring. On by default;
-    /// `KACHE_DEFERRED_DURABILITY=0` or `[cache] deferred_durability = false`
-    /// flushes every entry inside the compile that stored it.
+    /// Store new and downloaded entries without an fsync on the build path.
+    /// The daemon (or the next `kache gc`) flushes them shortly after; until
+    /// then a hit on such an entry verifies its bytes before restoring. On by
+    /// default; `KACHE_DEFERRED_DURABILITY=0` or
+    /// `[cache] deferred_durability = false` flushes every entry inside the
+    /// compile or download that stored it.
     pub deferred_durability: bool,
     /// Hand a finished cc compile's store put to the daemon so the wrapper
     /// returns as soon as the object is written (see `daemon_publish`). On

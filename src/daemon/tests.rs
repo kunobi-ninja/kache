@@ -2799,6 +2799,43 @@ fn the_daemon_sweep_flushes_entries_pending_durability() {
     assert!(store.try_durability_flush_lock().unwrap().is_some());
 }
 
+/// A `[cache.volumes]` shard holds entries the daemon stored or imported
+/// without an fsync too, so the same sweep flushes it.
+#[test]
+fn the_daemon_sweep_flushes_volume_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    config.deferred_durability = true;
+    let shard_dir = dir.path().join("shard");
+    config.volume_stores = vec![crate::config::VolumeStore {
+        volume: dir.path().to_string_lossy().into_owned(),
+        store: shard_dir.clone(),
+        max_size: None,
+    }];
+    let mut shard_config = config.clone();
+    shard_config.cache_dir = shard_dir;
+    let shard = Store::open(&shard_config).unwrap();
+    let output = dir.path().join("out.rlib");
+    std::fs::write(&output, b"artifact-bytes").unwrap();
+    shard
+        .put(
+            "pending",
+            "pending_crate",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(output, "libout.rlib".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    assert_eq!(shard.pending_durability().unwrap(), 1);
+
+    Daemon::new(config).flush_pending_durability();
+    assert_eq!(shard.pending_durability().unwrap(), 0);
+}
+
 #[test]
 fn test_handle_gc_reports_lock_skip() {
     let dir = tempfile::tempdir().unwrap();

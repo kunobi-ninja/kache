@@ -872,17 +872,18 @@ fn is_ident_continue(byte: u8) -> bool {
     is_ident_start(byte) || byte.is_ascii_digit()
 }
 
-fn skip_ident_bytes(bytes: &[u8], mut index: usize) -> usize {
+fn skip_ident_bytes(bytes: &[u8], index: usize) -> usize {
+    let mut cursor = index;
     for _ in index..bytes.len() {
-        let Some(&byte) = bytes.get(index) else {
+        let Some(&byte) = bytes.get(cursor) else {
             break;
         };
-        if !is_ident_continue(byte) || non_ascii_rust_whitespace_len(bytes, index) > 0 {
+        if !is_ident_continue(byte) || non_ascii_rust_whitespace_len(bytes, cursor) > 0 {
             break;
         }
-        index += 1;
+        cursor += 1;
     }
-    index
+    cursor
 }
 
 // Non-ASCII Rust whitespace must not join identifier bytes.

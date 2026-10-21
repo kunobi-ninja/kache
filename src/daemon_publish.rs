@@ -1469,6 +1469,72 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// A hand-off the shutdown drain stores is still queued for upload: the
+    /// upload queue closes only after the publish worker is done. The worker
+    /// here starts only once shutdown has closed the publish queue, as a busy
+    /// one reaches its last jobs only during the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_queues_what_it_stores_for_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.auto_gc = false;
+        config.remote = Some(crate::config::RemoteConfig {
+            prefix: "artifacts".into(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.path().join("remote"),
+                    atomic_write_dir: dir.path().join("remote-staging"),
+                },
+            ),
+        });
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (upload_tx, mut uploads) = tokio::sync::mpsc::unbounded_channel();
+        daemon.set_upload_tx(upload_tx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        daemon.publish_queue().set_sender(tx);
+        let mut request = handoff_request(&config, &key("drained"), dir.path());
+        request.publishes_to_remote = true;
+        let _receipt = HandoffReceipt::new(&request).unwrap();
+        assert!(daemon.handle_publish_cc(request.clone()).await.ok);
+
+        let runtime = tokio::runtime::Handle::current();
+        let (done_tx, done) = tokio::sync::oneshot::channel();
+        let worker_daemon = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while worker_daemon.publish_queue().sender().is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "shutdown closes the publish queue"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            run_publish_worker(worker_daemon, rx);
+            let _ = done_tx.send(());
+        });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::daemon::drain_publications_then_close_uploads(&daemon, done),
+        )
+        .await
+        .expect("the drain ends once the worker exits");
+
+        let store = Store::open(&config).unwrap();
+        assert!(store.get(&request.cache_key).unwrap().is_some(), "stored");
+        let queued = uploads
+            .try_recv()
+            .expect("the entry the drain stored is queued for upload");
+        assert_eq!(queued.key, request.cache_key);
+        assert!(
+            matches!(
+                uploads.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "the upload queue is closed after the drain"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_cleanup_after_a_lost_reply_cannot_remove_queued_outputs() {
         let dir = tempfile::tempdir().unwrap();

@@ -904,10 +904,7 @@ pub fn event_stats_since(event_log_path: &Path, since: DateTime<Utc>) -> Result<
     let (inside, edge): (Vec<_>, Vec<_>) = archive_segments_since(event_log_path, since)
         .into_iter()
         .partition(|segment| segment.oldest > since.timestamp());
-    let mut stats = {
-        let mut memo = MEMO.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        inside_segments_stats(&mut memo, event_archive_dir(event_log_path), &inside)
-    };
+    let mut stats = memoized_inside_stats(&MEMO, event_archive_dir(event_log_path), &inside);
 
     for segment in edge {
         match segment_stats_onto(stats.clone(), &segment.path, Some(since)) {
@@ -929,6 +926,25 @@ pub fn event_stats_since(event_log_path: &Path, since: DateTime<Utc>) -> Result<
 /// and a wider stats request from repeatedly evicting each other's totals.
 type InsideStatsMemo = Vec<(PathBuf, Vec<String>, EventStats)>;
 const EVENT_STATS_MEMO_WINDOWS: usize = 4;
+
+/// Do file I/O outside the shared memo lock. Concurrent stats requests may
+/// decode the same new segment, but cannot block each other's cached reads.
+fn memoized_inside_stats(
+    memo: &std::sync::Mutex<InsideStatsMemo>,
+    dir: PathBuf,
+    inside: &[ArchiveSegment],
+) -> EventStats {
+    let mut snapshot = memo.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let stats = inside_segments_stats(&mut snapshot, dir, inside);
+    let (dir, names, total) = snapshot.pop().expect("inside stats records its window");
+    remember_stats(
+        &mut memo.lock().unwrap_or_else(|p| p.into_inner()),
+        dir,
+        names,
+        total,
+    );
+    stats
+}
 
 /// Reuse the largest cached subset, then read only the missing segments.
 /// Failed reads never enter the cached name set, so the next call retries them.
@@ -963,12 +979,16 @@ fn inside_segments_stats(
         }
     }
     names.sort();
+    remember_stats(memo, dir, names, stats.clone());
+    stats
+}
+
+fn remember_stats(memo: &mut InsideStatsMemo, dir: PathBuf, names: Vec<String>, stats: EventStats) {
     memo.retain(|(memo_dir, memo_names, _)| memo_dir != &dir || memo_names != &names);
-    memo.push((dir, names, stats.clone()));
+    memo.push((dir, names, stats));
     if memo.len() > EVENT_STATS_MEMO_WINDOWS {
         memo.remove(0);
     }
-    stats
 }
 
 fn segment_stats_onto(
@@ -3202,6 +3222,64 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_stats_memo_reuses_a_completed_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let mut event = test_event("memo", EventResult::Miss, 1, 2, 3, "k");
+        event.ts = now - chrono::Duration::hours(1);
+        let line = serde_json::to_string(&event).unwrap() + "\n";
+        archive_dropped_events(&log, &[&line], now).unwrap();
+        let segments = archive_segments(&log);
+        let memo = std::sync::Mutex::new(Vec::new());
+        assert_eq!(
+            memoized_inside_stats(&memo, event_archive_dir(&log), &segments).misses,
+            1
+        );
+        fs::write(&segments[0].path, b"not a frame").unwrap();
+        assert_eq!(
+            memoized_inside_stats(&memo, event_archive_dir(&log), &segments).misses,
+            1
+        );
+    }
+
+    #[test]
+    fn a_broken_edge_segment_cannot_add_its_decoded_prefix_to_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let since = now - chrono::Duration::hours(1);
+        let mut event = test_event("edge", EventResult::Miss, 1, 2, 3, "k");
+        event.ts = since + chrono::Duration::minutes(10);
+        event.crate_name = "long_edge_".repeat(2048);
+        let line = serde_json::to_string(&event).unwrap() + "\n";
+        let mut frame = zstd::encode_all(line.repeat(4).as_bytes(), 3).unwrap();
+        let mut tail = zstd::encode_all(line.as_bytes(), 3).unwrap();
+        tail.truncate(tail.len() - 1);
+        frame.extend(tail);
+        let archive = event_archive_dir(&log);
+        fs::create_dir_all(&archive).unwrap();
+        let path = archive.join(format!(
+            "{:011}-{:011}-1-1.jsonl.zst",
+            event.ts.timestamp(),
+            since.timestamp()
+        ));
+        fs::write(&path, frame).unwrap();
+        // Prove that the decoder delivered records before its frame error.
+        let decoded = read_segment(&path).unwrap().collect::<Vec<_>>();
+        assert!(decoded.iter().any(Result::is_ok));
+        assert!(decoded.iter().any(Result::is_err));
+        let live = test_event("live", EventResult::LocalHit, 1, 2, 3, "k");
+        log_event(&log, &live).unwrap();
+        let stats = event_stats_since(&log, since).unwrap();
+        assert_eq!(stats.local_hits, 1);
+        assert_eq!(stats.misses, 0);
+        let segments = archive_segments_since(&log, event.ts);
+        assert_eq!(segments.len(), 1, "the exact newest timestamp is included");
+        assert!(archive_segments_since(&log, event.ts + chrono::Duration::seconds(1)).is_empty());
+    }
+
+    #[test]
     fn a_failed_segment_is_retried_instead_of_becoming_a_cached_zero() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("events.jsonl");
@@ -3251,6 +3329,10 @@ mod tests {
         let mut live = test_event("live", EventResult::LocalHit, 1, 2, 3, "k");
         live.ts = now;
         log_event(&log, &live).unwrap();
+        let segment = archive_segments(&log);
+        let decoded = read_segment(&segment[0].path).unwrap().collect::<Vec<_>>();
+        assert!(decoded.iter().any(Result::is_ok));
+        assert!(decoded.iter().any(Result::is_err));
         let events = read_events_since(&log, now - chrono::Duration::days(1)).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].crate_name, "live");

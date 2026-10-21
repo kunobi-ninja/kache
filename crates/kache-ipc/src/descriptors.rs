@@ -170,14 +170,9 @@ fn receive_with(
         .collect::<Vec<_>>();
     // The guard also covers test-induced pauses in the non-atomic interval.
     admitted();
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     for file in &files {
-        let current = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        if current == -1
-            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, current | libc::FD_CLOEXEC) }
-                == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
+        set_close_on_exec(file)?;
     }
     if received != PACKET_BYTES as isize
         || packet[0] != MARKER
@@ -192,6 +187,17 @@ fn receive_with(
         ));
     }
     Ok(files)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_close_on_exec(file: &OwnedFd) -> io::Result<()> {
+    let current = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if current == -1
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, current | libc::FD_CLOEXEC) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Read the initialized control buffer without taking ownership of its fds.
@@ -247,6 +253,19 @@ mod tests {
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     const TICKET: [u8; 16] = [7; 16];
+
+    fn datagram_pair() -> (UnixDatagram, UnixDatagram) {
+        let sockets = UnixDatagram::pair().unwrap();
+        for socket in [&sockets.0, &sockets.1] {
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        }
+        sockets
+    }
 
     fn control_record(level: libc::c_int, kind: libc::c_int, payload: &[u8]) -> Vec<u8> {
         let length = unsafe { libc::CMSG_SPACE(payload.len() as u32) } as usize;
@@ -380,7 +399,7 @@ mod tests {
 
     #[test]
     fn a_full_nonblocking_send_queue_returns_its_error_without_retrying() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         sender.set_nonblocking(true).unwrap();
         receiver.set_nonblocking(true).unwrap();
         let packet = [0; PACKET_BYTES];
@@ -423,7 +442,7 @@ mod tests {
     #[test]
     fn invalid_packet_headers_and_truncation_close_received_descriptors() {
         for variant in ["marker", "short", "truncated"] {
-            let (sender, receiver) = UnixDatagram::pair().unwrap();
+            let (sender, receiver) = datagram_pair();
             let (writer, mut reader) = UnixStream::pair().unwrap();
             reader
                 .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -469,7 +488,7 @@ mod tests {
 
     #[test]
     fn transferred_files_are_owned_close_on_exec_and_share_their_open_description() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         let mut source = tempfile::tempfile().unwrap();
         source.write_all(b"client bytes").unwrap();
         source.rewind().unwrap();
@@ -489,7 +508,7 @@ mod tests {
 
     #[test]
     fn rejecting_a_bundle_closes_all_received_descriptors() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         let (writer, mut reader) = UnixStream::pair().unwrap();
         reader
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -517,7 +536,7 @@ mod tests {
 
     #[test]
     fn ordinary_bytes_empty_datagrams_and_streams_are_rejected() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         sender.send(b"F").unwrap();
         assert_eq!(
             receive(receiver.as_fd(), &TICKET, 1).unwrap_err().kind(),
@@ -529,6 +548,9 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         let (_sender, stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         assert_eq!(
             receive(stream.as_fd(), &TICKET, 1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -537,7 +559,7 @@ mod tests {
 
     #[test]
     fn an_empty_nonblocking_socket_returns_would_block_without_waiting_for_a_sender() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         receiver.set_nonblocking(true).unwrap();
         let (file, _other) = UnixStream::pair().unwrap();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -565,7 +587,7 @@ mod tests {
 
     #[test]
     fn a_wrong_ticket_closes_its_descriptors_without_accepting_the_bundle() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         let (writer, mut reader) = UnixStream::pair().unwrap();
         reader
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -583,7 +605,7 @@ mod tests {
 
     #[test]
     fn the_largest_protocol_bundle_is_received_in_full() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         let (writer, mut reader) = UnixStream::pair().unwrap();
         reader
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -612,7 +634,7 @@ mod tests {
 
     #[test]
     fn oversized_control_bundle_does_not_leave_received_pipes_open() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         let (writer, mut reader) = UnixStream::pair().unwrap();
         reader
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -660,7 +682,7 @@ mod tests {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[test]
     fn process_creation_waits_until_received_descriptors_are_close_on_exec() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (sender, receiver) = datagram_pair();
         let source = tempfile::tempfile().unwrap();
         send(sender.as_fd(), &TICKET, &[source.as_fd()]).unwrap();
         let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
@@ -670,7 +692,9 @@ mod tests {
             let receiving = threads.spawn(move || {
                 receive_with(receiver.as_fd(), &TICKET, 1, || {
                     admitted_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
                 })
                 .unwrap()
             });

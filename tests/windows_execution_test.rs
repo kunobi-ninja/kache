@@ -405,7 +405,7 @@ fn parallel_msvc_debug_compiles_complete_through_warm_frontends() {
     use kache_protocol::execution::{NativeString, windows::Discovery};
     let fixture = Fixture::new();
     let tools = kache_ipc::windows_msvc::discover(&Discovery {
-        architecture: format!("{}-pc-windows-msvc", std::env::consts::ARCH),
+        architecture: std::env::consts::ARCH.to_owned(),
         env: fixture
             .host
             .iter()
@@ -543,8 +543,8 @@ fn native_console_fixture() {
             let mut command = compile(&fixture, &fixture.path(frontend), &rustc, "console_canary");
             command
                 .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
+                .stdout(Stdio::from(console.try_clone().unwrap()))
+                .stderr(Stdio::from(console.try_clone().unwrap()));
             let output = fixture.spawn_native(&mut command).output();
             let mut characters = vec![0u16; cells as usize];
             let mut read = 0;
@@ -647,10 +647,15 @@ fn native_compiler_fixture() {
     std::process::exit(7);
 }
 
-fn native_compiler_command(fixture: &Fixture, compiler: &Path, client: &str) -> Command {
+fn native_compiler_command(
+    fixture: &Fixture,
+    frontend: &str,
+    compiler: &Path,
+    client: &str,
+) -> Command {
     let cwd = fixture.path(client);
     std::fs::create_dir(&cwd).unwrap();
-    let mut command = fixture.command(fixture.path("frontend-only/kache.exe"));
+    let mut command = fixture.command(fixture.path(frontend));
     command
         .arg(compiler)
         .args([
@@ -675,6 +680,26 @@ fn native_compiler_command(fixture: &Fixture, compiler: &Path, client: &str) -> 
             fixture.path(&format!("{client}.release")),
         );
     command
+}
+
+#[test]
+fn cold_bootstrap_keeps_the_compiler_in_the_original_frontend() {
+    let fixture = Fixture::new();
+    let compiler = fixture.path("native-compiler.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &compiler).unwrap();
+    let mut command = native_compiler_command(&fixture, "install/kache.exe", &compiler, "cold");
+    command.env("KACHE_DISABLED", "0").env("RUSTC", &compiler);
+    let mut frontend = fixture.spawn(&mut command);
+    let record = ready(&fixture.path("cold.ready"));
+    assert_eq!(record["parent"], frontend.child.id());
+    assert_eq!(record["client"], "cold");
+    let daemon = fixture.daemon_pid();
+    std::fs::write(fixture.path("cold.release"), b"go").unwrap();
+    let output = frontend.output();
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stdout.ends_with(b"native-output-\xff"));
+    assert!(output.stderr.ends_with(b"native-error-\xfe"));
+    assert_eq!(fixture.daemon_pid(), daemon);
 }
 
 fn ready(path: &Path) -> Value {
@@ -720,8 +745,18 @@ fn disconnect_cancels_one_frontends_native_tree_and_keeps_another_running() {
     let pid = fixture.daemon_pid();
     let compiler = fixture.path("rustc.exe");
     std::fs::copy(std::env::current_exe().unwrap(), &compiler).unwrap();
-    let mut first = fixture.spawn(&mut native_compiler_command(&fixture, &compiler, "first"));
-    let mut second = fixture.spawn(&mut native_compiler_command(&fixture, &compiler, "second"));
+    let mut first = fixture.spawn(&mut native_compiler_command(
+        &fixture,
+        "frontend-only/kache.exe",
+        &compiler,
+        "first",
+    ));
+    let mut second = fixture.spawn(&mut native_compiler_command(
+        &fixture,
+        "frontend-only/kache.exe",
+        &compiler,
+        "second",
+    ));
     let a = ready(&fixture.path("first.ready"));
     let b = ready(&fixture.path("second.ready"));
     assert_eq!(a["parent"], first.child.id());
@@ -789,14 +824,16 @@ fn compiler_children_share_the_callers_named_cargo_jobserver() {
     let compiler = fixture.path("rustc.exe");
     std::fs::copy(std::env::current_exe().unwrap(), &compiler).unwrap();
     let pool = jobserver::Client::new(1).unwrap();
-    let mut first_command = native_compiler_command(&fixture, &compiler, "first");
+    let mut first_command =
+        native_compiler_command(&fixture, "frontend-only/kache.exe", &compiler, "first");
     first_command.env("KACHE_NATIVE_JOBSERVER", "1");
     pool.configure(&mut first_command);
     let mut first = fixture.spawn(&mut first_command);
     let a = ready(&fixture.path("first.ready"));
     assert_eq!(a["jobserver"], true);
     assert!(pool.try_acquire().unwrap().is_none());
-    let mut second_command = native_compiler_command(&fixture, &compiler, "second");
+    let mut second_command =
+        native_compiler_command(&fixture, "frontend-only/kache.exe", &compiler, "second");
     second_command.env("KACHE_NATIVE_JOBSERVER", "1");
     pool.configure(&mut second_command);
     let mut second = fixture.spawn(&mut second_command);

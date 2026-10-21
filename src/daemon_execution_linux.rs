@@ -5,6 +5,14 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+pub(super) fn peer_may_delegate(
+    proc_root: &Path,
+    kernel_pid: Option<u32>,
+    reported_pid: u32,
+) -> bool {
+    kernel_pid == Some(reported_pid) && permits_delegation(proc_root, reported_pid).unwrap_or(false)
+}
+
 fn field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
     status.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
@@ -92,6 +100,21 @@ mod tests {
                 std::fs::write(&path, STATUS).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn delegation_requires_both_the_kernel_pid_and_an_eligible_process() {
+        let root = fixture();
+        assert!(peer_may_delegate(root.path(), Some(42), 42));
+        assert!(!peer_may_delegate(root.path(), Some(7), 42));
+        assert!(!peer_may_delegate(root.path(), None, 42));
+        std::fs::write(
+            root.path().join("42/status"),
+            STATUS.replace("Seccomp:\t0", "Seccomp:\t2"),
+        )
+        .unwrap();
+        assert!(!peer_may_delegate(root.path(), Some(42), 42));
+        assert!(!peer_may_delegate(root.path(), Some(999), 999));
     }
 
     #[test]

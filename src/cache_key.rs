@@ -2947,7 +2947,7 @@ fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>)
 /// This only coordinates discovery: every waiter validates its own inputs
 /// and computes its complete cache key before restoring anything.
 fn discovery_flight_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
-    let vars: Vec<_> = std::env::vars_os().collect();
+    let vars: Vec<_> = args.invocation_env().vars_os().collect();
     workspace_roots(args, &vars)
         .and_then(|workspace| workspace_prediction_identity(args, vars, &workspace))
         .or_else(|| prediction_discovery_identity(args, file_hasher))

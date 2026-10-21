@@ -8905,6 +8905,7 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
         [
             ("OUT_DIR", out.as_os_str().to_owned()),
             ("SDKROOT", "".into()),
+            ("KACHE_BASE_DIR", "".into()),
         ],
         Some(dir.path().to_path_buf()),
         None,
@@ -8916,9 +8917,23 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     assert!(has(&maps, CC_OUT_DIR_SENTINEL), "{maps:?}");
     assert!(has(&maps, CC_TARGET_SENTINEL), "{maps:?}");
     assert!(
+        !has(&maps, CC_BASE_SENTINEL),
+        "an empty base directory is unset"
+    );
+    assert!(
         !has(&maps, CC_SDKROOT_SENTINEL),
         "an empty SDKROOT is unset"
     );
+    let base = dir.path().join("explicit-base");
+    parsed.invocation_env.set("KACHE_BASE_DIR", &base);
+    let with_base = cc_prefix_maps(&parsed, &[]);
+    assert!(
+        with_base
+            .iter()
+            .any(|map| Path::new(&map.from) == base && map.to == "/kache/base-dir"),
+        "the client-supplied base must retain its own map: {with_base:?}",
+    );
+    parsed.invocation_env.set("KACHE_BASE_DIR", "");
 
     let dep_include = dir
         .path()

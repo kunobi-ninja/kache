@@ -24,12 +24,38 @@ impl Drop for ChildGuard {
 }
 
 #[test]
+fn unfinished_frontends_are_killed_and_reaped_by_the_fixture_guard() {
+    let child = Command::new("sleep")
+        .arg("30")
+        .env("PATH", env!("PATH"))
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    drop(ChildGuard {
+        child,
+        finished: false,
+    });
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    let error = std::io::Error::last_os_error();
+    if reaped == 0 {
+        // The child is still unreaped, so its PID cannot name another process.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+    assert_eq!(reaped, -1, "fixture guard left its child unreaped");
+    assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+}
+
+#[test]
 #[ignore = "subprocess fixture for the public frontend boundary"]
 fn frontend_process_fixture() {
     std::process::exit(run("fixture-version").unwrap());
 }
 
-fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) {
+fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) -> i32 {
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let directory = root.path().canonicalize().unwrap();
     let frontend = directory.join("kache");
@@ -99,9 +125,14 @@ fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) {
                     decline.push(b'\n');
                     let _ = stream.write_all(&decline);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => panic!("frontend listener failed: {error}"),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "frontend listener failed: {error}"
+                    );
+                    break;
+                }
             }
         }
         if let Some(status) = child.child.try_wait().unwrap() {
@@ -113,7 +144,6 @@ fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) {
     };
     let output = std::fs::read(stdout).unwrap();
     let error = std::fs::read(stderr).unwrap();
-    assert_eq!(status.code(), Some(29), "{output:?} {error:?}");
     assert_eq!(connections, expected_connections);
     assert!(output.ends_with(b"engine-stdout-\xff"), "{output:?}");
     assert_eq!(error, b"engine-stderr-\xfe");
@@ -139,24 +169,31 @@ fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) {
     for (actual, expected) in fields[5..].iter().zip(original_args) {
         assert_eq!(*actual, expected.as_bytes());
     }
+    status.code().expect("frontend was terminated by a signal")
 }
 
 #[test]
 fn cli_forwarding_preserves_native_argv_streams_version_and_image_identity() {
-    run_case("client-ñ\nname".into(), None, 0);
+    assert_eq!(run_case("client-ñ\nname".into(), None, 0), 29);
 }
 
 #[test]
 fn compiler_requests_try_the_daemon_before_forwarding_a_declined_request() {
-    run_case("cc".into(), None, 1);
+    assert_eq!(run_case("cc".into(), None, 1), 29);
 }
 
 #[test]
 fn family_probe_forwarding_never_contacts_the_daemon() {
-    run_case("cc".into(), Some("KACHE_FAMILY_PROBE_ACTIVE"), 0);
+    assert_eq!(
+        run_case("cc".into(), Some("KACHE_FAMILY_PROBE_ACTIVE"), 0),
+        29
+    );
 }
 
 #[test]
 fn build_script_forwarding_never_contacts_the_daemon() {
-    run_case("cc".into(), Some("KACHE_BUILD_SCRIPT_PATH"), 0);
+    assert_eq!(
+        run_case("cc".into(), Some("KACHE_BUILD_SCRIPT_PATH"), 0),
+        29
+    );
 }

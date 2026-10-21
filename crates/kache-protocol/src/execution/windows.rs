@@ -195,12 +195,29 @@ pub enum Reply {
 mod tests {
     use super::*;
 
+    fn bounded_chunks(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let bytes = bytes.to_vec();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let chunks = output_chunks(&bytes)
+                .take(bytes.len() + 1)
+                .map(<[u8]>::to_vec)
+                .collect();
+            let _ = send.send(chunks);
+        });
+        let chunks = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("console replay must advance through each packet");
+        worker.join().unwrap();
+        chunks
+    }
+
     #[test]
     fn console_replay_keeps_unicode_characters_in_one_packet() {
         for character in ['\u{00e9}', '\u{20ac}', '\u{1f980}'] {
             for padding in 0..character.len_utf8() {
                 let message = format!("{}{}tail", "a".repeat((64 << 10) - padding), character);
-                let chunks = output_chunks(message.as_bytes()).collect::<Vec<_>>();
+                let chunks = bounded_chunks(message.as_bytes());
                 assert!(chunks.len() > 1);
                 for chunk in &chunks {
                     assert!(chunk.len() <= 65_536);
@@ -215,13 +232,27 @@ mod tests {
     fn redirected_replay_preserves_invalid_utf8_and_empty_output() {
         let mut bytes = vec![b'a'; 65_535];
         bytes.extend_from_slice(&[0xff, 0xfe, 0x80]);
-        let chunks = output_chunks(&bytes).collect::<Vec<_>>();
+        let chunks = bounded_chunks(&bytes);
         assert_eq!(
             chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
             [65_536, 2]
         );
         assert_eq!(chunks.concat(), bytes);
-        assert_eq!(output_chunks(&[]).count(), 0);
+        assert!(bounded_chunks(&[]).is_empty());
+    }
+
+    #[test]
+    fn console_replay_keeps_unicode_after_multiple_packet_boundaries() {
+        let message = format!("{}€{}🦀tail", "a".repeat(65_535), "b".repeat(65_531));
+        let chunks = bounded_chunks(message.as_bytes());
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            [65_535, 65_534, 8]
+        );
+        for chunk in &chunks {
+            std::str::from_utf8(chunk).unwrap();
+        }
+        assert_eq!(chunks.concat(), message.as_bytes());
     }
 
     #[test]
@@ -236,11 +267,39 @@ mod tests {
         };
         let command = Command::Spawn(Box::new(spawn));
         let debug = format!("{command:?}");
+        assert!(debug.contains("args_count: 1"));
+        assert!(debug.contains("env_count: 1"));
+        assert!(debug.contains("stdout: Pipe"));
         assert!(!debug.contains("private-value"));
         let encoded = serde_json::to_vec(&command).unwrap();
         assert_eq!(
             serde_json::from_slice::<Command>(&encoded).unwrap(),
             command
         );
+    }
+
+    #[test]
+    fn msvc_debug_keeps_architecture_and_counts_without_private_paths_or_values() {
+        let private = NativeString::capture("private-value".as_ref());
+        let env = vec![(private.clone(), private.clone())];
+        let discovery = Discovery {
+            architecture: "aarch64".to_owned(),
+            env: env.clone(),
+        };
+        let debug = format!("{:?}", Command::DiscoverMsvc(discovery));
+        assert!(debug.contains("architecture: \"aarch64\""));
+        assert!(debug.contains("env_count: 1"));
+        assert!(!debug.contains("private-value"));
+        let tools = Msvc {
+            linker: Some(Tool { path: private, env }),
+            compiler: None,
+            sdk_version: Some("sdk-version".to_owned()),
+            ucrt_version: None,
+        };
+        let debug = format!("{:?}", Reply::Msvc { tools });
+        assert!(debug.contains("linker: Some(Tool"));
+        assert!(debug.contains("env_count: 1"));
+        assert!(debug.contains("sdk-version"));
+        assert!(!debug.contains("private-value"));
     }
 }

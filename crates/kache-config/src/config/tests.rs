@@ -2044,7 +2044,7 @@ fn config_provenance_makes_an_explicit_path_absolute_without_resolving_it() {
 
     let (_, provenance) = Config::load_with_provenance().unwrap();
     assert!(provenance.path.is_absolute());
-    assert_eq!(provenance.path, std::path::absolute(&cfg).unwrap());
+    assert_eq!(provenance.path, cfg);
 }
 
 #[test]

@@ -255,6 +255,7 @@ exclude_globs = [
     "crates/kache-fs/src/apfs.rs",
     "src/fallback/macos.rs",
     "crates/kache-client/src/stdio_windows.rs",
+    "crates/kache-client/src/frontend_windows.rs",
     "crates/kache-ipc/src/windows_handles.rs",
     "crates/kache-ipc/src/windows_process.rs",
     "crates/kache-ipc/src/windows_security.rs",
@@ -264,6 +265,7 @@ exclude_globs = [
     "src/invocation/windows_broker.rs",
     "src/invocation/process/windows.rs",
     "src/daemon_execution_windows.rs",
+    "src/daemon_execution_macos.rs",
     "tests/windows_execution_test.rs",
 ]
 # `notice::show`, `notice::show_requested` and `notice::terminal` open the
@@ -287,6 +289,22 @@ exclude_re = [
     # This replacement names the inactive non-Unix terminal stub on Linux.
     # Keep the real Unix terminal opener and its viable mutations in scope.
     "src/invocation/io.rs:.*replace process_terminal -> Option<File> with Some\\(Default::default\\(\\)\\)",
+    # The broker and Windows-only IO arms are not compiled by this Linux lane.
+    # Native Windows acceptance covers compiler ownership and console replay.
+    "src/invocation/io.rs:.*InvocationIo::broker",
+    "src/invocation/io.rs:.*InvocationIo::from_broker",
+    "src/invocation/io.rs:.*delete match arm (Source|Sink)::Windows",
+    # Only the Windows ParentDir guard uses equality in this function. Its
+    # lexical-path behavior is checked by native Windows configuration tests.
+    "crates/kache-config/src/config.rs:.*replace == with != in resolve_config_path_for",
+    # Linux receives CLOEXEC atomically, so its spawn guard already returns None.
+    # Other Unix hosts exercise the admission lock and fcntl adapter natively.
+    "crates/kache-ipc/src/descriptors.rs:.*replace spawn_guard -> .* with None",
+    "crates/kache-ipc/src/descriptors.rs:.*set_close_on_exec",
+    # The two truncation flags occupy distinct bits, so OR and XOR are equal.
+    "crates/kache-ipc/src/descriptors.rs:.*replace \\| with \\^ in receive_with",
+    # WEXITED and WNOWAIT also occupy distinct bits.
+    "src/invocation/process.rs:.*replace \\| with \\^ in Child::wait",
     # These functions are selected only on macOS. Keep creation_mask's Linux
     # reader and the shared request/descriptor policy in mutation scope.
     "crates/kache-client/src/creation_mask.rs:.*(native_getter|inherited_mask)( ->|$)",

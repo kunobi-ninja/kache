@@ -4167,13 +4167,11 @@ fn a_workspace_identity_is_the_same_in_every_checkout_and_per_unit() {
 
 #[test]
 fn workspace_discovery_flights_follow_the_portable_record_identity() {
-    let mut lock = key_test_lock();
-    let base = lock.enter();
-    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let base = tempfile::tempdir().unwrap();
     let hasher = FileHasher::new();
     for with_macro in [false, true] {
         let identity = |name: &str, crate_name: &str| {
-            let (root, args) = workspace_invocation(&base, name, crate_name);
+            let (root, args) = workspace_invocation(base.path(), name, crate_name);
             let args = if with_macro {
                 let mut argv = vec!["rustc".to_string()];
                 argv.extend(args.all_args);
@@ -4185,13 +4183,16 @@ fn workspace_discovery_flights_follow_the_portable_record_identity() {
             } else {
                 args
             };
-            std::env::set_current_dir(&root).unwrap();
             let manifest = root.join("kt");
-            let _manifest = crate::config::tests::set_env_for_test(
-                "CARGO_MANIFEST_DIR",
-                Some(manifest.as_os_str()),
+            let env = client_invocation(
+                &root,
+                &[
+                    ("CARGO_MANIFEST_DIR", Some(manifest.as_os_str())),
+                    ("OUT_DIR", None),
+                ],
             );
-            let vars: Vec<_> = std::env::vars_os().collect();
+            let args = reparse_for_client(&args, &env);
+            let vars: Vec<_> = env.vars_os().collect();
             let workspace = workspace_roots(&args, &vars).unwrap();
             let portable = workspace_prediction_identity(&args, vars, &workspace).unwrap();
             let flight = discovery_flight_identity(&args, &hasher).unwrap();

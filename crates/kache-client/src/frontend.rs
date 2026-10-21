@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::process::Command;
 
+#[cfg(windows)]
+#[path = "frontend_windows.rs"]
+mod windows;
+
 /// Run the thin compiler client, or replace it with the companion CLI engine.
 pub fn run(version: &str) -> Result<i32> {
     let started_at = std::time::Instant::now();
@@ -36,10 +40,10 @@ pub fn run(version: &str) -> Result<i32> {
                 let (files, terminal) = crate::Stdio::capture()?.into_files();
                 #[cfg(windows)]
                 let (files, terminal) = (Vec::new(), false);
-                Ok((config.socket_path(), files, terminal))
+                Ok((config, files, terminal))
             })();
-            if let Ok((socket, files, terminal)) = prepared
-                && let Some(exit) = (crate::Execution {
+            if let Ok((config, files, terminal)) = prepared {
+                let execution = crate::Execution {
                     entry: kache_protocol::execution::ExecutionEntry::Original,
                     args: &args,
                     env: &env,
@@ -48,10 +52,15 @@ pub fn run(version: &str) -> Result<i32> {
                     files: &files,
                     terminal,
                     client_version: version,
-                })
-                .try_execute(&socket)?
-            {
-                return Ok(exit);
+                };
+                let socket = config.socket_path();
+                if let Some(exit) = execution.try_execute(&socket)? {
+                    return Ok(exit);
+                }
+                #[cfg(windows)]
+                if let Some(exit) = windows::try_bootstrap(&execution, &socket, config.disabled)? {
+                    return Ok(exit);
+                }
             }
         }
     }
@@ -64,6 +73,25 @@ fn forward_engine(
     args: &[OsString],
     started_at: std::time::Instant,
 ) -> Result<i32> {
+    let mut command = engine_command(executable, version, args, started_at)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec()).context("starting the Kache engine")
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status().context("starting the Kache engine")?;
+        Ok(status.code().unwrap_or(1))
+    }
+}
+
+fn engine_command(
+    executable: &std::path::Path,
+    version: &str,
+    args: &[OsString],
+    started_at: std::time::Instant,
+) -> Result<Command> {
     let engine = kache_shims::engine_for(executable)
         .context("locating kache-engine; reinstall both Kache binaries together")?;
     let mut command = Command::new(engine);
@@ -84,16 +112,7 @@ fn forward_engine(
                 .unwrap_or_else(|| "-".to_owned()),
         )
         .args(args);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        Err(command.exec()).context("starting the Kache engine")
-    }
-    #[cfg(not(unix))]
-    {
-        let status = command.status().context("starting the Kache engine")?;
-        Ok(status.code().unwrap_or(1))
-    }
+    Ok(command)
 }
 
 fn engine_only(args: &[OsString]) -> bool {

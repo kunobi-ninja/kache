@@ -10,6 +10,15 @@ use std::os::windows::process::ExitStatusExt;
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
 use std::sync::Arc;
 
+pub(super) fn wait_for_exit(handle: RawHandle) -> io::Result<()> {
+    if unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(handle, u32::MAX) }
+        == windows_sys::Win32::Foundation::WAIT_FAILED
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 enum Process {
     Local(std::process::Child),
     Remote {

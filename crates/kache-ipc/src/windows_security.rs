@@ -3,19 +3,19 @@
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub(crate) fn matches_daemon(process: BorrowedHandle<'_>) -> io::Result<bool> {
-    let client = token(process.as_raw_handle())?;
-    let daemon = token(unsafe { GetCurrentProcess() })?;
+    let client = token(process.as_raw_handle(), TOKEN_QUERY)?;
+    let daemon = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
     equivalent(client.as_raw_handle(), daemon.as_raw_handle())
 }
 
-fn token(process: HANDLE) -> io::Result<OwnedHandle> {
+fn token(process: HANDLE, access: u32) -> io::Result<OwnedHandle> {
     let mut handle = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut handle) } == 0 {
+    if unsafe { OpenProcessToken(process, access, &mut handle) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
@@ -32,10 +32,9 @@ impl Information {
         unsafe {
             GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length);
         }
-        if io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-            || length == 0
-            || length > (1 << 20)
-        {
+        // The required size is useful even when a class reports BAD_LENGTH
+        // rather than INSUFFICIENT_BUFFER. The second call must still succeed.
+        if length == 0 || length > (1 << 20) {
             return Err(io::Error::other("cannot size compiler security context"));
         }
         let mut storage = vec![0usize; (length as usize).div_ceil(size_of::<usize>())];
@@ -133,15 +132,31 @@ fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
             return Ok(false);
         }
     }
-    // TokenSecurityAttributes and the restricted-claim information classes
-    // are reserved by Win32. Inspect only the documented access record and
-    // retain local execution if it exposes opaque security attributes.
+    let client_statistics =
+        Information::read(client, TokenStatistics)?.value::<TOKEN_STATISTICS>()?;
+    let daemon_statistics =
+        Information::read(daemon, TokenStatistics)?.value::<TOKEN_STATISTICS>()?;
+    let authentication = |info: TOKEN_STATISTICS| {
+        (
+            info.AuthenticationId.HighPart,
+            info.AuthenticationId.LowPart,
+        )
+    };
+    if authentication(client_statistics) != authentication(daemon_statistics) {
+        return Ok(false);
+    }
+    let same_generation = client_statistics.ModifiedId.HighPart
+        == daemon_statistics.ModifiedId.HighPart
+        && client_statistics.ModifiedId.LowPart == daemon_statistics.ModifiedId.LowPart;
+    // Windows exposes opaque security attributes even on ordinary tokens.
+    // Compare every documented access field below; permit opaque attributes
+    // only on unchanged token copies with the same kernel-issued ModifiedId.
+    // https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-token_statistics
     let client_access = Information::read(client, TokenAccessInformation)?;
     let daemon_access = Information::read(daemon, TokenAccessInformation)?;
     let a = client_access.value::<TOKEN_ACCESS_INFORMATION>()?;
     let b = daemon_access.value::<TOKEN_ACCESS_INFORMATION>()?;
-    if !a.SecurityAttributes.is_null()
-        || !b.SecurityAttributes.is_null()
+    if ((!a.SecurityAttributes.is_null() || !b.SecurityAttributes.is_null()) && !same_generation)
         || a.TokenType != TokenPrimary
         || b.TokenType != TokenPrimary
         || a.Flags != b.Flags
@@ -163,19 +178,6 @@ fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
         if Information::read(client, class)?.bytes() != Information::read(daemon, class)?.bytes() {
             return Ok(false);
         }
-    }
-    let client_statistics =
-        Information::read(client, TokenStatistics)?.value::<TOKEN_STATISTICS>()?;
-    let daemon_statistics =
-        Information::read(daemon, TokenStatistics)?.value::<TOKEN_STATISTICS>()?;
-    let authentication = |info: TOKEN_STATISTICS| {
-        (
-            info.AuthenticationId.HighPart,
-            info.AuthenticationId.LowPart,
-        )
-    };
-    if authentication(client_statistics) != authentication(daemon_statistics) {
-        return Ok(false);
     }
     for class in [
         TokenUser,
@@ -249,7 +251,7 @@ mod tests {
 
     #[test]
     fn the_same_primary_token_has_the_same_context() {
-        let token = token(unsafe { GetCurrentProcess() }).unwrap();
+        let token = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
         if Information::read(token.as_raw_handle(), TokenIsAppContainer)
             .unwrap()
             .value::<u32>()
@@ -261,8 +263,51 @@ mod tests {
     }
 
     #[test]
+    fn an_unmodified_primary_token_copy_has_the_same_context() {
+        let token = token(
+            unsafe { GetCurrentProcess() },
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+        )
+        .unwrap();
+        let mut duplicate = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                DuplicateTokenEx(
+                    token.as_raw_handle(),
+                    TOKEN_QUERY,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut duplicate,
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let duplicate = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+        let original = Information::read(token.as_raw_handle(), TokenStatistics)
+            .unwrap()
+            .value::<TOKEN_STATISTICS>()
+            .unwrap();
+        let copied = Information::read(duplicate.as_raw_handle(), TokenStatistics)
+            .unwrap()
+            .value::<TOKEN_STATISTICS>()
+            .unwrap();
+        assert_ne!(
+            (original.TokenId.HighPart, original.TokenId.LowPart),
+            (copied.TokenId.HighPart, copied.TokenId.LowPart)
+        );
+        assert!(equivalent(token.as_raw_handle(), duplicate.as_raw_handle()).unwrap());
+    }
+
+    #[test]
     fn deleting_privileges_cannot_use_an_unrestricted_daemon() {
-        let token = token(unsafe { GetCurrentProcess() }).unwrap();
+        let token = token(
+            unsafe { GetCurrentProcess() },
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+        )
+        .unwrap();
         let mut restricted = std::ptr::null_mut();
         assert_ne!(
             unsafe {
@@ -282,5 +327,6 @@ mod tests {
         );
         let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
         assert!(!equivalent(restricted.as_raw_handle(), token.as_raw_handle()).unwrap());
+        assert!(!equivalent(token.as_raw_handle(), restricted.as_raw_handle()).unwrap());
     }
 }

@@ -253,12 +253,7 @@ impl Child {
             use std::os::windows::io::AsRawHandle;
             let handle = running.child.as_raw_handle();
             drop(running);
-            if unsafe {
-                windows_sys::Win32::System::Threading::WaitForSingleObject(handle, u32::MAX)
-            } == windows_sys::Win32::Foundation::WAIT_FAILED
-            {
-                return Err(io::Error::last_os_error());
-            }
+            windows::wait_for_exit(handle)?;
         }
         #[cfg(not(any(unix, windows)))]
         drop(running);
@@ -487,6 +482,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn spawning_another_child_discards_completed_registrations() {
+        let request = Cancellation::default();
+        let _scope = CancellationScope::enter(Some(request.clone()));
+        let mut first = shell("exit 7").invocation_spawn().unwrap();
+        assert_eq!(first.wait().unwrap().code(), Some(7));
+        drop(first);
+        let mut second = shell("exit 9").invocation_spawn().unwrap();
+        {
+            let registered = request.0.lock().unwrap();
+            assert_eq!(registered.children.len(), 1);
+            assert!(Arc::ptr_eq(
+                &registered.children[0].upgrade().unwrap(),
+                &second.running,
+            ));
+        }
+        assert_eq!(second.wait().unwrap().code(), Some(9));
+    }
+
+    #[cfg(unix)]
     fn wait_for_file(path: &std::path::Path) {
         let started = std::time::Instant::now();
         while !path.exists() {
@@ -611,32 +626,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn waiting_for_an_externally_reaped_child_returns_an_error() {
-        let mut fixture = crate::platform::host_spawn(
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "invocation::process::tests::externally_reaped_child_fixture",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        )
-        .unwrap();
-        let started = std::time::Instant::now();
-        loop {
-            if fixture.try_wait().unwrap().is_some() {
-                let output = fixture.wait_with_output().unwrap();
-                assert!(output.status.success(), "{output:?}");
-                break;
+    fn polling_and_blocking_waits_return_unrecoverable_errors() {
+        for mode in ["poll", "blocking"] {
+            let mut fixture = crate::platform::host_spawn(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "invocation::process::tests::externally_reaped_child_fixture",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("KACHE_TEST_WAIT_ERROR", mode)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                if fixture.try_wait().unwrap().is_some() {
+                    let output = fixture.wait_with_output().unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                    break;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    fixture.kill().unwrap();
+                    let output = fixture.wait_with_output().unwrap();
+                    panic!("wait retried an unrecoverable error: {output:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            if started.elapsed() > std::time::Duration::from_secs(5) {
-                fixture.kill().unwrap();
-                let output = fixture.wait_with_output().unwrap();
-                panic!("wait retried an unrecoverable error: {output:?}");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -644,8 +662,16 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture for bounded native wait-error coverage"]
     fn externally_reaped_child_fixture() {
-        let _scope = CancellationScope::enter(None);
+        let blocking = std::env::var("KACHE_TEST_WAIT_ERROR").unwrap() == "blocking";
+        let _scope = CancellationScope::enter(blocking.then(Cancellation::default));
         let mut child = shell("exit 7").invocation_spawn().unwrap();
+        if blocking {
+            // Observe a PID which cannot be our child, while retaining the
+            // native child's ownership for safe cancellation and reaping.
+            child.pid = std::process::id();
+            assert_eq!(child.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+            return;
+        }
         assert_eq!(
             child.running.lock().unwrap().child.wait().unwrap().code(),
             Some(7)

@@ -198,17 +198,26 @@ mod tests {
                 let barrier = &barrier;
                 threads.spawn(move || {
                     force(Some(true));
+                    let mut observations = Vec::new();
                     for _ in 0..2 {
                         let _scope = InvocationPressureScope::enter(enabled);
                         barrier.wait();
-                        assert_eq!(now(), enabled);
-                        let failed = std::panic::catch_unwind(|| {
+                        let before = now();
+                        let nested = std::panic::catch_unwind(|| {
                             let _child = InvocationPressureScope::enter(!enabled);
-                            assert_eq!(now(), !enabled);
-                            panic!("nested request failed");
-                        });
-                        assert!(failed.is_err());
-                        assert_eq!(now(), enabled);
+                            std::panic::panic_any(now());
+                        })
+                        .err()
+                        .and_then(|payload| payload.downcast::<bool>().ok())
+                        .map(|value| *value);
+                        let after = now();
+                        barrier.wait();
+                        observations.push((before, nested, after));
+                    }
+                    for (before, nested, after) in observations {
+                        assert_eq!(before, enabled);
+                        assert_eq!(nested, Some(!enabled));
+                        assert_eq!(after, enabled);
                     }
                     assert!(INVOCATION_ENABLED.with(|slot| slot.get().is_none()));
                     force(None);

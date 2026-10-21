@@ -18,7 +18,7 @@ const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const MAX_REPLY_BYTES: u64 = 64 << 10;
 #[cfg(windows)]
-const MAX_REPLY_BYTES: u64 = 8 << 20;
+use windows::MAX_REPLY_BYTES;
 
 #[cfg(windows)]
 mod windows;
@@ -239,10 +239,18 @@ mod tests {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("control");
         let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let context = fixture(root.path());
         std::thread::scope(|threads| {
             let server = threads.spawn(|| {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) =
+                    retry_until(Some(std::time::Instant::now() + PREPARE_TIMEOUT), || {
+                        listener.accept()
+                    })
+                    .unwrap();
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                stream.set_write_timeout(Some(PREPARE_TIMEOUT)).unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -283,11 +291,15 @@ mod tests {
                 let files = loop {
                     match crate::descriptors::receive(datagram.as_fd(), &ticket.key, 3) {
                         Ok(files) => break files,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(error) => {
+                            assert_eq!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock,
+                                "receive failed: {error}"
+                            );
                             assert!(started.elapsed() < PREPARE_TIMEOUT);
                             std::thread::sleep(Duration::from_millis(1));
                         }
-                        Err(error) => panic!("receive failed: {error}"),
                     }
                 };
                 assert_eq!(files.len(), 3);
@@ -382,8 +394,17 @@ mod protocol_tests {
                 .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         }
-        let error =
-            retry_until::<()>(None, || Err(std::io::ErrorKind::BrokenPipe.into())).unwrap_err();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = send.send(retry_until::<()>(None, || {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }));
+        });
+        let error = receive
+            .recv_timeout(PREPARE_TIMEOUT)
+            .expect("non-transient errors must stop retries without a deadline")
+            .unwrap_err();
+        worker.join().unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
@@ -639,6 +660,11 @@ mod windows_tests {
         .unwrap();
         let probe: crate::SyncStream =
             interprocess::os::windows::named_pipe::local_socket::Stream::from(pipe).into();
+        while !root.path().join("accepted").exists() {
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(probe.credentials().unwrap().same_user);
         assert_eq!(
             probe.credentials().unwrap().pid.unwrap().get(),
@@ -654,6 +680,7 @@ mod windows_tests {
             "{error:#}"
         );
         assert_eq!(try_execute(&socket, &request(root.path())).unwrap(), None);
+        std::fs::write(root.path().join("done"), b"done").unwrap();
         while child.0.try_wait().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -661,11 +688,18 @@ mod windows_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(child.0.wait().unwrap().success());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("received")).unwrap(),
-            "0,0,0"
+        let status = child.0.wait().unwrap();
+        let mut diagnostics = String::new();
+        if let Some(mut stderr) = child.0.stderr.take() {
+            stderr.read_to_string(&mut diagnostics).unwrap();
+        }
+        assert!(status.success(), "{diagnostics}");
+        let received = std::fs::read_to_string(root.path().join("received")).unwrap();
+        assert!(
+            !received.is_empty(),
+            "the credential probe must reach the server"
         );
+        assert!(received.split(',').all(|count| count == "0"), "{received}");
     }
 
     #[test]
@@ -741,9 +775,25 @@ mod windows_tests {
             .unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
         let mut received = Vec::new();
-        for _ in 0..3 {
+        let limit = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            // The listener can discard a client that closes before accept.
+            // Count observed bytes, rather than requiring every rejected
+            // connection to survive long enough to be accepted in user space.
+            let stream = match listener.accept() {
+                Ok(stream) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if root.join("done").exists() {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < limit);
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("accepting the credential probe: {error}"),
+            };
+            std::fs::write(root.join("accepted"), b"accepted").unwrap();
             let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
-            let stream = retry_until(Some(deadline), || listener.accept()).unwrap();
             let mut byte = [0u8; 1];
             let count = retry_until(Some(deadline), || (&stream).read(&mut byte))
                 .or_else(|error| {

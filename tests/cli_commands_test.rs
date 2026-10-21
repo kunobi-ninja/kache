@@ -1915,6 +1915,11 @@ fn targets_lists_a_tracked_target_and_flags_its_deleted_worktree() {
         String::from_utf8_lossy(&text.stdout)
     );
 
+    // Windows keeps the daemon's working directory open until it exits.
+    stop_daemon(
+        kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache).args(["daemon", "stop"]),
+        &e.cache,
+    );
     std::fs::remove_dir_all(project.path()).unwrap();
     let orphaned = targets();
     assert_eq!(orphaned["targets"][0]["state"], "worktree_deleted");

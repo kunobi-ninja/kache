@@ -130,7 +130,6 @@ impl InvocationIo {
         Ok((files, streams.terminal.is_some()))
     }
 
-    #[cfg(any(unix, windows))]
     pub(crate) fn try_capture() -> io::Result<Self> {
         let stdio = kache_client::Stdio::capture()?;
         Ok(Self::from_files(
@@ -138,14 +137,6 @@ impl InvocationIo {
             stdio.output,
             stdio.error,
             stdio.terminal,
-        ))
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    pub(crate) fn try_capture() -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "standard handle capture unavailable",
         ))
     }
 

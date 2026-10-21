@@ -15,10 +15,13 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
+pub(super) const MAX_REPLY_BYTES: u64 = 8 << 20;
+
 pub(super) struct Connection {
     pub(super) inner: crate::SyncStream,
     pub(super) deadline: std::cell::Cell<Option<std::time::Instant>>,
     peer: PeerSecurity,
+    write_capacity: usize,
 }
 
 /// Pin the peer before trusting its process-creation requests. Credentials
@@ -120,11 +123,33 @@ impl Connection {
         deadline: std::time::Instant,
     ) -> Result<Self> {
         let peer = PeerSecurity::open(&inner)?;
+        use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_SERVER_END};
+        let crate::SyncStream::NamedPipe(pipe) = &inner;
+        let (mut flags, mut outbound, mut inbound) = (0, 0, 0);
+        if unsafe {
+            GetNamedPipeInfo(
+                pipe.as_handle().as_raw_handle(),
+                &mut flags,
+                &mut outbound,
+                &mut inbound,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let write_capacity = if flags & PIPE_SERVER_END != 0 {
+            outbound
+        } else {
+            inbound
+        };
+        anyhow::ensure!(write_capacity > 0, "compiler pipe has no write buffer");
         inner.set_nonblocking(true)?;
         Ok(Self {
             inner,
             deadline: std::cell::Cell::new(Some(deadline)),
             peer,
+            write_capacity: write_capacity as usize,
         })
     }
 
@@ -180,6 +205,9 @@ impl Read for &Connection {
 
 impl Write for &Connection {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // A nonblocking pipe can return zero for a frame larger than its
+        // buffer even while empty. Send bounded pieces so the peer can read.
+        let bytes = &bytes[..bytes.len().min(self.write_capacity)];
         retry_until(self.deadline.get(), || match (&self.inner).write(bytes) {
             // PIPE_NOWAIT may successfully write zero bytes when full.
             Ok(0) if !bytes.is_empty() => Err(std::io::ErrorKind::WouldBlock.into()),

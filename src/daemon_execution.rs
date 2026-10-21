@@ -22,18 +22,22 @@ const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 #[path = "daemon_execution_linux.rs"]
 mod linux;
 
+#[cfg(target_os = "macos")]
+#[path = "daemon_execution_macos.rs"]
+mod macos;
+
 fn peer_may_delegate(stream: &TokioStream, reported_pid: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
-        crate::transport::peer_audit_token(stream).is_ok_and(|token| {
-            u32::try_from(token.pid()).ok() == Some(reported_pid)
-                && crate::fallback::compiler_peer_unrestricted(token)
-        })
+        macos::peer_may_delegate(stream, reported_pid)
     }
     #[cfg(target_os = "linux")]
     {
-        crate::transport::peer_pid(stream) == Some(reported_pid)
-            && linux::permits_delegation(Path::new("/proc"), reported_pid).unwrap_or(false)
+        linux::peer_may_delegate(
+            Path::new("/proc"),
+            crate::transport::peer_pid(stream),
+            reported_pid,
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -487,11 +491,20 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut handlers = tokio::task::JoinSet::new();
             for _ in 0..connections {
-                let stream = listener.accept().await.unwrap();
+                let stream = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("execution client did not connect")
+                    .unwrap();
                 let d = d.clone();
                 let l = l.clone();
-                handlers
-                    .spawn(async move { super::super::handle_connection(stream, &d, &l).await });
+                handlers.spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        super::super::handle_connection(stream, &d, &l),
+                    )
+                    .await
+                    .expect("execution request did not finish")
+                });
             }
             let mut results = Vec::new();
             while let Some(result) = handlers.join_next().await {

@@ -43,6 +43,13 @@ impl Stdio {
         {
             windows::capture()
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "standard handle capture unavailable",
+            ))
+        }
     }
 
     pub fn into_files(self) -> (Vec<File>, bool) {

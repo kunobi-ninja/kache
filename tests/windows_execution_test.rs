@@ -689,13 +689,14 @@ fn cold_bootstrap_keeps_the_compiler_in_the_original_frontend() {
     std::fs::copy(std::env::current_exe().unwrap(), &compiler).unwrap();
     let mut command = native_compiler_command(&fixture, "install/kache.exe", &compiler, "cold");
     command.env("KACHE_DISABLED", "0").env("RUSTC", &compiler);
+    let cwd = command.get_current_dir().unwrap().to_owned();
     let mut frontend = fixture.spawn(&mut command);
     let record = ready(&fixture.path("cold.ready"));
     assert_eq!(record["parent"], frontend.child.id());
     assert_eq!(record["client"], "cold");
     assert_eq!(
         std::fs::canonicalize(record["cwd"].as_str().unwrap()).unwrap(),
-        fixture.path("work").canonicalize().unwrap()
+        cwd.canonicalize().unwrap()
     );
     let daemon = fixture.daemon_pid();
     std::fs::write(fixture.path("cold.release"), b"go").unwrap();
@@ -703,8 +704,8 @@ fn cold_bootstrap_keeps_the_compiler_in_the_original_frontend() {
     assert_eq!(output.status.code(), Some(7));
     assert!(output.stdout.ends_with(b"native-output-\xff"));
     assert!(output.stderr.ends_with(b"native-error-\xfe"));
-    std::fs::remove_dir(fixture.path("work")).unwrap();
-    std::fs::create_dir(fixture.path("work")).unwrap();
+    std::fs::remove_dir(&cwd).unwrap();
+    std::fs::create_dir(&cwd).unwrap();
     assert_eq!(fixture.daemon_pid(), daemon);
 }
 

@@ -96,12 +96,14 @@ On stable, let Kache insert the remapping flag. Putting `-Z` options in
 `RUSTFLAGS` can make Cargo's compiler queries fail before this managed compile
 path runs; Kache's bootstrap permission does not apply to those queries.
 
-The receiver copies compatible private state while holding donor and receiver
-locks. rustc checks changed inputs. Kache copies no Cargo fingerprints or cached
+The receiver imports compatible state while holding donor and receiver locks.
+It hard-links finalized rustc graph and codegen files when possible, and copies
+locks and other files. Failed hard links fall back to copies.
+rustc checks changed inputs. Kache copies no Cargo fingerprints or cached
 artifacts and publishes no normal artifact-cache entry from this path. Compiler
 identity, effective bootstrap, flags and cache policy must match. A busy donor,
 incompatible flags, an unsupported argument or incomplete state leaves the
-receiver without an imported seed. Copying is limited to 1 GiB and 65,536
+receiver without an imported seed. Imports are limited to 1 GiB and 65,536
 entries, and scanning to 256 donor units.
 
 Use the same relative package layout in both checkouts. Targets outside the

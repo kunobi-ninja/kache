@@ -3875,10 +3875,9 @@ fn run_parsed_rustc(
                 None,
                 key_record,
             );
-        } else if automatic_seeding_enabled(config, args)
-            && let Some(mut lease) = adaptive_unit
-                .as_ref()
-                .and_then(AdaptiveUnit::try_source_changed_seed)
+        } else if let Some(unit) = adaptive_unit.as_ref()
+            && automatic_seeding_enabled(config, args)
+            && let Some(mut lease) = unit.try_source_changed_seed()
         {
             let _ = prepare_worktree_compiler_args(config, args, &mut lease);
             if lease.worktree_portable() && !lease.needs_worktree_donor() {

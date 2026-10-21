@@ -372,12 +372,12 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
         .unwrap();
     assert_eq!(seed["passthrough_reason"], "adaptive seed", "{seed:#}");
     assert_eq!(
-        seed["dep_info_runs"], 0,
-        "no separate dep-info pre-pass: {seed:#}"
+        seed["dep_info_runs"], 1,
+        "only the discarded bootstrap discovery counts as dep-info work: {seed:#}"
     );
     assert_eq!(
-        seed["compiler_runs"], 2,
-        "the injected attempt must retry natively: {seed:#}"
+        seed["compiler_runs"], 1,
+        "exactly one native compile follows the discarded discovery: {seed:#}"
     );
     assert!(
         graph_contents(&root.join("target/debug/incremental.kache-auto"))

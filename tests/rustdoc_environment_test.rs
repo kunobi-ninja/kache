@@ -9,10 +9,15 @@ use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 struct DocFixture {
     project: tempfile::TempDir,
     cache: PathBuf,
+    edition: &'static str,
 }
 
 impl DocFixture {
     fn new(source: &str) -> Self {
+        Self::with_edition(source, "2021")
+    }
+
+    fn with_edition(source: &str, edition: &'static str) -> Self {
         build_kache();
         let temp_root = if cfg!(target_os = "macos") {
             "/private/tmp".into()
@@ -26,7 +31,11 @@ impl DocFixture {
         fs::write(isolated_config_path(&cache),
             "[cache]\nlocal_only = true\nscheduler = false\nauto_gc = false\ndaemon_publish = false\n").unwrap();
         fs::write(project.path().join("lib.rs"), source).unwrap();
-        Self { project, cache }
+        Self {
+            project,
+            cache,
+            edition,
+        }
     }
 
     fn run(&self, wrapped: bool, doc_text: &str) -> String {
@@ -54,7 +63,8 @@ impl DocFixture {
                 "lib.rs",
                 "--crate-name=doc_fixture",
                 "--crate-type=rlib",
-                "--edition=2021",
+                "--edition",
+                self.edition,
                 "-Zunstable-options",
                 "--merge=none",
                 "--parts-out-dir",
@@ -84,6 +94,10 @@ impl DocFixture {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn function_documentation(&self) -> String {
+        fs::read_to_string(self.project.path().join("out/doc_fixture/fn.text.html")).unwrap()
     }
 }
 
@@ -122,4 +136,49 @@ fn documentation_without_env_macros_keeps_warm_reuse_across_env_changes() {
     assert_eq!(events[0]["result"], "miss");
     assert_eq!(events[1]["result"], "local_hit");
     assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
+}
+
+#[test]
+fn environment_macros_in_prefix_macro_arguments_refresh_documentation() {
+    for (edition, source) in [
+        (
+            "2018",
+            r###"macro_rules! document {
+                (cr # $a:literal $which:ident !($v:literal), $z:literal) => {
+                    #[doc = $which!($v)] pub fn text() {}
+                };
+            }
+            document! { cr#"a" env!("DOC_TEXT"), "#" }"###,
+        ),
+        (
+            "2021",
+            r###"macro_rules! document {
+                ($tag:literal # $a:literal $which:ident !($v:literal), $z:literal) => {
+                    #[doc = $which!($v)] pub fn text() {}
+                };
+            }
+            document! { 1cr#"a" env!("DOC_TEXT"), "#" }"###,
+        ),
+    ] {
+        let fixture = DocFixture::with_edition(source, edition);
+        for wrapped in [false, true] {
+            for marker in ["OLD_MARKER", "NEW_MARKER"] {
+                fixture.run(wrapped, marker);
+                let html = fixture.function_documentation();
+                assert!(html.contains(marker), "edition={edition}, wrapped={wrapped}");
+                if marker == "NEW_MARKER" {
+                    assert!(!html.contains("OLD_MARKER"));
+                }
+            }
+        }
+        let events = fixture.events();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event["result"], "passthrough");
+            assert_eq!(
+                event["passthrough_reason"],
+                "uncacheable: rustdoc environment macros require compiler dependency tracking"
+            );
+        }
+    }
 }

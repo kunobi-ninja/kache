@@ -58,5 +58,15 @@ Compatible Cargo versions run rustdoc with `--merge=none` for each crate, then `
 for the shared search index. Kache caches both as output archives. Other
 rustdoc modes pass through.
 
+Kache also passes through when its source scan finds `env!` or `option_env!`
+in the crate, followed modules, or literal includes. Their environment values
+are not tracked for rustdoc cache keys. The scan does not expand macros or
+resolve imported aliases. It cannot see environment reads in procedural
+macros or modules declared by macro expansion.
+
+The scan also reads `include_str!` and `include_bytes!` inputs, so a matching
+macro invocation in included data can cause passthrough. Setting
+`cache.key_env_vars` does not override this refusal.
+
 Windows has no Kache compiler shim generator, so this setup does not cache
 `cargo doc` there.

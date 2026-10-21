@@ -9,8 +9,9 @@
 //! key, so a second checkout restores into its own directories. The key hashes
 //! the crate source, every `mod` and string `include!` it names, and each flag
 //! with its name. Dep-info is not an input: the first `cargo doc` has none,
-//! and hashing it would miss on the next identical run. Source environment
-//! macros pass through until compiler environment dependencies are tracked.
+//! and hashing it would miss on the next identical run. Source invocations of
+//! `env!` and `option_env!` pass through until compiler environment dependencies
+//! are tracked. The source scan does not expand macros or resolve aliases.
 
 use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result};
@@ -264,7 +265,7 @@ pub(crate) fn cache_key_with(
         hasher.update(kind.as_bytes());
         hasher.update(b"\0");
     }
-    for record in source_records(&parsed.sources, &parsed.invocation_env)? {
+    for record in source_records(parsed)? {
         if record.relative == "." {
             continue;
         }
@@ -366,8 +367,18 @@ struct SourceRecord {
 /// contexts but enters the key once. A missing file is skipped. A file that exists but cannot
 /// be read is an error, and the invocation is not cached. `include!`,
 /// `include_str!`, and `include_bytes!` count only with a string literal;
-/// anything else is an error. Dep-info is not read here.
-fn source_records(sources: &[PathBuf], env: &InvocationEnv) -> Result<Vec<SourceRecord>> {
+/// anything else is an error. A scanned `env!` or `option_env!` invocation
+/// is also an error because its environment dependency is not tracked.
+/// Dep-info is not read here.
+fn source_records(parsed: &RustdocArgs) -> Result<Vec<SourceRecord>> {
+    let sources = &parsed.sources;
+    let env = &parsed.invocation_env;
+    let c_strings = parsed
+        .keyed
+        .iter()
+        .rev()
+        .find_map(|flag| flag.strip_prefix("--edition="))
+        .is_some_and(|edition| matches!(edition, "2021" | "2024"));
     let Some(primary) = sources.first() else {
         return Ok(Vec::new());
     };
@@ -381,6 +392,7 @@ fn source_records(sources: &[PathBuf], env: &InvocationEnv) -> Result<Vec<Source
             true,
             false,
             (&mut seen, &mut files),
+            c_strings,
             env,
         )?;
     }
@@ -402,6 +414,7 @@ fn collect_source(
     module_file: bool,
     seen: &mut BTreeSet<(PathBuf, bool)>,
     out: &mut Vec<SourceRecord>,
+    c_strings: bool,
 ) -> Result<()> {
     collect_source_for(
         path,
@@ -409,6 +422,7 @@ fn collect_source(
         required,
         module_file,
         (seen, out),
+        c_strings,
         &InvocationEnv::capture(),
     )
 }
@@ -419,6 +433,7 @@ fn collect_source_for(
     required: bool,
     module_file: bool,
     (seen, out): (&mut BTreeSet<(PathBuf, bool)>, &mut Vec<SourceRecord>),
+    c_strings: bool,
     env: &InvocationEnv,
 ) -> Result<()> {
     let absolute = lexical_absolute_for(path, env)?;
@@ -463,15 +478,31 @@ fn collect_source_for(
     } else {
         parent.to_path_buf()
     };
-    for found in scan_rust(&bytes)? {
+    for found in scan_rust(&bytes, c_strings)? {
         match found {
             Found::Include(rel) => {
-                collect_source_for(&parent.join(rel), crate_dir, false, false, (seen, out), env)?;
+                collect_source_for(
+                    &parent.join(rel),
+                    crate_dir,
+                    false,
+                    false,
+                    (seen, out),
+                    c_strings,
+                    env,
+                )?;
             }
             Found::Module { path, name } => {
                 let dir = if path.is_some() { parent } else { &module_dir };
                 if let Some(next) = resolve_module_for(dir, path.as_deref(), &name, env)? {
-                    collect_source_for(&next, crate_dir, false, path.is_none(), (seen, out), env)?;
+                    collect_source_for(
+                        &next,
+                        crate_dir,
+                        false,
+                        path.is_none(),
+                        (seen, out),
+                        c_strings,
+                        env,
+                    )?;
                 }
             }
         }
@@ -597,8 +628,8 @@ enum Tok {
     Punct(u8),
 }
 
-fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
-    let tokens = rust_tokens(bytes);
+fn scan_rust(bytes: &[u8], c_strings: bool) -> Result<Vec<Found>> {
+    let tokens = rust_tokens(bytes, c_strings);
     if has_environment_macro(&tokens) {
         anyhow::bail!("rustdoc environment macros require compiler dependency tracking");
     }
@@ -758,7 +789,7 @@ fn close_at(tokens: &[Tok], start: usize, open: u8, close: u8) -> Option<usize> 
     None
 }
 
-fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
+fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut index = 0;
     for _ in bytes {
@@ -784,17 +815,21 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            let rest = &bytes[index + 2..];
-            let offset = rest
-                .windows(2)
-                .position(|pair| pair == b"*/")
-                .map(|at| at + 2)
-                .unwrap_or(rest.len());
-            index += 2 + offset;
+            index = skip_block_comment(bytes, index);
             continue;
         }
-        if byte == b'b' && matches!(bytes.get(index + 1), Some(b'"' | b'r' | b'\'')) {
-            index = skip_byte_literal(bytes, index);
+        // A numeric suffix belongs to the number, not a string prefix.
+        if byte.is_ascii_digit() {
+            index += bytes[index..]
+                .iter()
+                .take_while(|byte| is_ident_continue(**byte))
+                .count();
+            continue;
+        }
+        if (byte == b'b' || (c_strings && byte == b'c'))
+            && matches!(bytes.get(index + 1), Some(b'"' | b'r' | b'\''))
+        {
+            index = skip_prefixed_literal(bytes, index);
             continue;
         }
         if byte == b'\'' {
@@ -847,7 +882,29 @@ fn is_ident_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn skip_byte_literal(bytes: &[u8], index: usize) -> usize {
+fn skip_block_comment(bytes: &[u8], index: usize) -> usize {
+    let mut cursor = index + 2;
+    let mut depth = 1usize;
+    while cursor + 1 < bytes.len() {
+        match &bytes[cursor..cursor + 2] {
+            b"/*" => {
+                depth += 1;
+                cursor += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                cursor += 2;
+                if depth == 0 {
+                    return cursor;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn skip_prefixed_literal(bytes: &[u8], index: usize) -> usize {
     match bytes.get(index + 1) {
         Some(b'\'') => skip_char_or_lifetime(bytes, index + 1),
         Some(b'"') => cooked_string(bytes, index + 1).1,
@@ -872,6 +929,8 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
                     .unwrap_or(rest.len());
                 next += offset;
             }
+        } else if bytes.get(next) == Some(&b'x') {
+            next += 3;
         } else {
             next += 1;
         }
@@ -882,6 +941,15 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
     }
     if bytes.get(index + 2) == Some(&b'\'') {
         return index + 3;
+    }
+    let width = match bytes.get(index + 1) {
+        Some(0xC2..=0xDF) => 2,
+        Some(0xE0..=0xEF) => 3,
+        Some(0xF0..=0xF4) => 4,
+        _ => return index + 1,
+    };
+    if bytes.get(index + width + 1) == Some(&b'\'') {
+        return index + width + 2;
     }
     index + 1
 }
@@ -1579,7 +1647,7 @@ pub(crate) fn rewrite_bytes(input: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -
 
 fn restore_bundle(parsed: &RustdocArgs, bundle: &Bundle) -> Result<()> {
     let parsed = &parsed.rooted_paths()?;
-    let current = source_records(&parsed.sources, &parsed.invocation_env)?;
+    let current = source_records(parsed)?;
     let rewrites = source_rewrites(&bundle.sources, &current);
     if let Some(out_dir) = &parsed.out_dir {
         for (rel, bytes) in &bundle.out_files {
@@ -1899,7 +1967,7 @@ fn files_written(parsed: &RustdocArgs) -> Result<Bundle> {
             Some(path) if path.is_file() => Some(std::fs::read(path)?),
             _ => None,
         },
-        sources: source_records(&parsed.sources, &parsed.invocation_env)?,
+        sources: source_records(parsed)?,
     })
 }
 
@@ -2285,7 +2353,7 @@ mod tests {
     }
 
     fn module_names(source: &str) -> Vec<String> {
-        scan_rust(source.as_bytes())
+        scan_rust(source.as_bytes(), true)
             .unwrap()
             .into_iter()
             .filter_map(|found| match found {
@@ -2296,7 +2364,7 @@ mod tests {
     }
 
     fn module_path(source: &str) -> Option<String> {
-        scan_rust(source.as_bytes())
+        scan_rust(source.as_bytes(), true)
             .unwrap()
             .into_iter()
             .find_map(|found| match found {
@@ -2306,7 +2374,7 @@ mod tests {
     }
 
     fn includes(source: &str) -> Vec<String> {
-        scan_rust(source.as_bytes())
+        scan_rust(source.as_bytes(), true)
             .unwrap()
             .into_iter()
             .filter_map(|found| match found {
@@ -2330,7 +2398,7 @@ mod tests {
             module_names("/* * mod fake;*/mod real;"),
             vec!["real".to_string()]
         );
-        assert!(rust_tokens(b"/*a*").len() < 8);
+        assert!(rust_tokens(b"/*a*", true).len() < 8);
         assert_eq!(
             module_names("// mod fake;\nmod real;"),
             vec!["real".to_string()]
@@ -2366,8 +2434,8 @@ mod tests {
         assert_eq!(skip_char_or_lifetime(b"'\\u{61}'", 0), 8);
         assert_eq!(skip_char_or_lifetime(b"'\\n'", 0), 4);
         assert_eq!(skip_char_or_lifetime(b"'\\u{61;", 0), 1);
-        assert_eq!(skip_byte_literal(b"b'a'", 0), 4);
-        assert_eq!(skip_byte_literal(b"b\"hi\"", 0), 5);
+        assert_eq!(skip_prefixed_literal(b"b'a'", 0), 4);
+        assert_eq!(skip_prefixed_literal(b"b\"hi\"", 0), 5);
         let (text, next) = raw_string(b"r#\"ab\"#", 0).unwrap();
         assert_eq!(text, "ab");
         assert_eq!(next, 7);
@@ -2375,9 +2443,9 @@ mod tests {
         assert_eq!(text, " \" # ");
         assert_eq!(next, 12);
 
-        let nested = rust_tokens(b"(())");
+        let nested = rust_tokens(b"(())", true);
         assert_eq!(close_at(&nested, 1, b'(', b')'), Some(3));
-        let idents: Vec<_> = rust_tokens(b"mod real")
+        let idents: Vec<_> = rust_tokens(b"mod real", true)
             .into_iter()
             .filter_map(|token| match token {
                 Tok::Ident(text) => Some(text),
@@ -2385,8 +2453,8 @@ mod tests {
             })
             .collect();
         assert_eq!(idents, ["mod".to_string(), "real".to_string()]);
-        assert_eq!(skip_byte_literal(b"br", 0), 1);
-        assert_eq!(skip_byte_literal(b"bx", 0), 1);
+        assert_eq!(skip_prefixed_literal(b"br", 0), 1);
+        assert_eq!(skip_prefixed_literal(b"bx", 0), 1);
     }
 
     #[test]
@@ -2397,9 +2465,14 @@ mod tests {
             r#"const TEXT: Option<&str> = option_env!("DOC_TEXT");"#,
             r#"env!["DOC_TEXT"]"#,
             r#"env!{"DOC_TEXT"}"#,
+            r#"option_env!["DOC_TEXT"]"#,
+            r#"option_env!{"DOC_TEXT"}"#,
+            r#"std::env!("DOC_TEXT")"#,
+            r#"core::option_env!("DOC_TEXT")"#,
+            r#"r#env /* comment */ ! ("DOC_TEXT")"#,
             r#"env!(concat!("DOC", "_TEXT"))"#,
         ] {
-            let error = scan_rust(source.as_bytes())
+            let error = scan_rust(source.as_bytes(), true)
                 .err()
                 .expect("env macro is uncacheable");
             assert_eq!(
@@ -2412,8 +2485,148 @@ mod tests {
             r#"const TEXT: &str = "env!(DOC_TEXT)"; mod real;"#,
             "fn env() {} mod real;",
             "fn test(env: u8) { if env != 0 {} } mod real;",
+            "/* option_env!(\"DOC_TEXT\") */ mod real;",
+            r##"const TEXT: &str = r#"option_env!(DOC_TEXT)"#; mod real;"##,
+            "other_env!(\"DOC_TEXT\"); mod real;",
+            "env(\"DOC_TEXT\"); mod real;",
+            "env!; mod real;",
         ] {
             assert_eq!(module_names(source), ["real"]);
+        }
+    }
+
+    #[test]
+    fn environment_macros_in_followed_sources_refuse_the_key() {
+        for declaration in ["mod child;", "include!(\"child.rs\");"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("lib.rs");
+            let child = dir.path().join("child.rs");
+            std::fs::write(&root, declaration).unwrap();
+            std::fs::write(&child, "const TEXT: &str = env!(\"DOC_TEXT\");").unwrap();
+            let parsed = parse(&[
+                "rustdoc",
+                "--merge=none",
+                "--crate-name=demo",
+                &root.to_string_lossy(),
+                "-o",
+                "/out",
+                "--parts-out-dir",
+                "/parts",
+            ]);
+            assert_eq!(
+                cache_key_with(&parsed, "v", None).unwrap_err().to_string(),
+                "rustdoc environment macros require compiler dependency tracking"
+            );
+
+            std::fs::write(&child, "pub fn child() {}").unwrap();
+            assert!(cache_key_with(&parsed, "v", None).is_ok());
+        }
+    }
+
+    #[test]
+    fn character_literals_do_not_hide_environment_macros() {
+        for literal in ["'a'", "'é'", "'中'", "'🦀'", r"'\x22'", r"'\u{22}'"] {
+            for name in ["env", "option_env"] {
+                let source = format!(
+                    "const CHARS: [char; 2] = [{literal},'\"']; fn text() {{ let _ = {name}!(\"DOC_TEXT\"); }}"
+                );
+                assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
+            }
+            assert_eq!(skip_char_or_lifetime(literal.as_bytes(), 0), literal.len());
+        }
+        for lifetime in ["'a", "'é", "'static"] {
+            assert_eq!(skip_char_or_lifetime(lifetime.as_bytes(), 0), 1);
+        }
+        assert_eq!(skip_char_or_lifetime(b"'", 0), 1);
+    }
+
+    #[test]
+    fn nested_comments_and_c_strings_do_not_hide_environment_macros() {
+        for prefix in [
+            "/* /* */ \" */",
+            r###"const DATA: &std::ffi::CStr = cr"\";"###,
+            r###"const DATA: &std::ffi::CStr = cr#"a"b"#;"###,
+            r###"const DATA: &std::ffi::CStr = c"\"";"###,
+            r###"const DATA: &[u8] = br#"a"b"#;"###,
+        ] {
+            for name in ["env", "option_env"] {
+                let source =
+                    format!("{prefix} fn text() {{ let _ = {name}!(\"DOC_TEXT\"); }} // \"");
+                assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
+            }
+        }
+        for source in [
+            "/* /* */ env!(\"DOC_TEXT\") */ mod real;",
+            r###"const DATA: &std::ffi::CStr = cr#"env!("DOC_TEXT")"#; mod real;"###,
+            r###"const DATA: &std::ffi::CStr = c"env!(\"DOC_TEXT\")"; mod real;"###,
+        ] {
+            assert_eq!(module_names(source), ["real"]);
+        }
+        for (comment, end) in [
+            ("/**/tail", 4),
+            ("/* /* */ */tail", 11),
+            ("/*/", 3),
+            ("/*", 2),
+            ("/* /* */", 8),
+        ] {
+            assert_eq!(skip_block_comment(comment.as_bytes(), 0), end);
+        }
+    }
+
+    #[test]
+    fn source_edition_keeps_legacy_c_prefix_arguments_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            r###"macro_rules! document {
+                (cr # $a:literal $which:ident !($v:literal), $z:literal) => {
+                    #[doc = $which!($v)] pub fn text() {}
+                };
+            }
+            document! { cr#"a" env!("DOC_TEXT"), "#" }"###,
+        )
+        .unwrap();
+        let source_name = source.to_string_lossy();
+        for (edition, refuses) in [
+            (None, true),
+            (Some("2015"), true),
+            (Some("2018"), true),
+            (Some("2021"), false),
+            (Some("2024"), false),
+        ] {
+            let mut args = vec![
+                "rustdoc",
+                "--merge=none",
+                "--crate-name=demo",
+                source_name.as_ref(),
+                "-o",
+                "/out",
+                "--parts-out-dir",
+                "/parts",
+            ];
+            if let Some(edition) = edition {
+                args.extend(["--edition", edition]);
+            }
+            assert_eq!(
+                cache_key_with(&parse(&args), "v", None).is_err(),
+                refuses,
+                "edition={edition:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_suffixes_do_not_become_literal_prefixes() {
+        let source = r###"macro_rules! document {
+            ($tag:literal # $a:literal $which:ident !($v:literal), $z:literal) => {
+                #[doc = $which!($v)] pub fn text() {}
+            };
+        }
+        document! { 1cr#"a" env!("DOC_TEXT"), "#" }"###;
+        for prefix in ["1cr", "1br", "1r", "12cr", "0x12cr"] {
+            let source = source.replace("1cr", prefix);
+            assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
         }
     }
 
@@ -2511,7 +2724,11 @@ mod tests {
         std::fs::write(root.join("renamed.rs"), "mod child;\n").unwrap();
         std::fs::write(root.join("child.rs"), "pub fn thing() {}\n").unwrap();
         std::fs::write(root.join("renamed/child.rs"), "pub fn decoy() {}\n").unwrap();
-        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2527,7 +2744,11 @@ mod tests {
         std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
         std::fs::write(root.join("foo/mod.rs"), "mod child;\n").unwrap();
         std::fs::write(root.join("foo/child.rs"), "pub fn thing() {}\n").unwrap();
-        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2551,7 +2772,11 @@ mod tests {
         for file in ["child.rs", "note.txt", "renamed.rs"] {
             std::fs::write(root.join(file), "pub fn decoy() {}\n").unwrap();
         }
-        let records = source_records(&[root.join("entry.rs")], &InvocationEnv::capture()).unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("entry.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2591,12 +2816,6 @@ mod tests {
                 None,
                 root.to_path_buf(),
             );
-            let records = source_records(&[PathBuf::from("lib.rs")], &env).unwrap();
-            let names: Vec<_> = records
-                .iter()
-                .map(|record| record.relative.as_str())
-                .collect();
-            assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
             let parsed = parse_args_for(
                 &argv(&[
                     "rustdoc",
@@ -2610,6 +2829,12 @@ mod tests {
                 ]),
                 &env,
             );
+            let records = source_records(&parsed).unwrap();
+            let names: Vec<_> = records
+                .iter()
+                .map(|record| record.relative.as_str())
+                .collect();
+            assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
             let original = cache_key_with(&parsed, "v", None).unwrap();
             for child in ["child.rs", "foo/child.rs"] {
                 std::fs::write(root.join(child), "pub fn changed() {}\n").unwrap();
@@ -2638,7 +2863,11 @@ mod tests {
         for child in ["child.rs", "foo/child.rs"] {
             std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
         }
-        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -2655,7 +2884,11 @@ mod tests {
         std::fs::write(root.join("foo.rs"), "mod inline { mod leaf; }\n").unwrap();
         std::fs::write(root.join("foo/inline/leaf/mod.rs"), "mod child;\n").unwrap();
         std::fs::write(root.join("foo/inline/leaf/child.rs"), "pub fn thing() {}\n").unwrap();
-        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
         let names: Vec<_> = records
             .iter()
             .map(|record| record.relative.as_str())
@@ -3843,7 +4076,7 @@ mod tests {
 
     #[test]
     fn a_raw_byte_string_is_one_literal() {
-        assert_eq!(skip_byte_literal(b"br\"abc\"", 0), 7);
+        assert_eq!(skip_prefixed_literal(b"br\"abc\"", 0), 7);
         assert_eq!(skip_char_or_lifetime(b"'a", 0), 1);
         assert!(raw_string(b"r#\"abc", 0).is_none());
         assert_eq!(module_names("mod real; // tail"), vec!["real".to_string()]);
@@ -3874,7 +4107,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        collect_source(dir.path(), dir.path(), true, false, &mut seen, &mut out).unwrap();
+        collect_source(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            &mut seen,
+            &mut out,
+            true,
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 
@@ -3890,6 +4132,7 @@ mod tests {
             false,
             &mut seen,
             &mut out,
+            true,
         )
         .unwrap();
         assert!(out.is_empty());
@@ -3910,7 +4153,9 @@ mod tests {
         std::os::unix::fs::symlink(&link, &link).unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        assert!(collect_source(&link, dir.path(), false, false, &mut seen, &mut out).is_err());
+        assert!(
+            collect_source(&link, dir.path(), false, false, &mut seen, &mut out, true).is_err()
+        );
         assert!(resolve_module(dir.path(), None, "loop").is_err());
     }
 

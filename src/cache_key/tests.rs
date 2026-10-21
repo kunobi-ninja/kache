@@ -12045,6 +12045,30 @@ fn runtime_env_use_scan_rejects_content_changed_after_hashing() {
 }
 
 #[test]
+fn env_use_scan_treats_non_utf8_data_as_unused() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob.bin");
+    std::fs::write(&blob, b"\xff pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    // A byte-order mark is valid UTF-8, so rustc compiles this file.
+    let bom = dir.path().join("bom.rs");
+    std::fs::write(
+        &bom,
+        b"\xef\xbb\xbf pub const OUT: &str = env!(\"OUT_DIR\");",
+    )
+    .unwrap();
+
+    let hasher = FileHasher::new();
+    assert_eq!(
+        hasher.env_dep_use(&blob, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::Unused
+    );
+    assert_eq!(
+        hasher.env_dep_use(&bom, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
 fn cc_preprocess_memo_support_requires_persistent_cache() {
     assert!(!FileHasher::new().supports_cc_preprocess_memo());
 

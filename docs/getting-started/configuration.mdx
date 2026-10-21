@@ -227,7 +227,7 @@ GC skips a shard whose store dir has no `index.db`: a missing directory, an unmo
 
 `kache stats` and `kache stats --full` include every configured store. Entry counts count each cache key once; stored bytes count every copy across stores. JSON includes per-store paths, sizes, budgets and errors. The `stats --json` filesystem `disk` and index measurements still describe the main store; use `stores` for shard measurements.
 
-`kache list` and `kache explain` show the stores that hold each entry. `kache doctor` checks shard availability and accounting. Its link-layout probe uses Cargo's resolved intermediate directory and the shard mapped to it. When Cargo keeps intermediates in the target directory, that directory is probed. Configuration that Kache cannot resolve produces a diagnostic instead of a link probe. `doctor --verify` checks every stored copy; `--repair` also repairs shards. Missing shards are reported without creating their directories.
+`kache list` and `kache explain` show the stores that hold each entry. `kache doctor` checks shard availability and accounting. Its link-layout probe resolves the intermediate directory from Cargo configuration and environment variables, falling back to the target directory. It probes that directory, or its nearest existing ancestor, using the shard mapped to the probe path. Configuration that Kache cannot resolve produces a diagnostic instead of a link probe. `doctor --verify` checks every stored copy; `--repair` also repairs shards. Missing shards are reported without creating their directories.
 
 `kache gc --json`, `kache gc --stale-schema` and emptying the cache with `kache clean --cache` still cover only the main store. Automatic prefetch still imports into the main store.
 

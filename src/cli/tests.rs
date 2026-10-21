@@ -11042,3 +11042,33 @@ fn an_unresolved_include_or_file_target_never_probes_a_different_directory() {
     assert_eq!(cargo_output_dir_from(&project, &env), None);
     assert_eq!(fs::read(target).unwrap(), b"keep this file");
 }
+
+#[test]
+fn an_explicit_workspace_must_have_a_valid_workspace_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let member = dir.path().join("member");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(&member).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nworkspace = \"../workspace\"\n",
+    )
+    .unwrap();
+    for manifest in [
+        "[package]\nname = \"other\"\nversion = \"0.1.0\"\n",
+        "not = [valid",
+        "workspace = \"not a table\"\n",
+    ] {
+        fs::write(workspace.join("Cargo.toml"), manifest).unwrap();
+        assert_eq!(
+            cargo_output_dir_from(&member, &environment()),
+            None,
+            "{manifest}"
+        );
+    }
+    fs::remove_file(workspace.join("Cargo.toml")).unwrap();
+    assert_eq!(cargo_output_dir_from(&member, &environment()), None);
+    fs::write(member.join("Cargo.toml"), "[package").unwrap();
+    assert_eq!(cargo_output_dir_from(&member, &environment()), None);
+}

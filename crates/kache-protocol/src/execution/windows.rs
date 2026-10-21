@@ -105,6 +105,10 @@ pub enum Command {
     Release {
         id: u64,
     },
+    /// Stop a child whose handle transfer did not complete, before reporting failure.
+    Abort {
+        id: u64,
+    },
     /// Reap an already completed child and release its lifetime job.
     Finish {
         id: u64,

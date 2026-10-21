@@ -52,6 +52,13 @@ impl Client {
                 drop(pending.child.stderr.take());
                 Ok(Reply::Done)
             }
+            Command::Abort { id } => {
+                let pending = self.children.get_mut(&id).ok_or_else(unknown_child)?;
+                pending.lifetime.kill()?;
+                pending.child.wait()?;
+                self.children.remove(&id);
+                Ok(Reply::Done)
+            }
             Command::Finish { id } => {
                 let pending = self.children.get_mut(&id).ok_or_else(unknown_child)?;
                 if pending.child.try_wait()?.is_none() {
@@ -283,6 +290,43 @@ mod tests {
             Reply::Done
         );
         assert!(client.children.is_empty());
+    }
+
+    #[test]
+    fn abort_reaps_a_started_child_before_acknowledging_transfer_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut client = Client::default();
+        let child = started(&mut client, request(root.path(), "wait"));
+        let process = client
+            .children
+            .get(&child.id)
+            .unwrap()
+            .child
+            .as_handle()
+            .try_clone_to_owned()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.path().join("ready").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native child did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT
+        );
+        assert_eq!(client.execute(Command::Abort { id: child.id }), Reply::Done);
+        assert!(client.children.is_empty());
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0
+        );
+        assert!(matches!(
+            client.execute(Command::Release { id: child.id }),
+            Reply::Failed { .. }
+        ));
     }
 
     #[test]

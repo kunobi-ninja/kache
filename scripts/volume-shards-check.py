@@ -94,6 +94,12 @@ def check(binary, rustc, root, mounts):
             build.mkdir()
             source = build / "lib.rs"
             source.write_text(f"pub fn value() -> u32 {{ {index + 42} }}\n")
+            # TMPDIR can be inside the checkout. Keep Cargo discovery inside
+            # this fixture instead of inheriting that enclosing workspace.
+            (build / "Cargo.toml").write_text(
+                f'[package]\nname = "shard-{index}"\nversion = "0.1.0"\n'
+                '[lib]\npath = "lib.rs"\n[workspace]\n'
+            )
             output = build / "out"
             output.mkdir()
             args = [rustc, "--crate-name", f"shard_{index}", "--crate-type", "rlib",

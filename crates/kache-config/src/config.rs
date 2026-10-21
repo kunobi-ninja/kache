@@ -482,11 +482,12 @@ pub struct Config {
     /// `<cache_dir>/out-dirs`. Must be absolute and outside the checkout.
     /// Set via `KACHE_OUT_DIR_ALIAS_ROOT` or `[cache] out_dir_alias_root`.
     pub out_dir_alias_root: Option<PathBuf>,
-    /// Store new entries without an fsync on the build path. The daemon (or
-    /// the next `kache gc`) flushes them shortly after; until then a hit on
-    /// such an entry verifies its bytes before restoring. On by default;
-    /// `KACHE_DEFERRED_DURABILITY=0` or `[cache] deferred_durability = false`
-    /// flushes every entry inside the compile that stored it.
+    /// Store new and downloaded entries without an fsync on the build path.
+    /// The daemon (or the next `kache gc`) flushes them shortly after; until
+    /// then a hit on such an entry verifies its bytes before restoring. On by
+    /// default; `KACHE_DEFERRED_DURABILITY=0` or
+    /// `[cache] deferred_durability = false` flushes every entry inside the
+    /// compile or download that stored it.
     pub deferred_durability: bool,
     /// Hand a finished cc compile's store put to the daemon so the wrapper
     /// returns as soon as the object is written (see `daemon_publish`). On

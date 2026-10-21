@@ -2124,6 +2124,68 @@ fn deferred_durability_verifies_pending_hits_until_the_flush() {
     assert!(strict.try_durability_flush_lock().unwrap().is_some());
 }
 
+/// Deferred durability covers downloaded entries too: both import paths
+/// leave the entry pending, so a hit verifies its bytes until the flush.
+/// With the feature off, an import is durable at once.
+#[test]
+fn deferred_durability_leaves_imported_entries_pending_until_the_flush() {
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+
+    let restored = "a".repeat(64);
+    write_verified_fixture(&store, &restored, &restored, "lib.rlib", None);
+    store.import_restored_entry(&restored).unwrap();
+    assert_eq!(store.pending_durability().unwrap(), 1);
+    let meta = store.get(&restored).unwrap().expect("intact import hits");
+    let blob = store.blob_path(&meta.files[0].hash);
+    let mut perms = fs::metadata(&blob).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&blob, perms).unwrap();
+    let mut bytes = fs::read(&blob).unwrap();
+    bytes[0] ^= 0xff;
+    fs::write(&blob, bytes).unwrap();
+    assert!(
+        store.get(&restored).unwrap().is_none(),
+        "a pending import whose bytes changed is evicted, not served"
+    );
+
+    let batched = "b".repeat(64);
+    let verified = write_verified_fixture(&store, &batched, &batched, "lib.rlib", None);
+    assert_eq!(
+        store.import_verified_restored_entries(&[verified]).unwrap(),
+        1
+    );
+    assert_eq!(store.pending_durability().unwrap(), 1);
+    assert_eq!(store.flush_durability(10).unwrap(), 1);
+    assert_eq!(store.pending_durability().unwrap(), 0);
+
+    config.deferred_durability = false;
+    let strict = Store::open(&config).unwrap();
+    let strict_restored = "c".repeat(64);
+    write_verified_fixture(
+        &strict,
+        &strict_restored,
+        &strict_restored,
+        "lib.rlib",
+        None,
+    );
+    strict.import_restored_entry(&strict_restored).unwrap();
+    let strict_batched = "d".repeat(64);
+    let verified =
+        write_verified_fixture(&strict, &strict_batched, &strict_batched, "lib.rlib", None);
+    assert_eq!(
+        strict
+            .import_verified_restored_entries(&[verified])
+            .unwrap(),
+        1
+    );
+    assert_eq!(strict.pending_durability().unwrap(), 0);
+}
+
 /// `Store::get` counts a hit once per stamp interval and evicts an entry
 /// whose blob is missing or has the wrong size, whatever the damage.
 #[test]

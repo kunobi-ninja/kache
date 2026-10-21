@@ -9110,6 +9110,13 @@ async fn sync_with_client(
                 String::new()
             },
         );
+        // With no daemon to flush entries pulled under deferred durability,
+        // every hit on them would re-read their blobs to verify them.
+        if !crate::transport::is_reachable(&config.socket_path())
+            && let Err(error) = store.flush_durability(usize::MAX)
+        {
+            tracing::debug!("durability flush after pull failed: {error:#}");
+        }
     }
 
     // ── Push phase ──────────────────────────────────────────────

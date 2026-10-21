@@ -2832,12 +2832,23 @@ impl Daemon {
         Response::ok()
     }
 
-    /// Flush a batch of entries stored without an fsync. Uses its own store
-    /// connection, as GC does, so a sweep of slow writes never holds the
-    /// mutex a lookup needs.
+    /// Flush a batch of entries stored without an fsync, in the main store and
+    /// in each `[cache.volumes]` shard. Uses its own store connections, as GC
+    /// does, so a sweep of slow writes never holds the mutex a lookup needs.
     fn flush_pending_durability(&self) {
+        Self::flush_store_durability(&self.config);
+        for shard in &self.config.volume_stores {
+            // Opening a shard without an index would create it on a volume
+            // that may not be mounted.
+            if crate::volume_gc::shard_has_index(&shard.store) {
+                Self::flush_store_durability(&self.config.for_volume_store(shard, |_| None));
+            }
+        }
+    }
+
+    fn flush_store_durability(config: &Config) {
         let flushed = (|| -> Result<usize> {
-            let store = Store::open(&self.config)?;
+            let store = Store::open(config)?;
             if store.pending_durability()? == 0 {
                 return Ok(0);
             }
@@ -6591,7 +6602,8 @@ async fn server_main(
         }
     });
 
-    // Entries a miss stored without an fsync (`cache.deferred_durability`).
+    // Entries a miss or a download stored without an fsync
+    // (`cache.deferred_durability`).
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.

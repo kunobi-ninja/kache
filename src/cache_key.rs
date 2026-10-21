@@ -2834,15 +2834,16 @@ fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>)
     rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
 }
 
-/// The flight two processes discovering the same unit share. With
-/// predictions on it is the record identity where one applies, so the
-/// waiter can read what the owner publishes. Otherwise the same identity
-/// is only a name for the unit: the waiter finds the owner's entry in the
-/// store instead. A unit with a proc-macro dependency gets that name too;
-/// its record needs the crate-tree guard, but a flight is only a lock, and
-/// compiling before keying never reads a record.
+/// Wait under the portable workspace record's identity when one applies,
+/// so another checkout can read the record the owner publishes. Registry
+/// and standalone units retain their shared-target or local identities.
+/// This only coordinates discovery: every waiter validates its own inputs
+/// and computes its complete cache key before restoring anything.
 fn discovery_flight_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
-    prediction_discovery_identity(args, file_hasher)
+    let vars: Vec<_> = std::env::vars_os().collect();
+    workspace_roots(args, &vars)
+        .and_then(|workspace| workspace_prediction_identity(args, vars, &workspace))
+        .or_else(|| prediction_discovery_identity(args, file_hasher))
         .or_else(|| rustc_shared_prediction_identity(args))
         .or_else(|| rustc_prediction_identity(args))
 }

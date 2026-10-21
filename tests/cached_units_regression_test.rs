@@ -330,6 +330,84 @@ fn concurrent_jobs_share_one_store_without_repeating_a_compile() {
     assert_eq!(results_for(&events, "build_script_run"), vec!["local_hit"]);
 }
 
+/// Independent checkouts must share cold compiles, including workspace
+/// units that expand proc macros and binaries that invoke the linker.
+#[test]
+fn concurrent_checkouts_compile_each_cache_key_once() {
+    concurrent_checkout_builds(false);
+}
+
+#[test]
+fn concurrent_checkouts_keep_changed_sources_separate() {
+    concurrent_checkout_builds(true);
+}
+
+fn concurrent_checkout_builds(changed_source: bool) {
+    let fx = fixture();
+    let second = TempDir::new().unwrap();
+    write_workspace(second.path());
+    let workspaces = [fx.workspace.as_path(), second.path()];
+    for (index, workspace) in workspaces.into_iter().enumerate() {
+        let extra = usize::from(changed_source) * index;
+        std::fs::write(
+            workspace.join("app/src/main.rs"),
+            format!("fn main() {{ println!(\"{{}}\", app::answer() + {extra}); }}\n"),
+        )
+        .unwrap();
+        let status = Command::new(env!("CARGO"))
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        common::settle_writes(&[workspace]);
+    }
+    let targets = [
+        target(&fx, "first-checkout"),
+        target(&fx, "second-checkout"),
+    ];
+    let mark = event_count(&fx.cache);
+    let children: Vec<_> = workspaces
+        .into_iter()
+        .zip(&targets)
+        .map(|(workspace, target)| {
+            cargo("build", workspace, &fx.home, &fx.cache, target, &[])
+                .args(["--offline", "--locked"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "cargo build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let events = events_since(&fx.cache, mark);
+    let mut runs = std::collections::BTreeMap::new();
+    for event in &events {
+        let key = field(event, "cache_key");
+        if !key.is_empty() {
+            *runs.entry(key).or_insert(0) += number(event, "compiler_runs");
+        }
+    }
+    assert!(runs.values().any(|runs| *runs == 1), "{events:?}");
+    assert!(
+        runs.values().all(|runs| *runs <= 1),
+        "checkouts repeated a compile for the same key: {runs:?}\n{events:?}"
+    );
+    for (index, target) in targets.iter().enumerate() {
+        let output = Command::new(target.join("debug/app")).output().unwrap();
+        assert!(output.status.success());
+        let expected = (47 + usize::from(changed_source) * index).to_string();
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
+}
+
 /// A miss with no closure record and no remote keys from the compile's own
 /// dep-info instead of a pre-pass; the record it leaves lets the next fresh
 /// target directory hit, and a module edit produces a new key.

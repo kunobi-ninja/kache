@@ -4085,6 +4085,47 @@ fn a_workspace_identity_is_the_same_in_every_checkout_and_per_unit() {
 }
 
 #[test]
+fn workspace_discovery_flights_follow_the_portable_record_identity() {
+    let mut lock = key_test_lock();
+    let base = lock.enter();
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let hasher = FileHasher::new();
+    for with_macro in [false, true] {
+        let identity = |name: &str, crate_name: &str| {
+            let (root, args) = workspace_invocation(&base, name, crate_name);
+            let args = if with_macro {
+                let mut argv = vec!["rustc".to_string()];
+                argv.extend(args.all_args);
+                argv.extend([
+                    "--extern".to_string(),
+                    format!("pm={}", root.join("target/debug/deps/libpm.so").display()),
+                ]);
+                RustcArgs::parse(&argv).unwrap()
+            } else {
+                args
+            };
+            std::env::set_current_dir(&root).unwrap();
+            let manifest = root.join("kt");
+            let _manifest = crate::config::tests::set_env_for_test(
+                "CARGO_MANIFEST_DIR",
+                Some(manifest.as_os_str()),
+            );
+            let vars: Vec<_> = std::env::vars_os().collect();
+            let workspace = workspace_roots(&args, &vars).unwrap();
+            let portable = workspace_prediction_identity(&args, vars, &workspace).unwrap();
+            let flight = discovery_flight_identity(&args, &hasher).unwrap();
+            assert_eq!(flight, portable, "a peer must wait for the row it can read");
+            let on = FileHasher::new().with_input_predictions(true);
+            assert_eq!(discovery_flight_identity(&args, &on), Some(flight.clone()));
+            flight
+        };
+        let first = identity("first", "kt");
+        assert_eq!(first, identity("second", "kt"));
+        assert_ne!(first, identity("other", "other"));
+    }
+}
+
+#[test]
 fn a_remote_row_is_kept_only_once_it_checks_out() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");

@@ -358,8 +358,11 @@ struct SourceRecord {
 /// Crate inputs in a stable order.
 ///
 /// `mod name;` and `#[path = "rel"] mod name;` are followed even when a `cfg`
-/// would drop them. A `mod` inside an inline `mod name { ... }` is resolved
-/// under that name. A missing file is skipped. A file that exists but cannot
+/// would drop them. An implicit `foo.rs` module resolves children under
+/// `foo/`; `mod.rs`, crate roots and explicit paths keep their directory.
+/// A `mod` inside an inline `mod name { ... }` is resolved under that name.
+/// A file loaded in both implicit and explicit roles is scanned in both
+/// contexts but enters the key once. A missing file is skipped. A file that exists but cannot
 /// be read is an error, and the invocation is not cached. `include!`,
 /// `include_str!`, and `include_bytes!` count only with a string literal;
 /// anything else is an error. Dep-info is not read here.
@@ -389,7 +392,7 @@ fn collect_source(
     crate_dir: &Path,
     required: bool,
     module_file: bool,
-    seen: &mut BTreeSet<PathBuf>,
+    seen: &mut BTreeSet<(PathBuf, bool)>,
     out: &mut Vec<SourceRecord>,
 ) -> Result<()> {
     collect_source_for(
@@ -408,12 +411,15 @@ fn collect_source_for(
     crate_dir: &Path,
     required: bool,
     module_file: bool,
-    seen: &mut BTreeSet<PathBuf>,
+    seen: &mut BTreeSet<(PathBuf, bool)>,
     out: &mut Vec<SourceRecord>,
     env: &InvocationEnv,
 ) -> Result<()> {
     let absolute = lexical_absolute_for(path, env)?;
-    if !seen.insert(absolute.clone()) {
+    // The same file can be both `mod foo;` and `#[path = "foo.rs"] mod alias;`.
+    // Their children have different roots, so cycle detection needs the role.
+    let first_visit = !seen.contains(&(absolute.clone(), !module_file));
+    if !seen.insert((absolute.clone(), module_file)) {
         return Ok(());
     }
     match std::fs::metadata(&absolute) {
@@ -436,11 +442,13 @@ fn collect_source_for(
     }
     let bytes = std::fs::read(&absolute)
         .with_context(|| format!("reading {} for the rustdoc cache key", absolute.display()))?;
-    let relative = relative_label(crate_dir, &absolute);
-    out.push(SourceRecord {
-        relative,
-        paths: vec![absolute.to_string_lossy().into_owned()],
-    });
+    if first_visit {
+        let relative = relative_label(crate_dir, &absolute);
+        out.push(SourceRecord {
+            relative,
+            paths: vec![absolute.to_string_lossy().into_owned()],
+        });
+    }
     let parent = absolute.parent().unwrap_or(Path::new(""));
     // An implicit foo.rs module owns foo/ for children; explicit paths keep the parent.
     let module_dir = if module_file && absolute.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
@@ -2514,6 +2522,99 @@ mod tests {
                 "note.txt",
                 "renamed.rs"
             ]
+        );
+    }
+
+    #[test]
+    fn one_source_in_implicit_and_explicit_modules_keys_both_child_roots() {
+        for root_source in [
+            "mod foo; #[path = \"foo.rs\"] mod alias;\n",
+            "#[path = \"foo.rs\"] mod alias; mod foo;\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir(root.join("foo")).unwrap();
+            let lib = root.join("lib.rs");
+            std::fs::write(&lib, root_source).unwrap();
+            std::fs::write(root.join("foo.rs"), "mod child;\n").unwrap();
+            for child in ["child.rs", "foo/child.rs"] {
+                std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+            }
+            let records = source_records(std::slice::from_ref(&lib)).unwrap();
+            let names: Vec<_> = records
+                .iter()
+                .map(|record| record.relative.as_str())
+                .collect();
+            assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
+            let parsed = parse(&[
+                "rustdoc",
+                "--merge=none",
+                "--crate-name=roles",
+                &lib.to_string_lossy(),
+                "-o",
+                "/out",
+                "--parts-out-dir",
+                "/parts",
+            ]);
+            let original = cache_key_with(&parsed, "v", None).unwrap();
+            for child in ["child.rs", "foo/child.rs"] {
+                std::fs::write(root.join(child), "pub fn changed() {}\n").unwrap();
+                assert_ne!(
+                    original,
+                    cache_key_with(&parsed, "v", None).unwrap(),
+                    "{root_source:?} omitted {child}",
+                );
+                std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+                assert_eq!(original, cache_key_with(&parsed, "v", None).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn role_aware_visits_terminate_alias_cycles_without_duplicate_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "#[path = \"foo.rs\"] mod cycle; mod child;\n",
+        )
+        .unwrap();
+        for child in ["child.rs", "foo/child.rs"] {
+            std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+        }
+        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn implicit_modules_keep_inline_children_and_mod_rs_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/inline/leaf")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo.rs"), "mod inline { mod leaf; }\n").unwrap();
+        std::fs::write(root.join("foo/inline/leaf/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/inline/leaf/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")]).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "foo.rs",
+                "foo/inline/leaf/child.rs",
+                "foo/inline/leaf/mod.rs",
+                "lib.rs",
+            ],
         );
     }
 

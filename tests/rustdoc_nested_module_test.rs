@@ -22,12 +22,7 @@ fn explicit_path_module_child_edits_refresh_docs_and_keep_warm_reuse() {
 
 fn assert_doc_edit_refreshes(root_source: &str, module_file: &str, child_file: &str) {
     build_kache();
-    let temp_root = if cfg!(target_os = "macos") {
-        "/private/tmp".into()
-    } else {
-        std::env::temp_dir()
-    };
-    let fixture = tempfile::tempdir_in(temp_root).unwrap();
+    let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
     let cache = project.join("cache");
     let home = project.join("home");

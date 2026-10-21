@@ -684,10 +684,80 @@ impl AdaptiveUnit {
         if !valid_state(state, &self.unit_key) || unsafe_file(&self.state_path) {
             return false;
         }
+        #[cfg(unix)]
+        if durable && state.in_flight && self.publish_in_flight_record() {
+            return true;
+        }
         let Ok(bytes) = serde_json::to_vec(state) else {
             return false;
         };
-        crate::atomic::atomic_replace_deferrable(&self.state_path, &bytes, durable).is_ok()
+        let stored =
+            crate::atomic::atomic_replace_deferrable(&self.state_path, &bytes, durable).is_ok();
+        #[cfg(unix)]
+        if !state.in_flight {
+            let _ = self.prepare_in_flight_record();
+        }
+        stored
+    }
+
+    /// Prepare immutable marker bytes while recording an ordinary build.
+    /// Publishing another link then needs only a directory flush. A live
+    /// lease retains its observation and counters in Completion; recovery
+    /// discards any in-flight graph before consulting those fields.
+    #[cfg(unix)]
+    fn prepare_in_flight_record(&self) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = self.unit_dir.join("in-flight.json");
+        let bytes = serde_json::to_vec(&self.in_flight_marker()).ok()?;
+        if fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            let _ = crate::atomic::atomic_write_and_replace_with(
+                &path,
+                true,
+                |stage| {
+                    fs::write(stage, &bytes)?;
+                    fs::set_permissions(stage, fs::Permissions::from_mode(0o400))?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+        }
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file()
+            || !metadata.permissions().readonly()
+            || metadata.len() != bytes.len() as u64
+        {
+            return None;
+        }
+        if fs::read(&path).ok()? != bytes {
+            return None;
+        }
+        Some(path)
+    }
+
+    #[cfg(unix)]
+    fn publish_in_flight_record(&self) -> bool {
+        let Some(source) = self.prepare_in_flight_record() else {
+            return false;
+        };
+        let Ok(stage) = tempfile::Builder::new()
+            .prefix("in-flight-")
+            .tempdir_in(&self.unit_dir)
+        else {
+            return false;
+        };
+        let linked = stage.path().join("state.json");
+        if fs::hard_link(source, &linked).is_err() {
+            return false;
+        }
+        if fs::rename(linked, &self.state_path).is_err() {
+            return false;
+        }
+        // Marker data was flushed when created. The new state.json entry
+        // must be durable before the caller starts rustc or removes a graph.
+        crate::atomic::fsync_dir(&self.unit_dir).is_ok()
     }
 
     /// The state every lease resets, written before private rustc state is
@@ -1199,7 +1269,12 @@ mod tests {
     }
 
     fn write_state(unit: &AdaptiveUnit, state: &DiskState) {
-        fs::write(&unit.state_path, serde_json::to_vec(state).unwrap()).unwrap();
+        crate::atomic::atomic_replace_deferrable(
+            &unit.state_path,
+            &serde_json::to_vec(state).unwrap(),
+            false,
+        )
+        .unwrap();
     }
 
     fn activate(unit: &AdaptiveUnit, at: u64) {
@@ -1213,6 +1288,123 @@ mod tests {
             .unwrap();
         fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
         assert!(lease.finish_at(CompileOutcome::Success, at + 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leases_reuse_prepared_in_flight_bytes_and_keep_completions_private() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let record = unit.unit_dir.join("in-flight.json");
+        let metadata = fs::metadata(&record).unwrap();
+        assert!(metadata.permissions().readonly());
+        let inode = metadata.ino();
+        let bytes = fs::read(&record).unwrap();
+        let lease = unit
+            .try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                101,
+            )
+            .unwrap();
+        assert_eq!(fs::metadata(&unit.state_path).unwrap().ino(), inode);
+        assert!(read_state(&unit).in_flight);
+        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        assert_ne!(fs::metadata(&unit.state_path).unwrap().ino(), inode);
+        for at in [103, 105] {
+            let lease = unit.try_active_at(at).unwrap();
+            assert_eq!(fs::metadata(&unit.state_path).unwrap().ino(), inode);
+            assert!(lease.finish_at(CompileOutcome::Success, at + 1));
+        }
+        assert_eq!(fs::read(record).unwrap(), bytes);
+        let completed = read_state(&unit);
+        assert!(!completed.in_flight);
+        assert_eq!(completed.phase, Phase::Active);
+        assert_eq!(completed.active_leases, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_in_flight_records_keep_the_original_durable_write_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for defect in ["directory", "symlink", "writable", "size", "content"] {
+            let (temp, _args, unit) = fixture();
+            teach(&unit, 100);
+            let record = unit.unit_dir.join("in-flight.json");
+            let valid = fs::read(&record).unwrap();
+            fs::remove_file(&record).unwrap();
+            let foreign = temp.path().join("foreign.json");
+            fs::write(&foreign, &valid).unwrap();
+            match defect {
+                "directory" => fs::create_dir(&record).unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&foreign, &record).unwrap(),
+                _ => {
+                    let mut bytes = valid.clone();
+                    if defect == "size" {
+                        bytes.push(b' ');
+                    }
+                    if defect == "content" {
+                        bytes[0] = b'x';
+                    }
+                    fs::write(&record, bytes).unwrap();
+                    fs::set_permissions(
+                        &record,
+                        fs::Permissions::from_mode(if defect == "writable" {
+                            0o600
+                        } else {
+                            0o400
+                        }),
+                    )
+                    .unwrap();
+                }
+            }
+            let lease = unit
+                .try_seed_at(
+                    &cache_key("second"),
+                    &fields("stable", "source-b", "extern-a"),
+                    101,
+                )
+                .unwrap();
+            let state = read_state(&unit);
+            assert!(state.in_flight, "{defect}");
+            assert_eq!(state.phase, Phase::Seed, "{defect}");
+            assert!(state.observation.is_some(), "{defect}");
+            assert_eq!(fs::read(foreign).unwrap(), valid);
+            assert!(lease.finish_at(CompileOutcome::CompileError, 102));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_directory_flush_falls_back_to_flushing_the_full_record() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let record = unit.unit_dir.join("in-flight.json");
+        let inode = fs::metadata(record).unwrap().ino();
+        // Write/search permit linking and renaming; read is needed to open
+        // the directory for its flush. Restore access before any assertion.
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let lease = unit.try_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-b", "extern-a"),
+            101,
+        );
+        fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = lease.unwrap();
+        assert_ne!(fs::metadata(&unit.state_path).unwrap().ino(), inode);
+        let state = read_state(&unit);
+        assert_eq!(state.phase, Phase::Seed);
+        assert!(state.in_flight);
+        assert!(lease.finish_at(CompileOutcome::CompileError, 102));
     }
 
     #[test]
@@ -1230,9 +1422,14 @@ mod tests {
         assert!(real_directory(&unit.rustc_dir));
         assert_eq!(fs::read_dir(&unit.rustc_dir).unwrap().count(), 0);
         let busy = read_state(&unit);
-        assert_eq!(busy.phase, Phase::Learning);
         assert!(busy.in_flight);
-        assert_eq!(busy.observation.unwrap().cache_key, cache_key("first"));
+        let Completion::DeferredSeed { previous } = &lease.completion else {
+            panic!("expected deferred seed");
+        };
+        assert_eq!(
+            previous.observation.as_ref().unwrap().cache_key,
+            cache_key("first")
+        );
         let rewritten = lease.compiler_args(&args);
         assert!(rewritten.contains(&format!("incremental={}", unit.rustc_dir.display())));
         assert_eq!(
@@ -1399,11 +1596,10 @@ mod tests {
             102,
         ));
         let seed = read_state(&unit);
-        assert_eq!(seed.phase, Phase::Seed);
         assert!(seed.in_flight);
-        assert_eq!(seed.active_leases, 0);
-        assert_eq!(seed.last_used_secs, 102);
-        let observation = seed.observation.unwrap();
+        let Completion::Seed { observation, .. } = &lease.completion else {
+            panic!("expected qualified seed");
+        };
         assert_eq!(observation.cache_key, cache_key("second"));
         assert_eq!(observation.at_secs, 102);
         assert!(matches!(lease.completion, Completion::Seed { .. }));
@@ -2172,8 +2368,11 @@ mod tests {
         let active = unit.try_active_at(122).unwrap();
         assert_eq!(active.kind(), LeaseKind::Active);
         let busy = read_state(&unit);
-        assert_eq!(busy.active_leases, 1);
         assert!(busy.in_flight);
+        let Completion::Active { state } = &active.completion else {
+            panic!("expected active lease");
+        };
+        assert_eq!(state.active_leases, 1);
         assert!(active.finish_at(CompileOutcome::Success, 123));
     }
 

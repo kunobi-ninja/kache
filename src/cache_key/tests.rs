@@ -12222,7 +12222,7 @@ fn runtime_env_use_scan_rejects_content_changed_after_hashing() {
 }
 
 #[test]
-fn env_use_scan_treats_non_utf8_data_as_unused() {
+fn env_use_scan_retains_non_utf8_runtime_value_veto() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("blob.bin");
     std::fs::write(&blob, b"\xff pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
@@ -12237,7 +12237,7 @@ fn env_use_scan_treats_non_utf8_data_as_unused() {
     let hasher = FileHasher::new();
     assert_eq!(
         hasher.env_dep_use(&blob, "OUT_DIR").unwrap(),
-        SourceEnvDepUse::Unused
+        SourceEnvDepUse::RuntimeValue
     );
     assert_eq!(
         hasher.env_dep_use(&bom, "OUT_DIR").unwrap(),
@@ -12268,7 +12268,7 @@ fn non_utf8_env_scan_replaces_version_five_memos() {
 
     let cache = FileHashCache::open(&db).unwrap();
     assert_eq!(
-        cache.get_source_env_dep_use(&hash, "OUT_DIR", 6).unwrap(),
+        cache.get_source_env_dep_use(&hash, "OUT_DIR", 7).unwrap(),
         Some(SourceEnvDepUse::Unused.memo_code())
     );
     drop(cache);
@@ -12284,7 +12284,33 @@ fn non_utf8_env_scan_replaces_version_five_memos() {
 }
 
 #[test]
-fn non_utf8_files_neither_supply_nor_veto_include_proof() {
+fn non_utf8_runtime_use_rescans_version_six_unused_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("template.bin");
+    std::fs::write(&source, b"//\xff\npub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    let hash = hash_file(&source).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(&hash, "OUT_DIR", 6, SourceEnvDepUse::Unused.memo_code())
+        .unwrap();
+    drop(cache);
+    let hasher = FileHasher::persistent(&db);
+    assert_eq!(
+        hasher.env_dep_use(&source, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::RuntimeValue,
+        "the binary-skip scanner's version-six answer must be rescanned"
+    );
+    drop(hasher);
+    let cache = FileHashCache::open(&db).unwrap();
+    assert_eq!(
+        cache.get_source_env_dep_use(&hash, "OUT_DIR", 7).unwrap(),
+        Some(SourceEnvDepUse::RuntimeValue.memo_code())
+    );
+}
+
+#[test]
+fn non_utf8_files_cannot_supply_proof_but_retain_runtime_vetoes() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"include_bytes!(env!(\"OUT_DIR\"));").unwrap();
@@ -12294,6 +12320,8 @@ fn non_utf8_files_neither_supply_nor_veto_include_proof() {
     std::fs::write(&binary_value, b"\xff pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
     let text_value = dir.path().join("text.bin");
     std::fs::write(&text_value, b"pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    let unused = dir.path().join("unused.bin");
+    std::fs::write(&unused, b"\xff\x00payload").unwrap();
     let hasher = FileHasher::new();
 
     assert_eq!(
@@ -12301,12 +12329,128 @@ fn non_utf8_files_neither_supply_nor_veto_include_proof() {
         EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
     );
     assert_eq!(
-        env_dep_source_decision("OUT_DIR", &[source.clone(), binary_value], &hasher),
+        env_dep_source_decision("OUT_DIR", &[source.clone(), unused], &hasher),
         EnvDepNormalizationDecision::NormalizedPathOnly
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source.clone(), binary_value], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
     );
     assert_eq!(
         env_dep_source_decision("OUT_DIR", &[source, text_value], &hasher),
         EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+    );
+}
+
+#[test]
+fn non_utf8_env_names_and_prefixes_are_unknown_runtime_uses() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("template.bin");
+    for source in [
+        b"//\xff\nenv!(\"OUT_\xffDIR\");".as_slice(),
+        b"//\xff\noption_env!(\"OUT_\xc2\x85\xffDIR\");",
+        b"//\xff\nenv!(concat!(\"OTHER_\xff\", \"VALUE\"));",
+    ] {
+        std::fs::write(&blob, source).unwrap();
+        assert_eq!(
+            FileHasher::new().env_dep_use(&blob, "OUT_DIR").unwrap(),
+            SourceEnvDepUse::RuntimeValue,
+            "an invalid literal cannot exclude the requested variable"
+        );
+    }
+}
+
+#[test]
+fn byte_env_scan_matches_lossy_char_boundaries() {
+    let characters: &[&[u8]] = &[
+        b"a",
+        "é".as_bytes(),
+        "中".as_bytes(),
+        "🦀".as_bytes(),
+        b"\xff",
+        b"\xe2\x82",
+        b"\xf0\x9f\xa6",
+    ];
+    for character in characters {
+        for (tail, expected) in [
+            (
+                b"'; const S: &str = \"env!(\\\"OUT_DIR\\\")\";".as_slice(),
+                SourceEnvDepUse::Unused,
+            ),
+            (
+                b"'\xff; const S: &str = \"env!(\\\"OUT_DIR\\\")\";",
+                SourceEnvDepUse::Unused,
+            ),
+            (b"'; env!(\"OUT_DIR\");", SourceEnvDepUse::RuntimeValue),
+        ] {
+            let source = [b"'".as_slice(), *character, tail].concat();
+            assert_eq!(
+                source_env_dep_use_bytes(&source, "OUT_DIR"),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_utf8_concat_binding_veto_survives_without_include_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = dir.path().join("binding.rs");
+    let include = dir.path().join("lib.rs");
+    std::fs::write(
+        &include,
+        b"include_bytes!(env!(\"OUT_DIR\")); env!(concat!(\"OTHER_\", \"VALUE\"));",
+    )
+    .unwrap();
+    for declaration in [
+        "use custom::*;",
+        "use custom::concat;",
+        "#[macro_use] extern crate custom;",
+    ] {
+        std::fs::write(
+            &binding,
+            [
+                b"//\xff\n".as_slice(),
+                declaration.as_bytes(),
+                b" include_bytes!(env!(\"OUT_DIR\"));",
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let hasher = FileHasher::new();
+        assert_eq!(
+            hasher.env_dep_use(&binding, "OUT_DIR").unwrap(),
+            SourceEnvDepUse::ConcatBinding {
+                include_locator: false
+            }
+        );
+        assert_eq!(
+            env_dep_source_decision("OUT_DIR", &[binding.clone(), include.clone()], &hasher),
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+        );
+    }
+}
+
+#[test]
+fn non_utf8_concat_prefix_does_not_supply_include_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("template.rs");
+    std::fs::write(
+        &source,
+        b"//\xff\ninclude_bytes!(env!(\"OUT_DIR\")); env!(concat!(\"OTHER_\", \"VALUE\"));",
+    )
+    .unwrap();
+    let hasher = FileHasher::new();
+    assert_eq!(
+        hasher.env_dep_use(&source, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: false
+        }
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
     );
 }
 
@@ -17813,4 +17957,26 @@ fn concurrent_key_env_snapshots_do_not_use_the_servers_values() {
         );
         assert!(key_env_guard_in(&patterns, env).is_some());
     }
+}
+
+#[test]
+fn non_utf8_proc_macro_template_keeps_runtime_env_absolute() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(
+        &source,
+        b"decoder::decode!(); const _: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/payload.bin\"));",
+    )
+    .unwrap();
+    let template = dir.path().join("template.bin");
+    std::fs::write(
+        &template,
+        b"//\xff\npub const OUT_VALUE: &str = env!(\"OUT_DIR\");\n",
+    )
+    .unwrap();
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source, template], &FileHasher::new()),
+        EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse,
+        "the prepared compiler control checks that the tracked template emits an env value"
+    );
 }

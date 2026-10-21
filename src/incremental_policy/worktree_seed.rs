@@ -406,7 +406,14 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
                     Some("bin" | "o" | "obj" | "bc")
                 );
             if !immutable || fs::hard_link(&path, &target).is_err() {
-                fs::copy(path, target)?;
+                // Never overwrite a stage file that might already link to a donor.
+                let mut input = File::open(path)?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(target)?;
+                io::copy(&mut input, &mut output)?;
+                output.set_permissions(meta.permissions())?;
             }
         } else {
             return Err(io::Error::other("non-regular incremental entry"));
@@ -902,6 +909,27 @@ mod tests {
         copy_tree(&source, other.path(), &mut budget, 2).unwrap();
         fs::write(other.path().join("dep-graph.bin"), b"receiver").unwrap();
         assert_eq!(fs::read(source.join("dep-graph.bin")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn an_existing_stage_file_cannot_overwrite_a_linked_donor() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("s-123-456-abcdef");
+        let dest = temp.path().join("receiver");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("dep-graph.bin"), b"receiver").unwrap();
+        let donor = temp.path().join("donor.bin");
+        fs::write(&donor, b"original").unwrap();
+        fs::hard_link(&donor, dest.join("dep-graph.bin")).unwrap();
+        let mut budget = CopyBudget { files: 1, bytes: 8 };
+        assert_eq!(
+            copy_tree(&source, &dest, &mut budget, 2)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(donor).unwrap(), b"original");
     }
 
     #[cfg(unix)]

@@ -274,7 +274,12 @@ def job_environment(
     elif backend == "mbx":
         for key in ("RUSTC_WRAPPER", "HOST_CC", "HOST_CXX"):
             env.pop(key, None)
-        env.update(MBX_CACHE_DIR=str(store), MBX_SCHEDULER="1", MBX_SUMMARY="full")
+        env.update(
+            MBX_CACHE_DIR=str(store),
+            MBX_SCHEDULER="1",
+            MBX_SUMMARY="full",
+            MBX_SHARE_WORKSPACE_ROOT="1",
+        )
     return env
 
 

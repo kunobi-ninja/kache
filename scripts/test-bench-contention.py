@@ -561,7 +561,12 @@ else:
         )
         repos = [Path("/one"), Path("/two")]
         with patch.dict(
-            os.environ, {"SCCACHE_BUCKET": "unwanted-remote", "MBX_CACHE_DIR": "/stale"}
+            os.environ,
+            {
+                "SCCACHE_BUCKET": "unwanted-remote",
+                "MBX_CACHE_DIR": "/stale",
+                "MBX_SHARE_WORKSPACE_ROOT": "0",
+            },
         ):
             env = bench.job_environment(
                 args,
@@ -591,6 +596,7 @@ else:
             self.assertNotIn("RUSTC_WRAPPER", env)
             self.assertNotIn("HOST_CC", env)
             self.assertEqual(env["CARGO_TARGET_DIR"], "/one/target")
+            self.assertEqual(env["MBX_SHARE_WORKSPACE_ROOT"], "1")
         counts = bench.external_counts(
             "mbx", [{"hits": 3, "misses": 2}, {"hits": 4, "misses": 1}]
         )

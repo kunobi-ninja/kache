@@ -6451,7 +6451,7 @@ fn adaptive_compile_before_key(
             Err(_) => true,
         }
     };
-    let portable = RustcCompiler::new()
+    let portable = RustcCompiler::new_for(ctx.args.invocation_env())
         .with_base_dirs(ctx.config.base_dirs.clone())
         .with_incremental_bootstrap(bootstrap.get());
     let mut executed = if !ready {
@@ -8256,9 +8256,9 @@ fn prepare_worktree_compiler_args(
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
     config.seed_incremental
         && args.inner_rustc.is_none()
-        && crate::cache_key::rustc_version_text(&args.rustc).is_some_and(|version| {
-            crate::incremental_policy::compiler_supports_automatic_seed(&version)
-        })
+        && crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).is_some_and(
+            |version| crate::incremental_policy::compiler_supports_automatic_seed(&version),
+        )
 }
 
 fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> {
@@ -8271,20 +8271,21 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
     let Ok(suffix) = profile.strip_prefix(&target) else {
         return Vec::new();
     };
-    let routed = config.routed_for_path(&volume_route_path_rustc(args));
+    let routed = config.routed_for_path_for(&volume_route_path_rustc(args), args.invocation_env());
     let Ok(store) = Store::open(&routed) else {
         return Vec::new();
     };
     if let Some(workspace) = args.path_normalization_root()
         && owns_its_target(
             workspace,
-            crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
+            crate::build_script_inputs::cargo_home(&|name| args.invocation_env().var_os(name))
+                .as_deref(),
         )
     {
         let _ = store.remember_target_root_built_by(
             &target,
             workspace,
-            crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
+            crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).as_deref(),
         );
     }
     let Ok(targets) = store.tracked_target_roots(0) else {
@@ -8359,7 +8360,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             );
         }
         compiler_args = lease.compiler_args(args);
-        compiler = RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
+        compiler =
+            RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
     }
     let mut compile =
         if kind == crate::incremental_policy::LeaseKind::Immediate || lease.worktree_portable() {
@@ -8391,7 +8393,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             );
         }
         compiler_args = lease.compiler_args(args);
-        let native = RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
+        let native =
+            RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
         compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
             native.execute_passthrough_preserving_incremental(args, &compiler_args)
         } else {

@@ -955,6 +955,7 @@ pub struct CacheFileConfig {
     pub clean_incremental: Option<bool>,
     pub preserve_incremental: Option<bool>,
     pub adaptive_incremental: Option<bool>,
+    pub seed_incremental: Option<bool>,
     pub incremental_seed_from: Option<String>,
     pub unstable: Option<bool>,
     pub exclude: Option<Vec<String>>,
@@ -5004,6 +5005,7 @@ pull_request_prefix = "pr/42"
             &[
                 ("KACHE_HOST_CONFIG", ""),
                 ("KACHE_KEY_SALT", "first"),
+                ("KACHE_SEED_INCREMENTAL", "false"),
                 ("KACHE_TRUST_DOMAIN", "one"),
                 ("SKIP", "1"),
                 ("GITHUB_ACTIONS", "true"),
@@ -5026,6 +5028,8 @@ pull_request_prefix = "pr/42"
         assert_eq!(b.readonly_store, Some(second.path().join("home/read")));
         assert_eq!(a.incremental_seed_from, Some(first.path().join("seed")));
         assert_eq!(a.key_salt.as_deref(), Some("first"));
+        assert!(!a.seed_incremental);
+        assert!(b.seed_incremental);
         assert_eq!(b.key_salt.as_deref(), Some("second"));
         assert_eq!(a.max_size, 1 << 30);
         assert_eq!(a.auto_recover_min_free_bytes, 0);

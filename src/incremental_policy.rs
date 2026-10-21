@@ -260,13 +260,10 @@ impl AdaptiveUnit {
         let unit_key = unit_key(args, original_incremental, policy_guard);
         let unit_dir = profile.join(AUTO_ROOT).join(POLICY_VERSION).join(&unit_key);
         Some(Self {
-            source_file: args.source_file.as_ref().and_then(|path| {
-                if path.is_absolute() {
-                    Some(path.clone())
-                } else {
-                    std::env::current_dir().ok().map(|cwd| cwd.join(path))
-                }
-            }),
+            source_file: args
+                .source_file
+                .as_ref()
+                .and_then(|path| args.invocation_env().resolve(path)),
             original_incremental: original_incremental.clone(),
             policy_guard: policy_guard.to_vec(),
             state_path: unit_dir.join("state.json"),
@@ -1288,6 +1285,25 @@ mod tests {
             .unwrap();
         fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
         assert!(lease.finish_at(CompileOutcome::Success, at + 2));
+    }
+
+    #[test]
+    fn primary_source_uses_the_invocation_directory() {
+        let (temp, args, _) = fixture();
+        let argv: Vec<_> = std::iter::once(args.rustc.to_string_lossy().into_owned())
+            .chain(args.all_args.clone())
+            .collect();
+        for cwd in [Some(temp.path().to_owned()), None] {
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [("CARGO_PRIMARY_PACKAGE", "1")],
+                cwd.clone(),
+                None,
+                temp.path().to_owned(),
+            );
+            let parsed = RustcArgs::parse_for(&argv, &env).unwrap();
+            let unit = AdaptiveUnit::eligible(&parsed, b"").unwrap();
+            assert_eq!(unit.source_file, cwd.map(|path| path.join("src/lib.rs")));
+        }
     }
 
     #[cfg(unix)]

@@ -140,7 +140,10 @@ fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool, librar
         .env("KACHE_PRESERVE_INCREMENTAL", "0")
         .env("KACHE_LOCAL_ONLY", "1")
         .env("KACHE_CACHE_EXECUTABLES", "1")
-        .env("KACHE_VERIFY_INPUT_PREDICTIONS", "always")
+        .env(
+            "KACHE_VERIFY_INPUT_PREDICTIONS",
+            if library { "off" } else { "always" },
+        )
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
         .env_remove("KACHE_FALLBACK")
@@ -153,6 +156,7 @@ fn automatic_build(root: &Path, cache: &Path, enabled: bool, force: bool, librar
         .env("RUSTFLAGS", "");
     if library {
         command.arg("--lib");
+        command.env("KACHE_LOG", "kache=trace");
     }
     if enabled {
         command.env_remove("KACHE_SEED_INCREMENTAL");
@@ -328,10 +332,21 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
     project(&root, 0);
+    let mut last_stderr = String::new();
     for answer in [0, 1] {
-        fs::write(root.join("src/lib.rs"), format!(
-            "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\npub fn answer() -> u64 {{ {answer} }}\n"
-        )).unwrap();
+        if answer == 1 {
+            fs::write(root.join("src/added.rs"), "pub fn value() -> u64 { 1 }\n").unwrap();
+        }
+        let body = if answer == 0 {
+            "pub fn answer() -> u64 { 0 }"
+        } else {
+            "mod added; pub fn answer() -> u64 { added::value() }"
+        };
+        fs::write(
+            root.join("src/lib.rs"),
+            format!("const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\n{body}\n"),
+        )
+        .unwrap();
         let output = automatic_build(&root, &cache, true, false, true);
         assert!(
             output.status.success(),
@@ -339,7 +354,12 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!String::from_utf8_lossy(&output.stderr).contains("E0080"));
+        last_stderr = String::from_utf8(output.stderr).unwrap();
     }
+    assert!(
+        last_stderr.contains("inputs=compile-while-keying"),
+        "{last_stderr}"
+    );
     let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
         .unwrap()
         .lines()
@@ -354,6 +374,10 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
     assert_eq!(
         seed["dep_info_runs"], 0,
         "no separate dep-info pre-pass: {seed:#}"
+    );
+    assert_eq!(
+        seed["compiler_runs"], 2,
+        "the injected attempt must retry natively: {seed:#}"
     );
     assert!(
         graph_contents(&root.join("target/debug/incremental.kache-auto"))

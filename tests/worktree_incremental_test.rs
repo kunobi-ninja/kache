@@ -622,6 +622,86 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
 }
 
 #[test]
+fn deferred_retry_reads_dep_info_when_the_compiler_omits_its_notification() {
+    if !automatic_supported() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let cache = root.join("cache");
+    project(&root, 0);
+    let output = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rustc = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+        .join("bin/rustc");
+    let compiler = root.join("tool/rustc");
+    fs::create_dir(compiler.parent().unwrap()).unwrap();
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/usr/bin/env python3
+import json, os, subprocess, sys
+real = os.environ['WORKTREE_PROBE_RUSTC']
+args = sys.argv[1:]
+if 'src/lib.rs' in args and os.environ.get('RUSTC_BOOTSTRAP') == '1':
+    result = subprocess.run([real, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sys.stdout.buffer.write(result.stdout)
+    for line in result.stderr.splitlines(keepends=True):
+        try:
+            if json.loads(line).get('emit') == 'dep-info':
+                continue
+        except (ValueError, UnicodeDecodeError):
+            pass
+        sys.stderr.buffer.write(line)
+    sys.exit(result.returncode)
+os.execv(real, [real, *args])
+"#,
+    );
+    for answer in [0, 1] {
+        let body = if answer == 0 {
+            "pub fn answer() -> u64 { 0 }"
+        } else {
+            fs::write(root.join("src/added.rs"), "pub fn value() -> u64 { 1 }\n").unwrap();
+            "mod added; pub fn answer() -> u64 { added::value() }"
+        };
+        fs::write(
+            root.join("src/lib.rs"),
+            format!("const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\n{body}\n"),
+        )
+        .unwrap();
+        let output = managed_command(&root, &cache, true, false, true)
+            .env("RUSTC", &compiler)
+            .env("WORKTREE_PROBE_RUSTC", &rustc)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("E0080"));
+    }
+    let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = events
+        .iter()
+        .rev()
+        .find(|event| event["crate_name"] == "worktree_probe")
+        .unwrap();
+    assert_eq!(event["passthrough_reason"], "adaptive seed", "{event:#}");
+    assert_eq!(event["dep_info_runs"], 0, "{event:#}");
+    assert_eq!(
+        event["compiler_runs"], 2,
+        "the reported dep-info still requires a native retry: {event:#}"
+    );
+}
+
+#[test]
 fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
     if !supports_cwd_remap() {
         eprintln!("skipping worktree seed test: rustc lacks remap-cwd-prefix");

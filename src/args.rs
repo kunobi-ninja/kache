@@ -2666,14 +2666,15 @@ mod tests {
             direct.extend(flags.iter().map(|flag| (*flag).to_string()));
             std::fs::write(&response, format!("{}\n", direct[1..].join("\n"))).unwrap();
             let parsed = RustcArgs::parse(&direct).unwrap();
-            let expanded = RustcArgs::parse(&[
-                "rustc".to_string(),
-                format!("@{}", response.display()),
-            ])
-            .unwrap();
+            let expanded =
+                RustcArgs::parse(&["rustc".to_string(), format!("@{}", response.display())])
+                    .unwrap();
             assert!(parsed.explicit_emit_output, "{flags:?}");
             assert!(expanded.explicit_emit_output, "{flags:?}");
-            assert_eq!(semantic_fingerprint(&parsed), semantic_fingerprint(&expanded));
+            assert_eq!(
+                semantic_fingerprint(&parsed),
+                semantic_fingerprint(&expanded)
+            );
         }
         let defaults = RustcArgs::parse(&[
             "rustc".to_string(),

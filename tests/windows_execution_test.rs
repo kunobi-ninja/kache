@@ -693,12 +693,18 @@ fn cold_bootstrap_keeps_the_compiler_in_the_original_frontend() {
     let record = ready(&fixture.path("cold.ready"));
     assert_eq!(record["parent"], frontend.child.id());
     assert_eq!(record["client"], "cold");
+    assert_eq!(
+        std::fs::canonicalize(record["cwd"].as_str().unwrap()).unwrap(),
+        fixture.path("work").canonicalize().unwrap()
+    );
     let daemon = fixture.daemon_pid();
     std::fs::write(fixture.path("cold.release"), b"go").unwrap();
     let output = frontend.output();
     assert_eq!(output.status.code(), Some(7));
     assert!(output.stdout.ends_with(b"native-output-\xff"));
     assert!(output.stderr.ends_with(b"native-error-\xfe"));
+    std::fs::remove_dir(fixture.path("work")).unwrap();
+    std::fs::create_dir(fixture.path("work")).unwrap();
     assert_eq!(fixture.daemon_pid(), daemon);
 }
 

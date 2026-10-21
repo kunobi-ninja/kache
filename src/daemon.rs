@@ -6309,11 +6309,20 @@ pub fn run_server(
         .context("writing daemon coordinator state")?;
     let _coord_guard = DaemonCoordGuard::new(coord.path.clone());
 
+    #[cfg(not(windows))]
+    let manifest_path = PathBuf::from("Cargo.lock");
+    #[cfg(windows)]
+    let manifest_path = crate::platform::release_daemon_working_directory(&config.runtime_dir)
+        .context("releasing the build working directory")?;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    run_daemon_runtime(rt, server_main(config, provenance, coord, readiness))
+    run_daemon_runtime(
+        rt,
+        server_main(config, provenance, coord, readiness, manifest_path),
+    )
 }
 
 fn run_daemon_runtime(
@@ -6329,14 +6338,16 @@ fn run_daemon_runtime(
     result
 }
 
-fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandle<()>> {
+fn start_manifest_warming(
+    daemon: &Arc<Daemon>,
+    lock_path: PathBuf,
+) -> Option<tokio::task::JoinHandle<()>> {
     if should_start_speculative_prefetch(
         daemon.config.remote.is_some(),
         daemon.config.prefetch_enabled,
     ) {
         let manifest_daemon = daemon.clone();
         let namespace = std::env::var("KACHE_NAMESPACE").ok();
-        let lock_path = PathBuf::from("Cargo.lock");
         Some(tokio::spawn(async move {
             manifest_prefetch(&manifest_daemon, namespace.as_deref(), &lock_path).await;
             manifest_daemon.signal_warming_complete();
@@ -6424,6 +6435,7 @@ async fn server_main(
     provenance: &crate::config::ConfigFileProvenance,
     mut coord: DaemonCoordFile,
     readiness: Option<kunobi_daemon::readiness::channel::Notifier>,
+    manifest_path: PathBuf,
 ) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -6627,7 +6639,7 @@ async fn server_main(
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
     // The shared launcher also releases the warming barrier immediately when no
     // remote exists or speculative prefetch is disabled.
-    let manifest_handle = start_manifest_warming(&daemon);
+    let manifest_handle = start_manifest_warming(&daemon, manifest_path);
 
     // Background blob migration: lazily migrate legacy entries on startup
     let migration_config = config.clone();

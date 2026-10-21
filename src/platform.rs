@@ -29,6 +29,17 @@ pub(crate) fn frontend_selection() -> Result<kache_shims::Selection, kache_shims
     kache_shims::select_frontend(&env, FRONTEND_IMAGE.get(), &kache_shims::RealFs)
 }
 
+/// Release the build directory after daemon configuration has been resolved.
+#[cfg(windows)]
+pub(crate) fn release_daemon_working_directory(
+    runtime: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let manifest = std::env::current_dir()?.join("Cargo.lock");
+    std::fs::create_dir_all(runtime)?;
+    std::env::set_current_dir(runtime)?;
+    Ok(manifest)
+}
+
 pub(crate) fn host_spawn(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {

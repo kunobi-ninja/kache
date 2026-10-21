@@ -512,4 +512,8 @@ exclude_re = [
     # take a path, and are tested directly.
     "replace offer_target_recovery -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     " in offer_target_recovery$",
+    # Windows startup releases its inherited cwd; native compiler acceptance
+    # checks directory removal while the daemon stays alive.
+    " in release_daemon_working_directory$",
+
 ]

@@ -911,6 +911,29 @@ mod tests {
         assert_eq!(fs::read(source.join("dep-graph.bin")).unwrap(), b"original");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_seed_copies_preserve_read_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("receiver");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        let input = source.join("session.lock");
+        fs::write(&input, b"private").unwrap();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o400)).unwrap();
+        let mut budget = CopyBudget { files: 1, bytes: 7 };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        let output = dest.join("session.lock");
+        assert_eq!(fs::read(&output).unwrap(), b"private");
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
     #[test]
     fn an_existing_stage_file_cannot_overwrite_a_linked_donor() {
         let temp = tempfile::tempdir().unwrap();

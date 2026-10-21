@@ -677,9 +677,9 @@ impl AdaptiveUnit {
         LoadedState::Valid(state)
     }
 
-    /// Write `state`. Lease writes and the reset marker are `durable`; an
-    /// observation is not, since it is written only after [`reset_locked`]
-    /// removed the private rustc state.
+    /// In-flight and reset markers are durable before any compiler or cleanup
+    /// runs. Losing a completion recovers that marker and discards the graph.
+    /// Observations follow a reset that already removed the private state.
     fn store_state(&self, state: &DiskState, durable: bool) -> bool {
         if !valid_state(state, &self.unit_key) || unsafe_file(&self.state_path) {
             return false;
@@ -835,7 +835,9 @@ impl Lease {
         };
 
         let kept = match next {
-            Some(state) if self.unit.store_state(&state, true) => true,
+            // The durable busy marker already protects this graph. A lost
+            // completion must reset it, so no second flush is needed here.
+            Some(state) if self.unit.store_state(&state, false) => true,
             None => remove_path_safely(&self.unit.state_path),
             Some(_) => {
                 reset_locked(&self.unit);
@@ -2283,6 +2285,42 @@ mod tests {
         write_state(&unit, &state);
 
         assert!(unit.try_active_at(13).is_none());
+    }
+
+    #[test]
+    fn losing_a_completion_recovers_the_busy_marker_and_discards_the_graph() {
+        for kind in [LeaseKind::Seed, LeaseKind::Active, LeaseKind::Immediate] {
+            for outcome in [CompileOutcome::Success, CompileOutcome::CompileError] {
+                let (_temp, _args, unit) = fixture();
+                let lease = match kind {
+                    LeaseKind::Seed => {
+                        teach(&unit, 10);
+                        unit.try_seed_at(
+                            &cache_key("second"),
+                            &fields("stable", "source-b", "extern-a"),
+                            11,
+                        )
+                    }
+                    LeaseKind::Active => {
+                        activate(&unit, 10);
+                        unit.try_active_at(13)
+                    }
+                    LeaseKind::Immediate => unit.try_immediate_at(13),
+                }
+                .unwrap();
+                let busy = fs::read(&unit.state_path).unwrap();
+                assert!(read_state(&unit).in_flight);
+                fs::write(unit.rustc_dir.join("dep-graph.bin"), b"completed").unwrap();
+                assert!(lease.finish_at(outcome, 14));
+
+                // Model a power loss that retained the durable pre-compile
+                // marker but lost the later atomic completion rename.
+                fs::write(&unit.state_path, busy).unwrap();
+                assert!(unit.try_active_at(15).is_none());
+                assert!(!path_exists(&unit.rustc_dir));
+                assert!(unit.try_immediate_at(16).is_some());
+            }
+        }
     }
 
     #[test]

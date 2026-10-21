@@ -85,7 +85,7 @@ impl Lease {
             current_bootstrap.as_deref()
         };
         if inject_bootstrap {
-            // The opt-in permits cwd remapping, not unstable source features.
+            // Bootstrap permits cwd remapping, not unstable source features.
             normalized.push("-Zallow-features=".into());
         }
         let Some(identity) =
@@ -229,7 +229,7 @@ fn path_operand(flag: &str, value: &str, cwd: &Path) -> Option<String> {
 }
 
 /// An allowlist prevents treating a cfg string or an unknown flag's operand
-/// as a filesystem path. Unmodeled flags decline the experiment.
+/// as a filesystem path. Unmodeled flags decline portable seeding.
 fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<Vec<String>> {
     let source = source?;
     // Absolute and relative source operands produce different file!() values

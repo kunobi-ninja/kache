@@ -537,3 +537,102 @@ fn incomplete_or_mismatched_executable_pairs_never_publish_a_hit() {
         }
     }
 }
+
+#[test]
+fn unidentifiable_executable_entries_evict_only_the_writable_source() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let invocation = crate::invocation::InvocationEnv::capture();
+    for result in [
+        EventResult::LocalHit,
+        EventResult::RemoteHit,
+        EventResult::PrefetchHit,
+    ] {
+        for readonly in [false, true] {
+            for (ambiguous, explicit) in [(false, false), (false, true), (true, false)] {
+                let mut fixture = Fixture::new();
+                let out_dir = fixture.dir.path().join("target/debug/deps");
+                let mut argv = s(&[
+                    "rustc",
+                    fixture.dir.path().join("lib.rs").to_str().unwrap(),
+                    "--crate-type=bin",
+                    "--crate-name=app",
+                    "--emit=link",
+                ]);
+                argv.extend(if explicit {
+                    vec![
+                        "-o".into(),
+                        out_dir.join("app.custom").display().to_string(),
+                    ]
+                } else {
+                    vec!["--out-dir".into(), out_dir.display().to_string()]
+                });
+                fixture.args = RustcArgs::parse_for(&argv, &invocation).unwrap();
+                fixture.compiler = RustcCompiler::new_for(&invocation);
+                let (exe, pdb) = crate::pe_pdb::fixture_pair();
+                let mut outputs = vec![("app.pdb", pdb.as_slice())];
+                if ambiguous {
+                    outputs.extend([("app.exe", exe.as_slice()), ("other.exe", exe.as_slice())]);
+                }
+                fixture.meta.files = outputs
+                    .into_iter()
+                    .map(|(name, bytes)| {
+                        let hash = blake3::hash(bytes).to_hex().to_string();
+                        create_blob(&fixture.store, &hash, bytes);
+                        let mut file = cached_file(name, &hash);
+                        file.size = bytes.len() as u64;
+                        file.executable = name.ends_with(".exe");
+                        file
+                    })
+                    .collect();
+                fixture.meta.crate_types = vec!["bin".into()];
+                fixture.meta.emit_kinds = vec!["link".into()];
+                fixture.publish();
+                let metadata = fixture.store.entry_dir(CACHE_KEY).join("meta.json");
+                let before = std::fs::read(&metadata).unwrap();
+                let readonly_store =
+                    readonly.then(|| Store::open_read_only(&fixture.config).unwrap());
+                let source = readonly_store.as_ref().unwrap_or(&fixture.store);
+                assert_eq!(source.is_read_only(), readonly);
+                let error = fixture
+                    .context()
+                    .restore_and_finish(
+                        source,
+                        &fixture.meta,
+                        result,
+                        CACHE_KEY,
+                        0,
+                        FileHashStats::default(),
+                        0,
+                        Some(&fixture.store),
+                        &fixture.key(),
+                        &key_record(),
+                    )
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(if ambiguous {
+                        "ambiguous linked executable outputs"
+                    } else if explicit {
+                        "executable output app.custom is missing"
+                    } else {
+                        "cannot identify the linked executable output"
+                    }),
+                    "{error:#}"
+                );
+                assert!(
+                    !out_dir.exists(),
+                    "no destination may be created before executable admission"
+                );
+                assert!(
+                    !fixture.config.event_log_path().exists(),
+                    "{result:?}/{readonly}/{ambiguous}/{explicit}: failed admission reported a hit"
+                );
+                assert_eq!(fixture.store.get(CACHE_KEY).unwrap().is_some(), readonly);
+                if readonly {
+                    assert_eq!(std::fs::read(&metadata).unwrap(), before);
+                } else {
+                    assert!(!metadata.exists());
+                }
+            }
+        }
+    }
+}

@@ -7741,11 +7741,18 @@ fn restore_from_cache_with_memo_store(
     // a cached pair before touching any destination: incomplete metadata or
     // mismatched blobs must never be published as a hit. Library-only entries
     // do not allocate paths or open blobs for this audit.
+    let reject_pair = |error: anyhow::Error| {
+        let _ = store.remove_entry(&meta.cache_key);
+        error.context(
+            "cached executable/PDB pair is incomplete or incompatible; evicting and recompiling",
+        )
+    };
     let executable_name = crate::pe_pdb::executable_output_name(
         args.is_user_facing_executable() && args.emits_link(),
         args.output.as_deref(),
         meta.files.iter().map(|file| file.name.as_str()),
-    )?;
+    )
+    .map_err(reject_pair)?;
     if executable_name.is_some()
         || meta
             .files
@@ -7763,10 +7770,7 @@ fn restore_from_cache_with_memo_store(
                 .map(|(path, name)| (path.as_path(), *name)),
             executable_name.as_deref(),
         ) {
-            let _ = store.remove_entry(&meta.cache_key);
-            return Err(error).context(
-                "cached executable/PDB pair is incomplete or incompatible; evicting and recompiling",
-            );
+            return Err(reject_pair(error));
         }
     }
 

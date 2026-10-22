@@ -5311,6 +5311,14 @@ fn debug_bundle_restore_honors_the_current_policy_for_legacy_entries() {
         let bundle = debug_bundle_tar("foo", b"dwarf");
         let hash = blake3::hash(&bundle).to_hex().to_string();
         create_blob(&store, &hash, &bundle);
+        // A legacy executable entry still needs its primary output; the
+        // sidecar policy is independent of PE/PDB pairing.
+        let executable = b"\x7fELFcached executable";
+        let executable_hash = blake3::hash(executable).to_hex().to_string();
+        create_blob(&store, &executable_hash, executable);
+        let mut primary = cached_file("foo", &executable_hash);
+        primary.size = executable.len() as u64;
+        primary.executable = true;
         let output = out_dir.to_str().unwrap();
         let mut argv = vec![
             "rustc",
@@ -5324,12 +5332,14 @@ fn debug_bundle_restore_honors_the_current_policy_for_legacy_entries() {
         ];
         argv.extend(&flags);
         let args = rustc_args(&argv);
-        let meta = entry_meta(
+        let mut meta = entry_meta(
             "legacy-debug-bundle",
-            vec![cached_file("foo.dsym.tar", &hash)],
+            vec![primary, cached_file("foo.dsym.tar", &hash)],
             &[],
         );
+        meta.crate_types = vec!["bin".into()];
         restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        assert!(out_dir.join("foo").is_file(), "{flags:?}");
         assert_eq!(out_dir.join("foo.dsym.tar").exists(), expected, "{flags:?}");
         assert_eq!(
             out_dir
@@ -9124,6 +9134,7 @@ fn restore_evicts_entry_whose_depinfo_references_missing_paths() {
         "src/lib.rs",
         "--crate-name",
         "foo",
+        "--crate-type=lib",
         "--emit",
         "dep-info,link",
         "--out-dir",
@@ -9699,6 +9710,7 @@ fn restore_seeds_the_file_hash_memo_with_the_restored_blobs_digest() {
         "src/lib.rs",
         "--crate-name",
         "foo",
+        "--crate-type=lib",
         "--emit",
         "link",
         "--out-dir",
@@ -9802,6 +9814,7 @@ fn restore_from_cache_rejects_unsafe_artifact_name() {
         "src/lib.rs",
         "--crate-name",
         "foo",
+        "--crate-type=lib",
         "--emit",
         "link",
         "--out-dir",
@@ -9830,7 +9843,13 @@ fn restore_from_cache_requires_output_location() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
-    let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+    let args = rustc_args(&[
+        "rustc",
+        "src/lib.rs",
+        "--crate-name",
+        "foo",
+        "--crate-type=lib",
+    ]);
     let meta = entry_meta("no-output-key", Vec::new(), &[]);
 
     let err = restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None)
@@ -10015,6 +10034,7 @@ fn restore_from_cache_with_verify_on_is_fail_open_when_recompile_fails() {
         "src/lib.rs",
         "--crate-name",
         "foo",
+        "--crate-type=lib",
         "--emit",
         "link",
         "--out-dir",
@@ -10055,6 +10075,7 @@ fn restore_from_cache_skips_verify_when_flag_off() {
         "src/lib.rs",
         "--crate-name",
         "foo",
+        "--crate-type=lib",
         "--emit",
         "link",
         "--out-dir",

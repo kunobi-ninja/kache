@@ -7352,6 +7352,12 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
 
 const OTHER_CHECKOUTS: &str = "Other checkouts";
 
+/// Only native Linux links key their linker, and without a `cc` there is no
+/// driver to ask.
+fn doctor_shows_native_linker(linux: bool, no_compiler: bool) -> bool {
+    linux && !no_compiler
+}
+
 /// Doctor's "Native linker" check: the linker a native Linux link runs with
 /// this shell's `RUSTFLAGS`, placed the way its cache key places it.
 fn native_linker_check(env: &crate::invocation::InvocationEnv) -> Check {
@@ -8321,7 +8327,7 @@ pub fn doctor(
 
     // Native linker (#1663): a native Linux link keys the linker its driver
     // runs, so show the one this shell's `cc` and RUSTFLAGS select.
-    if cfg!(target_os = "linux") && !probe_no_compiler {
+    if doctor_shows_native_linker(cfg!(target_os = "linux"), probe_no_compiler) {
         checks.push(native_linker_check(
             &crate::invocation::InvocationEnv::capture(),
         ));

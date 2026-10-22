@@ -11096,6 +11096,14 @@ fn direct_stats_include_rotated_events() {
     assert_eq!(snap.event_stats.misses, 1);
 }
 
+#[test]
+fn doctor_shows_the_native_linker_only_on_linux_with_a_compiler() {
+    assert!(doctor_shows_native_linker(true, false));
+    assert!(!doctor_shows_native_linker(true, true));
+    assert!(!doctor_shows_native_linker(false, false));
+    assert!(!doctor_shows_native_linker(false, true));
+}
+
 #[cfg(unix)]
 #[test]
 fn native_linker_check_reports_the_linker_cc_runs() {

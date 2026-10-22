@@ -575,6 +575,69 @@ fn rustc_runs_bundled_lld_only_where_it_is_the_default() {
     }
 }
 
+/// With rustc's bundled lld in the default position, the link runs the
+/// `ld.lld` in rustc's `gcc-ld`, not the system `ld` on PATH.
+#[cfg(unix)]
+#[test]
+fn rustcs_bundled_lld_is_the_linker_when_rustc_defaults_to_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    let sysroot = root.join("sysroot");
+    let gcc_ld = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&gcc_ld).unwrap();
+    let driver = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &driver,
+        "#!/bin/sh\ndirs=\"\"\nfor arg in \"$@\"; do case \"$arg\" in -B*) dirs=\"$dirs ${arg#-B}\" ;; -print-prog-name=*) name=${arg#-print-prog-name=}; for dir in $dirs; do if [ -x \"$dir/$name\" ]; then echo \"$dir/$name\"; exit 0; fi; done; echo \"$name\" ;; esac; done\n",
+    );
+    kache_fs::testutil::write_executable(&bin.join("ld"), "system ld");
+    kache_fs::testutil::write_executable(&bin.join("ld.lld"), "system lld");
+    kache_fs::testutil::write_executable(&gcc_ld.join("ld.lld"), "rustc's lld");
+    let env = InvocationEnv::from_parts([("PATH", &bin)], Some(root.clone()), None, root.clone());
+    let args = |flags: &[&str]| {
+        let mut argv: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "probe",
+            "--crate-type",
+            "bin",
+            "src/main.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        argv.extend(["--sysroot".to_string(), sysroot.display().to_string()]);
+        argv.extend(flags.iter().map(|flag| flag.to_string()));
+        RustcArgs::parse_for(&argv, &env).unwrap()
+    };
+    let x86_64 = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
+    let linker = |flags: &[&str], version: &str| {
+        native_linker_for(&args(flags), version, &driver, None, &env).unwrap()
+    };
+
+    assert_eq!(linker(&[], x86_64), gcc_ld.join("ld.lld"));
+    assert_eq!(
+        linker(&["-Clinker-features=-lld"], x86_64),
+        bin.join("ld"),
+        "opting out of rustc's lld links with the system ld"
+    );
+    assert_eq!(
+        linker(
+            &[],
+            "rustc 1.89.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.89.0\n"
+        ),
+        bin.join("ld")
+    );
+    std::fs::remove_file(gcc_ld.join("ld.lld")).unwrap();
+    assert_eq!(
+        linker(&[], x86_64),
+        bin.join("ld"),
+        "a sysroot without rustc's lld leaves the system ld"
+    );
+}
+
 /// Placement, the production file hasher and the fold together: the same
 /// driver, flags and path with a new linker behind them give a new key.
 #[cfg(unix)]

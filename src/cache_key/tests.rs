@@ -18398,177 +18398,438 @@ fn main() { println!("{OUT_VALUE}"); }
     assert_ne!(values[0], values[1]);
 }
 
-/// One checkout, two target directories inside it (`target/` and
-/// `target/integrate-clippy`): a build script's `-L native=$OUT_DIR` keys by
-/// its path below the unit's own target directory, not by the directory's
-/// name. A search dir in some other target directory keeps its path.
-#[test]
-fn link_search_into_the_units_own_target_dir_ignores_its_name() {
-    let _lock = key_test_lock();
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().join("ws");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let source = workspace.join("lib.rs");
-    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+mod build_script_target_paths {
+    use super::*;
 
-    let key_in = |target: &Path, native_in: &Path| {
-        let target = target.to_string_lossy();
-        let out_dir = format!("{target}/debug/deps");
-        let native = format!(
-            "native={}/debug/build/foo-sys-fedcba9876543210/out",
-            native_in.to_string_lossy()
-        );
-        let argv: Vec<String> = [
-            "rustc",
-            "--crate-name",
-            "mylib",
-            &source.to_string_lossy(),
-            "--crate-type",
-            "lib",
-            "--out-dir",
-            &out_dir,
-            "-L",
-            &format!("dependency={target}/debug/deps"),
-            "-L",
-            &native,
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let args = RustcArgs::parse(&argv).unwrap();
-        let pn = PathNormalizer::from_env(Some(&workspace))
-            .with_target_dir(args.target_dir().as_deref());
-        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
-    };
+    struct Unit {
+        workspace: PathBuf,
+        source: PathBuf,
+        invocation: InvocationEnv,
+    }
 
-    let plain = workspace.join("target");
-    let clippy = workspace.join("target/integrate-clippy");
-    assert_eq!(key_in(&plain, &plain), key_in(&clippy, &clippy));
-    assert_ne!(
-        key_in(&plain, &workspace.join("target/a")),
-        key_in(&plain, &workspace.join("target/b")),
-        "a search dir outside the unit's target dir keeps its path"
-    );
-    let other = |sub: &str| {
-        let argv = [
-            "rustc".to_string(),
-            "--crate-name".to_string(),
-            "mylib".to_string(),
-            source.to_string_lossy().to_string(),
-            "--crate-type".to_string(),
-            "lib".to_string(),
-            "--out-dir".to_string(),
-            plain.join("debug/deps").to_string_lossy().to_string(),
-            "-L".to_string(),
-            format!("native={}", plain.join(sub).to_string_lossy()),
-        ];
-        let args = RustcArgs::parse(&argv).unwrap();
-        let pn = PathNormalizer::from_env(Some(&workspace))
-            .with_target_dir(args.target_dir().as_deref());
-        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
-    };
-    assert_ne!(
-        other("debug/build/x/out"),
-        other("debug/build/y/out"),
-        "different dirs below the target dir key apart"
-    );
-}
+    impl Unit {
+        fn new(root: &Path) -> Self {
+            let workspace = root.canonicalize().unwrap();
+            let source = workspace.join("lib.rs");
+            std::fs::write(
+                &source,
+                b"#[link(name = \"foo\", kind = \"static\")] unsafe extern \"C\" {}",
+            )
+            .unwrap();
+            let invocation = client_invocation(
+                &workspace,
+                &[
+                    ("OUT_DIR", None),
+                    ("RUSTFLAGS", None),
+                    ("CARGO_ENCODED_RUSTFLAGS", None),
+                    ("KACHE_BASE_DIR", None),
+                    ("KACHE_RUSTC_PATH_NORMALIZE", Some(OsStr::new("1"))),
+                ],
+            );
+            Self {
+                workspace,
+                source,
+                invocation,
+            }
+        }
 
-/// A source the unit's build script generated (`include!` from OUT_DIR) is
-/// keyed by its path below OUT_DIR and Cargo's unit dir, so one unit in two
-/// target directories of one checkout shares a key; its bytes and its unit
-/// hash still key it apart.
-#[test]
-fn out_dir_sources_key_by_their_unit_not_the_target_dir() {
-    let _lock = key_test_lock();
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().join("ws");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let source = workspace.join("lib.rs");
-    std::fs::write(
-        &source,
-        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));",
-    )
-    .unwrap();
-    let args = RustcArgs::parse(&[
-        "rustc".to_string(),
-        "--crate-name".to_string(),
-        "mylib".to_string(),
-        source.to_str().unwrap().to_string(),
-    ])
-    .unwrap();
+        fn out_dir(target: &Path) -> PathBuf {
+            let out = target.join("debug/build/foo-sys-0123456789abcdef/out");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                out.join("libfoo.a"),
+                gnu_ar_named_object("foo.o", b"object"),
+            )
+            .unwrap();
+            out
+        }
 
-    let key = |target: &str, unit: &str, generated: &str| {
-        let out_dir = workspace
-            .join(target)
-            .join("debug/build")
-            .join(unit)
-            .join("out");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        let gen_rs = out_dir.join("gen.rs");
-        std::fs::write(&gen_rs, generated).unwrap();
-        provide_dep_info(
-            DepInfo {
-                source_files: vec![source.clone(), gen_rs],
-                env_deps: vec![(
+        fn key(
+            &self,
+            target: Option<&Path>,
+            out_dir: Option<&Path>,
+            search: &[String],
+            crate_type: &str,
+            extra: &[&str],
+            generated: Option<&Path>,
+        ) -> (String, KeyOutputs) {
+            // Capture once per fixture. Every key gets the same snapshot with
+            // only OUT_DIR changed; no test mutates the process environment.
+            let vars = self
+                .invocation
+                .vars_os()
+                .filter(|(name, _)| name.as_os_str() != OsStr::new("OUT_DIR"))
+                .chain(out_dir.map(|out| ("OUT_DIR".into(), out.as_os_str().to_owned())));
+            let invocation = InvocationEnv::from_parts(
+                vars,
+                Some(self.workspace.clone()),
+                self.invocation.home_dir().map(Path::to_path_buf),
+                self.invocation.temp_dir().to_path_buf(),
+            );
+            let mut argv = vec![
+                "rustc".into(),
+                "--crate-name=mylib".into(),
+                format!("--crate-type={crate_type}"),
+                self.source.to_str().unwrap().into(),
+            ];
+            if let Some(target) = target {
+                argv.extend([
+                    "--out-dir".into(),
+                    target.join("debug/deps").to_str().unwrap().into(),
+                ]);
+            }
+            for spec in search {
+                argv.extend(["-L".into(), spec.clone()]);
+            }
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            let args = RustcArgs::parse_for(&argv, &invocation).unwrap();
+            let mut sources = vec![self.source.clone()];
+            let mut env_deps = Vec::new();
+            if let Some(generated) = generated {
+                sources.push(generated.to_path_buf());
+                env_deps.push((
                     "OUT_DIR".into(),
-                    Some(out_dir.to_str().unwrap().to_string()),
-                )],
-            },
-            None,
-        );
-        let env = KeyEnv::from_parts([("OUT_DIR", out_dir.as_path())], Some(workspace.clone()));
-        let (key, _) = compute_cache_key_with_outputs(
-            &args,
-            &FileHasher::new(),
-            &PathNormalizer::from_env(Some(&workspace)),
-            &env,
-        );
-        key.unwrap()
-    };
+                    Some(out_dir.unwrap().to_str().unwrap().into()),
+                ));
+            }
+            provide_dep_info(
+                DepInfo {
+                    source_files: sources,
+                    env_deps,
+                },
+                None,
+            );
+            let normalizer = PathNormalizer::from_invocation(Some(&self.workspace), &invocation)
+                .with_target_dir(args.target_dir().as_deref());
+            let (key, outputs) = compute_cache_key_with_outputs(
+                &args,
+                &FileHasher::new().with_invocation_env(&invocation),
+                &normalizer,
+                &KeyEnv::from_invocation(&invocation),
+            );
+            (key.unwrap(), outputs)
+        }
+    }
 
-    let unit = "mylib-0123456789abcdef";
-    let a = key("target", unit, "pub fn g() {}");
-    assert_eq!(a, key("target/integrate-clippy", unit, "pub fn g() {}"));
-    assert_ne!(
-        a,
-        key("target/integrate-clippy", unit, "pub fn h() {}"),
-        "other bytes"
-    );
-    assert_ne!(
-        a,
-        key("target", "mylib-fedcba9876543210", "pub fn g() {}"),
-        "another unit"
-    );
-}
+    fn native(path: &Path) -> String {
+        format!("native={}", path.to_str().unwrap())
+    }
 
-#[test]
-fn out_dir_source_identity_needs_a_file_below_an_absolute_out_dir() {
-    let out = if cfg!(windows) {
-        "C:/t/debug/build/p-1/out"
-    } else {
-        "/t/debug/build/p-1/out"
-    };
-    let id = |file: &str, out_dir: Option<&str>| {
-        out_dir_source_identity(Path::new(file), out_dir.map(OsStr::new))
-            .map(|v| String::from_utf8(v).unwrap())
-    };
-    assert_eq!(
-        id(&format!("{out}/a/b.rs"), Some(out)).as_deref(),
-        Some("<OUT_DIR:p-1>/a/b.rs")
-    );
-    assert_eq!(id(&format!("{out}/a/b.rs"), None), None);
-    assert_eq!(id(out, Some(out)), None, "OUT_DIR itself is no source");
-    assert_eq!(id("/elsewhere/b.rs", Some(out)), None);
-    assert_eq!(
-        id("rel/out/b.rs", Some("rel/out")),
-        None,
-        "a relative OUT_DIR"
-    );
-    assert_eq!(
-        id(&format!("{out}/../x.rs"), Some(out)),
-        None,
-        "leaves OUT_DIR"
-    );
-    assert_eq!(id("/out/b.rs", Some("/out")), None, "no unit dir");
+    fn assert_distinct_link(a: (String, KeyOutputs), b: (String, KeyOutputs), why: &str) {
+        assert_ne!(a.0, b.0, "{why}");
+        // Other groups can also keep unsafe invocations apart. Observe the
+        // search-path group itself so those cannot hide a weakened guard.
+        assert_ne!(
+            a.1.fields.unwrap()["link"],
+            b.1.fields.unwrap()["link"],
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn native_rlib_search_reuses_only_identical_bundled_archives() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let a = unit.workspace.join("target");
+        let b = unit.workspace.join("target/integrate-clippy");
+        let out_a = Unit::out_dir(&a);
+        let out_b = Unit::out_dir(&b);
+        let key = |target: &Path, out: &Path| {
+            unit.key(Some(target), Some(out), &[native(out)], "rlib", &[], None)
+        };
+        let original = key(&a, &out_a);
+        let relocated = key(&b, &out_b);
+        assert_eq!(
+            original.0, relocated.0,
+            "native-only build-script output can share across target names"
+        );
+        assert_eq!(
+            relocated.1.native_archives.unwrap().archives,
+            [out_b.join("libfoo.a")]
+        );
+
+        std::fs::write(
+            out_b.join("libfoo.a"),
+            gnu_ar_named_object("foo.o", b"changed object"),
+        )
+        .unwrap();
+        assert_ne!(
+            original.0,
+            key(&b, &out_b).0,
+            "bundled bytes affect the key"
+        );
+        std::fs::write(
+            out_b.join("libfoo.a"),
+            gnu_ar_named_object("renamed.o", b"object"),
+        )
+        .unwrap();
+        assert_ne!(
+            original.0,
+            key(&b, &out_b).0,
+            "bundle member names affect the key"
+        );
+        let mut timestamped = gnu_ar_named_object("foo.o", b"object");
+        timestamped[8 + 16] = b'1';
+        std::fs::write(out_b.join("libfoo.a"), timestamped).unwrap();
+        assert_ne!(
+            original.0,
+            key(&b, &out_b).0,
+            "bundle member timestamps affect the key"
+        );
+        std::fs::write(
+            out_b.join("libfoo.a"),
+            gnu_ar_named_object("foo.o", b"object"),
+        )
+        .unwrap();
+        let other_unit = b.join("debug/build/foo-sys-fedcba9876543210/out");
+        std::fs::rename(&out_b, &other_unit).unwrap();
+        assert_distinct_link(
+            original,
+            key(&b, &other_unit),
+            "Cargo unit identity is retained",
+        );
+    }
+
+    #[test]
+    fn native_target_alias_excludes_other_search_kinds_outputs_and_unremapped_units() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let a = unit.workspace.join("target-a");
+        let b = unit.workspace.join("target-b");
+        let out_a = Unit::out_dir(&a);
+        let out_b = Unit::out_dir(&b);
+        for (kind, crate_type, extra) in [
+            ("all=", "rlib", &[][..]),
+            ("", "rlib", &[][..]),
+            ("framework=", "rlib", &[][..]),
+            ("native=", "staticlib", &[][..]),
+            ("native=", "rlib,staticlib", &[][..]),
+            ("native=", "rlib", &["--emit=metadata"][..]),
+            ("native=", "rlib", &["-Cinstrument-coverage"][..]),
+            ("native=", "rlib", &["--cfg=trybuild"][..]),
+        ] {
+            let key = |target: &Path, out: &Path| {
+                unit.key(
+                    Some(target),
+                    Some(out),
+                    &[format!("{kind}{}", out.display())],
+                    crate_type,
+                    extra,
+                    None,
+                )
+            };
+            assert_distinct_link(
+                key(&a, &out_a),
+                key(&b, &out_b),
+                &format!("{kind} {crate_type} {extra:?}"),
+            );
+        }
+        let mut no_remap = unit;
+        no_remap.invocation = InvocationEnv::from_parts(
+            no_remap
+                .invocation
+                .vars_os()
+                .filter(|(name, _)| name.as_os_str() != OsStr::new("KACHE_RUSTC_PATH_NORMALIZE"))
+                .chain([("KACHE_RUSTC_PATH_NORMALIZE".into(), "0".into())]),
+            Some(no_remap.workspace.clone()),
+            no_remap.invocation.home_dir().map(Path::to_path_buf),
+            no_remap.invocation.temp_dir().to_path_buf(),
+        );
+        let key = |target: &Path, out: &Path| {
+            no_remap.key(Some(target), Some(out), &[native(out)], "rlib", &[], None)
+        };
+        assert_distinct_link(
+            key(&a, &out_a),
+            key(&b, &out_b),
+            "normalization opt-out retains search path identity",
+        );
+    }
+
+    #[test]
+    fn native_target_alias_requires_an_absolute_scanned_path_and_unit_target() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let targets = [
+            unit.workspace.join("target-a"),
+            unit.workspace.join("target-b"),
+        ];
+        let outs = targets.each_ref().map(|target| Unit::out_dir(target));
+        for case in [
+            "no-target",
+            "no-out-dir",
+            "relative-out-dir",
+            "relative-search",
+            "outside-out-dir",
+            "outside-target",
+            "parent-component",
+            "parent-escape",
+            "empty-suffix",
+        ] {
+            let keys = [0, 1].map(|i| {
+                let (target, out) = (&targets[i], &outs[i]);
+                let relative = out.strip_prefix(&unit.workspace).unwrap();
+                let search = match case {
+                    "relative-search" => relative.to_path_buf(),
+                    "outside-out-dir" => target.join("debug/build/other/out"),
+                    "outside-target" => unit
+                        .workspace
+                        .join(target.file_name().unwrap())
+                        .with_extension("external"),
+                    "parent-component" => out.join("../out"),
+                    "parent-escape" => target.join("../escape"),
+                    "empty-suffix" => target.clone(),
+                    _ => out.clone(),
+                };
+                std::fs::create_dir_all(unit.workspace.join(&search)).unwrap();
+                let observed_out = match case {
+                    "no-out-dir" => None,
+                    "relative-out-dir" => Some(relative),
+                    "outside-target" | "parent-escape" | "empty-suffix" => Some(search.as_path()),
+                    _ => Some(out.as_path()),
+                };
+                unit.key(
+                    (case != "no-target").then_some(target.as_path()),
+                    observed_out,
+                    &[native(&search)],
+                    "rlib",
+                    &[],
+                    None,
+                )
+            });
+            let [a, b] = keys;
+            assert_distinct_link(a, b, case);
+        }
+    }
+
+    #[test]
+    fn generated_source_file_macro_keeps_the_compiler_visible_target_name() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        std::fs::write(
+            &unit.source,
+            "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));",
+        )
+        .unwrap();
+        let targets = [
+            unit.workspace.join("target-a"),
+            unit.workspace.join("target-b"),
+        ];
+        for extra in [
+            &[][..],
+            &["--cfg=trybuild"][..],
+            &["-Cinstrument-coverage"][..],
+        ] {
+            let keys = targets.each_ref().map(|target| {
+                let out = Unit::out_dir(target);
+                let generated = out.join("gen.rs");
+                std::fs::write(&generated, "pub fn generated() -> &'static str { file!() }")
+                    .unwrap();
+                unit.key(
+                    Some(target),
+                    Some(&out),
+                    &[native(&out)],
+                    "rlib",
+                    extra,
+                    Some(&generated),
+                )
+            });
+            let [a, b] = keys;
+            assert_ne!(
+                a.0, b.0,
+                "file!() exposes the generated source's remapped spelling"
+            );
+            assert_ne!(
+                a.1.fields.unwrap()["sources"],
+                b.1.fields.unwrap()["sources"],
+                "OUT_DIR env folding cannot hide a source-path collision"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_target_alias_never_admits_an_unscanned_symlink_escape() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let external = unit.workspace.join("external");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("libfoo.a"), gnu_ar_one_object(b"object")).unwrap();
+        let keys = ["target-a", "target-b"].map(|name| {
+            let target = unit.workspace.join(name);
+            let out = Unit::out_dir(&target);
+            let alias = out.join("escape");
+            std::os::unix::fs::symlink(&external, &alias).unwrap();
+            unit.key(
+                Some(&target),
+                Some(&out),
+                &[native(&alias)],
+                "rlib",
+                &[],
+                None,
+            )
+        });
+        let [a, b] = keys;
+        assert_distinct_link(
+            a,
+            b,
+            "only resolved directories covered by the archive scan can alias",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_and_source_identities_preserve_literal_backslashes_and_search_order() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut unit = Unit::new(dir.path());
+        let target = unit.workspace.join("target");
+        let out = Unit::out_dir(&target);
+        let paths = [out.join(r"a\b"), out.join("a/b")];
+        for path in &paths {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("libfoo.a"), gnu_ar_one_object(b"object")).unwrap();
+        }
+        let key =
+            |search: &[String]| unit.key(Some(&target), Some(&out), search, "rlib", &[], None);
+        assert_distinct_link(
+            key(&[native(&paths[0])]),
+            key(&[native(&paths[1])]),
+            "a Unix backslash is not a separator",
+        );
+        assert_distinct_link(
+            key(&[native(&paths[0]), native(&paths[1])]),
+            key(&[native(&paths[1]), native(&paths[0])]),
+            "search order is retained",
+        );
+        let empty = [out.join("left"), out.join("right")];
+        let joined = target.join(format!(
+            "{}link_search_native_out_dir.v1:{}",
+            empty[0].strip_prefix(&target).unwrap().display(),
+            empty[1].strip_prefix(&target).unwrap().display(),
+        ));
+        for path in [&empty[0], &empty[1], &joined] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        assert_distinct_link(
+            key(&[native(&joined)]),
+            key(&[native(&empty[0]), native(&empty[1])]),
+            "one path containing a field label cannot impersonate two search fields",
+        );
+        let source_keys = [out.join(r"a\b.rs"), out.join("a/b.rs")].map(|source| {
+            std::fs::write(&source, "pub fn origin() -> &'static str { file!() }").unwrap();
+            unit.source = source;
+            unit.key(Some(&target), Some(&out), &[], "rlib", &[], None)
+        });
+        let [a, b] = source_keys;
+        assert_ne!(a.0, b.0, "file!() observes the two Unix filenames");
+        assert_ne!(
+            a.1.fields.unwrap()["sources"],
+            b.1.fields.unwrap()["sources"]
+        );
+    }
 }

@@ -1771,30 +1771,30 @@ pub(crate) fn source_path_identity(
     Ok(format!("<OPAQUE_PATH>/{}", opaque.finalize().to_hex()).into_bytes())
 }
 
-/// The key identity of a source file the unit's own build script generated:
-/// `<OUT_DIR:{unit-dir}>/{path below OUT_DIR}`, the sentinel env-dep values
-/// under OUT_DIR already use (kunobi-ninja/kache#330). `None` when the unit
-/// has no OUT_DIR or the file is not under it as spelled.
+/// Identity of an explicit native search directory an rlib can bundle from.
 ///
-/// Through the generic prefix rules such a file (`include!(concat!(env!(
-/// "OUT_DIR"), "/gen.rs"))`) kept the target directory's name in the key:
-/// `<CWD>/target/<name>/debug/build/<pkg>-<hash>/out/gen.rs`. The target
-/// directory is the caller's choice, not an input, so one unit built into two
-/// target directories of one checkout (`target/`, `target/integrate-clippy`,
-/// any CARGO_TARGET_DIR) got two keys and compiled the same output twice.
-/// The file's bytes are still hashed, and Cargo's per-unit directory stays in
-/// the identity, as it does for OUT_DIR itself: units that differ only by
-/// their unit hash never share a key.
-///
-/// The comparison is lexical: rustc writes an included file's path as the
-/// macro spelled it, and the macro spells it from OUT_DIR. A file reached
-/// through another spelling keeps the generic identity (a miss at worst).
-fn out_dir_source_identity(file: &Path, out_dir: Option<&OsStr>) -> Option<Vec<u8>> {
+/// Rlib native inputs beneath this unit's OUT_DIR are all content-keyed by
+/// `native_scan_dirs`, including archive member names and timestamps. Rustc
+/// bundles those members without recording their absolute search directory.
+/// Linked outputs and framework/all search paths keep their existing identity.
+/// Source files always use `source_path_identity`: rustc can expose their
+/// spelling through file!(), caller locations and debug information.
+fn out_dir_native_search_identity(
+    args: &RustcArgs,
+    path: &Path,
+    out_dir: Option<&OsStr>,
+) -> Option<Vec<u8>> {
+    if !args.emits_rlib() || args.links_native_closure() || args.skip_path_remap() {
+        return None;
+    }
+    let target = args.target_dir()?;
     let out_dir = Path::new(out_dir?);
     if !out_dir.is_absolute() {
         return None;
     }
-    let rest = file.strip_prefix(out_dir).ok()?;
+    // target_dir is resolved against the invocation, so this prefix match
+    // also requires an absolute search path.
+    let rest = path.strip_prefix(&target).ok()?;
     if rest.as_os_str().is_empty()
         || rest
             .components()
@@ -1802,12 +1802,12 @@ fn out_dir_source_identity(file: &Path, out_dir: Option<&OsStr>) -> Option<Vec<u
     {
         return None;
     }
-    let unit = out_dir_unit(Some(out_dir.as_os_str()));
-    if unit.is_empty() {
+    // Use the same resolved containment as the native archive scan. A lexical
+    // child can be a symlink to an unscanned directory outside this OUT_DIR.
+    if dirs_under_for(&[path.to_path_buf()], out_dir, args.invocation_env()).is_empty() {
         return None;
     }
-    let rest = rest.to_str()?.replace('\\', "/");
-    Some(format!("<OUT_DIR:{unit}>/{rest}").into_bytes())
+    Some(env_os_key_bytes(rest.as_os_str()))
 }
 
 /// The prediction identity of one rustc invocation, or `None` when there is
@@ -3426,10 +3426,7 @@ fn compute_key_into(
             let file_hash = file_hasher
                 .hash(file)
                 .with_context(|| format!("hashing source identity {}", file.display()))?;
-            let normalized_path = match out_dir_source_identity(file, out_dir.as_deref()) {
-                Some(identity) => identity,
-                None => source_path_identity(file, path_normalizer)?,
-            };
+            let normalized_path = source_path_identity(file, path_normalizer)?;
             hashed.push((normalized_path, file_hash));
         }
         hashed.sort();
@@ -3654,16 +3651,6 @@ fn compute_key_into(
     // cross-machine stability). Order is preserved — link order is
     // significant, and a stable argv from cargo keeps the key stable.
     const KNOWN_L_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
-    // A search dir inside this unit's own target dir (a build script's OUT_DIR)
-    // is keyed by its path below that dir. The target dir's name is the
-    // caller's choice (`target/`, `target/integrate-clippy`, any
-    // CARGO_TARGET_DIR), not an input: the archives the dir holds are hashed by
-    // content below ([`fold_native_link_inputs`]), and the same path in another
-    // checkout already shares the key through `<WORKSPACE>`. Keyed by its full
-    // path, one unit built in two target dirs of one checkout got two keys and
-    // compiled the same output twice (a workspace clippy in `target/` after one
-    // in `target/integrate-clippy`: 263 of 350 units again, 2026-10-18).
-    let unit_target_dir = args.target_dir();
     // Real (un-normalized) build-script search dirs, kept for resolving `-l`
     // static libs to a content hash below (#421). `native=`/bare entries are the
     // OUT_DIR dirs a `cc`/`cmake` build script emits; `dependency=`/`crate=` are
@@ -3689,16 +3676,16 @@ fn compute_key_into(
         if kind == Some("framework") {
             framework_search_dirs.push(file_hasher.resolve_path(Path::new(path))?);
         }
-        let normalized = match unit_target_dir
-            .as_deref()
-            .and_then(|dir| Path::new(path).strip_prefix(dir).ok())
+        if kind == Some("native")
+            && let Some(identity) =
+                out_dir_native_search_identity(args, Path::new(path), out_dir.as_deref())
         {
-            Some(rest) => format!(
-                "<UNIT_TARGET>/{}",
-                rest.to_string_lossy().replace('\\', "/")
-            ),
-            None => path_normalizer.normalize(path),
-        };
+            // A separate length-prefixed namespace avoids both old key-only
+            // aliases and separator ambiguity in a literal Unix filename.
+            fold_field(&mut hasher, b"link_search_native_out_dir.v1:", &identity);
+            continue;
+        }
+        let normalized = path_normalizer.normalize(path);
         hasher.update(b"link_search:");
         if let Some(k) = kind {
             hasher.update(k.as_bytes());

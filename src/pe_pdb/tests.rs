@@ -81,36 +81,63 @@ fn pe(magic: u16, debug: Debug<'_>) -> Vec<u8> {
 /// PDB information stream, stream 2 nil, stream 3 a DBI header with
 /// `dbi_age` (absent when `None`).
 fn pdb(guid: [u8; 16], info_age: u32, dbi_age: Option<u32>) -> Vec<u8> {
+    let mut info = pdb_info(guid, info_age);
+    info.extend(20140508u32.to_le_bytes());
+    msf_with_info(&info, dbi_age)
+}
+
+/// Info header followed by a serialized empty named-stream map and NiMac.
+fn pdb_info(guid: [u8; 16], age: u32) -> Vec<u8> {
+    let mut info = vec![0; 28];
+    put_u32(&mut info, 0, 20000404);
+    put_u32(&mut info, 4, 0x5f00_0000);
+    put_u32(&mut info, 8, age);
+    info[12..28].copy_from_slice(&guid);
+    for word in [0u32, 0, 1, 0, 0, 0] {
+        info.extend(word.to_le_bytes());
+    }
+    info
+}
+
+/// A minimal MSF whose directory and Info stream may span several blocks.
+/// The ordinary fixture still puts Info in block 3 and DBI in block 4.
+fn msf_with_info(info: &[u8], dbi_age: Option<u32>) -> Vec<u8> {
     const BLOCK: usize = 512;
-    // Blocks: 0 superblock, 1 block map, 2 directory, 3 info, 4 DBI.
-    let mut bytes = vec![0u8; BLOCK * 5];
+    let streams = if dbi_age.is_some() { 4u32 } else { 2u32 };
+    let info_blocks = info.len().div_ceil(BLOCK);
+    let directory_bytes =
+        4 + 4 * streams as usize + 4 * (info_blocks + usize::from(dbi_age.is_some()));
+    let directory_blocks = directory_bytes.div_ceil(BLOCK);
+    let info_first = 2 + directory_blocks;
+    let dbi_block = info_first + info_blocks;
+    let total_blocks = dbi_block + usize::from(dbi_age.is_some());
+    let mut bytes = vec![0; total_blocks * BLOCK];
     bytes[..32].copy_from_slice(MSF_MAGIC);
     put_u32(&mut bytes, 32, BLOCK as u32);
-    put_u32(&mut bytes, 40, 5);
+    put_u32(&mut bytes, 40, total_blocks as u32);
+    put_u32(&mut bytes, 44, directory_bytes as u32);
     put_u32(&mut bytes, 52, 1);
-    put_u32(&mut bytes, BLOCK, 2); // the directory lives in block 2
+    for index in 0..directory_blocks {
+        put_u32(&mut bytes, BLOCK + 4 * index, (2 + index) as u32);
+    }
     let mut directory = Vec::new();
-    let streams: u32 = if dbi_age.is_some() { 4 } else { 2 };
-    directory.extend(streams.to_le_bytes());
-    directory.extend(0u32.to_le_bytes()); // stream 0: empty
-    directory.extend(28u32.to_le_bytes()); // stream 1: info
-    if dbi_age.is_some() {
-        directory.extend(u32::MAX.to_le_bytes()); // stream 2: nil
-        directory.extend(64u32.to_le_bytes()); // stream 3: DBI
+    for word in [streams, 0, info.len() as u32] {
+        directory.extend(word.to_le_bytes());
     }
-    directory.extend(3u32.to_le_bytes());
     if dbi_age.is_some() {
-        directory.extend(4u32.to_le_bytes());
+        directory.extend(u32::MAX.to_le_bytes());
+        directory.extend(64u32.to_le_bytes());
     }
-    put_u32(&mut bytes, 44, directory.len() as u32);
-    bytes[BLOCK * 2..BLOCK * 2 + directory.len()].copy_from_slice(&directory);
-    let info = BLOCK * 3;
-    put_u32(&mut bytes, info, 20000404);
-    put_u32(&mut bytes, info + 4, 0x5f00_0000);
-    put_u32(&mut bytes, info + 8, info_age);
-    bytes[info + 12..info + 28].copy_from_slice(&guid);
+    for block in info_first..info_first + info_blocks {
+        directory.extend((block as u32).to_le_bytes());
+    }
+    if dbi_age.is_some() {
+        directory.extend((dbi_block as u32).to_le_bytes());
+    }
+    bytes[2 * BLOCK..2 * BLOCK + directory.len()].copy_from_slice(&directory);
+    bytes[info_first * BLOCK..info_first * BLOCK + info.len()].copy_from_slice(info);
     if let Some(age) = dbi_age {
-        let dbi = BLOCK * 4;
+        let dbi = dbi_block * BLOCK;
         put_u32(&mut bytes, dbi, u32::MAX);
         put_u32(&mut bytes, dbi + 4, 19990903);
         put_u32(&mut bytes, dbi + 8, age);
@@ -581,6 +608,9 @@ fn codeview_bounds_termination_and_ambiguity_fail_closed() {
 
     let mut bytes = pe(0x20b, rsds("app.pdb"));
     bytes.resize(0x440 + 4096, 0);
+    // The admitted maximum must also have a complete RVA-backed section.
+    put_u32(&mut bytes, 0x188 + 8, 0x40 + 4096);
+    put_u32(&mut bytes, 0x188 + 16, 0x40 + 4096);
     put_u32(&mut bytes, 0x41c + 16, 4096);
     bytes[0x440 + 24..0x440 + 4096 - 1].fill(b'a');
     assert!(
@@ -798,5 +828,289 @@ fn selected_executable_outputs_do_not_depend_on_an_exe_extension() {
         )
         .unwrap()
         .is_empty()
+    );
+}
+
+#[test]
+fn codeview_rva_and_raw_pointer_must_identify_the_same_valid_pair() {
+    for magic in [0x10b, 0x20b] {
+        let bytes = pe(magic, rsds("app.pdb"));
+        let good = Unit::new(&[
+            ("app.exe", bytes.clone()),
+            ("app.pdb", pdb(GUID, 1, Some(1))),
+        ]);
+        assert!(matches!(
+            good.check().unwrap()[..],
+            [Pairing::Paired { .. }]
+        ));
+
+        // Both addresses contain individually valid RSDS records, with distinct
+        // GUIDs and matching PDB controls. A raw-pointer-only reader chose A
+        // while LLVM/debugger-style RVA lookup chose B.
+        let mut other_guid = GUID;
+        other_guid[0] ^= 1;
+        let mut moved = bytes.clone();
+        let mut other_record = bytes[0x440..0x460].to_vec();
+        other_record[4] ^= 1;
+        moved[0x480..0x4a0].copy_from_slice(&other_record);
+        put_u32(&mut moved, 0x41c + 20, 0x1080);
+        put_u32(&mut moved, 0x41c + 24, 0x480);
+        let good_b = Unit::new(&[
+            ("app.exe", moved.clone()),
+            ("app.pdb", pdb(other_guid, 1, Some(1))),
+        ]);
+        assert!(matches!(
+            good_b.check().unwrap()[..],
+            [Pairing::Paired { .. }]
+        ));
+
+        put_u32(&mut moved, 0x41c + 24, 0x440);
+        let contradictory = Unit::new(&[("app.exe", moved), ("app.pdb", pdb(GUID, 1, Some(1)))]);
+        let error = format!("{:#}", contradictory.check().unwrap_err());
+        assert!(
+            error.contains("RVA and raw pointer select different data"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn codeview_rva_locations_must_be_present_complete_and_unique() {
+    for (rva, raw, message) in [
+        (0, 0x440, "has no mapped RVA"),
+        (0x1040, 0, "RVA and raw pointer"),
+        (0x8000, 0x440, "no file-backed RVA mapping"),
+        (0x11f0, 0x440, "not fully file-backed"),
+    ] {
+        let mut bytes = pe(0x20b, rsds("app.pdb"));
+        put_u32(&mut bytes, 0x41c + 20, rva);
+        put_u32(&mut bytes, 0x41c + 24, raw);
+        let error = inspect(bytes).unwrap_err().to_string();
+        assert!(
+            error.contains(message),
+            "RVA {rva:#x}, raw {raw:#x}: {error}"
+        );
+    }
+    for raw in [0x440, 0x500] {
+        let mut bytes = pe(0x20b, rsds("app.pdb"));
+        // This second section overlaps only the record, not the directory.
+        put_u16(&mut bytes, 0x80 + 6, 2);
+        put_u32(&mut bytes, 0x1b0 + 8, 0x40);
+        put_u32(&mut bytes, 0x1b0 + 12, 0x1040);
+        put_u32(&mut bytes, 0x1b0 + 16, 0x40);
+        put_u32(&mut bytes, 0x1b0 + 20, raw);
+        let error = inspect(bytes).unwrap_err().to_string();
+        assert!(error.contains("ambiguous RVA mappings"), "{error}");
+    }
+
+    for (address, raw_size) in [(0x1040, 16), (0x1050, 16)] {
+        let mut bytes = pe(0x20b, rsds("app.pdb"));
+        put_u16(&mut bytes, 0x80 + 6, 2);
+        put_u32(&mut bytes, 0x1b0 + 8, 0x40);
+        put_u32(&mut bytes, 0x1b0 + 12, address);
+        put_u32(&mut bytes, 0x1b0 + 16, raw_size);
+        put_u32(&mut bytes, 0x1b0 + 20, 0x500);
+        assert!(
+            inspect(bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("not fully file-backed"),
+            "even a partial overlapping mapping must not select another record"
+        );
+    }
+
+    let mut bytes = pe(0x20b, rsds("app.pdb"));
+    let record = bytes[0x440..0x460].to_vec();
+    bytes[0x300..0x320].copy_from_slice(&record);
+    put_u32(&mut bytes, 0x98 + 60, 0x400);
+    put_u32(&mut bytes, 0x41c + 20, 0x300);
+    put_u32(&mut bytes, 0x41c + 24, 0x300);
+    assert!(
+        matches!(
+            inspect(bytes.clone()).unwrap(),
+            ExecutableDebug::CodeView(_)
+        ),
+        "a consistent record in declared headers is supported"
+    );
+    let mut crossing = bytes.clone();
+    put_u32(&mut crossing, 0x41c + 20, 0x3f0);
+    put_u32(&mut crossing, 0x41c + 24, 0x3f0);
+    assert!(
+        inspect(crossing)
+            .unwrap_err()
+            .to_string()
+            .contains("crosses the headers")
+    );
+    put_u16(&mut bytes, 0x80 + 6, 2);
+    put_u32(&mut bytes, 0x1b0 + 8, 0x40);
+    put_u32(&mut bytes, 0x1b0 + 12, 0x300);
+    put_u32(&mut bytes, 0x1b0 + 16, 0x40);
+    put_u32(&mut bytes, 0x1b0 + 20, 0x500);
+    assert!(
+        inspect(bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous RVA mappings"),
+        "a section cannot contradict a header-backed record"
+    );
+}
+
+#[test]
+fn fastlink_is_refused_even_when_guid_and_both_ages_match() {
+    let mut info = pdb_info(GUID, 1);
+    for feature in [20140508u32, 0x4d54_4f4e] {
+        info.extend(feature.to_le_bytes());
+    }
+    let full = Unit::new(&[
+        ("app.exe", pe(0x20b, rsds("app.pdb"))),
+        ("app.pdb", msf_with_info(&info, Some(1))),
+    ]);
+    assert!(matches!(
+        full.check().unwrap()[..],
+        [Pairing::Paired { .. }]
+    ));
+    let mut vc110 = pdb_info(GUID, 1);
+    vc110.extend(20091201u32.to_le_bytes());
+    let legacy = Unit::new(&[("app.pdb", msf_with_info(&vc110, Some(1)))]);
+    assert_eq!(read_pdb_identity(&legacy.files[0].0).unwrap().guid, GUID);
+    info.extend(0x494e_494du32.to_le_bytes());
+    let fastlink = Unit::new(&[
+        ("app.exe", pe(0x20b, rsds("app.pdb"))),
+        ("app.pdb", msf_with_info(&info, Some(1))),
+    ]);
+    let error = format!("{:#}", fastlink.check().unwrap_err());
+    assert!(
+        error.contains("FASTLINK PDB needs the original object and library files"),
+        "{error}"
+    );
+}
+
+#[test]
+fn pdb_info_feature_tail_follows_the_complete_named_stream_map() {
+    // A real named-map entry whose string contains MINI must not look like
+    // the feature. The hash table also has a distinct deleted bucket.
+    let mut info = pdb_info(GUID, 1)[..28].to_vec();
+    info.extend(5u32.to_le_bytes());
+    info.extend(b"MINI\0");
+    for word in [1u32, 4, 1, 1, 1, 2, 0, 1, 0, 20140508] {
+        info.extend(word.to_le_bytes());
+    }
+    let identity = |info: &[u8]| {
+        let unit = Unit::new(&[("app.pdb", msf_with_info(info, Some(1)))]);
+        read_pdb_identity(&unit.files[0].0)
+    };
+    assert_eq!(identity(&info).unwrap().guid, GUID);
+    for version in [20000404, 20030901, 20091201, 20140508] {
+        let mut supported = info.clone();
+        put_u32(&mut supported, 0, version);
+        assert_eq!(identity(&supported).unwrap().guid, GUID);
+    }
+    let mut unsupported = info.clone();
+    put_u32(&mut unsupported, 0, 19990604);
+    assert!(
+        identity(&unsupported)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported PDB Info stream version")
+    );
+    for (offset, value, message) in [
+        (41, 0, "map capacity"),
+        (41, 1, "bitmap exceeds"),
+        (37, 0, "present count"),
+        (49, 16, "bitmap exceeds"),
+        (57, 1, "maps overlap"),
+        (45, u32::MAX, "named-stream map"),
+        (61, 5, "invalid string"),
+        (73, 0xdead_beef, "unsupported PDB Info feature"),
+    ] {
+        let mut invalid = info.clone();
+        put_u32(&mut invalid, offset, value);
+        let error = identity(&invalid).unwrap_err().to_string();
+        assert!(
+            error.contains(message) || (offset == 45 && error.contains("bitmap length overflow")),
+            "offset {offset}, value {value}: {error}"
+        );
+    }
+    for end in [27, 31, 36, 44, 52, 68, 72, 76] {
+        assert!(identity(&info[..end]).is_err(), "truncated Info at {end}");
+    }
+    let mut overloaded = info.clone();
+    put_u32(&mut overloaded, 37, 4);
+    put_u32(&mut overloaded, 49, 15);
+    put_u32(&mut overloaded, 57, 0);
+    assert!(
+        identity(&overloaded)
+            .unwrap_err()
+            .to_string()
+            .contains("map capacity")
+    );
+    let mut no_terminator = info.clone();
+    no_terminator[36] = b'X';
+    assert!(
+        identity(&no_terminator)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid string")
+    );
+}
+
+#[test]
+fn info_stream_and_directory_reads_use_their_logical_extents() {
+    let identity = |bytes: Vec<u8>| {
+        let unit = Unit::new(&[("app.pdb", bytes)]);
+        read_pdb_identity(&unit.files[0].0)
+    };
+    // A non-block-sized Info stream whose last feature is in its second block.
+    let mut info = pdb_info(GUID, 1);
+    for _ in 0..130 {
+        info.extend(20140508u32.to_le_bytes());
+    }
+    assert_eq!(info.len(), 572);
+    let complete = msf_with_info(&info, Some(1));
+    assert_eq!(identity(complete.clone()).unwrap().guid, GUID);
+    let mut invalid_block = complete.clone();
+    let blocks = u32_at(&invalid_block, 40);
+    put_u32(&mut invalid_block, 1024 + 24, blocks);
+    assert!(
+        identity(invalid_block)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the declared blocks")
+    );
+    info[568..572].copy_from_slice(&0x494e_494du32.to_le_bytes());
+    assert!(
+        identity(msf_with_info(&info, Some(1)))
+            .unwrap_err()
+            .to_string()
+            .contains("FASTLINK")
+    );
+
+    // The physical block still has a DBI block reference after the declared
+    // directory ends. Reading the entire last block would accidentally use it.
+    let mut short_directory = pdb(GUID, 1, Some(1));
+    put_u32(&mut short_directory, 44, 24);
+    assert!(
+        identity(short_directory)
+            .unwrap_err()
+            .to_string()
+            .contains("stream directory is truncated")
+    );
+
+    let mut boundary = pdb_info(GUID, 1);
+    while boundary.len() < 1_048_576 {
+        boundary.extend(20140508u32.to_le_bytes());
+    }
+    assert_eq!(boundary.len(), 1_048_576);
+    assert_eq!(
+        identity(msf_with_info(&boundary, Some(1))).unwrap().guid,
+        GUID
+    );
+    let mut excessive = pdb(GUID, 1, Some(1));
+    put_u32(&mut excessive, 1024 + 8, 1_048_577);
+    assert!(
+        identity(excessive)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds the supported admission size")
     );
 }

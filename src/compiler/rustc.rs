@@ -359,7 +359,9 @@ impl Compiler for RustcCompiler {
     }
 
     fn classify_output(&self, parsed: &RustcArgs, name: &str) -> ArtifactKind {
-        if parsed.is_user_facing_executable()
+        let kind = classify_by_filename(name);
+        if kind != ArtifactKind::WasmModule
+            && parsed.is_user_facing_executable()
             && parsed.emits_link()
             && parsed
                 .output
@@ -373,7 +375,7 @@ impl Compiler for RustcCompiler {
         // Only the extensionless / unrecognized cases need invocation
         // context (to distinguish a bin's primary output from random
         // unrelated files).
-        match classify_by_filename(name) {
+        match kind {
             ArtifactKind::Other("extensionless") => {
                 // No extension: the rustc convention for bin output on
                 // Unix. Confirm via crate_types (or `--test`).

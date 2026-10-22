@@ -12564,3 +12564,79 @@ fn windows_rustc_pairs_survive_json_and_fallback_cache_roundtrips() {
         );
     }
 }
+
+#[test]
+fn wasm_bin_outputs_keep_module_admission_and_restore_behavior() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let invocation = crate::invocation::InvocationEnv::from_parts(
+        std::iter::empty::<(String, String)>(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let compiler = RustcCompiler::new_for(&invocation);
+    let config = test_config(root.join("cache"));
+    let store = Store::open(&config).unwrap();
+    let wasm = b"\0asm\x01\0\0\0";
+    for explicit in [false, true] {
+        let producer = root.join(format!("wasm-producer-{explicit}"));
+        let consumer = root.join(format!("wasm-consumer-{explicit}"));
+        std::fs::create_dir_all(&producer).unwrap();
+        let output = producer.join("app.wasm");
+        std::fs::write(&output, wasm).unwrap();
+        let parse = |directory: &Path| {
+            let mut argv = s(&[
+                "rustc",
+                "main.rs",
+                "--crate-name=app",
+                "--crate-type=bin",
+                "--target=wasm32-unknown-unknown",
+                "--emit=link",
+                "--out-dir",
+                directory.to_str().unwrap(),
+            ]);
+            if explicit {
+                argv.extend(s(&["-o", directory.join("app.wasm").to_str().unwrap()]));
+            }
+            RustcArgs::parse_for(&argv, &invocation).unwrap()
+        };
+        let args = parse(&producer);
+        let artifacts = ArtifactSet::from_output_files(
+            vec![(output.clone(), "app.wasm".into())],
+            classify_by_filename,
+        );
+        assert_eq!(
+            compiler.classify_output(&args, "app.wasm"),
+            ArtifactKind::WasmModule
+        );
+        assert_eq!(
+            compiler.classify_output(&args, "app.wasm").link_strategy(),
+            link::LinkStrategy::Copy
+        );
+        assert!(
+            crate::compiler::plan_post_restore(compiler.classify_output(&args, "app.wasm"))
+                .is_empty()
+        );
+        assert_eq!(unpaired_executable_debug_info(&args, &artifacts), None);
+        let key = format!("wasm-compat-{explicit}");
+        store
+            .put(
+                &key,
+                "app",
+                &["bin".into()],
+                &[],
+                "wasm32-unknown-unknown",
+                "dev",
+                &[(output, "app.wasm".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let meta = store.get(&key).unwrap().unwrap();
+        let restore_args = parse(&consumer);
+        restore_from_cache(&config, &compiler, &store, &restore_args, &meta, None).unwrap();
+        assert_eq!(&std::fs::read(consumer.join("app.wasm")).unwrap(), wasm);
+    }
+}

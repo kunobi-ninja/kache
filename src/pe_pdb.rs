@@ -20,7 +20,10 @@
 //! Only the bytes needed are read: the PE headers, the debug directory and
 //! its record, and from the `.pdb` (an MSF 7.0 container) its superblock,
 //! stream directory, PDB information stream and DBI stream header. Cache hits
-//! validate the same pair before restoring any output. The linked invocation
+//! validate the same pair before restoring any output. FASTLINK databases need
+//! original objects and are refused through their Info-stream MINI feature.
+//! File-only CodeView layouts without a mapped RVA are also left uncached.
+//! The linked invocation
 //! selects an explicit `-o` output even without an `.exe` suffix; an unknown
 //! or ambiguous output cannot be cached. Other executable formats
 //! keep their existing handling, including ELF binaries named with `.exe`.
@@ -46,6 +49,8 @@ const PDB_INFO_STREAM: usize = 1;
 const DBI_STREAM: usize = 3;
 /// The largest stream directory read; a multi-gigabyte `.pdb` stays far below.
 const MAX_DIRECTORY_BYTES: u64 = 64 << 20;
+/// Bound the Info stream read needed to identify external-debug flavors.
+const MAX_INFO_STREAM_BYTES: u32 = 1 << 20;
 /// The largest CodeView record read; its path is at most `MAX_PATH`-ish.
 const MAX_CODEVIEW_BYTES: u32 = 4096;
 /// A conservative admission limit; ordinary linkers write only a few entries.
@@ -188,6 +193,7 @@ pub(crate) fn executable_output_name<'a>(
         matches!(
             crate::compiler::classify_by_filename(name),
             crate::compiler::ArtifactKind::Executable
+                | crate::compiler::ArtifactKind::WasmModule
                 | crate::compiler::ArtifactKind::Other("extensionless")
         )
     });
@@ -337,37 +343,8 @@ pub(crate) fn read_codeview(path: &Path) -> Result<ExecutableDebug> {
         pe + 24 + optional_size as u64,
         sections * SECTION_HEADER_SIZE,
     )?;
-    let headers = u64::from(u32_at(&optional, 60));
-    let debug_offset = if u64::from(debug_rva) < headers {
-        ensure!(
-            u64::from(debug_rva) + u64::from(debug_size) <= headers,
-            "PE debug directory crosses the headers"
-        );
-        u64::from(debug_rva)
-    } else {
-        let mut locations = table
-            .as_chunks::<SECTION_HEADER_SIZE>()
-            .0
-            .iter()
-            .filter_map(|section| {
-                let address = u32_at(section, 12);
-                let delta = debug_rva.checked_sub(address)?;
-                let raw_size = u32_at(section, 16);
-                let span = u32_at(section, 8).max(raw_size);
-                if delta >= span || u64::from(delta) + u64::from(debug_size) > u64::from(raw_size) {
-                    return None;
-                }
-                Some(u64::from(u32_at(section, 20)) + u64::from(delta))
-            });
-        let offset = locations
-            .next()
-            .context("the PE debug directory has no file-backed section")?;
-        ensure!(
-            locations.next().is_none(),
-            "PE debug directory has ambiguous sections"
-        );
-        offset
-    };
+    let headers = u32_at(&optional, 60);
+    let debug_offset = file_offset_for_rva(debug_rva, debug_size, headers, &table)?;
     file.check_range(debug_offset, u64::from(debug_size))?;
     let mut found = None;
     for index in 0..debug_size / DEBUG_ENTRY_SIZE as u32 {
@@ -384,7 +361,14 @@ pub(crate) fn read_codeview(path: &Path) -> Result<ExecutableDebug> {
             (25..=MAX_CODEVIEW_BYTES).contains(&size),
             "CodeView record of {size} bytes"
         );
-        let record = file.read_at(u64::from(u32_at(&entry, 24)), size as usize)?;
+        // Consumers can locate CodeView through its RVA rather than its raw
+        // file pointer. Both addresses must select the same complete record.
+        let record_offset = file_offset_for_rva(u32_at(&entry, 20), size, headers, &table)?;
+        ensure!(
+            record_offset == u64::from(u32_at(&entry, 24)),
+            "CodeView RVA and raw pointer select different data"
+        );
+        let record = file.read_at(record_offset, size as usize)?;
         ensure!(&record[..4] == b"RSDS", "CodeView record is not RSDS");
         let mut guid = [0; 16];
         guid.copy_from_slice(&record[4..20]);
@@ -405,8 +389,47 @@ pub(crate) fn read_codeview(path: &Path) -> Result<ExecutableDebug> {
     Ok(found.map_or(ExecutableDebug::NoCodeView, ExecutableDebug::CodeView))
 }
 
+/// Map a complete debug-data extent through exactly one declared file-backed
+/// location. Headers and overlapping sections must not select different bytes.
+fn file_offset_for_rva(rva: u32, size: u32, headers: u32, table: &[u8]) -> Result<u64> {
+    ensure!(
+        rva != 0,
+        "PE debug data has no mapped RVA (file-only layout is unsupported)"
+    );
+    let start = u64::from(rva);
+    let end = start + u64::from(size);
+    let mut location = if rva < headers {
+        ensure!(
+            end <= u64::from(headers),
+            "PE debug data crosses the headers"
+        );
+        Some(start)
+    } else {
+        None
+    };
+    for section in table.as_chunks::<SECTION_HEADER_SIZE>().0 {
+        let address = u64::from(u32_at(section, 12));
+        let raw_size = u64::from(u32_at(section, 16));
+        let span = u64::from(u32_at(section, 8)).max(raw_size);
+        if end <= address || start >= address + span {
+            continue;
+        }
+        ensure!(
+            start >= address && end <= address + raw_size,
+            "PE debug data is not fully file-backed in an overlapping section"
+        );
+        ensure!(
+            location.is_none(),
+            "PE debug data has ambiguous RVA mappings"
+        );
+        location = Some(u64::from(u32_at(section, 20)) + start - address);
+    }
+    location.context("PE debug data has no file-backed RVA mapping")
+}
+
 /// The GUID and executable-validation ages of a modern MSF 7.0 database.
-/// Both Info and DBI headers must exist within the declared file blocks.
+/// Both Info and DBI headers must exist within the declared file blocks. The
+/// bounded Info stream must have a supported, non-FASTLINK feature tail.
 pub(crate) fn read_pdb_identity(path: &Path) -> Result<PdbIdentity> {
     let mut file = Reader::open(path)?;
     let superblock = file.read_at(0, 56)?;
@@ -445,44 +468,61 @@ pub(crate) fn read_pdb_identity(path: &Path) -> Result<PdbIdentity> {
             block < blocks,
             "MSF directory block is outside the declared blocks"
         );
-        directory.extend(file.read_at(block * block_size, block_size as usize)?);
+        let remaining = directory_bytes as usize - directory.len();
+        directory.extend(file.read_at(block * block_size, remaining.min(block_size as usize))?);
     }
-    directory.truncate(directory_bytes as usize);
     let streams = u32_at(&directory, 0) as usize;
     ensure!(
         streams <= (directory.len() - 4) / 4,
         "MSF stream directory is truncated"
     );
-    let first_block = |stream: usize| -> Result<(u64, u32)> {
+    let stream_blocks = |stream: usize| -> Result<(u32, &[u8])> {
         ensure!(stream < streams, "PDB stream {stream} is missing");
         let size_of = |index: usize| match u32_at(&directory, 4 + 4 * index) {
             u32::MAX => 0,
             size => size,
         };
+        let size = size_of(stream);
+        ensure!(size != 0, "PDB stream {stream} is empty");
+        ensure!(
+            stream != PDB_INFO_STREAM || size <= MAX_INFO_STREAM_BYTES,
+            "PDB Info stream of {size} bytes exceeds the supported admission size"
+        );
         let blocks_before: u64 = (0..stream)
             .map(|i| u64::from(size_of(i)).div_ceil(block_size))
             .sum();
-        let size = size_of(stream);
-        ensure!(size != 0, "PDB stream {stream} is empty");
         let at = 4 + 4 * streams + 4 * blocks_before as usize;
+        let length = 4 * u64::from(size).div_ceil(block_size) as usize;
+        let ids = directory
+            .get(at..at + length)
+            .context("MSF stream directory is truncated")?;
         ensure!(
-            directory.len() >= at + 4,
-            "MSF stream directory is truncated"
-        );
-        let block = u64::from(u32_at(&directory, at));
-        ensure!(
-            block < blocks,
+            ids.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|id| u64::from(u32::from_le_bytes(*id)) < blocks),
             "PDB stream {stream} points outside the declared blocks"
         );
-        Ok((block * block_size, size))
+        Ok((size, ids))
     };
-    let (info_at, info_size) = first_block(PDB_INFO_STREAM)?;
+    let (info_size, info_blocks) = stream_blocks(PDB_INFO_STREAM)?;
     ensure!(info_size >= 28, "the PDB information stream is truncated");
-    let info = file.read_at(info_at, 28)?;
+    let mut info = Vec::with_capacity(info_size as usize);
+    for block in info_blocks.as_chunks::<4>().0 {
+        let at = u64::from(u32::from_le_bytes(*block)) * block_size;
+        let remaining = info_size as usize - info.len();
+        info.extend(file.read_at(at, remaining.min(block_size as usize))?);
+    }
+    ensure!(
+        matches!(u32_at(&info, 0), 20000404 | 20030901 | 20091201 | 20140508),
+        "unsupported PDB Info stream version"
+    );
+    check_pdb_info_features(&info)?;
     let mut guid = [0; 16];
     guid.copy_from_slice(&info[12..28]);
-    let (dbi_at, dbi_size) = first_block(DBI_STREAM)?;
+    let (dbi_size, dbi_blocks) = stream_blocks(DBI_STREAM)?;
     ensure!(dbi_size >= 64, "the PDB DBI header is truncated");
+    let dbi_at = u64::from(u32_at(dbi_blocks, 0)) * block_size;
     let dbi = file.read_at(dbi_at, 64)?;
     ensure!(
         u32_at(&dbi, 0) == u32::MAX && matches!(u32_at(&dbi, 4), 19990903 | 20091201),
@@ -493,6 +533,91 @@ pub(crate) fn read_pdb_identity(path: &Path) -> Result<PdbIdentity> {
         info_age: u32_at(&info, 8),
         dbi_age: u32_at(&dbi, 8),
     })
+}
+
+/// Locate the feature tail through the documented named-stream map. MINI
+/// marks FASTLINK PDBs, which need the original objects even with a matching
+/// GUID/age. This skips a bounded map; it does not decode symbols or types.
+fn check_pdb_info_features(info: &[u8]) -> Result<()> {
+    fn take<'a>(bytes: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
+        let (value, rest) = (*bytes)
+            .split_at_checked(length)
+            .context("truncated PDB Info named-stream map")?;
+        *bytes = rest;
+        Ok(value)
+    }
+    fn number(bytes: &mut &[u8]) -> Result<u32> {
+        Ok(u32_at(take(bytes, 4)?, 0))
+    }
+    fn bitmap<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
+        let length = (number(bytes)? as usize)
+            .checked_mul(4)
+            .context("PDB Info bitmap length overflow")?;
+        take(bytes, length)
+    }
+    let mut bytes = info.get(28..).context("truncated PDB Info header")?;
+    let string_bytes = number(&mut bytes)? as usize;
+    let names = take(&mut bytes, string_bytes)?;
+    // One reverse scan validates every later name offset without repeatedly
+    // scanning a large shared string buffer for each hash-table entry.
+    let last_terminator = names.iter().rposition(|&byte| byte == 0);
+    let entries = number(&mut bytes)?;
+    let capacity = number(&mut bytes)?;
+    ensure!(
+        capacity != 0 && u64::from(entries) <= u64::from(capacity) * 2 / 3 + 1,
+        "invalid PDB Info map capacity"
+    );
+    let present = bitmap(&mut bytes)?;
+    let deleted = bitmap(&mut bytes)?;
+    let mut present_count = 0u64;
+    for (is_present, map) in [(true, present), (false, deleted)] {
+        for (index, word) in map.as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_le_bytes(*word);
+            ensure!(
+                word == 0
+                    || index as u64 * 32 + u64::from(32 - word.leading_zeros())
+                        <= u64::from(capacity),
+                "PDB Info bitmap exceeds its map capacity"
+            );
+            if is_present {
+                present_count += u64::from(word.count_ones());
+            }
+        }
+    }
+    ensure!(
+        present_count == u64::from(entries),
+        "PDB Info present count does not match its map size"
+    );
+    ensure!(
+        present
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(deleted.as_chunks::<4>().0.iter())
+            .all(|(left, right)| u32::from_le_bytes(*left) & u32::from_le_bytes(*right) == 0),
+        "PDB Info present and deleted maps overlap"
+    );
+    for _ in 0..entries {
+        let name = number(&mut bytes)? as usize;
+        ensure!(
+            last_terminator.is_some_and(|end| name <= end),
+            "PDB Info map names an invalid string"
+        );
+        let _stream = number(&mut bytes)?;
+    }
+    let _ni_mac = number(&mut bytes)?;
+    ensure!(
+        bytes.len().is_multiple_of(4),
+        "PDB Info feature tail is truncated"
+    );
+    for feature in bytes.as_chunks::<4>().0 {
+        match u32::from_le_bytes(*feature) {
+            0x494e_494d => bail!("FASTLINK PDB needs the original object and library files"),
+            20091201 | 20140508 | 0x4d54_4f4e => {}
+            feature => bail!("unsupported PDB Info feature {feature:#x}"),
+        }
+    }
+    Ok(())
 }
 
 /// A bounded file reader shared by the PE and MSF headers. Bounds are checked

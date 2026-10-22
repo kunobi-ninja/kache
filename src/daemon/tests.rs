@@ -15212,14 +15212,59 @@ fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
         .expect("bind listener");
     let line = format!("{{\"pad\":\"{}\"}}\n", "y".repeat(256 << 10));
     let expected = line.clone();
+    let (release, held) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         let stream = listener.accept().expect("accept");
         let mut received = String::new();
-        std::io::BufReader::new(stream)
+        std::io::BufReader::new(&stream)
             .read_line(&mut received)
             .unwrap();
+        held.recv_timeout(Duration::from_secs(20)).unwrap();
         received
     });
     send_line_fire_and_forget(&socket, line, Duration::from_secs(10)).expect("send");
+    release.send(()).unwrap();
     assert_eq!(reader.join().unwrap(), expected);
+}
+
+/// Measure the actual request, including creation and destruction of its
+/// runtime, against a pipe whose only instance remains occupied.
+#[cfg(windows)]
+#[test]
+fn a_busy_windows_request_honors_its_short_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("request-busy.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .unwrap();
+    let _first = crate::transport::connect_sync(&socket, Duration::ZERO).unwrap();
+    let started = Instant::now();
+    let result = within_20s(move || {
+        send_request_with_timeout(&socket, &Request::Health, Duration::from_millis(75))
+    });
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_millis(750));
+}
+
+/// Even a short write that fits in the kernel buffer must not escape into
+/// interprocess's unbounded background flush when the peer never reads.
+#[cfg(windows)]
+#[test]
+fn a_buffered_fire_and_forget_request_is_bounded_through_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("buffered-write.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .unwrap();
+    let started = Instant::now();
+    let result = within_20s(move || {
+        send_line_fire_and_forget(&socket, "{}\n".to_owned(), Duration::from_millis(500))
+    });
+    assert!(
+        result.is_err(),
+        "a peer that never reads cannot finish a flush"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

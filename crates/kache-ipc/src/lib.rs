@@ -15,6 +15,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+mod deadline_io;
+pub use deadline_io::finish_by;
+
 pub use interprocess::local_socket::ListenerOptions;
 #[cfg(feature = "async")]
 pub use interprocess::local_socket::tokio::Stream as TokioStream;
@@ -295,12 +298,33 @@ pub async fn connect_tokio(
     #[cfg(windows)]
     {
         use interprocess::os::windows::named_pipe::{local_socket, pipe_mode, tokio};
-        let pipe = tokio::DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
-            pipe_path(socket),
-            interprocess::ConnectWaitMode::Timeout(busy_wait),
-        )
-        .await?;
-        Ok(local_socket::tokio::Stream::from(pipe).into())
+        // Zero-wait attempts never enter interprocess's spawn_blocking path.
+        // Cancellation and runtime drop therefore leave no busy-pipe waiter.
+        let path = pipe_path(socket);
+        let deadline = ::tokio::time::Instant::now() + busy_wait;
+        loop {
+            match tokio::DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+                path.as_str(),
+                interprocess::ConnectWaitMode::Timeout(std::time::Duration::ZERO),
+            )
+            .await
+            {
+                Ok(pipe) => return Ok(local_socket::tokio::Stream::from(pipe).into()),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        && ::tokio::time::Instant::now() < deadline =>
+                {
+                    let next = (::tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(10))
+                    .min(deadline);
+                    ::tokio::time::sleep_until(next).await;
+                    if ::tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     #[cfg(not(windows))]
     {
@@ -310,27 +334,35 @@ pub async fn connect_tokio(
     }
 }
 
-/// Run `work` on a helper thread and wait for it until `deadline`.
-///
-/// `None` when it is not done by then (or no thread could be started): the
-/// caller goes on as if the work failed, and the helper finishes or blocks on
-/// its own, ending at the latest with the process. For I/O that has no
-/// timeout of its own, such as a write to a Windows named pipe whose reader
-/// stalled, or a library's connect that waits for a busy pipe without limit.
-pub fn finish_by<T: Send + 'static>(
-    deadline: std::time::Instant,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let (done, finished) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("kache-bounded-io".into())
-        .spawn(move || {
-            let _ = done.send(work());
-        })
-        .ok()?;
-    finished
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .ok()
+/// Close a failed or completed client exchange without interprocess starting
+/// an unbounded background pipe flush. A reply proves the request was read;
+/// failed exchanges may discard their remaining bytes.
+#[cfg(all(windows, feature = "async"))]
+#[must_use = "keep this guard alive through the exchange"]
+pub fn discard_pipe_writes_on_drop(stream: &TokioStream) -> impl Drop + '_ {
+    struct Discard<'a>(&'a TokioStream);
+    impl Drop for Discard<'_> {
+        fn drop(&mut self) {
+            let TokioStream::NamedPipe(pipe) = self.0;
+            pipe.inner().assume_flushed();
+        }
+    }
+    Discard(stream)
+}
+
+/// Keep synchronous pipe cleanup inside the bounded I/O worker. Its caller
+/// explicitly flushes a successful no-response request before releasing it.
+#[cfg(windows)]
+#[must_use = "keep this guard alive through the exchange"]
+pub fn discard_sync_pipe_writes_on_drop(stream: &SyncStream) -> impl Drop + '_ {
+    struct Discard<'a>(&'a SyncStream);
+    impl Drop for Discard<'_> {
+        fn drop(&mut self) {
+            let SyncStream::NamedPipe(pipe) = self.0;
+            pipe.inner().assume_flushed();
+        }
+    }
+    Discard(stream)
 }
 
 /// True if a daemon socket / named pipe at `path` accepts a connection
@@ -470,6 +502,48 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("Tokio connect to a busy pipe hung");
         assert!(result.is_err(), "a busy pipe cannot take a second client");
+    }
+
+    /// Cancel an outer request before its longer connect wait. Dropping the
+    /// runtime must not join an abandoned blocking named-pipe connect.
+    #[cfg(all(windows, feature = "async"))]
+    #[test]
+    fn cancelling_a_busy_connect_does_not_delay_runtime_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel-busy.sock");
+        let _listener = ListenerOptions::new()
+            .name(socket_name(&path).unwrap())
+            .create_sync()
+            .unwrap();
+        let _first = connect_sync(&path, std::time::Duration::ZERO).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let started = std::time::Instant::now();
+            assert!(
+                runtime
+                    .block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(75),
+                            connect_tokio(&path, std::time::Duration::from_secs(2)),
+                        )
+                        .await
+                    })
+                    .is_err()
+            );
+            drop(runtime);
+            done.send(started.elapsed()).unwrap();
+        });
+        let elapsed = finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("runtime drop waited for the cancelled connect");
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "{elapsed:?}"
+        );
     }
 
     /// A free instance: the bounded connect takes it at once, and the stream

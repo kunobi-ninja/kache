@@ -13751,6 +13751,26 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.db");
     let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    cache
+        .put_cc_preprocess_memo_inputs(
+            "existing",
+            "preprocessed",
+            &[crate::file_hash::CcPreprocessMemoInput {
+                name: "a.h".into(),
+                fingerprint: crate::file_hash::FileFingerprint {
+                    path: "/checkout/a.h".into(),
+                    size: 1,
+                    mtime_ns: 1,
+                    ctime_ns: 1,
+                    inode: 1,
+                },
+                content: "header-content".into(),
+                mapped: String::new(),
+                observed_ns: 10 * crate::file_hash::HASH_SETTLE_NS,
+            }],
+        )
+        .unwrap();
     db.execute_batch("DROP TABLE cc_header_scans").unwrap();
     db.pragma_update(None, "user_version", 10_i64).unwrap();
     drop(db);
@@ -13766,4 +13786,18 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     assert_eq!(tables, 1, "cc_header_scans was not created");
     let cache = crate::file_hash::FileHashCache::Borrowed(&db);
     assert!(cache.get_cc_preprocess_memo("absent").unwrap().is_none());
+    let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
+    assert_eq!(memo.preprocessed_hash, "preprocessed");
+    assert_eq!(memo.header_scans, vec![None]);
+    cache
+        .put_cc_header_scans(7, &[("header-content".into(), "[]".into())])
+        .unwrap();
+    assert_eq!(cache.prune_cc_preprocess_memos().unwrap(), (0, 0));
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
+    assert_eq!(memo.preprocessed_hash, "preprocessed");
+    assert_eq!(memo.header_scans, vec![Some((7, "[]".into()))]);
 }

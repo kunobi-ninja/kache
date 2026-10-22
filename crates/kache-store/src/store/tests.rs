@@ -2306,7 +2306,7 @@ fn strict_imports_verify_and_sync_shared_pending_blobs_before_success() {
             let entry = write_verified_fixture(&strict, &import_key, &import_key, "lib.rlib", None);
             if batched && !corrupt {
                 deferred
-                    .import_verified_restored_entries(&[entry.clone()])
+                    .import_verified_restored_entries(std::slice::from_ref(&entry))
                     .unwrap();
                 fs::write(strict.entry_dir(&import_key).join("lib.rlib"), shared_bytes).unwrap();
             }
@@ -2373,7 +2373,7 @@ fn strict_put_verifies_and_syncs_a_shared_pending_winner() {
         let deferred = Store::open(&config).unwrap();
         let bytes = b"strict shared artifact";
         put_entry(&deferred, dir.path(), 97, "pending", bytes);
-        let blob = deferred.blob_path(&blake3::hash(bytes).to_hex().to_string());
+        let blob = deferred.blob_path(blake3::hash(bytes).to_hex().as_ref());
         let identity = kache_fs::file_identity(&blob).unwrap();
         if corrupt {
             let mut permissions = fs::metadata(&blob).unwrap().permissions();
@@ -2675,7 +2675,7 @@ fn durability_flush_verifies_reopened_imports_and_continues_after_corruption() {
         if batched {
             assert_eq!(
                 store
-                    .import_verified_restored_entries(&[entry.clone()])
+                    .import_verified_restored_entries(std::slice::from_ref(&entry))
                     .unwrap(),
                 1
             );
@@ -10460,7 +10460,7 @@ fn test_get_lazily_migrates_legacy_entry() {
 }
 
 #[test]
-fn get_evicts_when_lazy_legacy_migration_fails() {
+fn get_preserves_a_retryable_legacy_entry_when_migration_fails() {
     // Covers get lazy-migration error warning branch.
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
@@ -10510,12 +10510,19 @@ fn get_evicts_when_lazy_legacy_migration_fails() {
 
     let result = store.get("old_bad_key").unwrap();
 
-    assert!(
-        result.is_none(),
-        "failed migration falls through to eviction"
-    );
-    assert!(!store.contains("old_bad_key"));
+    assert!(result.is_none(), "failed migration must not serve a hit");
+    assert!(store.contains("old_bad_key"));
+    assert_eq!(fs::read(&artifact).unwrap(), b"old format artifact");
     assert!(shard_path.is_file(), "unrelated shard conflict remains");
+
+    fs::remove_file(&shard_path).unwrap();
+    assert!(store.get("old_bad_key").unwrap().is_some());
+    assert!(!artifact.exists());
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"old format artifact"
+    );
+    assert_eq!(blob_refcount(&store, &hash), Some(1));
 }
 
 #[test]
@@ -11885,7 +11892,7 @@ fn legacy_migration_syncs_a_pending_winner_and_keeps_good_artifacts_on_corruptio
         let store = Store::open(&config).unwrap();
         let shared = b"shared pending artifact";
         let seed = put_entry(&store, dir.path(), 100, "pending", shared);
-        let blob = store.blob_path(&blake3::hash(shared).to_hex().to_string());
+        let blob = store.blob_path(blake3::hash(shared).to_hex().as_ref());
         let identity = kache_fs::file_identity(&blob).unwrap();
         let meta = legacy_entry(
             &store,
@@ -11945,6 +11952,7 @@ fn legacy_migration_keeps_completed_refcounts_after_a_later_io_failure() {
         second.parent(),
         "the failure must affect only the second shard"
     );
+    fs::create_dir_all(store.blobs_dir()).unwrap();
     let result = store.migrate_entry_to_blobs_after_preflight(&meta, || {
         assert!(!second.parent().unwrap().exists());
         fs::write(second.parent().unwrap(), b"not a directory").unwrap();

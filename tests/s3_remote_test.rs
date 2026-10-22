@@ -211,6 +211,12 @@ struct Client {
     command_seq: usize,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        common::stop_daemon(self.command().args(["daemon", "stop"]), &self.runtime_dir);
+    }
+}
+
 impl Client {
     fn new() -> Self {
         let root = TempDir::new().unwrap();

@@ -51,6 +51,7 @@ fn miss_and_verified_hit_emit_metadata_once_and_preserve_large_diagnostics() {
     build_kache();
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     fs::create_dir(project.path().join("out")).unwrap();
     fs::write(
         isolated_config_path(cache.path()),
@@ -103,6 +104,19 @@ fn miss_and_verified_hit_emit_metadata_once_and_preserve_large_diagnostics() {
             .collect();
         assert_eq!(hit_diagnostics, diagnostics);
     }
+
+    let state: Value =
+        serde_json::from_slice(&fs::read(cache.path().join("daemon.state.json")).unwrap()).unwrap();
+    let pid =
+        kunobi_daemon::ProcessId::new(state["pid"].as_u64().unwrap().try_into().unwrap()).unwrap();
+    let mut process = kunobi_daemon::local::ProcessHandle::open(pid).unwrap();
+    drop(_daemon);
+    assert!(
+        process
+            .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(3))
+            .unwrap(),
+        "fixture cleanup left its daemon process running"
+    );
 }
 
 #[test]
@@ -111,6 +125,7 @@ fn changing_diagnostic_format_preserves_requested_output_and_reuse() {
     let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
     let cache = project.join("cache");
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let home = project.join("home");
     let out = project.join("out");
     fs::create_dir(&cache).unwrap();
@@ -208,6 +223,7 @@ fn explicit_metadata_destinations_are_materialized_without_cache_replay() {
     let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
     let cache = project.join("cache");
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let home = project.join("home");
     let out = project.join("out");
     fs::create_dir(&cache).unwrap();

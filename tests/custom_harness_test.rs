@@ -141,6 +141,7 @@ fn custom_harness_test_binary_is_executable_after_restore() {
     build_kache();
     let project = copy_fixture();
     let cache = TempDir::new_in(scratch_dir()).unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let target = TempDir::new_in(scratch_dir()).unwrap();
 
     let cold = cargo_test(project.path(), cache.path(), target.path());

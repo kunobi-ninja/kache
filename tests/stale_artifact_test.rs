@@ -92,6 +92,7 @@ fn stale_cache_hit_baseline() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // First build -- populates cache
@@ -131,6 +132,7 @@ fn stale_invalidates_on_crate_root_edit() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // First build
@@ -171,6 +173,7 @@ fn stale_invalidates_on_module_edit() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     let out1 = build_and_run(
@@ -213,6 +216,7 @@ fn stale_invalidates_on_new_module() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     let out1 = build_and_run(
@@ -259,6 +263,7 @@ fn stale_invalidates_on_feature_change() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // Build without features
@@ -294,6 +299,7 @@ fn stale_invalidates_on_rustflags_change() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // Build with default flags
@@ -340,6 +346,7 @@ fn stale_invalidates_on_profile_change() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // Build debug
@@ -372,6 +379,7 @@ fn stale_recovers_from_corrupted_artifact() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // First build — populates cache
@@ -435,6 +443,7 @@ fn stale_concurrent_builds_safe() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target1 = TempDir::new().unwrap();
     let target2 = TempDir::new().unwrap();
 
@@ -495,6 +504,7 @@ fn stale_invalidates_on_env_change() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // Build without env var
@@ -530,6 +540,7 @@ fn stale_invalidates_on_coverage_flag() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     // Build without coverage
@@ -621,6 +632,7 @@ fn unrestorable_cache_entry_falls_back_to_recompile() {
     build_kache();
     let project = copy_fixture();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
 
     let out1 = build_and_run(
@@ -755,6 +767,7 @@ fn stale_native_archive_two_crates_down_reaches_the_binary() {
     let project = TempDir::new().unwrap();
     write_native_chain(project.path());
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
     let config = isolated_config_path(cache_dir.path());
     std::fs::write(

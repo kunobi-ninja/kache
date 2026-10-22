@@ -297,6 +297,7 @@ fn fixture() -> (TempDir, TempDir, TempDir, PathBuf) {
 fn predictions_cold_warm_off_and_stale_closure() {
     build_kache();
     let (work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let cache_dir = cache.path();
     let out_dir = out.path();
 
@@ -351,6 +352,7 @@ fn predictions_cold_warm_off_and_stale_closure() {
 fn a_stale_record_is_re_derived_from_the_running_compile() {
     build_kache();
     let (work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let (cache_dir, out_dir) = (cache.path(), out.path());
     run_kache_rustc_as_cargo(cache_dir, out_dir, &src, true);
     let cold = last_event(cache_dir);
@@ -423,6 +425,7 @@ fn a_source_saved_while_rustc_ran_is_not_restored_for_its_new_content() {
 
     build_kache();
     let (work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let (cache_dir, out_dir) = (cache.path(), out.path());
     let module = work.path().join("a.rs");
     let sysroot = std::process::Command::new(rustc_path())
@@ -498,6 +501,7 @@ fn a_source_saved_while_rustc_ran_is_not_restored_for_its_new_content() {
 fn a_too_new_input_leaves_a_compile_first_result_unstored() {
     build_kache();
     let (work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let (cache_dir, out_dir) = (cache.path(), out.path());
     let module = work.path().join("a.rs");
     let stamp = |at: SystemTime| {
@@ -554,6 +558,7 @@ fn a_too_new_input_leaves_a_compile_first_result_unstored() {
 fn verified_predictions_agree_with_the_pre_pass_and_count_it() {
     build_kache();
     let (_work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let cache_dir = cache.path();
     let out_dir = out.path();
 
@@ -592,6 +597,7 @@ fn verified_predictions_agree_with_the_pre_pass_and_count_it() {
 fn predictions_sibling_shadow_fails_closed() {
     build_kache();
     let (work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let cache_dir = cache.path();
     let out_dir = out.path();
 
@@ -672,6 +678,12 @@ struct OutDirUnit {
     proc_macro: Option<PathBuf>,
     /// Copied into every target's `deps`; the unit then links `facade`.
     facade: Vec<PathBuf>,
+}
+
+impl Drop for OutDirUnit {
+    fn drop(&mut self) {
+        drop(common::DaemonGuard::new(kache_binary(), &self.cache));
+    }
 }
 
 impl OutDirUnit {
@@ -1068,6 +1080,15 @@ struct WorkspaceUnit {
     runtime: Option<PathBuf>,
     /// A `[cache.volumes]` store for each target, apart from the cache.
     shard: Option<PathBuf>,
+}
+
+impl Drop for WorkspaceUnit {
+    fn drop(&mut self) {
+        drop(common::DaemonGuard::new(
+            kache_binary(),
+            self.runtime.as_ref().unwrap_or(&self.cache),
+        ));
+    }
 }
 
 impl WorkspaceUnit {
@@ -1866,6 +1887,13 @@ struct EmptyOutDirMacro {
     package: PathBuf,
     alias: bool,
     proc_macro: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl Drop for EmptyOutDirMacro {
+    fn drop(&mut self) {
+        drop(common::DaemonGuard::new(kache_binary(), &self.cache));
+    }
 }
 
 #[cfg(unix)]

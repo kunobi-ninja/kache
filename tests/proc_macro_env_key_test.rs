@@ -200,6 +200,7 @@ fn declared_env_var_separates_proc_macro_expansions() {
     build_kache();
     let workspace = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let out = TempDir::new().unwrap();
 
     // Declare the var that steers expansion. Without this the two compiles are

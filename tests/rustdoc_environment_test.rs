@@ -7,6 +7,7 @@ mod common;
 use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 struct DocFixture {
+    _daemon: common::DaemonGuard,
     project: tempfile::TempDir,
     cache: PathBuf,
     edition: Option<&'static str>,
@@ -32,6 +33,7 @@ impl DocFixture {
             "[cache]\nlocal_only = true\nscheduler = false\nauto_gc = false\ndaemon_publish = false\n").unwrap();
         fs::write(project.path().join("lib.rs"), source).unwrap();
         Self {
+            _daemon: common::DaemonGuard::new(kache_binary(), &cache),
             project,
             cache,
             edition,

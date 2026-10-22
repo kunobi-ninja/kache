@@ -21,7 +21,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+#[allow(dead_code)]
+mod common;
 
 /// Path to the kache binary under test (Cargo sets this for the
 /// integration-test harness).
@@ -36,6 +37,7 @@ const FAKE_MARKER: &str = "__KACHE_FAKE_COMPILER_FAMILY_PROBE__";
 #[test]
 fn family_probe_forwards_to_real_compiler_recovered_from_cc_env() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
 
     // A fake compiler: ignores its args, prints a unique marker. Stands
     // in for clang-cl on a host where `cc` may or may not exist.
@@ -59,17 +61,21 @@ fn family_probe_forwards_to_real_compiler_recovered_from_cc_env() {
     // real compiler from argv — so kache must recover it from CC here.
     let cc_value = format!("{} {}", kache_binary(), fake.display());
 
-    let output = Command::new(kache_binary())
-        .args(["-E", probe_file.to_str().unwrap()])
-        .env("CC", &cc_value)
-        .env("KACHE_CACHE_DIR", &cache_dir)
-        .env("KACHE_CONFIG", &config)
-        // Make sure a stray `cc` on PATH can't accidentally satisfy the
-        // probe and mask a regression: an empty PATH means the old
-        // hard-coded `cc` spawn fails outright.
-        .env("PATH", "")
-        .output()
-        .expect("failed to run kache as a cc-family probe");
+    let output = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    )
+    .args(["-E", probe_file.to_str().unwrap()])
+    .env("CC", &cc_value)
+    .env("KACHE_CACHE_DIR", &cache_dir)
+    .env("KACHE_CONFIG", &config)
+    // Make sure a stray `cc` on PATH can't accidentally satisfy the
+    // probe and mask a regression: an empty PATH means the old
+    // hard-coded `cc` spawn fails outright.
+    .env("PATH", "")
+    .output()
+    .expect("failed to run kache as a cc-family probe");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -93,19 +99,24 @@ fn family_probe_forwards_to_real_compiler_recovered_from_cc_env() {
 #[test]
 fn family_probe_without_kache_cc_does_not_use_fake_compiler() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let probe_file = dir.path().join("detect_compiler_family.c");
     fs::write(&probe_file, b"int main(void){return 0;}\n").unwrap();
 
     let _ = PathBuf::from(kache_binary());
-    let output = Command::new(kache_binary())
-        .args(["-E", probe_file.to_str().unwrap()])
-        // No CC var → nothing to recover → fall back to system `cc`.
-        .env_remove("CC")
-        .env_remove("CXX")
-        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-        .env("KACHE_CONFIG", dir.path().join("kache.toml"))
-        .output()
-        .expect("failed to run kache as a cc-family probe");
+    let output = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    )
+    .args(["-E", probe_file.to_str().unwrap()])
+    // No CC var → nothing to recover → fall back to system `cc`.
+    .env_remove("CC")
+    .env_remove("CXX")
+    .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+    .env("KACHE_CONFIG", dir.path().join("kache.toml"))
+    .output()
+    .expect("failed to run kache as a cc-family probe");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

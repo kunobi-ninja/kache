@@ -25,6 +25,7 @@ fn assert_doc_edit_refreshes(root_source: &str, module_file: &str, child_file: &
     let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
     let cache = project.join("cache");
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let home = project.join("home");
     let out = project.join("out");
     let parts = project.join("parts");

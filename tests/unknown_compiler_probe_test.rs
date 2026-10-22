@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::process::Command;
+#[allow(dead_code)]
+mod common;
 use std::time::{Duration, Instant};
 
 fn kache_binary() -> &'static str {
@@ -23,6 +24,7 @@ fn process_is_running(pid: i32) -> bool {
 #[test]
 fn probe_recovers_when_wrapper_fork_bombs() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let wrapper = dir.path().join("my-compiler");
 
     kache_fs::testutil::write_executable(
@@ -31,13 +33,17 @@ fn probe_recovers_when_wrapper_fork_bombs() {
     );
 
     let start = Instant::now();
-    let _ = Command::new(kache_binary())
-        .arg(&wrapper)
-        .arg("-c")
-        .arg("foo.c")
-        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-        .output()
-        .expect("failed to run kache");
+    let _ = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    )
+    .arg(&wrapper)
+    .arg("-c")
+    .arg("foo.c")
+    .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+    .output()
+    .expect("failed to run kache");
 
     assert!(
         start.elapsed().as_secs() < 10,
@@ -48,6 +54,7 @@ fn probe_recovers_when_wrapper_fork_bombs() {
 #[test]
 fn probe_recovers_when_wrapper_emits_8kb_then_hangs() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let wrapper = dir.path().join("my-compiler-hang");
 
     kache_fs::testutil::write_executable(
@@ -58,13 +65,17 @@ fn probe_recovers_when_wrapper_emits_8kb_then_hangs() {
     );
 
     let start = Instant::now();
-    let _ = Command::new(kache_binary())
-        .arg(&wrapper)
-        .arg("-c")
-        .arg("foo.c")
-        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-        .output()
-        .expect("failed to run kache");
+    let _ = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    )
+    .arg(&wrapper)
+    .arg("-c")
+    .arg("foo.c")
+    .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+    .output()
+    .expect("failed to run kache");
 
     assert!(
         start.elapsed().as_secs() < 15,
@@ -75,6 +86,7 @@ fn probe_recovers_when_wrapper_emits_8kb_then_hangs() {
 #[test]
 fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let wrapper = dir.path().join("my-compiler-descendant");
     let pid_file = dir.path().join("descendant.pid");
 
@@ -90,13 +102,17 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
     );
 
     let start = Instant::now();
-    let _ = Command::new(kache_binary())
-        .arg(&wrapper)
-        .arg("-c")
-        .arg("foo.c")
-        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-        .output()
-        .expect("failed to run kache");
+    let _ = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    )
+    .arg(&wrapper)
+    .arg("-c")
+    .arg("foo.c")
+    .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+    .output()
+    .expect("failed to run kache");
 
     assert!(
         start.elapsed().as_secs() < 15,

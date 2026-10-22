@@ -260,6 +260,7 @@ fn exercise_uncached_lane(
 ) {
     let target = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     std::fs::write(input, before).unwrap();
 
     let cold = cargo_build_with_env(
@@ -332,6 +333,7 @@ fn exercise_workspace_wrapper_lane(
 ) {
     let target = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let workspace_wrapper = kache_binary().to_string_lossy().into_owned();
     let extra_env = [("RUSTC_WORKSPACE_WRAPPER", workspace_wrapper.as_str())];
     std::fs::write(input, before).unwrap();
@@ -405,6 +407,7 @@ fn declared_extra_input_invalidates_a_real_warm_cargo_target() {
         .unwrap();
     let target_dir = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let scaffolding = TempDir::new().unwrap();
     let input_reader = build_input_reader(scaffolding.path());
 
@@ -836,6 +839,7 @@ edition = "2021"
     std::fs::write(&activation_input, "v8").unwrap();
     let activation_target = TempDir::new().unwrap();
     let activation_cache = TempDir::new().unwrap();
+    let _activation_daemon = common::DaemonGuard::new(kache_binary(), activation_cache.path());
     let activating_wrapper = build_activating_workspace_wrapper(scaffolding.path());
     let activating_wrapper_text = activating_wrapper.to_string_lossy().into_owned();
     let activation_config_text = activation_config.to_string_lossy().into_owned();
@@ -884,6 +888,7 @@ edition = "2021"
     std::fs::write(&bootstrap_input, "v8").unwrap();
     let bootstrap_target = TempDir::new().unwrap();
     let bootstrap_cache = TempDir::new().unwrap();
+    let _bootstrap_daemon = common::DaemonGuard::new(kache_binary(), bootstrap_cache.path());
 
     let pre_upgrade = cargo_build(
         bootstrap_project.path(),

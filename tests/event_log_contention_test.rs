@@ -115,6 +115,7 @@ fn version_probe_returns_while_another_process_holds_the_event_lock() {
     for shared in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
+        let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
         fs::create_dir(&cache).unwrap();
         let lock_path = cache.join("events.jsonl.lock");
         let holder = LockHolder::start(&lock_path, shared);
@@ -143,6 +144,7 @@ fn version_probe_returns_while_another_process_holds_the_event_lock() {
 fn completed_compile_returns_while_another_process_holds_the_event_lock() {
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     fs::create_dir(&cache).unwrap();
     let source = dir.path().join("answer.rs");
     let output_path = dir.path().join("answer.rlib");
@@ -169,6 +171,7 @@ fn completed_compile_returns_while_another_process_holds_the_event_lock() {
 fn version_probe_defers_rotation_while_the_ledger_is_locked() {
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     fs::create_dir(&cache).unwrap();
     let holder = LockHolder::start(&cache.join("savings.json.lock"), false);
     let mut command = wrapper(&cache);

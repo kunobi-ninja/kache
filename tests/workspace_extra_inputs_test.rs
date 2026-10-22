@@ -277,6 +277,7 @@ fn workspace_provider_input_rekeys_direct_and_two_hop_consumers() {
     let workspace = TempDir::new().unwrap();
     let target = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     write_workspace(workspace.path());
 
     let cold = cargo_build(workspace.path(), target.path(), cache.path());

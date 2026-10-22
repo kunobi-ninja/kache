@@ -4,7 +4,8 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::process::Command;
+#[allow(dead_code)]
+mod common;
 
 fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
@@ -94,6 +95,7 @@ fn run_fake_compiler(
     configured_rustc: bool,
 ) -> (Vec<String>, String, Option<serde_json::Value>) {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let argv_dump = dir.path().join("argv.txt");
     let env_dump = dir.path().join("incremental-env.txt");
     let fake_rustc = dir.path().join(compiler_name);
@@ -136,7 +138,11 @@ fn run_fake_compiler(
     } else {
         rustc_args.push(incremental_arg);
     }
-    let mut command = Command::new(kache_binary());
+    let mut command = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    );
     command
         .arg(&fake_rustc)
         .current_dir(dir.path())
@@ -226,6 +232,7 @@ fn run_fake_compiler(
 
 fn assert_changed_response_transport_fails_closed(disabled: bool) {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let fake_rustc = dir.path().join("rustc");
     let compiler_marker = dir.path().join("compiler-ran");
     kache_fs::testutil::write_executable(
@@ -252,7 +259,11 @@ fn assert_changed_response_transport_fails_closed(disabled: bool) {
     let broken_tmpdir = dir.path().join("not-a-directory");
     fs::write(&broken_tmpdir, "file").unwrap();
 
-    let mut command = Command::new(kache_binary());
+    let mut command = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    );
     command
         .arg(&fake_rustc)
         .arg(format!("@{}", response.display()))
@@ -285,6 +296,7 @@ fn assert_changed_response_transport_fails_closed(disabled: bool) {
 
 fn assert_unchanged_response_transport_failure_uses_original_argv() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), dir.path().join("cache"));
     let fake_rustc = dir.path().join("rustc");
     let argv_dump = dir.path().join("argv.txt");
     kache_fs::testutil::write_executable(
@@ -310,17 +322,21 @@ fn assert_unchanged_response_transport_failure_uses_original_argv() {
     fs::write(&broken_tmpdir, "file").unwrap();
     let response_arg = format!("@{}", response.display());
 
-    let output = Command::new(kache_binary())
-        .arg(&fake_rustc)
-        .arg(&response_arg)
-        .current_dir(dir.path())
-        .env("ARGV_DUMP", &argv_dump)
-        .env("TMPDIR", &broken_tmpdir)
-        .env("KACHE_DISABLED", "1")
-        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-        .env("KACHE_CONFIG", dir.path().join("missing-config.toml"))
-        .output()
-        .expect("failed to run kache wrapper");
+    let output = common::hermetic_command(
+        kache_binary(),
+        &dir.path().join("cache"),
+        Some(&dir.path().join("missing-config.toml")),
+    )
+    .arg(&fake_rustc)
+    .arg(&response_arg)
+    .current_dir(dir.path())
+    .env("ARGV_DUMP", &argv_dump)
+    .env("TMPDIR", &broken_tmpdir)
+    .env("KACHE_DISABLED", "1")
+    .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+    .env("KACHE_CONFIG", dir.path().join("missing-config.toml"))
+    .output()
+    .expect("failed to run kache wrapper");
 
     assert!(
         output.status.success(),

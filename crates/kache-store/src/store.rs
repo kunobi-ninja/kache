@@ -3119,34 +3119,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Phase 1: move each new blob into the content-addressed store. Strict
-        // stores flush the registered entry before returning, including any
-        // shared blobs a deferred writer left pending. Keep the downloaded
-        // copy in the entry dir for now — it's the fallback Phase 2 restores from
-        // if a concurrent remove unlinks the blob.
-        for cached_file in &meta.files {
-            let blob = self.blob_path(&cached_file.hash);
-            if !blob.is_file() {
-                let tx = rusqlite::Transaction::new_unchecked(
-                    &self.db,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
-                self.move_verified_blob(&entry_dir, cached_file)?;
-                tx.commit()?;
-            }
-        }
-
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
         let content_hash = compute_content_hash(&meta.files);
 
-        // Phase 2: register blob references and the entry row atomically, so the
-        // entry only becomes visible once every blob is in place. The write lock
-        // the INSERT/UPDATE holds also serializes us against `remove_entry`'s
-        // unlink, so we can safely restore a blob a concurrent remove reclaimed.
+        // Install missing blobs and register references under the same writer
+        // lock, so removal cannot reclaim a blob between installation and commit.
+        // Content verification above and the strict flush below stay outside it.
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         // A second download of a committed key (two daemons, a retried
         // prefetch) replaces a generation that already holds references.
         release_entry_blob_refs(&tx, cache_key)?;
@@ -3161,27 +3146,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     params![cached_file.hash],
                 )?;
             }
-            let blob = self.blob_path(&cached_file.hash);
-            if !blob.is_file() {
-                // A concurrent remove unlinked this shared blob; restore it from
-                // the downloaded copy kept in Phase 1 (still under the lock).
-                let file_path = entry_dir.join(&cached_file.name);
-                if !file_path.is_file() {
-                    anyhow::bail!(
-                        "downloaded blob {} vanished during import",
-                        &cached_file.hash[..16.min(cached_file.hash.len())]
-                    );
-                }
-                fs::create_dir_all(blob.parent().unwrap())
-                    .context("creating blob shard directory")?;
-                fs::rename(&file_path, &blob).with_context(|| {
-                    format!(
-                        "restoring downloaded artifact {} to blob store",
-                        file_path.display()
-                    )
-                })?;
-                set_blob_readonly(&blob);
-            }
+            self.move_verified_blob(&entry_dir, cached_file)?;
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
@@ -3190,8 +3155,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         )?;
         tx.commit()?;
 
-        // Remove any downloaded duplicates kept as fallbacks but not needed
-        // (their blob already existed and survived).
+        // Remove downloaded duplicates whose content-addressed inode already
+        // existed. The locked installation above preserves that winner.
         for cached_file in &meta.files {
             let file_path = entry_dir.join(&cached_file.name);
             if file_path.is_file() {
@@ -3365,25 +3330,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Install the blobs before registering pending references. Strict
-        // stores verify and flush the entries after registration. Existing
-        // blobs leave the extracted copy as the in-transaction race fallback.
-        for entry in entries {
-            let entry_dir = self.entry_dir(&entry.cache_key);
-            for file in &entry.meta.files {
-                let blob = self.blob_path(&file.hash);
-                if !blob.is_file() {
-                    let tx = rusqlite::Transaction::new_unchecked(
-                        &self.db,
-                        rusqlite::TransactionBehavior::Immediate,
-                    )?;
-                    self.move_verified_blob(&entry_dir, file)?;
-                    tx.commit()?;
-                }
-            }
-        }
-
-        let tx = self.db.unchecked_transaction()?;
+        // Install missing blobs and register the batch under one writer lock.
+        // Preflight and the strict durability flush remain outside the lock.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let mut imported = 0usize;
         for entry in entries {
             let meta = &entry.meta;
@@ -3436,6 +3388,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     false
                 ],
             )?;
+            // A retried download can repair a missing CAS blob even when its
+            // committed row already exists. Keep its references unchanged.
+            let entry_dir = self.entry_dir(&entry.cache_key);
+            for file in &meta.files {
+                self.move_verified_blob(&entry_dir, file)?;
+            }
             if inserted == 0 {
                 continue;
             }
@@ -3443,7 +3401,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // a leftover whose references nothing else will release.
             release_entry_blob_refs(&tx, &entry.cache_key)?;
 
-            let entry_dir = self.entry_dir(&entry.cache_key);
             for file in &meta.files {
                 let added = tx.execute(
                     "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
@@ -3455,7 +3412,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         params![file.hash],
                     )?;
                 }
-                self.move_verified_blob(&entry_dir, file)?;
             }
             record_entry_blobs(&tx, &entry.cache_key, &meta.files)?;
             tx.execute(

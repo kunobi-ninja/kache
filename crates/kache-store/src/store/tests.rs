@@ -2365,6 +2365,105 @@ fn strict_imports_verify_and_sync_shared_pending_blobs_before_success() {
 }
 
 #[test]
+fn reimport_repairs_missing_pending_blobs_without_replacing_shared_winners() {
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+    for batched in [false, true] {
+        for deferred_durability in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path());
+            config.deferred_durability = true;
+            let seed = Store::open(&config).unwrap();
+            let cache_key = key(90);
+            let shared_key = key(91);
+            let outputs: [(&str, &[u8]); 2] = [
+                ("first.rlib", b"missing CAS bytes"),
+                ("second.rmeta", b"shared winner"),
+            ];
+            let import = |store: &Store| {
+                let meta = extract_download(store, &cache_key, &outputs);
+                if batched {
+                    store
+                        .import_verified_restored_entries(&[VerifiedRestoredEntry {
+                            cache_key: cache_key.clone(),
+                            meta,
+                        }])
+                        .unwrap()
+                } else {
+                    store.import_restored_entry(&cache_key).unwrap();
+                    1
+                }
+            };
+            assert_eq!(import(&seed), 1);
+            extract_download(&seed, &shared_key, &outputs[1..]);
+            seed.import_restored_entry(&shared_key).unwrap();
+            let missing_hash = content_hash(outputs[0].1);
+            let shared_hash = content_hash(outputs[1].1);
+            let missing_blob = seed.blob_path(&missing_hash);
+            let shared_blob = seed.blob_path(&shared_hash);
+            let shared_identity = kache_fs::file_identity(&shared_blob).unwrap();
+            unlink_blob(&missing_blob);
+            assert!(!missing_blob.exists());
+            assert_eq!(seed.pending_durability().unwrap(), 2);
+            assert_eq!(blob_refcount(&seed, &missing_hash), Some(1));
+            assert_eq!(blob_refcount(&seed, &shared_hash), Some(2));
+
+            config.deferred_durability = deferred_durability;
+            let store = Store::open(&config).unwrap();
+            let observed = DurabilitySyncObserver::start();
+            assert_eq!(
+                import(&store),
+                usize::from(!batched),
+                "an existing batch row is repaired without counting a new entry"
+            );
+            assert_eq!(fs::read(&missing_blob).unwrap(), outputs[0].1);
+            let repaired_identity = kache_fs::file_identity(&missing_blob).unwrap();
+            assert_eq!(
+                kache_fs::file_identity(&shared_blob).unwrap(),
+                shared_identity,
+                "the existing shared inode must survive reimport"
+            );
+            assert_eq!(store.entry_is_durable(&cache_key), !deferred_durability);
+            if deferred_durability {
+                assert!(
+                    observed.files().is_empty(),
+                    "deferred repair must leave fsync to the flush"
+                );
+            } else {
+                assert!(observed.files().contains(&repaired_identity));
+                assert!(observed.files().contains(&shared_identity));
+                assert!(
+                    observed.files().contains(
+                        &kache_fs::file_identity(&store.entry_dir(&cache_key).join("meta.json"))
+                            .unwrap()
+                    ),
+                    "strict repair must flush the selected metadata too"
+                );
+            }
+            assert_eq!(blob_refcount(&store, &missing_hash), Some(1));
+            assert_eq!(blob_refcount(&store, &shared_hash), Some(2));
+            assert_blob_refs_match_mappings(&store);
+
+            assert_eq!(import(&store), usize::from(!batched));
+            assert_eq!(
+                kache_fs::file_identity(&missing_blob).unwrap(),
+                repaired_identity,
+                "a retry must retain the repaired winner"
+            );
+            assert_eq!(
+                kache_fs::file_identity(&shared_blob).unwrap(),
+                shared_identity
+            );
+            assert_eq!(blob_refcount(&store, &missing_hash), Some(1));
+            assert_eq!(blob_refcount(&store, &shared_hash), Some(2));
+            assert_blob_refs_match_mappings(&store);
+            assert!(store.get(&cache_key).unwrap().is_some());
+            assert!(store.get(&shared_key).unwrap().is_some());
+        }
+    }
+}
+
+#[test]
 fn strict_put_verifies_and_syncs_a_shared_pending_winner() {
     for corrupt in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -13609,6 +13708,17 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
     let mut bytes = vec![0u8; size];
     bytes[..key.len()].copy_from_slice(key.as_bytes());
     std::fs::write(&output, bytes).unwrap();
+    // This fixture owns its private store. Retain any older staging files,
+    // but require this completed put to consume its own snapshots before the
+    // eviction model reasons about external retainers.
+    let staging_before: std::collections::HashSet<PathBuf> = match fs::read_dir(store.staging_dir())
+    {
+        Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::collections::HashSet::new()
+        }
+        Err(error) => panic!("reading fixture staging directory: {error}"),
+    };
     store
         .put(
             key,
@@ -13623,6 +13733,15 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
         )
         .unwrap();
     store.remove_clone_for_test(&output);
+    let leftovers: Vec<_> = fs::read_dir(store.staging_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| !staging_before.contains(path))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "completed fixture put left staging snapshots: {leftovers:?}"
+    );
     // Read before aging the entry: a get counts as a use.
     let meta = store.get(key).unwrap().unwrap();
     store

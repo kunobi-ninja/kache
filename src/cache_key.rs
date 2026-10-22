@@ -4016,17 +4016,22 @@ fn compute_key_into(
         cfg!(target_os = "windows"),
         |linker, architecture, host| {
             let search_dirs = windows_native_link_search_dirs(args)?;
-            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
-                linker,
-                architecture,
-                &rustc_tool_dirs_for(args, host, invocation)?,
-                &search_dirs.rustc,
-                &search_dirs.linker,
-                &args.link_libs,
-                |path| file_hasher.hash_static_lib(path),
-                invocation,
-            )
-            .map(|identity| identity.encode())
+            let mut identity =
+                crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+                    linker,
+                    architecture,
+                    &rustc_tool_dirs_for(args, host, invocation)?,
+                    &search_dirs.rustc,
+                    &search_dirs.linker,
+                    &args.link_libs,
+                    |path| file_hasher.hash_static_lib(path),
+                    invocation,
+                )?
+                .encode();
+            append_windows_link_argument_files(&mut identity, &search_dirs.files, |path| {
+                file_hasher.hash(path)
+            })?;
+            Ok(identity)
         },
         invocation,
     )?;
@@ -10588,6 +10593,9 @@ struct WindowsNativeLinkSearchDirs {
     rustc: Vec<PathBuf>,
     /// Directories emitted to LINK before the LIB environment paths.
     linker: Vec<PathBuf>,
+    /// Files `-C link-arg` hands LINK by absolute path, which the key hashes
+    /// (see `windows_link_argument_input_files`), in argument order.
+    files: Vec<PathBuf>,
 }
 
 fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {
@@ -10606,6 +10614,7 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
         }
     }
     let mut linker = rustc.clone();
+    let mut files = Vec::new();
     for (key, value) in &args.codegen_opts {
         if !matches!(key.as_str(), "link-arg" | "link-args") {
             continue;
@@ -10614,17 +10623,49 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
             continue;
         };
         if crate::native_link_key::windows_link_argument_has_unmodeled_input(value) {
+            if let Some(inputs) =
+                crate::native_link_key::windows_link_argument_input_files(key, value)
+            {
+                files.extend(inputs);
+                continue;
+            }
             anyhow::bail!(
                 "explicit Windows linker input files (.lib/.a/.obj/.o/.res/.def/.exp/.manifest) \
-                 and file-carrying LINK options (/DEF, /DEFAULTLIB, /MANIFESTINPUT, \
-                 /MANIFESTFILE, /PDBSTRIPPED, ...) are not hashed and are not cacheable"
+                 other than an absolute .res/.obj/.o/.lib/.a or /MANIFESTINPUT path, and \
+                 file-carrying LINK options (/DEF, /DEFAULTLIB, /MANIFESTFILE, /PDBSTRIPPED, \
+                 a side-by-side /MANIFEST, ...) are not hashed and are not cacheable"
             );
         }
         if let Some(path) = windows_libpath_argument(value)? {
             linker.push(PathBuf::from(path));
         }
     }
-    Ok(WindowsNativeLinkSearchDirs { rustc, linker })
+    Ok(WindowsNativeLinkSearchDirs {
+        rustc,
+        linker,
+        files,
+    })
+}
+
+/// Append the digest of each file a native MSVC link reads through `-C
+/// link-arg` to its identity, in argument order. LINK merges these files
+/// into the image (a resource, an object, a manifest), so a file rebuilt in
+/// place under the same name must change the key; a file that is gone
+/// cannot be keyed and fails closed.
+fn append_windows_link_argument_files(
+    identity: &mut String,
+    files: &[PathBuf],
+    hash: impl Fn(&Path) -> Result<String>,
+) -> Result<()> {
+    for (index, file) in files.iter().enumerate() {
+        if !file.is_file() {
+            anyhow::bail!("linker input {} is not a regular file", file.display());
+        }
+        let digest =
+            hash(file).with_context(|| format!("hashing linker input {}", file.display()))?;
+        identity.push_str(&format!("\nlink_arg_input.v1={index}={digest}"));
+    }
+    Ok(())
 }
 
 fn windows_libpath_argument(value: &str) -> Result<Option<String>> {

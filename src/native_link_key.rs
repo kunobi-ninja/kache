@@ -1250,6 +1250,91 @@ fn windows_link_token_is_file_option(token: &str) -> bool {
         || named("PDB")
         || named("IMPLIB")
         || named("ILK")
+        || (named("MANIFEST") && !manifest_value_writes_no_side_file(value))
+}
+
+/// Whether a `/MANIFEST` value keeps LINK from writing a side-by-side
+/// `<output>.manifest` file, which the cache never captures: `NO`, or
+/// `EMBED` (with or without `,ID=n`, whose comma splits it off before this).
+fn manifest_value_writes_no_side_file(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value.eq_ignore_ascii_case("NO")
+            || value
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("EMBED"))
+    })
+}
+
+/// The files a native MSVC link reads through one `-C link-arg` (`key`
+/// `link-arg`) or `link-args` value, when the identity can key them by
+/// their bytes: `None` when any argument hands LINK something it cannot.
+///
+/// rustc hands a `link-arg` to LINK as one argument and splits `link-args`
+/// on whitespace. An argument that [`windows_link_argument_has_unmodeled_input`]
+/// clears needs no file. Otherwise only two shapes are read, each naming an
+/// absolute path, so the bytes the key hashes are the bytes LINK reads
+/// whatever its working directory:
+///
+/// - the whole argument is the path of an input LINK merges into the image,
+///   by extension `.res` (a compiled resource script: what `winresource` and
+///   `embed-resource` print), `.obj`, `.o`, `.lib` or `.a`;
+/// - `/MANIFESTINPUT:<path>` (either prefix, any case), the XML LINK merges
+///   into the manifest it embeds. It needs `/MANIFEST:EMBED`, so it writes no
+///   side file.
+///
+/// Every other file-carrying option stays refused: its file is an output the
+/// cache does not capture (`/PDB`, `/IMPLIB`, `/MANIFESTFILE`, ...), makes
+/// LINK write one (`/DEF` exports an import library beside the image), or is
+/// resolved through a search path (`/DEFAULTLIB`). So is a relative path, a
+/// quoted one, and a `-Wl,` argument, which is a C driver's spelling LINK
+/// would not read as a file.
+pub(crate) fn windows_link_argument_input_files(key: &str, value: &str) -> Option<Vec<PathBuf>> {
+    let arguments: Vec<&str> = if key == "link-args" {
+        value.split_whitespace().collect()
+    } else {
+        vec![value]
+    };
+    let mut files = Vec::new();
+    for argument in arguments {
+        if !windows_link_argument_has_unmodeled_input(argument) {
+            continue;
+        }
+        files.push(windows_link_argument_input_file(argument)?);
+    }
+    Some(files)
+}
+
+fn windows_link_argument_input_file(argument: &str) -> Option<PathBuf> {
+    let path = match argument
+        .strip_prefix(['/', '-'])
+        .and_then(|option| option.split_once(':'))
+    {
+        Some((name, path)) if name.eq_ignore_ascii_case("MANIFESTINPUT") => path,
+        Some(_) => return None,
+        None => {
+            let merged = [".res", ".obj", ".o", ".lib", ".a"]
+                .iter()
+                .any(|extension| ends_with_ignore_ascii_case(argument, extension));
+            if !merged {
+                return None;
+            }
+            argument
+        }
+    };
+    (windows_absolute_path(path) && !path.contains('"')).then(|| PathBuf::from(path))
+}
+
+/// A Windows path that does not depend on a working directory or a current
+/// drive: `C:\...` (or `C:/...`) or a UNC / device path (`\\server\share`,
+/// `\\?\C:\...`). Spelled out rather than `Path::is_absolute` so the rule is
+/// the same on every host that runs the tests.
+pub(crate) fn windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let drive = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    drive || (path.len() > 2 && path.starts_with(r"\\"))
 }
 
 pub(crate) fn ends_with_ignore_ascii_case(token: &str, suffix: &str) -> bool {
@@ -5195,6 +5280,116 @@ esac
         ] {
             assert!(
                 windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_link_inputs_by_absolute_path_are_read_by_their_bytes() {
+        for (key, value, expected) in [
+            (
+                "link-arg",
+                r"C:\w\target\debug\build\app-1\out\resource.res",
+                vec![r"C:\w\target\debug\build\app-1\out\resource.res"],
+            ),
+            (
+                "link-arg",
+                r"C:\Program Files\out dir\APP.RES",
+                vec![r"C:\Program Files\out dir\APP.RES"],
+            ),
+            ("link-arg", "C:/w/extra.obj", vec!["C:/w/extra.obj"]),
+            ("link-arg", r"\\?\C:\w\libfoo.a", vec![r"\\?\C:\w\libfoo.a"]),
+            (
+                "link-arg",
+                r"\\server\share\foo.lib",
+                vec![r"\\server\share\foo.lib"],
+            ),
+            (
+                "link-arg",
+                r"/MANIFESTINPUT:C:\w\pkg\windows\Manifest.xml",
+                vec![r"C:\w\pkg\windows\Manifest.xml"],
+            ),
+            (
+                "link-arg",
+                r"-manifestinput:C:\w\app.manifest",
+                vec![r"C:\w\app.manifest"],
+            ),
+            (
+                "link-args",
+                r"/DEBUG C:\w\a.res /MANIFEST:EMBED,ID=2 C:\w\b.o",
+                vec![r"C:\w\a.res", r"C:\w\b.o"],
+            ),
+            ("link-arg", "/MANIFEST:EMBED", vec![]),
+            ("link-arg", "/WX", vec![]),
+        ] {
+            assert_eq!(
+                windows_link_argument_input_files(key, value),
+                Some(expected.into_iter().map(PathBuf::from).collect()),
+                "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_link_inputs_that_cannot_be_read_by_their_bytes_stay_refused() {
+        for (key, value) in [
+            // Relative to LINK's working directory, or drive-relative.
+            ("link-arg", "app.res"),
+            ("link-arg", r"out\app.res"),
+            ("link-arg", r"C:app.res"),
+            ("link-arg", r"\w\app.res"),
+            ("link-arg", "/MANIFESTINPUT:extra.manifest"),
+            // Quoted: LINK would read the quotes as part of the name.
+            ("link-arg", r#""C:\out dir\app.res""#),
+            ("link-arg", r#"/MANIFESTINPUT:"C:\w\Manifest.xml""#),
+            // A C driver's spelling, not a LINK argument.
+            ("link-arg", r"-Wl,C:\w\app.res"),
+            // Spaces split `link-args` into pieces that are not paths.
+            ("link-args", r"C:\out dir\app.res"),
+            // Inputs not merged as they are, or outputs beside the image.
+            ("link-arg", r"C:\w\exports.def"),
+            ("link-arg", r"C:\w\exports.exp"),
+            ("link-arg", r"/DEF:C:\w\exports.def"),
+            ("link-arg", r"/DEFAULTLIB:C:\w\foo.lib"),
+            ("link-arg", r"/NATVIS:C:\w\types.natvis"),
+            ("link-arg", r"/MANIFESTFILE:C:\w\app.exe.manifest"),
+            ("link-arg", r"/PDB:C:\w\app.pdb"),
+            ("link-arg", r"/IMPLIB:C:\w\app.lib"),
+            ("link-arg", r"/MANIFESTINPUT=C:\w\Manifest.xml"),
+            ("link-args", r"C:\w\a.res /PDBSTRIPPED:C:\w\p.pdb"),
+        ] {
+            assert_eq!(
+                windows_link_argument_input_files(key, value),
+                None,
+                "{key}={value}"
+            );
+        }
+    }
+
+    /// LINK writes `<output>.manifest` beside the image for a side-by-side
+    /// manifest; the cache stores only the image and its PDB.
+    #[test]
+    fn a_side_by_side_manifest_fails_closed() {
+        for argument in [
+            "/MANIFEST",
+            "-manifest",
+            "/MANIFEST:SIDEBYSIDE",
+            "/manifest:",
+        ] {
+            assert!(
+                windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+        for argument in [
+            "/MANIFEST:NO",
+            "/manifest:no",
+            "/MANIFEST:EMBED",
+            "-Manifest:Embed,ID=1",
+        ] {
+            assert!(
+                !windows_link_argument_has_unmodeled_input(argument),
                 "{argument}"
             );
         }

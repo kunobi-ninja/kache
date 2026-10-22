@@ -265,6 +265,13 @@ mod apple_install_name;
 // profile directory from N_OSO paths, and native archives under the target
 // dir are keyed by their portable digest. Each changes new-layout keys only.
 //
+// v33: native Linux links also key the linker the driver runs (#1663).
+// `cc --version` names the driver, so a mold or binutils upgrade behind an
+// unchanged driver kept the key. The link's `-fuse-ld`, `--ld-path` and `-B`
+// arguments pick the linker, the driver places it (`-print-prog-name`, then
+// the client's PATH), and its content hash is folded. A linker that cannot be
+// placed fails closed to passthrough. Every native Linux link key changes.
+//
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or `OUT_DIR` sits under it. Those are
 // the paths rustc writes into the rmeta; `--out-dir` reaches dep-info, which
@@ -3931,6 +3938,12 @@ fn compute_key_into(
                 |path| file_hasher.hash(path),
                 invocation,
             )
+        },
+        |driver, rustc_version| {
+            let memo_dir = crate::config::probe_memo_dir_for(invocation)?;
+            let linker =
+                native_linker_for(args, rustc_version, driver, Some(&memo_dir), invocation)?;
+            file_hasher.hash(&linker)
         },
         |sdkroot| match crate::native_link_key::sdk_identity_for_invocation(sdkroot, invocation)? {
             Some(identity) => Ok(identity),
@@ -10407,19 +10420,21 @@ where
 /// into linked-output keys. Injected probes keep the gating testable without
 /// running host tools.
 #[cfg(test)]
-fn fold_native_link_runtime_identity<H, Crt, Sdk>(
+fn fold_native_link_runtime_identity<H, Crt, Linker, Sdk>(
     hasher: &mut H,
     args: &RustcArgs,
     rustc_version: &str,
     running_on_linux: bool,
     running_on_macos: bool,
     crt_probe: Crt,
+    linker_probe: Linker,
     sdk_probe: Sdk,
     env: &KeyEnv,
 ) -> Result<()>
 where
     H: KeyFold,
     Crt: FnOnce(&Path) -> Result<BTreeMap<String, String>>,
+    Linker: FnOnce(&Path, &str) -> Result<String>,
     Sdk: FnOnce(Option<String>) -> Result<String>,
 {
     fold_native_link_runtime_identity_for(
@@ -10429,19 +10444,21 @@ where
         running_on_linux,
         running_on_macos,
         crt_probe,
+        linker_probe,
         sdk_probe,
         env,
         &InvocationEnv::capture(),
     )
 }
 
-fn fold_native_link_runtime_identity_for<H, Crt, Sdk>(
+fn fold_native_link_runtime_identity_for<H, Crt, Linker, Sdk>(
     hasher: &mut H,
     args: &RustcArgs,
     rustc_version: &str,
     running_on_linux: bool,
     running_on_macos: bool,
     crt_probe: Crt,
+    linker_probe: Linker,
     sdk_probe: Sdk,
     env: &KeyEnv,
     invocation: &InvocationEnv,
@@ -10449,6 +10466,7 @@ fn fold_native_link_runtime_identity_for<H, Crt, Sdk>(
 where
     H: KeyFold,
     Crt: FnOnce(&Path) -> Result<BTreeMap<String, String>>,
+    Linker: FnOnce(&Path, &str) -> Result<String>,
     Sdk: FnOnce(Option<String>) -> Result<String>,
 {
     let emits_link = args.emit.is_empty() || args.emit.iter().any(|kind| kind == "link");
@@ -10478,6 +10496,16 @@ where
             "[key:{}] host_crt={}",
             args.crate_name.as_deref().unwrap_or("unknown"),
             encoded.replace('\n', ",")
+        );
+        // `cc --version` names the driver, not the linker it runs, so a mold
+        // or binutils upgrade behind an unchanged driver kept the key (#1663).
+        let linker = linker_probe(&driver, &rustc_version)
+            .context("identifying the linker the native Linux link runs")?;
+        fold_field(hasher, b"host_linker.v1:", linker.as_bytes());
+        tracing::trace!(
+            "[key:{}] host_linker={}",
+            args.crate_name.as_deref().unwrap_or("unknown"),
+            linker
         );
     }
 
@@ -10830,6 +10858,77 @@ fn probe_linux_libc_signature_for(
         "unable to identify native Linux {} (tried getconf/ldd)",
         expected.key_name()
     )
+}
+
+/// The linker a native Linux link runs, placed through its driver (#1663).
+///
+/// The link's own `-fuse-ld`, `--ld-path` and `-B` arguments select it. When
+/// rustc links through its bundled `rust-lld` ([`rustc_defaults_to_bundled_lld`]),
+/// rustc's `gcc-ld` directory and `lld` come first, as rustc passes them
+/// ahead of the link arguments. `memo_dir` remembers the placement.
+pub(crate) fn native_linker_for(
+    args: &RustcArgs,
+    rustc_version: &str,
+    driver: &Path,
+    memo_dir: Option<&Path>,
+    env: &InvocationEnv,
+) -> Result<PathBuf> {
+    let mut selection = crate::native_link_key::LinkerSelection::of(args)?;
+    if rustc_defaults_to_bundled_lld(args, rustc_version)
+        && let Some(gcc_ld) = bundled_gcc_ld_dir(args, rustc_version, env)
+    {
+        selection = selection.with_bundled_lld(gcc_ld);
+    }
+    match memo_dir {
+        Some(memo_dir) => {
+            crate::native_link_key::place_linker_memoized_for(memo_dir, driver, &selection, env)
+        }
+        None => crate::native_link_key::place_linker(driver, &selection, env),
+    }
+}
+
+/// Whether rustc links through its bundled `rust-lld`: the default on
+/// x86_64-unknown-linux-gnu since Rust 1.90, unless the invocation sets the
+/// linker features, flavor or self-contained mode itself. A wrong guess keys
+/// a linker the link does not run: an unused system linker (extra misses),
+/// or rustc's bundled one, which the rustc version already pins, in place of
+/// the system one, leaving a system linker upgrade unkeyed as before #1663.
+fn rustc_defaults_to_bundled_lld(args: &RustcArgs, rustc_version: &str) -> bool {
+    args.target
+        .as_deref()
+        .or_else(|| rustc_host_triple(rustc_version))
+        == Some("x86_64-unknown-linux-gnu")
+        && rustc_release_at_least(rustc_version, (1, 90))
+        && ["linker-features", "linker-flavor", "link-self-contained"]
+            .iter()
+            .all(|option| args.get_codegen_opt(option).is_none())
+}
+
+fn rustc_release_at_least(rustc_version: &str, at_least: (u64, u64)) -> bool {
+    rustc_version
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .and_then(|release| {
+            let mut parts = release.split(['.', '-']);
+            Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+        })
+        .is_some_and(|release: (u64, u64)| release >= at_least)
+}
+
+/// rustc's `gcc-ld` directory, when it holds the `ld.lld` rustc links with.
+fn bundled_gcc_ld_dir(
+    args: &RustcArgs,
+    rustc_version: &str,
+    env: &InvocationEnv,
+) -> Option<PathBuf> {
+    let host = rustc_host_triple(rustc_version)?;
+    let dir = get_rustc_sysroot_for(args, env)?
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("bin")
+        .join("gcc-ld");
+    dir.join("ld.lld").is_file().then_some(dir)
 }
 
 /// Get linker identity string for cache key, with file-based caching.

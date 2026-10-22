@@ -318,6 +318,28 @@ fn crt_fold_key(
     sdk: &str,
     deployment_target: Option<&str>,
 ) -> Result<String> {
+    runtime_fold_key(
+        args,
+        rustc_version,
+        linux,
+        macos,
+        crt,
+        "ld",
+        sdk,
+        deployment_target,
+    )
+}
+
+fn runtime_fold_key(
+    args: &RustcArgs,
+    rustc_version: &str,
+    linux: bool,
+    macos: bool,
+    crt: &str,
+    linker: &str,
+    sdk: &str,
+    deployment_target: Option<&str>,
+) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"base-key");
     fold_native_link_runtime_identity(
@@ -334,6 +356,7 @@ fn crt_fold_key(
             }
             Ok(objects)
         },
+        |_, _| Ok(linker.to_string()),
         |_| Ok(sdk.to_string()),
         &KeyEnv::from_parts(
             deployment_target.map(|target| ("MACOSX_DEPLOYMENT_TARGET", target)),
@@ -433,6 +456,7 @@ fn native_linux_crt_probe_fails_closed() {
         true,
         false,
         |_| anyhow::bail!("no startup object"),
+        |_, _| unreachable!("the linker is placed after the CRT objects"),
         |_| unreachable!("linux fold must not probe the macOS SDK"),
         &KeyEnv::default(),
     )
@@ -441,6 +465,198 @@ fn native_linux_crt_probe_fails_closed() {
         err.to_string()
             .contains("determining native Linux CRT/libc identity")
     );
+}
+
+#[test]
+fn native_linux_links_key_the_linker_their_driver_runs() {
+    let args = parsed_linked_bin(None);
+    let key = |linker: &str| {
+        runtime_fold_key(
+            &args,
+            GNU_RUSTC_VERSION,
+            true,
+            false,
+            "crt1.o=aaa;libc.so.6=bbb",
+            linker,
+            "",
+            None,
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        key("mold-2.42.1-digest"),
+        key("mold-3.0.0-digest"),
+        "a new linker behind the same driver must re-key the link"
+    );
+}
+
+#[test]
+fn native_linux_linker_probe_fails_closed() {
+    let bin = parsed_linked_bin(None);
+    let err = fold_native_link_runtime_identity(
+        &mut blake3::Hasher::new(),
+        &bin,
+        GNU_RUSTC_VERSION,
+        true,
+        false,
+        |_| {
+            Ok(BTreeMap::from([
+                ("crt1.o".to_string(), "aaa".to_string()),
+                ("libc.so.6".to_string(), "bbb".to_string()),
+            ]))
+        },
+        |_, _| anyhow::bail!("ld.mold is not installed"),
+        |_| unreachable!("linux fold must not probe the macOS SDK"),
+        &KeyEnv::default(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("identifying the linker the native Linux link runs"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn rustc_runs_bundled_lld_only_where_it_is_the_default() {
+    let bin = |flags: &[&str], target: Option<&str>| {
+        let mut argv: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "probe",
+            "--crate-type",
+            "bin",
+            "src/main.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        argv.extend(flags.iter().map(|flag| flag.to_string()));
+        if let Some(target) = target {
+            argv.extend(["--target".to_string(), target.to_string()]);
+        }
+        RustcArgs::parse(&argv).unwrap()
+    };
+    let x86_64 = |release: &str| {
+        format!("rustc {release}\nhost: x86_64-unknown-linux-gnu\nrelease: {release}\n")
+    };
+    assert!(rustc_defaults_to_bundled_lld(
+        &bin(&[], None),
+        &x86_64("1.90.0")
+    ));
+    assert!(rustc_defaults_to_bundled_lld(
+        &bin(&[], None),
+        &x86_64("1.99.1")
+    ));
+    assert!(rustc_defaults_to_bundled_lld(
+        &bin(&[], None),
+        &x86_64("1.100.0-nightly")
+    ));
+    assert!(!rustc_defaults_to_bundled_lld(
+        &bin(&[], None),
+        &x86_64("1.89.0")
+    ));
+    assert!(!rustc_defaults_to_bundled_lld(
+        &bin(&[], None),
+        DARWIN_RUSTC_VERSION
+    ));
+    assert!(!rustc_defaults_to_bundled_lld(
+        &bin(&[], Some("aarch64-unknown-linux-gnu")),
+        &x86_64("1.90.0")
+    ));
+    for flag in [
+        "-Clinker-features=-lld",
+        "-Clink-self-contained=-linker",
+        "-Clinker-flavor=gnu-cc",
+    ] {
+        assert!(
+            !rustc_defaults_to_bundled_lld(&bin(&[flag], None), &x86_64("1.90.0")),
+            "{flag}"
+        );
+    }
+}
+
+/// Placement, the production file hasher and the fold together: the same
+/// driver, flags and path with a new linker behind them give a new key.
+#[cfg(unix)]
+#[test]
+fn a_new_linker_behind_the_same_driver_changes_the_native_link_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let driver = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &driver,
+        "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in -print-prog-name=*) echo \"${arg#-print-prog-name=}\" ;; esac; done\n",
+    );
+    kache_fs::testutil::write_executable(&bin.join("ld.mold"), "mold 2.42.1");
+    let env = InvocationEnv::from_parts([("PATH", &bin)], Some(root.clone()), None, root.clone());
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "probe".to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+            "src/main.rs".to_string(),
+            format!("-Clinker={}", driver.display()),
+            "-Clink-arg=-fuse-ld=mold".to_string(),
+        ],
+        &env,
+    )
+    .unwrap();
+    let memo = root.join("probes");
+    let hasher = FileHasher::new_for(&env);
+    let key = || {
+        let mut fold = blake3::Hasher::new();
+        fold_native_link_runtime_identity_for(
+            &mut fold,
+            &args,
+            GNU_RUSTC_VERSION,
+            true,
+            false,
+            |_| {
+                Ok(BTreeMap::from([
+                    ("crt1.o".to_string(), "aaa".to_string()),
+                    ("libc.so.6".to_string(), "bbb".to_string()),
+                ]))
+            },
+            |driver, rustc_version| {
+                let linker = native_linker_for(&args, rustc_version, driver, Some(&memo), &env)?;
+                hasher.hash(&linker)
+            },
+            |_| unreachable!("linux fold must not probe the macOS SDK"),
+            &KeyEnv::default(),
+            &env,
+        )
+        .unwrap();
+        fold.finalize().to_hex().to_string()
+    };
+    let old = key();
+    assert_eq!(key(), old);
+    kache_fs::testutil::write_executable(&bin.join("ld.mold"), "mold 3.0.0");
+    assert_ne!(key(), old, "an upgraded linker must re-key the link");
+}
+
+#[test]
+fn cross_target_and_library_outputs_place_no_linker() {
+    for args in [
+        parsed_linked_bin(Some("aarch64-unknown-linux-gnu")),
+        parsed_crate_type("rlib", None),
+    ] {
+        fold_native_link_runtime_identity(
+            &mut blake3::Hasher::new(),
+            &args,
+            GNU_RUSTC_VERSION,
+            true,
+            false,
+            |_| panic!("no CRT probe for {:?}", args.crate_types),
+            |_, _| panic!("no linker probe for {:?}", args.crate_types),
+            |_| panic!("no SDK probe for {:?}", args.crate_types),
+            &KeyEnv::default(),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -928,6 +1144,7 @@ fn native_macos_sdk_probe_fails_closed() {
         false,
         true,
         |_| unreachable!("macOS fold must not probe Linux CRT"),
+        |_, _| unreachable!("macOS fold must not place a Linux linker"),
         |_| anyhow::bail!("sdk missing"),
         &KeyEnv::default(),
     )
@@ -950,6 +1167,7 @@ fn the_sdk_probe_gets_sdkroot_from_the_snapshot() {
             false,
             true,
             |_| unreachable!("macOS fold must not probe Linux CRT"),
+            |_, _| unreachable!("macOS fold must not place a Linux linker"),
             |value| {
                 sdkroot = Some(value);
                 Ok("sdk".to_string())
@@ -1124,6 +1342,7 @@ fn metadata_only_outputs_do_not_probe_crt_or_sdk() {
         true,
         true,
         |_| panic!("metadata-only output must not probe CRT"),
+        |_, _| panic!("metadata-only output must not place a linker"),
         |_| panic!("metadata-only output must not probe SDK"),
         &KeyEnv::default(),
     )
@@ -11851,7 +12070,7 @@ fn rust_keys_reject_the_legacy_explicit_emit_recipe() {
         host_target_triple(),
     );
     let mut expected = blake3::Hasher::new();
-    expected.update(b"key_version:32\nemit_placement.v1:");
+    expected.update(format!("key_version:{CACHE_KEY_VERSION}\nemit_placement.v1:").as_bytes());
     expected.update(&14_u64.to_le_bytes());
     expected.update(b"compiler-owned");
     expected.update(identity.as_bytes());
@@ -11859,8 +12078,8 @@ fn rust_keys_reject_the_legacy_explicit_emit_recipe() {
     let compiler = &fields["compiler"];
     assert_eq!(compiler, &expected.finalize().to_hex()[..16]);
 
-    // Deleting only the emit marker must restore this unsafe schema-32 prefix.
-    let legacy = format!("key_version:32\n{identity}");
+    // Deleting only the emit marker must restore the unsafe legacy prefix.
+    let legacy = format!("key_version:{CACHE_KEY_VERSION}\n{identity}");
     let legacy_compiler = blake3::hash(legacy.as_bytes()).to_hex();
     assert_ne!(
         compiler,

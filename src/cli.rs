@@ -7352,6 +7352,48 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
 
 const OTHER_CHECKOUTS: &str = "Other checkouts";
 
+/// Doctor's "Native linker" check: the linker a native Linux link runs with
+/// this shell's `RUSTFLAGS`, placed the way its cache key places it.
+fn native_linker_check(env: &crate::invocation::InvocationEnv) -> Check {
+    let mut argv: Vec<String> = ["rustc", "--crate-type", "bin", "main.rs"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    argv.extend(
+        env.var("RUSTFLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string),
+    );
+    let placed = crate::args::RustcArgs::parse_for(&argv, env).and_then(|args| {
+        let rustc_version =
+            crate::cache_key::get_rustc_version_for(&args.rustc, env).unwrap_or_default();
+        let driver = std::path::Path::new(args.get_codegen_opt("linker").unwrap_or("cc"));
+        crate::cache_key::native_linker_for(&args, &rustc_version, driver, None, env)
+    });
+    match placed {
+        Ok(linker) => Check {
+            label: "Native linker",
+            pass: true,
+            detail: match crate::native_link_key::linker_banner(&linker, env) {
+                Some(banner) => format!("{} ({banner})", linker.display()),
+                None => linker.display().to_string(),
+            },
+            fix: None,
+        },
+        Err(error) => Check {
+            label: "Native linker",
+            pass: false,
+            detail: format!("{error:#}"),
+            fix: Some(
+                "install the linker that `cc` and RUSTFLAGS select; native Linux links \
+                 are not cached until it resolves"
+                    .into(),
+            ),
+        },
+    }
+}
+
 /// Whether the latest recorded build missed crates that another checkout of
 /// the project had built, for a reason `kache explain` can name. `None` when
 /// there is no recorded build to look at.
@@ -8276,6 +8318,14 @@ pub fn doctor(
             )),
         },
     });
+
+    // Native linker (#1663): a native Linux link keys the linker its driver
+    // runs, so show the one this shell's `cc` and RUSTFLAGS select.
+    if cfg!(target_os = "linux") && !probe_no_compiler {
+        checks.push(native_linker_check(
+            &crate::invocation::InvocationEnv::capture(),
+        ));
+    }
 
     // Print
     let version = crate::VERSION;

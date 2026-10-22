@@ -254,6 +254,15 @@ fn driver_library_search_dirs(driver: &Path) -> Vec<PathBuf> {
 }
 
 fn driver_library_search_dirs_for(driver: &Path, env: &InvocationEnv) -> Vec<PathBuf> {
+    driver_search_dirs_for(driver, "libraries:", env)
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
+/// One line of `cc -print-search-dirs` (`libraries:` or `programs:`), as the
+/// absolute directories it lists, whether or not they exist yet.
+fn driver_search_dirs_for(driver: &Path, line_prefix: &str, env: &InvocationEnv) -> Vec<PathBuf> {
     let Ok(mut command) = env.command(driver) else {
         return Vec::new();
     };
@@ -277,15 +286,12 @@ fn driver_library_search_dirs_for(driver: &Path, env: &InvocationEnv) -> Vec<Pat
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let Some(line) = text
-        .lines()
-        .find_map(|line| line.strip_prefix("libraries:"))
-    else {
+    let Some(line) = text.lines().find_map(|line| line.strip_prefix(line_prefix)) else {
         return Vec::new();
     };
     let line = line.trim().trim_start_matches('=');
     std::env::split_paths(line)
-        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .filter(|dir| dir.is_absolute())
         .collect()
 }
 
@@ -361,6 +367,317 @@ fn print_file_name_for(driver: &Path, name: &str, env: &InvocationEnv) -> Option
     path.is_absolute()
         .then_some(path)
         .filter(|path| path.is_file())
+}
+
+/// The driver arguments of a link that choose which linker the driver runs.
+///
+/// Read from `-C link-arg` and `-C link-args` in the order the driver sees
+/// them: the last `-fuse-ld=` and `--ld-path=` win, and `-B` directories are
+/// searched in the order given. `cc --version` names the driver only, so
+/// this is what tells two links through the same driver apart.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LinkerSelection {
+    /// `-B<dir>`, `-B <dir>`, `--prefix=<dir>` and `--prefix <dir>`, in order.
+    search_dirs: Vec<String>,
+    /// The last `-fuse-ld=` value.
+    fuse_ld: Option<String>,
+    /// The last `--ld-path=` value. Clang lets it override `-fuse-ld`.
+    ld_path: Option<String>,
+    /// rustc's own `gcc-ld` directory when rustc links through its bundled
+    /// `rust-lld`. rustc then passes `-B<dir>` and `-fuse-ld=lld` ahead of the
+    /// link arguments, so the directory is searched first and `lld` is what a
+    /// link without its own `-fuse-ld` uses.
+    bundled_lld: Option<PathBuf>,
+}
+
+/// What to ask the driver for: a linker it names, or one given by path.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkerQuery {
+    Named(String),
+    Path(PathBuf),
+}
+
+impl LinkerSelection {
+    pub(crate) fn of(args: &crate::args::RustcArgs) -> Result<Self> {
+        let mut words = Vec::new();
+        for (key, value) in &args.codegen_opts {
+            let Some(value) = value.as_deref() else {
+                continue;
+            };
+            match key.as_str() {
+                "link-arg" => words.push(value.to_string()),
+                "link-args" => words.extend(value.split_whitespace().map(str::to_string)),
+                _ => {}
+            }
+        }
+        Self::from_words(&words)
+    }
+
+    fn from_words(words: &[String]) -> Result<Self> {
+        let mut selection = Self::default();
+        let mut words = words.iter();
+        while let Some(word) = words.next() {
+            if let Some(value) = word.strip_prefix("-fuse-ld=") {
+                selection.fuse_ld = Some(value.to_string());
+            } else if let Some(value) = word.strip_prefix("--ld-path=") {
+                selection.ld_path = Some(value.to_string());
+            } else if word == "-B" || word == "--prefix" {
+                let dir = words
+                    .next()
+                    .with_context(|| format!("`{word}` link argument has no directory"))?;
+                selection.search_dirs.push(dir.clone());
+            } else if let Some(dir) = word.strip_prefix("--prefix=") {
+                selection.search_dirs.push(dir.to_string());
+            } else if let Some(dir) = word.strip_prefix("-B") {
+                selection.search_dirs.push(dir.to_string());
+            }
+        }
+        Ok(selection)
+    }
+
+    /// The selection when rustc links through the `rust-lld` in `gcc_ld`.
+    pub(crate) fn with_bundled_lld(mut self, gcc_ld: PathBuf) -> Self {
+        self.bundled_lld = Some(gcc_ld);
+        self
+    }
+
+    /// `-B` directories in the order the driver searches them.
+    fn driver_search_dirs(&self) -> impl Iterator<Item = &str> {
+        self.bundled_lld
+            .iter()
+            .filter_map(|dir| dir.to_str())
+            .chain(self.search_dirs.iter().map(String::as_str))
+    }
+
+    /// Clang's rules, which GCC's `-fuse-ld=<name>` follows: a value with a
+    /// directory is a path, a bare `--ld-path` name is searched like any
+    /// program, and `-fuse-ld=<name>` means the program `ld.<name>`.
+    fn query(&self) -> Result<LinkerQuery> {
+        if let Some(value) = &self.ld_path {
+            if value.is_empty() {
+                bail!("an empty `--ld-path` names no linker");
+            }
+            return Ok(if Path::new(value).components().count() > 1 {
+                LinkerQuery::Path(PathBuf::from(value))
+            } else {
+                LinkerQuery::Named(value.clone())
+            });
+        }
+        match self.fuse_ld.as_deref() {
+            Some("") => bail!("an empty `-fuse-ld` names no linker"),
+            Some(value) if Path::new(value).components().count() > 1 => {
+                Ok(LinkerQuery::Path(PathBuf::from(value)))
+            }
+            Some(name) => Ok(LinkerQuery::Named(format!("ld.{name}"))),
+            None if self.bundled_lld.is_some() => Ok(LinkerQuery::Named("ld.lld".to_string())),
+            None => Ok(LinkerQuery::Named("ld".to_string())),
+        }
+    }
+}
+
+/// The file a native link's driver runs as its linker.
+///
+/// A linker given by path is that file, relative to the client's working
+/// directory. A named one is placed by the driver (`-print-prog-name`, with
+/// the link's `-B` directories): a path it reports is used, relative ones
+/// rooted at the working directory, and a bare name it echoes back is
+/// searched on the client's PATH, as collect2 and Clang do. A linker that
+/// cannot be placed is an error: the caller then treats the link as
+/// uncacheable.
+pub(crate) fn place_linker(
+    driver: &Path,
+    selection: &LinkerSelection,
+    env: &InvocationEnv,
+) -> Result<PathBuf> {
+    let _trace = crate::phase_trace::phase("native_linker_resolve");
+    let name = match selection.query()? {
+        LinkerQuery::Path(path) => {
+            return env
+                .resolve(&path)
+                .filter(|path| path.is_file())
+                .with_context(|| format!("linker {} does not exist", path.display()));
+        }
+        LinkerQuery::Named(name) => name,
+    };
+    let mut command = env
+        .command(driver)
+        .context("running the native linker driver")?;
+    for dir in selection.driver_search_dirs() {
+        command.arg(format!("-B{dir}"));
+    }
+    let output = command
+        .arg(format!("-print-prog-name={name}"))
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .invocation_output()
+        .context("asking the native linker driver for its linker")?;
+    if !output.status.success() {
+        bail!("the native linker driver could not place `{name}`");
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let reported = Path::new(reported.trim());
+    let placed = if reported.components().count() > 1 {
+        env.resolve(reported)
+    } else {
+        env.resolve_program(Path::new(&name))
+    };
+    placed
+        .filter(|path| path.is_file())
+        .with_context(|| format!("the native linker driver runs `{name}`, which is not installed"))
+}
+
+/// First line of a placed linker's `--version`, for diagnostics only.
+pub(crate) fn linker_banner(linker: &Path, env: &InvocationEnv) -> Option<String> {
+    let output = env
+        .command(linker)
+        .ok()?
+        .arg("--version")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .invocation_output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// [`place_linker`] with the placement remembered.
+///
+/// A placement depends on the driver, the selection, the variables that
+/// steer the driver's search, and what the searched locations hold. The
+/// memo is keyed by the first three and validated against the last: every
+/// directory the search could look in (the driver's program directories,
+/// each `-B` directory, every PATH entry, the placed linker's directory)
+/// and the linker's name inside each of them must look as they did. See
+/// [`location_stamp`]. The caller hashes the placed file's content on every
+/// call. A linker given by path needs no driver and is not memoised.
+pub(crate) fn place_linker_memoized_for(
+    memo_dir: &Path,
+    driver: &Path,
+    selection: &LinkerSelection,
+    env: &InvocationEnv,
+) -> Result<PathBuf> {
+    let driver = env
+        .resolve_program(driver)
+        .context("resolving native linker driver")?;
+    let LinkerQuery::Named(name) = selection.query()? else {
+        return place_linker(&driver, selection, env);
+    };
+    let memo_dir = env
+        .resolve(memo_dir)
+        .context("resolving linker memo directory")?;
+    if let Some(placed) = linker_placement_memo_for(&memo_dir, &driver, selection, env) {
+        return Ok(placed);
+    }
+    let placed = place_linker(&driver, selection, env)?;
+    record_linker_placement_memo(&memo_dir, &driver, selection, &name, &placed, env);
+    Ok(placed)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LinkerPlacementMemo {
+    placed: PathBuf,
+    /// Searched location to its [`location_stamp`] when the memo was written.
+    locations: BTreeMap<PathBuf, String>,
+}
+
+/// What a search location looks like, so a memo can tell it changed.
+///
+/// An existing path is its canonical target with that target's modification
+/// and change times: renaming a file in or out of a directory, retargeting a
+/// symlink on the way, or changing a file's mode all change it. A missing
+/// path is just absent, so creating it changes the stamp too.
+fn location_stamp(path: &Path) -> Option<String> {
+    match std::fs::canonicalize(path) {
+        Ok(target) => Some(format!(
+            "{}\n{}",
+            target.display(),
+            directory_stamp(&target)?
+        )),
+        Err(_) => Some("absent".to_string()),
+    }
+}
+
+fn linker_memo_digest(
+    driver: &Path,
+    selection: &LinkerSelection,
+    env: &InvocationEnv,
+) -> Option<(PathBuf, String)> {
+    let (canonical, crt_digest) = crt_memo_material(driver, env)?;
+    let mut material = Material::new("linux-linker-placement-v1");
+    material.push(crt_digest.as_bytes());
+    for dir in selection.driver_search_dirs() {
+        material.push(b"-B");
+        material.push(dir.as_bytes());
+    }
+    material.push(selection.fuse_ld.as_deref().unwrap_or("").as_bytes());
+    material.push(selection.ld_path.as_deref().unwrap_or("").as_bytes());
+    Some((canonical, material.digest()))
+}
+
+fn linker_placement_memo_for(
+    memo_dir: &Path,
+    driver: &Path,
+    selection: &LinkerSelection,
+    env: &InvocationEnv,
+) -> Option<PathBuf> {
+    let (_, digest) = linker_memo_digest(driver, selection, env)?;
+    let path = probe_memo::memo_path(memo_dir, "linker-placement", "json", &digest);
+    let body = probe_memo::read_verified(&path, &digest)?;
+    let memo: LinkerPlacementMemo = serde_json::from_str(&body).ok()?;
+    if memo.locations.is_empty() {
+        return None;
+    }
+    for (location, stamp) in &memo.locations {
+        if location_stamp(location).as_ref() != Some(stamp) {
+            return None;
+        }
+    }
+    memo.placed.is_file().then_some(memo.placed)
+}
+
+fn record_linker_placement_memo(
+    memo_dir: &Path,
+    driver: &Path,
+    selection: &LinkerSelection,
+    name: &str,
+    placed: &Path,
+    env: &InvocationEnv,
+) {
+    let Some((canonical, digest)) = linker_memo_digest(driver, selection, env) else {
+        return;
+    };
+    let mut directories = driver_search_dirs_for(&canonical, "programs:", env);
+    directories.extend(
+        selection
+            .driver_search_dirs()
+            .filter_map(|dir| env.resolve(Path::new(dir))),
+    );
+    if let Some(path) = env.var_os("PATH") {
+        directories.extend(std::env::split_paths(&path).filter_map(|dir| env.resolve(&dir)));
+    }
+    directories.extend(placed.parent().map(Path::to_path_buf));
+    let mut locations = BTreeMap::new();
+    for directory in directories {
+        for location in [directory.join(name), directory] {
+            let Some(stamp) = location_stamp(&location) else {
+                // A location that cannot be described cannot validate a memo.
+                return;
+            };
+            locations.insert(location, stamp);
+        }
+    }
+    let memo = LinkerPlacementMemo {
+        placed: placed.to_path_buf(),
+        locations,
+    };
+    if let Ok(body) = serde_json::to_string(&memo) {
+        probe_memo::write_verified(
+            &probe_memo::memo_path(memo_dir, "linker-placement", "json", &digest),
+            &digest,
+            &body,
+        );
+    }
 }
 
 /// Identity of the SDK a macOS link builds against.
@@ -2217,6 +2534,297 @@ fn unwrap_windows_linker_wrapper(
 mod tests {
     use super::*;
     use crate::test_support::process_state_test_lock;
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn linker_selection_reads_link_arguments_as_the_driver_does() {
+        let selection = LinkerSelection::from_words(&words(&[
+            "-fuse-ld=gold",
+            "-Wl,--as-needed",
+            "-B",
+            "/a",
+            "-B/b",
+            "--prefix=/c",
+            "--prefix",
+            "/d",
+            "-fuse-ld=mold",
+        ]))
+        .unwrap();
+        assert_eq!(selection.fuse_ld.as_deref(), Some("mold"), "last one wins");
+        assert_eq!(selection.search_dirs, ["/a", "/b", "/c", "/d"]);
+        assert_eq!(selection.ld_path, None);
+        assert!(LinkerSelection::from_words(&words(&["-B"])).is_err());
+        assert!(LinkerSelection::from_words(&words(&["--prefix"])).is_err());
+
+        let args = crate::args::RustcArgs::parse(&words(&[
+            "rustc",
+            "--crate-type",
+            "bin",
+            "main.rs",
+            "-C",
+            "link-args=-B/x -fuse-ld=lld",
+            "-C",
+            "link-arg=--ld-path=/opt/ld",
+            "-C",
+            "opt-level=1",
+        ]))
+        .unwrap();
+        let selection = LinkerSelection::of(&args).unwrap();
+        assert_eq!(selection.search_dirs, ["/x"]);
+        assert_eq!(selection.fuse_ld.as_deref(), Some("lld"));
+        assert_eq!(selection.ld_path.as_deref(), Some("/opt/ld"));
+
+        // `link-arg` and `link-args` reach the driver in command-line order.
+        let args = crate::args::RustcArgs::parse(&words(&[
+            "rustc",
+            "--crate-type",
+            "bin",
+            "main.rs",
+            "-C",
+            "link-arg=-fuse-ld=gold",
+            "-C",
+            "link-args=-fuse-ld=mold -B/y",
+            "-C",
+            "link-arg=-fuse-ld=lld",
+        ]))
+        .unwrap();
+        assert_eq!(
+            LinkerSelection::of(&args).unwrap().fuse_ld.as_deref(),
+            Some("lld")
+        );
+    }
+
+    #[test]
+    fn linker_query_follows_the_drivers_rules() {
+        let query = |given: &[&str]| LinkerSelection::from_words(&words(given)).unwrap().query();
+        let named = |name: &str| LinkerQuery::Named(name.to_string());
+        let path = |path: &str| LinkerQuery::Path(PathBuf::from(path));
+        assert_eq!(query(&[]).unwrap(), named("ld"));
+        assert_eq!(query(&["-fuse-ld=mold"]).unwrap(), named("ld.mold"));
+        assert_eq!(
+            query(&["-fuse-ld=/opt/mold/bin/mold"]).unwrap(),
+            path("/opt/mold/bin/mold")
+        );
+        assert_eq!(query(&["-fuse-ld=bin/mold"]).unwrap(), path("bin/mold"));
+        for given in [
+            &["-fuse-ld=lld", "--ld-path=/opt/ld"][..],
+            &["--ld-path=/opt/ld", "-fuse-ld=lld"][..],
+        ] {
+            assert_eq!(query(given).unwrap(), path("/opt/ld"), "{given:?}");
+        }
+        assert_eq!(query(&["--ld-path=tools/ld"]).unwrap(), path("tools/ld"));
+        assert_eq!(
+            query(&["--ld-path=ld.mold"]).unwrap(),
+            named("ld.mold"),
+            "a bare --ld-path name is searched like any program"
+        );
+        for given in ["--ld-path=", "-fuse-ld="] {
+            assert!(query(&[given]).is_err(), "{given}");
+        }
+
+        // rustc's bundled lld is searched first and used unless the link
+        // picks its own linker.
+        let bundled = |given: &[&str]| {
+            LinkerSelection::from_words(&words(given))
+                .unwrap()
+                .with_bundled_lld(PathBuf::from("/sysroot/gcc-ld"))
+        };
+        assert_eq!(bundled(&[]).query().unwrap(), named("ld.lld"));
+        assert_eq!(
+            bundled(&["-fuse-ld=mold"]).query().unwrap(),
+            named("ld.mold")
+        );
+        assert_eq!(
+            bundled(&["-B/user"])
+                .driver_search_dirs()
+                .collect::<Vec<_>>(),
+            ["/sysroot/gcc-ld", "/user"]
+        );
+    }
+
+    /// A driver that places `-print-prog-name` names in its `-B` directories,
+    /// then its own program directory, among executable files only, echoes
+    /// anything else back, and logs every call so a test can tell a memo hit
+    /// from a probe. A relative `-B` gives a relative answer, as GCC's does.
+    #[cfg(unix)]
+    fn fake_linker_driver(root: &Path) -> (PathBuf, PathBuf) {
+        let programs = root.join("libexec");
+        let later = root.join("libexec-later");
+        std::fs::create_dir_all(&programs).unwrap();
+        let log = root.join("driver-calls");
+        let driver = root.join("cc");
+        kache_fs::testutil::write_executable(
+            &driver,
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> "{log}"
+dirs=""
+for arg in "$@"; do
+    case "$arg" in
+        -B*) dirs="$dirs ${{arg#-B}}" ;;
+        -print-search-dirs) echo "programs: ={programs}:{later}"; exit 0 ;;
+        -print-prog-name=*)
+            name=${{arg#-print-prog-name=}}
+            for dir in $dirs {programs} {later}; do
+                if [ -x "$dir/$name" ]; then echo "$dir/$name"; exit 0; fi
+            done
+            echo "$name"; exit 0 ;;
+    esac
+done
+"#,
+                log = log.display(),
+                programs = programs.display(),
+                later = later.display()
+            ),
+        );
+        (driver, log)
+    }
+
+    #[cfg(unix)]
+    fn driver_calls(log: &Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_driver_places_the_linker_it_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (driver, _) = fake_linker_driver(&root);
+        let bin = root.join("bin");
+        let extra = root.join("extra");
+        for dir in [&bin, &extra] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        kache_fs::testutil::write_executable(&root.join("libexec/ld"), "gnu ld");
+        kache_fs::testutil::write_executable(&bin.join("ld.mold"), "mold on PATH");
+        kache_fs::testutil::write_executable(&extra.join("ld.mold"), "mold under -B");
+        let env =
+            InvocationEnv::from_parts([("PATH", &bin)], Some(root.clone()), None, root.clone());
+        let place = |given: &[&str]| {
+            place_linker(
+                &driver,
+                &LinkerSelection::from_words(&words(given)).unwrap(),
+                &env,
+            )
+        };
+
+        assert_eq!(place(&[]).unwrap(), root.join("libexec/ld"));
+        assert_eq!(place(&["-fuse-ld=mold"]).unwrap(), bin.join("ld.mold"));
+        let extra_arg = format!("-B{}", extra.display());
+        assert_eq!(
+            place(&[&extra_arg, "-fuse-ld=mold"]).unwrap(),
+            extra.join("ld.mold")
+        );
+        assert_eq!(
+            place(&["-Bextra", "-fuse-ld=mold"]).unwrap(),
+            extra.join("ld.mold"),
+            "a relative placement is the one under the working directory, not PATH's"
+        );
+        let ld_path = format!("--ld-path={}", extra.join("ld.mold").display());
+        assert_eq!(place(&[&ld_path]).unwrap(), extra.join("ld.mold"));
+        assert_eq!(
+            place(&["--ld-path=extra/ld.mold"]).unwrap(),
+            extra.join("ld.mold")
+        );
+        assert_eq!(place(&["--ld-path=ld.mold"]).unwrap(), bin.join("ld.mold"));
+
+        let missing = place(&["-fuse-ld=gold"]).unwrap_err();
+        assert!(missing.to_string().contains("not installed"), "{missing:#}");
+        let gone = format!("--ld-path={}", root.join("nowhere").display());
+        assert!(place(&[&gone]).is_err());
+    }
+
+    /// The placement is remembered, a linker replaced in place re-keys
+    /// through its content, and anything that changes what the search finds
+    /// invalidates the placement: a missing PATH or driver directory created
+    /// later, a symlinked PATH directory retargeted, and an earlier candidate
+    /// made executable.
+    #[cfg(unix)]
+    #[test]
+    fn linker_placement_memo_follows_what_the_driver_would_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (driver, log) = fake_linker_driver(&root);
+        let missing = root.join("missing/bin");
+        let linked = root.join("linked");
+        let empty = root.join("empty");
+        let other = root.join("other");
+        let early = root.join("early");
+        let late = root.join("late");
+        for dir in [&empty, &other, &early, &late] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&empty, &linked).unwrap();
+        kache_fs::testutil::write_executable(&late.join("ld.mold"), "mold 2.42.1");
+        let path = std::env::join_paths([&missing, &linked, &early, &late]).unwrap();
+        let env =
+            InvocationEnv::from_parts([("PATH", path)], Some(root.clone()), None, root.clone());
+        // Outside `root`: `root` is the watched ancestor of the missing PATH
+        // directory, and creating the memo directory there would change it.
+        let memo_root = tempfile::tempdir().unwrap();
+        let memo = memo_root.path().join("probes");
+        let mold = LinkerSelection::from_words(&words(&["-fuse-ld=mold"])).unwrap();
+        let identity = || {
+            let placed = place_linker_memoized_for(&memo, &driver, &mold, &env).unwrap();
+            (placed.clone(), hash_file(&placed).unwrap())
+        };
+        let placed_from_memo = || {
+            let calls = driver_calls(&log);
+            let placed = identity().0;
+            (placed, driver_calls(&log) == calls)
+        };
+
+        let (placed, old) = identity();
+        assert_eq!(placed, late.join("ld.mold"));
+        assert_eq!(
+            placed_from_memo(),
+            (late.join("ld.mold"), true),
+            "a valid memo runs no driver"
+        );
+
+        // Same driver, same flags, same path, new linker: a new identity.
+        kache_fs::testutil::write_executable(&late.join("ld.mold"), "mold 3.0.0");
+        let (placed, new) = identity();
+        assert_eq!(placed, late.join("ld.mold"));
+        assert_ne!(new, old, "an upgraded linker must change the identity");
+
+        // A candidate that is not executable is skipped, until it is.
+        std::fs::write(early.join("ld.mold"), "not yet executable").unwrap();
+        assert_eq!(identity().0, late.join("ld.mold"));
+        assert_eq!(placed_from_memo(), (late.join("ld.mold"), true));
+        let mut mode = std::fs::metadata(early.join("ld.mold"))
+            .unwrap()
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(early.join("ld.mold"), mode).unwrap();
+        assert_eq!(placed_from_memo(), (early.join("ld.mold"), false));
+
+        // Retargeting a symlinked PATH directory changes the search.
+        kache_fs::testutil::write_executable(&other.join("ld.mold"), "mold via symlink");
+        assert_eq!(placed_from_memo(), (early.join("ld.mold"), true));
+        std::fs::remove_file(&linked).unwrap();
+        std::os::unix::fs::symlink(&other, &linked).unwrap();
+        assert_eq!(placed_from_memo(), (linked.join("ld.mold"), false));
+
+        // So does creating a PATH directory that did not exist.
+        std::fs::create_dir_all(&missing).unwrap();
+        kache_fs::testutil::write_executable(&missing.join("ld.mold"), "mold, new");
+        assert_eq!(placed_from_memo(), (missing.join("ld.mold"), false));
+
+        // And a driver program directory that did not exist yet.
+        let later = root.join("libexec-later");
+        std::fs::create_dir_all(&later).unwrap();
+        kache_fs::testutil::write_executable(&later.join("ld.mold"), "mold, driver's");
+        assert_eq!(placed_from_memo(), (later.join("ld.mold"), false));
+
+        // The selection is part of the memo's identity.
+        let lld = LinkerSelection::from_words(&words(&["-fuse-ld=lld"])).unwrap();
+        assert!(place_linker_memoized_for(&memo, &driver, &lld, &env).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

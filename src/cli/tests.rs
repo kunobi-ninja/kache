@@ -11095,3 +11095,59 @@ fn direct_stats_include_rotated_events() {
     assert_eq!(snap.event_stats.local_hits, 12);
     assert_eq!(snap.event_stats.misses, 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn native_linker_check_reports_the_linker_cc_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    kache_fs::testutil::write_executable(
+        &bin.join("cc"),
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in -print-prog-name=ld) echo {bin}/ld ;; -print-prog-name=*) echo \"${{arg#-print-prog-name=}}\" ;; esac; done\n",
+            bin = bin.display()
+        ),
+    );
+    kache_fs::testutil::write_executable(&bin.join("ld"), "#!/bin/sh\necho 'GNU ld (test) 2.45'\n");
+    let env = |rustflags: &str| {
+        crate::invocation::InvocationEnv::from_parts(
+            [
+                ("PATH", bin.as_os_str()),
+                ("RUSTFLAGS", std::ffi::OsStr::new(rustflags)),
+            ],
+            Some(root.clone()),
+            None,
+            root.clone(),
+        )
+    };
+
+    let check = native_linker_check(&env(""));
+    assert!(check.pass, "{}", check.detail);
+    assert_eq!(
+        check.detail,
+        format!("{} (GNU ld (test) 2.45)", bin.join("ld").display())
+    );
+
+    let check = native_linker_check(&env("-C link-arg=-fuse-ld=mold"));
+    assert!(!check.pass);
+    assert!(check.detail.contains("`ld.mold`"), "{}", check.detail);
+    assert!(check.fix.is_some());
+
+    // `-C linker` in RUSTFLAGS names the driver to ask.
+    kache_fs::testutil::write_executable(
+        &bin.join("clang"),
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in -print-prog-name=ld) echo {bin}/ld.alt ;; esac; done\n",
+            bin = bin.display()
+        ),
+    );
+    kache_fs::testutil::write_executable(&bin.join("ld.alt"), "#!/bin/sh\necho 'LLD 22.1.8'\n");
+    let check = native_linker_check(&env("-C linker=clang"));
+    assert!(check.pass, "{}", check.detail);
+    assert_eq!(
+        check.detail,
+        format!("{} (LLD 22.1.8)", bin.join("ld.alt").display())
+    );
+}

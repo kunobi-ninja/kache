@@ -4014,9 +4014,9 @@ fn compute_key_into(
         args,
         &rustc_version,
         cfg!(target_os = "windows"),
-        |linker, architecture, host| {
-            let search_dirs = windows_native_link_search_dirs(args)?;
-            let identity =
+        file_hasher,
+        |linker, architecture, host, search_dirs| {
+            Ok(
                 crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
                     linker,
                     architecture,
@@ -4027,8 +4027,8 @@ fn compute_key_into(
                     |path| file_hasher.hash_static_lib(path),
                     invocation,
                 )?
-                .encode();
-            windows_link_identity_with_argument_files(identity, &search_dirs.files, file_hasher)
+                .encode(),
+            )
         },
         invocation,
     )?;
@@ -10697,7 +10697,8 @@ fn windows_link_identity_with_argument_files(
     file_hasher: &FileHasher<'_>,
 ) -> Result<String> {
     for (index, file) in files.iter().enumerate() {
-        if !file.is_file() {
+        let resolved = file_hasher.resolve_path(file)?;
+        if !resolved.is_file() {
             anyhow::bail!("linker input {} is not a regular file", file.display());
         }
         let digest = file_hasher
@@ -10788,7 +10789,7 @@ where
 /// Fold the selected native Windows MSVC link identity into a linked-output
 /// key. The probe is injected so the admission gate can be tested without a
 /// Windows toolchain; production supplies the real tool/library discovery.
-/// It gets the selected linker, the MSVC architecture and rustc's host.
+/// Argument admission and resource hashing stay in the shared fold.
 #[cfg(test)]
 fn fold_native_windows_msvc_identity<H, Probe>(
     hasher: &mut H,
@@ -10801,13 +10802,15 @@ where
     H: KeyFold,
     Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
 {
+    let invocation = InvocationEnv::capture();
     fold_native_windows_msvc_identity_for(
         hasher,
         args,
         rustc_version,
         running_on_windows,
-        probe,
-        &InvocationEnv::capture(),
+        &FileHasher::new_for(&invocation),
+        |linker, architecture, host, _| probe(linker, architecture, host),
+        &invocation,
     )
 }
 
@@ -10816,12 +10819,13 @@ fn fold_native_windows_msvc_identity_for<H, Probe>(
     args: &RustcArgs,
     rustc_version: &str,
     running_on_windows: bool,
+    file_hasher: &FileHasher<'_>,
     probe: Probe,
     invocation: &InvocationEnv,
 ) -> Result<()>
 where
     H: KeyFold,
-    Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
+    Probe: FnOnce(Option<&Path>, &str, &str, &WindowsNativeLinkSearchDirs) -> Result<String>,
 {
     if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
         return Ok(());
@@ -10866,8 +10870,11 @@ where
             );
         }
     }
-    let identity = probe(linker, architecture, host)
+    let search_dirs = windows_native_link_search_dirs(args)?;
+    let identity = probe(linker, architecture, host, &search_dirs)
         .context("determining native Windows MSVC link identity")?;
+    let identity =
+        windows_link_identity_with_argument_files(identity, &search_dirs.files, file_hasher)?;
     fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());
     tracing::trace!(
         "[key:{}] host_windows_msvc={}",

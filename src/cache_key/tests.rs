@@ -1075,7 +1075,7 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
         .unwrap();
         let error = windows_native_link_search_dirs(&args).unwrap_err();
         assert!(
-            error.to_string().contains("not hashed"),
+            error.to_string().contains("not cacheable"),
             "unmodeled Windows link input must fail closed: {linker_arg}: {error:#}"
         );
     }
@@ -1159,57 +1159,127 @@ fn windows_resources_do_not_hide_mixed_search_paths_or_unsupported_files() {
 #[test]
 fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone() {
     let dir = tempfile::tempdir().unwrap();
-    let first_res = dir.path().join("first.res");
-    let second_res = dir.path().join("second.res");
+    // Unix treats C:/ as relative; resolve it within the invocation instead
+    // of changing the process cwd. Windows uses real absolute fixture paths.
+    let first_arg = if cfg!(windows) {
+        dir.path().join("first.res")
+    } else {
+        PathBuf::from("C:/first.res")
+    };
+    let second_arg = if cfg!(windows) {
+        dir.path().join("second.res")
+    } else {
+        PathBuf::from("C:/second.res")
+    };
+    let invocation = client_invocation(dir.path(), &[]);
+    let file_hasher = FileHasher::new_for(&invocation);
+    let first_res = file_hasher.resolve_path(&first_arg).unwrap();
+    let second_res = file_hasher.resolve_path(&second_arg).unwrap();
+    std::fs::create_dir_all(first_res.parent().unwrap()).unwrap();
     std::fs::write(&first_res, windows_test_resource(b"resource v1")).unwrap();
     std::fs::write(&second_res, windows_test_resource(b"other")).unwrap();
-    let files = vec![first_res.clone(), second_res.clone()];
-    let identity = |files: &[PathBuf]| {
-        windows_link_identity_with_argument_files(
-            "linker=LINK 14".into(),
-            files,
-            &FileHasher::new(),
-        )
+    let key = |files: &[&Path], extra: Option<&str>| -> Result<String> {
+        let mut argv = vec![
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            "-Lnative=native-libs".into(),
+            "-lstatic=example".into(),
+            "-Clink-arg=/LIBPATH:C:/sdk-libs".into(),
+        ];
+        argv.extend(
+            files
+                .iter()
+                .map(|path| format!("-Clink-arg={}", path.display())),
+        );
+        argv.extend(extra.map(|argument| format!("-Clink-args={argument}")));
+        let args = RustcArgs::parse_for(&argv, &invocation).unwrap();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"base-key");
+        fold_native_windows_msvc_identity_for(
+            &mut hasher,
+            &args,
+            WINDOWS_RUSTC_VERSION,
+            true,
+            &file_hasher,
+            |linker, architecture, host, search_dirs| {
+                assert_eq!(linker, None);
+                assert_eq!(architecture, "x64");
+                assert_eq!(host, "x86_64-pc-windows-msvc");
+                assert_eq!(args.link_libs, vec!["static=example".to_string()]);
+                assert_eq!(search_dirs.rustc, [PathBuf::from("native-libs")]);
+                assert_eq!(
+                    search_dirs.linker,
+                    [PathBuf::from("native-libs"), PathBuf::from("C:/sdk-libs")]
+                );
+                assert_eq!(
+                    search_dirs.files,
+                    files
+                        .iter()
+                        .map(|path| path.to_path_buf())
+                        .collect::<Vec<_>>()
+                );
+                Ok("linker=LINK 14".into())
+            },
+            &invocation,
+        )?;
+        Ok(hasher.finalize().to_hex().to_string())
     };
-    let args = parsed_crate_type("bin", None);
-    let key = |files: &[PathBuf]| windows_fold_key(&args, WINDOWS_RUSTC_VERSION, &identity(files)?);
-    let first_identity = identity(&files).unwrap();
-    let first = key(&files).unwrap();
-    assert!(first_identity.starts_with("linker=LINK 14\nlink_arg_input.v1=0="));
-    assert_eq!(first_identity.matches("link_arg_input.v1=").count(), 2);
-    assert_eq!(key(&files).unwrap(), first, "same bytes, same folded key");
-    assert_eq!(identity(&[]).unwrap(), "linker=LINK 14");
+    let files = [first_arg.as_path(), second_arg.as_path()];
+    let first = key(&files, None).unwrap();
+    assert_eq!(
+        key(&files, None).unwrap(),
+        first,
+        "same bytes, same folded key"
+    );
+    assert_ne!(
+        key(&[], None).unwrap(),
+        first,
+        "resources reach the folded key"
+    );
 
     std::fs::write(&first_res, windows_test_resource(b"resource v2")).unwrap();
-    assert_ne!(key(&files).unwrap(), first, "an edit reaches the key");
+    assert_ne!(key(&files, None).unwrap(), first, "an edit reaches the key");
     std::fs::write(&first_res, windows_test_resource(b"resource v1")).unwrap();
     std::fs::write(&second_res, windows_test_resource(b"OTHER")).unwrap();
     assert_ne!(
-        key(&files).unwrap(),
+        key(&files, None).unwrap(),
         first,
         "every resource reaches the key"
     );
     std::fs::write(&second_res, windows_test_resource(b"other")).unwrap();
     assert_ne!(
-        key(&[second_res.clone(), first_res.clone()]).unwrap(),
+        key(&[second_arg.as_path(), first_arg.as_path()], None).unwrap(),
         first,
         "argument order reaches the key"
     );
     assert_eq!(
-        key(&files).unwrap(),
+        key(&files, None).unwrap(),
         first,
         "reverting recovers the old key"
     );
+    for argument in [
+        "C:/extra.obj",
+        "/MANIFESTINPUT:C:/app.xml",
+        "/LIBPATH:C:/other C:/extra.res",
+    ] {
+        assert!(key(&files, Some(argument)).is_err(), "{argument}");
+    }
 
+    std::fs::write(&second_res, b"!<arch>\nrenamed archive").unwrap();
+    assert!(
+        key(&files, None).is_err(),
+        "format admission reaches the same folded-key path"
+    );
     std::fs::remove_file(&second_res).unwrap();
     assert!(
-        identity(&files)
+        key(&files, None)
             .unwrap_err()
             .to_string()
             .contains("not a regular file")
     );
+    std::fs::create_dir(&second_res).unwrap();
     assert!(
-        identity(&[dir.path().to_path_buf()]).is_err(),
+        key(&files, None).is_err(),
         "a directory cannot become a resource input"
     );
 }

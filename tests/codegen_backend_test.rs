@@ -45,33 +45,33 @@ printf 'binary' > app
             &dir.path().join("cache"),
             Some(&dir.path().join("absent.toml")),
         )
-            .arg(&rustc)
-            .args([
-                "--crate-name",
-                "app",
-                "main.rs",
-                "--crate-type",
-                "bin",
-                "--emit=link",
-                "-o",
-                "app",
-            ])
-            .arg(format!(
-                "-Zcodegen-backend={}",
-                dir.path().join("backend.so").display()
-            ))
-            .current_dir(dir.path())
-            .env("KACHE_CONFIG", dir.path().join("absent.toml"))
-            .env("KACHE_HOST_CONFIG", "")
-            .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-            .env("KACHE_FALLBACK", &fallback)
-            .env("KACHE_CACHE_EXECUTABLES", "true")
-            .env("KACHE_REMOTE", "")
-            .env_remove("KACHE_TRUST_CODEGEN_BACKENDS")
-            .env_remove("KACHE_DISABLED")
-            .env("TEST_CALLS", &calls)
-            .output()
-            .unwrap();
+        .arg(&rustc)
+        .args([
+            "--crate-name",
+            "app",
+            "main.rs",
+            "--crate-type",
+            "bin",
+            "--emit=link",
+            "-o",
+            "app",
+        ])
+        .arg(format!(
+            "-Zcodegen-backend={}",
+            dir.path().join("backend.so").display()
+        ))
+        .current_dir(dir.path())
+        .env("KACHE_CONFIG", dir.path().join("absent.toml"))
+        .env("KACHE_HOST_CONFIG", "")
+        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+        .env("KACHE_FALLBACK", &fallback)
+        .env("KACHE_CACHE_EXECUTABLES", "true")
+        .env("KACHE_REMOTE", "")
+        .env_remove("KACHE_TRUST_CODEGEN_BACKENDS")
+        .env_remove("KACHE_DISABLED")
+        .env("TEST_CALLS", &calls)
+        .output()
+        .unwrap();
         assert!(
             output.status.success(),
             "{}",

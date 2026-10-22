@@ -70,7 +70,10 @@ printf 'complete-object' > "$TEST_OBJECT"
         .map(String::from)
         .collect();
         Self {
-            _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), dir.path().join("cache")),
+            _daemon: common::DaemonGuard::new(
+                env!("CARGO_BIN_EXE_kache"),
+                dir.path().join("cache"),
+            ),
             dir,
             compiler,
             fallback,

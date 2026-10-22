@@ -2408,20 +2408,9 @@ mod tests {
 
     #[test]
     fn normalize_disabled_by_knob() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let previous = std::env::var_os("KACHE_NVCC_PATH_NORMALIZE");
-        unsafe {
-            std::env::set_var("KACHE_NVCC_PATH_NORMALIZE", "0");
-        }
-        let maps = nvcc_prefix_maps(Path::new("k.cu"), None, &[]);
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("KACHE_NVCC_PATH_NORMALIZE", value);
-            },
-            None => unsafe {
-                std::env::remove_var("KACHE_NVCC_PATH_NORMALIZE");
-            },
-        }
+        let mut env = crate::invocation::InvocationEnv::capture();
+        env.set("KACHE_NVCC_PATH_NORMALIZE", "0");
+        let maps = nvcc_prefix_maps_for(Path::new("k.cu"), None, &[], &env).unwrap();
         assert!(maps.is_empty());
     }
 

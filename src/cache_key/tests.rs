@@ -18409,7 +18409,9 @@ mod build_script_target_paths {
 
     impl Unit {
         fn new(root: &Path) -> Self {
-            let workspace = root.canonicalize().unwrap();
+            // Cargo uses ordinary Windows paths. A verbatim prefix makes
+            // PathBuf::push normalize away the parent components tested below.
+            let workspace = PathBuf::from(crate::path_normalizer::canonical_string(root).unwrap());
             let source = workspace.join("lib.rs");
             std::fs::write(
                 &source,
@@ -18583,6 +18585,7 @@ mod build_script_target_paths {
         )
         .unwrap();
         let other_unit = b.join("debug/build/foo-sys-fedcba9876543210/out");
+        std::fs::create_dir_all(other_unit.parent().unwrap()).unwrap();
         std::fs::rename(&out_b, &other_unit).unwrap();
         assert_distinct_link(
             original,
@@ -18685,6 +18688,14 @@ mod build_script_target_paths {
                     "empty-suffix" => target.clone(),
                     _ => out.clone(),
                 };
+                if matches!(case, "parent-component" | "parent-escape") {
+                    assert!(
+                        search
+                            .components()
+                            .any(|part| part == std::path::Component::ParentDir),
+                        "{case} must exercise a literal parent component"
+                    );
+                }
                 std::fs::create_dir_all(unit.workspace.join(&search)).unwrap();
                 let observed_out = match case {
                     "no-out-dir" => None,

@@ -19,11 +19,11 @@
 //! variables, a linker other than `link.exe`/`lld-link`, an ambiguous or
 //! missing `-l` library, cross-target and windows-gnu links, and any
 //! `-C link-arg` that hands LINK a file the identity does not hash. That last
-//! group is decided by [`windows_link_argument_has_unmodeled_input`]:
-//! `.lib`/`.a`/`.obj`/`.o`/`.res`/`.def`/`.exp`/`.manifest` inputs and
-//! file-carrying options such as `/DEF:`, `/MANIFESTINPUT:`,
-//! `/MANIFESTFILE:` and `/PDBSTRIPPED:` are only text in the key, so a file
-//! rebuilt under an unchanged name would otherwise restore a stale executable.
+//! group is checked by [`windows_link_argument_input_files`]. Absolute `.res`
+//! inputs with the standard binary resource header are hashed from their
+//! validated bytes. Objects, archives, explicit manifest inputs and other
+//! file-carrying options stay refused; their further inputs or side outputs
+//! are not modeled.
 
 use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result, bail};
@@ -1182,12 +1182,11 @@ pub(crate) fn is_windows_msvc_target(target: &str) -> bool {
 /// Whether a `-C link-arg`/`link-args` value hands the COFF linker an input
 /// the native MSVC identity does not hash.
 ///
-/// The key folds the argument *text*, not the bytes of the files that text
-/// names. A `.res`, `.def` or `.obj` rebuilt in place under the same OUT_DIR
-/// name would then restore a stale executable, so every such argument fails
-/// closed and the link passes through. Two shapes are recognised, after the
-/// value is split on the commas and whitespace that `-Wl,` and `link-args`
-/// use to carry several tokens:
+/// Argument text alone does not key the bytes a path names. The caller must
+/// either identify and hash a supported input with
+/// [`windows_link_argument_input_files`] or refuse the link. Two shapes are
+/// recognised after splitting the commas and whitespace that `-Wl,` and
+/// `link-args` use to carry several tokens:
 ///
 /// - a token naming a linker input by extension (`.lib`, `.a`, `.obj`, `.o`,
 ///   `.res`, `.def`, `.exp`, `.manifest`), bare or as an option value;
@@ -1221,9 +1220,9 @@ pub(crate) fn link_token_names_input_file(token: &str) -> bool {
         || ends_with_ignore_ascii_case(token, ".manifest")
 }
 
-/// A `/NAME:value` or `-NAME=value` option whose value is a file the identity
-/// neither hashes nor captures. A bare `/WHOLEARCHIVE` applies to the inputs
-/// rustc already passes and carries no file of its own.
+/// A `/NAME:value` or `-NAME=value` option that needs file handling beyond
+/// its argument text. A bare `/WHOLEARCHIVE` applies to the inputs rustc
+/// already passes and carries no file of its own.
 fn windows_link_token_is_file_option(token: &str) -> bool {
     let Some(option) = token.strip_prefix(['/', '-']) else {
         return false;
@@ -1258,36 +1257,18 @@ fn windows_link_token_is_file_option(token: &str) -> bool {
 /// `EMBED` (with or without `,ID=n`, whose comma splits it off before this).
 fn manifest_value_writes_no_side_file(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
-        value.eq_ignore_ascii_case("NO")
-            || value
-                .get(..5)
-                .is_some_and(|head| head.eq_ignore_ascii_case("EMBED"))
+        value.eq_ignore_ascii_case("NO") || value.eq_ignore_ascii_case("EMBED")
     })
 }
 
-/// The files a native MSVC link reads through one `-C link-arg` (`key`
-/// `link-arg`) or `link-args` value, when the identity can key them by
-/// their bytes: `None` when any argument hands LINK something it cannot.
+/// Absolute compiled-resource files carried by one link-arg or
+/// whitespace-split link-args value. Their binary format is checked by the
+/// hasher. Objects and archives can name further inputs; XML manifests need
+/// a separate proof of the merger's external-file behavior. Both stay refused.
 ///
-/// rustc hands a `link-arg` to LINK as one argument and splits `link-args`
-/// on whitespace. An argument that [`windows_link_argument_has_unmodeled_input`]
-/// clears needs no file. Otherwise only two shapes are read, each naming an
-/// absolute path, so the bytes the key hashes are the bytes LINK reads
-/// whatever its working directory:
-///
-/// - the whole argument is the path of an input LINK merges into the image,
-///   by extension `.res` (a compiled resource script: what `winresource` and
-///   `embed-resource` print), `.obj`, `.o`, `.lib` or `.a`;
-/// - `/MANIFESTINPUT:<path>` (either prefix, any case), the XML LINK merges
-///   into the manifest it embeds. It needs `/MANIFEST:EMBED`, so it writes no
-///   side file.
-///
-/// Every other file-carrying option stays refused: its file is an output the
-/// cache does not capture (`/PDB`, `/IMPLIB`, `/MANIFESTFILE`, ...), makes
-/// LINK write one (`/DEF` exports an import library beside the image), or is
-/// resolved through a search path (`/DEFAULTLIB`). So is a relative path, a
-/// quoted one, and a `-Wl,` argument, which is a C driver's spelling LINK
-/// would not read as a file.
+/// A bare token is a possible input even without a recognized extension.
+/// Embedded quotes, relative paths and C-driver spellings stay outside this
+/// parser's accepted subset. Plain LINK options retain the existing guards.
 pub(crate) fn windows_link_argument_input_files(key: &str, value: &str) -> Option<Vec<PathBuf>> {
     let arguments: Vec<&str> = if key == "link-args" {
         value.split_whitespace().collect()
@@ -1296,32 +1277,20 @@ pub(crate) fn windows_link_argument_input_files(key: &str, value: &str) -> Optio
     };
     let mut files = Vec::new();
     for argument in arguments {
-        if !windows_link_argument_has_unmodeled_input(argument) {
-            continue;
+        if windows_link_argument_has_unmodeled_input(argument) {
+            files.push(windows_link_argument_input_file(argument)?);
+        } else if !argument.starts_with(['/', '-']) {
+            return None;
         }
-        files.push(windows_link_argument_input_file(argument)?);
     }
     Some(files)
 }
 
 fn windows_link_argument_input_file(argument: &str) -> Option<PathBuf> {
-    let path = match argument
-        .strip_prefix(['/', '-'])
-        .and_then(|option| option.split_once(':'))
-    {
-        Some((name, path)) if name.eq_ignore_ascii_case("MANIFESTINPUT") => path,
-        Some(_) => return None,
-        None => {
-            let merged = [".res", ".obj", ".o", ".lib", ".a"]
-                .iter()
-                .any(|extension| ends_with_ignore_ascii_case(argument, extension));
-            if !merged {
-                return None;
-            }
-            argument
-        }
-    };
-    (windows_absolute_path(path) && !path.contains('"')).then(|| PathBuf::from(path))
+    (windows_absolute_path(argument)
+        && ends_with_ignore_ascii_case(argument, ".res")
+        && !argument.contains('"'))
+    .then(|| PathBuf::from(argument))
 }
 
 /// A Windows path that does not depend on a working directory or a current
@@ -5298,27 +5267,17 @@ esac
                 r"C:\Program Files\out dir\APP.RES",
                 vec![r"C:\Program Files\out dir\APP.RES"],
             ),
-            ("link-arg", "C:/w/extra.obj", vec!["C:/w/extra.obj"]),
-            ("link-arg", r"\\?\C:\w\libfoo.a", vec![r"\\?\C:\w\libfoo.a"]),
+            ("link-arg", "C:/w/a.res", vec!["C:/w/a.res"]),
+            ("link-arg", r"\\?\C:\w\a.res", vec![r"\\?\C:\w\a.res"]),
             (
                 "link-arg",
-                r"\\server\share\foo.lib",
-                vec![r"\\server\share\foo.lib"],
-            ),
-            (
-                "link-arg",
-                r"/MANIFESTINPUT:C:\w\pkg\windows\Manifest.xml",
-                vec![r"C:\w\pkg\windows\Manifest.xml"],
-            ),
-            (
-                "link-arg",
-                r"-manifestinput:C:\w\app.manifest",
-                vec![r"C:\w\app.manifest"],
+                r"\\server\share\a.res",
+                vec![r"\\server\share\a.res"],
             ),
             (
                 "link-args",
-                r"/DEBUG C:\w\a.res /MANIFEST:EMBED,ID=2 C:\w\b.o",
-                vec![r"C:\w\a.res", r"C:\w\b.o"],
+                r"/DEBUG C:\w\a.res /MANIFEST:EMBED,ID=2 C:\w\b.res",
+                vec![r"C:\w\a.res", r"C:\w\b.res"],
             ),
             ("link-arg", "/MANIFEST:EMBED", vec![]),
             ("link-arg", "/WX", vec![]),
@@ -5340,13 +5299,28 @@ esac
             ("link-arg", r"C:app.res"),
             ("link-arg", r"\w\app.res"),
             ("link-arg", "/MANIFESTINPUT:extra.manifest"),
-            // Quoted: LINK would read the quotes as part of the name.
+            // Embedded quotes need parsing beyond this accepted subset.
             ("link-arg", r#""C:\out dir\app.res""#),
             ("link-arg", r#"/MANIFESTINPUT:"C:\w\Manifest.xml""#),
             // A C driver's spelling, not a LINK argument.
             ("link-arg", r"-Wl,C:\w\app.res"),
             // Spaces split `link-args` into pieces that are not paths.
             ("link-args", r"C:\out dir\app.res"),
+            // An unrecognized bare input is still a file, including beside
+            // an otherwise supported compiled resource.
+            ("link-arg", r"C:\w\opaque.dat"),
+            ("link-arg", r"C:\w\extensionless"),
+            ("link-args", r"C:\w\a.res C:\w\opaque.dat"),
+            ("link-args", r"C:\w\a.res /MANIFESTINPUT:C:\w\app.xml"),
+            ("link-arg", r"/MANIFESTINPUT:C:\w\Manifest.xml"),
+            ("link-arg", r"-manifestinput:C:\w\app.res"),
+            // Objects/archives can name further inputs through directives or
+            // thin members. Renamed containers are also checked by the hasher.
+            ("link-arg", r"C:\w\extra.obj"),
+            ("link-arg", r"C:\w\extra.o"),
+            ("link-arg", r"C:\w\foo.lib"),
+            ("link-arg", r"C:\w\foo.a"),
+            ("link-args", r"C:\w\a.res C:\w\foo.lib"),
             // Inputs not merged as they are, or outputs beside the image.
             ("link-arg", r"C:\w\exports.def"),
             ("link-arg", r"C:\w\exports.exp"),
@@ -5376,6 +5350,8 @@ esac
             "-manifest",
             "/MANIFEST:SIDEBYSIDE",
             "/manifest:",
+            "/MANIFEST:EMBEDDED",
+            "/MANIFEST:EMBEDjunk",
         ] {
             assert!(
                 windows_link_argument_has_unmodeled_input(argument),

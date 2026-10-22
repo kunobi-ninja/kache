@@ -1081,9 +1081,25 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
     }
 }
 
-/// Absolute inputs LINK merges into the image are keyed by their bytes
-/// instead of refusing the link: a resource script's `.res` (winresource,
-/// embed-resource) and a `/MANIFESTINPUT` (ripgrep), in argument order.
+/// Compile a resource entry in the documented .res layout. Build the null
+/// header independently of the production format check.
+fn windows_test_resource(payload: &[u8]) -> Vec<u8> {
+    fn entry(bytes: &mut Vec<u8>, kind: u16, name: u16, data: &[u8]) {
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&32_u32.to_le_bytes());
+        for value in [u16::MAX, kind, u16::MAX, name] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(data);
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+    }
+    let mut bytes = Vec::new();
+    entry(&mut bytes, 0, 0, &[]);
+    entry(&mut bytes, 10, 1, payload);
+    bytes
+}
+
 #[test]
 fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
     let args = RustcArgs::parse(&[
@@ -1091,67 +1107,214 @@ fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
         "--crate-type=bin".into(),
         r"-Clink-arg=C:\w\target\debug\build\app-1\out\resource.res".into(),
         "-Clink-arg=/MANIFEST:EMBED".into(),
-        r"-Clink-arg=/MANIFESTINPUT:C:\w\pkg\windows\Manifest.xml".into(),
         "-Clink-arg=/WX".into(),
-        r"-Clink-args=/DEBUG C:\w\extra.obj".into(),
+        r"-Clink-args=/DEBUG C:\w\extra.res".into(),
+        r"-Clink-arg=/LIBPATH:C:\shadow".into(),
     ])
     .unwrap();
     assert_eq!(
-        windows_native_link_search_dirs(&args).unwrap().files,
-        vec![
-            PathBuf::from(r"C:\w\target\debug\build\app-1\out\resource.res"),
-            PathBuf::from(r"C:\w\pkg\windows\Manifest.xml"),
-            PathBuf::from(r"C:\w\extra.obj"),
-        ]
+        windows_native_link_search_dirs(&args).unwrap(),
+        WindowsNativeLinkSearchDirs {
+            rustc: vec![],
+            linker: vec![PathBuf::from(r"C:\shadow")],
+            files: vec![
+                PathBuf::from(r"C:\w\target\debug\build\app-1\out\resource.res"),
+                PathBuf::from(r"C:\w\extra.res"),
+            ],
+        }
     );
-
-    // One unmodeled argument beside them still refuses the whole link.
-    let mixed = RustcArgs::parse(&[
-        "rustc".into(),
-        "--crate-type=bin".into(),
-        r"-Clink-arg=C:\w\resource.res".into(),
-        r"-Clink-arg=/DEF:C:\w\exports.def".into(),
-    ])
-    .unwrap();
-    assert!(windows_native_link_search_dirs(&mixed).is_err());
 }
 
 #[test]
-fn windows_link_argument_files_key_their_bytes_and_fail_closed_when_gone() {
+fn windows_resources_do_not_hide_mixed_search_paths_or_unsupported_files() {
+    for value in [
+        r"/LIBPATH:C:\shadow C:\w\a.res",
+        r"C:\w\a.res /LIBPATH:C:\shadow",
+        r"/debug C:\w\a.res -libpath=C:\shadow",
+        r"/LIBPATH:C:\shadow /MANIFESTINPUT:C:\w\app.xml",
+        r"C:\w\a.res /DEF:C:\w\exports.def",
+        r"C:\w\a.res C:\w\extra.obj",
+        r"C:\w\a.res C:\w\opaque.dat",
+        r"C:\w\a.res /MANIFESTINPUT:C:\w\app.xml",
+        r"/MANIFESTINPUT:C:\w\Manifest.xml",
+        r"C:\w\opaque.dat",
+    ] {
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            format!("-Clink-args={value}"),
+        ])
+        .unwrap();
+        assert!(windows_native_link_search_dirs(&args).is_err(), "{value}");
+    }
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-type=bin".into(),
+        r"-Clink-args=C:\w\a.res @C:\w\more.rsp".into(),
+    ])
+    .unwrap();
+    assert!(native_linker_side_files_are_unmodeled(&args));
+}
+
+#[test]
+fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone() {
     let dir = tempfile::tempdir().unwrap();
-    let res = dir.path().join("resource.res");
-    let manifest = dir.path().join("Manifest.xml");
-    std::fs::write(&res, b"resource v1").unwrap();
-    std::fs::write(&manifest, b"<assembly/>").unwrap();
-    let files = vec![res.clone(), manifest.clone()];
+    let first_res = dir.path().join("first.res");
+    let second_res = dir.path().join("second.res");
+    std::fs::write(&first_res, windows_test_resource(b"resource v1")).unwrap();
+    std::fs::write(&second_res, windows_test_resource(b"other")).unwrap();
+    let files = vec![first_res.clone(), second_res.clone()];
     let identity = |files: &[PathBuf]| {
-        let mut identity = String::from("linker=LINK 14");
-        append_windows_link_argument_files(&mut identity, files, |path| {
-            Ok(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
-        })
-        .map(|()| identity)
+        windows_link_identity_with_argument_files(
+            "linker=LINK 14".into(),
+            files,
+            &FileHasher::new(),
+        )
     };
-    let first = identity(&files).unwrap();
-    assert!(first.starts_with("linker=LINK 14\nlink_arg_input.v1=0="));
-    assert_eq!(first.matches("link_arg_input.v1=").count(), 2);
-    assert_eq!(
-        identity(&files).unwrap(),
+    let args = parsed_crate_type("bin", None);
+    let key = |files: &[PathBuf]| windows_fold_key(&args, WINDOWS_RUSTC_VERSION, &identity(files)?);
+    let first_identity = identity(&files).unwrap();
+    let first = key(&files).unwrap();
+    assert!(first_identity.starts_with("linker=LINK 14\nlink_arg_input.v1=0="));
+    assert_eq!(first_identity.matches("link_arg_input.v1=").count(), 2);
+    assert_eq!(key(&files).unwrap(), first, "same bytes, same folded key");
+    assert_eq!(identity(&[]).unwrap(), "linker=LINK 14");
+
+    std::fs::write(&first_res, windows_test_resource(b"resource v2")).unwrap();
+    assert_ne!(key(&files).unwrap(), first, "an edit reaches the key");
+    std::fs::write(&first_res, windows_test_resource(b"resource v1")).unwrap();
+    std::fs::write(&second_res, windows_test_resource(b"OTHER")).unwrap();
+    assert_ne!(
+        key(&files).unwrap(),
         first,
-        "same bytes, same identity"
+        "every resource reaches the key"
+    );
+    std::fs::write(&second_res, windows_test_resource(b"other")).unwrap();
+    assert_ne!(
+        key(&[second_res.clone(), first_res.clone()]).unwrap(),
+        first,
+        "argument order reaches the key"
+    );
+    assert_eq!(
+        key(&files).unwrap(),
+        first,
+        "reverting recovers the old key"
     );
 
-    // A resource rebuilt in place under the same name changes the key.
-    std::fs::write(&res, b"resource v2").unwrap();
-    assert_ne!(identity(&files).unwrap(), first);
-    // So does the order LINK reads them in.
-    std::fs::write(&res, b"resource v1").unwrap();
-    assert_ne!(identity(&[manifest.clone(), res.clone()]).unwrap(), first);
-
-    std::fs::remove_file(&manifest).unwrap();
-    let error = identity(&files).unwrap_err();
+    std::fs::remove_file(&second_res).unwrap();
     assert!(
-        error.to_string().contains("not a regular file"),
-        "{error:#}"
+        identity(&files)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file")
+    );
+    assert!(
+        identity(&[dir.path().to_path_buf()]).is_err(),
+        "a directory cannot become a resource input"
+    );
+}
+
+#[test]
+fn windows_resource_hash_rejects_truncated_headers_and_renamed_containers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("renamed.res");
+    let file_hasher = FileHasher::new();
+    let identity = || {
+        windows_link_identity_with_argument_files(
+            "linker=LINK 14".into(),
+            std::slice::from_ref(&path),
+            &file_hasher,
+        )
+    };
+    let valid = windows_test_resource(b"data");
+    assert_eq!(valid.len(), 68);
+    for len in 0..32 {
+        std::fs::write(&path, &valid[..len]).unwrap();
+        assert!(identity().is_err(), "len={len}");
+    }
+    for offset in 0..32 {
+        let mut invalid = valid.clone();
+        invalid[offset] ^= 1;
+        std::fs::write(&path, invalid).unwrap();
+        assert!(identity().is_err(), "offset={offset}");
+    }
+    for bytes in [
+        b"!<thin>\nexternal.obj".as_slice(),
+        b"!<arch>\nopaque archive".as_slice(),
+        b"\x64\x86COFF .drectve /DEFAULTLIB:helper.lib".as_slice(),
+        b"BC\xc0\xdeLLVM bitcode".as_slice(),
+        b"<assembly/>".as_slice(),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        assert!(identity().is_err(), "{bytes:?}");
+    }
+    std::fs::write(&path, &valid).unwrap();
+    assert_eq!(
+        file_hasher.hash_windows_resource(&path).unwrap(),
+        blake3::hash(&valid).to_hex().to_string(),
+        "accepted bytes are exactly the bytes hashed"
+    );
+}
+
+#[test]
+fn windows_resources_stream_all_bytes_without_trusting_a_whole_file_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.res");
+    let bytes = windows_test_resource(&b"a".repeat(70_000));
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let stamp = FileFingerprint::from_path(&path).unwrap();
+    let stale = "0".repeat(64);
+    FileHashCache::Borrowed(&db).put(&stamp, &stale).unwrap();
+    let file_hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    assert_eq!(
+        file_hasher.hash_windows_resource(&path).unwrap(),
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    assert_eq!(file_hasher.stats().cache_hits, 0);
+    assert_eq!(file_hasher.stats().bytes_hashed, bytes.len() as u64);
+    assert!(file_hasher.pending_memo.borrow().is_empty());
+}
+
+#[test]
+fn windows_resource_validation_reads_after_the_guarded_stat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resource.res");
+    let original = windows_test_resource(b"original");
+    std::fs::write(&path, &original).unwrap();
+    let mut file_hasher = FileHasher::new();
+    file_hasher.arm_too_new_guard(1, 0);
+    set_before_read(Some(Box::new(|path| {
+        let mut thin = b"!<thin>\n".to_vec();
+        thin.resize(64, b'x');
+        std::fs::write(path, thin).unwrap();
+    })));
+    let result = file_hasher.hash_windows_resource(&path);
+    set_before_read(None);
+    assert!(
+        result.is_err(),
+        "validate the bytes read, not an earlier path check"
+    );
+
+    std::fs::write(&path, &original).unwrap();
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, windows_test_resource(b"changed and longer")).unwrap();
+    })));
+    let changed = file_hasher.hash_windows_resource(&path);
+    set_before_read(None);
+    assert_eq!(changed.unwrap(), hash_file(&path).unwrap());
+    assert!(file_hasher.too_new());
+    assert!(file_hasher.inputs_changed_since_keyed());
+    let guarded = file_hasher.take_guarded_inputs();
+    assert!(
+        guarded.len() >= 2,
+        "both sides of a changed read must remain guarded"
+    );
+    assert!(
+        guarded
+            .iter()
+            .any(|input| input.fingerprint.size == original.len() as i64)
     );
 }
 

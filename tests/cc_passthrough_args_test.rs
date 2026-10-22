@@ -778,6 +778,8 @@ fn cc_admission_reports_a_skip_reason_and_recompiles_until_admitted() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(root.join("unit.o").is_file());
+        // Drain asynchronous publication before reading this compile's event.
+        dir.stop_daemon();
         let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
         let event: serde_json::Value =
             serde_json::from_str(events.lines().last().unwrap()).unwrap();

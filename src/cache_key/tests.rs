@@ -1058,6 +1058,9 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
         "/DEFAULTLIB:foo.lib",
         "app.res",
         "APP.RES",
+        r"C:\",
+        "Z:/",
+        r"\\",
         "extra.obj",
         "exports.exp",
         "/DEF:exports.def",
@@ -1098,6 +1101,30 @@ fn windows_test_resource(payload: &[u8]) -> Vec<u8> {
     entry(&mut bytes, 0, 0, &[]);
     entry(&mut bytes, 10, 1, payload);
     bytes
+}
+
+#[test]
+fn windows_absolute_paths_distinguish_roots_from_relative_names() {
+    for (path, absolute) in [
+        ("", false),
+        (r"\", false),
+        ("C:", false),
+        (r"C:\", true),
+        ("Z:/", true),
+        (r"C:resource.res", false),
+        (r"\resource.res", false),
+        (r"\\", false),
+        (r"\\server\share", true),
+        (r"\\server\share\resource.res", true),
+        (r"\\?\C:\resource.res", true),
+        ("resource.res", false),
+    ] {
+        assert_eq!(
+            crate::native_link_key::windows_absolute_path(path),
+            absolute,
+            "{path:?}"
+        );
+    }
 }
 
 #[test]

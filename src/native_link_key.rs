@@ -1299,7 +1299,7 @@ fn windows_link_argument_input_file(argument: &str) -> Option<PathBuf> {
 /// the same on every host that runs the tests.
 pub(crate) fn windows_absolute_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    let drive = bytes.len() > 3
+    let drive = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'\\' | b'/');

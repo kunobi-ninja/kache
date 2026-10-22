@@ -864,6 +864,7 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
 }
 
 struct ReceiptAcceptance {
+    _daemon: common::DaemonGuard,
     _dir: tempfile::TempDir,
     home: std::path::PathBuf,
     project: std::path::PathBuf,
@@ -880,7 +881,6 @@ impl ReceiptAcceptance {
         let project = dir.path().join("project");
         let target = project.join("target");
         let cache = dir.path().join("cache");
-        let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
         let dependency = dir.path().join("external-dependency");
         let script_input = dir.path().join("external-input.txt");
         std::fs::create_dir_all(project.join("src")).unwrap();
@@ -926,6 +926,7 @@ impl ReceiptAcceptance {
         )
         .unwrap();
         let fixture = Self {
+            _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache),
             _dir: dir,
             home,
             project,

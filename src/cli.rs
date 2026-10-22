@@ -1220,12 +1220,12 @@ fn since_label(since: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
     }
 }
 
-/// Hit rate, weighted hit rate, time saved and miss time.
+/// Hit rate, source counts, weighted hit rate, time saved and miss time.
 fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
     let es = &snap.event_stats;
     let hits = es.local_hits + es.prefetch_hits + es.remote_hits;
     let total = hits + es.dups + es.misses;
-    let mut from_cache = if total == 0 {
+    let from_cache = if total == 0 {
         "no builds in this window".to_string()
     } else {
         format!(
@@ -1234,15 +1234,21 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
             term::counted(total as u64, "crate", "crates")
         )
     };
-    if es.remote_hits + es.prefetch_hits > 0 {
-        from_cache.push_str(&format!(
-            " ({} local, {} remote, {} prefetched)",
-            term::count(es.local_hits as u64),
-            term::count(es.remote_hits as u64),
-            term::count(es.prefetch_hits as u64)
-        ));
-    }
-    let mut rows = vec![("Hit rate", term::percent(count_hit_rate(es)), from_cache)];
+    let mut rows = vec![
+        ("Hit rate", term::percent(count_hit_rate(es)), from_cache),
+        (
+            "Sources",
+            format!(
+                "local {} · prefetch {} · remote {} · dup {} · miss {}",
+                term::count(es.local_hits as u64),
+                term::count(es.prefetch_hits as u64),
+                term::count(es.remote_hits as u64),
+                term::count(es.dups as u64),
+                term::count(es.misses as u64),
+            ),
+            String::new(),
+        ),
+    ];
     if let Some(weighted) = compile_weighted_hit_rate(es) {
         rows.push((
             "By time",

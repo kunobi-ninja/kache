@@ -4970,6 +4970,40 @@ fn prefetch_session_lines_follow_the_summaries() {
 }
 
 #[test]
+fn stats_summary_shows_every_source_even_when_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    for (counts, expected) in [
+        (
+            [30, 1, 7, 2, 86],
+            "local 30 · prefetch 1 · remote 7 · dup 2 · miss 86",
+        ),
+        (
+            [4, 0, 0, 0, 0],
+            "local 4 · prefetch 0 · remote 0 · dup 0 · miss 0",
+        ),
+        (
+            [0, 0, 0, 0, 0],
+            "local 0 · prefetch 0 · remote 0 · dup 0 · miss 0",
+        ),
+    ] {
+        let mut snap = StatsSnapshot::default();
+        [
+            snap.event_stats.local_hits,
+            snap.event_stats.prefetch_hits,
+            snap.event_stats.remote_hits,
+            snap.event_stats.dups,
+            snap.event_stats.misses,
+        ] = counts;
+        let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+        assert_eq!(
+            stats_row(&lines, "Sources"),
+            Some(format!("Sources | {expected} | "))
+        );
+    }
+}
+
+#[test]
 fn hit_rate_row_adds_every_outcome() {
     let row = |local, prefetch, remote, dups, misses| {
         let dir = tempfile::tempdir().unwrap();
@@ -4984,17 +5018,17 @@ fn hit_rate_row_adds_every_outcome() {
         stats_row(&lines, "Hit rate").unwrap_or_default()
     };
     assert!(
-        row(1, 4, 0, 0, 0).contains("5 of 5 crates from cache (1 local, 0 remote, 4 prefetched)"),
+        row(1, 4, 0, 0, 0).contains("5 of 5 crates from cache"),
         "{}",
         row(1, 4, 0, 0, 0)
     );
     assert!(
-        row(1, 0, 4, 0, 0).contains("5 of 5 crates from cache (1 local, 4 remote, 0 prefetched)"),
+        row(1, 0, 4, 0, 0).contains("5 of 5 crates from cache"),
         "{}",
         row(1, 0, 4, 0, 0)
     );
     assert!(
-        row(3, 1, 1, 2, 0).contains("5 of 7 crates from cache (3 local, 1 remote, 1 prefetched)"),
+        row(3, 1, 1, 2, 0).contains("5 of 7 crates from cache"),
         "{}",
         row(3, 1, 1, 2, 0)
     );

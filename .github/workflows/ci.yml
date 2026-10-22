@@ -1604,10 +1604,10 @@ jobs:
         version-consistency,
       ]
     # In-org mirror of the shared release workflow, pinned to its merged commit.
-    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@5c4d21956396270698b589ba5808dc51b33ffbd2
+    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@d604e5a4402c5fdaf3968f897b0fa4357c8295fa
     with:
       binary_name: kache
-      companion_binary: kache-engine
+      companion_binaries: '["kache-engine"]'
       cache_windows_sysroot: true
       # Include both binaries in Debian packages and release archives.
       build_deb: true

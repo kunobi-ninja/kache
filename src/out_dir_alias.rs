@@ -8,8 +8,9 @@
 //! directory is empty, the path is all the compile reads from it.
 //!
 //! Such a unit compiles with `OUT_DIR` pointing at
-//! `<cache>/out-dirs/v1/d/<pkg>-<hash>/out` instead: the same path in every
-//! checkout on this machine. Kache creates it empty with mode 0555 and never
+//! `<alias root>/v1/d/<pkg>-<hash>/out` instead. The root defaults to
+//! `<cache>/out-dirs`; fleets can set `out_dir_alias_root` to the same absolute
+//! path across stores and hosts. Kache creates it empty with mode 0555 and never
 //! writes into it, so no process can put anything there and sharing it shares
 //! no state.
 //!
@@ -19,7 +20,7 @@
 //! inside rustc. A consumer that shows up later trips the tripwire: kache
 //! deletes the aliased lib so Cargo rebuilds it without the alias.
 //!
-//! Nothing here is collected: `kache gc` and `kache purge` leave `out-dirs/`
+//! Nothing here is collected: `kache gc` and `kache purge` leave alias roots
 //! alone, since an old artifact could otherwise recreate a deleted alias as a
 //! writable directory.
 
@@ -522,8 +523,15 @@ fn is_private_dir(path: &Path, euid: u32) -> bool {
     }
 }
 
-/// `<canonical cache_dir>/out-dirs`, creating the cache dir if needed.
-fn alias_root(cache_dir: &Path) -> Option<PathBuf> {
+/// The configured private root, or `<canonical cache_dir>/out-dirs`.
+fn alias_root(cache_dir: &Path, configured: Option<&Path>, euid: u32) -> Option<PathBuf> {
+    if let Some(root) = configured {
+        create_private_dir_all(root).ok()?;
+        if !is_private_dir(root, euid) {
+            return None;
+        }
+        return std::fs::canonicalize(root).ok();
+    }
     std::fs::create_dir_all(cache_dir).ok()?;
     Some(std::fs::canonicalize(cache_dir).ok()?.join(ROOT_NAME))
 }
@@ -550,7 +558,9 @@ fn checkout_dirs(args: &RustcArgs) -> Vec<PathBuf> {
 /// and is outside the checkout.
 fn root_is_safe(root: &Path, args: &RustcArgs, euid: u32) -> bool {
     let _ = create_private_dir_all(root);
-    is_private_dir(root, euid) && root_location_ok(root, &checkout_dirs(args))
+    is_private_dir(root, euid)
+        && std::fs::canonicalize(root)
+            .is_ok_and(|root| root_location_ok(&root, &checkout_dirs(args)))
 }
 
 /// Does `dir` exist with no entries?
@@ -924,7 +934,7 @@ fn apply_after_host_check(
     let compiler = RustcCompiler::new_for(invocation).with_base_dirs(config.base_dirs.clone());
     let args = compiler.parse(wrapper_args).ok()?;
     let cache_dir = invocation.resolve(&config.cache_dir)?;
-    let root = alias_root(&cache_dir)?;
+    let root = alias_root(&cache_dir, config.out_dir_alias_root.as_deref(), euid)?;
     if let Some(code) = checks_before_decision(&args, &root, &mut crate::invocation::io::stderr()) {
         return Some(code);
     }
@@ -1164,6 +1174,38 @@ mod tests {
             );
         }
         assert_eq!(active_alias(), Some(PathBuf::from("/outer/alias")));
+    }
+
+    #[test]
+    fn configured_root_is_private_canonical_and_independent_of_the_store() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let cache = base.join("cache");
+        let root = base.join("shared");
+        let euid = effective_uid();
+        assert_eq!(alias_root(&cache, None, euid), Some(cache.join("out-dirs")));
+        assert_eq!(alias_root(&cache, Some(&root), euid), Some(root.clone()));
+        assert_eq!(
+            alias_root(&base.join("another-store"), Some(&root), euid),
+            Some(root.clone())
+        );
+        assert!(!base.join("another-store").exists());
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let link = base.join("linked-parent");
+        symlink(&base, &link).unwrap();
+        assert_eq!(
+            alias_root(&cache, Some(&link.join("shared")), euid),
+            Some(root.clone())
+        );
+        let link = base.join("linked-root");
+        symlink(&root, &link).unwrap();
+        assert_eq!(alias_root(&cache, Some(&link), euid), None);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(alias_root(&cache, Some(&root), euid), None);
     }
 
     #[test]
@@ -2202,6 +2244,22 @@ mod tests {
             std::iter::once("rustc".to_string())
                 .chain(layout.args.all_args.iter().cloned())
                 .collect()
+        }
+
+        #[test]
+        fn alias_root_rejects_a_symlinked_parent_into_the_checkout() {
+            let layout = layout("proc-macro");
+            let invocation = invocation_for_layout(&layout);
+            let args = RustcCompiler::new_for(&invocation)
+                .parse(&invocation_argv(&layout))
+                .unwrap();
+            let link = layout._tmp.path().join("linked-checkout");
+            std::os::unix::fs::symlink(&layout.manifest_dir, &link).unwrap();
+            assert!(!root_is_safe(
+                &link.join("out-dirs"),
+                &args,
+                effective_uid()
+            ));
         }
 
         #[test]

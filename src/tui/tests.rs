@@ -117,6 +117,7 @@ fn test_config() -> Config {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         out_dir_alias: true,
+        out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
         project_rules: crate::config::ProjectRules::default(),

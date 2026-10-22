@@ -473,10 +473,15 @@ pub struct Config {
     pub deferred_discovery: bool,
     /// Compile a registry proc macro, or a lib only proc macros link, whose
     /// `OUT_DIR` is empty against one shared read-only directory under the
-    /// cache dir, so the path it bakes is the same in every checkout. On by
+    /// cache dir (or `out_dir_alias_root`), so the path it bakes is the same
+    /// in checkouts sharing that root. On by
     /// default on Unix; `KACHE_OUT_DIR_ALIAS=0` or
     /// `[cache] out_dir_alias = false` turns it off.
     pub out_dir_alias: bool,
+    /// Shared empty OUT_DIR root, independent of the local store. Defaults to
+    /// `<cache_dir>/out-dirs`. Must be absolute and outside the checkout.
+    /// Set via `KACHE_OUT_DIR_ALIAS_ROOT` or `[cache] out_dir_alias_root`.
+    pub out_dir_alias_root: Option<PathBuf>,
     /// Store new entries without an fsync on the build path. The daemon (or
     /// the next `kache gc`) flushes them shortly after; until then a hit on
     /// such an entry verifies its bytes before restoring. On by default;
@@ -911,6 +916,8 @@ pub struct CacheFileConfig {
     pub deferred_discovery: Option<bool>,
     /// Shared read-only OUT_DIR toggle. See [`Config::out_dir_alias`].
     pub out_dir_alias: Option<bool>,
+    /// Shared empty OUT_DIR root. See [`Config::out_dir_alias_root`].
+    pub out_dir_alias_root: Option<String>,
     /// Deferred store flush toggle. See [`Config::deferred_durability`].
     pub deferred_durability: Option<bool>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
@@ -1352,6 +1359,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
     "KACHE_OUT_DIR_ALIAS",
+    "KACHE_OUT_DIR_ALIAS_ROOT",
     "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
@@ -1457,6 +1465,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_DEFERRED_DISCOVERY", "cache.deferred_discovery"),
     ("KACHE_OUT_DIR_ALIAS", "cache.out_dir_alias"),
+    ("KACHE_OUT_DIR_ALIAS_ROOT", "cache.out_dir_alias_root"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
@@ -2118,6 +2127,24 @@ impl Config {
             Self::shared_hardlink_restores_enabled_for(invocation, &file_config);
         let deferred_discovery = Self::deferred_discovery_enabled_for(invocation, &file_config);
         let out_dir_alias = Self::out_dir_alias_enabled_for(invocation, &file_config);
+        let out_dir_alias_root =
+            env_or_ignored_for(invocation, "KACHE_OUT_DIR_ALIAS_ROOT", ignore_env)
+                .ok()
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.out_dir_alias_root.clone())
+                })
+                .filter(|value| !value.is_empty())
+                .map(|value| shellexpand_for(invocation, &value));
+        if let Some(root) = &out_dir_alias_root {
+            anyhow::ensure!(
+                root.is_absolute(),
+                "cache.out_dir_alias_root must be an absolute path"
+            );
+        }
         let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
         let project_rules = ProjectRules::from_file_config(&file_config);
@@ -2257,6 +2284,7 @@ impl Config {
             shared_hardlink_restores,
             deferred_discovery,
             out_dir_alias,
+            out_dir_alias_root,
             deferred_durability,
             daemon_publish,
             project_rules,

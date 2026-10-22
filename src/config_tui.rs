@@ -2165,6 +2165,7 @@ mod tests {
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
                 out_dir_alias: None,
+                out_dir_alias_root: None,
                 deferred_durability: None,
                 daemon_publish: None,
                 auto_gc: None,

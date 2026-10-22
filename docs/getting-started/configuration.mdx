@@ -648,7 +648,8 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies. CLI commands print the advice; compiler wrappers log it at `warn` (see `KACHE_LOG`) so it never lands in compiler output |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
 | `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass; a C compile with no recorded read set likewise compiles first and keys from the dependency file it writes. Set to `0` to keep the pre-pass and the preprocessor probe on every miss. |
-| `KACHE_OUT_DIR_ALIAS` | `cache.out_dir_alias` | `true` | On Unix, compile a registry proc macro whose `OUT_DIR` is empty, or a registry lib that only proc macros link, against one shared read-only directory under `<cache>/out-dirs` instead of its own `OUT_DIR`, so the path it bakes in is the same in every checkout. A macro that writes debug output there fails with a hint; set to `0` to turn this off. |
+| `KACHE_OUT_DIR_ALIAS` | `cache.out_dir_alias` | `true` | On Unix, compile a registry proc macro whose `OUT_DIR` is empty, or a registry lib that only proc macros link, against one shared read-only directory under `<cache>/out-dirs` instead of its own `OUT_DIR`, so the path it bakes in is the same in checkouts sharing that root. With per-job or per-host stores, set `KACHE_OUT_DIR_ALIAS_ROOT` to share the path across stores. A macro that writes debug output there fails with a hint; set to `0` to turn this off. |
+| `KACHE_OUT_DIR_ALIAS_ROOT` | `cache.out_dir_alias_root` | `<cache>/out-dirs` | Absolute path to a shared alias root, independent of the local store. Use the same path on each fleet host to keep proc-macro bytes and dependent keys stable across stores. Kache creates it if missing; it must be owned by the build user, forbid writes by other users, and sit outside the checkout and target directories. An unsafe root disables aliasing. |
 | `KACHE_DEFERRED_DURABILITY` | `cache.deferred_durability` | `true` | Store a miss without an fsync and let a background worker flush it a moment later; a hit on an entry not yet flushed verifies its bytes first. Set to `0` to flush every entry inside the compile that stored it. |
 | `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |
@@ -681,3 +682,16 @@ ignore_env = true
 It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`, S3 and OCI credentials, logging, progress, or other environment-only controls. It does suppress `KACHE_PLANNER_TOKEN`, which has a TOML key. Kache warns when it ignores a set variable.
 
 The daemon reads configuration at startup and watches the active config file and the host config. When either changes, the daemon drains and exits, and the next start loads the new settings. Other settings come from the environment the daemon started with. A daemon started by a build, `kache daemon start` or `kache daemon restart` drops the variables that select the remote (`KACHE_S3_BUCKET`, `KACHE_S3_ENDPOINT`, `KACHE_S3_REGION`, `KACHE_S3_PREFIX`, `KACHE_S3_PROFILE`, `KACHE_S3_USER_AGENT` and `KACHE_LOCAL_ONLY`), so set those in the config file, or run `kache daemon run` from that environment. An installed service uses its service definition, not your current shell. See [Updates and config changes](/docs/daemon/lifecycle#updates-and-config-changes).
+
+### Shared empty OUT_DIRs across stores
+
+The default alias path includes the local store path. If jobs use different store paths, a proc macro that embeds its alias path produces different bytes and changes its dependents' cache keys. Give those jobs one absolute alias root instead:
+
+```toml
+[cache]
+out_dir_alias_root = "/var/lib/kache-out-dirs"
+```
+
+Set `KACHE_OUT_DIR_ALIAS_ROOT` to override the file. Each host needs that same canonical path, writable by the build user; Kache creates private parents and empty read-only aliases beneath it. The setting applies on Unix, where OUT_DIR aliasing is supported.
+
+When switching roots, clean existing Cargo targets so proc macros rebuild with the new path. Keep old alias directories while any artifacts may still reference them. Kache does not collect alias directories or the consumer evidence and deny markers stored with them. A macro that writes debug output still needs `KACHE_OUT_DIR_ALIAS=0`, as described above.

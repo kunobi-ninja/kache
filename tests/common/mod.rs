@@ -172,6 +172,7 @@ pub fn hermetic_command(
         .env_remove("KACHE_EVENT_ROOT")
         .env_remove("KACHE_ACTIVE")
         .env_remove("KACHE_UNSTABLE")
+        .env_remove("KACHE_OUT_DIR_ALIAS_ROOT")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
         .env_remove("KACHE_S3_BUCKET")
         .env_remove("KACHE_S3_ENDPOINT")

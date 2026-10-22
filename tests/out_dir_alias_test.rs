@@ -265,6 +265,7 @@ fn cargo(workspace: &Path, cache: &Path, args: &[&str], envs: &[(&str, &Path)]) 
         .env("KACHE_CACHE_EXECUTABLES", "1")
         .env("KACHE_LOG", "off")
         .env_remove("KACHE_OUT_DIR_ALIAS")
+        .env_remove("KACHE_OUT_DIR_ALIAS_ROOT")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("KACHE_DISABLED")
         .env_remove("KACHE_LOG_FILE")
@@ -315,6 +316,100 @@ fn alias_markers(tree: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn proc_macro_bytes_and_dependent_keys_match_across_stores() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    build_kache();
+    let tmp = TempDir::new().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let shared = base.join("shared-out-dirs");
+    let mut artifacts = Vec::new();
+    let mut keys = Vec::new();
+    for name in ["a", "b"] {
+        let tree = base.join(name);
+        let cache = base.join(format!("store-{name}"));
+        let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
+        let package = tree.join("registry/src/fixture/dumpmac");
+        write(
+            &tree.join("Cargo.toml"),
+            &manifest(
+                "app",
+                "\n[dependencies]\ndumpmac = { path = \"registry/src/fixture/dumpmac\" }\n",
+            ),
+        );
+        write(
+            &tree.join("src/main.rs"),
+            "fn main() { println!(\"{}\", dumpmac::debug_dir!()); }\n",
+        );
+        write(
+            &package.join("Cargo.toml"),
+            &manifest("dumpmac", "\n[lib]\nproc-macro = true\n"),
+        );
+        write(
+            &package.join("build.rs"),
+            "fn main() { println!(\"cargo:rustc-env=DEBUG_OUTPUT_DIR={}\", std::env::var(\"OUT_DIR\").unwrap()); }\n",
+        );
+        write(
+            &package.join("src/lib.rs"),
+            "extern crate proc_macro;\n#[proc_macro]\npub fn debug_dir(_: proc_macro::TokenStream) -> proc_macro::TokenStream { format!(\"{:?}\", env!(\"DEBUG_OUTPUT_DIR\")).parse().unwrap() }\n",
+        );
+        let envs = if name == "a" {
+            vec![("KACHE_OUT_DIR_ALIAS_ROOT", shared.as_path())]
+        } else {
+            write(
+                &isolated_config_path(&cache),
+                &format!(
+                    "[cache]\nout_dir_alias_root = {:?}\n",
+                    shared.to_str().unwrap()
+                ),
+            );
+            vec![]
+        };
+        let output = cargo(&tree, &cache, &["build", "--offline"], &envs);
+        assert_built(&output, name);
+        let paths = printed_paths(&tree.join("target/debug/app"));
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with(&shared), "{paths:?}");
+        let dylib = std::fs::read_dir(tree.join("target/debug/deps"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("libdumpmac-")
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
+            })
+            .unwrap();
+        artifacts.push(std::fs::read(dylib).unwrap());
+        let events = events(&cache);
+        keys.push(["dumpmac", "app"].map(|krate| {
+            let event = events
+                .iter()
+                .find(|event| event["crate_name"] == krate && event["cache_key"].is_string())
+                .unwrap_or_else(|| panic!("no keyed event for {krate}: {events:?}"));
+            assert_eq!(
+                event["result"], "miss",
+                "store {name} was not cold: {event}"
+            );
+            assert!(!event["cache_key"].as_str().unwrap().is_empty());
+            event["cache_key"].clone()
+        }));
+    }
+    assert_eq!(
+        artifacts[0], artifacts[1],
+        "proc-macro bytes differ across stores"
+    );
+    assert_eq!(
+        keys[0], keys[1],
+        "macro or dependent keys differ across stores"
+    );
+}
+
+#[test]
 fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
     // As root nothing is aliased: the mode bits would not stop root's writes.
     if unsafe { libc::geteuid() } == 0 {
@@ -325,6 +420,7 @@ fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
     let tmp = TempDir::new().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
     let cache = base.join("cache");
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let tree = |name: &str| base.join(name);
     let out_dirs = cache.join("out-dirs");
@@ -618,6 +714,7 @@ fn a_failed_rederivation_hints_and_denies_the_alias() {
     let tmp = TempDir::new().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
     let cache = base.join("cache");
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
     let tree = base.join("tree");
     let out_dirs = cache.join("out-dirs");

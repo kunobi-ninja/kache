@@ -1052,9 +1052,8 @@ jobs:
     # Expand every platform name even when docs-only changes skip the work.
     env:
       RUN_E2E: ${{ github.event_name != 'pull_request' || needs.changes.outputs.e2e == 'true' }}
-    # A cold macOS release build can take 25m before the scenarios start.
-    # Keep time for the harness, negative control and artifact upload.
-    timeout-minutes: ${{ matrix.os == 'macOS' && 45 || 30 }}
+    # Leave room after cold macOS/Windows builds for the harness and cleanup.
+    timeout-minutes: ${{ (matrix.os == 'macOS' || matrix.os == 'Windows') && 45 || 30 }}
     # All three arms are blocking. Windows was non-blocking while its port
     # landed (the cache store #196, the `.sh` fallback wrappers #197, the
     # rust-c-ffi cc-rs path #198, the harness `.exe`/probe/OUT_DIR fixes

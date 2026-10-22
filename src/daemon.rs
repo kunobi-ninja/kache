@@ -8933,7 +8933,7 @@ fn send_line_fire_and_forget(
 /// A worker flushes before closing so successful delivery does not depend on
 /// interprocess starting another, unbounded background flush.
 #[cfg(windows)]
-fn send_line_fire_and_forget(
+fn send_line_fire_and_forget_windows(
     socket_path: &Path,
     line: String,
     send_wait: std::time::Duration,
@@ -8962,6 +8962,9 @@ fn send_line_fire_and_forget(
         ))
     })
 }
+
+#[cfg(windows)]
+use self::send_line_fire_and_forget_windows as send_line_fire_and_forget;
 
 /// Start the daemon in the background and wait for it to be ready.
 ///

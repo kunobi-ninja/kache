@@ -309,6 +309,17 @@ exclude_re = [
     # reader and the shared request/descriptor policy in mutation scope.
     "crates/kache-client/src/creation_mask.rs:.*(native_getter|inherited_mask)( ->|$)",
     "crates/kache-ipc/src/lib.rs:.*(PeerAuditToken::pid|peer_audit_token)",
+    # These deadline adapters and pipe guards are cfg(windows), so this Linux
+    # lane never compiles them. Native Windows tests exercise busy/connected
+    # deadlines, delivery, framing, reply identity and negotiation refusal.
+    # The Unix sender and shared bounded-worker/protocol policy stay in scope.
+    "src/daemon.rs:.*(send_request_with_async_timeout|with_windows_client|send_line_fire_and_forget_windows)( ->|$)",
+    "src/daemon_control.rs:.*(request_windows|classify_connect_error|legacy_exchange_windows)( ->|$)",
+    "crates/kache-ipc/src/lib.rs:.*(pipe_path|discard_pipe_writes_on_drop::<impl Drop for Discard<'_>>::drop|discard_sync_pipe_writes_on_drop::<impl Drop for Discard<'_>>::drop)( ->| with |$)",
+    # Only the Windows arm has these operators or guarded retries. Keep the
+    # connect_tokio body replacement and its Unix transport mutation-tested.
+    "crates/kache-ipc/src/lib.rs:.*replace (\\+|==|&&|<|>=) with .* in connect_tokio$",
+    "crates/kache-ipc/src/lib.rs:.*replace match guard .* in connect_tokio$",
     "src/fallback.rs:.*compiler_peer_unrestricted",
     "src/compiler/platform.rs:.*MacOsPlatform::codesign",
     "src/compiler/platform.rs:.*replace <impl Platform for MacOsPlatform>::ensure_binary_loadable -> .* with Ok\\(Default::default\\(\\)\\)",

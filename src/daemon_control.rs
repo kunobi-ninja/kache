@@ -504,6 +504,178 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_legacy_replies_preserve_framing_and_the_size_limit() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut limit_with_newline = vec![b'x'; 65_535];
+        limit_with_newline.push(b'\n');
+        for (payload, expected) in [
+            (b"ready\n".to_vec(), None),
+            (limit_with_newline, None),
+            (b"partial".to_vec(), Some(std::io::ErrorKind::UnexpectedEof)),
+            (vec![b'x'; 65_536], Some(std::io::ErrorKind::InvalidData)),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("legacy.sock");
+            let listener = crate::transport::bind_daemon_listener(&socket)
+                .await
+                .unwrap()
+                .unwrap();
+            let answer = payload.clone();
+            let server = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let stream = listener.accept().await.unwrap();
+                    let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+                    let mut line = String::new();
+                    tokio::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        serde_json::from_str::<Request>(&line).unwrap(),
+                        Request::Health
+                    ));
+                    (&stream).write_all(&answer).await.unwrap();
+                    // The reader may close immediately after rejecting the frame.
+                    let _ = (&stream).flush().await;
+                })
+                .await
+                .expect("legacy reply fixture stalled");
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                legacy_request(
+                    &socket,
+                    &Request::Health,
+                    Instant::now() + Duration::from_secs(5),
+                )
+            })
+            .await
+            .unwrap();
+            server.await.unwrap();
+            match expected {
+                None => assert_eq!(result.unwrap().as_bytes(), payload),
+                Some(kind) => assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    kind
+                ),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_binary_replies_validate_identity_operation_and_refusal() {
+        use kunobi_daemon::client::RequestError;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Reply {
+            Valid,
+            OtherProcess,
+            OtherOperation,
+            OtherRequest,
+            Refused,
+        }
+
+        for case in [
+            Reply::Valid,
+            Reply::OtherProcess,
+            Reply::OtherOperation,
+            Reply::OtherRequest,
+            Reply::Refused,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let config = super::super::tests::test_config(root.path());
+            let listener = crate::transport::bind_daemon_listener(&endpoint(&config))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+            coord.control_version = Some(wire::VERSION);
+            coord.write_phase(DaemonPhase::Ready).unwrap();
+            let local = offer(&config).unwrap();
+            let invalid = request(
+                &config,
+                operation::PREPARE,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+            assert!(
+                invalid
+                    .to_string()
+                    .contains("unsupported lifecycle operation")
+            );
+
+            let server = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let stream = listener.accept().await.unwrap();
+                    let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+                    if matches!(case, Reply::Refused) {
+                        wire::AsyncSession::refuse(&stream, &local, wire::Refused::PeerRejected)
+                            .await
+                            .unwrap();
+                        return;
+                    }
+                    let mut session = wire::AsyncSession::accept(&stream, &local).await.unwrap();
+                    let message = session.receive().await.unwrap();
+                    assert_eq!(message.operation, operation::HEALTH);
+                    let health = wire::Health {
+                        process_id: if matches!(case, Reply::OtherProcess) {
+                            std::process::id().checked_add(1).unwrap()
+                        } else {
+                            std::process::id()
+                        },
+                        ready: true,
+                        ..Default::default()
+                    };
+                    let mut reply = health.response(&message).unwrap();
+                    match case {
+                        Reply::OtherOperation => reply.operation = operation::DRAIN,
+                        Reply::OtherRequest => reply.request_id = message.request_id + 1,
+                        _ => {}
+                    }
+                    session.send(&reply).await.unwrap();
+                })
+                .await
+                .expect("binary reply fixture stalled");
+            });
+            let result = query(&config, operation::HEALTH).await;
+            server.await.unwrap();
+            if matches!(case, Reply::Valid) {
+                let health = result.unwrap().unwrap();
+                assert_eq!(health.process_id, std::process::id());
+                assert!(health.ready);
+                continue;
+            }
+            let error = result.unwrap_err();
+            match case {
+                Reply::OtherProcess => assert!(matches!(
+                    error.downcast_ref::<RequestError>(),
+                    Some(RequestError::ProcessMismatch { .. })
+                )),
+                Reply::OtherOperation | Reply::OtherRequest => assert!(matches!(
+                    error.downcast_ref::<RequestError>(),
+                    Some(RequestError::Protocol(error))
+                        if error.kind() == std::io::ErrorKind::InvalidData
+                )),
+                Reply::Refused => {
+                    assert!(matches!(
+                        error.downcast_ref::<RequestError>(),
+                        Some(RequestError::Protocol(error))
+                            if wire::Refused::of(error) == Some(wire::Refused::PeerRejected)
+                    ));
+                    assert!(!super::super::lifecycle_client::transient(&error));
+                }
+                Reply::Valid => unreachable!(),
+            }
+        }
+    }
+
     /// Both endpoints are Unix sockets in the same directory, so they share one
     /// path budget. A control name that cost more than `daemon.sock` refuses a
     /// runtime directory that has always held a daemon (kunobi-ninja/kache#1216).

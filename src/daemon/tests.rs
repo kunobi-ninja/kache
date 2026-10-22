@@ -15200,31 +15200,43 @@ fn a_fire_and_forget_request_to_a_daemon_that_never_reads_gives_up_within_its_wa
 }
 
 /// The same hand-off still delivers its line to a daemon that reads it.
-#[test]
-fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
-    use interprocess::local_socket::traits::Listener as _;
-    use std::io::BufRead;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
+    use tokio::io::AsyncBufReadExt;
+
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("daemon.sock");
-    let listener = ListenerOptions::new()
-        .name(socket_name(&socket).unwrap())
-        .create_sync()
-        .expect("bind listener");
+    let listener = crate::transport::bind_daemon_listener(&socket)
+        .await
+        .unwrap()
+        .unwrap();
     let line = format!("{{\"pad\":\"{}\"}}\n", "y".repeat(256 << 10));
     let expected = line.clone();
-    let (release, held) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let stream = listener.accept().expect("accept");
-        let mut received = String::new();
-        std::io::BufReader::new(&stream)
-            .read_line(&mut received)
-            .unwrap();
-        held.recv_timeout(Duration::from_secs(20)).unwrap();
-        received
+    let (release, held) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let stream = listener.accept().await.expect("accept");
+            #[cfg(windows)]
+            let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+            let mut received = String::new();
+            tokio::io::BufReader::new(&stream)
+                .read_line(&mut received)
+                .await
+                .unwrap();
+            held.await.unwrap();
+            received
+        })
+        .await
+        .expect("the fire-and-forget request was never delivered")
     });
-    send_line_fire_and_forget(&socket, line, Duration::from_secs(10)).expect("send");
+    tokio::task::spawn_blocking(move || {
+        send_line_fire_and_forget(&socket, line, Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .expect("send");
     release.send(()).unwrap();
-    assert_eq!(reader.join().unwrap(), expected);
+    assert_eq!(reader.await.unwrap(), expected);
 }
 
 /// Measure the actual request, including creation and destruction of its

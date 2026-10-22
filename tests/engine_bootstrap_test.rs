@@ -172,10 +172,23 @@ fn direct_engine_bootstraps_a_daemon_and_delegates_the_compiler() {
     let fixture = Fixture::new();
     let (engine_pid, status) = fixture.run_compiler(false);
     let parents = fixture.assert_compiler_output(status);
-    assert!(
-        parents.iter().all(|parent| *parent != engine_pid),
-        "{parents:?}"
-    );
+    #[cfg(target_os = "linux")]
+    let filtered = std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| matches!(name, "Seccomp" | "NoNewPrivs") && value.trim() != "0");
+    #[cfg(not(target_os = "linux"))]
+    let filtered = false;
+    if filtered {
+        // Linux filters cannot be compared across processes; execution stays local.
+        assert_eq!(parents, vec![engine_pid]);
+    } else {
+        assert!(
+            parents.iter().all(|parent| *parent != engine_pid),
+            "{parents:?}"
+        );
+    }
     assert!(
         parents.iter().all(|parent| *parent == parents[0]),
         "{parents:?}"

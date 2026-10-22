@@ -5,11 +5,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[allow(dead_code)]
+mod common;
+
 fn script(path: &Path, body: &str) {
     kache_fs::testutil::write_executable(path, format!("#!/bin/sh\n{body}\n"));
 }
 
 struct Fixture {
+    _daemon: common::DaemonGuard,
     dir: tempfile::TempDir,
     compiler: std::path::PathBuf,
     fallback: std::path::PathBuf,
@@ -66,6 +70,7 @@ printf 'complete-object' > "$TEST_OBJECT"
         .map(String::from)
         .collect();
         Self {
+            _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), dir.path().join("cache")),
             dir,
             compiler,
             fallback,
@@ -73,7 +78,11 @@ printf 'complete-object' > "$TEST_OBJECT"
         }
     }
     fn command(&self, compiler_exit: i32) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kache"));
+        let mut command = common::hermetic_command(
+            env!("CARGO_BIN_EXE_kache"),
+            &self.dir.path().join("cache"),
+            Some(&self.dir.path().join("absent.toml")),
+        );
         command
             .arg(&self.compiler)
             .args(&self.args)

@@ -807,7 +807,7 @@ jobs:
     if: github.event_name != 'pull_request' || needs.changes.outputs.nix == 'true'
     # A cold macOS build compiles the optimized binary and tests separately;
     # allow time for the full test suite after both compilations finish.
-    timeout-minutes: ${{ matrix.os == 'macOS' && 60 || 40 }}
+    timeout-minutes: ${{ matrix.os == 'macOS' && 75 || 40 }}
     strategy:
       fail-fast: false
       matrix:

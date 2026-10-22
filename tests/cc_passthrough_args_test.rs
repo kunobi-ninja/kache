@@ -34,11 +34,8 @@ impl FixtureDir {
     }
     fn stop_daemon_at(root: &std::path::Path) {
         let cache = root.join("cache");
-        let mut stop = common::hermetic_command(
-            kache_binary(),
-            &cache,
-            Some(&root.join("kache.toml")),
-        );
+        let mut stop =
+            common::hermetic_command(kache_binary(), &cache, Some(&root.join("kache.toml")));
         common::stop_daemon(stop.args(["daemon", "stop"]), &cache);
     }
 }

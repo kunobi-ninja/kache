@@ -6430,14 +6430,14 @@ fn publish_drain_warning(unpublished: usize) -> Option<String> {
     })
 }
 
-/// Let the publish worker finish the hand-offs it accepted, then close the
-/// upload queue.
+/// Drain accepted publications until the worker finishes or stops making
+/// progress, then close the upload queue.
 ///
 /// Accepted hand-offs hold their key locks. The worker keeps going for as long
 /// as it makes progress: a job it never reaches is an entry the next build
-/// compiles again. The upload queue closes only after that, so an entry the
-/// worker stores now is still queued for upload by this daemon, like one a
-/// wrapper stored before the shutdown.
+/// compiles again. Keep uploads open during that wait so entries stored by the
+/// drain can be uploaded by this daemon. If the worker stalls, close uploads
+/// anyway; durable intents it records later remain available for restart.
 pub(crate) async fn drain_publications_then_close_uploads(
     daemon: &Daemon,
     publish_done: tokio::sync::oneshot::Receiver<()>,

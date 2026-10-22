@@ -1184,12 +1184,11 @@ mod tests {
         );
     }
 
-    /// Only an entry the wrapper marked for the remote is queued for upload,
-    /// even when a remote is configured.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_an_entry_marked_for_the_remote_is_queued_for_upload() {
-        const CHILD_ROOT: &str = "KACHE_TEST_REMOTE_PUBLISH_ROOT";
-        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+    /// Run blocking publication fixtures in a child that can be killed and
+    /// reaped if persistence outlives an async timeout or runtime teardown.
+    /// Return its root inside the child, or None after checking its result.
+    fn publish_fixture_child_root(test_name: &str, root_env: &str) -> Option<PathBuf> {
+        let Some(root) = std::env::var_os(root_env) else {
             // A stuck publish_one owns a blocking task that runtime teardown
             // cannot cancel. Keep the worker in a process we can kill and reap.
             let dir = tempfile::tempdir().unwrap();
@@ -1206,13 +1205,8 @@ mod tests {
             }
             let mut child = FixtureChild(
                 std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "daemon_publish::tests::only_an_entry_marked_for_the_remote_is_queued_for_upload",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(CHILD_ROOT, dir.path())
+                    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                    .env(root_env, dir.path())
                     .current_dir(dir.path())
                     .stdout(log.try_clone().unwrap())
                     .stderr(log)
@@ -1235,7 +1229,7 @@ mod tests {
                             b"ok",
                             "the child must finish the upload assertions"
                         );
-                        return;
+                        return None;
                     }
                     Ok(None) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(10));
@@ -1253,7 +1247,19 @@ mod tests {
                 }
             }
         };
-        let dir = PathBuf::from(root);
+        Some(PathBuf::from(root))
+    }
+
+    /// Only an entry the wrapper marked for the remote is queued for upload,
+    /// even when a remote is configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_entry_marked_for_the_remote_is_queued_for_upload() {
+        let Some(dir) = publish_fixture_child_root(
+            "daemon_publish::tests::only_an_entry_marked_for_the_remote_is_queued_for_upload",
+            "KACHE_TEST_REMOTE_PUBLISH_ROOT",
+        ) else {
+            return;
+        };
         let mut config = crate::test_support::test_config(dir.join("cache"));
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
         let daemon = Arc::new(Daemon::new(config.clone()));
@@ -1475,15 +1481,20 @@ mod tests {
     /// one reaches its last jobs only during the drain.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_shutdown_drain_queues_what_it_stores_for_upload() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        let Some(dir) = publish_fixture_child_root(
+            "daemon_publish::tests::the_shutdown_drain_queues_what_it_stores_for_upload",
+            "KACHE_TEST_SHUTDOWN_PUBLISH_ROOT",
+        ) else {
+            return;
+        };
+        let mut config = crate::test_support::test_config(dir.join("cache"));
         config.auto_gc = false;
         config.remote = Some(crate::config::RemoteConfig {
             prefix: "artifacts".into(),
             backend: crate::config::RemoteBackendConfig::Filesystem(
                 crate::config::FilesystemRemoteConfig {
-                    root: dir.path().join("remote"),
-                    atomic_write_dir: dir.path().join("remote-staging"),
+                    root: dir.join("remote"),
+                    atomic_write_dir: dir.join("remote-staging"),
                 },
             ),
         });
@@ -1492,33 +1503,42 @@ mod tests {
         daemon.set_upload_tx(upload_tx);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         daemon.publish_queue().set_sender(tx);
-        let mut request = handoff_request(&config, &key("drained"), dir.path());
+        let mut request = handoff_request(&config, &key("drained"), &dir);
         request.publishes_to_remote = true;
         let _receipt = HandoffReceipt::new(&request).unwrap();
         assert!(daemon.handle_publish_cc(request.clone()).await.ok);
 
         let runtime = tokio::runtime::Handle::current();
         let (done_tx, done) = tokio::sync::oneshot::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
         let worker_daemon = Arc::clone(&daemon);
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let _runtime = runtime.enter();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while worker_daemon.publish_queue().sender().is_some() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "shutdown closes the publish queue"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            start_rx.recv().expect("shutdown releases the worker");
             run_publish_worker(worker_daemon, rx);
             let _ = done_tx.send(());
         });
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            crate::daemon::drain_publications_then_close_uploads(&daemon, done),
-        )
-        .await
-        .expect("the drain ends once the worker exits");
+        let drain = crate::daemon::drain_publications_then_close_uploads(&daemon, done);
+        tokio::pin!(drain);
+        // Let shutdown close publication admission before the worker can
+        // publish. Poll once so the fixture needs no scheduling delay.
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(drain.as_mut(), cx).is_pending(),
+                "the drain waits for the worker"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            daemon.publish_queue().sender().is_none(),
+            "shutdown closes the publish queue"
+        );
+        start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("the drain ends once the worker exits");
+        worker.join().expect("publish worker panicked");
 
         let store = Store::open(&config).unwrap();
         assert!(store.get(&request.cache_key).unwrap().is_some(), "stored");
@@ -1533,6 +1553,7 @@ mod tests {
             ),
             "the upload queue is closed after the drain"
         );
+        std::fs::write(dir.join("publisher-complete"), b"ok").unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

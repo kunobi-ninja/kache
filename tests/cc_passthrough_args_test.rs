@@ -30,11 +30,14 @@ impl FixtureDir {
         self.0.path()
     }
     fn stop_daemon(&self) {
-        let cache = self.path().join("cache");
+        Self::stop_daemon_at(self.path());
+    }
+    fn stop_daemon_at(root: &std::path::Path) {
+        let cache = root.join("cache");
         let mut stop = common::hermetic_command(
             kache_binary(),
             &cache,
-            Some(&self.path().join("kache.toml")),
+            Some(&root.join("kache.toml")),
         );
         common::stop_daemon(stop.args(["daemon", "stop"]), &cache);
     }
@@ -419,7 +422,7 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
 fn cc_header_availability_creation_uses_current_compiler_output() {
     for discovery in ["0", "1"] {
         for in_header in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = FixtureDir::new();
             let root = dir.path().canonicalize().unwrap();
             fs::write(root.join("kache.toml"), "").unwrap();
             fs::create_dir(root.join("home")).unwrap();
@@ -540,6 +543,7 @@ fn compile_and_run_unit(root: &std::path::Path, discovery: &str, args: &[&str]) 
 fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], absent: i32) {
     for discovery in ["0", "1"] {
         let _ = fs::remove_file(root.join("inc/optional.h"));
+        FixtureDir::stop_daemon_at(root);
         let _ = fs::remove_dir_all(root.join("cache"));
         let (cold, value) = compile_and_run_unit(root, discovery, args);
         assert!(
@@ -585,7 +589,7 @@ fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], a
 /// user `-I` directory. The key must change and the object must use it.
 #[test]
 fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -604,7 +608,7 @@ fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
 
 #[test]
 fn absolute_angle_header_probe_follows_its_optional_header() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -629,7 +633,7 @@ fn absolute_angle_header_probe_follows_its_optional_header() {
 /// header appears in a user `-I` directory.
 #[test]
 fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -652,7 +656,7 @@ fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
 
 #[test]
 fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -667,6 +671,7 @@ fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
     .unwrap();
     for discovery in ["0", "1"] {
         let _ = fs::remove_file(root.join("elsewhere/optional.h"));
+        dir.stop_daemon();
         let _ = fs::remove_dir_all(root.join("cache"));
         assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
         assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
@@ -685,7 +690,7 @@ fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
 
 #[test]
 fn a_header_created_after_preprocessing_cannot_publish_an_incomplete_read_set() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -1160,6 +1165,7 @@ fn identical_sources_at_different_paths_get_their_own_entries() {
     .unwrap();
 
     for deferred in ["0", "1"] {
+        dir.stop_daemon();
         dir.stop_daemon();
         let _ = fs::remove_dir_all(root.join("cache"));
         let mut keys = Vec::new();

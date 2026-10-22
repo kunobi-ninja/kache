@@ -2819,41 +2819,53 @@ fn the_daemon_sweep_flushes_entries_pending_durability() {
     assert!(store.try_durability_flush_lock().unwrap().is_some());
 }
 
-/// A `[cache.volumes]` shard holds entries the daemon stored or imported
-/// without an fsync too, so the same sweep flushes it.
+/// A busy or missing shard must not prevent the main store and later shards
+/// from flushing. Opening a missing volume would create its store directory.
 #[test]
-fn the_daemon_sweep_flushes_volume_shards() {
+fn the_daemon_sweep_flushes_volume_shards_and_skips_busy_or_missing_stores() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(&dir.path().join("main"));
     config.deferred_durability = true;
-    let shard_dir = dir.path().join("shard");
-    config.volume_stores = vec![crate::config::VolumeStore {
-        volume: dir.path().to_string_lossy().into_owned(),
-        store: shard_dir.clone(),
-        max_size: None,
-    }];
-    let mut shard_config = config.clone();
-    shard_config.cache_dir = shard_dir;
-    let shard = Store::open(&shard_config).unwrap();
-    let output = dir.path().join("out.rlib");
-    std::fs::write(&output, b"artifact-bytes").unwrap();
-    shard
-        .put(
-            "pending",
-            "pending_crate",
-            &["lib".to_string()],
-            &[],
-            "x86_64-unknown-linux-gnu",
-            "dev",
-            &[(output, "libout.rlib".to_string())],
-            "",
-            "",
-        )
-        .unwrap();
-    assert_eq!(shard.pending_durability().unwrap(), 1);
-
-    Daemon::new(config).flush_pending_durability();
-    assert_eq!(shard.pending_durability().unwrap(), 0);
+    config.volume_stores = ["busy", "missing", "ready"]
+        .into_iter()
+        .map(|name| crate::config::VolumeStore {
+            volume: dir.path().join(name).to_string_lossy().into_owned(),
+            store: dir.path().join(name),
+            max_size: None,
+        })
+        .collect();
+    let main = Store::open(&config).unwrap();
+    let busy = Store::open(&config.for_volume_store(&config.volume_stores[0], |_| None)).unwrap();
+    let ready = Store::open(&config.for_volume_store(&config.volume_stores[2], |_| None)).unwrap();
+    for (name, store) in [("main", &main), ("busy", &busy), ("ready", &ready)] {
+        let output = dir.path().join(format!("{name}.rlib"));
+        std::fs::write(&output, name.as_bytes()).unwrap();
+        store
+            .put(
+                "pending",
+                "pending_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(store.pending_durability().unwrap(), 1);
+    }
+    let held = busy.try_durability_flush_lock().unwrap().unwrap();
+    let missing = config.volume_stores[1].store.clone();
+    let daemon = Daemon::new(config);
+    daemon.flush_pending_durability();
+    assert_eq!(main.pending_durability().unwrap(), 0);
+    assert_eq!(busy.pending_durability().unwrap(), 1);
+    assert_eq!(ready.pending_durability().unwrap(), 0);
+    assert!(!missing.exists(), "an unmounted shard must not be created");
+    drop(held);
+    daemon.flush_pending_durability();
+    assert_eq!(busy.pending_durability().unwrap(), 0);
 }
 
 #[test]

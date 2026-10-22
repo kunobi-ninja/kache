@@ -7065,6 +7065,117 @@ async fn sync_with_client_pull_flushes_deferred_imports_without_a_daemon() {
 }
 
 #[tokio::test]
+async fn sync_with_client_retries_pending_durability_on_a_no_op_but_not_a_dry_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let key = sync_test_cache_key("no-op-durability-retry");
+    let source = dir.path().join("pending.rlib");
+    std::fs::write(&source, b"pending local artifact").unwrap();
+    store
+        .put(
+            &key,
+            "serde",
+            &["lib".to_string()],
+            &[],
+            "",
+            "dev",
+            &[(source, "libserde.rlib".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    let meta = store.get(&key).unwrap().unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    let temporarily_unavailable = dir.path().join("temporarily-unavailable");
+    std::fs::rename(&blob, &temporarily_unavailable).unwrap();
+    assert_eq!(store.flush_durability(10).unwrap(), 0);
+    assert_eq!(store.pending_durability().unwrap(), 1);
+    std::fs::rename(&temporarily_unavailable, &blob).unwrap();
+
+    let backend = TestBackend::memory();
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/serde/{key}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+    let client = as_cache_remote(as_remote_backend(&backend), &remote);
+    let held = store.try_durability_flush_lock().unwrap().unwrap();
+    sync_with_client(
+        &client, &config, &store, None, true, false, false, false, None, false, false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.pending_durability().unwrap(),
+        1,
+        "another flusher owns the queue"
+    );
+    drop(held);
+    sync_with_client(
+        &client, &config, &store, None, true, false, true, false, None, false, false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.pending_durability().unwrap(),
+        1,
+        "dry-run must not flush"
+    );
+    sync_with_client(
+        &client, &config, &store, None, true, false, false, false, None, false, false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.pending_durability().unwrap(),
+        0,
+        "no-op sync must retry"
+    );
+    assert!(
+        backend.get_calls().is_empty(),
+        "the entry must not be downloaded again"
+    );
+    assert_eq!(std::fs::read(&blob).unwrap(), b"pending local artifact");
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_sync_leaves_pending_work_to_a_reachable_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = save_manifest_config(dir.path().to_path_buf(), None);
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let source = dir.path().join("daemon-owned.rlib");
+    std::fs::write(&source, b"daemon-owned pending artifact").unwrap();
+    store
+        .put(
+            "daemon-owned",
+            "fixture",
+            &["lib".to_string()],
+            &[],
+            "",
+            "dev",
+            &[(source, "libfixture.rlib".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    let listener = crate::transport::ListenerOptions::new()
+        .name(crate::transport::socket_name(&config.socket_path()).unwrap())
+        .create_sync()
+        .unwrap();
+    flush_standalone_sync(&config, &store);
+    assert_eq!(store.pending_durability().unwrap(), 1);
+    drop(listener);
+    flush_standalone_sync(&config, &store);
+    assert_eq!(store.pending_durability().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn sync_with_client_pull_recovers_uncommitted_extracted_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));

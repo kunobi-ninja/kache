@@ -1585,13 +1585,14 @@ fn deferred_publish_is_repaired_by_the_locked_phase() {
     let hash = crate::file_hash::hash_file(&staged).unwrap();
     let blob = store.blob_path(&hash);
 
-    let outcome = Store::publish_staged_blob_with(
-        &staged,
-        &blob,
-        || Err(std::io::Error::from_raw_os_error(5)),
-        |_| true,
-    )
-    .unwrap();
+    let outcome = store
+        .publish_staged_blob_with(
+            &staged,
+            &blob,
+            || Err(std::io::Error::from_raw_os_error(5)),
+            |_| true,
+        )
+        .unwrap();
     assert_eq!(outcome, PublishRename::Deferred);
     assert!(!staged.exists(), "a deferred publish discards its snapshot");
     assert!(!blob.exists());
@@ -1613,13 +1614,14 @@ fn failed_publish_discards_its_snapshot_and_keeps_the_error() {
     let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
     let blob = store.blob_path(&"f".repeat(64));
 
-    let err = Store::publish_staged_blob_with(
-        &staged,
-        &blob,
-        || Err(std::io::Error::other("disk on fire")),
-        |_| false,
-    )
-    .unwrap_err();
+    let err = store
+        .publish_staged_blob_with(
+            &staged,
+            &blob,
+            || Err(std::io::Error::other("disk on fire")),
+            |_| false,
+        )
+        .unwrap_err();
     assert!(format!("{err:#}").contains("disk on fire"));
     assert!(!staged.exists(), "a failed publish discards its snapshot");
 }
@@ -1635,11 +1637,80 @@ fn successful_publish_keeps_the_staged_bytes_as_the_blob() {
     let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
     let blob = store.blob_path(&"a".repeat(64));
 
-    let outcome =
-        Store::publish_staged_blob_with(&staged, &blob, || fs::rename(&staged, &blob), |_| false)
-            .unwrap();
+    let outcome = store
+        .publish_staged_blob_with(&staged, &blob, || fs::rename(&staged, &blob), |_| false)
+        .unwrap();
     assert_eq!(outcome, PublishRename::Published);
     assert_eq!(fs::read(&blob).unwrap(), b"published-bytes");
+}
+
+#[test]
+fn cas_publication_keeps_a_flushed_winner_after_the_initial_absence_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let peer = Store::open(&config).unwrap();
+    let bytes = b"same-cas-generation";
+    let source = write_temp_file(dir.path(), "late-publisher.rlib", bytes);
+    let (staged, ingest) = store.stage_blob_from_source(&source, false).unwrap();
+    let hash = crate::file_hash::hash_file(&staged).unwrap();
+    let blob = store.blob_path(&hash);
+    assert!(!blob.exists());
+    let mut winner_identity = None;
+    let published = store
+        .publish_staged_blob_before_lock(&staged, ingest, &hash, bytes.len() as u64, || {
+            let key = put_entry(&peer, dir.path(), 99, "winner", bytes);
+            assert!(peer.flush_entry_durability(&key).unwrap());
+            winner_identity = Some(kache_fs::file_identity(&blob).unwrap());
+        })
+        .unwrap();
+    assert!(
+        !published,
+        "the final locked check must preserve the winner"
+    );
+    assert!(!staged.exists());
+    assert_eq!(
+        Some(kache_fs::file_identity(&blob).unwrap()),
+        winner_identity
+    );
+    assert_eq!(fs::read(&blob).unwrap(), bytes);
+    assert_eq!(peer.pending_durability().unwrap(), 0);
+}
+
+#[test]
+fn cas_publication_holds_the_writer_lock_through_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let peer = Store::open(&config).unwrap();
+    peer.db.busy_timeout(Duration::ZERO).unwrap();
+    let source = write_temp_file(dir.path(), "locked-publish.rlib", b"published bytes");
+    let (staged, _) = store.stage_blob_from_source(&source, false).unwrap();
+    let hash = crate::file_hash::hash_file(&staged).unwrap();
+    let blob = store.blob_path(&hash);
+    let outcome = store.publish_staged_blob_with(
+        &staged,
+        &blob,
+        || {
+            let competing = rusqlite::Transaction::new_unchecked(
+                &peer.db, rusqlite::TransactionBehavior::Immediate,
+            );
+            assert!(matches!(
+                competing,
+                Err(SqlError::SqliteFailure(code, _)) if code.code == ErrorCode::DatabaseBusy
+            ), "a second connection must not publish between the check and rename");
+            fs::rename(&staged, &blob)
+        },
+        |_| false,
+    ).unwrap();
+    assert_eq!(outcome, PublishRename::Published);
+    assert_eq!(fs::read(&blob).unwrap(), b"published bytes");
+    assert!(
+        rusqlite::Transaction::new_unchecked(&peer.db, rusqlite::TransactionBehavior::Immediate,)
+            .is_ok(),
+        "the publication lock must be released"
+    );
 }
 
 /// The grace both sweepers share (daemon GC and `doctor --repair`) must
@@ -1922,13 +1993,14 @@ fn a_read_only_blob_flushes_and_a_missing_one_reports_not_found() {
         fs::metadata(&blob).unwrap().permissions().readonly(),
         "the fixture must reproduce a published blob"
     );
-    fsync_published_blob(&blob).expect("a published blob flushes");
+    let file = open_published_file(&blob).expect("a published blob opens for flushing");
+    sync_durability_file(&file).expect("a published blob flushes");
     assert!(
         fs::metadata(&blob).unwrap().permissions().readonly(),
         "and stays read-only afterwards"
     );
     assert_eq!(
-        fsync_published_blob(&dir.path().join("absent"))
+        open_published_file(&dir.path().join("absent"))
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::NotFound
@@ -2087,7 +2159,7 @@ fn deferred_durability_verifies_pending_hits_until_the_flush() {
         "a durable entry keeps the size-only check the verification policy asks for"
     );
 
-    // A pending entry whose blob vanished is evicted by the flush.
+    // A flush never certifies a missing blob. Lookup owns its eviction.
     store.remove_entry("pending_key").unwrap();
     put(b"artifact-bytes-three");
     let meta = store.get("pending_key").unwrap().unwrap();
@@ -2097,10 +2169,9 @@ fn deferred_durability_verifies_pending_hits_until_the_flush() {
     fs::set_permissions(&blob, perms).unwrap();
     fs::remove_file(&blob).unwrap();
     assert_eq!(store.flush_durability(10).unwrap(), 0);
-    assert!(
-        !store.contains("pending_key"),
-        "evicted rather than marked durable"
-    );
+    assert!(!store.entry_is_durable("pending_key"));
+    assert!(store.get("pending_key").unwrap().is_none());
+    assert!(!store.contains("pending_key"));
 
     // Feature off: the put is durable inside the compile.
     config.deferred_durability = false;
@@ -2184,6 +2255,605 @@ fn deferred_durability_leaves_imported_entries_pending_until_the_flush() {
         1
     );
     assert_eq!(strict.pending_durability().unwrap(), 0);
+}
+
+struct DurabilitySyncObserver {
+    previous: Option<Vec<kache_fs::InodeId>>,
+}
+
+impl DurabilitySyncObserver {
+    fn start() -> Self {
+        Self {
+            previous: DURABILITY_SYNC_OBSERVATIONS.with(|slot| slot.replace(Some(Vec::new()))),
+        }
+    }
+
+    fn files(&self) -> Vec<kache_fs::InodeId> {
+        DURABILITY_SYNC_OBSERVATIONS.with(|slot| slot.borrow().as_ref().unwrap().clone())
+    }
+}
+
+impl Drop for DurabilitySyncObserver {
+    fn drop(&mut self) {
+        DURABILITY_SYNC_OBSERVATIONS.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+#[test]
+fn strict_imports_verify_and_sync_shared_pending_blobs_before_success() {
+    for batched in [false, true] {
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path());
+            config.deferred_durability = true;
+            let deferred = Store::open(&config).unwrap();
+            let shared_bytes = b"verified fixture artifact";
+            let seed = put_entry(&deferred, dir.path(), 94, "pending", shared_bytes);
+            let hash = blake3::hash(shared_bytes).to_hex().to_string();
+            let blob = deferred.blob_path(&hash);
+            let identity = kache_fs::file_identity(&blob).unwrap();
+            if corrupt {
+                let mut permissions = fs::metadata(&blob).unwrap().permissions();
+                permissions.set_readonly(false);
+                fs::set_permissions(&blob, permissions).unwrap();
+                fs::write(&blob, vec![b'x'; shared_bytes.len()]).unwrap();
+            }
+            config.deferred_durability = false;
+            let strict = Store::open(&config).unwrap();
+            let import_key = key(95);
+            let entry = write_verified_fixture(&strict, &import_key, &import_key, "lib.rlib", None);
+            if batched && !corrupt {
+                deferred
+                    .import_verified_restored_entries(&[entry.clone()])
+                    .unwrap();
+                fs::write(strict.entry_dir(&import_key).join("lib.rlib"), shared_bytes).unwrap();
+            }
+            let observed = DurabilitySyncObserver::start();
+            let imported = if batched {
+                strict
+                    .import_verified_restored_entries(&[entry])
+                    .map(|count| {
+                        if !corrupt {
+                            assert_eq!(
+                                count, 0,
+                                "an already committed pending key still needs flushing"
+                            );
+                        }
+                    })
+            } else {
+                strict.import_restored_entry(&import_key)
+            };
+            assert!(!deferred.entry_is_durable(&seed));
+            if corrupt {
+                assert!(
+                    imported.is_err(),
+                    "strict success must not certify corrupt shared bytes"
+                );
+                assert!(!strict.entry_is_durable(&import_key));
+                assert!(strict.get(&import_key).unwrap().is_none());
+            } else {
+                imported.unwrap();
+                assert!(strict.entry_is_durable(&import_key));
+                assert!(
+                    observed.files().contains(&identity),
+                    "the existing inode must be synced"
+                );
+                let meta_id =
+                    kache_fs::file_identity(&strict.entry_dir(&import_key).join("meta.json"))
+                        .unwrap();
+                assert!(
+                    observed.files().contains(&meta_id),
+                    "strict success also syncs metadata"
+                );
+                assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+                let count = observed.files().len();
+                strict.finish_strict_durability(&import_key).unwrap();
+                assert_eq!(
+                    observed.files().len(),
+                    count,
+                    "an already completed flush is accepted"
+                );
+            }
+            assert!(
+                strict.finish_strict_durability(&key(96)).is_err(),
+                "a missing row is not durable"
+            );
+        }
+    }
+}
+
+#[test]
+fn strict_put_verifies_and_syncs_a_shared_pending_winner() {
+    for corrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let deferred = Store::open(&config).unwrap();
+        let bytes = b"strict shared artifact";
+        put_entry(&deferred, dir.path(), 97, "pending", bytes);
+        let blob = deferred.blob_path(&blake3::hash(bytes).to_hex().to_string());
+        let identity = kache_fs::file_identity(&blob).unwrap();
+        if corrupt {
+            let mut permissions = fs::metadata(&blob).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&blob, permissions).unwrap();
+            fs::write(&blob, vec![b'x'; bytes.len()]).unwrap();
+        }
+        config.deferred_durability = false;
+        let strict = Store::open(&config).unwrap();
+        let source = write_temp_file(dir.path(), "strict-source.rlib", bytes);
+        let key = key(98);
+        let observed = DurabilitySyncObserver::start();
+        let result = strict.put(
+            &key,
+            "strict",
+            &["lib".to_string()],
+            &[],
+            "",
+            "dev",
+            &[(source, "libstrict.rlib".to_string())],
+            "",
+            "",
+        );
+        if corrupt {
+            assert!(
+                result.is_err(),
+                "a private valid snapshot does not certify a corrupt winner"
+            );
+            assert!(!strict.entry_is_durable(&key));
+            assert!(strict.get(&key).unwrap().is_none());
+        } else {
+            result.unwrap();
+            assert!(strict.entry_is_durable(&key));
+            assert_eq!(kache_fs::file_identity(&blob).unwrap(), identity);
+            assert!(
+                observed.files().contains(&identity),
+                "flush the winning inode, not the discarded snapshot"
+            );
+            assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+        }
+    }
+}
+
+#[test]
+fn durability_verification_bounds_handles_at_the_64_record_boundary() {
+    for count in [64, 65] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        let peer = Store::open(&config).unwrap();
+        peer.db.busy_timeout(Duration::ZERO).unwrap();
+        let outputs: Vec<_> = (0..count)
+            .map(|index| {
+                let name = format!("part-{index}.rlib");
+                let path = dir.path().join(&name);
+                fs::write(&path, format!("unique artifact {index}")).unwrap();
+                (path, name)
+            })
+            .collect();
+        let put = || {
+            store
+                .put(
+                    "many-artifacts",
+                    "many",
+                    &["lib".to_string()],
+                    &[],
+                    "",
+                    "dev",
+                    &outputs,
+                    "",
+                    "",
+                )
+                .unwrap()
+        };
+        put();
+        let mut calls = 0;
+        assert!(
+            store
+                .flush_entry_durability_with(
+                    "many-artifacts",
+                    |file| {
+                        let metadata_sync = calls == count;
+                        calls += 1;
+                        let must_hold_writer = count == 65 || metadata_sync;
+                        let competing = rusqlite::Transaction::new_unchecked(
+                            &peer.db,
+                            rusqlite::TransactionBehavior::Immediate,
+                        );
+                        match competing {
+                            Ok(tx) => {
+                                assert!(
+                                    !must_hold_writer,
+                                    "large-entry verification must retain the writer lock"
+                                );
+                                drop(tx);
+                            }
+                            Err(SqlError::SqliteFailure(code, _))
+                                if code.code == ErrorCode::DatabaseBusy =>
+                            {
+                                assert!(
+                                    must_hold_writer,
+                                    "ordinary blob IO must run outside the writer lock"
+                                );
+                            }
+                            Err(error) => panic!("unexpected writer probe: {error}"),
+                        }
+                        file.sync_all()
+                    },
+                    || {},
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            calls,
+            count + 1,
+            "every blob and the metadata must be synced"
+        );
+        assert_eq!(store.pending_durability().unwrap(), 0);
+
+        put();
+        let meta: EntryMeta = serde_json::from_slice(
+            &fs::read(store.entry_dir("many-artifacts").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        let last = &meta.files[count - 1];
+        let blob = store.blob_path(&last.hash);
+        let mut permissions = fs::metadata(&blob).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&blob, permissions).unwrap();
+        fs::write(&blob, vec![b'x'; last.size as usize]).unwrap();
+        assert!(!store.flush_entry_durability("many-artifacts").unwrap());
+        assert!(!store.entry_is_durable("many-artifacts"));
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        assert!(store.get("many-artifacts").unwrap().is_none());
+    }
+}
+
+#[test]
+fn durability_deduplicates_shared_hashes_but_rejects_contradictory_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let outputs: Vec<_> = ["first.rlib", "second.rlib"]
+        .into_iter()
+        .map(|name| {
+            let path = write_temp_file(dir.path(), name, b"shared bytes");
+            (path, name.to_string())
+        })
+        .collect();
+    let put = || {
+        store
+            .put(
+                "duplicate-blob",
+                "fixture",
+                &["lib".to_string()],
+                &[],
+                "",
+                "dev",
+                &outputs,
+                "",
+                "",
+            )
+            .unwrap()
+    };
+    put();
+    let mut syncs = 0;
+    assert!(
+        store
+            .flush_entry_durability_with(
+                "duplicate-blob",
+                |file| {
+                    syncs += 1;
+                    file.sync_all()
+                },
+                || {},
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        syncs, 2,
+        "one shared blob plus metadata, not one sync per file record"
+    );
+    put();
+    let meta_path = store.entry_dir("duplicate-blob").join("meta.json");
+    let mut meta: EntryMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    meta.files[1].size += 1;
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'duplicate-blob'",
+            params![compute_content_hash(&meta.files)],
+        )
+        .unwrap();
+    assert!(!store.flush_entry_durability("duplicate-blob").unwrap());
+    assert!(!store.entry_is_durable("duplicate-blob"));
+}
+
+#[test]
+fn durability_flush_rejects_untrusted_pending_metadata_without_promotion() {
+    for damage in [
+        "unreadable",
+        "malformed",
+        "binding",
+        "aggregate",
+        "hash",
+        "size",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        put_test_entry(&store, dir.path(), "metadata-boundary", 23);
+        let meta_path = store.entry_dir("metadata-boundary").join("meta.json");
+        let mut meta = store.stored_meta("metadata-boundary").unwrap();
+        match damage {
+            "unreadable" => {
+                fs::rename(&meta_path, meta_path.with_extension("saved")).unwrap();
+                fs::create_dir(&meta_path).unwrap();
+            }
+            "malformed" => fs::write(&meta_path, b"not json").unwrap(),
+            "binding" => {
+                meta.cache_key = "different-key".to_string();
+                fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            }
+            "aggregate" => {
+                store.db.execute(
+                    "UPDATE entries SET content_hash = 'different' WHERE cache_key = 'metadata-boundary'", [],
+                ).unwrap();
+            }
+            "hash" | "size" => {
+                if damage == "hash" {
+                    meta.files[0].hash = "invalid".to_string();
+                } else {
+                    meta.files[0].size += 1;
+                }
+                fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+                store.db.execute(
+                    "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'metadata-boundary'",
+                    params![compute_content_hash(&meta.files)],
+                ).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !store.flush_entry_durability("metadata-boundary").unwrap(),
+            "{damage}"
+        );
+        assert!(!store.entry_is_durable("metadata-boundary"), "{damage}");
+    }
+}
+
+#[test]
+fn durability_flush_does_not_certify_metadata_replaced_during_its_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "metadata-inode", 23);
+    let meta_path = store.entry_dir("metadata-inode").join("meta.json");
+    let contents = fs::read(&meta_path).unwrap();
+    let old_identity = kache_fs::file_identity(&meta_path).unwrap();
+    let mut calls = 0;
+    assert!(
+        !store
+            .flush_entry_durability_with(
+                "metadata-inode",
+                |file| {
+                    if calls == 1 {
+                        fs::rename(&meta_path, meta_path.with_extension("old"))?;
+                        fs::write(&meta_path, &contents)?;
+                    }
+                    calls += 1;
+                    file.sync_all()
+                },
+                || {},
+            )
+            .unwrap()
+    );
+    assert_eq!(calls, 2);
+    assert_ne!(kache_fs::file_identity(&meta_path).unwrap(), old_identity);
+    assert!(!store.entry_is_durable("metadata-inode"));
+    assert!(store.flush_entry_durability("metadata-inode").unwrap());
+}
+
+/// Model a crash image before any lookup: both remote import paths must
+/// reject same-size damaged bytes before clearing mandatory verification.
+#[test]
+fn durability_flush_verifies_reopened_imports_and_continues_after_corruption() {
+    for batched in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
+        let damaged = key(91);
+        let entry = write_verified_fixture(&store, &damaged, &damaged, "lib.rlib", None);
+        if batched {
+            assert_eq!(
+                store
+                    .import_verified_restored_entries(&[entry.clone()])
+                    .unwrap(),
+                1
+            );
+        } else {
+            store.import_restored_entry(&damaged).unwrap();
+        }
+        let blob = store.blob_path(&entry.meta.files[0].hash);
+        let mut permissions = fs::metadata(&blob).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&blob, permissions).unwrap();
+        let mut bytes = fs::read(&blob).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&blob, &bytes).unwrap();
+        let intact = put_entry(&store, dir.path(), 92, "intact", b"intact pending artifact");
+        store
+            .db
+            .execute(
+                "UPDATE entries SET created_at = CASE WHEN cache_key = ?1
+             THEN '2000-01-01' ELSE '2001-01-01' END",
+                params![damaged],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
+        assert_eq!(reopened.flush_durability(2).unwrap(), 1);
+        assert!(!reopened.entry_is_durable(&damaged));
+        assert!(reopened.entry_is_durable(&intact));
+        assert_eq!(reopened.pending_durability().unwrap(), 1);
+        let read_only =
+            Store::open_read_only_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
+        assert!(read_only.get_read_only(&damaged).unwrap().is_none());
+        assert!(
+            reopened.contains(&damaged),
+            "read-only lookup must not evict"
+        );
+        assert!(reopened.get(&damaged).unwrap().is_none());
+        assert!(!reopened.contains(&damaged));
+        assert!(reopened.get(&intact).unwrap().is_some());
+    }
+}
+
+/// The metadata and row can be replaced or removed during bulk verification,
+/// which must not hold the writer lock or promote the next generation.
+#[test]
+fn durability_flush_does_not_promote_a_replaced_or_removed_entry() {
+    for remove in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        let peer = Store::open(&config).unwrap();
+        put_test_entry(&store, dir.path(), "generation", 17);
+        assert!(
+            !store
+                .flush_entry_durability_with("generation", fs::File::sync_all, || {
+                    if remove {
+                        peer.remove_entry("generation").unwrap();
+                    } else {
+                        put_test_entry(&peer, dir.path(), "generation", 29);
+                    }
+                },)
+                .unwrap()
+        );
+        if remove {
+            assert!(!store.contains("generation"));
+            assert_eq!(store.pending_durability().unwrap(), 0);
+        } else {
+            assert_eq!(store.pending_durability().unwrap(), 1);
+            assert!(!store.entry_is_durable("generation"));
+            assert!(store.flush_entry_durability("generation").unwrap());
+            let meta = store.get("generation").unwrap().unwrap();
+            assert_eq!(
+                fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+                vec![b'b'; 29]
+            );
+        }
+    }
+}
+
+#[test]
+fn durability_flush_checks_metadata_even_when_blob_content_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let peer = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "metadata-generation", 17);
+    let meta_path = store.entry_dir("metadata-generation").join("meta.json");
+    assert!(
+        !store
+            .flush_entry_durability_with("metadata-generation", fs::File::sync_all, || {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &peer.db,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let mut meta: EntryMeta =
+                    serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+                meta.stdout = "replacement diagnostics".to_string();
+                crate::atomic::atomic_replace_deferrable(
+                    &meta_path,
+                    &serde_json::to_vec_pretty(&meta).unwrap(),
+                    false,
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            },)
+            .unwrap()
+    );
+    assert_eq!(store.pending_durability().unwrap(), 1);
+    assert!(store.flush_entry_durability("metadata-generation").unwrap());
+    assert_eq!(
+        store.get("metadata-generation").unwrap().unwrap().stdout,
+        "replacement diagnostics",
+    );
+}
+
+/// Unix can replace a CAS inode while a verifier retains its old handle.
+/// A delete and identical republication defeat metadata-only generation checks.
+#[cfg(unix)]
+#[test]
+fn durability_flush_rechecks_the_verified_cas_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    let peer = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "same-generation", 23);
+    let meta_path = store.entry_dir("same-generation").join("meta.json");
+    let before = fs::read(&meta_path).unwrap();
+    assert!(
+        !store
+            .flush_entry_durability_with("same-generation", fs::File::sync_all, || {
+                peer.remove_entry("same-generation").unwrap();
+                put_test_entry(&peer, dir.path(), "same-generation", 23);
+                assert_eq!(fs::read(&meta_path).unwrap(), before);
+            },)
+            .unwrap()
+    );
+    assert!(!store.entry_is_durable("same-generation"));
+    assert!(store.flush_entry_durability("same-generation").unwrap());
+}
+
+#[test]
+fn durability_flush_keeps_failed_blob_and_metadata_syncs_retryable() {
+    for fail_on in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        put_test_entry(&store, dir.path(), "retry", 19);
+        let mut calls = 0;
+        let attempted = store.flush_entry_durability_with(
+            "retry",
+            |file| {
+                let current = calls;
+                calls += 1;
+                if current == fail_on {
+                    Err(std::io::Error::other("injected sync failure"))
+                } else {
+                    file.sync_all()
+                }
+            },
+            || {},
+        );
+        assert!(!attempted.unwrap_or(false));
+        assert_eq!(calls, fail_on + 1);
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        assert!(!store.entry_is_durable("retry"));
+        assert!(store.flush_entry_durability("retry").unwrap());
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        let meta = store.get("retry").unwrap().unwrap();
+        assert_eq!(
+            fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+            vec![b'b'; 19]
+        );
+    }
 }
 
 /// `Store::get` counts a hit once per stamp interval and evicts an entry
@@ -11181,6 +11851,124 @@ fn test_migration_of_legacy_entry() {
 }
 
 #[test]
+fn legacy_migration_preserves_an_unindexed_cas_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let key = key(93);
+    let entry = write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+    let artifact = store.entry_dir(&key).join("lib.rlib");
+    let file = &entry.meta.files[0];
+    let blob = store.blob_path(&file.hash);
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::copy(&artifact, &blob).unwrap();
+    set_blob_readonly(&blob);
+    let winner = kache_fs::file_identity(&blob).unwrap();
+    store.db.execute(
+        "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES (?1, 'fixture', ?2, 1)",
+        params![key, file.size as i64],
+    ).unwrap();
+    assert_eq!(blob_refcount(&store, &file.hash), None);
+    assert!(store.migrate_entry_to_blobs(&entry.meta).unwrap());
+    assert_eq!(kache_fs::file_identity(&blob).unwrap(), winner);
+    assert_eq!(fs::read(&blob).unwrap(), b"verified fixture artifact");
+    assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+    assert!(!artifact.exists());
+    assert_eq!(blob_refcount(&store, &file.hash), Some(1));
+}
+
+#[test]
+fn legacy_migration_syncs_a_pending_winner_and_keeps_good_artifacts_on_corruption() {
+    for corrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        let shared = b"shared pending artifact";
+        let seed = put_entry(&store, dir.path(), 100, "pending", shared);
+        let blob = store.blob_path(&blake3::hash(shared).to_hex().to_string());
+        let identity = kache_fs::file_identity(&blob).unwrap();
+        let meta = legacy_entry(
+            &store,
+            "legacy-winner",
+            &[
+                ("first.rlib", b"another good legacy artifact"),
+                ("second.rlib", shared),
+            ],
+        );
+        let first = store.entry_dir("legacy-winner").join("first.rlib");
+        let second = store.entry_dir("legacy-winner").join("second.rlib");
+        if corrupt {
+            let mut permissions = fs::metadata(&blob).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&blob, permissions).unwrap();
+            fs::write(&blob, vec![b'x'; shared.len()]).unwrap();
+            assert!(
+                store.get("legacy-winner").unwrap().is_none(),
+                "migration errors must fail closed"
+            );
+            assert!(store.migrate_entry_to_blobs(&meta).is_err());
+            assert_eq!(fs::read(&first).unwrap(), b"another good legacy artifact");
+            assert_eq!(fs::read(&second).unwrap(), shared);
+        } else {
+            let observed = DurabilitySyncObserver::start();
+            assert!(store.get("legacy-winner").unwrap().is_some());
+            assert!(
+                observed.files().contains(&identity),
+                "sync the selected pending inode"
+            );
+            assert_eq!(kache_fs::file_identity(&blob).unwrap(), identity);
+            assert!(!first.exists());
+            assert!(!second.exists());
+        }
+        assert!(
+            !store.entry_is_durable(&seed),
+            "the peer row remains independently pending"
+        );
+    }
+}
+
+#[test]
+fn legacy_migration_keeps_completed_refcounts_after_a_later_io_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let first_bytes = b"first legacy migration progress";
+    let second_bytes = b"second legacy migration progress";
+    let meta = legacy_entry(
+        &store,
+        "partial-legacy",
+        &[("first.rlib", first_bytes), ("second.rlib", second_bytes)],
+    );
+    let first = store.blob_path(&meta.files[0].hash);
+    let second = store.blob_path(&meta.files[1].hash);
+    assert_ne!(
+        first.parent(),
+        second.parent(),
+        "the failure must affect only the second shard"
+    );
+    let result = store.migrate_entry_to_blobs_after_preflight(&meta, || {
+        assert!(!second.parent().unwrap().exists());
+        fs::write(second.parent().unwrap(), b"not a directory").unwrap();
+    });
+    assert!(
+        result.is_err(),
+        "the later filesystem error must be returned"
+    );
+    assert_eq!(blob_refcount(&store, &meta.files[0].hash), Some(1));
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert!(
+        !store
+            .entry_dir("partial-legacy")
+            .join("first.rlib")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(store.entry_dir("partial-legacy").join("second.rlib")).unwrap(),
+        second_bytes,
+    );
+    assert_eq!(blob_refcount(&store, &meta.files[1].hash), None);
+}
+
+#[test]
 fn migrate_entry_to_blobs_bumps_refcount_when_insert_loses_race() {
     // Covers migrate_entry_to_blobs INSERT OR IGNORE changes()==0 branch.
     let dir = tempfile::tempdir().unwrap();
@@ -11212,6 +12000,12 @@ fn migrate_entry_to_blobs_bumps_refcount_when_insert_loses_race() {
         compile_time_ms: 0,
         emit_kinds: Vec::new(),
     };
+
+    fs::write(
+        entry_dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta).unwrap(),
+    )
+    .unwrap();
 
     store
         .db
@@ -11782,7 +12576,7 @@ fn verified_batch_import_checks_each_artifact_field_independently() {
 }
 
 #[test]
-fn verified_batch_import_never_rewrites_an_existing_content_addressed_blob() {
+fn verified_batch_import_preserves_but_rejects_a_corrupt_existing_blob() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(tmp.path())).unwrap();
     let key = blake3::hash(b"existing-immutable-blob")
@@ -11793,7 +12587,10 @@ fn verified_batch_import_never_rewrites_an_existing_content_addressed_blob() {
     std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
     std::fs::write(&blob, b"pre-existing immutable blob").unwrap();
 
-    assert_eq!(store.import_verified_restored_entries(&[entry]).unwrap(), 1);
+    store
+        .import_verified_restored_entries(&[entry])
+        .expect_err("a corrupt existing blob must not become a strict hit");
+    assert!(!store.entry_is_durable(&key));
     assert_eq!(std::fs::read(blob).unwrap(), b"pre-existing immutable blob");
 }
 
@@ -11811,7 +12608,7 @@ fn verified_blob_install_reports_a_vanished_source_before_rename() {
     };
 
     let error = store
-        .install_verified_blob(&tmp.path().join("missing-entry"), &file)
+        .move_verified_blob(&tmp.path().join("missing-entry"), &file)
         .expect_err("a vanished verified source must fail")
         .to_string();
     assert!(

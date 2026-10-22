@@ -69,7 +69,11 @@ Identical output bytes share one blob. Restores first try copy-on-write cloning.
 
 See [Deduplication](/docs/deduplication) for platform details.
 
-A miss stores its outputs without waiting for an fsync, and an entry downloaded from the remote is imported the same way. The daemon flushes the new blobs and metadata to disk on a two-second sweep, up to 64 entries per sweep in the main store and in each volume shard, and marks those entries durable, and a GC run flushes whatever is still pending. Without a reachable daemon the wrapper flushes the entry itself, and `kache sync` flushes every pending entry after its pull, so a store used without a daemon does not accumulate unflushed entries. Until an entry is flushed, a hit on it verifies every blob against its content hash before restoring, so a crash in between costs a recompile or a new download, never a wrong artifact. `[cache] deferred_durability = false` flushes inside the compile or download instead.
+A miss or a remotely downloaded entry can be stored without waiting for an fsync. The daemon verifies and flushes pending entries on a two-second sweep, up to 64 entries in the main store and in each indexed volume shard. A GC run also flushes pending entries.
+
+Without a reachable daemon, the wrapper attempts to flush the entry it stored. A non-dry-run `kache sync` also retries pending entries, even when there is nothing to transfer. IO failures or concurrent changes can leave entries pending for the next attempt. While an entry is pending, a hit verifies its blobs against their content hashes; the flush also verifies the bytes before marking that publication durable. Missing or damaged pending artifacts cause a cache miss. Set `[cache] deferred_durability = false` to flush inside the compile or download instead.
+
+Strict stores validate and flush shared blobs too, before a store or import operation succeeds. This adds a validation read to strict writes. Entries with more than 64 artifact records verify sequentially while holding the store's writer lock to bound open files, so a large flush can delay other writers. Already-durable hits keep the configured restore-verification policy.
 
 ## Daemon
 

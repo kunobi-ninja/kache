@@ -8880,6 +8880,21 @@ async fn list_remote_crates(
     .await
 }
 
+fn flush_standalone_sync(config: &Config, store: &Store) {
+    if crate::transport::is_reachable(&config.socket_path()) {
+        return;
+    }
+    let flushed = (|| -> Result<usize> {
+        let Some(_lock) = store.try_durability_flush_lock()? else {
+            return Ok(0);
+        };
+        store.flush_durability(usize::MAX)
+    })();
+    if let Err(error) = flushed {
+        tracing::debug!("durability flush after sync failed: {error:#}");
+    }
+}
+
 /// The remote-driven body of `sync`, with the backend injected so tests can
 /// drive it against a mock. Lists remote keys, diffs against the local store,
 /// then (unless `dry_run`) pulls missing artifacts and pushes local-only ones.
@@ -8994,6 +9009,9 @@ async fn sync_with_client(
     };
 
     if to_pull.is_empty() && to_push.is_empty() {
+        if !dry_run {
+            flush_standalone_sync(config, store);
+        }
         println!("Nothing to sync.");
         return Ok(());
     }
@@ -9110,14 +9128,9 @@ async fn sync_with_client(
                 String::new()
             },
         );
-        // With no daemon to flush entries pulled under deferred durability,
-        // every hit on them would re-read their blobs to verify them.
-        if !crate::transport::is_reachable(&config.socket_path())
-            && let Err(error) = store.flush_durability(usize::MAX)
-        {
-            tracing::debug!("durability flush after pull failed: {error:#}");
-        }
     }
+    // Retry earlier pending work even when this sync did not pull anything.
+    flush_standalone_sync(config, store);
 
     // ── Push phase ──────────────────────────────────────────────
     if !to_push.is_empty() {

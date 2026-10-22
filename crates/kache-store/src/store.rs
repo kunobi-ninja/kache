@@ -22,8 +22,8 @@ pub struct StorePutResult {
 
 /// An entry whose remote bytes and declared artifact hashes were verified in
 /// the same pass that extracted them. Construction stays inside the remote
-/// transport boundary; the store still re-checks metadata, paths and lengths,
-/// but deliberately does not read every artifact a second time.
+/// transport boundary. Registration rechecks metadata, paths and lengths;
+/// durability promotion verifies the bytes before clearing the pending flag.
 #[derive(Debug, Clone)]
 pub struct VerifiedRestoredEntry {
     pub cache_key: String,
@@ -42,32 +42,74 @@ fn set_blob_readonly(blob: &Path) {
     let _ = set_blob_readonly_checked(blob);
 }
 
-/// Mark a blob read-only, reporting failure. The hardlink ingest path needs
-/// the result: there the guard is a correctness requirement (the blob shares
-/// an inode with the build's own output), not a courtesy.
-/// Flush a published blob to disk. Published blobs are read-only, and
-/// Windows needs write access to flush a handle, so there the read-only
-/// attribute comes off for the flush and goes straight back on.
-fn fsync_published_blob(blob: &Path) -> std::io::Result<()> {
+/// Bound retained descriptors during the optimistic durability pass.
+const DURABILITY_MAX_VERIFIED_HANDLES: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_SYNC_OBSERVATIONS: std::cell::RefCell<Option<Vec<kache_fs::InodeId>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn sync_durability_file(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    DURABILITY_SYNC_OBSERVATIONS.with(|observations| -> std::io::Result<()> {
+        if let Some(observed) = observations.borrow_mut().as_mut() {
+            observed.push(kache_fs::handle_identity(file)?);
+        }
+        Ok(())
+    })?;
+    file.sync_all()
+}
+
+/// Open a published file for verification and flushing through the same handle.
+/// Windows needs write access for FlushFileBuffers, even on read-only blobs.
+fn open_published_file(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(not(windows))]
     {
-        crate::atomic::fsync_file(blob)
+        fs::File::open(path)
     }
     #[cfg(windows)]
     {
-        let meta = fs::metadata(blob)?;
-        if !meta.permissions().readonly() {
-            return crate::atomic::fsync_file(blob);
+        let permissions = fs::metadata(path)?.permissions();
+        if permissions.readonly() {
+            let mut writable = permissions.clone();
+            writable.set_readonly(false);
+            fs::set_permissions(path, writable)?;
         }
-        let mut writable = meta.permissions();
-        writable.set_readonly(false);
-        fs::set_permissions(blob, writable)?;
-        let flushed = crate::atomic::fsync_file(blob);
-        let _ = set_blob_readonly_checked(blob);
-        flushed
+        let opened = fs::OpenOptions::new().read(true).write(true).open(path);
+        if permissions.readonly() {
+            match &opened {
+                Ok(file) => file.set_permissions(permissions)?,
+                Err(_) => {
+                    let _ = fs::set_permissions(path, permissions);
+                }
+            }
+        }
+        opened
     }
 }
 
+fn verify_durability_file(
+    path: &Path,
+    cached: &CachedFile,
+    sync_file: &mut impl FnMut(&fs::File) -> std::io::Result<()>,
+) -> Result<fs::File> {
+    let mut file = open_published_file(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "pending blob is not a regular file");
+    anyhow::ensure!(metadata.len() == cached.size, "pending blob size changed");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(&mut file)?;
+    anyhow::ensure!(
+        hasher.finalize().to_hex().as_str() == cached.hash,
+        "pending blob content hash mismatch"
+    );
+    sync_file(&file)?;
+    Ok(file)
+}
+
+/// A hardlinked ingest must not publish a writable shared inode.
 fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
     let mut perms = meta.permissions();
@@ -2507,6 +2549,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 "lazy migration failed for {}: {e}",
                 &cache_key[..16.min(cache_key.len())]
             );
+            return Ok(None);
         }
 
         // Decide once per hit whether to content-verify, so all of an entry's
@@ -2911,8 +2954,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let meta_path = entry_dir.join("meta.json");
 
         // Phase 2: register the entry and all of its blob references in a single
-        // transaction, flipping `committed = 1` only once every blob is durable
-        // on disk. Either the whole entry (with correct refcounts) becomes
+        // transaction. Entries stay pending until a verified flush completes.
+        // Either the whole entry (with correct refcounts) becomes
         // visible, or none of it does — no refcount drift, no half-written row.
         //
         // `meta.json` is written INSIDE this transaction (#670), after the
@@ -2973,9 +3016,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .context("writing entry metadata")?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, false],
         )?;
         tx.commit()?;
+        self.finish_strict_durability(cache_key)?;
 
         // Both ingest phases may hardlink a compiler output to the immutable
         // blob and mark the shared inode read-only, changing ctime. Seed only
@@ -3001,6 +3045,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// method moves the artifact files into the content-addressed blob
     /// store and records them in the `blobs` table, leaving only
     /// `meta.json` in the entry directory.
+    /// Strict stores verify and flush before success. A failed flush leaves
+    /// committed entries pending for retry rather than certifying their bytes.
     pub fn import_downloaded_entry(&self, cache_key: &str) -> Result<()> {
         self.refuse_write("import an entry")?;
         let entry_dir = self.entry_dir(cache_key);
@@ -3073,28 +3119,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Phase 1: move each *new* blob into the content-addressed store and make
-        // it durable, or leave that to the flush of an entry recorded as not yet
-        // durable. For blobs that already exist (shared), keep the downloaded
+        // Phase 1: move each new blob into the content-addressed store. Strict
+        // stores flush the registered entry before returning, including any
+        // shared blobs a deferred writer left pending. Keep the downloaded
         // copy in the entry dir for now — it's the fallback Phase 2 restores from
         // if a concurrent remove unlinks the blob.
-        let durable = self.durable_writes();
         for cached_file in &meta.files {
             let blob = self.blob_path(&cached_file.hash);
             if !blob.is_file() {
-                let file_path = entry_dir.join(&cached_file.name);
-                fs::create_dir_all(blob.parent().unwrap())
-                    .context("creating blob shard directory")?;
-                fs::rename(&file_path, &blob).with_context(|| {
-                    format!(
-                        "moving downloaded artifact {} to blob store",
-                        file_path.display()
-                    )
-                })?;
-                if durable {
-                    crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
-                }
-                set_blob_readonly(&blob);
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &self.db,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                self.move_verified_blob(&entry_dir, cached_file)?;
+                tx.commit()?;
             }
         }
 
@@ -3142,16 +3180,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         file_path.display()
                     )
                 })?;
-                if durable {
-                    crate::atomic::fsync_file(&blob).context("flushing downloaded blob to disk")?;
-                }
                 set_blob_readonly(&blob);
             }
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, unixepoch(), 1)",
-            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema, durable],
+            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema, false],
         )?;
         tx.commit()?;
 
@@ -3164,6 +3199,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
+        self.finish_strict_durability(cache_key)?;
         Ok(())
     }
 
@@ -3241,10 +3277,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Install one already-verified artifact into the content-addressed blob
-    /// store. A missing source is a distinct integrity race, not a generic
-    /// rename failure, so keep that decision directly testable.
-    fn install_verified_blob(&self, entry_dir: &Path, file: &CachedFile) -> Result<()> {
+    /// Move an already-verified artifact while the caller holds SQLite's writer
+    /// lock. Rechecking the destination under that lock preserves a winner's
+    /// inode, including one another entry has already flushed.
+    fn move_verified_blob(&self, entry_dir: &Path, file: &CachedFile) -> Result<bool> {
         let blob = self.blob_path(&file.hash);
         if !blob.is_file() {
             let artifact = entry_dir.join(&file.name);
@@ -3253,21 +3289,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             fs::create_dir_all(blob.parent().expect("blob path has a parent"))?;
             fs::rename(&artifact, &blob)?;
-            if self.durable_writes() {
-                crate::atomic::fsync_file(&blob)?;
-            }
             set_blob_readonly(&blob);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Import already stream-verified restored entries with one SQLite
     /// transaction for the whole batch.
     ///
-    /// Artifact content is not hashed again: callers may only construct
+    /// Registration trusts the stream hashes: callers may only construct
     /// [`VerifiedRestoredEntry`] after extraction verified each byte against
     /// `meta.files[].hash`. This method still performs a complete metadata and
     /// on-disk length preflight before moving blobs or opening the transaction.
+    /// Strict stores then verify and flush before success; a failed flush can
+    /// leave committed rows pending for retry.
     pub fn import_verified_restored_entries(
         &self,
         entries: &[VerifiedRestoredEntry],
@@ -3328,30 +3364,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Make every content-addressed blob durable before the database can
-        // advertise a reference to it, or leave that to the flush of entries
-        // recorded as not yet durable. Existing blobs leave the extracted copy
-        // in place as the in-transaction race fallback below.
-        let durable = self.durable_writes();
+        // Install the blobs before registering pending references. Strict
+        // stores verify and flush the entries after registration. Existing
+        // blobs leave the extracted copy as the in-transaction race fallback.
         for entry in entries {
             let entry_dir = self.entry_dir(&entry.cache_key);
             for file in &entry.meta.files {
                 let blob = self.blob_path(&file.hash);
                 if !blob.is_file() {
-                    let artifact = entry_dir.join(&file.name);
-                    fs::create_dir_all(blob.parent().expect("blob path has a parent"))
-                        .context("creating verified blob shard directory")?;
-                    fs::rename(&artifact, &blob).with_context(|| {
-                        format!(
-                            "moving verified artifact {} to blob store",
-                            artifact.display()
-                        )
-                    })?;
-                    if durable {
-                        crate::atomic::fsync_file(&blob)
-                            .context("flushing verified restored blob to disk")?;
-                    }
-                    set_blob_readonly(&blob);
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        &self.db,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )?;
+                    self.move_verified_blob(&entry_dir, file)?;
+                    tx.commit()?;
                 }
             }
         }
@@ -3406,7 +3432,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     content_hash,
                     meta.compile_time_ms as i64,
                     meta.key_schema,
-                    durable
+                    false
                 ],
             )?;
             if inserted == 0 {
@@ -3428,7 +3454,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         params![file.hash],
                     )?;
                 }
-                self.install_verified_blob(&entry_dir, file)?;
+                self.move_verified_blob(&entry_dir, file)?;
             }
             record_entry_blobs(&tx, &entry.cache_key, &meta.files)?;
             tx.execute(
@@ -3447,6 +3473,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     let _ = fs::remove_file(artifact);
                 }
             }
+            self.finish_strict_durability(&entry.cache_key)?;
         }
         Ok(imported)
     }
@@ -4098,8 +4125,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         hash: &str,
         size_bytes: u64,
     ) -> Result<bool> {
+        self.publish_staged_blob_before_lock(staged, ingest, hash, size_bytes, || {})
+    }
+
+    fn publish_staged_blob_before_lock(
+        &self,
+        staged: &Path,
+        ingest: StoreIngest,
+        hash: &str,
+        size_bytes: u64,
+        before_write_lock: impl FnOnce(),
+    ) -> Result<bool> {
         let blob = self.blob_path(hash);
-        let outcome = Self::publish_staged_blob_with(
+        if blob.is_file() {
+            Self::discard_staged_blob(staged);
+            return Ok(false);
+        }
+        before_write_lock();
+        let outcome = self.publish_staged_blob_with(
             staged,
             &blob,
             || fs::rename(staged, &blob),
@@ -4127,26 +4170,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// its transient classifier passed in so a test can stage the Windows
     /// failures. The staged file is gone afterwards unless it became the blob.
     fn publish_staged_blob_with(
+        &self,
         staged: &Path,
         blob: &Path,
         rename: impl FnMut() -> std::io::Result<()>,
         is_transient: impl Fn(&std::io::Error) -> bool,
     ) -> Result<PublishRename> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         if blob.is_file() {
             Self::discard_staged_blob(staged);
             return Ok(PublishRename::LostRace);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        // This runs outside the SQLite write lock, so a concurrent remove can
-        // unlink the blob, and a concurrent put can publish it, at any point.
-        // `publish_rename` waits out the states that clear on their own and
-        // keeps the staged file alive between attempts.
+        // Keep SQLite's writer lock from this final existence check through
+        // the rename. Plain rename would otherwise overwrite a
+        // newly published inode on Unix and undo another entry's flush.
+        // `publish_rename` still handles Windows sharing/delete-pending states.
         let outcome = publish_rename(rename, || publish_dest_state(blob), is_transient);
         if !matches!(outcome, Ok(PublishRename::Published)) {
             tracing::debug!("{} not published by this put: {outcome:?}", blob.display());
             Self::discard_staged_blob(staged);
         }
-        outcome
+        let outcome = outcome?;
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Discard a staging snapshot (best effort; the staging sweep reclaims any
@@ -4352,6 +4402,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         !self.config.deferred_durability
     }
 
+    /// Strict success requires a verified flush of the current publication,
+    /// including shared blobs. A peer may already have completed that flush.
+    fn finish_strict_durability(&self, cache_key: &str) -> Result<()> {
+        if self.durable_writes() {
+            self.flush_entry_durability(cache_key)?;
+            let durable: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries
+                 WHERE cache_key = ?1 AND committed = 1 AND durable = 1)",
+                params![cache_key],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                durable,
+                "entry remains pending after strict durability flush"
+            );
+        }
+        Ok(())
+    }
+
     /// Whether an entry's blobs and metadata have reached disk. Unknown rows
     /// read as durable: the size check and the verification policy still apply.
     fn entry_is_durable(&self, cache_key: &str) -> bool {
@@ -4375,8 +4444,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Flush up to `limit` entries stored without an fsync: every blob and
     /// its shard directory, then the entry's `meta.json` and directory, and
-    /// mark them durable. An entry whose blob went missing meanwhile is
-    /// evicted instead. Returns how many entries were flushed.
+    /// mark them durable. Changed or unverifiable entries stay pending.
+    /// Returns how many entries were flushed.
     pub fn flush_durability(&self, limit: usize) -> Result<usize> {
         self.refuse_write("flush durability")?;
         let keys: Vec<String> = {
@@ -4396,63 +4465,150 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(flushed)
     }
 
-    /// Flush one entry stored without an fsync and mark it durable. `Ok(false)`
-    /// when the entry was already durable or had to be evicted.
+    /// Verify and flush one pending entry before marking it durable. Changed,
+    /// unreadable or corrupt entries remain pending for a retry or lookup eviction.
     pub fn flush_entry_durability(&self, cache_key: &str) -> Result<bool> {
+        self.flush_entry_durability_with(cache_key, sync_durability_file, || {})
+    }
+
+    fn flush_entry_durability_with(
+        &self,
+        cache_key: &str,
+        mut sync_file: impl FnMut(&fs::File) -> std::io::Result<()>,
+        before_promotion: impl FnOnce(),
+    ) -> Result<bool> {
         self.refuse_write("flush entry durability")?;
-        if self.entry_is_durable(cache_key) {
+        let pending_hash: Option<String> = self
+            .db
+            .query_row(
+                "SELECT content_hash FROM entries
+                 WHERE cache_key = ?1 AND committed = 1 AND durable = 0",
+                params![cache_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(content_hash) = pending_hash else {
             return Ok(false);
-        }
+        };
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
-        let meta: EntryMeta = match fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|json| serde_json::from_str(&json).ok())
-        {
-            Some(meta) => meta,
-            None => {
-                tracing::warn!(
-                    "cache entry {} has no readable meta.json to flush, evicting",
-                    cache_key.get(..16).unwrap_or(cache_key)
-                );
-                let _ = self.remove_entry(cache_key);
-                return Ok(false);
-            }
+        let Ok(meta_bytes) = fs::read(&meta_path) else {
+            return Ok(false);
         };
-        for file in &meta.files {
-            let blob = self.blob_path(&file.hash);
-            if let Err(error) = fsync_published_blob(&blob) {
-                // A blob that is gone takes the entry with it; anything else
-                // (a busy handle, a transient IO error) leaves the entry
-                // pending, to be flushed by a later worker or by GC. An
-                // unflushed entry is still served, with its bytes verified.
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        "cache entry {} blob {} vanished before it was flushed, evicting",
-                        cache_key.get(..16).unwrap_or(cache_key),
-                        file.name
-                    );
-                    let _ = self.remove_entry(cache_key);
-                } else {
-                    tracing::debug!(
-                        "cache entry {} blob {} could not be flushed ({error}); still pending",
-                        cache_key.get(..16).unwrap_or(cache_key),
-                        file.name
-                    );
-                }
+        let Ok(meta) = serde_json::from_slice::<EntryMeta>(&meta_bytes) else {
+            return Ok(false);
+        };
+        if meta.cache_key != cache_key || compute_content_hash(&meta.files) != content_hash {
+            return Ok(false);
+        }
+        let mut unique_files = std::collections::HashMap::new();
+        for cached in &meta.files {
+            if !kache_format::is_blob_hash(&cached.hash) {
                 return Ok(false);
             }
-            if let Some(parent) = blob.parent() {
-                let _ = crate::atomic::fsync_dir(parent);
+            if let Some(previous) = unique_files.insert(cached.hash.as_str(), cached)
+                && previous.size != cached.size
+            {
+                return Ok(false);
             }
         }
-        fsync_published_blob(&meta_path).context("flushing entry metadata")?;
-        let _ = crate::atomic::fsync_dir(&entry_dir);
-        self.db.execute(
+
+        // Keep the common case's bulk IO outside the writer lock. Large
+        // entries verify sequentially under it rather than retaining enough
+        // handles to exhaust a normal process descriptor limit.
+        let sequential = meta.files.len() > DURABILITY_MAX_VERIFIED_HANDLES;
+        let mut verified = Vec::new();
+        if !sequential {
+            for cached in unique_files.values() {
+                let Some(blob) = self.verify_pending_blob(cache_key, cached, &mut sync_file) else {
+                    return Ok(false);
+                };
+                verified.push(blob);
+            }
+        }
+        before_promotion();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let current_hash: Option<String> = tx
+            .query_row(
+                "SELECT content_hash FROM entries
+                 WHERE cache_key = ?1 AND committed = 1 AND durable = 0",
+                params![cache_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_hash.as_deref() != Some(content_hash.as_str()) {
+            return Ok(false);
+        }
+        let mut metadata_file = match open_published_file(&meta_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        let mut current_meta = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
+        if current_meta != meta_bytes {
+            return Ok(false);
+        }
+        if sequential {
+            for cached in unique_files.values() {
+                let Some((blob, file)) =
+                    self.verify_pending_blob(cache_key, cached, &mut sync_file)
+                else {
+                    return Ok(false);
+                };
+                if kache_fs::file_identity(&blob).ok() != Some(kache_fs::handle_identity(&file)?) {
+                    return Ok(false);
+                }
+            }
+        } else {
+            for (blob, file) in &verified {
+                if kache_fs::file_identity(blob).ok() != Some(kache_fs::handle_identity(file)?) {
+                    return Ok(false);
+                }
+            }
+        }
+        sync_file(&metadata_file).context("flushing entry metadata")?;
+        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
+        if kache_fs::file_identity(&meta_path).ok()
+            != Some(kache_fs::handle_identity(&metadata_file)?)
+        {
+            return Ok(false);
+        }
+        let promoted = tx.execute(
             "UPDATE entries SET durable = 1 WHERE cache_key = ?1",
             params![cache_key],
         )?;
-        Ok(true)
+        tx.commit()?;
+        Ok(promoted == 1)
+    }
+
+    /// A crash can preserve size and timestamps while damaging bytes. Bypass
+    /// the hash memo and sync the same open file whose content was verified.
+    fn verify_pending_blob(
+        &self,
+        cache_key: &str,
+        cached: &CachedFile,
+        sync_file: &mut impl FnMut(&fs::File) -> std::io::Result<()>,
+    ) -> Option<(PathBuf, fs::File)> {
+        let blob = self.blob_path(&cached.hash);
+        let checked = (|| -> Result<fs::File> {
+            let file = verify_durability_file(&blob, cached, sync_file)?;
+            crate::atomic::fsync_dir(blob.parent().expect("blob path has a parent"))?;
+            Ok(file)
+        })();
+        match checked {
+            Ok(file) => Some((blob, file)),
+            Err(error) => {
+                tracing::debug!(
+                    "cache entry {} blob {} remains pending: {error:#}",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached.name
+                );
+                None
+            }
+        }
     }
 
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
@@ -6556,7 +6712,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// reference it already held. That errs high only, and the daemon's
     /// blob-index reconcile repairs it.
     fn migrate_entry_to_blobs(&self, meta: &EntryMeta) -> Result<bool> {
-        let committed: bool = self.db.query_row(
+        self.migrate_entry_to_blobs_after_preflight(meta, || {})
+    }
+
+    fn migrate_entry_to_blobs_after_preflight(
+        &self,
+        meta: &EntryMeta,
+        after_preflight: impl FnOnce(),
+    ) -> Result<bool> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let committed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
             params![meta.cache_key],
             |row| row.get(0),
@@ -6565,60 +6733,77 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(false);
         }
         let entry_dir = self.entry_dir(&meta.cache_key);
-        for cached_file in &meta.files {
-            let artifact_path = entry_dir.join(&cached_file.name);
-            if !artifact_path.exists() {
-                continue; // Already migrated
+        let mut metadata_file = open_published_file(&entry_dir.join("meta.json"))?;
+        let mut metadata_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut metadata_bytes)?;
+        anyhow::ensure!(
+            serde_json::from_slice::<EntryMeta>(&metadata_bytes)? == *meta,
+            "legacy metadata changed before migration"
+        );
+        let mut sync_file = sync_durability_file;
+        // Validate every selected inode before discarding any legacy source.
+        // All cooperating CAS publishers share the writer lock held here.
+        for cached in &meta.files {
+            anyhow::ensure!(
+                kache_format::is_blob_hash(&cached.hash)
+                    && kache_format::is_safe_stored_artifact_name(&cached.name),
+                "legacy entry has unsafe artifact metadata"
+            );
+            let artifact = entry_dir.join(&cached.name);
+            if artifact.exists() {
+                let blob = self.blob_path(&cached.hash);
+                let selected = if blob.is_file() { &blob } else { &artifact };
+                verify_durability_file(selected, cached, &mut sync_file)?;
             }
-            let blob = self.blob_path(&cached_file.hash);
-            let blob_dir = blob.parent().unwrap();
-            fs::create_dir_all(blob_dir)?;
-
-            // Check if blob already exists
-            let existing: Option<i64> = self
-                .db
-                .query_row(
-                    "SELECT refcount FROM blobs WHERE hash = ?1",
-                    params![cached_file.hash],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            if existing.is_some() {
-                // Blob exists — delete artifact, bump refcount
-                if let Ok(m) = fs::metadata(&artifact_path) {
-                    let mut perms = m.permissions();
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(&artifact_path, perms);
+        }
+        after_preflight();
+        let progress = (|| -> Result<()> {
+            for cached_file in &meta.files {
+                let artifact_path = entry_dir.join(&cached_file.name);
+                if !artifact_path.exists() {
+                    continue; // Already migrated
                 }
-                fs::remove_file(&artifact_path)?;
-                self.db.execute(
-                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-                    params![cached_file.hash],
-                )?;
-            } else {
-                // New blob — rename artifact into blob store
-                if let Ok(m) = fs::metadata(&artifact_path) {
-                    let mut perms = m.permissions();
-                    if !perms.readonly() {
-                        perms.set_readonly(true);
-                        fs::set_permissions(&artifact_path, perms)?;
-                    }
+                let blob = self.blob_path(&cached_file.hash);
+                let blob_dir = blob.parent().unwrap();
+                fs::create_dir_all(blob_dir)?;
+
+                if blob.is_file() {
+                    // An unindexed blob can already belong to a publisher. Keep
+                    // its inode and discard the duplicate legacy artifact.
+                    let mut permissions = fs::metadata(&artifact_path)?.permissions();
+                    permissions.set_readonly(false);
+                    fs::set_permissions(&artifact_path, permissions)?;
+                    fs::remove_file(&artifact_path)?;
+                    set_blob_readonly(&blob);
+                } else {
+                    self.move_verified_blob(&entry_dir, cached_file)?;
                 }
-                fs::rename(&artifact_path, &blob)?;
-                self.db.execute(
+                tx.execute(
                     "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                     params![cached_file.hash, cached_file.size as i64],
                 )?;
-                if self.db.changes() == 0 {
-                    self.db.execute(
+                if tx.changes() == 0 {
+                    tx.execute(
                         "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
                         params![cached_file.hash],
                     )?;
                 }
+                crate::atomic::fsync_dir(blob_dir)?;
             }
+            sync_durability_file(&metadata_file)?;
+            crate::atomic::fsync_dir(&entry_dir)?;
+            Ok(())
+        })();
+        // Renames cannot roll back. Keep references for files already migrated
+        // if a later filesystem operation fails.
+        match (progress, tx.commit()) {
+            (Ok(()), Ok(())) => Ok(true),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error.into()),
+            (Err(error), Err(commit_error)) => Err(error.context(format!(
+                "also failed to commit completed migration progress: {commit_error}"
+            ))),
         }
-        Ok(true)
     }
 
     /// Bulk-migrate all legacy entries' artifacts into the blob store.

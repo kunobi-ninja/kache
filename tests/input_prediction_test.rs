@@ -1495,6 +1495,8 @@ fn a_cache_inside_the_workspace_keeps_the_record_guarded_under_a_trust_domain() 
     unit.cache = a.join(".cache/kache");
     std::fs::create_dir_all(&unit.cache).unwrap();
     unit.env.push(("KACHE_TRUST_DOMAIN", "ci".into()));
+    // The runtime follows the cache into the trust-domain directory.
+    let _daemon = common::DaemonGuard::new(kache_binary(), unit.cache.join("ci"));
     assert_eq!(unit.build(&a, true, None).result, "miss");
     // A tree memo another unit wrote.
     let probes = unit.cache.join("probes");

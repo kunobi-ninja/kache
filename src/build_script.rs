@@ -218,6 +218,7 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
             .write(true)
             .open(&temporary)?
             .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        wait_for_no_writers(&temporary);
         std::fs::rename(&temporary, executable)?;
         Ok(())
     })();
@@ -279,9 +280,65 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
         kache_fs::copy_writable(&kache, &staged, true)?;
     }
     kache_fs::set_writable_permissions(&staged, true)?;
+    wait_for_no_writers(&staged);
     // Replace old symlink pins atomically. Concurrent installers pin the same bytes.
     std::fs::rename(&staged, &pinned)?;
     Ok(pinned)
+}
+
+/// Longest [`wait_for_no_writers`] waits for children to drop a file.
+#[cfg(unix)]
+const NO_WRITERS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait, at most [`NO_WRITERS_WAIT`], until no process holds `path` open for
+/// writing; whether that was seen.
+///
+/// This process writes the launcher and the pinned kache and closes them, but
+/// a child another thread forks meanwhile inherits each descriptor until it
+/// execs, and Linux refuses to exec a file open for writing (ETXTBSY). The
+/// daemon compiles for many builds at once and spawns compilers all the time,
+/// so Cargo's run of a build script right after its compile could fail with
+/// "Text file busy". A read lease is granted only while nobody has the file
+/// open for writing: once one is, those children have exec'd or exited, and
+/// with our own descriptors closed no new writer can come from here. Best
+/// effort: a file system without leases, or the deadline, returns false.
+#[cfg(target_os = "linux")]
+fn wait_for_no_writers(path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+    // <fcntl.h>'s F_SETSIG, the same on every Linux architecture; the libc
+    // crate does not name it.
+    const F_SETSIG: libc::c_int = 10;
+    // A lease break (someone opening the file for writing while the lease is
+    // held, for the instant it is) signals the holder: SIGURG, ignored by
+    // default, instead of SIGIO, which would end the process.
+    // SAFETY: fcntl on a descriptor this function owns, with integer args.
+    if unsafe { libc::fcntl(fd, F_SETSIG, libc::SIGURG) } != 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + NO_WRITERS_WAIT;
+    loop {
+        // SAFETY: as above.
+        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
+            // SAFETY: as above.
+            unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) };
+            return true;
+        }
+        let busy = std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN);
+        if !busy || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+}
+
+/// No leases outside Linux; macOS has no ETXTBSY for these files.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn wait_for_no_writers(_path: &Path) -> bool {
+    false
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -2200,6 +2257,76 @@ fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes a tiny script `rounds` times while other threads spawn
+    /// processes, runs each copy at once, and counts the runs that failed
+    /// with ETXTBSY. `wait` runs [`wait_for_no_writers`] before each run.
+    #[cfg(target_os = "linux")]
+    fn busy_runs(rounds: usize, wait: bool) -> usize {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let mut busy = 0;
+        for round in 0..rounds {
+            let script = dir.path().join(format!("script-{round}"));
+            std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if wait {
+                assert!(wait_for_no_writers(&script), "still open for writing");
+            }
+            match std::process::Command::new(&script).status() {
+                Ok(status) => assert!(status.success()),
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => busy += 1,
+                Err(error) => panic!("running the script: {error}"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        eprintln!("{busy} of {rounds} runs busy (wait: {wait})");
+        busy
+    }
+
+    /// A file this process just wrote runs at once after the wait, however
+    /// many children other threads fork meanwhile (a daemon's compiles).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_written_executable_runs_after_waiting_for_its_writers() {
+        assert_eq!(busy_runs(400, true), 0);
+    }
+
+    /// The race [`wait_for_no_writers`] closes: without the wait, some runs
+    /// fail with ETXTBSY. Timing-dependent, so not part of the suite.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "shows the race; depends on timing"]
+    fn a_written_executable_can_be_busy_without_the_wait() {
+        assert!(busy_runs(400, false) > 0);
+    }
+
+    /// A file open for writing elsewhere holds the wait to its deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_wait_ends_at_its_deadline_while_a_writer_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held");
+        let _writer = std::fs::File::create(&path).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!wait_for_no_writers(&path));
+        assert!(started.elapsed() >= NO_WRITERS_WAIT);
+    }
 
     fn environment(out_dir: &Path, manifest_dir: &Path) -> Environment {
         let mut mappings = vec![

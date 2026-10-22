@@ -3230,7 +3230,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// before the row check and keeps it through directory removal. A concurrent
     /// publisher therefore either commits first (and is preserved) or publishes
     /// after the stale directory is gone.
-    fn discard_uncommitted_restored_entry(&self, cache_key: &str) -> Result<()> {
+    pub fn discard_uncommitted_restored_entry(&self, cache_key: &str) -> Result<()> {
+        self.refuse_write("discard an uncommitted restored entry")?;
         self.discard_uncommitted_restored_entry_inner(cache_key, || {}, || {})
     }
 

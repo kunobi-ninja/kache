@@ -8652,6 +8652,118 @@ async fn packed_import_error_marks_the_pack_failed_without_entry_validation_erro
     assert_eq!(entry.outcome, "import_error");
 }
 
+#[test]
+fn packed_import_cleanup_preserves_committed_entries_after_a_strict_flush_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = false;
+    let strict = Store::open(&config).unwrap();
+    let mut deferred_config = config.clone();
+    deferred_config.deferred_durability = true;
+    let deferred = Store::open(&deferred_config).unwrap();
+    let keys = ["healthy-packed", "pending-packed", "new-packed"].map(test_cache_key);
+    let healthy_bytes = b"healthy packed artifact";
+    let pending_bytes = b"pending packed artifact";
+    let seed = |store: &Store, key: &str, bytes: &[u8]| {
+        let source = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&source, bytes).unwrap();
+        store
+            .put(
+                key,
+                "fixture",
+                &["lib".to_string()],
+                &[],
+                "",
+                "dev",
+                &[(source, "libartifact.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.stored_meta(key).unwrap()
+    };
+    let healthy = seed(&strict, &keys[0], healthy_bytes);
+    let pending = seed(&deferred, &keys[1], pending_bytes);
+    let mut newly_imported = healthy.clone();
+    newly_imported.cache_key = keys[2].clone();
+    let mut batch = vec![
+        crate::store::VerifiedRestoredEntry {
+            cache_key: keys[0].clone(),
+            meta: healthy,
+        },
+        crate::store::VerifiedRestoredEntry {
+            cache_key: keys[2].clone(),
+            meta: newly_imported,
+        },
+        crate::store::VerifiedRestoredEntry {
+            cache_key: keys[1].clone(),
+            meta: pending,
+        },
+    ];
+    let metadata: Vec<_> = batch
+        .iter()
+        .map(|entry| {
+            let entry_dir = strict.entry_dir(&entry.cache_key);
+            std::fs::create_dir_all(&entry_dir).unwrap();
+            let bytes = serde_json::to_vec_pretty(&entry.meta).unwrap();
+            std::fs::write(entry_dir.join("meta.json"), &bytes).unwrap();
+            let artifact = if entry.cache_key == keys[1] {
+                &pending_bytes[..]
+            } else {
+                &healthy_bytes[..]
+            };
+            std::fs::write(entry_dir.join("libartifact.rlib"), artifact).unwrap();
+            bytes
+        })
+        .collect();
+    let blob = strict.blob_path(&batch[2].meta.files[0].hash);
+    let mut permissions = std::fs::metadata(&blob).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&blob, permissions).unwrap();
+    std::fs::write(&blob, vec![b'x'; pending_bytes.len()]).unwrap();
+    assert!(!strict.contains(&keys[2]));
+    let daemon = Daemon::new(config);
+    assert!(
+        daemon
+            .with_store(|store| store.import_verified_restored_entries(&batch))
+            .is_err()
+    );
+    assert!(
+        keys.iter().all(|key| strict.contains(key)),
+        "the batch committed before strict flushing failed"
+    );
+    assert_eq!(strict.pending_durability().unwrap(), 1);
+
+    // The same cleanup also handles pre-commit residue without deleting a
+    // concurrent publisher's committed metadata.
+    let residue_key = test_cache_key("uncommitted-packed-residue");
+    let mut residue = batch[0].clone();
+    residue.cache_key = residue_key.clone();
+    residue.meta.cache_key = residue_key.clone();
+    let residue_dir = strict.entry_dir(&residue_key);
+    std::fs::create_dir_all(&residue_dir).unwrap();
+    std::fs::write(
+        residue_dir.join("meta.json"),
+        serde_json::to_vec(&residue.meta).unwrap(),
+    )
+    .unwrap();
+    batch.push(residue);
+    daemon.discard_uncommitted_packed_entries(&batch).unwrap();
+    assert!(!residue_dir.exists());
+    for (entry, expected) in batch.iter().zip(metadata) {
+        assert!(strict.contains(&entry.cache_key));
+        assert_eq!(
+            std::fs::read(strict.entry_dir(&entry.cache_key).join("meta.json")).unwrap(),
+            expected
+        );
+    }
+    assert!(strict.get(&keys[0]).unwrap().is_some());
+    assert!(strict.get(&keys[2]).unwrap().is_some());
+    std::fs::write(&blob, pending_bytes).unwrap();
+    assert!(strict.flush_entry_durability(&keys[1]).unwrap());
+    assert_eq!(strict.pending_durability().unwrap(), 0);
+}
+
 #[tokio::test]
 async fn test_remote_check_success_records_v3_transfer_timestamps() {
     // a VALID pack GET: handle_remote_check downloads, extracts,

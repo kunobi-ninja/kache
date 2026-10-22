@@ -1392,9 +1392,9 @@ fn accepted_private_clone(src: &Path, dest: &Path) -> Option<PathBuf> {
         return None;
     };
     let Ok(src_meta) = fs::metadata(src) else {
-        // The clone moved the blob onto `dest`. Put that name back so the
-        // copy still has a source. Deleting `dest` would drop the only copy.
-        let _ = fs::rename(dest, src);
+        // Recover the source name without replacing a publisher that won
+        // after the metadata probe. Its inode may already be durable.
+        recover_vanished_blob(src, dest);
         return None;
     };
     if !same_file(&src_meta, &dst_meta) {
@@ -1409,6 +1409,18 @@ fn accepted_private_clone(src: &Path, dest: &Path) -> Option<PathBuf> {
         dest.display()
     );
     None
+}
+
+fn recover_vanished_blob(src: &Path, dest: &Path) {
+    match fs::hard_link(dest, src) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            tracing::debug!("could not recover vanished blob {}: {error}", src.display());
+            return;
+        }
+    }
+    let _ = fs::remove_file(dest);
 }
 
 fn rewind_stage(staged: &mut kache_fs::StagedFile) -> std::io::Result<()> {
@@ -3408,6 +3420,51 @@ mod tests {
         .publish()
         .unwrap();
         assert_eq!(fs::read(&output).unwrap(), b"cached object");
+    }
+
+    #[test]
+    fn vanished_blob_recovery_preserves_a_republished_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        let clone = dir.path().join("clone.o");
+        fs::write(&clone, b"old private clone").unwrap();
+        fs::write(&blob, b"flushed winner").unwrap();
+        crate::atomic::fsync_file(&blob).unwrap();
+        let winner = kache_fs::file_identity(&blob).unwrap();
+
+        recover_vanished_blob(&blob, &clone);
+
+        assert_eq!(kache_fs::file_identity(&blob).unwrap(), winner);
+        assert_eq!(fs::read(&blob).unwrap(), b"flushed winner");
+        assert!(!clone.exists());
+    }
+
+    #[test]
+    fn vanished_blob_recovery_restores_only_an_absent_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.o");
+        let clone = dir.path().join("clone.o");
+        fs::write(&clone, b"last cached copy").unwrap();
+        let identity = kache_fs::file_identity(&clone).unwrap();
+
+        assert!(accepted_private_clone(&blob, &clone).is_none());
+
+        assert_eq!(kache_fs::file_identity(&blob).unwrap(), identity);
+        assert_eq!(fs::read(&blob).unwrap(), b"last cached copy");
+        assert!(!clone.exists());
+    }
+
+    #[test]
+    fn failed_blob_recovery_keeps_the_last_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("blocked");
+        fs::write(&parent, b"not a directory").unwrap();
+        let clone = dir.path().join("clone.o");
+        fs::write(&clone, b"last cached copy").unwrap();
+
+        assert!(accepted_private_clone(&parent.join("blob.o"), &clone).is_none());
+
+        assert_eq!(fs::read(&clone).unwrap(), b"last cached copy");
     }
 
     #[cfg(unix)]

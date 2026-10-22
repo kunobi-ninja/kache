@@ -14019,6 +14019,15 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         ro.import_restored_entry("rokey1").is_err(),
         "import_restored_entry must be refused on a read-only store"
     );
+    let cleanup_error = ro
+        .discard_uncommitted_restored_entry(&key(109))
+        .unwrap_err();
+    assert!(
+        cleanup_error
+            .to_string()
+            .contains("refusing to discard an uncommitted restored entry"),
+        "cleanup must refuse before starting a writer transaction"
+    );
     assert!(
         ro.import_verified_restored_entries(&[]).is_err(),
         "import_verified_restored_entries must be refused on a read-only store"

@@ -277,15 +277,12 @@ fn daemon_run_lock_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("daemon.run.lock")
 }
 
-/// Whether a daemon currently holds the run lock under `runtime_dir`. The probe
+/// Whether a daemon currently holds `lock_path`. The probe
 /// does not create the file, so a test that never started a daemon stays
 /// untouched. An error other than "missing" counts as held: the caller then
 /// asks the daemon to stop, which is harmless if there is none.
-fn daemon_run_lock_is_held(runtime_dir: &Path) -> bool {
-    let file = match std::fs::OpenOptions::new()
-        .write(true)
-        .open(daemon_run_lock_path(runtime_dir))
-    {
+fn daemon_run_lock_is_held(lock_path: &Path) -> bool {
+    let file = match std::fs::OpenOptions::new().write(true).open(lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
         Err(_) => return true,
@@ -302,12 +299,16 @@ fn daemon_run_lock_is_held(runtime_dir: &Path) -> bool {
 /// Waits until no daemon holds the run lock under `runtime_dir`.
 #[allow(dead_code)]
 pub fn wait_for_daemon_exit(runtime_dir: &Path, timeout: Duration) -> Result<(), String> {
+    wait_for_daemon_lock_release(&daemon_run_lock_path(runtime_dir), timeout)
+}
+
+fn wait_for_daemon_lock_release(lock_path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
-    while daemon_run_lock_is_held(runtime_dir) {
+    while daemon_run_lock_is_held(lock_path) {
         if Instant::now() >= deadline {
             return Err(format!(
                 "daemon lifetime lock {} remained held after its drain phase",
-                daemon_run_lock_path(runtime_dir).display()
+                lock_path.display()
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -361,7 +362,27 @@ impl Drop for DaemonGuard {
 /// failure is ignored.
 #[allow(dead_code)]
 pub fn stop_daemon(stop: &mut Command, runtime_dir: &Path) {
-    if !daemon_run_lock_is_held(runtime_dir) {
+    let socket = stop.get_envs().find_map(|(name, value)| {
+        (name == "KACHE_SOCKET_PATH")
+            .then_some(value)
+            .flatten()
+            .filter(|value| !value.is_empty())
+    });
+    let lock_path = socket.map_or_else(
+        || daemon_run_lock_path(runtime_dir),
+        |socket| {
+            let socket = Path::new(socket);
+            let socket = if socket.is_absolute() {
+                socket.to_owned()
+            } else {
+                stop.get_current_dir()
+                    .unwrap_or(Path::new("."))
+                    .join(socket)
+            };
+            socket.with_extension("run.lock")
+        },
+    );
+    if !daemon_run_lock_is_held(&lock_path) {
         return;
     }
     let spawned = stop
@@ -388,5 +409,5 @@ pub fn stop_daemon(stop: &mut Command, runtime_dir: &Path) {
     }
     // On Windows the daemon can keep handles into the runtime dir during
     // teardown; wait for it before the fixture removes that directory.
-    let _ = wait_for_daemon_exit(runtime_dir, Duration::from_secs(45));
+    let _ = wait_for_daemon_lock_release(&lock_path, Duration::from_secs(45));
 }

@@ -65,6 +65,21 @@ impl Fixture {
             .output()
             .unwrap()
     }
+
+    fn assert_stopped(self) {
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(self.path().join("k.state.json")).unwrap()).unwrap();
+        let pid = kunobi_daemon::ProcessId::new(state["pid"].as_u64().unwrap().try_into().unwrap())
+            .unwrap();
+        let mut process = kunobi_daemon::local::ProcessHandle::open(pid).unwrap();
+        drop(self);
+        assert!(
+            process
+                .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(3))
+                .unwrap(),
+            "fixture cleanup left its custom-socket daemon running"
+        );
+    }
 }
 
 impl Drop for Fixture {
@@ -99,6 +114,7 @@ fn a_relative_kache_symlink_installs_an_executable_pin() {
     let output = fixture.command(&pinned).arg("--version").output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(output.stdout.starts_with(b"kache "));
+    fixture.assert_stopped();
 }
 
 #[test]
@@ -129,4 +145,5 @@ fn an_install_failure_records_why_the_script_will_run_uncached() {
         event["passthrough_reason"],
         "refused|build-script cache bypassed: installing the build-script launcher"
     );
+    fixture.assert_stopped();
 }

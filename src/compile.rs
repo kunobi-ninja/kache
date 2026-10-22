@@ -292,7 +292,9 @@ pub(crate) fn run_rustc(
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
     let artifacts = if exit_code == 0 {
-        let from_json = resolve_artifacts_in(&captured_stderr.artifacts, cwd);
+        let mut from_json = resolve_artifacts_in(&captured_stderr.artifacts, cwd);
+        // rustc reports a Windows `.exe` but not the `.pdb` it names.
+        crate::pe_pdb::add_named_pdbs(&mut from_json);
         if from_json.is_empty() {
             tracing::debug!(
                 "[kache] no rustc artifact notifications for {}; falling back to candidate path discovery",

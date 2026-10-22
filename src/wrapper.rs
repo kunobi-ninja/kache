@@ -4949,7 +4949,10 @@ fn run_parsed_rustc(
     // fault that caused it (kunobi-ninja/kache#1326).
     let degraded = kache_format::reports_debug_info_tool_failure(&result.stderr)
         .then(|| "rustc could not post-process its debug info".to_string());
-    if let Some(reason) = unaudited.or(degraded) {
+    // A Windows executable finds its `.pdb` by the GUID, age and name it
+    // records: it is cached only with that very `.pdb`, named by file name.
+    let unpaired = unpaired_executable_debug_info(&result.artifacts);
+    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -5665,6 +5668,19 @@ fn find_executable_output(
         .iter()
         .find(|a| compiler.classify_output(args, &a.store_name) == ArtifactKind::Executable)
         .map(|a| (a.path.clone(), a.store_name.clone()))
+}
+
+/// Why a unit's Windows executable must not be cached, `None` when every
+/// `.exe` among its outputs carries no external debug info or is stored with
+/// the `.pdb` it names ([`crate::pe_pdb`]).
+fn unpaired_executable_debug_info(artifacts: &crate::compiler::ArtifactSet) -> Option<String> {
+    let outputs = artifacts
+        .outputs()
+        .iter()
+        .map(|a| (a.path.as_path(), a.store_name.as_str()));
+    crate::pe_pdb::check_outputs(outputs)
+        .err()
+        .map(|error| format!("its executable cannot be cached with its .pdb: {error:#}"))
 }
 
 /// Bundle debug info for cached user binaries unless the invocation opts out

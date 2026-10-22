@@ -104,8 +104,8 @@ pub trait Platform: Send + Sync {
     /// Called on the store path while the binary's build-local debug
     /// inputs (macOS: the `.o` files its `N_OSO` debug map points at)
     /// still exist. Returns `Ok(None)` when the platform has no such
-    /// companion (Linux embeds DWARF; Windows `.pdb` is untouched for
-    /// now) or when the packaging tool is unavailable/fails — the
+    /// companion (Linux embeds DWARF; Windows stores the `.pdb` as an
+    /// output of its own) or when the packaging tool is unavailable/fails — the
     /// best-effort failure contract of this trait: a missing debug
     /// bundle degrades debuggability of the cached binary, never the
     /// build.
@@ -505,7 +505,8 @@ impl Platform for LinuxPlatform {
 /// Windows implementation. Authenticode signing is not enforced for
 /// load-time loading of unsigned PE binaries (only for kernel-mode
 /// drivers and SmartScreen), so [`Platform::ensure_binary_loadable`]
-/// is a no-op. When PE/PDB-specific handling lands, it goes here.
+/// is a no-op. The `.exe`/`.pdb` pairing is checked on the store path
+/// (`pe_pdb`), whatever the host.
 ///
 /// Constructed off Windows only by tests; see [`LinuxPlatform`].
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -521,9 +522,9 @@ impl Platform for WindowsPlatform {
     }
 
     fn package_debug_bundle(&self, _binary: &Path, _staging_dir: &Path) -> Result<Option<PathBuf>> {
-        // The PE/PDB analogue of kunobi-ninja/kache#319 (an `.exe`
-        // references its `.pdb` by recorded path) is a separate
-        // investigation; until it lands there is nothing to package.
+        // Nothing to package: rustc names the `.pdb` by file name
+        // (`/PDBALTPATH:%_PDB%`) and it is stored with the `.exe` as an
+        // output of its own; the store checks the pair (`pe_pdb`).
         Ok(None)
     }
 }

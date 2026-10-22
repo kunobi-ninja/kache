@@ -1082,6 +1082,8 @@ fn index_rows(root: &std::path::Path, table: &str) -> i64 {
 }
 
 fn last_cc_event(root: &std::path::Path) -> serde_json::Value {
+    // Local fallback may return before the daemon publishes its event.
+    FixtureDir::stop_daemon_at(root);
     let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
     serde_json::from_str(events.lines().last().unwrap()).unwrap()
 }
@@ -1164,7 +1166,6 @@ fn identical_sources_at_different_paths_get_their_own_entries() {
     .unwrap();
 
     for deferred in ["0", "1"] {
-        dir.stop_daemon();
         dir.stop_daemon();
         let _ = fs::remove_dir_all(root.join("cache"));
         let mut keys = Vec::new();

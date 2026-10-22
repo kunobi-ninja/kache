@@ -3143,6 +3143,20 @@ fn dep_info_pre_pass_for(args: &RustcArgs, env: &InvocationEnv) -> Result<Option
         .transpose()
 }
 
+/// Whether this invocation can produce an EXE whose external debug database
+/// must pass the pairing audit. Libraries and known non-Windows outputs keep
+/// their previous keys. A custom spec's output format is not inferred here.
+fn executable_pdb_admission(args: &RustcArgs, rustc_version: &str, custom_target: bool) -> bool {
+    args.is_user_facing_executable()
+        && args.emits_link()
+        && (custom_target
+            || args
+                .target
+                .as_deref()
+                .or_else(|| rustc_host_triple(rustc_version))
+                .is_none_or(|target| target.split('-').any(|part| part == "windows")))
+}
+
 /// Compute the blake3 cache key for a rustc invocation, with what the
 /// computation learned on the way ([`KeyOutputs`]).
 ///
@@ -3277,7 +3291,8 @@ fn compute_key_into(
     // the same path on another machine) diverges the key. Built-in
     // triples aren't files, so they're unaffected.
     let target_path = Path::new(target);
-    if target_path.is_file() {
+    let custom_target_file = target_path.is_file();
+    if custom_target_file {
         match hash_file(target_path) {
             Ok(spec_hash) => {
                 hasher.update(b"target_spec:");
@@ -3294,6 +3309,21 @@ fn compute_key_into(
                 );
             }
         }
+    }
+
+    // Pre-audit clients can store an EXE-only entry under the old key. Keep
+    // those entries out of every local/remote lookup and committed-peer
+    // recheck. Custom specs can choose PE without saying so in
+    // their filename, so their linked executables take the same namespace.
+    let custom_target = custom_target_file
+        || args.target.as_deref().is_some_and(|target| {
+            target.contains(['/', '\\'])
+                || target.ends_with(".json")
+                || invocation.var_os("RUST_TARGET_PATH").is_some()
+        });
+    if executable_pdb_admission(args, &rustc_version, custom_target) {
+        hasher.set_group("pe_pdb_admission");
+        fold_field(&mut hasher, b"executable_pdb_pairing.v1:", b"verified");
     }
 
     // crate identity

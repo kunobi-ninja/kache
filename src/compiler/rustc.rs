@@ -317,6 +317,7 @@ impl RustcCompiler {
             parsed.crate_name.as_deref(),
             parsed.extra_filename.as_deref(),
             &parsed.emit,
+            parsed.is_user_facing_executable() && parsed.emits_link(),
             skip_remap,
             &path_normalizer,
             incremental_mode,
@@ -358,6 +359,16 @@ impl Compiler for RustcCompiler {
     }
 
     fn classify_output(&self, parsed: &RustcArgs, name: &str) -> ArtifactKind {
+        if parsed.is_user_facing_executable()
+            && parsed.emits_link()
+            && parsed
+                .output
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .is_some_and(|output| output == name)
+        {
+            return ArtifactKind::Executable;
+        }
         // Delegate to the filename-based classifier for known extensions.
         // Only the extensionless / unrecognized cases need invocation
         // context (to distinguish a bin's primary output from random

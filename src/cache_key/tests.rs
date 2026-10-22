@@ -19183,3 +19183,116 @@ mod build_script_target_paths {
         );
     }
 }
+
+#[test]
+fn pdb_pairing_admission_is_scoped_to_windows_or_custom_linked_executables() {
+    let _lock = key_test_lock();
+    let invocation = InvocationEnv::capture();
+    let windows = "rustc 1.99.0\nhost: x86_64-pc-windows-msvc\n";
+    let linux = "rustc 1.99.0\nhost: x86_64-unknown-linux-gnu\n";
+    let parse = |extra: &[&str]| {
+        let argv = ["rustc", "src/main.rs"]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        RustcArgs::parse_for(&argv, &invocation).unwrap()
+    };
+    assert!(executable_pdb_admission(&parse(&[]), windows, false));
+    assert!(!executable_pdb_admission(&parse(&[]), linux, false));
+    assert!(executable_pdb_admission(
+        &parse(&["--target=x86_64-pc-windows-msvc"]),
+        linux,
+        false
+    ));
+    assert!(executable_pdb_admission(
+        &parse(&["--target=x86_64-pc-windows-gnu"]),
+        linux,
+        false
+    ));
+    assert!(!executable_pdb_admission(
+        &parse(&["--target=x86_64-unknown-linux-gnu"]),
+        windows,
+        false
+    ));
+    assert!(!executable_pdb_admission(
+        &parse(&["--target=aarch64-apple-darwin"]),
+        windows,
+        false
+    ));
+    assert!(executable_pdb_admission(&parse(&[]), linux, true));
+    assert!(executable_pdb_admission(
+        &parse(&[]),
+        "unknown compiler host",
+        false
+    ));
+    assert!(executable_pdb_admission(
+        &parse(&["--crate-type=rlib", "--test"]),
+        windows,
+        false
+    ));
+    for args in [
+        &["--emit=metadata"][..],
+        &["--crate-type=rlib"][..],
+        &["--crate-type=staticlib"][..],
+        &["--crate-type=dylib"][..],
+        &["--crate-type=proc-macro"][..],
+    ] {
+        assert!(
+            !executable_pdb_admission(&parse(args), windows, false),
+            "{args:?}"
+        );
+        assert!(
+            !executable_pdb_admission(&parse(args), linux, true),
+            "custom {args:?}"
+        );
+    }
+}
+
+#[test]
+fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").unwrap();
+    let invocation = client_invocation(&workspace, &[("OUT_DIR", None)]);
+    // Native MSVC identity refuses cross-architecture SDK guesses on Windows.
+    // Use that runner's actual Windows host; other hosts exercise cross-target
+    // key admission without invoking a Windows linker.
+    let target = if cfg!(windows) {
+        let version = get_rustc_version_for(Path::new("rustc"), &invocation).unwrap();
+        rustc_host_triple(&version).unwrap().to_string()
+    } else {
+        "x86_64-pc-windows-msvc".to_string()
+    };
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            source.to_str().unwrap().into(),
+            "--crate-name=app".into(),
+            "--crate-type=bin".into(),
+            format!("--target={target}"),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let (key, output) = compute_cache_key_with_outputs(
+        &args,
+        &FileHasher::new_for(&invocation),
+        &PathNormalizer::from_invocation(Some(&workspace), &invocation),
+        &KeyEnv::from_invocation(&invocation),
+    );
+    key.unwrap();
+    assert!(
+        output.fields.unwrap().contains_key("pe_pdb_admission"),
+        "legacy producers cannot write this namespace"
+    );
+}

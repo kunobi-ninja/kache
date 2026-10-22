@@ -114,6 +114,7 @@ pub(crate) fn run_rustc(
     crate_name: Option<&str>,
     extra_filename: Option<&str>,
     emit: &[String],
+    linked_executable: bool,
     skip_remap: bool,
     path_normalizer: &crate::path_normalizer::PathNormalizer,
     incremental_mode: IncrementalMode,
@@ -294,16 +295,30 @@ pub(crate) fn run_rustc(
     let artifacts = if exit_code == 0 {
         let mut from_json = resolve_artifacts_in(&captured_stderr.artifacts, cwd);
         // rustc reports a Windows `.exe` but not the `.pdb` it names.
-        crate::pe_pdb::add_named_pdbs(&mut from_json);
+        let executable_name = crate::pe_pdb::executable_output_name(
+            linked_executable,
+            output_path,
+            from_json.iter().map(|(_, name)| name.as_str()),
+        )
+        .ok()
+        .flatten();
+        crate::pe_pdb::add_named_pdbs(&mut from_json, executable_name.as_deref());
         if from_json.is_empty() {
             tracing::debug!(
                 "[kache] no rustc artifact notifications for {}; falling back to candidate path discovery",
                 crate_name.unwrap_or("unknown")
             );
-            ArtifactSet::from_output_files(
-                discover_output_files(output_path, out_dir, crate_name, extra_filename, emit)?,
-                classify_by_filename,
+            let mut discovered =
+                discover_output_files(output_path, out_dir, crate_name, extra_filename, emit)?;
+            let executable_name = crate::pe_pdb::executable_output_name(
+                linked_executable,
+                output_path,
+                discovered.iter().map(|(_, name)| name.as_str()),
             )
+            .ok()
+            .flatten();
+            crate::pe_pdb::add_named_pdbs(&mut discovered, executable_name.as_deref());
+            ArtifactSet::from_output_files(discovered, classify_by_filename)
         } else {
             tracing::debug!(
                 "[kache] discovered {} output file(s) for {} from rustc artifact notifications",
@@ -938,6 +953,7 @@ fi
                             Some("sample"),
                             None,
                             &[],
+                            false,
                             false,
                             &crate::path_normalizer::PathNormalizer::empty(),
                             IncrementalMode::Strip,

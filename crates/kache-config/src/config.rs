@@ -3799,9 +3799,9 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 ///   the entry; restore materializes it next to the binary, where `lldb`
 ///   prefers it over the stale debug map. Source-level debugging of restored
 ///   executables works, so on by default.
-/// - **Windows**: the `.exe` references its `.pdb` by recorded path, the same
-///   external-reference problem. Off pending the equivalent investigation
-///   (the `.pdb` path remains untouched).
+/// - **Windows**: off by default. When enabled, the Rust adapter checks PE
+///   outputs against their named PDBs and refuses debug records it cannot
+///   restore with the executable.
 ///
 /// A split-debuginfo configuration (`-Csplit-debuginfo=unpacked`) moves Linux
 /// into the same external-reference shape, but the sidecars are themselves

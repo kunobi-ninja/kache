@@ -450,3 +450,90 @@ fn readonly_hit_records_restored_output_hashes_in_the_primary_store() {
         crate::cache_key::FileHashLookup::NeedsHash(_)
     ));
 }
+
+#[test]
+fn incomplete_or_mismatched_executable_pairs_never_publish_a_hit() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let invocation = crate::invocation::InvocationEnv::capture();
+    for result in [
+        EventResult::LocalHit,
+        EventResult::RemoteHit,
+        EventResult::PrefetchHit,
+    ] {
+        for (name, mismatch) in [("app.exe", false), ("app", false), ("app.custom", true)] {
+            let mut fixture = Fixture::new();
+            let out_dir = fixture.dir.path().join("target/debug/deps");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let output = out_dir.join(name);
+            fixture.args = RustcArgs::parse_for(
+                &s(&[
+                    "rustc",
+                    fixture.dir.path().join("lib.rs").to_str().unwrap(),
+                    "--crate-type=bin",
+                    "--crate-name=app",
+                    "--emit=link",
+                    "-o",
+                    output.to_str().unwrap(),
+                ]),
+                &invocation,
+            )
+            .unwrap();
+            fixture.compiler = RustcCompiler::new_for(&invocation);
+            let (exe, mut pdb) = crate::pe_pdb::fixture_pair();
+            let exe_hash = blake3::hash(&exe).to_hex().to_string();
+            create_blob(&fixture.store, &exe_hash, &exe);
+            let mut exe_file = cached_file(name, &exe_hash);
+            exe_file.size = exe.len() as u64;
+            fixture.meta.files = vec![exe_file];
+            if mismatch {
+                pdb[1536 + 12] ^= 1; // PDB information GUID, not an unrelated padding byte.
+                let hash = blake3::hash(&pdb).to_hex().to_string();
+                create_blob(&fixture.store, &hash, &pdb);
+                let mut file = cached_file("app.pdb", &hash);
+                file.size = pdb.len() as u64;
+                fixture.meta.files.push(file);
+            }
+            fixture.meta.emit_kinds = vec!["link".into()];
+            fixture.publish();
+            std::fs::write(&output, b"existing executable").unwrap();
+            let destination_pdb = out_dir.join("app.pdb");
+            std::fs::write(&destination_pdb, b"existing database").unwrap();
+            let error = fixture
+                .context()
+                .restore_and_finish(
+                    &fixture.store,
+                    &fixture.meta,
+                    result,
+                    CACHE_KEY,
+                    0,
+                    FileHashStats::default(),
+                    0,
+                    Some(&fixture.store),
+                    &fixture.key(),
+                    &key_record(),
+                )
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(if mismatch {
+                    "GUID or age differ"
+                } else {
+                    "not among the outputs"
+                }),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing executable");
+            assert_eq!(
+                std::fs::read(&destination_pdb).unwrap(),
+                b"existing database"
+            );
+            assert!(
+                !fixture.config.event_log_path().exists(),
+                "{result:?}/{name}: a failed pair was reported as a hit"
+            );
+            assert!(
+                fixture.store.get(CACHE_KEY).unwrap().is_none(),
+                "the writable corrupt entry must be evicted"
+            );
+        }
+    }
+}

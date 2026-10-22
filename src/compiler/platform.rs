@@ -505,8 +505,8 @@ impl Platform for LinuxPlatform {
 /// Windows implementation. Authenticode signing is not enforced for
 /// load-time loading of unsigned PE binaries (only for kernel-mode
 /// drivers and SmartScreen), so [`Platform::ensure_binary_loadable`]
-/// is a no-op. The `.exe`/`.pdb` pairing is checked on the store path
-/// (`pe_pdb`), whatever the host.
+/// is a no-op. PE/PDB pairing is checked before storage and before restoring
+/// any cached output (`pe_pdb`), including explicitly named executables.
 ///
 /// Constructed off Windows only by tests; see [`LinuxPlatform`].
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]

@@ -12328,15 +12328,18 @@ fn concurrent_requests_keep_progress_and_warning_markers_with_the_client() {
     });
 }
 
-/// A store reads every `.exe` output against the `.pdb` it names: a file
-/// that is no PE refuses the unit, other outputs are not read.
+/// PE-looking outputs must parse; ordinary non-PE executables keep their
+/// existing handling, even if the caller chose an `.exe` suffix.
 #[test]
-fn unpaired_executable_debug_info_reads_only_exe_outputs() {
+fn unpaired_executable_debug_info_distinguishes_pe_from_other_formats() {
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("app-0a1b");
     std::fs::write(&elf, b"\x7fELF").unwrap();
     let not_pe = dir.path().join("app-0a1b.exe");
-    std::fs::write(&not_pe, vec![0u8; 128]).unwrap();
+    let mut malformed = vec![0u8; 128];
+    malformed[..2].copy_from_slice(b"MZ");
+    std::fs::write(&not_pe, malformed).unwrap();
+    let args = rustc_args(&["rustc", "src/main.rs", "--crate-type=bin"]);
     let set = |files: Vec<(PathBuf, &str)>| {
         ArtifactSet::from_output_files(
             files
@@ -12347,11 +12350,217 @@ fn unpaired_executable_debug_info_reads_only_exe_outputs() {
         )
     };
     assert_eq!(
-        unpaired_executable_debug_info(&set(vec![(elf, "app-0a1b")])),
+        unpaired_executable_debug_info(&args, &set(vec![(elf.clone(), "app-0a1b")])),
         None
     );
-    let reason = unpaired_executable_debug_info(&set(vec![(not_pe, "app-0a1b.exe")]))
-        .expect("a .exe that is no PE is refused");
+    assert_eq!(
+        unpaired_executable_debug_info(&args, &set(vec![(elf, "app.exe")])),
+        None
+    );
+    let reason = unpaired_executable_debug_info(&args, &set(vec![(not_pe, "app-0a1b.exe")]))
+        .expect("an MZ executable with invalid PE headers is refused");
     assert!(reason.contains("app-0a1b.exe"), "{reason}");
     assert!(reason.contains("not a PE file"), "{reason}");
+}
+
+#[test]
+fn explicit_executable_names_keep_pairing_and_copy_ownership() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let invocation = crate::invocation::InvocationEnv::capture();
+    let compiler = RustcCompiler::new_for(&invocation);
+    let dir = tempfile::tempdir().unwrap();
+    let (exe, pdb) = crate::pe_pdb::fixture_pair();
+    for name in ["app", "app.custom"] {
+        let output = dir.path().join(name);
+        let database = dir.path().join("app.pdb");
+        std::fs::write(&output, &exe).unwrap();
+        std::fs::write(&database, &pdb).unwrap();
+        let parse = |crate_type: &str| {
+            RustcArgs::parse_for(
+                &s(&[
+                    "rustc",
+                    "main.rs",
+                    "--crate-type",
+                    crate_type,
+                    "-o",
+                    output.to_str().unwrap(),
+                ]),
+                &invocation,
+            )
+            .unwrap()
+        };
+        let args = parse("bin");
+        assert_eq!(
+            compiler.classify_output(&args, name),
+            ArtifactKind::Executable
+        );
+        assert_eq!(
+            compiler.classify_output(&args, name).link_strategy(),
+            link::LinkStrategy::Copy
+        );
+        assert_ne!(
+            compiler.classify_output(&parse("rlib"), name),
+            ArtifactKind::Executable
+        );
+        let artifacts = ArtifactSet::from_output_files(
+            vec![(output.clone(), name.into())],
+            classify_by_filename,
+        );
+        assert!(
+            unpaired_executable_debug_info(&args, &artifacts)
+                .unwrap()
+                .contains("not among the outputs")
+        );
+        let pair = ArtifactSet::from_output_files(
+            vec![(output, name.into()), (database, "app.pdb".into())],
+            classify_by_filename,
+        );
+        assert_eq!(unpaired_executable_debug_info(&args, &pair), None);
+        std::fs::write(&pair.outputs()[0].path, b"\x7fELF native executable").unwrap();
+        assert_eq!(
+            unpaired_executable_debug_info(&args, &pair),
+            None,
+            "an explicit output name must not force ELF through the PE parser"
+        );
+    }
+    let args =
+        RustcArgs::parse_for(&s(&["rustc", "main.rs", "--crate-type=bin"]), &invocation).unwrap();
+    let unknown = ArtifactSet::from_output_files(
+        vec![(dir.path().join("app.custom"), "app.custom".into())],
+        classify_by_filename,
+    );
+    assert!(
+        unpaired_executable_debug_info(&args, &unknown)
+            .unwrap()
+            .contains("cannot be identified")
+    );
+}
+
+/// The native Windows lane produces an actual rustc/LINK pair, then exercises
+/// artifact discovery, store admission, persisted blobs and the common restore.
+/// It is a default test on Windows; it has no compiler-availability skip.
+#[cfg(windows)]
+#[test]
+fn windows_rustc_pairs_survive_json_and_fallback_cache_roundtrips() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let snapshot = crate::invocation::InvocationEnv::capture();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let invocation = crate::invocation::InvocationEnv::from_parts(
+        snapshot.vars_os().filter(|(key, _)| {
+            !["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "OUT_DIR"]
+                .iter()
+                .any(|name| key.to_string_lossy().eq_ignore_ascii_case(name))
+        }),
+        Some(root.clone()),
+        snapshot.home_dir().map(Path::to_owned),
+        snapshot.temp_dir().to_owned(),
+    );
+    let source = root.join("main.rs");
+    std::fs::write(&source, "fn main() { std::hint::black_box(7); }\n").unwrap();
+    let compiler = RustcCompiler::new_for(&invocation);
+    let config = test_config(root.join("cache"));
+    let store = Store::open(&config).unwrap();
+    for (index, (json, name)) in [(true, "app.exe"), (false, "app"), (true, "app.custom")]
+        .into_iter()
+        .enumerate()
+    {
+        let producer = root.join(format!("producer-{index}"));
+        let consumer = root.join(format!("consumer-{index}"));
+        std::fs::create_dir_all(&producer).unwrap();
+        let output = producer.join(name);
+        let mut argv = s(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name=app",
+            "--crate-type=bin",
+            "--emit=link",
+            "-Cdebuginfo=2",
+            "-o",
+            output.to_str().unwrap(),
+        ]);
+        if json {
+            argv.extend(s(&["--error-format=json", "--json=artifacts"]));
+        }
+        let args = RustcArgs::parse_for(&argv, &invocation).unwrap();
+        let compiled = compiler.execute(&args).unwrap();
+        assert_eq!(compiled.exit_code, 0, "{}", compiled.stderr);
+        assert_eq!(
+            unpaired_executable_debug_info(&args, &compiled.artifacts),
+            None,
+            "{}",
+            compiled.stderr
+        );
+        let outputs: Vec<_> = compiled
+            .artifacts
+            .outputs()
+            .iter()
+            .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
+            .collect();
+        let selected = crate::pe_pdb::executable_output_name(
+            true,
+            Some(&output),
+            outputs.iter().map(|(_, name)| name.as_str()),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::pe_pdb::check_outputs(
+                outputs
+                    .iter()
+                    .map(|(path, name)| (path.as_path(), name.as_str())),
+                selected.as_deref()
+            )
+            .unwrap()[..],
+            [crate::pe_pdb::Pairing::Paired { .. }]
+        ));
+        let expected: Vec<_> = outputs
+            .iter()
+            .map(|(path, name)| (name.clone(), std::fs::read(path).unwrap()))
+            .collect();
+        let key = format!("windows-pair-{index}");
+        store
+            .put(
+                &key,
+                "app",
+                &["bin".into()],
+                &[],
+                "windows",
+                "dev",
+                &outputs,
+                &compiled.stdout,
+                &compiled.stderr,
+            )
+            .unwrap();
+        let meta = store.get(&key).unwrap().unwrap();
+        let destination = consumer.join(name);
+        let mut restore_argv = s(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name=app",
+            "--crate-type=bin",
+            "--emit=link",
+            "-o",
+            destination.to_str().unwrap(),
+        ]);
+        if json {
+            restore_argv.extend(s(&["--error-format=json", "--json=artifacts"]));
+        }
+        let restore_args = RustcArgs::parse_for(&restore_argv, &invocation).unwrap();
+        restore_from_cache(&config, &compiler, &store, &restore_args, &meta, None).unwrap();
+        let restored: Vec<_> = expected
+            .iter()
+            .map(|(name, bytes)| {
+                let path = consumer.join(name);
+                assert_eq!(&std::fs::read(&path).unwrap(), bytes);
+                (path, name.as_str())
+            })
+            .collect();
+        assert!(
+            crate::pe_pdb::check_outputs(
+                restored.iter().map(|(path, name)| (path.as_path(), *name)),
+                selected.as_deref()
+            )
+            .is_ok()
+        );
+    }
 }

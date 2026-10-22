@@ -149,16 +149,54 @@ pub(super) fn request(
         .context("lifecycle advertisement has an invalid PID")?;
     let endpoint = crate::transport::daemon_endpoint(&endpoint(config));
     let offer = offer(config)?;
-    let health = match operation {
-        operation::HEALTH => {
-            kunobi_daemon::client::health(&endpoint, &offer, Some(expected), deadline)
-        }
-        operation::DRAIN => {
-            kunobi_daemon::client::drain(&endpoint, &offer, Some(expected), deadline)
-        }
-        _ => anyhow::bail!("unsupported lifecycle operation {operation}"),
-    }?;
+    anyhow::ensure!(
+        matches!(operation, operation::HEALTH | operation::DRAIN),
+        "unsupported lifecycle operation {operation}"
+    );
+    let health = by_deadline(deadline, move || {
+        Ok(if operation == operation::HEALTH {
+            kunobi_daemon::client::health(&endpoint, &offer, Some(expected), deadline)?
+        } else {
+            kunobi_daemon::client::drain(&endpoint, &offer, Some(expected), deadline)?
+        })
+    })?;
     Ok(Some(health))
+}
+
+/// How long past its deadline a lifecycle exchange may still answer on
+/// Windows: an answer read just before the deadline is still on its way back
+/// from the helper thread.
+#[cfg(windows)]
+const LATE_ANSWER_GRACE: Duration = Duration::from_millis(250);
+
+/// Run a lifecycle exchange so that it ends by `deadline`.
+///
+/// On Windows kunobi-daemon's client connects through interprocess's
+/// local-socket layer, which waits for a busy pipe without limit whatever
+/// wait it is given (interprocess 2.4.4 to 2.4.6), so a daemon that stopped
+/// accepting would hold the caller past every deadline. The exchange runs on
+/// a helper thread there; one still running at the deadline fails with the
+/// connect timeout kunobi-daemon reports for a pipe that never freed, which
+/// callers already treat as a daemon that is not there yet. Elsewhere it runs
+/// inline: Unix sockets honour the deadline themselves.
+fn by_deadline<T: Send + 'static>(
+    deadline: Instant,
+    exchange: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    #[cfg(windows)]
+    {
+        crate::transport::finish_by(deadline + LATE_ANSWER_GRACE, exchange).unwrap_or_else(|| {
+            Err(
+                anyhow::Error::new(kunobi_daemon::local::ConnectError::ConnectTimeout)
+                    .context("lifecycle exchange outlived its deadline"),
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = deadline;
+        exchange()
+    }
 }
 
 pub(super) fn health(config: &Config, deadline: Instant) -> Result<Option<wire::Health>> {
@@ -186,6 +224,12 @@ fn connect(path: &Path, deadline: Instant) -> Result<Local> {
 /// Bounded compatibility exchange on the existing JSON endpoint. Only callers
 /// that found no binary advertisement may use this adapter.
 pub(super) fn legacy_request(path: &Path, request: &Request, deadline: Instant) -> Result<String> {
+    let path = path.to_path_buf();
+    let request = request.clone();
+    by_deadline(deadline, move || legacy_exchange(&path, &request, deadline))
+}
+
+fn legacy_exchange(path: &Path, request: &Request, deadline: Instant) -> Result<String> {
     use std::io::{BufRead, Read, Write};
     let stream = connect(path, deadline)?;
     let (read, mut write) = stream.split()?;
@@ -210,6 +254,46 @@ pub(super) fn legacy_request(path: &Path, request: &Request, deadline: Instant) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that stopped accepting: its only pipe instance is taken. The
+    /// legacy exchange ends by its deadline with an error callers treat as a
+    /// daemon not there yet, instead of waiting for the pipe to free.
+    #[cfg(windows)]
+    #[test]
+    fn a_legacy_request_to_a_busy_pipe_ends_by_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let _listener = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&socket).unwrap())
+            .create_sync()
+            .expect("bind listener");
+        let _first = crate::transport::connect_sync(&socket, Duration::from_millis(300))
+            .expect("first client");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let _ = done.send(legacy_request(&socket, &Request::Health, deadline));
+        });
+        let result = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the lifecycle exchange hung on a busy pipe");
+        let waited = started.elapsed();
+        let error = result.expect_err("a busy pipe cannot answer");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert!(
+            super::super::lifecycle_client::transient(&error),
+            "a stalled pipe reads as a daemon not there yet: {error:#}"
+        );
+    }
+
+    #[test]
+    fn by_deadline_returns_an_exchange_that_finishes_in_time() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        assert_eq!(by_deadline(deadline, || Ok(5)).unwrap(), 5);
+        assert!(by_deadline::<()>(deadline, || anyhow::bail!("refused")).is_err());
+    }
 
     /// Both endpoints are Unix sockets in the same directory, so they share one
     /// path budget. A control name that cost more than `daemon.sock` refuses a

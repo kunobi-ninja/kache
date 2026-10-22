@@ -1,5 +1,5 @@
 use crate::transport::prelude::*;
-use crate::transport::{TokioListener, TokioStream, socket_name};
+use crate::transport::{TokioListener, TokioStream};
 use anyhow::{Context, Result};
 use kache_core::timeline::{
     PackedEntryTransfer, PrefetchAccounting, PrefetchOperation, PrefetchOrigin,
@@ -8759,12 +8759,10 @@ fn send_request_with_socket_timeout(
     req: &Request,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
-    use crate::transport::SyncStream;
     use interprocess::local_socket::traits::Stream as _;
     use std::io::{BufRead, Write};
 
-    let name = socket_name(socket_path)?;
-    let mut stream = SyncStream::connect(name)
+    let mut stream = crate::transport::connect_sync(socket_path, crate::transport::BUSY_PIPE_WAIT)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
         .context(DaemonConnectionFailure)?;
 
@@ -8847,8 +8845,10 @@ async fn send_request_with_async_transport(
     line: String,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
-    let name = socket_name(socket_path)?;
-    let mut stream = TokioStream::connect(name)
+    // The busy-pipe wait ends no later than the caller's own timeout, so the
+    // blocking task it runs in never outlives the request.
+    let busy_wait = crate::transport::BUSY_PIPE_WAIT.min(read_timeout);
+    let mut stream = crate::transport::connect_tokio(socket_path, busy_wait)
         .await
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
         .context(DaemonConnectionFailure)?;
@@ -8882,19 +8882,31 @@ async fn send_request_with_async_transport(
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
-    use crate::transport::SyncStream;
+    let mut line = serde_json::to_string(req)?;
+    line.push('\n');
+    send_line_fire_and_forget(socket_path, line, FIRE_AND_FORGET_SEND_WAIT)
+}
+
+/// How long a fire-and-forget request may take to hand its line to the
+/// daemon: the socket's send timeout on Unix, the helper thread's wait on
+/// Windows.
+const FIRE_AND_FORGET_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(not(windows))]
+fn send_line_fire_and_forget(
+    socket_path: &Path,
+    line: String,
+    send_wait: std::time::Duration,
+) -> Result<()> {
     use interprocess::local_socket::traits::Stream as _;
     use std::io::Write;
 
-    let name = socket_name(socket_path)?;
-    let mut stream = SyncStream::connect(name)
+    let mut stream = crate::transport::connect_sync(socket_path, crate::transport::BUSY_PIPE_WAIT)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
         .context(DaemonConnectionFailure)?;
 
-    let _ = stream.set_send_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_send_timeout(Some(send_wait));
 
-    let mut line = serde_json::to_string(req)?;
-    line.push('\n');
     stream
         .write_all(line.as_bytes())
         .context("writing request to daemon")?;
@@ -8903,6 +8915,41 @@ fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()>
     // Don't read a response — just close. The daemon will see EOF on the
     // read half after processing the line and silently skip the response write.
     Ok(())
+}
+
+/// Windows: the same exchange, bounded by `send_wait` as a whole.
+///
+/// A named pipe has no send timeout, and a write blocks until the daemon
+/// reads whatever does not fit in the pipe's buffer (the daemon's pipe asks
+/// for 512 bytes): a daemon that stopped reading would hold the wrapper for
+/// good. The connect and the write run on a helper thread; past the wait the
+/// request counts as failed, and the thread ends when the daemon reads or the
+/// process exits.
+#[cfg(windows)]
+fn send_line_fire_and_forget(
+    socket_path: &Path,
+    line: String,
+    send_wait: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + send_wait;
+    let socket = socket_path.to_path_buf();
+    let busy_wait = crate::transport::BUSY_PIPE_WAIT.min(send_wait);
+    let sent = crate::transport::finish_by(deadline, move || -> Result<()> {
+        use std::io::Write;
+        let mut stream = crate::transport::connect_sync(&socket, busy_wait)
+            .with_context(|| format!("connecting to daemon socket {}", socket.display()))
+            .context(DaemonConnectionFailure)?;
+        stream
+            .write_all(line.as_bytes())
+            .context("writing request to daemon")?;
+        Ok(())
+    });
+    sent.unwrap_or_else(|| {
+        Err(anyhow::anyhow!(
+            "writing request to daemon socket {} took longer than {send_wait:?}",
+            socket_path.display()
+        ))
+    })
 }
 
 /// Start the daemon in the background and wait for it to be ready.

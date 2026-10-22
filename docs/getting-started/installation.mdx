@@ -89,6 +89,20 @@ kache init
 
 ## Nix
 
+### nixpkgs
+
+Kache is available in nixpkgs-unstable. Install its package with:
+
+```bash
+nix profile install github:NixOS/nixpkgs/nixpkgs-unstable#kache
+```
+
+On NixOS, add `pkgs.kache` to `environment.systemPackages` and set `RUSTC_WRAPPER` to `"${pkgs.kache}/bin/kache"`. The separate `pkgs.kache.shims` output provides C/C++ wrappers in `${pkgs.kache.shims}/bin`; put that directory before the real compilers on `PATH` to cache native compilations.
+
+### Kache flake
+
+Use Kache's flake to follow its releases directly or use its NixOS and nix-darwin modules.
+
 The flake builds for x86_64-linux, aarch64-linux and aarch64-darwin. On Intel macOS, use Homebrew, a release binary or `cargo install`.
 
 The `stable` branch follows released versions:

@@ -30,6 +30,32 @@ For S3-compatible storage:
 
 Add `s3-endpoint` for R2, Ceph, or MinIO. Prefer workload identity or IAM roles over long-lived access keys when the runner supports them.
 
+For release and publishing jobs, set `save-cache: false` to restore existing entries without saving changes. This skips the GitHub Actions cache save and disables remote uploads when the action uses S3:
+
+```yaml
+- uses: kunobi-ninja/kache-action@v1
+  with:
+    save-cache: false
+```
+
+### Python wheels with maturin
+
+For a project that uses [PyO3/maturin-action](https://github.com/PyO3/maturin-action), select Kache through its `cache` input:
+
+```yaml
+- uses: PyO3/maturin-action@acb699e6734322acb57a0b1a5b4b62d01d68156d
+  with:
+    command: build
+    args: --release
+    cache: kache
+```
+
+The action installs Kache and persists its store with GitHub Actions cache for host and manylinux Docker builds. It configures the wrapper for its own build step, so no separate kache-action step is needed.
+
+The example pins the merged Kache integration. The `v1` tag does not yet include these inputs; switch to a release tag once it includes [PyO3/maturin-action#474](https://github.com/PyO3/maturin-action/pull/474).
+
+The `save-cache` input above belongs to kache-action. maturin-action has no equivalent restore-only input; use `cache: none` in release and publishing jobs that must not save caches.
+
 ## Who may write
 
 Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.

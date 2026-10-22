@@ -194,8 +194,8 @@ target directory and hashes the native archives, including their member names,
 timestamps and contents. Archives whose digest retains their path can still
 miss after relocation. This applies only when Rust path normalization is on,
 the search path and `OUT_DIR` are absolute, and the resolved search directory
-stays inside that `OUT_DIR`. Native links, `staticlib` outputs, metadata-only
-outputs, and bare, `all=` or `framework=` search paths keep their existing path
+stays inside that `OUT_DIR`. Native links, test binaries, `staticlib` outputs,
+metadata-only outputs, and bare, `all=` or `framework=` search paths keep their existing path
 identity, as do coverage, trybuild and normalization opt-out builds. Generated
 Rust sources also keep the path identity the compiler
 emits: `file!()`, caller locations and debug information can expose the target

@@ -18606,6 +18606,8 @@ mod build_script_target_paths {
             ("framework=", "rlib", &[][..]),
             ("native=", "staticlib", &[][..]),
             ("native=", "rlib,staticlib", &[][..]),
+            ("native=", "lib", &["--test"][..]),
+            ("native=", "rlib", &["--test"][..]),
             ("native=", "rlib", &["--emit=metadata"][..]),
             ("native=", "rlib", &["-Cinstrument-coverage"][..]),
             ("native=", "rlib", &["--cfg=trybuild"][..]),

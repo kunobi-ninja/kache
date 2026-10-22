@@ -1784,7 +1784,7 @@ fn out_dir_native_search_identity(
     path: &Path,
     out_dir: Option<&OsStr>,
 ) -> Option<Vec<u8>> {
-    if !args.emits_rlib() || args.links_native_closure() || args.skip_path_remap() {
+    if args.is_test || !args.emits_rlib() || args.links_native_closure() || args.skip_path_remap() {
         return None;
     }
     let target = args.target_dir()?;

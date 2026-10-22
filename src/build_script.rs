@@ -1544,6 +1544,7 @@ impl Run {
                 link::prepare_writable_target_from_file(&blob, &target)?,
                 cached.executable,
                 cached.hash.as_str(),
+                cached.size,
             ));
         }
         // Each file published here is a verbatim copy of its blob, so the
@@ -1551,11 +1552,13 @@ impl Run {
         // its mode is set, the units that read it next (a static library a
         // crate links) take the hash from the memo instead of reading it.
         let mut restored = Vec::with_capacity(prepared.len());
-        for (artifact, executable, hash) in prepared {
+        for (artifact, executable, hash, size) in prepared {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
             set_executable(&target, executable)?;
-            if let Ok(fingerprint) = kache_store::file_hash::FileFingerprint::from_path(&target) {
+            if size >= kache_store::file_hash::MIN_PERSISTED_HASH_BYTES as u64
+                && let Ok(fingerprint) = kache_store::file_hash::FileFingerprint::from_path(&target)
+            {
                 restored.push((fingerprint, hash));
             }
         }
@@ -4122,8 +4125,14 @@ mod tests {
                 start: std::time::Instant::now(),
             }
         };
-        let pc = |out: &Path| format!("prefix={}\nlibdir=${{prefix}}/lib\n", out.display());
-        let object = [
+        let pc = |out: &Path| {
+            format!(
+                "prefix={}\nlibdir=${{prefix}}/lib\n{}",
+                out.display(),
+                "padding=x\n".repeat(8 * 1024)
+            )
+        };
+        let mut object = [
             b"\x7fELF\0".as_slice(),
             dir.as_path()
                 .join("cargo/registry/src/z-1.0.0/adler32.c")
@@ -4131,6 +4140,8 @@ mod tests {
                 .as_encoded_bytes(),
         ]
         .concat();
+        object.resize(64 * 1024, 0);
+        let small = vec![b's'; 65_535];
 
         let mut a = run_in("a/target");
         a.start = std::time::Instant::now() - std::time::Duration::from_secs(2);
@@ -4138,6 +4149,8 @@ mod tests {
         std::fs::create_dir_all(out.join("lib/pkgconfig")).unwrap();
         std::fs::write(out.join("lib/pkgconfig/z.pc"), pc(out)).unwrap();
         std::fs::write(out.join("lib/adler32.o"), &object).unwrap();
+        set_executable(&out.join("lib/adler32.o"), true).unwrap();
+        std::fs::write(out.join("lib/small.a"), &small).unwrap();
         let after_the_run = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         a.record(
             b"cargo:rerun-if-changed=build.rs\n",
@@ -4181,6 +4194,65 @@ mod tests {
             pc(out)
         );
         assert_eq!(std::fs::read(out.join("lib/adler32.o")).unwrap(), object);
+        assert_eq!(std::fs::read(out.join("lib/small.a")).unwrap(), small);
+
+        let file_hasher = b.store.file_hasher();
+        assert_eq!(
+            file_hasher.hash(&out.join("lib/adler32.o")).unwrap(),
+            kache_store::file_hash::hash_file(&out.join("lib/adler32.o")).unwrap()
+        );
+        assert_eq!(
+            file_hasher.stats().bytes_hashed,
+            0,
+            "an exact copy at the persistence floor is memoised after its mode is set"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(out.join("lib/adler32.o"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+
+        let rewritten = out.join("lib/pkgconfig/z.pc");
+        let fingerprint = kache_store::file_hash::FileFingerprint::from_path(&rewritten).unwrap();
+        assert!(
+            b.store
+                .file_hash_cache()
+                .get(&fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        let source_hash = &meta
+            .files
+            .iter()
+            .find(|file| file.name == "out/lib/pkgconfig/z.pc")
+            .unwrap()
+            .hash;
+        let file_hasher = b.store.file_hasher();
+        let restored_hash = file_hasher.hash(&rewritten).unwrap();
+        assert_eq!(
+            restored_hash,
+            kache_store::file_hash::hash_file(&rewritten).unwrap()
+        );
+        assert_ne!(&restored_hash, source_hash);
+        assert_eq!(
+            file_hasher.stats().bytes_hashed,
+            std::fs::metadata(&rewritten).unwrap().len(),
+            "rewritten text is hashed instead of inheriting its stored blob's digest"
+        );
+
+        let file_hasher = b.store.file_hasher();
+        assert_eq!(
+            file_hasher.hash(&out.join("lib/small.a")).unwrap(),
+            kache_store::file_hash::hash_file(&out.join("lib/small.a")).unwrap()
+        );
+        assert_eq!(file_hasher.stats().bytes_hashed, 65_535);
     }
 
     /// A restored `OUT_DIR` file is a copy of its blob, so its hash is known:
@@ -4243,7 +4315,19 @@ mod tests {
         #[cfg(unix)]
         {
             let before = std::fs::metadata(&restored).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            let fingerprint =
+                kache_store::file_hash::FileFingerprint::from_metadata(&restored, &before);
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while kache_store::file_hash::stamp_written_since(
+                &fingerprint,
+                kache_store::file_hash::stamp_clock_ns(),
+            ) {
+                assert!(
+                    std::time::Instant::now() < give_up,
+                    "the stamp clock never passed {fingerprint:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&restored)

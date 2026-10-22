@@ -19,7 +19,7 @@ kache-fs = { version = "1.2.2", path = "../kache-fs" }
 libc = "0.2"
 
 [dev-dependencies]
-proptest = { version = "1.11.0", default-features = false, features = ["std", "handle-panics"] }
+proptest = { version = "1.12.0", default-features = false, features = ["std", "handle-panics"] }
 tempfile = "3"
 
 [lints.rust]

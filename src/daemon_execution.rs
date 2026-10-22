@@ -209,7 +209,7 @@ impl Prepared {
 }
 
 struct DescriptorChannel {
-    socket: tokio::io::unix::AsyncFd<UnixDatagram>,
+    socket: tokio::net::UnixDatagram,
     ticket: DescriptorTicket,
     _directory: tempfile::TempDir,
 }
@@ -227,7 +227,7 @@ impl DescriptorChannel {
         let mut key = [0; 16];
         getrandom::fill(&mut key).context("creating descriptor ticket")?;
         Ok(Self {
-            socket: tokio::io::unix::AsyncFd::new(socket)?,
+            socket: tokio::net::UnixDatagram::from_std(socket)?,
             ticket: DescriptorTicket {
                 endpoint: NativeString::capture(path.as_os_str()),
                 key,
@@ -237,19 +237,12 @@ impl DescriptorChannel {
     }
 
     async fn receive(&self, expected: usize) -> Result<Vec<OwnedFd>> {
-        loop {
-            let mut ready = self.socket.readable().await?;
-            match ready.try_io(|socket| {
-                kache_ipc::descriptors::receive(
-                    socket.get_ref().as_fd(),
-                    &self.ticket.key,
-                    expected,
-                )
-            }) {
-                Ok(result) => return Ok(result?),
-                Err(_) => continue,
-            }
-        }
+        Ok(self
+            .socket
+            .async_io(tokio::io::Interest::READABLE, || {
+                kache_ipc::descriptors::receive(self.socket.as_fd(), &self.ticket.key, expected)
+            })
+            .await?)
     }
 }
 
@@ -395,6 +388,49 @@ pub(super) async fn handle(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn descriptor_channel_waits_for_readiness_and_validates_the_ticket() {
+        for valid_ticket in [true, false] {
+            let channel = DescriptorChannel::new().unwrap();
+            let mut receiving = std::pin::pin!(channel.receive(1));
+            assert!(futures::poll!(&mut receiving).is_pending());
+
+            let input = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(input.path(), b"descriptor input\n").unwrap();
+            let file = File::open(input.path()).unwrap();
+            let sender = UnixDatagram::unbound().unwrap();
+            sender
+                .connect(PathBuf::from(channel.ticket.endpoint.decode().unwrap()))
+                .unwrap();
+            let mut ticket = channel.ticket.key;
+            if !valid_ticket {
+                ticket[0] ^= 1;
+            }
+            kache_ipc::descriptors::send(sender.as_fd(), &ticket, &[file.as_fd()]).unwrap();
+
+            let result = tokio::time::timeout(PREPARE_TIMEOUT, receiving)
+                .await
+                .unwrap();
+            if valid_ticket {
+                let mut descriptors = result.unwrap();
+                assert_eq!(descriptors.len(), 1);
+                let mut received = File::from(descriptors.pop().unwrap());
+                let mut contents = String::new();
+                std::io::Read::read_to_string(&mut received, &mut contents).unwrap();
+                assert_eq!(contents, "descriptor input\n");
+            } else {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+            }
+        }
+    }
 
     fn native_execution_available() -> bool {
         #[cfg(target_os = "linux")]

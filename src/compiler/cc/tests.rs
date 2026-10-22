@@ -2969,6 +2969,44 @@ fn opt_in_link_response_files_are_refused_without_compiler_parsing() {
 }
 
 #[test]
+fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let env = InvocationEnv::capture();
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("input.o");
+    fs::write(&object, b"same object bytes").unwrap();
+    let compiler = CcCompiler::for_invocation(Vec::new(), &env).with_cache_cc_links(true);
+    let file_hasher = crate::cache_key::FileHasher::new_for(&env);
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let ctx = KeyCtx {
+        invocation_env: &env,
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: dir.path(),
+        key_salt: None,
+        key_env_vars: &[],
+        extra_inputs_digest: None,
+        build_script_inputs_digest: None,
+    };
+    // Unicode 18 assigns U+1ADE a combining class that merges these names
+    // under NFC. The linker embeds their distinct raw SONAME bytes.
+    let key = |soname: &str| {
+        let argv = vec![
+            "cc".to_string(),
+            "-shared".to_string(),
+            object.to_string_lossy().into_owned(),
+            format!("-Wl,-soname,{soname}"),
+            "-o".to_string(),
+            dir.path().join("output.so").to_string_lossy().into_owned(),
+        ];
+        let parsed = compiler.parse(&argv).unwrap();
+        assert!(compiler.refuse_reasons(&parsed).is_empty());
+        compiler.cache_key(&parsed, &ctx).unwrap()
+    };
+    assert_ne!(key("q\u{1ade}\u{0323}"), key("q\u{0323}\u{1ade}"));
+}
+
+#[test]
 fn cache_key_for_link_changes_when_an_object_changes() {
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();

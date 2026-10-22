@@ -1551,7 +1551,7 @@ impl Run {
         // blob's name is its hash: memoised at the stamp the file has once
         // its mode is set, the units that read it next (a static library a
         // crate links) take the hash from the memo instead of reading it.
-        let mut restored = Vec::with_capacity(prepared.len());
+        let mut restored = Vec::new();
         for (artifact, executable, hash, size) in prepared {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;

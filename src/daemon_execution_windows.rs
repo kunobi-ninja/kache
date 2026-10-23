@@ -28,6 +28,7 @@ pub(super) fn probe(
         && PeerProcess::for_connection(stream, client_pid)
             .is_ok_and(|peer| peer.permits_delegation().unwrap_or(false));
     kache_protocol::execution::ExecutionStatus {
+        protocol_version: EXECUTION_VERSION,
         eligible,
         client_trust_enabled: client_trust,
         daemon_trust_enabled: daemon.config.trust_daemon_execution,

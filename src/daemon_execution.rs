@@ -81,6 +81,7 @@ pub(super) fn probe(
         )
     };
     kache_protocol::execution::ExecutionStatus {
+        protocol_version: EXECUTION_VERSION,
         eligible,
         client_trust_enabled: client_trust,
         daemon_trust_enabled: daemon_trust,

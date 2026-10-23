@@ -8807,9 +8807,10 @@ pub(crate) fn compiler_execution_status(
     let response =
         send_request_with_timeout(&config.socket_path(), &request, Duration::from_secs(3))?;
     let response: Response = serde_json::from_str(&response)?;
-    response.execution_status.context(
-        "daemon does not support compiler execution diagnostics; restart it with this release",
-    )
+    response
+        .execution_status
+        .filter(kache_protocol::execution::ExecutionStatus::compatible)
+        .context("daemon execution protocol differs; restart it with this release")
 }
 
 #[cfg(not(windows))]

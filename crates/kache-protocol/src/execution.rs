@@ -190,14 +190,32 @@ impl std::fmt::Debug for DescriptorTicket {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionStatus {
+    #[serde(default)]
+    pub protocol_version: u32,
     pub eligible: bool,
     pub client_trust_enabled: bool,
     pub daemon_trust_enabled: bool,
     pub detail: String,
 }
 
+impl ExecutionStatus {
+    pub fn compatible(&self) -> bool {
+        self.protocol_version == EXECUTION_VERSION
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_diagnostics_reject_legacy_and_foreign_protocols() {
+        let mut status: super::ExecutionStatus = serde_json::from_str(r#"{"eligible":true,"client_trust_enabled":false,"daemon_trust_enabled":false,"detail":"old daemon"}"#).unwrap();
+        assert!(!status.compatible());
+        for (version, compatible) in [(0, false), (1, false), (2, true), (3, false)] {
+            status.protocol_version = version;
+            assert_eq!(status.compatible(), compatible);
+        }
+    }
+
     use super::*;
 
     #[test]

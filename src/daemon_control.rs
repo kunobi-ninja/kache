@@ -170,6 +170,14 @@ pub(super) fn request(
     Ok(Some(health))
 }
 
+#[cfg(any(windows, test))]
+fn lifecycle_message(operation: u32) -> wire::Control {
+    wire::Control {
+        operation,
+        ..Default::default()
+    }
+}
+
 /// Use the shared codec, reply validation and peer policies with cancelable
 /// Windows I/O. The synchronous shared adapter cannot accept a bounded stream.
 #[cfg(windows)]
@@ -208,10 +216,7 @@ fn request_windows(
             if Instant::now() >= deadline {
                 return Err(Error::Late);
             }
-            let message = wire::Control {
-                operation,
-                ..Default::default()
-            };
+            let message = lifecycle_message(operation);
             session.send(&message).await.map_err(Error::Protocol)?;
             let reply = session.receive().await.map_err(Error::Protocol)?;
             let health = wire::Health::from_response(&reply, &message).map_err(Error::Protocol)?;
@@ -350,6 +355,45 @@ async fn legacy_exchange_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_messages_preserve_health_and_drain_through_the_binary_codec() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let local = offer(&config).unwrap();
+        for operation in [operation::HEALTH, operation::DRAIN] {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let client = async {
+                    let mut session = wire::AsyncSession::connect(client, &local).await.unwrap();
+                    let message = lifecycle_message(operation);
+                    session.send(&message).await.unwrap();
+                    let reply = session.receive().await.unwrap();
+                    let health = wire::Health::from_response(&reply, &message).unwrap();
+                    assert_eq!(health.ready, operation == operation::HEALTH);
+                    assert_eq!(health.draining, operation == operation::DRAIN);
+                };
+                let server = async {
+                    let mut session = wire::AsyncSession::accept(server, &local).await.unwrap();
+                    let message = session.receive().await.unwrap();
+                    assert_eq!(message.operation, operation);
+                    let health = wire::Health {
+                        process_id: std::process::id(),
+                        ready: message.operation == operation::HEALTH,
+                        draining: message.operation == operation::DRAIN,
+                        ..Default::default()
+                    };
+                    session
+                        .send(&health.response(&message).unwrap())
+                        .await
+                        .unwrap();
+                };
+                tokio::join!(client, server);
+            })
+            .await
+            .expect("binary lifecycle roundtrip stalled");
+        }
+    }
 
     /// A daemon that stopped accepting: its only pipe instance is taken. The
     /// legacy exchange ends by its deadline with an error callers treat as a

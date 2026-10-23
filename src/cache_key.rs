@@ -9290,6 +9290,11 @@ pub(crate) fn run_dep_info_pass_for(
 
     let dep_args = dep_info_pass_args(source_file, rustc_args, &dep_file);
 
+    let use_response_file = crate::compile::command_needs_response_file(
+        use_response_file,
+        &cmd,
+        dep_args.iter().map(std::string::String::as_str),
+    );
     let response_file = if use_response_file {
         let response = crate::compile::RustcResponseFile::new_in(
             &temp_root,

@@ -605,17 +605,47 @@ fn task_scheduler_installed() -> bool {
 
 /// Whether the installed login service owns this configured runtime instance.
 /// Login services load user/host configuration, not a build's KACHE_* overrides.
+///
+/// Nor a build's `XDG_CONFIG_HOME` or `XDG_CACHE_HOME`: the service manager
+/// starts the daemon in the login environment, so it reads the user's file
+/// under the home folder and keeps its store in the home folder's cache. A
+/// shell that points `XDG_CONFIG_HOME` at a config of its own (a test rig's
+/// private store and runtime folder) was taken for the service's instance:
+/// `daemon start` and every compile's auto-start kicked the service, which
+/// started (or already ran) the user's daemon elsewhere, and then waited out
+/// the 8 s start budget for a socket that never came, compiling without a
+/// daemon. Where the login environment does set those variables too, this
+/// answers "not managed" and the instance's daemon is started directly,
+/// which works the same.
 pub(crate) fn manages_instance(config: &crate::config::Config) -> Result<bool> {
     if !service_file_path().is_some_and(|path| path.is_file()) {
         return Ok(false);
     }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     configured_instance_matches(
         &config.socket_path(),
-        crate::config::default_cache_dir(),
+        login_service_cache_dir(&home),
         crate::config::host_config_path()
             .into_iter()
-            .chain(std::iter::once(crate::config::config_file_path())),
+            .chain(std::iter::once(login_service_config_file(&home))),
     )
+}
+
+/// The user config file the login service's daemon reads: `config_file_path`
+/// without a build's `XDG_CONFIG_HOME` (see [`manages_instance`]).
+fn login_service_config_file(home: &Path) -> PathBuf {
+    home.join(".config").join("kache").join("config.toml")
+}
+
+/// The store the login service's daemon keeps without a configured one:
+/// `default_cache_dir` without a build's `XDG_CACHE_HOME`, which only the
+/// XDG platforms read (see [`manages_instance`]).
+fn login_service_cache_dir(home: &Path) -> PathBuf {
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        home.join(".cache").join("kache")
+    } else {
+        crate::config::default_cache_dir()
+    }
 }
 
 /// Where a daemon started for this instance writes the error that stops it
@@ -1476,6 +1506,65 @@ mod tests {
             error
                 .to_string()
                 .contains("reading login service configuration")
+        );
+    }
+
+    /// A shell whose `XDG_CONFIG_HOME` names a private config with its own
+    /// runtime folder runs an instance the login service never starts: the
+    /// service reads the home folder's config. Before, the private file was
+    /// read as the service's, so the private socket matched and every start
+    /// kicked the service and waited 8 s for a daemon that never came.
+    #[test]
+    fn a_private_xdg_config_is_not_the_login_services() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let private = root.path().join("rig");
+        let private_runtime = private.join("runtime");
+        let private_config = private.join("xdg/kache/config.toml");
+        std::fs::create_dir_all(private_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &private_config,
+            format!(
+                "[cache]\nruntime_dir = {:?}\n",
+                private_runtime.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let socket = private_runtime.join("daemon.sock");
+
+        // What the service reads: the home folder's file, absent here, so
+        // the service's daemon listens in its default store.
+        let service_config = login_service_config_file(&home);
+        assert_eq!(service_config, home.join(".config/kache/config.toml"));
+        assert_ne!(service_config, private_config);
+        assert!(
+            !configured_instance_matches(&socket, login_service_cache_dir(&home), [service_config])
+                .unwrap(),
+            "the private instance is not the service's"
+        );
+        // The mistake this replaces: the private file read as the service's.
+        assert!(
+            configured_instance_matches(&socket, login_service_cache_dir(&home), [private_config])
+                .unwrap()
+        );
+        // The user's own instance stays the service's.
+        assert!(
+            configured_instance_matches(
+                &login_service_cache_dir(&home).join("daemon.sock"),
+                login_service_cache_dir(&home),
+                [login_service_config_file(&home)]
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_login_services_default_store_is_the_home_folders_cache() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            login_service_cache_dir(home),
+            PathBuf::from("/home/someone/.cache/kache")
         );
     }
 

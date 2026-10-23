@@ -193,7 +193,18 @@ mod tests {
                 &pipes,
             )
             .unwrap();
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
+        let pending = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &blob && path != &target)
+            .collect::<Vec<_>>();
+        assert!(!pending.is_empty());
+        assert!(pending.iter().all(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".kache-")
+        }));
         drop(files);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
     }

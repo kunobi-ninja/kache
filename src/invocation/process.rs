@@ -421,10 +421,6 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
     if controlled {
         crate::platform::configure_process_group(command);
     }
-    // Cancellation may run a host utility while holding the request lock.
-    // Keep that lock order: request, then descriptor admission.
-    #[cfg(unix)]
-    let descriptor_admission = kache_ipc::descriptors::spawn_guard();
     #[cfg(windows)]
     let (mut child, tree) = if let Some(broker) = crate::invocation::io::current().broker() {
         let (id, pid, handles) = broker.spawn(
@@ -450,12 +446,13 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
             })?,
         )?
     } else {
+        // A broker receives descriptors during spawn, so admission covers only
+        // local process creation. Keep request -> admission lock ordering.
+        let _admission = kache_ipc::descriptors::spawn_guard();
         super::unix_broker::Child::local(command.spawn()?)
     };
     #[cfg(not(any(windows, unix)))]
     let mut child = command.spawn()?;
-    #[cfg(unix)]
-    drop(descriptor_admission);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

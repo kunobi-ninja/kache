@@ -152,6 +152,17 @@ mod tests {
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
     }
 
+    #[test]
+    fn cloning_a_missing_blob_keeps_the_existing_stage_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut stage = StagedFile::new_in(root.path(), ".stage-").unwrap();
+        stage.writer().write_all(b"existing bytes").unwrap();
+        assert!(stage.try_clone_from(&root.path().join("missing")).is_err());
+        let target = root.path().join("output");
+        stage.publish_new(&target).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"existing bytes");
+    }
+
     fn entries(directory: &Path) -> Vec<PathBuf> {
         let mut paths: Vec<_> = fs::read_dir(directory)
             .unwrap()

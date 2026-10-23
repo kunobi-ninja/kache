@@ -278,7 +278,10 @@ impl Client {
             .next_id
             .checked_add(1)
             .ok_or_else(|| invalid("compiler child ID exhausted"))?;
-        let child = command.spawn()?;
+        let child = {
+            let _admission = crate::descriptors::spawn_guard();
+            command.spawn()?
+        };
         let mut pending = Pending {
             child,
             status: None,
@@ -523,7 +526,7 @@ mod tests {
             format!(
                 "{}:request-only:{}:native-input",
                 std::process::id(),
-                root.path().display()
+                root.path().canonicalize().unwrap().display()
             )
         );
         let mut error = String::new();

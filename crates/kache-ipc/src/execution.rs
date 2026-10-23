@@ -2,7 +2,7 @@
 
 #[cfg(all(test, windows))]
 use crate::prelude::*;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use kache_protocol::execution::{
     EXECUTION_VERSION, ExecutionCommand, ExecutionReply, ExecutionRequest,
 };
@@ -119,8 +119,7 @@ fn exchange(
         let descriptors = files.as_slice();
         crate::descriptors::send(datagram.as_fd(), &ticket.key, descriptors)?;
     }
-    #[cfg(unix)]
-    drop(broker_files);
+
     #[cfg(windows)]
     ensure!(
         matches!(
@@ -137,12 +136,20 @@ fn exchange(
         "compiler execution was not prepared"
     );
 
+    // macOS can drain an in-flight socket when its last sender descriptor
+    // closes. Prepared confirms the daemon has installed its own descriptors.
+    #[cfg(unix)]
+    drop(broker_files);
+
     stream.prepare_commit()?;
-    send_commit(&mut &stream, committed)?;
+    send_commit(&mut &stream, committed).context("sending compiler Commit")?;
     #[cfg(windows)]
     stream.commit_written()?;
     ensure!(
-        matches!(read_reply(&mut reader)?, ExecutionReply::Accepted),
+        matches!(
+            read_reply(&mut reader).context("waiting for compiler acceptance")?,
+            ExecutionReply::Accepted
+        ),
         "daemon did not acknowledge compiler execution"
     );
     #[cfg(windows)]
@@ -163,14 +170,17 @@ fn exchange(
             && reader.buffer().is_empty()
             && client.ready(stream.as_fd())?
         {
-            if !client.service()? {
+            if !client
+                .service()
+                .context("servicing client-owned native operations")?
+            {
                 // The worker can release its broker before the async handler
                 // writes Complete. Completion still comes from that handler.
                 unix_client = None;
             }
             continue;
         }
-        return match read_reply(&mut reader)? {
+        return match read_reply(&mut reader).context("waiting for compiler completion")? {
             ExecutionReply::Complete { exit_code } => Ok(exit_code),
             ExecutionReply::Failed { message } => bail!("{message}"),
             reply => bail!("invalid compiler completion: {reply:?}"),
@@ -282,6 +292,10 @@ mod tests {
                     },
                 )
                 .unwrap();
+                // Model a receiver which has sent Ready but has not installed
+                // the in-flight socket descriptors yet. macOS drains a socket
+                // if its sender closes the last installed descriptor here.
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 let mut files =
                     crate::descriptors::receive(datagram.as_fd(), &ticket.key, 8).unwrap();
                 let control = UnixStream::from(files.remove(4));
@@ -634,7 +648,6 @@ mod protocol_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use anyhow::Context as _;
     use interprocess::local_socket::ListenerNonblockingMode;
     use kache_protocol::execution::{ExecutionChannels, ExecutionEntry, NativeString};
 

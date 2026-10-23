@@ -2468,6 +2468,15 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_modes_preserve_permissions_and_remove_file_type_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, expected) in [(0o100754, 0o754), (0o104640, 0o640), (0o100000, 0)] {
+            assert_eq!(writable_mode(&fs::Permissions::from_mode(mode)), expected);
+        }
+    }
+
     fn configure_invocation_policy(enabled: bool, marker: &Path) {
         set_windows_hardlink_restore(enabled);
         set_shared_hardlink_restores(enabled);

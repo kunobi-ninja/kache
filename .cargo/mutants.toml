@@ -263,6 +263,10 @@ exclude_globs = [
     "crates/kache-ipc/src/execution/windows.rs",
     "crates/kache-ipc/src/execution/windows_client.rs",
     "src/invocation/windows_broker.rs",
+    # Native adapters absent from the Ubuntu mutation binary. Required macOS
+    # and Windows test jobs exercise them; shared broker logic stays in scope.
+    "src/invocation/unix_broker/macos.rs",
+    "crates/kache-ipc/src/execution/workspace/windows.rs",
     "src/invocation/process/windows.rs",
     "src/daemon_execution_windows.rs",
     "src/daemon_execution_macos.rs",
@@ -276,9 +280,12 @@ exclude_globs = [
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
+    "in can_track_client$",
+    "in compiler_peer_may_delegate$",
     # touch uses two disjoint kernel flags. XOR and OR produce the same mask;
     # symlink and FIFO tests exercise the meaningful removal of either flag.
-    "crates/kache-ipc/src/execution/linux_client/workspace.rs:.*replace \\| with \\^ in touch$",
+    "crates/kache-ipc/src/execution/workspace.rs:.*replace \\| with \\^ in touch$",
     # Drive-prefix components are a Windows Path API. The native Windows
     # tests check client drive selection and invalid per-drive directories.
     # InvocationEnv's shared resolution and command policy stay in scope.
@@ -405,7 +412,9 @@ exclude_re = [
     "replace \\| with \\^ in touch_mtime_write_clock",
     "replace \\| with & in touch_mtime_write_clock",
     "replace < with <= in touch_mtime_write_clock",
-    "sample_write_clock",
+    # The Windows-only store wrapper stays excluded. The shared kache-fs
+    # sampler is compiled on Linux and remains in mutation scope.
+    "crates/kache-store/src/link.rs:.*in sample_write_clock$",
     "NonInheritableStdio",
     "windows_pattern_has_ambiguous_root",
     "windows_path_uses_device_namespace",

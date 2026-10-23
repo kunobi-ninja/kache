@@ -1199,11 +1199,11 @@ fn successful_put_leaves_staging_dir_empty() {
         )
         .unwrap();
 
-    let staging = dir.path().join("staging");
-    if staging.exists() {
-        let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
-        assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
-    }
+    let leftovers = fs::read_dir(store.staging_dir())
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
 }
 
 /// `stored_meta` reads back what a put wrote, and nothing for a key that
@@ -1258,11 +1258,11 @@ fn zero_byte_refusal_cleans_up_staged_snapshot() {
         "",
     );
     assert!(result.is_err(), "zero-byte rlib must be refused");
-    let staging = dir.path().join("staging");
-    if staging.exists() {
-        let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
-        assert!(leftovers.is_empty(), "refused put left staging litter");
-    }
+    let leftovers = fs::read_dir(store.staging_dir())
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert!(leftovers.is_empty(), "refused put left staging litter");
 }
 
 /// Publishing onto an already-present blob discards the staged snapshot
@@ -1285,18 +1285,31 @@ fn publish_staged_blob_is_idempotent_when_blob_exists() {
             .unwrap(),
         "first publish should win"
     );
+    assert!(!staged_a.exists(), "the published stage must be consumed");
+    let blob = store.blob_path(&hash);
+    assert_eq!(fs::read(&blob).unwrap(), b"identical-content");
+    let winner = kache_fs::file_identity(&blob).unwrap();
 
-    let (staged_b, _ingest_b) = store.stage_blob_from_source(&source, false).unwrap();
+    let (staged_b, ingest_b) = store.stage_blob_from_source(&source, false).unwrap();
     assert_ne!(staged_a, staged_b, "each stage gets its own temp");
     assert!(
         !store
-            .publish_staged_blob(&staged_b, ingest_a, &hash, 17)
+            .publish_staged_blob(&staged_b, ingest_b, &hash, 17)
             .unwrap(),
         "second publish of the same digest must be a no-op"
     );
 
-    let staging_leftovers = fs::read_dir(store.staging_dir()).unwrap().flatten().count();
-    assert_eq!(staging_leftovers, 0, "discarded stage must not linger");
+    assert!(!staged_b.exists(), "the duplicate stage must be discarded");
+    assert_eq!(kache_fs::file_identity(&blob).unwrap(), winner);
+    assert_eq!(fs::read(&blob).unwrap(), b"identical-content");
+    let staging_leftovers = fs::read_dir(store.staging_dir())
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        staging_leftovers.is_empty(),
+        "discarded stage must not linger"
+    );
 }
 
 /// Crash-orphaned staging files are reclaimed only once older than the
@@ -13732,7 +13745,6 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
             "",
         )
         .unwrap();
-    store.remove_clone_for_test(&output);
     let leftovers: Vec<_> = fs::read_dir(store.staging_dir())
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -13742,6 +13754,9 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
         leftovers.is_empty(),
         "completed fixture put left staging snapshots: {leftovers:?}"
     );
+    // A leaked hardlinked stage keeps the blob externally retained. Check
+    // staging before the bounded clone-retainer wait, including during shrinking.
+    store.remove_clone_for_test(&output);
     // Read before aging the entry: a get counts as a use.
     let meta = store.get(key).unwrap().unwrap();
     store

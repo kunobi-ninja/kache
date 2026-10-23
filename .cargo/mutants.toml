@@ -281,8 +281,8 @@ exclude_globs = [
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
     # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
-    "in can_track_client$",
-    "in compiler_peer_may_delegate$",
+    "src/invocation/unix_broker.rs:.*can_track_client",
+    "src/fallback.rs:.*compiler_peer_may_delegate",
     # touch uses two disjoint kernel flags. XOR and OR produce the same mask;
     # symlink and FIFO tests exercise the meaningful removal of either flag.
     "crates/kache-ipc/src/execution/workspace.rs:.*replace \\| with \\^ in touch$",
@@ -414,7 +414,7 @@ exclude_re = [
     "replace < with <= in touch_mtime_write_clock",
     # The Windows-only store wrapper stays excluded. The shared kache-fs
     # sampler is compiled on Linux and remains in mutation scope.
-    "crates/kache-store/src/link.rs:.*in sample_write_clock$",
+    "crates/kache-store/src/link.rs:.*sample_write_clock",
     "NonInheritableStdio",
     "windows_pattern_has_ambiguous_root",
     "windows_path_uses_device_namespace",

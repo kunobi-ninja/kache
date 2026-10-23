@@ -543,7 +543,7 @@ fn runtime_archive_name(bytes: &[u8]) -> Option<&str> {
     {
         Some(end) => end,
         None if bytes.get(MAX_RUNTIME_NAME_BYTES..MAX_RUNTIME_NAME_BYTES + 2) == Some(b"/\n") => {
-            MAX_RUNTIME_NAME_BYTES + 1
+            return std::str::from_utf8(bytes.get(..MAX_RUNTIME_NAME_BYTES)?).ok();
         }
         None => return None,
     };
@@ -2297,9 +2297,11 @@ mod tests {
     #[test]
     fn closed_windows_runtime_name_limits_bound_each_reference_lookup() {
         let object = runtime_coff_object(b".text", b"code");
+        let expected = "n".repeat(256);
         for terminator in [b"\0".as_slice(), b"/\n"] {
             let mut at_limit = vec![b'n'; 256];
             at_limit.extend_from_slice(terminator);
+            assert_eq!(runtime_archive_name(&at_limit), Some(expected.as_str()));
             assert!(
                 validate_closed_windows_runtime_archive(&raw_archive(&[
                     ("//", &at_limit),
@@ -2319,6 +2321,19 @@ mod tests {
                 .is_none()
             );
         }
+        let mut utf8_name = "n".repeat(254);
+        utf8_name.push('é');
+        assert_eq!(utf8_name.len(), 256);
+        let mut utf8_gnu = utf8_name.as_bytes().to_vec();
+        utf8_gnu.extend_from_slice(b"/\n");
+        assert_eq!(runtime_archive_name(&utf8_gnu), Some(utf8_name.as_str()));
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[
+                ("//", &utf8_gnu),
+                ("/0", &object),
+            ]))
+            .is_some()
+        );
         for (length, accepted) in [(256, true), (257, false), (4096, false)] {
             let name = vec![b's'; length];
             let object = runtime_coff_object(&name, b"code");

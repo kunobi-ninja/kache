@@ -24,6 +24,8 @@
 //! validated bytes. Objects, archives, explicit manifest inputs and other
 //! file-carrying options stay refused; their further inputs or side outputs
 //! are not modeled.
+//!
+//! `NODEFAULTLIB` excludes libraries rather than introducing file inputs.
 
 use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result, bail};
@@ -1201,11 +1203,22 @@ pub(crate) fn is_windows_msvc_target(target: &str) -> bool {
 /// and `@response` files are refused earlier by the generic side-file check.
 /// Libraries requested through `-l` never reach this function; they are
 /// resolved and hashed by [`hash_windows_selected_libraries`].
+/// `NODEFAULTLIB` names exclusions, not input files.
 pub(crate) fn windows_link_argument_has_unmodeled_input(value: &str) -> bool {
     value
         .split([',', ' ', '\t', '\n', '\r'])
         .map(|token| token.trim_matches('"'))
-        .any(|token| link_token_names_input_file(token) || windows_link_token_is_file_option(token))
+        .any(|token| {
+            if let Some(option) = token.strip_prefix(['/', '-']) {
+                let name = option
+                    .split_once([':', '='])
+                    .map_or(option, |(name, _)| name);
+                if name.eq_ignore_ascii_case("NODEFAULTLIB") {
+                    return false;
+                }
+            }
+            link_token_names_input_file(token) || windows_link_token_is_file_option(token)
+        })
 }
 
 /// A bare or option-value token whose extension marks a linker input file.
@@ -5195,7 +5208,6 @@ esac
             "-Wl,app.res",
             "/DEBUG app.res",
             "/OPT:REF\tapp.res",
-            "/NODEFAULTLIB:libcmt.lib",
         ] {
             assert!(
                 windows_link_argument_has_unmodeled_input(argument),
@@ -5366,6 +5378,38 @@ esac
         ] {
             assert!(
                 !windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_nodefaultlib_exclusions_do_not_name_input_files() {
+        for argument in [
+            "/NODEFAULTLIB:libc++.lib",
+            "/NODEFAULTLIB:libucrt.lib",
+            "/NODEFAULTLIB:libcmt.lib",
+            "-nodefaultlib:LIBCMT.LIB",
+            "/NoDefaultLib=libcmt.lib",
+        ] {
+            assert_eq!(
+                windows_link_argument_input_files("link-arg", argument),
+                Some(Vec::new()),
+                "{argument}"
+            );
+            assert!(
+                windows_link_argument_has_unmodeled_input(&format!("{argument} helper.lib")),
+                "{argument}"
+            );
+        }
+        for argument in [
+            "NODEFAULTLIB:helper.lib",
+            "/NODEFAULTLIBRARY:helper.lib",
+            "/DEFAULTLIB:helper.lib",
+        ] {
+            assert_eq!(
+                windows_link_argument_input_files("link-arg", argument),
+                None,
                 "{argument}"
             );
         }

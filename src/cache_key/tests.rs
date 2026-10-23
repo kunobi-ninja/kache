@@ -1040,6 +1040,7 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
             rustc: vec![native.clone()],
             linker: vec![native, libpath],
             files: vec![],
+            default_libraries: vec![],
         }
     );
 
@@ -1082,6 +1083,114 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
             "unmodeled Windows link input must fail closed: {linker_arg}: {error:#}"
         );
     }
+}
+
+#[test]
+fn windows_defaultlib_requests_are_not_rustc_libraries() {
+    use crate::native_link_key::WindowsDefaultLibrary;
+
+    for carrier in ["link-arg", "link-args"] {
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            format!("-C{carrier}=/DEFAULTLIB:ucrt.lib"),
+            "-Clink-args=/DEBUG -defaultlib:MSVCRT /NODEFAULTLIB:libucrt.lib".into(),
+        ])
+        .unwrap();
+        let inputs = windows_native_link_search_dirs(&args).unwrap();
+        assert_eq!(
+            inputs.default_libraries,
+            [
+                WindowsDefaultLibrary::parse("/DEFAULTLIB:ucrt.lib").unwrap(),
+                WindowsDefaultLibrary::parse("/DEFAULTLIB:msvcrt.lib").unwrap(),
+            ]
+        );
+        assert!(args.link_libs.is_empty());
+        assert!(inputs.files.is_empty());
+    }
+    for value in [
+        "/DEFAULTLIB",
+        "/DEFAULTLIB:",
+        "/DEFAULTLIB=ucrt.lib",
+        "/DEFAULTLIB:helper.lib",
+        r"/DEFAULTLIB:C:\sdk\ucrt.lib",
+        "/DEFAULTLIB:../ucrt.lib",
+        "/DEFAULTLIB:ucrt.lib,helper.lib",
+        "/DEFAULTLIB:ucrt.lib /DEBUG",
+        r#"/DEFAULTLIB:"ucrt.lib""#,
+        "-Wl,/DEFAULTLIB:ucrt.lib",
+    ] {
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            format!("-Clink-arg={value}"),
+        ])
+        .unwrap();
+        assert!(windows_native_link_search_dirs(&args).is_err(), "{value}");
+    }
+}
+
+#[test]
+fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let invocation = client_invocation(dir.path(), &[]);
+    let file_hasher = FileHasher::new_for(&invocation);
+    let key = |arguments: &[&str]| -> Result<String> {
+        let mut argv = vec!["rustc".into(), "--crate-type=bin".into()];
+        argv.extend(arguments.iter().map(|argument| argument.to_string()));
+        let args = RustcArgs::parse_for(&argv, &invocation).unwrap();
+        let mut hasher = blake3::Hasher::new();
+        fold_native_windows_msvc_identity_for(
+            &mut hasher,
+            &args,
+            WINDOWS_RUSTC_VERSION,
+            true,
+            &file_hasher,
+            |_, _, _, _| {
+                Ok(crate::native_link_key::WindowsMsvcIdentity {
+                    linker: "LINK 14".into(),
+                    compiler: "cl".into(),
+                    toolset: "14".into(),
+                    sdk: "10".into(),
+                    ucrt: "10".into(),
+                    architecture: "x64".into(),
+                    wrapper: None,
+                    libraries: BTreeMap::from([
+                        ("ucrt.lib".into(), "ucrt-digest".into()),
+                        ("msvcrt.lib".into(), "msvcrt-digest".into()),
+                    ]),
+                })
+            },
+            &invocation,
+        )?;
+        Ok(hasher.finalize().to_hex().to_string())
+    };
+    let requested = key(&["-Clink-arg=/DEFAULTLIB:ucrt.lib"]).unwrap();
+    assert_ne!(key(&[]).unwrap(), requested, "explicit request presence");
+    assert_eq!(
+        key(&["-Clink-args=-defaultlib:UCRT"]).unwrap(),
+        requested,
+        "both carriers use canonical runtime names"
+    );
+    assert_ne!(
+        key(&["-Clink-args=/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt"]).unwrap(),
+        key(&["-Clink-args=/DEFAULTLIB:msvcrt /DEFAULTLIB:ucrt"]).unwrap(),
+        "request order must survive identity encoding"
+    );
+    assert_ne!(
+        key(&["-Clink-args=/DEFAULTLIB:ucrt /DEFAULTLIB:ucrt"]).unwrap(),
+        requested,
+        "repeated requests retain their indices"
+    );
+    let error = key(&[
+        "-Clink-arg=/DEFAULTLIB:ucrtd",
+        "-Clink-arg=/NODEFAULTLIB:ucrtd.lib",
+    ])
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("DEFAULTLIB:ucrtd.lib has no selected runtime library"),
+        "{error:#}"
+    );
 }
 
 /// Compile a resource entry in the documented .res layout. Build the null
@@ -1144,6 +1253,7 @@ fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
         WindowsNativeLinkSearchDirs {
             rustc: vec![],
             linker: vec![PathBuf::from(r"C:\shadow")],
+            default_libraries: vec![],
             files: vec![
                 PathBuf::from(r"C:\w\target\debug\build\app-1\out\resource.res"),
                 PathBuf::from(r"C:\w\extra.res"),
@@ -1245,7 +1355,16 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
                         .map(|path| path.to_path_buf())
                         .collect::<Vec<_>>()
                 );
-                Ok("linker=LINK 14".into())
+                Ok(crate::native_link_key::WindowsMsvcIdentity {
+                    linker: "LINK 14".into(),
+                    compiler: "cl".into(),
+                    toolset: "14".into(),
+                    sdk: "10".into(),
+                    ucrt: "10".into(),
+                    architecture: architecture.into(),
+                    wrapper: None,
+                    libraries: BTreeMap::new(),
+                })
             },
             &invocation,
         )?;
@@ -1482,6 +1601,7 @@ fn windows_lld_libpath_preserves_shadowing_order() {
             rustc: Vec::new(),
             linker: vec![first, second],
             files: vec![],
+            default_libraries: vec![],
         }
     );
 }
@@ -1529,6 +1649,7 @@ fn windows_native_link_search_dirs_honor_only_linker_visible_l_kinds() {
             ],
             linker: vec![native, all, bare, PathBuf::from(unknown), libpath],
             files: vec![],
+            default_libraries: vec![],
         }
     );
 }

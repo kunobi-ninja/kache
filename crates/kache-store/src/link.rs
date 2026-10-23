@@ -435,6 +435,7 @@ pub enum LinkStrategy {
     ExecutableHardlink,
 }
 
+#[cfg(not(windows))]
 fn remove_restore_file(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Remove(path)) {

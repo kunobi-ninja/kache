@@ -3,9 +3,10 @@
 // decisions live in sandbox.rs and run under Linux mutations; macOS unit and
 // subprocess tests exercise this native adapter against an actual sandbox.
 use crate::invocation::process::CommandExt as _;
+use kache_protocol::execution::process::{Stdio as Plan, Stream};
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::sandbox::{self, Probe};
@@ -43,7 +44,6 @@ impl Probe for Policy {
 fn server_pid(port: u16) -> Option<i32> {
     // Bound the optional probe, including output volume. No shell, credentials,
     // or compiler arguments are passed to lsof. A timeout leaves recovery to run().
-    let output = tempfile::tempfile().ok()?;
     let mut command = Command::new("/usr/sbin/lsof");
     command.args([
         "-nP",
@@ -54,10 +54,11 @@ fn server_pid(port: u16) -> Option<i32> {
         "-Fp",
     ]);
     let mut child = command
-        .stdin(Stdio::null())
-        .stdout(output.try_clone().ok()?)
-        .stderr(Stdio::null())
-        .invocation_spawn()
+        .invocation_spawn_with_io(Plan {
+            stdin: Stream::Null,
+            stdout: Stream::Pipe,
+            stderr: Stream::Null,
+        })
         .ok()?;
     let deadline = Instant::now() + Duration::from_millis(200);
     let success = loop {
@@ -74,11 +75,14 @@ fn server_pid(port: u16) -> Option<i32> {
     if !success {
         return None;
     }
-    use std::io::{Read, Seek};
-    let mut output = output;
-    output.rewind().ok()?;
+    use std::io::Read;
     let mut text = String::new();
-    output.take(4096).read_to_string(&mut text).ok()?;
+    child
+        .stdout
+        .take()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
     sandbox::parse_pid(&text)
 }
 

@@ -1795,6 +1795,59 @@ pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoM
     rewrite_depinfo_content_with_sentinel(content, project_dir, DEPINFO_ROOT_SENTINEL, mode)
 }
 
+/// Move dep-info's Make rule paths between target roots. Keep recorded env
+/// values: an artifact may embed one, so changing it must still rebuild.
+/// Existing cache sentinels are refused rather than interpreted as paths.
+/// The primary rule must name outputs under the donor, including its aliases.
+pub fn rebase_depinfo_content(content: &str, from: &Path, to: &Path) -> Option<String> {
+    if content.contains(DEPINFO_ROOT_SENTINEL) {
+        return None;
+    }
+    let from_prefixes = depinfo_prefixes_for_path(from, DepInfoMode::Relativize, cfg!(windows));
+    let to_prefixes = depinfo_prefixes_for_path(to, DepInfoMode::Expand, cfg!(windows));
+    let (outputs, _) = content.lines().next()?.split_once(": ")?;
+    let outputs = rewrite_depinfo_content_with_prefixes_and_sentinel(
+        outputs,
+        &from_prefixes,
+        DEPINFO_ROOT_SENTINEL,
+        DepInfoMode::Relativize,
+    );
+    let mut outputs = outputs.split_ascii_whitespace().peekable();
+    outputs.peek()?;
+    if outputs.any(|output| {
+        let Some(relative) = output.strip_prefix(DEPINFO_ROOT_SENTINEL) else {
+            return true;
+        };
+        Path::new(relative)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    }) {
+        return None;
+    }
+    Some(
+        content
+            .split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with(DEPINFO_ENV_DEP_PREFIX) {
+                    return line.to_owned();
+                }
+                let relative = rewrite_depinfo_content_with_prefixes_and_sentinel(
+                    line,
+                    &from_prefixes,
+                    DEPINFO_ROOT_SENTINEL,
+                    DepInfoMode::Relativize,
+                );
+                rewrite_depinfo_content_with_prefixes_and_sentinel(
+                    &relative,
+                    &to_prefixes,
+                    DEPINFO_ROOT_SENTINEL,
+                    DepInfoMode::Expand,
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Rust dep-info carries two independently relocatable path families: target
 /// outputs and sources below Cargo's invocation directory. Re-root both with
 /// distinct sentinels so a cached `.d` never leaves Cargo watching a live donor
@@ -2009,6 +2062,11 @@ fn rewrite_depinfo_content_with_sentinel_for_platform(
     mode: DepInfoMode,
     windows: bool,
 ) -> String {
+    let prefixes = depinfo_prefixes_for_path(project_dir, mode, windows);
+    rewrite_depinfo_content_with_prefixes_and_sentinel(content, &prefixes, sentinel, mode)
+}
+
+fn depinfo_prefixes_for_path(project_dir: &Path, mode: DepInfoMode, windows: bool) -> Vec<String> {
     let mut roots = vec![project_dir.to_path_buf()];
     if matches!(mode, DepInfoMode::Relativize)
         && let Ok(canonical) = project_dir.canonicalize()
@@ -2026,7 +2084,7 @@ fn rewrite_depinfo_content_with_sentinel_for_platform(
     }
     let mut seen = std::collections::HashSet::new();
     prefixes.retain(|prefix| seen.insert(prefix.clone()));
-    rewrite_depinfo_content_with_prefixes_and_sentinel(content, &prefixes, sentinel, mode)
+    prefixes
 }
 
 fn depinfo_prefixes_for_display(
@@ -3751,6 +3809,97 @@ mod tests {
 
         let content = fs::read_to_string(&depfile).unwrap();
         assert!(content.contains("/home/user/project/"));
+    }
+
+    #[test]
+    fn rebasing_depinfo_preserves_escaping_sources_and_prefix_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("donor target");
+        let to = dir.path().join("consumer target");
+        let similar = dir.path().join("donor target-other/source.rs");
+        let make = |path: &Path| escape_depinfo_make_path(path.to_str().unwrap());
+        let env = |path: &Path| escape_depinfo_env_value(path.to_str().unwrap());
+        let input = format!(
+            "{}: {} {} registry.rs\n# env-dep:OUT_DIR={}\n",
+            make(&from.join("lib.rlib")),
+            make(&from.join("out/generated.rs")),
+            make(&similar),
+            env(&from.join("out")),
+        );
+        let expected = format!(
+            "{}: {} {} registry.rs\n# env-dep:OUT_DIR={}\n",
+            make(&to.join("lib.rlib")),
+            make(&to.join("out/generated.rs")),
+            make(&similar),
+            env(&from.join("out")),
+        );
+        assert_eq!(
+            rebase_depinfo_content(&input, &from, &to).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            rebase_depinfo_content(input.strip_suffix('\n').unwrap(), &from, &to).as_deref(),
+            expected.strip_suffix('\n'),
+            "an unterminated final env record keeps its exact bytes",
+        );
+        assert_eq!(
+            rebase_depinfo_content("plain.rs: registry.rs\n", &from, &to),
+            None
+        );
+        assert_eq!(
+            rebase_depinfo_content("out: __kache_root__/untrusted.rs\n", &from, &to),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebasing_depinfo_accepts_the_donors_canonical_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let to = dir.path().join("consumer");
+        let source = real.canonicalize().unwrap().join("generated.rs");
+        let input = format!(
+            "{}: {}\n",
+            real.canonicalize().unwrap().join("out").display(),
+            source.display()
+        );
+        assert_eq!(
+            rebase_depinfo_content(&input, &alias, &to),
+            Some(format!(
+                "{}: {}\n",
+                to.join("out").display(),
+                to.join("generated.rs").display()
+            ))
+        );
+    }
+
+    #[test]
+    fn rebasing_depinfo_refuses_unowned_or_ambiguous_primary_outputs() {
+        let from = Path::new("/donor/debug");
+        let to = Path::new("/consumer/debug");
+        for input in [
+            "",
+            "not a Make rule",
+            ": registry.rs\n",
+            "relative.rlib: registry.rs\n",
+            "/older/debug/lib.rlib: registry.rs\n",
+            "/donor/debug/lib.rlib /older/debug/other.rlib: registry.rs\n",
+            "/donor/debug/../outside.rlib: registry.rs\n",
+        ] {
+            assert_eq!(rebase_depinfo_content(input, from, to), None, "{input:?}");
+        }
+        assert_eq!(
+            rebase_depinfo_content(
+                "/donor/debug/a.rlib /donor/debug/a.d: registry.rs\n",
+                from,
+                to
+            ),
+            Some("/consumer/debug/a.rlib /consumer/debug/a.d: registry.rs\n".into())
+        );
     }
 
     #[test]

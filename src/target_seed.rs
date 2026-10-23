@@ -24,6 +24,9 @@
 //! - Files are cloned where the filesystem can, else copied. Each unit's
 //!   fingerprint is put in place last, so an interrupted copy leaves a unit
 //!   Cargo rebuilds rather than one it trusts.
+//! - Compiler dep-info paths and paired build-script stdout/root-output are
+//!   rebased before publication. Recorded environment dependencies keep
+//!   their observed values, so Cargo can still detect an environment change.
 //! - A build script's `OUT_DIR` that a hermetic run left as a link to its
 //!   sealed, shared run in this kache's cache is linked to the same run, and
 //!   recorded as linking to it so the run is kept while the new target uses
@@ -48,6 +51,7 @@
 //! `clippy` share.
 
 mod placement;
+mod relocation;
 
 use crate::invocation::process::CommandExt as _;
 use std::collections::{BTreeSet, HashMap};
@@ -565,6 +569,7 @@ fn copy_unit(
     cache_dir: &Path,
     deadline: Instant,
 ) -> std::io::Result<()> {
+    let relocation = relocation::Relocation::for_unit(from, to, layout, unit, deadline)?;
     #[cfg(unix)]
     {
         let out = build_script_out_dir(from, layout, unit);
@@ -583,6 +588,7 @@ fn copy_unit(
                 &package.join(&unit.hash),
                 cache_dir,
                 deadline,
+                Some(&relocation),
             )
         }
         Layout::Shared => {
@@ -592,13 +598,25 @@ fn copy_unit(
             for file in deps.get(&unit.hash).into_iter().flatten() {
                 let name = file_name(file);
                 if !to_deps.join(&name).exists() {
-                    place_tree(file, &to_deps.join(&name), cache_dir, deadline)?;
+                    place_tree(
+                        file,
+                        &to_deps.join(&name),
+                        cache_dir,
+                        deadline,
+                        Some(&relocation),
+                    )?;
                 }
             }
             let build = from.join("build").join(&named);
             if build.is_dir() {
                 std::fs::create_dir_all(to.join("build"))?;
-                place_tree(&build, &to.join("build").join(&named), cache_dir, deadline)?;
+                place_tree(
+                    &build,
+                    &to.join("build").join(&named),
+                    cache_dir,
+                    deadline,
+                    Some(&relocation),
+                )?;
             }
             std::fs::create_dir_all(to.join(".fingerprint"))?;
             place_tree(
@@ -606,18 +624,26 @@ fn copy_unit(
                 &to.join(".fingerprint").join(&named),
                 cache_dir,
                 deadline,
+                Some(&relocation),
             )
         }
     }
 }
 
 /// Copy `from` (a file or a directory) beside `to` and rename it there.
-fn place_tree(from: &Path, to: &Path, cache_dir: &Path, deadline: Instant) -> std::io::Result<()> {
+fn place_tree(
+    from: &Path,
+    to: &Path,
+    cache_dir: &Path,
+    deadline: Instant,
+    relocation: Option<&relocation::Relocation>,
+) -> std::io::Result<()> {
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
     let tree = Placing {
         from,
         to,
         cache_dir,
+        relocation,
     };
     // Held past the rename, so a sweep keeps each run the tree links to until
     // its recorded `OUT_DIR` does.
@@ -639,6 +665,7 @@ struct Placing<'a> {
     from: &'a Path,
     to: &'a Path,
     cache_dir: &'a Path,
+    relocation: Option<&'a relocation::Relocation>,
 }
 
 /// Copy `from`, a file or directory in `tree`, to `to`, keeping every file's
@@ -690,14 +717,26 @@ fn copy_tree(
             from.display()
         )));
     }
-    copy_file(from, to, &metadata)
+    let contents = tree
+        .relocation
+        .map(|relocation| relocation.contents(from, deadline))
+        .transpose()?
+        .flatten();
+    copy_file(from, to, &metadata, contents.as_deref())
 }
 
 /// Copy the file `from` to `to`, giving it `metadata`'s permissions and
 /// modification time. A Linux reflink creates `to` with the default mode, so
 /// without the permissions a seeded build script is one Cargo cannot execute.
-fn copy_file(from: &Path, to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
-    if kache_store::link::try_reflink(from, to).is_err() {
+fn copy_file(
+    from: &Path,
+    to: &Path,
+    metadata: &std::fs::Metadata,
+    contents: Option<&[u8]>,
+) -> std::io::Result<()> {
+    if let Some(contents) = contents {
+        std::fs::write(to, contents)?;
+    } else if kache_store::link::try_reflink(from, to).is_err() {
         std::fs::copy(from, to)?;
     }
     filetime::set_file_mtime(
@@ -1125,11 +1164,28 @@ source = "git+https://example.com/gitdep#abc"
                     );
                     write(
                         &profile.join("deps").join(format!("{package}-{hash}.d")),
-                        "d",
+                        &format!(
+                            "{}: registry.rs\n",
+                            profile
+                                .join("deps")
+                                .join(format!("lib{package}-{hash}.rlib"))
+                                .to_str()
+                                .unwrap()
+                                .replace(' ', "\\ ")
+                        ),
                     );
                     write(
                         &profile.join("build").join(&named).join("output"),
                         "cargo:rustc-cfg=x\n",
+                    );
+                    write(
+                        &profile.join("build").join(&named).join("root-output"),
+                        profile
+                            .join("build")
+                            .join(&named)
+                            .join("out")
+                            .to_str()
+                            .unwrap(),
                     );
                 }
             }
@@ -1299,6 +1355,25 @@ source = "git+https://example.com/gitdep#abc"
                 matching.target_dir = matching.workspace_root.join("elsewhere").join(lane);
                 std::fs::create_dir_all(matching.target_dir.parent().unwrap()).unwrap();
                 std::fs::rename(&old, &matching.target_dir).unwrap();
+                if layout == Layout::Shared {
+                    // Model compiler outputs built in this lane. Renaming the
+                    // fixture alone leaves its dep-info naming the old target.
+                    let profile = matching.target_dir.join(PROFILE);
+                    for (package, hash) in [("dep", HASH), ("app", OTHER)] {
+                        write(
+                            &profile.join("deps").join(format!("{package}-{hash}.d")),
+                            &format!(
+                                "{}: registry.rs\n",
+                                profile
+                                    .join("deps")
+                                    .join(format!("lib{package}-{hash}.rlib"))
+                                    .to_str()
+                                    .unwrap()
+                                    .replace(' ', "\\ ")
+                            ),
+                        );
+                    }
+                }
                 let mut target = checkout(dir.path(), &format!("new-{label}"));
                 target.target_dir = target.target_dir.join(lane);
                 let result = seed(
@@ -1646,7 +1721,7 @@ source = "git+https://example.com/gitdep#abc"
                 .collect();
             let expected = match layout {
                 Layout::PerUnit => 2,
-                Layout::Shared => 4,
+                Layout::Shared => 5,
             };
             assert_eq!(copied.len(), expected, "{layout:?}: {copied:?}");
             for file in &copied {
@@ -1918,6 +1993,16 @@ source = "git+https://example.com/gitdep#abc"
         script_stdout(profile, layout).with_file_name("root-output")
     }
 
+    fn write_script_stdout(profile: &Path, layout: Layout, text: &str) {
+        write(&script_stdout(profile, layout), text);
+        write(
+            &script_root_output(profile, layout),
+            build_script_out_dir(profile, layout, &unit("dep", HASH))
+                .to_str()
+                .unwrap(),
+        );
+    }
+
     fn cmake_cache(profile: &Path, layout: Layout) -> PathBuf {
         build_script_out_dir(profile, layout, &unit("dep", HASH)).join("build/CMakeCache.txt")
     }
@@ -1926,12 +2011,433 @@ source = "git+https://example.com/gitdep#abc"
     fn record_out_dir_stdout(profile: &Path, layout: Layout) -> PathBuf {
         let out_dir = build_script_out_dir(profile, layout, &unit("dep", HASH));
         let recorded = out_dir.display().to_string();
-        write(
-            &script_stdout(profile, layout),
+        write_script_stdout(
+            profile,
+            layout,
             &format!("cargo:rustc-link-search={recorded}\n"),
         );
-        write(&script_root_output(profile, layout), &recorded);
         out_dir
+    }
+
+    /// Exercise the public seeding path, then remove each donor. Cargo's
+    /// generated-input watcher and native search path must read the consumer.
+    #[test]
+    fn seeded_metadata_survives_donor_removal_and_tracks_generated_inputs() {
+        use crate::build_script_inputs::{Resolved, Resolver, locate, resolve};
+        use crate::cache_key::FileHasher;
+
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("with spaces");
+            let mut donor = donor(&root, "a", layout);
+            let profile = donor.target_dir.join(PROFILE);
+            if layout == Layout::Shared {
+                // The library compile and build-script run are distinct units.
+                std::fs::remove_file(script_stdout(&profile, layout)).unwrap();
+                let _ = std::fs::remove_file(script_root_output(&profile, layout));
+            }
+            let script = unit("dep", OTHER);
+            let script_marker = marker(&profile, layout, &script);
+            write(
+                &script_marker.join(match layout {
+                    Layout::PerUnit => "fingerprint/run",
+                    Layout::Shared => "run",
+                }),
+                "fp",
+            );
+            let old_out = build_script_out_dir(&profile, layout, &script);
+            write(&old_out.join("generated.rs"), "pub const VALUE: u8 = 1;\n");
+            write(&old_out.join("native/libseed.a"), "native fixture");
+            let stdout = crate::cargo_layout::build_script_stdout(&old_out).unwrap();
+            write(
+                &stdout,
+                &format!(
+                    "cargo:rerun-if-changed={}/generated.rs\ncargo::rustc-link-search=native={}/native\ncargo:rustc-env=GENERATED={}/generated.rs\nopaque {}\n",
+                    old_out.display(),
+                    old_out.display(),
+                    old_out.display(),
+                    old_out.display()
+                ),
+            );
+            write(
+                &stdout.with_file_name("root-output"),
+                old_out.to_str().unwrap(),
+            );
+            let depinfo = |profile: &Path| match layout {
+                Layout::PerUnit => {
+                    build_script_out_dir(profile, layout, &unit("dep", HASH)).join("dep.d")
+                }
+                Layout::Shared => profile.join("deps").join(format!("dep-{HASH}.d")),
+            };
+            let make_path = |path: &Path| path.to_str().unwrap().replace(' ', "\\ ");
+            write(
+                &depinfo(&profile),
+                &format!(
+                    "{}: {}\n",
+                    make_path(&depinfo(&profile).with_extension("rlib")),
+                    make_path(&old_out.join("generated.rs")),
+                ),
+            );
+            if layout == Layout::Shared {
+                write(
+                    &profile
+                        .join("build")
+                        .join(format!("dep-{HASH}/build_script_build-{HASH}.d")),
+                    &std::fs::read_to_string(depinfo(&profile)).unwrap(),
+                );
+            }
+            let data_file = |profile: &Path| {
+                build_script_out_dir(profile, layout, &unit("dep", HASH)).join("nested/config.d")
+            };
+            let opaque_data = format!("value: {}/is-data-not-depinfo\n", profile.display());
+            write(&data_file(&profile), &opaque_data);
+            let cache = no_runs();
+            for name in ["b", "c"] {
+                let current = checkout(&root, name);
+                let original = std::fs::read(depinfo(&donor.target_dir.join(PROFILE))).unwrap();
+                let old_mtime = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+                filetime::set_file_mtime(depinfo(&donor.target_dir.join(PROFILE)), old_mtime)
+                    .unwrap();
+                let seeded = seed(
+                    &current,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    cache.path(),
+                    later(),
+                );
+                assert_eq!(seeded.units, 2, "{layout:?}, {name}");
+                assert_eq!(
+                    std::fs::read(depinfo(&donor.target_dir.join(PROFILE))).unwrap(),
+                    original,
+                    "the donor is never rewritten"
+                );
+                std::fs::remove_dir_all(&donor.target_dir).unwrap();
+                let profile = current.target_dir.join(PROFILE);
+                assert_eq!(
+                    filetime::FileTime::from_last_modification_time(
+                        &std::fs::metadata(depinfo(&profile)).unwrap()
+                    ),
+                    old_mtime
+                );
+                let out = build_script_out_dir(&profile, layout, &script);
+                let text = std::fs::read_to_string(depinfo(&profile)).unwrap();
+                let inputs = crate::cache_key::parse_dep_info(&text);
+                assert_eq!(
+                    std::fs::read_to_string(&inputs[0]).unwrap(),
+                    "pub const VALUE: u8 = 1;\n"
+                );
+                assert_eq!(inputs, [out.join("generated.rs")], "{layout:?}, {name}");
+                assert!(text.starts_with(&make_path(&depinfo(&profile).with_extension("rlib"))));
+                assert_eq!(
+                    std::fs::read_to_string(data_file(&profile)).unwrap(),
+                    opaque_data,
+                    "nested .d files retain their data bytes"
+                );
+                if layout == Layout::Shared {
+                    let text = std::fs::read_to_string(
+                        profile
+                            .join("build")
+                            .join(format!("dep-{HASH}/build_script_build-{HASH}.d")),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        crate::cache_key::parse_dep_info(&text),
+                        inputs,
+                        "direct build-script compile dep-info also moves"
+                    );
+                }
+                let stdout = crate::cargo_layout::build_script_stdout(&out).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(stdout.with_file_name("root-output")).unwrap(),
+                    out.to_str().unwrap()
+                );
+                let output = std::fs::read_to_string(&stdout).unwrap();
+                let native = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("cargo::rustc-link-search=native="))
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(Path::new(native).join("libseed.a")).unwrap(),
+                    "native fixture"
+                );
+                assert!(output.contains(&format!(
+                    "cargo:rustc-env=GENERATED={}/generated.rs",
+                    out.display()
+                )));
+                assert!(
+                    output.contains(&format!("opaque {}", old_out.display())),
+                    "non-directive stdout is opaque"
+                );
+
+                // Use the existing declared-input consumer, rather than only
+                // checking that the copied text no longer spells the donor.
+                let rustc_out = match layout {
+                    Layout::PerUnit => build_script_out_dir(&profile, layout, &unit("dep", HASH)),
+                    Layout::Shared => profile.join("deps"),
+                };
+                let invocation = crate::invocation::InvocationEnv::from_parts(
+                    [
+                        ("OUT_DIR", out.clone().into_os_string()),
+                        (
+                            "CARGO_MANIFEST_DIR",
+                            current.workspace_root.clone().into_os_string(),
+                        ),
+                        ("CARGO_PKG_NAME", "dep".into()),
+                        ("CARGO_HOME", root.join("cargo-home").into_os_string()),
+                    ],
+                    Some(current.workspace_root.clone()),
+                    None,
+                    dir.path().to_path_buf(),
+                );
+                let args = crate::args::RustcArgs::parse_for(
+                    &[
+                        "rustc".into(),
+                        "--crate-name".into(),
+                        "dep".into(),
+                        "src/lib.rs".into(),
+                        "--out-dir".into(),
+                        rustc_out.to_str().unwrap().into(),
+                    ],
+                    &invocation,
+                )
+                .unwrap();
+                let var = |key: &str| invocation.var_os(key);
+                let located = locate(&args, &var, Some(&current.workspace_root), false).unwrap();
+                let snapshot = || {
+                    let mut file_hasher = FileHasher::new_for(&invocation);
+                    file_hasher.arm_too_new_guard(1, 0);
+                    let outside = |path: &Path| Ok(path.to_string_lossy().as_bytes().to_vec());
+                    match resolve(
+                        &located,
+                        &Resolver {
+                            file_hasher: &file_hasher,
+                            var: &var,
+                            cache_dir: cache.path(),
+                            excluded: &[],
+                            outside: &outside,
+                            max_entries: 100,
+                        },
+                    )
+                    .unwrap()
+                    {
+                        Resolved::Folded(snapshot) => snapshot,
+                        other => panic!("expected declared inputs, got {other:?}"),
+                    }
+                };
+                let before = snapshot();
+                assert_eq!(before.paths, 1);
+                write(&out.join("generated.rs"), "pub const VALUE: u8 = 200;\n");
+                assert_ne!(
+                    before.digest,
+                    snapshot().digest,
+                    "{layout:?}: generated input changed"
+                );
+                write(&out.join("generated.rs"), "pub const VALUE: u8 = 1;\n");
+                donor = Donor {
+                    target_dir: current.target_dir,
+                    workspace_root: current.workspace_root,
+                    rustc: Some(VERSION.into()),
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn an_older_donors_raw_depinfo_is_not_seeded_again() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let older = donor(dir.path(), "older", layout);
+            let borrower = donor(dir.path(), "borrower", layout);
+            let depinfo = |profile: &Path| match layout {
+                Layout::PerUnit => {
+                    build_script_out_dir(profile, layout, &unit("dep", HASH)).join("dep.d")
+                }
+                Layout::Shared => profile.join("deps").join(format!("dep-{HASH}.d")),
+            };
+            let library = |profile: &Path| match layout {
+                Layout::PerUnit => {
+                    build_script_out_dir(profile, layout, &unit("dep", HASH)).join("lib.rlib")
+                }
+                Layout::Shared => profile.join("deps").join(format!("libdep-{HASH}.rlib")),
+            };
+            let rule = |profile: &Path| {
+                format!(
+                    "{}: registry.rs\n",
+                    library(profile).to_str().unwrap().replace(' ', "\\ ")
+                )
+            };
+            let old_profile = older.target_dir.join(PROFILE);
+            let borrowed_profile = borrower.target_dir.join(PROFILE);
+            write(&depinfo(&old_profile), &rule(&old_profile));
+            std::fs::copy(depinfo(&old_profile), depinfo(&borrowed_profile)).unwrap();
+            std::fs::remove_dir_all(&older.target_dir).unwrap();
+            let current = checkout(dir.path(), "consumer");
+            assert_eq!(
+                seed(
+                    &current,
+                    VERSION,
+                    std::slice::from_ref(&borrower),
+                    no_runs().path(),
+                    later()
+                )
+                .units,
+                0,
+                "{layout:?}: older Kache copied the first donor's rule verbatim"
+            );
+            assert!(
+                !marker(
+                    &current.target_dir.join(PROFILE),
+                    layout,
+                    &unit("dep", HASH)
+                )
+                .exists()
+            );
+
+            // Correct current-donor metadata remains eligible; the registry
+            // dependency is unchanged and is never treated as an output root.
+            write(&depinfo(&borrowed_profile), &rule(&borrowed_profile));
+            let healthy = checkout(dir.path(), "healthy");
+            assert_eq!(
+                seed(&healthy, VERSION, &[borrower], no_runs().path(), later()).units,
+                1,
+                "{layout:?}: a donor-owned rule is still seeded"
+            );
+            assert!(
+                marker(
+                    &healthy.target_dir.join(PROFILE),
+                    layout,
+                    &unit("dep", HASH)
+                )
+                .is_dir()
+            );
+            assert_eq!(
+                std::fs::read_to_string(depinfo(&healthy.target_dir.join(PROFILE))).unwrap(),
+                rule(&healthy.target_dir.join(PROFILE))
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_or_ambiguous_seed_metadata_does_not_publish_a_fingerprint() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            for malformed in [
+                "reserved",
+                "binary",
+                "oversized",
+                "wrong-root",
+                "empty-root",
+                "missing-root",
+                "missing-stdout",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let donor = donor(dir.path(), "a", layout);
+                let from = donor.target_dir.join(PROFILE);
+                let depinfo = match layout {
+                    Layout::PerUnit => {
+                        build_script_out_dir(&from, layout, &unit("dep", HASH)).join("dep.d")
+                    }
+                    Layout::Shared => from.join("deps").join(format!("dep-{HASH}.d")),
+                };
+                match malformed {
+                    "reserved" => write(&depinfo, "output: __kache_root__/source.rs\n"),
+                    "binary" => {
+                        write(&depinfo, "");
+                        std::fs::write(&depinfo, [0xff]).unwrap();
+                    }
+                    "oversized" => {
+                        write(&depinfo, "");
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&depinfo)
+                            .unwrap()
+                            .set_len((16 << 20) + 1)
+                            .unwrap();
+                    }
+                    "wrong-root" => {
+                        write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
+                        write(&script_root_output(&from, layout), "/unrecognized/out");
+                    }
+                    "empty-root" => {
+                        write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
+                        write(&script_root_output(&from, layout), "");
+                    }
+                    "missing-root" => {
+                        write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
+                        let _ = std::fs::remove_file(script_root_output(&from, layout));
+                    }
+                    "missing-stdout" => {
+                        write(
+                            &script_root_output(&from, layout),
+                            build_script_out_dir(&from, layout, &unit("dep", HASH))
+                                .to_str()
+                                .unwrap(),
+                        );
+                        let _ = std::fs::remove_file(script_stdout(&from, layout));
+                    }
+                    _ => unreachable!(),
+                }
+                let current = checkout(dir.path(), "b");
+                assert_eq!(
+                    seed(&current, VERSION, &[donor], no_runs().path(), later()).units,
+                    0,
+                    "{layout:?}: {malformed}"
+                );
+                assert!(
+                    !marker(
+                        &current.target_dir.join(PROFILE),
+                        layout,
+                        &unit("dep", HASH)
+                    )
+                    .exists(),
+                    "{layout:?}: {malformed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unpaired_stdout_from_an_older_or_aliased_donor_does_not_publish_a_fingerprint() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            let dep = unit("dep", HASH);
+            let older = dir.path().join("older/target/debug");
+            #[cfg(unix)]
+            let profiles = {
+                let alias = dir.path().join("elsewhere-profile");
+                std::os::unix::fs::symlink(&from, &alias).unwrap();
+                vec![older, alias]
+            };
+            #[cfg(not(unix))]
+            let profiles = vec![older];
+            let _ = std::fs::remove_file(script_root_output(&from, layout));
+            for (index, profile) in profiles.into_iter().enumerate() {
+                let recorded = build_script_out_dir(&profile, layout, &dep);
+                write(
+                    &script_stdout(&from, layout),
+                    &format!("cargo:rustc-link-search={}\n", recorded.display()),
+                );
+                assert!(
+                    !names_the_donor(&from, layout, &dep, &donor),
+                    "the lexical donor scan cannot resolve this old or aliased record"
+                );
+                let current = checkout(dir.path(), &format!("consumer-{index}"));
+                assert_eq!(
+                    seed(
+                        &current,
+                        VERSION,
+                        std::slice::from_ref(&donor),
+                        no_runs().path(),
+                        later()
+                    )
+                    .units,
+                    0,
+                    "{layout:?}: {recorded:?}"
+                );
+                assert!(!marker(&current.target_dir.join(PROFILE), layout, &dep).exists());
+            }
+        }
     }
 
     #[test]
@@ -2086,7 +2592,7 @@ source = "git+https://example.com/gitdep#abc"
             let donor = donor(dir.path(), "a", layout);
             let from = donor.target_dir.join(PROFILE);
             let dep = unit("dep", HASH);
-            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
             let cache = cmake_cache(&from, layout);
 
             let mut named = donor.clone();
@@ -2132,7 +2638,7 @@ source = "git+https://example.com/gitdep#abc"
                 "{layout:?}: no script record, so out/ is the unit's artifact"
             );
 
-            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
             write(&cache, &format!("{needle}\n"));
             #[cfg(unix)]
             {
@@ -2211,7 +2717,7 @@ source = "git+https://example.com/gitdep#abc"
             let stdout = script_stdout(&from, layout);
             let cache = cmake_cache(&from, layout);
 
-            write(&stdout, "cargo:rustc-cfg=x\n");
+            write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
             write(&cache, "CMAKE_HOME_DIRECTORY:INTERNAL=C:/Users/me/vendor\n");
             assert!(
                 !names_the_donor(&from, layout, &dep, &windows),
@@ -2356,7 +2862,7 @@ source = "git+https://example.com/gitdep#abc"
             let donor = donor(dir.path(), "a", layout);
             let from = donor.target_dir.join(PROFILE);
             let dep = unit("dep", HASH);
-            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
             let cache = cmake_cache(&from, layout);
             write(&cache, "");
             let needle = donor.target_dir.to_string_lossy().into_owned();
@@ -2444,7 +2950,7 @@ source = "git+https://example.com/gitdep#abc"
             let donor = donor(dir.path(), "a", layout);
             let from = donor.target_dir.join(PROFILE);
             let dep = unit("dep", HASH);
-            write(&script_stdout(&from, layout), "cargo:rustc-cfg=x\n");
+            write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
             let cache = cmake_cache(&from, layout);
             write(&cache, "");
             // Sparse, and past the budget on its own, so it is never read.
@@ -2509,7 +3015,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, no_runs().path(), later()).unwrap();
+        place_tree(&from, &to, no_runs().path(), later(), None).unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -2527,7 +3033,8 @@ source = "git+https://example.com/gitdep#abc"
                 &from,
                 &dir.path().join("escaped"),
                 no_runs().path(),
-                later()
+                later(),
+                None
             )
             .is_err()
         );
@@ -2540,7 +3047,8 @@ source = "git+https://example.com/gitdep#abc"
                 &linked_unit,
                 &dir.path().join("whole"),
                 no_runs().path(),
-                later()
+                later(),
+                None
             )
             .is_err()
         );
@@ -2579,6 +3087,15 @@ source = "git+https://example.com/gitdep#abc"
             let cache = cache_storing(&dir.path().join("cache"), &["rlib"]);
             let shared = sealed_run(&cache, &"ab".repeat(32), below);
             std::os::unix::fs::symlink(&shared, run.join("out")).unwrap();
+            let stdout = crate::cargo_layout::build_script_stdout(&run.join("out")).unwrap();
+            write(
+                &stdout,
+                &format!("cargo:rerun-if-changed={}/gen.rs\n", shared.display()),
+            );
+            write(
+                &stdout.with_file_name("root-output"),
+                shared.to_str().unwrap(),
+            );
             let elsewhere = cache_storing(&dir.path().join("other-cache"), &["rlib"]);
             let new = checkout(dir.path(), "b");
             let seeded = seed(
@@ -2606,6 +3123,17 @@ source = "git+https://example.com/gitdep#abc"
                 "pub const N: u8 = 1;"
             );
             assert_eq!(linked_to(&shared, below), vec![to.clone()], "{layout:?}");
+            let stdout = crate::cargo_layout::build_script_stdout(&to).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(stdout.with_file_name("root-output")).unwrap(),
+                to.to_str().unwrap()
+            );
+            let text = std::fs::read(&stdout).unwrap();
+            let declared = crate::build_script::declarations::cargo_declarations(&text, None);
+            assert_eq!(
+                std::fs::read_to_string(&declared.paths[0]).unwrap(),
+                "pub const N: u8 = 1;"
+            );
         }
     }
 
@@ -2654,10 +3182,10 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, no_runs().path(), Instant::now()).unwrap_err();
+        let error = place_tree(&from, &to, no_runs().path(), Instant::now(), None).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, no_runs().path(), later()).unwrap();
+        place_tree(&from, &to, no_runs().path(), later(), None).unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
     }
 
@@ -2703,7 +3231,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&recorded, "");
         std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o751)).unwrap();
         let to = dir.path().join("copy");
-        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap()).unwrap();
+        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap(), None).unwrap();
         let mode = std::fs::metadata(&to).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o751);
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
@@ -2721,7 +3249,7 @@ source = "git+https://example.com/gitdep#abc"
         permissions.set_readonly(true);
         std::fs::set_permissions(&recorded, permissions).unwrap();
         let to = dir.path().join("copy");
-        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap()).unwrap();
+        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap(), None).unwrap();
         assert!(std::fs::metadata(&to).unwrap().permissions().readonly());
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
     }

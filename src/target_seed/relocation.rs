@@ -195,6 +195,47 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reading_metadata_refuses_a_leaf_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("stdout");
+        let linked = dir.path().join("linked-stdout");
+        let text = "cargo:rustc-cfg=seeded\n";
+        std::fs::write(&regular, text).unwrap();
+        std::os::unix::fs::symlink(&regular, &linked).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        assert_eq!(
+            read_text(&regular, deadline).unwrap().as_deref(),
+            Some(text)
+        );
+        assert!(
+            read_text(&linked, deadline).is_err(),
+            "seed metadata must not follow a leaf symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_metadata_propagates_non_missing_lookup_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("stdout");
+        std::fs::write(&anchor, "cargo:rustc-cfg=seeded\n").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        assert_eq!(
+            read_text(&dir.path().join("missing"), deadline).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_text(&anchor.join("child"), deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotADirectory
+        );
+    }
+
     #[test]
     fn stdout_relocation_matches_cargos_directive_value_replay() {
         let original = "opaque /old/out\ncargo:warning=/old/out/value\n cargo::rustc-env=PATH=/old/out/native\ncargo::rerun-if-changed=/old/out/source\n";

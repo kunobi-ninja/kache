@@ -360,20 +360,14 @@ fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
     }
     assert!(std::fs::read_dir(&out).unwrap().next().is_none());
     fixture.success(&mut build("frontend-only/kache.exe"));
-    assert_eq!(
-        outputs(),
-        expected,
-        "the cache restores every compiler output"
-    );
-    let restored = fixture.success(&mut fixture.command(out.join("defaultlib_canary.exe")));
-    assert_eq!(restored.stdout, b"msvc-defaultlib");
     let events = fixture.events(name, 2);
     assert_eq!(
         events
             .iter()
             .map(|event| event["result"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["miss", "local_hit"]
+        ["miss", "local_hit"],
+        "cache events: {events:#?}"
     );
     assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
     assert!(
@@ -381,6 +375,20 @@ fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
             .as_str()
             .is_some_and(|key| !key.is_empty())
     );
+    let restored = outputs();
+    assert_eq!(
+        restored.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "the cache restores every compiler output"
+    );
+    for (name, expected) in &expected {
+        assert!(
+            restored[name] == *expected,
+            "restored {name:?} differs from the stored compiler output"
+        );
+    }
+    let restored = fixture.success(&mut fixture.command(out.join("defaultlib_canary.exe")));
+    assert_eq!(restored.stdout, b"msvc-defaultlib");
 }
 
 #[test]

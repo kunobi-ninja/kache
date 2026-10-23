@@ -15139,3 +15139,87 @@ fn daemon_stats_include_rotated_events() {
     assert_eq!(snapshot.events.local_hits, 12);
     assert_eq!(snapshot.events.misses, 1);
 }
+
+/// Run `work` on a thread and fail the test if it has not finished in 20 s:
+/// the hang these tests guard against must fail them, not stall the run.
+#[cfg(windows)]
+fn within_20s<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the request hung on a stalled daemon pipe")
+}
+
+/// A daemon that stopped accepting: its only pipe instance is taken. A
+/// fire-and-forget request gives up within its wait instead of holding the
+/// wrapper until the pipe frees.
+#[cfg(windows)]
+#[test]
+fn a_fire_and_forget_request_to_a_busy_pipe_gives_up_within_its_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .expect("bind listener");
+    let _first =
+        crate::transport::connect_sync(&socket, Duration::from_millis(300)).expect("first client");
+
+    let started = std::time::Instant::now();
+    let result = within_20s(move || {
+        send_line_fire_and_forget(&socket, "{}\n".to_owned(), Duration::from_millis(500))
+    });
+    let waited = started.elapsed();
+    assert!(result.is_err(), "a busy pipe cannot take the request");
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
+/// A daemon that accepted the pipe but never reads it: a request larger than
+/// the pipe's buffer cannot be written in full. Windows pipes have no send
+/// timeout, so the wait bounds the whole hand-off.
+#[cfg(windows)]
+#[test]
+fn a_fire_and_forget_request_to_a_daemon_that_never_reads_gives_up_within_its_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .expect("bind listener");
+
+    let line = format!("{}\n", "x".repeat(4 << 20));
+    let started = std::time::Instant::now();
+    let result =
+        within_20s(move || send_line_fire_and_forget(&socket, line, Duration::from_millis(500)));
+    let waited = started.elapsed();
+    assert!(result.is_err(), "4 MiB cannot fit in a pipe nobody reads");
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
+/// The same hand-off still delivers its line to a daemon that reads it.
+#[test]
+fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
+    use interprocess::local_socket::traits::Listener as _;
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .expect("bind listener");
+    let line = format!("{{\"pad\":\"{}\"}}\n", "y".repeat(256 << 10));
+    let expected = line.clone();
+    let reader = std::thread::spawn(move || {
+        let stream = listener.accept().expect("accept");
+        let mut received = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut received)
+            .unwrap();
+        received
+    });
+    send_line_fire_and_forget(&socket, line, Duration::from_secs(10)).expect("send");
+    assert_eq!(reader.join().unwrap(), expected);
+}

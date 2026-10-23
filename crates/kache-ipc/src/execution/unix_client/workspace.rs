@@ -1,193 +1,56 @@
-//! Apply engine-selected file operations with the original client's authority.
-
+//! Unix descriptor transport for the shared workspace executor.
+#[cfg(test)]
+use kache_protocol::execution::NativeString;
 use kache_protocol::execution::{
-    NativeString,
     unix::{Reply, Workspace},
+    workspace::Reply as WorkspaceReply,
 };
-use std::os::{
-    fd::{AsFd, AsRawFd},
-    unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        net::UnixDatagram,
-    },
-};
+#[cfg(test)]
+use std::io::Seek;
+#[cfg(test)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::{fd::AsFd, unix::net::UnixDatagram};
+#[cfg(test)]
 use std::{
-    collections::HashMap,
-    fs::{self, File},
-    io::{self, Seek},
+    fs,
     path::{Path, PathBuf},
 };
+use std::{fs::File, io};
 
 #[derive(Default)]
-pub(super) struct Files {
-    next_id: u64,
-    stages: HashMap<u64, Stage>,
-}
-
-struct Stage {
-    file: kache_fs::StagedFile,
-    target: PathBuf,
-}
-
+pub(super) struct Files(super::super::workspace::Files);
 impl Files {
     pub(super) fn execute(
         &mut self,
         operation: Workspace,
         pipes: &UnixDatagram,
     ) -> io::Result<Reply> {
-        // Consume the payload before validating paths or creating a stage.
-        // A rejected operation must not leave its bytes for the next request.
-        let mut input = if matches!(
+        let input = if matches!(
             &operation,
             Workspace::Write { .. } | Workspace::PrepareBytes { .. }
         ) {
-            Some(contents(pipes)?)
+            let mut files = crate::descriptors::receive(pipes.as_fd(), &[0; 16], 1)?;
+            Some(File::from(files.remove(0)))
         } else {
             None
         };
-        match operation {
-            Workspace::Reflink { source, target } => {
-                kache_fs::try_reflink(&path(source)?, &path(target)?)?
-            }
-            Workspace::Copy {
-                source,
-                target,
-                executable,
-            } => {
-                kache_fs::copy_writable(&path(source)?, &path(target)?, executable)?;
-            }
-            Workspace::Hardlink { source, target } => fs::hard_link(path(source)?, path(target)?)?,
-            Workspace::Remove { path: value } => fs::remove_file(path(value)?)?,
-            Workspace::CreateDirectories { path: value } => fs::create_dir_all(path(value)?)?,
-            Workspace::Permissions { path: value, mode } => {
-                fs::set_permissions(path(value)?, permissions(mode)?)?
-            }
-            Workspace::Touch { path: value } => touch(&path(value)?)?,
-            Workspace::Write { path: value, mode } => {
-                let target = path(value)?;
-                let parent = parent(&target)?;
-                fs::create_dir_all(parent)?;
-                let mut stage = kache_fs::StagedFile::new_in(parent, ".kache-restore-")?;
-                let mut input = input
-                    .take()
-                    .ok_or_else(|| super::invalid("missing workspace contents"))?;
-                io::copy(&mut input, stage.writer())?;
-                stage.file_mut().set_permissions(permissions(mode)?)?;
-                stage.replace(&target)?;
-            }
-            Workspace::PrepareFile { source, target } => {
-                let source = path(source)?;
-                let target = path(target)?;
-                let mut stage = kache_fs::StagedFile::new_in(parent(&target)?, ".kache-restore-")?;
-                let reflinked = kache_fs::try_clone_extents_into(&source, stage.file_mut()).is_ok();
-                if !reflinked {
-                    stage.file_mut().set_len(0)?;
-                    stage.file_mut().rewind()?;
-                    io::copy(&mut File::open(source)?, stage.writer())?;
-                }
-                let bytes = stage.file_mut().metadata()?.len();
-                return self.keep(stage, target, bytes, reflinked);
-            }
-            Workspace::PrepareBytes { target } => {
-                let target = path(target)?;
-                let mut stage = kache_fs::StagedFile::new_in(parent(&target)?, ".kache-restore-")?;
-                let bytes = io::copy(
-                    &mut input
-                        .take()
-                        .ok_or_else(|| super::invalid("missing workspace contents"))?,
-                    stage.writer(),
-                )?;
-                return self.keep(stage, target, bytes, false);
-            }
-            Workspace::Publish { id, replace } => {
-                let stage = self.stages.remove(&id).ok_or_else(unknown)?;
-                if replace {
-                    stage.file.replace(&stage.target)?;
-                } else {
-                    stage.file.publish_new(&stage.target)?;
-                }
-            }
-            Workspace::Discard { id } => {
-                drop(self.stages.remove(&id).ok_or_else(unknown)?);
-            }
-        }
-        Ok(Reply::Done)
-    }
-
-    fn keep(
-        &mut self,
-        file: kache_fs::StagedFile,
-        target: PathBuf,
-        bytes: u64,
-        reflinked: bool,
-    ) -> io::Result<Reply> {
-        if self.stages.len() >= 1024 {
-            return Err(io::Error::other("too many staged workspace files"));
-        }
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("workspace file ID exhausted"))?;
-        self.stages.insert(self.next_id, Stage { file, target });
-        Ok(Reply::PreparedFile {
-            id: self.next_id,
-            bytes,
-            reflinked,
+        self.0.execute(operation, input).map(|reply| match reply {
+            WorkspaceReply::Done => Reply::Done,
+            WorkspaceReply::PreparedFile {
+                id,
+                bytes,
+                reflinked,
+            } => Reply::PreparedFile {
+                id,
+                bytes,
+                reflinked,
+            },
         })
     }
 }
-
-fn contents(pipes: &UnixDatagram) -> io::Result<File> {
-    let mut files = crate::descriptors::receive(pipes.as_fd(), &[0; 16], 1)?;
-    Ok(File::from(files.remove(0)))
-}
-
-fn path(value: NativeString) -> io::Result<PathBuf> {
-    let value = PathBuf::from(value.decode().map_err(super::invalid)?);
-    if !value.is_absolute() {
-        return Err(super::invalid("workspace paths must be absolute"));
-    }
-    Ok(value)
-}
-
-fn parent(path: &Path) -> io::Result<&Path> {
-    path.parent()
-        .ok_or_else(|| super::invalid("workspace file has no parent directory"))
-}
-
-fn permissions(mode: u32) -> io::Result<fs::Permissions> {
-    if mode & !0o777 != 0 {
-        return Err(super::invalid("unsupported workspace file mode"));
-    }
-    Ok(fs::Permissions::from_mode(mode))
-}
-
-fn unknown() -> io::Error {
-    super::invalid("unknown staged workspace file")
-}
-
+#[cfg(test)]
 fn touch(path: &Path) -> io::Result<()> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(super::invalid("restored output is not a regular file"));
-    }
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_NOW,
-        },
-    ];
-    if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    super::super::workspace::touch(path)
 }
 
 #[cfg(test)]

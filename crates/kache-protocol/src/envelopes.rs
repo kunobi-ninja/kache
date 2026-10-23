@@ -219,7 +219,7 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<DaemonHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_status: Option<execution::unix::ExecutionStatus>,
+    pub execution_status: Option<execution::ExecutionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_results: Option<Vec<Response>>,
     #[serde(skip_serializing_if = "Option::is_none")]

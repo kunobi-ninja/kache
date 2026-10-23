@@ -5725,8 +5725,7 @@ fn take_prestaged(
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
 ) -> bool {
-    #[cfg(target_os = "linux")]
-    if crate::invocation::io::current().linux_broker().is_some() {
+    if kache_store::workspace::current().is_some() {
         return false;
     }
     strategy == link::LinkStrategy::Copy
@@ -5827,8 +5826,7 @@ fn remember_prestaged_executables(
     shared_loadable: Option<ArtifactKind>,
     meta: &crate::store::EntryMeta,
 ) {
-    #[cfg(target_os = "linux")]
-    if crate::invocation::io::current().linux_broker().is_some() {
+    if kache_store::workspace::current().is_some() {
         return;
     }
     let Some(target_dir) = prestage_target_dir(args) else {

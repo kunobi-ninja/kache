@@ -172,15 +172,8 @@ fn direct_engine_bootstraps_a_daemon_and_keeps_the_platform_process_owner() {
     let fixture = Fixture::new();
     let (engine_pid, status) = fixture.run_compiler(false);
     let parents = fixture.assert_compiler_output(status);
-    // Linux keeps native children in the requesting process on both the
-    // delegated and local paths. macOS still creates them in the daemon.
-    #[cfg(target_os = "linux")]
+    // Every Unix client retains native process creation after handoff.
     assert_eq!(parents, vec![engine_pid]);
-    #[cfg(not(target_os = "linux"))]
-    assert!(
-        parents.iter().all(|parent| *parent != engine_pid),
-        "{parents:?}"
-    );
     assert!(
         parents.iter().all(|parent| *parent == parents[0]),
         "{parents:?}"
@@ -257,9 +250,8 @@ fn trusted_linux_frontend_keeps_native_children_and_reports_execution_separately
     assert_eq!(report["compiler_execution"]["daemon_trust_enabled"], true);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn trusted_linux_pipeline_restores_real_rust_outputs_without_recompiling() {
+fn trusted_unix_pipeline_restores_real_rust_outputs_without_recompiling() {
     let fixture = Fixture::new();
     let mut config = std::fs::read_to_string(&fixture.config).unwrap();
     config.push_str("trust_daemon_execution=true\n");
@@ -321,9 +313,8 @@ fn trusted_linux_pipeline_restores_real_rust_outputs_without_recompiling() {
     assert_eq!(second["local_hits"], 1, "{second}");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn trusted_linux_pipeline_restores_c_objects_through_client_owned_stages() {
+fn trusted_unix_pipeline_restores_c_objects_through_client_owned_stages() {
     let fixture = Fixture::new();
     let mut config = std::fs::read_to_string(&fixture.config).unwrap();
     config.push_str("trust_daemon_execution=true\n");
@@ -368,4 +359,66 @@ fn trusted_linux_pipeline_restores_c_objects_through_client_owned_stages() {
                 .to_string_lossy()
                 .starts_with(".kache-restore-"))
     );
+}
+
+#[test]
+fn killing_a_client_stops_its_native_compiler() {
+    let fixture = Fixture::new();
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str("trust_daemon_execution=true\n");
+    std::fs::write(&fixture.config, config).unwrap();
+    let (_, started) = fixture.run(fixture.command(FRONTEND).args(["daemon", "start"]));
+    assert!(started.success());
+    let marker = fixture.root.path().join("compiler-pid");
+    kache_fs::testutil::write_executable(
+        &fixture.compiler,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$CHILD_RECORD\"\nexec sleep 30\n",
+    );
+    let mut client = fixture
+        .command(FRONTEND)
+        .arg(&fixture.compiler)
+        .arg("--version")
+        .env("CHILD_RECORD", &marker)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(value) = std::fs::read_to_string(&marker)
+            && let Ok(pid) = value.parse::<i32>()
+        {
+            break pid;
+        }
+        if Instant::now() >= ready {
+            let _ = client.kill();
+            let _ = client.wait();
+            panic!("compiler did not start");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    client.kill().unwrap();
+    client.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        #[cfg(target_os = "linux")]
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, state)| state.starts_with('Z'))
+        });
+        #[cfg(not(target_os = "linux"))]
+        let zombie = false;
+        if zombie || unsafe { libc::kill(pid, 0) } != 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // This PID still belongs to the fixture's sleeping compiler.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            panic!("client exit left its compiler alive");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

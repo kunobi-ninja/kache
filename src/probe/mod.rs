@@ -537,7 +537,7 @@ fn run_family_probe_for(program: &str, env: &InvocationEnv) -> Result<Option<Pro
         .stderr(Stdio::null());
 
     let mut child = child_cmd
-        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::STDOUT)
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::process::Stdio::STDOUT)
         .map_err(|_| ())?;
     let mut stdout_handle = child.stdout.take().ok_or(())?;
     let (tx, rx) = std::sync::mpsc::channel();

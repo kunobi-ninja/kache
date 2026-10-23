@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 #[derive(Default)]
 pub(super) struct Client {
+    workspace: super::workspace::Files,
     next_id: u64,
     children: HashMap<u64, Pending>,
     stalled_discovery: bool,
@@ -31,6 +32,32 @@ impl Drop for Pending {
 }
 
 impl Client {
+    pub(super) fn execute_from(
+        &mut self,
+        command: Command,
+        connection: &super::windows::Connection,
+    ) -> Reply {
+        match command {
+            Command::Workspace {
+                request: operation,
+                contents,
+            } => {
+                let result = contents
+                    .map(|value| connection.contents(value))
+                    .transpose()
+                    .and_then(|input| self.workspace.execute(operation, input));
+                match result {
+                    Ok(result) => Reply::Workspace { result },
+                    Err(error) => Reply::Failed {
+                        os_error: error.raw_os_error(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+            command => self.execute(command),
+        }
+    }
+
     pub(super) fn execute(&mut self, command: Command) -> Reply {
         match self.execute_inner(command) {
             Ok(reply) => reply,
@@ -43,6 +70,9 @@ impl Client {
 
     fn execute_inner(&mut self, command: Command) -> io::Result<Reply> {
         match command {
+            Command::Workspace { .. } => Err(invalid(
+                "workspace operation requires an authenticated connection",
+            )),
             Command::DiscoverMsvc(request) => self.discover(request),
             Command::Spawn(spawn) => self.spawn(*spawn),
             Command::Release { id } => {

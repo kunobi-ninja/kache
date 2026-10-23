@@ -27,11 +27,9 @@ mod linux;
 mod macos;
 
 fn peer_may_delegate(stream: &TokioStream, reported_pid: u32, trusted_pipeline: bool) -> bool {
-    #[cfg(not(target_os = "linux"))]
-    let _ = trusted_pipeline;
     #[cfg(target_os = "macos")]
     {
-        macos::peer_may_delegate(stream, reported_pid)
+        macos::peer_may_delegate(stream, reported_pid, trusted_pipeline)
     }
     #[cfg(target_os = "linux")]
     {
@@ -44,7 +42,7 @@ fn peer_may_delegate(stream: &TokioStream, reported_pid: u32, trusted_pipeline: 
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (stream, reported_pid);
+        let _ = (stream, reported_pid, trusted_pipeline);
         false
     }
 }
@@ -53,14 +51,14 @@ fn trusts_pipeline(client: bool, daemon: bool) -> bool {
     client && daemon
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn probe(
     stream: &TokioStream,
     client_pid: u32,
     version: &str,
     client_trust: bool,
     daemon: &Daemon,
-) -> kache_protocol::execution::unix::ExecutionStatus {
+) -> kache_protocol::execution::ExecutionStatus {
     let daemon_trust = daemon.config.trust_daemon_execution;
     let eligible = version == daemon.version
         && peer_may_delegate(
@@ -82,7 +80,7 @@ pub(super) fn probe(
             "local engine: process restrictions or security context are incompatible (client trust: {client_trust}, daemon trust: {daemon_trust})"
         )
     };
-    kache_protocol::execution::unix::ExecutionStatus {
+    kache_protocol::execution::ExecutionStatus {
         eligible,
         client_trust_enabled: client_trust,
         daemon_trust_enabled: daemon_trust,
@@ -97,7 +95,6 @@ struct Prepared {
     executable: PathBuf,
     terminal: bool,
     originals: Vec<i32>,
-    client_processes: bool,
     started_at: Instant,
 }
 
@@ -116,18 +113,13 @@ impl Prepared {
                 && request.creation_mask == kache_client::creation_mask(),
             "compiler file creation policy requires local execution"
         );
-        let (terminal, jobserver, client_processes) = match request.channels {
-            ExecutionChannels::Unix {
-                terminal,
-                jobserver,
-            } => (terminal, jobserver, false),
-            #[cfg(target_os = "linux")]
-            ExecutionChannels::UnixClient {
-                terminal,
-                jobserver,
-                ..
-            } => (terminal, jobserver, true),
-            _ => anyhow::bail!("compiler channels belong to another platform"),
+        let ExecutionChannels::UnixClient {
+            terminal,
+            jobserver,
+            ..
+        } = request.channels
+        else {
+            anyhow::bail!("compiler requires client-owned process creation and restores");
         };
         let vars = request
             .env
@@ -203,7 +195,6 @@ impl Prepared {
             executable,
             terminal,
             originals: jobserver,
-            client_processes,
             started_at,
         })
     }
@@ -215,8 +206,7 @@ impl Prepared {
         daemon: Arc<Daemon>,
     ) -> Result<(ExecutionEntry, PathBuf, Vec<String>, InvocationContext)> {
         let jobserver = kache_ipc::jobserver::Descriptors::new(
-            descriptors
-                .split_off(3 + usize::from(self.terminal) + 2 * usize::from(self.client_processes)),
+            descriptors.split_off(3 + usize::from(self.terminal) + 2),
         )?;
         let vars = kache_ipc::jobserver::rewrite(
             &self.env.vars_os().collect::<Vec<_>>(),
@@ -239,9 +229,8 @@ impl Prepared {
             files.next().context("missing compiler stderr")?,
             self.terminal.then(|| files.next()).flatten(),
         );
-        #[cfg(target_os = "linux")]
-        let io = if self.client_processes {
-            let broker = crate::invocation::linux_broker::Broker::new(
+        let io = {
+            let broker = crate::invocation::unix_broker::Broker::new(
                 files
                     .next()
                     .context("missing native process channel")?
@@ -253,9 +242,7 @@ impl Prepared {
                 env.clone(),
                 jobserver.clone(),
             )?;
-            io.with_linux_broker(broker)?
-        } else {
-            io
+            io.with_unix_broker(broker)?
         };
         Ok((
             self.entry,
@@ -410,7 +397,7 @@ pub(super) async fn handle(
             let _ = incoming?;
             anyhow::bail!("compiler client disconnected or wrote before preparation");
         }
-        result = tokio::time::timeout(PREPARE_TIMEOUT, channel.receive(3 + usize::from(prepared.terminal) + 2 * usize::from(prepared.client_processes) + prepared.originals.len())) => result??,
+        result = tokio::time::timeout(PREPARE_TIMEOUT, channel.receive(3 + usize::from(prepared.terminal) + 2 + prepared.originals.len())) => result??,
     };
     drop(channel);
     let cancellation = Cancellation::default();
@@ -1012,9 +999,10 @@ mod tests {
             cache: None,
             executable: native(std::env::current_exe().unwrap().as_os_str()),
             startup_micros: 0,
-            channels: ExecutionChannels::Unix {
+            channels: ExecutionChannels::UnixClient {
                 terminal: false,
                 jobserver: vec![],
+                trusted_pipeline: false,
             },
         }
     }
@@ -1076,9 +1064,10 @@ mod tests {
                         NativeString::Unix(vec![255]),
                     ),
                 ]);
-                request.channels = ExecutionChannels::Unix {
+                request.channels = ExecutionChannels::UnixClient {
                     terminal,
                     jobserver: jobs.iter().map(|(original, _)| *original).collect(),
+                    trusted_pipeline: false,
                 };
                 let prepared = Prepared::decode(request, crate::VERSION).unwrap();
                 let directory = context.env.cwd().unwrap();
@@ -1093,6 +1082,9 @@ mod tests {
                     .iter()
                     .map(|(original, received)| (*original, received.as_raw_fd()))
                     .collect::<std::collections::BTreeMap<_, _>>();
+                let (_client, control) = UnixStream::pair().unwrap();
+                let (_pipes_client, pipes) = UnixDatagram::pair().unwrap();
+                descriptors.extend([OwnedFd::from(control), OwnedFd::from(pipes)]);
                 descriptors.extend(jobs.into_iter().map(|(_, file)| file));
                 let (_, _, _, received) = prepared
                     .receive(descriptors, Cancellation::default(), daemon.clone())
@@ -1356,8 +1348,15 @@ mod tests {
         let valid = request(&args, &context);
         assert!(Prepared::decode(valid.clone(), crate::VERSION).is_ok());
         type InvalidCase = (&'static str, fn(&mut ExecutionRequest));
-        let cases: [InvalidCase; 13] = [
+        let cases: [InvalidCase; 15] = [
             ("protocol", |r| r.version += 1),
+            ("legacy process-only protocol", |r| r.version = 1),
+            ("legacy daemon-owned processes", |r| {
+                r.channels = ExecutionChannels::Unix {
+                    terminal: false,
+                    jobserver: vec![],
+                }
+            }),
             ("missing creation policy", |r| r.creation_mask = None),
             ("different creation policy", |r| {
                 r.creation_mask = r.creation_mask.map(|mask| mask ^ 0o077)
@@ -1404,9 +1403,10 @@ mod tests {
             assert!(Prepared::decode(request, crate::VERSION).is_err(), "{name}");
         }
         let mut invalid_jobs = valid.clone();
-        invalid_jobs.channels = ExecutionChannels::Unix {
+        invalid_jobs.channels = ExecutionChannels::UnixClient {
             terminal: false,
             jobserver: vec![999],
+            trusted_pipeline: false,
         };
         assert!(Prepared::decode(invalid_jobs, crate::VERSION).is_err());
         let mut native_value = valid;
@@ -1440,7 +1440,13 @@ mod tests {
         else {
             panic!("server not ready: {line}");
         };
-        let files = context.io.transfer_files().unwrap().0;
+        let mut files = context.io.transfer_files().unwrap().0;
+        let (_client, control) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_pipes_client, pipes) = UnixDatagram::pair().unwrap();
+        files.extend([
+            File::from(OwnedFd::from(control)),
+            File::from(OwnedFd::from(pipes)),
+        ]);
         let socket = UnixDatagram::unbound().unwrap();
         socket
             .connect(PathBuf::from(ticket.endpoint.decode().unwrap()))
@@ -1527,21 +1533,22 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let (socket, daemon, _, server) = server(root.path(), 1, 1).await;
-        let (args, context) = fixture(root.path(), "disconnected");
-        let path = context.env.cwd().unwrap().to_owned();
-        let (stream, _) = prepare_client(&socket, request(&args, &context), &context).await;
-        (&stream).write_all(b"\"commit\"\n").await.unwrap();
-        let line = read_bounded_line(&mut BufReader::new(&stream), &mut Vec::new())
-            .await
-            .unwrap()
+        let path = root.path().join("disconnected");
+        let mut client = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::execution::tests::execution_cancellable_client_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_EXECUTION_ROOT", root.path())
+            .env("KACHE_TEST_EXECUTION_SOCKET", &socket)
+            .spawn()
             .unwrap();
-        assert!(matches!(
-            serde_json::from_str(&line).unwrap(),
-            ExecutionReply::Accepted
-        ));
         ready(&path.join("ready")).await;
         let start = Instant::now();
-        drop(stream);
+        client.kill().unwrap();
+        client.wait().unwrap();
         let results = tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .unwrap()
@@ -1568,6 +1575,15 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+
+    #[test]
+    #[ignore = "client process for the native cancellation regression"]
+    fn execution_cancellable_client_fixture() {
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_EXECUTION_ROOT").unwrap());
+        let socket = PathBuf::from(std::env::var_os("KACHE_TEST_EXECUTION_SOCKET").unwrap());
+        let (args, context) = fixture(&root, "disconnected");
+        let _ = crate::invocation::execution::try_execute(&socket, &args, &context);
     }
 
     #[test]
@@ -1695,14 +1711,29 @@ mod tests {
     fn execution_sandboxed_client_fixture() {
         let root = PathBuf::from(std::env::var_os("KACHE_TEST_EXECUTION_ROOT").unwrap());
         let socket = PathBuf::from(std::env::var_os("KACHE_TEST_EXECUTION_SOCKET").unwrap());
-        let (args, context) = fixture(&root, "restricted");
+        let (args, mut context) = fixture(&root, "restricted");
+        let trusted =
+            std::env::var_os("KACHE_TEST_TRUST").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let allowed =
+            std::env::var_os("KACHE_TEST_ALLOWED").as_deref() == Some(std::ffi::OsStr::new("1"));
         let path = context.env.cwd().unwrap().to_owned();
+        let denied = root.join("denied/output");
+        context.env.set("DENIED_OUTPUT", &denied);
+        let program = PathBuf::from(&args[0]);
+        let script = std::fs::read_to_string(&program).unwrap().replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif printf forbidden > \"$DENIED_OUTPUT\"; then exit 99; fi\n",
+            1,
+        );
+        std::fs::write(program, script).unwrap();
         std::fs::write(path.join("release"), b"go").unwrap();
         assert_eq!(
-            crate::invocation::execution::try_execute(&socket, &args, &context).unwrap(),
-            None
+            crate::invocation::execution::try_execute_with_trust(&socket, &args, &context, trusted)
+                .unwrap(),
+            allowed.then_some(7)
         );
-        assert!(!path.join("record").exists());
+        assert_eq!(path.join("record").exists(), allowed);
+        assert!(!denied.exists());
     }
 
     #[cfg(target_os = "macos")]
@@ -1715,37 +1746,54 @@ mod tests {
     #[tokio::test]
     #[ignore = "bounded subprocess fixture"]
     async fn fixture_execution_rejects_sandboxed_client_using_kernel_identity() {
-        let root = tempfile::tempdir().unwrap();
-        let root_path = root.path().canonicalize().unwrap();
-        let (socket, daemon, _, server) = server(&root_path, 1, 1).await;
-        let denied = root_path.join("denied");
-        std::fs::create_dir(&denied).unwrap();
-        let profile = format!(
-            "(version 1)(allow default)(deny file-write* (subpath \"{}\"))",
-            denied.display()
-        );
-        let output = crate::platform::host_output_async(
-            tokio::process::Command::new("/usr/bin/sandbox-exec")
-                .arg("-p")
-                .arg(profile)
-                .arg(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "daemon::execution::tests::execution_sandboxed_client_fixture",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("KACHE_TEST_EXECUTION_ROOT", &root_path)
-                .env("KACHE_TEST_EXECUTION_SOCKET", socket)
-                .kill_on_drop(true),
-        )
-        .await
-        .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert!(server.await.unwrap()[0].is_ok());
-        assert!(!root_path.join("restricted/record").exists());
-        assert_eq!(daemon.execution_workers.available_permits(), 1);
+        for (client_trust, daemon_trust) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let root_path = root.path().canonicalize().unwrap();
+            let (socket, daemon, _, server) =
+                server_with_trust(&root_path, 1, 1, daemon_trust).await;
+            let denied = root_path.join("denied");
+            std::fs::create_dir(&denied).unwrap();
+            let profile = format!(
+                "(version 1)(allow default)(deny file-write* (subpath \"{}\"))",
+                denied.display()
+            );
+            let output = crate::platform::host_output_async(
+                tokio::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-p")
+                    .arg(profile)
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "daemon::execution::tests::execution_sandboxed_client_fixture",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("KACHE_TEST_TRUST", if client_trust { "1" } else { "0" })
+                    .env(
+                        "KACHE_TEST_ALLOWED",
+                        if client_trust && daemon_trust {
+                            "1"
+                        } else {
+                            "0"
+                        },
+                    )
+                    .env("KACHE_TEST_EXECUTION_ROOT", &root_path)
+                    .env("KACHE_TEST_EXECUTION_SOCKET", socket)
+                    .kill_on_drop(true),
+            )
+            .await
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(server.await.unwrap()[0].is_ok());
+            assert_eq!(
+                root_path.join("restricted/record").exists(),
+                client_trust && daemon_trust
+            );
+            assert_eq!(daemon.execution_workers.available_permits(), 1);
+        }
     }
 }

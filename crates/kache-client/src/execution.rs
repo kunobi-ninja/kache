@@ -67,7 +67,7 @@ impl Execution<'_> {
     }
 
     fn prepare(&self, trusted_pipeline: bool) -> Result<Prepared> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         let _ = trusted_pipeline;
         #[cfg(unix)]
         anyhow::ensure!(
@@ -82,12 +82,7 @@ impl Execution<'_> {
         let env = self.env.vars_os().collect::<Vec<_>>();
         #[cfg(unix)]
         let (originals, jobserver) = kache_ipc::jobserver::capture(&env)?;
-        #[cfg(all(unix, not(target_os = "linux")))]
-        let channels = ExecutionChannels::Unix {
-            terminal: self.terminal,
-            jobserver: originals,
-        };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let channels = ExecutionChannels::UnixClient {
             terminal: self.terminal,
             jobserver: originals,
@@ -225,15 +220,12 @@ mod tests {
                     version: EXECUTION_VERSION,
                     descriptors: Some(ticket.clone()),
                 });
-                let mut transferred = kache_ipc::descriptors::receive(
-                    datagram.as_fd(),
-                    &ticket.key,
-                    if cfg!(target_os = "linux") { 5 } else { 3 },
-                )
-                .unwrap()
-                .into_iter()
-                .map(File::from)
-                .collect::<Vec<_>>();
+                let mut transferred =
+                    kache_ipc::descriptors::receive(datagram.as_fd(), &ticket.key, 5)
+                        .unwrap()
+                        .into_iter()
+                        .map(File::from)
+                        .collect::<Vec<_>>();
                 let mut input = Vec::new();
                 transferred[0].read_to_end(&mut input).unwrap();
                 assert_eq!(input, b"client-input");

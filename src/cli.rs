@@ -8220,7 +8220,6 @@ pub fn doctor(
             detail,
             fix: fix_hint,
         });
-        #[cfg(target_os = "linux")]
         if healthy_daemon_reachable {
             checks.push(match crate::daemon::compiler_execution_status(cfg) {
                 Ok(status) => Check {
@@ -10712,7 +10711,7 @@ struct SetupResult {
     service_installed: bool,
     daemon_running: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    compiler_execution: Option<kache_protocol::execution::unix::ExecutionStatus>,
+    compiler_execution: Option<kache_protocol::execution::ExecutionStatus>,
 }
 
 /// What `kache init` found before it changes anything, or what a run did,
@@ -11419,12 +11418,10 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         println!("  Background cache setup failed. Run kache doctor for details.\n");
         anyhow::bail!("init did not complete: daemon not reachable");
     }
-    #[cfg(target_os = "linux")]
     let compiler_execution = config
         .as_ref()
         .and_then(|config| crate::daemon::compiler_execution_status(config).ok());
-    #[cfg(not(target_os = "linux"))]
-    let compiler_execution: Option<kache_protocol::execution::unix::ExecutionStatus> = None;
+
     if let Some(status) = &compiler_execution {
         println!("  Compiler execution: {}", status.detail);
     }

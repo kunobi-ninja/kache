@@ -12,7 +12,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, SECURITY_IDENTIFICATION,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
 };
 
 pub(super) const MAX_REPLY_BYTES: u64 = 8 << 20;
@@ -48,7 +49,7 @@ impl PeerSecurity {
             })?;
         let process = unsafe {
             OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                 0,
                 pid,
             )
@@ -151,6 +152,47 @@ impl Connection {
             peer,
             write_capacity: write_capacity as usize,
         })
+    }
+
+    pub(super) fn contents(&self, value: u64) -> io::Result<std::fs::File> {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        self.peer.verify(&self.inner)?;
+        let value = usize::try_from(value)
+            .ok()
+            .filter(|value| *value != 0 && isize::try_from(*value).is_ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid restore contents handle",
+                )
+            })?;
+        let mut handle = std::ptr::null_mut();
+        if unsafe {
+            DuplicateHandle(
+                self.peer.process.as_raw_handle(),
+                value as _,
+                GetCurrentProcess(),
+                &mut handle,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let file = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(handle) });
+        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK
+            || !file.metadata()?.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "restore contents must be a regular file",
+            ));
+        }
+        Ok(file)
     }
 
     pub(super) fn prepare_commit(&self) -> Result<()> {

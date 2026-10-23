@@ -2,10 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 
+pub mod process;
 pub mod unix;
 pub mod windows;
+pub mod workspace;
 
-pub const EXECUTION_VERSION: u32 = 1;
+/// Version 2 requires client-owned restores on every supported platform.
+pub const EXECUTION_VERSION: u32 = 2;
 
 /// Native strings retain Unix bytes or Windows UTF-16, including values that
 /// cannot be represented by a Rust String. A receiver rejects a foreign encoding.
@@ -116,7 +119,7 @@ impl std::fmt::Debug for ExecutionRequest {
 pub enum ExecutionChannels {
     /// Descriptors arrive in stdin/stdout/stderr, optional terminal, jobserver order.
     Unix { terminal: bool, jobserver: Vec<i32> },
-    /// Linux clients retain native process creation. Two private broker
+    /// Unix clients retain native process creation. Two private broker
     /// descriptors follow the standard streams and precede the jobserver.
     UnixClient {
         terminal: bool,
@@ -183,6 +186,14 @@ impl std::fmt::Debug for DescriptorTicket {
             .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionStatus {
+    pub eligible: bool,
+    pub client_trust_enabled: bool,
+    pub daemon_trust_enabled: bool,
+    pub detail: String,
 }
 
 #[cfg(test)]

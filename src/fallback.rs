@@ -125,8 +125,11 @@ mod sandbox;
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub(crate) fn compiler_peer_unrestricted(token: kache_ipc::PeerAuditToken) -> bool {
-    macos::compiler_peer_unrestricted(token)
+pub(crate) fn compiler_peer_may_delegate(
+    token: kache_ipc::PeerAuditToken,
+    trusted_pipeline: bool,
+) -> bool {
+    macos::compiler_peer_may_delegate(token, trusted_pipeline)
 }
 
 #[cfg(test)]

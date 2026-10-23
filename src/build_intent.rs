@@ -373,7 +373,7 @@ fn run_bounded(
     use std::io::Read;
 
     let mut child = command
-        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::STDOUT)
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::process::Stdio::STDOUT)
         .map_err(|_| DiscoveryFailure::Spawn)?;
     let Some(mut stdout) = child.stdout.take() else {
         return Err(DiscoveryFailure::Spawn);

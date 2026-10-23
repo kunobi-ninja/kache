@@ -139,6 +139,25 @@ impl Broker {
     }
 }
 
+impl kache_store::workspace::Workspace for Broker {
+    fn execute(
+        &self,
+        operation: kache_store::workspace::Operation<'_>,
+    ) -> io::Result<kache_store::workspace::Outcome> {
+        use std::os::windows::io::AsRawHandle;
+        super::workspace::execute(&self.env, operation, |operation, contents| {
+            let contents = contents.map(|file| file.as_raw_handle() as usize as u64);
+            match self.call(Command::Workspace {
+                request: operation,
+                contents,
+            })? {
+                Reply::Workspace { result } => Ok(result),
+                _ => Err(io::Error::other("invalid workspace operation response")),
+            }
+        })
+    }
+}
+
 fn disconnected() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "compiler frontend disconnected")
 }

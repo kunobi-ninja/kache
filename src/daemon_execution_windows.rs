@@ -17,6 +17,29 @@ use tokio::io::AsyncReadExt;
 
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub(super) fn probe(
+    stream: &TokioStream,
+    client_pid: u32,
+    version: &str,
+    client_trust: bool,
+    daemon: &Daemon,
+) -> kache_protocol::execution::ExecutionStatus {
+    let eligible = version == daemon.version
+        && PeerProcess::for_connection(stream, client_pid)
+            .is_ok_and(|peer| peer.permits_delegation().unwrap_or(false));
+    kache_protocol::execution::ExecutionStatus {
+        eligible,
+        client_trust_enabled: client_trust,
+        daemon_trust_enabled: daemon.config.trust_daemon_execution,
+        detail: if eligible {
+            "client process and restore broker"
+        } else {
+            "local engine: release or process security context is incompatible"
+        }
+        .into(),
+    }
+}
+
 struct Prepared {
     entry: ExecutionEntry,
     args: Vec<String>,

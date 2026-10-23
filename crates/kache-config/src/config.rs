@@ -496,7 +496,7 @@ pub struct Config {
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
     /// Permit a trusted daemon's pipeline to access the workspace under its
-    /// own restrictions. Linux native children still run in the client.
+    /// own restrictions. Native children and restores still run in the client.
     /// Disabled unless `KACHE_TRUST_DAEMON_EXECUTION=1` or
     /// `[cache] trust_daemon_execution = true` is set on both peers.
     pub trust_daemon_execution: bool,

@@ -1,6 +1,6 @@
-//! Process operations on a private, invocation-owned Linux broker connection.
+//! Process operations on a private, invocation-owned Unix broker connection.
 
-use super::{NativeString, windows::Spawn};
+use super::process::Spawn;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,71 +48,12 @@ pub enum Reply {
 /// Stream framing is bounded independently of compiler output pipes.
 pub const MAX_FRAME_BYTES: u64 = 8 << 20;
 
+pub use super::{ExecutionStatus, workspace::Command as Workspace};
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn control_frames_allow_eight_mebibytes() {
         assert_eq!(super::MAX_FRAME_BYTES, 8_388_608);
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionStatus {
-    pub eligible: bool,
-    pub client_trust_enabled: bool,
-    pub daemon_trust_enabled: bool,
-    pub detail: String,
-}
-
-/// Placement and restore policy stay in the engine. These operations execute
-/// with the original client's filesystem permissions and syscall filters.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "file_operation", rename_all = "snake_case")]
-pub enum Workspace {
-    Reflink {
-        source: NativeString,
-        target: NativeString,
-    },
-    Copy {
-        source: NativeString,
-        target: NativeString,
-        executable: bool,
-    },
-    Hardlink {
-        source: NativeString,
-        target: NativeString,
-    },
-    Remove {
-        path: NativeString,
-    },
-    CreateDirectories {
-        path: NativeString,
-    },
-    Permissions {
-        path: NativeString,
-        mode: u32,
-    },
-    Touch {
-        path: NativeString,
-    },
-    /// Contents arrive as one descriptor over the private datagram channel.
-    Write {
-        path: NativeString,
-        mode: u32,
-    },
-    PrepareFile {
-        source: NativeString,
-        target: NativeString,
-    },
-    /// Like Write, but retain a stage until Publish or Discard.
-    PrepareBytes {
-        target: NativeString,
-    },
-    Publish {
-        id: u64,
-        replace: bool,
-    },
-    Discard {
-        id: u64,
-    },
 }

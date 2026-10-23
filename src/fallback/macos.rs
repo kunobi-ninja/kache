@@ -99,9 +99,12 @@ fn process_path(pid: i32) -> Option<PathBuf> {
 type SandboxCheck =
     unsafe extern "C" fn(libc::pid_t, *const libc::c_char, libc::c_int, ...) -> libc::c_int;
 
-/// A compiler task cannot inherit another process's Seatbelt policy. Unknown
-/// policy and sandboxed peers stay on the client's local execution path.
-pub(super) fn compiler_peer_unrestricted(token: kache_ipc::PeerAuditToken) -> bool {
+/// Native children stay in the client. Pipeline reads still use daemon authority,
+/// so sandboxed peers require explicit trust and unknown policy stays local.
+pub(super) fn compiler_peer_may_delegate(
+    token: kache_ipc::PeerAuditToken,
+    trusted_pipeline: bool,
+) -> bool {
     type CheckToken = unsafe extern "C" fn(
         kache_ipc::PeerAuditToken,
         *const libc::c_char,
@@ -117,8 +120,9 @@ pub(super) fn compiler_peer_unrestricted(token: kache_ipc::PeerAuditToken) -> bo
     }
     let check: CheckToken = unsafe { std::mem::transmute(check) };
     unsafe {
-        check(token, std::ptr::null(), 0) == 0
-            && (policy.check)(libc::getpid(), std::ptr::null(), 0) == 0
+        let peer = check(token, std::ptr::null(), 0);
+        let daemon = (policy.check)(libc::getpid(), std::ptr::null(), 0);
+        sandbox::permits_pipeline(peer, daemon, trusted_pipeline)
     }
 }
 struct Policy {

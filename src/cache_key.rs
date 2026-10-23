@@ -9311,7 +9311,7 @@ pub(crate) fn run_dep_info_pass_for(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .invocation_capture_with_io(kache_protocol::execution::windows::Stdio::STDERR)
+        .invocation_capture_with_io(kache_protocol::execution::process::Stdio::STDERR)
         .context("running rustc --emit=dep-info")?;
     // One extra rustc start per invocation, hit or miss. Counted and timed so
     // the event log can show what removing it would buy (`dep_info_runs`,
@@ -9836,7 +9836,7 @@ pub(crate) fn rustc_accepts_cwd_remap_for(
         command.arg("-Zallow-features=");
     }
     let mut child = command
-        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::QUIET)
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::process::Stdio::QUIET)
         .ok()?;
     let start = Instant::now();
     loop {

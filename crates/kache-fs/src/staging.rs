@@ -15,6 +15,14 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct StagedFile {
     file: tempfile::NamedTempFile,
+    cloned: Option<Clone>,
+}
+
+#[derive(Debug)]
+struct Clone {
+    file: File,
+    path: std::path::PathBuf,
+    _directory: tempfile::TempDir,
 }
 
 impl StagedFile {
@@ -30,17 +38,60 @@ impl StagedFile {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(std::fs::Permissions::from_mode(0o666));
         }
-        builder.tempfile_in(directory).map(|file| Self { file })
+        builder
+            .tempfile_in(directory)
+            .map(|file| Self { file, cloned: None })
     }
 
     /// Access the temporary-file writer for streaming bytes into the stage.
     pub fn writer(&mut self) -> &mut impl io::Write {
-        &mut self.file
+        self.file_mut()
     }
 
     /// Access the open file for explicit synchronization or metadata changes.
     pub fn file_mut(&mut self) -> &mut File {
-        self.file.as_file_mut()
+        match &mut self.cloned {
+            Some(clone) => &mut clone.file,
+            None => self.file.as_file_mut(),
+        }
+    }
+
+    /// Clone cached bytes while retaining the stage's writable creation mode.
+    /// A private sibling directory supplies the absent pathname required by APFS.
+    pub fn try_clone_from(&mut self, source: &Path) -> io::Result<()> {
+        let in_place = crate::try_clone_extents_into(source, self.file_mut());
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            in_place
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            if in_place.is_ok() {
+                return Ok(());
+            }
+            let permissions = self.file_mut().metadata()?.permissions();
+            let directory = tempfile::Builder::new()
+                .prefix(".kache-clone-")
+                .tempdir_in(
+                    self.file
+                        .path()
+                        .parent()
+                        .ok_or_else(|| io::Error::other("stage has no parent"))?,
+                )?;
+            let path = directory.path().join("artifact");
+            crate::try_reflink(source, &path)?;
+            std::fs::set_permissions(&path, permissions)?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            self.cloned = Some(Clone {
+                file,
+                path,
+                _directory: directory,
+            });
+            Ok(())
+        }
     }
 
     /// Publish at an absent destination, refusing an existing directory entry.
@@ -48,6 +99,9 @@ impl StagedFile {
     /// The destination must be on the stage's filesystem. This preserves
     /// `tempfile`'s create-only publication semantics without an existence check.
     pub fn publish_new(self, target: &Path) -> io::Result<()> {
+        if let Some(clone) = self.cloned {
+            return std::fs::hard_link(&clone.path, target);
+        }
         self.file
             .persist_noclobber(target)
             .map(|_| ())
@@ -59,6 +113,9 @@ impl StagedFile {
     /// The destination must be on the stage's filesystem. The caller must decide
     /// whether replacement is permitted; this method does not inspect the target.
     pub fn replace(self, target: &Path) -> io::Result<()> {
+        if let Some(clone) = self.cloned {
+            return std::fs::rename(&clone.path, target);
+        }
         self.file
             .persist(target)
             .map(|_| ())
@@ -72,6 +129,28 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cloned_stages_keep_writable_modes_and_publish_independent_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("blob");
+        let probe = root.path().join("clone-probe");
+        let target = root.path().join("output");
+        fs::write(&source, b"cached").unwrap();
+        if crate::try_reflink(&source, &probe).is_err() {
+            return;
+        }
+        fs::remove_file(probe).unwrap();
+        let mut stage = StagedFile::new_in(root.path(), ".stage-").unwrap();
+        let expected = stage.file_mut().metadata().unwrap().permissions();
+        stage.try_clone_from(&source).unwrap();
+        assert_eq!(stage.file_mut().metadata().unwrap().permissions(), expected);
+        stage.writer().write_all(b"edited").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"cached");
+        stage.publish_new(&target).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"edited");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
 
     fn entries(directory: &Path) -> Vec<PathBuf> {
         let mut paths: Vec<_> = fs::read_dir(directory)

@@ -3,15 +3,23 @@
 use super::InvocationEnv;
 use kache_protocol::execution::{
     NativeString,
+    process::{Spawn, Stdio, Stream},
     unix::{Command, MAX_FRAME_BYTES, Reply},
-    windows::{Spawn, Stdio, Stream},
 };
-use std::io::{self, BufRead, BufReader, Read, Seek, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn can_track_client(pid: u32) -> bool {
+    macos::Identity::capture(pid).is_ok()
+}
 
 pub(crate) struct Broker {
     channel: Mutex<Channel>,
@@ -156,6 +164,29 @@ impl Broker {
         let Reply::Spawned { id, pid } = reply else {
             return Err(io::Error::other("invalid native compiler spawn response"));
         };
+        #[cfg(target_os = "macos")]
+        let identity = match macos::Identity::capture(pid) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                // An instant compiler may already be a zombie before its task
+                // port can be pinned. Its status remains owned by the client.
+                if matches!(
+                    self.call(Command::TryWait { id }, 0),
+                    Ok((
+                        Reply::Waited {
+                            status: Some(_),
+                            ..
+                        },
+                        _
+                    ))
+                ) {
+                    None
+                } else {
+                    let _ = self.done(Command::Release { id });
+                    return Err(error);
+                }
+            }
+        };
         let mut files = files.into_iter();
         let mut next = |mode| {
             if mode == Stream::Pipe {
@@ -169,6 +200,8 @@ impl Broker {
                 id,
                 pid,
                 broker: Arc::clone(self),
+                #[cfg(target_os = "macos")]
+                identity,
             },
             stdin: next(stdio.stdin).map(ChildStdin::from),
             stdout: next(stdio.stdout).map(ChildStdout::from),
@@ -189,86 +222,25 @@ impl kache_store::workspace::Workspace for Broker {
         &self,
         operation: kache_store::workspace::Operation<'_>,
     ) -> io::Result<kache_store::workspace::Outcome> {
-        use kache_protocol::execution::unix::Workspace;
-        use kache_store::workspace::{Operation, Outcome};
-        let path = |path: &std::path::Path| {
-            self.env
-                .resolve(path)
-                .map(|path| NativeString::capture(path.as_os_str()))
-                .ok_or_else(|| io::Error::other("workspace path cannot be resolved"))
-        };
-        let mut content = None;
-        let command = match operation {
-            Operation::Reflink(source, target) => Workspace::Reflink {
-                source: path(source)?,
-                target: path(target)?,
-            },
-            Operation::Copy(source, target, executable) => Workspace::Copy {
-                source: path(source)?,
-                target: path(target)?,
-                executable,
-            },
-            Operation::Hardlink(source, target) => Workspace::Hardlink {
-                source: path(source)?,
-                target: path(target)?,
-            },
-            Operation::Remove(value) => Workspace::Remove { path: path(value)? },
-            Operation::CreateDirectories(value) => {
-                Workspace::CreateDirectories { path: path(value)? }
+        super::workspace::execute(&self.env, operation, |operation, contents| {
+            match self
+                .call_with_contents(Command::Workspace(operation), 0, contents)?
+                .0
+            {
+                Reply::Done => Ok(kache_protocol::execution::workspace::Reply::Done),
+                Reply::PreparedFile {
+                    id,
+                    bytes,
+                    reflinked,
+                } => Ok(kache_protocol::execution::workspace::Reply::PreparedFile {
+                    id,
+                    bytes,
+                    reflinked,
+                }),
+                _ => Err(io::Error::other("invalid workspace operation response")),
             }
-            Operation::Permissions(value, mode) => Workspace::Permissions {
-                path: path(value)?,
-                mode: mode & 0o777,
-            },
-            Operation::Touch(value) => Workspace::Touch { path: path(value)? },
-            Operation::Write(value, bytes, mode) => {
-                content = Some(content_file(bytes)?);
-                Workspace::Write {
-                    path: path(value)?,
-                    mode,
-                }
-            }
-            Operation::PrepareFile(source, target) => Workspace::PrepareFile {
-                source: path(source)?,
-                target: path(target)?,
-            },
-            Operation::PrepareBytes(target, bytes) => {
-                content = Some(content_file(bytes)?);
-                Workspace::PrepareBytes {
-                    target: path(target)?,
-                }
-            }
-            Operation::Publish(id, replace) => Workspace::Publish { id, replace },
-            Operation::Discard(id) => Workspace::Discard { id },
-        };
-        match self
-            .call_with_contents(Command::Workspace(command), 0, content.as_ref())?
-            .0
-        {
-            Reply::Done => Ok(Outcome::Done),
-            Reply::PreparedFile {
-                id,
-                bytes,
-                reflinked,
-            } => Ok(Outcome::Prepared {
-                id,
-                bytes,
-                reflinked,
-            }),
-            _ => Err(io::Error::other("invalid workspace operation response")),
-        }
+        })
     }
-}
-
-fn content_file(bytes: &[u8]) -> io::Result<std::fs::File> {
-    let fd = unsafe { libc::memfd_create(c"kache-restore".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(bytes)?;
-    file.rewind()?;
-    Ok(file)
 }
 
 pub(crate) struct Child {
@@ -284,6 +256,8 @@ enum Inner {
         id: u64,
         pid: u32,
         broker: Arc<Broker>,
+        #[cfg(target_os = "macos")]
+        identity: Option<macos::Identity>,
     },
 }
 
@@ -321,7 +295,19 @@ impl Child {
     pub(crate) fn kill(&mut self) -> io::Result<()> {
         match &mut self.inner {
             Inner::Local(child) => child.kill(),
-            Inner::Remote { id, broker, .. } => broker.done(Command::Kill { id: *id }),
+            Inner::Remote { id, broker, .. } => {
+                let result = broker.done(Command::Kill { id: *id });
+                #[cfg(target_os = "macos")]
+                if result.is_err()
+                    && let Inner::Remote {
+                        identity: Some(identity),
+                        ..
+                    } = &self.inner
+                {
+                    identity.kill_if_unchanged();
+                }
+                result
+            }
         }
     }
 
@@ -339,13 +325,26 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if let Inner::Remote { id, broker, .. } = &self.inner {
-            let _ = broker.done(Command::Release { id: *id });
+            let released = broker.done(Command::Release { id: *id });
+            #[cfg(target_os = "macos")]
+            if released.is_err()
+                && let Inner::Remote {
+                    identity: Some(identity),
+                    ..
+                } = &self.inner
+            {
+                identity.kill_if_unchanged();
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = released;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::super::workspace::content_file;
     use super::*;
 
     fn sized_frame(bytes: usize) -> Command {
@@ -421,11 +420,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn content_files_accept_descriptor_zero_and_propagate_creation_errors() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "invocation::linux_broker::tests::content_descriptor_fixture",
+                "invocation::unix_broker::tests::content_descriptor_fixture",
                 "--ignored",
                 "--nocapture",
             ])
@@ -436,6 +436,7 @@ mod tests {
 
     #[test]
     #[ignore = "isolated process closes stdin and changes its descriptor limit"]
+    #[cfg(target_os = "linux")]
     fn content_descriptor_fixture() {
         unsafe {
             libc::close(0);
@@ -513,6 +514,8 @@ mod tests {
                     id: 5,
                     pid: 7,
                     broker,
+                    #[cfg(target_os = "macos")]
+                    identity: Some(macos::Identity::stale_for_test(7)),
                 },
                 stdin: None,
                 stdout: None,

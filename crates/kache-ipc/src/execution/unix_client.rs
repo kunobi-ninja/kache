@@ -2,8 +2,8 @@
 
 use kache_protocol::execution::{
     ExecutionChannels, ExecutionRequest,
+    process::{Spawn, Stdio as Plan, Stream},
     unix::{Command, MAX_FRAME_BYTES, Reply},
-    windows::{Spawn, Stdio as Plan, Stream},
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -258,7 +258,9 @@ impl Client {
             .stdout(self.stream(stdout, 1)?)
             .stderr(self.stream(stderr, 2)?);
         command.process_group(0);
+        #[cfg(target_os = "linux")]
         let parent = std::process::id();
+        #[cfg(target_os = "linux")]
         unsafe {
             command.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
@@ -341,6 +343,7 @@ mod tests {
     use std::io::{Read, Seek, Write};
     use std::os::unix::process::ExitStatusExt;
 
+    #[cfg(target_os = "linux")]
     fn isolated_test(name: &str) {
         let root = tempfile::tempdir().unwrap();
         let stdout = root.path().join("stdout");
@@ -348,7 +351,7 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                &format!("execution::linux_client::tests::{name}"),
+                &format!("execution::unix_client::tests::{name}"),
                 "--ignored",
                 "--nocapture",
             ])
@@ -640,7 +643,7 @@ mod tests {
             crate::jobserver::Descriptors::new(vec![first.into(), second.into()]).unwrap();
         let Command::Spawn { mut command, .. } = spawn(
             root.path(),
-            "pair=${CARGO_MAKEFLAGS#*=}; r=${pair%,*}; w=${pair#*,}; /bin/cat /proc/self/fd/$r; /bin/cat /proc/self/fd/$w",
+            "pair=${CARGO_MAKEFLAGS#*=}; r=${pair%,*}; w=${pair#*,}; /bin/cat /dev/fd/$r; /bin/cat /dev/fd/$w",
             Plan::OUTPUT,
         ) else {
             unreachable!()
@@ -668,12 +671,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn native_children_keep_the_original_clients_seccomp_and_no_new_privs() {
         isolated_test("restricted_client_fixture");
     }
 
     #[test]
     #[ignore = "isolated process installs an additional syscall filter"]
+    #[cfg(target_os = "linux")]
     fn restricted_client_fixture() {
         let root = tempfile::tempdir().unwrap();
         let mut client = fixture(root.path());
@@ -762,7 +767,7 @@ mod tests {
                 program: native(std::env::current_exe().unwrap().as_os_str()),
                 args: [
                     "--exact",
-                    "execution::linux_client::tests::restricted_compiler_fixture",
+                    "execution::unix_client::tests::restricted_compiler_fixture",
                     "--ignored",
                     "--nocapture",
                 ]
@@ -813,6 +818,7 @@ mod tests {
 
     #[test]
     #[ignore = "native compiler verifies the original clients additional filter"]
+    #[cfg(target_os = "linux")]
     fn restricted_compiler_fixture() {
         assert_eq!(
             unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },

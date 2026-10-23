@@ -240,7 +240,7 @@ pub(crate) fn run_rustc(
         .stderr(std::process::Stdio::piped());
     let compiler_trace = crate::phase_trace::phase("compiler");
     let mut child = cmd
-        .invocation_spawn_with_io(kache_protocol::execution::windows::Stdio::OUTPUT)
+        .invocation_spawn_with_io(kache_protocol::execution::process::Stdio::OUTPUT)
         .with_context(|| format!("executing {}", rustc.display()))?;
     let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
     let child_stdout = child.stdout.take().context("capturing rustc stdout")?;

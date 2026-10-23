@@ -287,7 +287,7 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
 }
 
 /// Longest [`wait_for_no_writers`] waits for children to drop a file.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const NO_WRITERS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Wait, at most [`NO_WRITERS_WAIT`], until no process holds `path` open for
@@ -304,42 +304,78 @@ const NO_WRITERS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// effort: a file system without leases, or the deadline, returns false.
 #[cfg(target_os = "linux")]
 fn wait_for_no_writers(path: &Path) -> bool {
+    wait_for_no_writers_with(path, NO_WRITERS_WAIT, || {
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_no_writers_with(
+    path: &Path,
+    timeout: std::time::Duration,
+    retry: impl FnMut(),
+) -> bool {
     use std::os::fd::AsRawFd;
-    let Ok(file) = std::fs::File::open(path) else {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Another process's write lease must not block before our retry deadline.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
         return false;
     };
     let fd = file.as_raw_fd();
     // <fcntl.h>'s F_SETSIG, the same on every Linux architecture; the libc
     // crate does not name it.
     const F_SETSIG: libc::c_int = 10;
-    // A lease break (someone opening the file for writing while the lease is
-    // held, for the instant it is) signals the holder: SIGURG, ignored by
-    // default, instead of SIGIO, which would end the process.
+    // A lease break signals the holder. SIGURG is ignored by default, unlike
+    // SIGIO, and applies only to this descriptor; no process handler changes.
     // SAFETY: fcntl on a descriptor this function owns, with integer args.
     if unsafe { libc::fcntl(fd, F_SETSIG, libc::SIGURG) } != 0 {
         return false;
     }
-    let deadline = std::time::Instant::now() + NO_WRITERS_WAIT;
-    loop {
-        // SAFETY: as above.
-        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
+    wait_for_read_lease(
+        std::time::Instant::now() + timeout,
+        || {
+            // SAFETY: as above. A granted read lease excludes open writers.
+            if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Release before publishing; a fork may have inherited this fd.
             // SAFETY: as above.
-            unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) };
-            return true;
+            if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        },
+        retry,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_read_lease(
+    deadline: std::time::Instant,
+    mut acquire: impl FnMut() -> std::io::Result<()>,
+    mut retry: impl FnMut(),
+) -> bool {
+    loop {
+        match acquire() {
+            Ok(()) => return true,
+            Err(error) => {
+                let busy = error.raw_os_error() == Some(libc::EAGAIN);
+                if !busy || std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                retry();
+            }
         }
-        let busy = std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN);
-        if !busy || std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(500));
     }
 }
 
 /// No leases outside Linux; macOS has no ETXTBSY for these files.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn wait_for_no_writers(_path: &Path) -> bool {
-    false
-}
+fn wait_for_no_writers(_path: &Path) {}
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -2258,74 +2294,177 @@ fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf>
 mod tests {
     use super::*;
 
-    /// Writes a tiny script `rounds` times while other threads spawn
-    /// processes, runs each copy at once, and counts the runs that failed
-    /// with ETXTBSY. `wait` runs [`wait_for_no_writers`] before each run.
     #[cfg(target_os = "linux")]
-    fn busy_runs(rounds: usize, wait: bool) -> usize {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let dir = tempfile::tempdir().unwrap();
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let spawners: Vec<_> = (0..8)
-            .map(|_| {
-                let stop = std::sync::Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let _ = std::process::Command::new("true").status();
-                    }
-                })
-            })
-            .collect();
-        let mut busy = 0;
-        for round in 0..rounds {
-            let script = dir.path().join(format!("script-{round}"));
-            std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            if wait {
-                assert!(wait_for_no_writers(&script), "still open for writing");
-            }
-            match std::process::Command::new(&script).status() {
-                Ok(status) => assert!(status.success()),
-                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => busy += 1,
-                Err(error) => panic!("running the script: {error}"),
+    fn read_leases_supported(path: &Path) -> bool {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).unwrap();
+        let fd = file.as_raw_fd();
+        // Probe independently of the helper under test. Restrict the fallback
+        // to documented unsupported/permission errors, not an arbitrary failure.
+        // SAFETY: fcntl on a descriptor owned by this fixture, with integer args.
+        let configured = unsafe { libc::fcntl(fd, 10, libc::SIGURG) } == 0;
+        // SAFETY: as above; no other thread has this private fixture open.
+        if configured && unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) },
+                0
+            );
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS | libc::EPERM | libc::EACCES)
+            ),
+            "unexpected uncontended lease failure: {error}"
+        );
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    struct HeldWriter {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HeldWriter {
+        fn new(path: &Path) -> Self {
+            let path = path.to_path_buf();
+            let (release, released) = std::sync::mpsc::channel();
+            let (ready, writer_ready) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                ready.send(()).unwrap();
+                let _ = released.recv();
+                drop(writer);
+            });
+            let held = Self {
+                release: Some(release),
+                worker: Some(worker),
+            };
+            writer_ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("writer opens the file");
+            held
+        }
+
+        fn release(&mut self) {
+            drop(self.release.take());
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HeldWriter {
+        fn drop(&mut self) {
+            // Disconnect before joining, including when an assertion unwinds.
+            drop(self.release.take());
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
             }
         }
-        stop.store(true, Ordering::Relaxed);
-        for spawner in spawners {
-            spawner.join().unwrap();
-        }
-        eprintln!("{busy} of {rounds} runs busy (wait: {wait})");
-        busy
     }
 
-    /// A file this process just wrote runs at once after the wait, however
-    /// many children other threads fork meanwhile (a daemon's compiles).
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_written_executable_runs_after_waiting_for_its_writers() {
-        assert_eq!(busy_runs(400, true), 0);
-    }
-
-    /// The race [`wait_for_no_writers`] closes: without the wait, some runs
-    /// fail with ETXTBSY. Timing-dependent, so not part of the suite.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "shows the race; depends on timing"]
-    fn a_written_executable_can_be_busy_without_the_wait() {
-        assert!(busy_runs(400, false) > 0);
-    }
-
-    /// A file open for writing elsewhere holds the wait to its deadline.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_wait_ends_at_its_deadline_while_a_writer_stays() {
+    fn a_written_executable_waits_for_a_known_writer_before_running() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("script");
+        kache_fs::testutil::write_executable(&script, "#!/bin/sh\nexit 0\n");
+        if !read_leases_supported(&script) {
+            assert!(!wait_for_no_writers(&script));
+            return;
+        }
+
+        let mut writer = HeldWriter::new(&script);
+        let error = std::process::Command::new(&script).status().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+        let mut observed_busy = false;
+        assert!(wait_for_no_writers_with(&script, NO_WRITERS_WAIT, || {
+            if !observed_busy {
+                observed_busy = true;
+                writer.release();
+            } else {
+                // Another test's child may also have inherited the writer.
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        }));
+        assert!(observed_busy, "success must follow an observed busy lease");
+        assert!(
+            std::process::Command::new(&script)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(wait_for_no_writers(&script), "an idle file needs no retry");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_lease_retry_distinguishes_busy_deadline_and_unavailable_leases() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        let released = Cell::new(false);
+        assert!(wait_for_read_lease(
+            Instant::now() + NO_WRITERS_WAIT,
+            || {
+                if released.get() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+                }
+            },
+            || released.set(true),
+        ));
+        assert!(released.get());
+
+        assert!(!wait_for_read_lease(
+            Instant::now() - Duration::from_secs(1),
+            || Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            || panic!("an expired wait must not retry"),
+        ));
+        for code in [
+            libc::EINVAL,
+            libc::EOPNOTSUPP,
+            libc::ENOSYS,
+            libc::EPERM,
+            libc::EACCES,
+            libc::EINTR,
+        ] {
+            assert!(
+                !wait_for_read_lease(
+                    Instant::now() + NO_WRITERS_WAIT,
+                    || Err(std::io::Error::from_raw_os_error(code)),
+                    || panic!("a terminal error must not retry"),
+                ),
+                "errno {code}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_writer_obeys_an_expired_deadline_and_missing_paths_fail_open() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!wait_for_no_writers(&dir.path().join("missing")));
         let path = dir.path().join("held");
-        let _writer = std::fs::File::create(&path).unwrap();
-        let started = std::time::Instant::now();
-        assert!(!wait_for_no_writers(&path));
-        assert!(started.elapsed() >= NO_WRITERS_WAIT);
+        kache_fs::testutil::write_executable(&path, "#!/bin/sh\nexit 0\n");
+        if !read_leases_supported(&path) {
+            assert!(!wait_for_no_writers(&path));
+            return;
+        }
+        let _writer = HeldWriter::new(&path);
+        assert!(!wait_for_no_writers_with(
+            &path,
+            std::time::Duration::ZERO,
+            || panic!("an expired lease must not sleep"),
+        ));
     }
 
     fn environment(out_dir: &Path, manifest_dir: &Path) -> Environment {

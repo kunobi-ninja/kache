@@ -5,6 +5,9 @@ type Token = [u32; 8];
 type Signal = unsafe extern "C" fn(*mut Token, libc::c_int) -> libc::c_int;
 
 unsafe extern "C" {
+    // mach/mach_init.h defines mach_task_self() as this process-local port.
+    #[link_name = "mach_task_self_"]
+    static TASK_SELF: u32;
     fn task_name_for_pid(task: u32, pid: i32, name: *mut u32) -> i32;
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
@@ -45,7 +48,7 @@ impl Identity {
             )
         })?;
         let mut task = 0;
-        let status = unsafe { task_name_for_pid(libc::mach_task_self(), pid as i32, &mut task) };
+        let status = unsafe { task_name_for_pid(TASK_SELF, pid as i32, &mut task) };
         if status != 0 {
             return Err(io::Error::other(format!(
                 "cannot pin compiler task: {status}"
@@ -98,7 +101,7 @@ impl Drop for Identity {
     fn drop(&mut self) {
         if self.task != 0 {
             unsafe {
-                mach_port_deallocate(libc::mach_task_self(), self.task);
+                mach_port_deallocate(TASK_SELF, self.task);
             }
         }
     }

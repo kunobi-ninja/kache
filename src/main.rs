@@ -1438,7 +1438,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             .unwrap_or_else(|| "kache".to_owned()),
     };
     #[cfg(any(unix, windows))]
-    if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
+    let config = if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         let config = config::Config::load_for(&context.env)?;
         if let Some(exit) =
             invocation::execution::try_execute(&config.socket_path(), args, &context)?
@@ -1460,8 +1460,13 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
                 Err(error) => tracing::debug!(%error, "compiler daemon did not start"),
             }
         }
-    }
-    let exit = run_compiler_invocation(args, context)?;
+        Some(config)
+    } else {
+        None
+    };
+    #[cfg(not(any(unix, windows)))]
+    let config = None;
+    let exit = run_compiler_invocation_with_config(args, context, config)?;
     std::process::exit(exit);
 }
 
@@ -1517,10 +1522,18 @@ fn run_original_compiler_invocation(
 }
 
 fn run_compiler_invocation(args: &[String], context: invocation::InvocationContext) -> Result<i32> {
+    run_compiler_invocation_with_config(args, context, None)
+}
+
+fn run_compiler_invocation_with_config(
+    args: &[String],
+    context: invocation::InvocationContext,
+    prepared_config: Option<config::Config>,
+) -> Result<i32> {
     let _cancellation = invocation::process::CancellationScope::enter(context.cancellation.clone());
     invocation::process::check()?;
     context.env.validate()?;
-    let result = run_compiler_invocation_inner(args, context);
+    let result = run_compiler_invocation_inner(args, context, prepared_config);
     invocation::process::check()?;
     result
 }
@@ -1528,6 +1541,7 @@ fn run_compiler_invocation(args: &[String], context: invocation::InvocationConte
 fn run_compiler_invocation_inner(
     args: &[String],
     context: invocation::InvocationContext,
+    prepared_config: Option<config::Config>,
 ) -> Result<i32> {
     let invocation::InvocationContext {
         daemon,
@@ -1572,7 +1586,12 @@ fn run_compiler_invocation_inner(
     // Every compiler child gets this request's re-entrancy depth.
     env.set(KACHE_ACTIVE_ENV, "1");
 
-    let mut config = config::Config::load_for(&env)?;
+    // Local fallback keeps the snapshot used to select the daemon endpoint.
+    // Delegated requests load their own invocation's configuration here.
+    let mut config = match prepared_config {
+        Some(config) => config,
+        None => config::Config::load_for(&env)?,
+    };
     if daemon.is_some() {
         config.daemon_publish = false;
     }
@@ -2081,6 +2100,65 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_fallback_reuses_its_config_snapshot_but_new_requests_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("bin")).unwrap();
+        kache_fs::testutil::write_executable(
+            &root.join("bin/rustc"),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > observed-args\nexit 23\n",
+        );
+        let config_path = root.join(".kache.toml");
+        std::fs::write(&config_path, "[cache]\npreserve_incremental = false\n").unwrap();
+        let mut env = invocation::InvocationEnv::from_parts(
+            [("PATH", "bin"), ("KACHE_DISABLED", "1")],
+            Some(root.clone()),
+            Some(root.clone()),
+            root.clone(),
+        );
+        env.set("KACHE_CONFIG", &config_path);
+        env.set("KACHE_CACHE_DIR", root.join("cache"));
+        let prepared = config::Config::load_for(&env).unwrap();
+        assert!(!prepared.preserve_incremental);
+        std::fs::write(&config_path, "[cache]\npreserve_incremental = true\n").unwrap();
+
+        for (snapshot, preserved) in [(Some(prepared), false), (None, true)] {
+            let exit = run_compiler_invocation_with_config(
+                &[
+                    "rustc".into(),
+                    "--crate-name".into(),
+                    "demo".into(),
+                    "--crate-type".into(),
+                    "lib".into(),
+                    "lib.rs".into(),
+                    "-C".into(),
+                    format!("incremental={}", root.join("incremental").display()),
+                ],
+                invocation::InvocationContext {
+                    daemon: None,
+                    env: env.clone(),
+                    io: invocation::io::InvocationIo::process(),
+                    cancellation: None,
+                    jobserver: kache_ipc::jobserver::Descriptors::default(),
+                    started_at: std::time::Instant::now(),
+                    shim_stem: "kache".into(),
+                },
+                snapshot,
+            )
+            .unwrap();
+            assert_eq!(exit, 23);
+            let observed = std::fs::read_to_string(root.join("observed-args")).unwrap();
+            assert_eq!(observed.contains("incremental="), preserved, "{observed}");
+            assert_eq!(
+                observed.contains(".kache-preserved"),
+                preserved,
+                "{observed}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

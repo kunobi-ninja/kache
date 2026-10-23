@@ -30,6 +30,8 @@ use windows::Connection;
 mod unix;
 #[cfg(unix)]
 use unix::Connection;
+#[cfg(target_os = "linux")]
+mod linux_client;
 
 /// `None` permits local execution. An error means Commit may have reached the
 /// daemon and the caller must not run the compiler again.
@@ -63,6 +65,16 @@ fn exchange(
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
     committed: &mut bool,
 ) -> Result<i32> {
+    #[cfg(target_os = "linux")]
+    let (mut linux_client, broker_files) = if matches!(
+        request.channels,
+        kache_protocol::execution::ExecutionChannels::UnixClient { .. }
+    ) {
+        let (client, files) = linux_client::Client::prepare(request, descriptors)?;
+        (Some(client), Some(files))
+    } else {
+        (None, None)
+    };
     #[cfg(windows)]
     let mut client = windows_client::Client::default();
     let stream = Connection::connect(socket)?;
@@ -86,8 +98,28 @@ fn exchange(
         let datagram = std::os::unix::net::UnixDatagram::unbound()?;
         datagram.set_write_timeout(Some(PREPARE_TIMEOUT))?;
         datagram.connect(endpoint)?;
+        #[cfg(target_os = "linux")]
+        let files = {
+            let mut files = descriptors.to_vec();
+            if let Some(broker_files) = &broker_files {
+                let kache_protocol::execution::ExecutionChannels::UnixClient { terminal, .. } =
+                    request.channels
+                else {
+                    unreachable!()
+                };
+                files.splice(
+                    3 + usize::from(terminal)..3 + usize::from(terminal),
+                    broker_files.iter().map(AsFd::as_fd),
+                );
+            }
+            files
+        };
+        #[cfg(target_os = "linux")]
+        let descriptors = files.as_slice();
         crate::descriptors::send(datagram.as_fd(), &ticket.key, descriptors)?;
     }
+    #[cfg(target_os = "linux")]
+    drop(broker_files);
     #[cfg(windows)]
     ensure!(
         matches!(
@@ -123,7 +155,27 @@ fn exchange(
             reply => bail!("invalid compiler completion: {reply:?}"),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    loop {
+        #[cfg(target_os = "linux")]
+        if let Some(client) = &mut linux_client
+            && reader.buffer().is_empty()
+            && client.ready(stream.as_fd())?
+        {
+            if !client.service()? {
+                // The worker can release its broker before the async handler
+                // writes Complete. Completion still comes from that handler.
+                linux_client = None;
+            }
+            continue;
+        }
+        return match read_reply(&mut reader)? {
+            ExecutionReply::Complete { exit_code } => Ok(exit_code),
+            ExecutionReply::Failed { message } => bail!("{message}"),
+            reply => bail!("invalid compiler completion: {reply:?}"),
+        };
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     match read_reply(&mut reader)? {
         ExecutionReply::Complete { exit_code } => Ok(exit_code),
         ExecutionReply::Failed { message } => bail!("{message}"),
@@ -184,6 +236,128 @@ mod tests {
     use kache_protocol::execution::{ExecutionChannels, ExecutionEntry, NativeString};
     use std::fs::File;
     use std::os::unix::net::{UnixDatagram, UnixListener};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_process_broker_transfers_live_pipes_and_reaps_the_native_child() {
+        use kache_protocol::execution::{
+            unix::{Command, Reply},
+            windows::{Spawn, Stdio as Plan},
+        };
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let path = root.path().join("control");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut fixture = fixture(root.path());
+        fixture.request.channels = ExecutionChannels::UnixClient {
+            terminal: false,
+            jobserver: Vec::new(),
+            trusted_pipeline: false,
+        };
+        std::thread::scope(|threads| {
+            let server = threads.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let endpoint = root.path().join("fds");
+                let datagram = UnixDatagram::bind(&endpoint).unwrap();
+                datagram.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let ticket = kache_protocol::execution::DescriptorTicket {
+                    endpoint: NativeString::capture(endpoint.as_os_str()),
+                    key: [31; 16],
+                };
+                write_message(
+                    &mut stream,
+                    &ExecutionReply::Ready {
+                        version: EXECUTION_VERSION,
+                        descriptors: Some(ticket.clone()),
+                    },
+                )
+                .unwrap();
+                let mut files =
+                    crate::descriptors::receive(datagram.as_fd(), &ticket.key, 5).unwrap();
+                let pipes = UnixDatagram::from(files.pop().unwrap());
+                pipes.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let control = UnixStream::from(files.pop().unwrap());
+                control.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let mut control = std::io::BufReader::new(control);
+                write_message(&mut stream, &ExecutionReply::Prepared).unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<ExecutionCommand>(&line).unwrap(),
+                    ExecutionCommand::Commit
+                );
+                write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
+                let native = |value: &str| NativeString::capture(value.as_ref());
+                write_message(
+                    control.get_mut(),
+                    &Command::Spawn {
+                        command: Box::new(Spawn {
+                            program: native("/bin/sh"),
+                            args: vec![
+                                native("-c"),
+                                native("printf '%s' \"$PPID\"; printf native-error >&2; exit 19"),
+                            ],
+                            env: Vec::new(),
+                            cwd: NativeString::capture(root.path().as_os_str()),
+                            stdio: Plan::OUTPUT,
+                        }),
+                        jobserver: Vec::new(),
+                    },
+                )
+                .unwrap();
+                let mut reply = || {
+                    let mut line = String::new();
+                    control.read_line(&mut line).unwrap();
+                    serde_json::from_str::<Reply>(&line).unwrap()
+                };
+                let Reply::Spawned { id, pid } = reply() else {
+                    panic!("missing native child");
+                };
+                assert_ne!(pid, std::process::id());
+                let mut outputs = crate::descriptors::receive(pipes.as_fd(), &[0; 16], 2)
+                    .unwrap()
+                    .into_iter()
+                    .map(File::from);
+                let mut parent = String::new();
+                outputs.next().unwrap().read_to_string(&mut parent).unwrap();
+                assert_eq!(parent, std::process::id().to_string());
+                let mut error = String::new();
+                outputs.next().unwrap().read_to_string(&mut error).unwrap();
+                assert_eq!(error, "native-error");
+                let raw = loop {
+                    write_message(control.get_mut(), &Command::TryWait { id }).unwrap();
+                    let mut line = String::new();
+                    control.read_line(&mut line).unwrap();
+                    let Reply::Waited { status, .. } =
+                        serde_json::from_str::<Reply>(&line).unwrap()
+                    else {
+                        panic!("missing status");
+                    };
+                    if let Some(status) = status {
+                        break status;
+                    }
+                };
+                assert_eq!(std::process::ExitStatus::from_raw(raw).code(), Some(19));
+                write_message(control.get_mut(), &Command::Release { id }).unwrap();
+                let mut line = String::new();
+                control.read_line(&mut line).unwrap();
+                assert_eq!(serde_json::from_str::<Reply>(&line).unwrap(), Reply::Done);
+                write_message(&mut stream, &ExecutionReply::Complete { exit_code: 19 }).unwrap();
+            });
+            let descriptors = fixture.files.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+            assert_eq!(
+                try_execute(&path, &fixture.request, &descriptors).unwrap(),
+                Some(19)
+            );
+            server.join().unwrap();
+        });
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum Disconnect {

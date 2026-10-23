@@ -642,6 +642,7 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | --- | --- | --- | --- |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `0` | Stop after idle seconds; `0` keeps it running |
 | `KACHE_DAEMON_PUBLISH` | `cache.daemon_publish` | `true` | Let a running daemon store completed C/C++ compiles. The wrapper stores locally when the daemon cannot accept the work. |
+| `KACHE_TRUST_DAEMON_EXECUTION` | `cache.trust_daemon_execution` | `false` | Linux: allow a trusted daemon pipeline under Seccomp/NoNewPrivs when both peers opt in. Compiler children and artifact restoration run in the client; input discovery and other pipeline accesses retain the daemon's restrictions. See [Linux process restrictions](/docs/how-it-works/architecture#linux-process-restrictions). |
 | `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | Event heartbeat cadence for long miss compiles; `0` disables it |
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Record changed key groups on repeat misses |
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache stats --full` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |

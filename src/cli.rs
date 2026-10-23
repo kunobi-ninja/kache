@@ -7353,6 +7353,7 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || (label == "Compiler probe" && probe_no_compiler)
         || label == "C/C++ shims"
         || label == "Install path"
+        || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
 }
 
@@ -7830,7 +7831,11 @@ fn doctor_index_quarantines(config: &Config) -> Check {
 }
 
 fn doctor_section(label: &str) -> &'static str {
-    if label.starts_with("Daemon") || label.starts_with("Service") || label.starts_with("Remote") {
+    if label.starts_with("Daemon")
+        || label.starts_with("Service")
+        || label.starts_with("Remote")
+        || label == "Compiler execution"
+    {
         "Services"
     } else if label.starts_with("Cache")
         || label.starts_with("Store")
@@ -8215,6 +8220,23 @@ pub fn doctor(
             detail,
             fix: fix_hint,
         });
+        #[cfg(target_os = "linux")]
+        if healthy_daemon_reachable {
+            checks.push(match crate::daemon::compiler_execution_status(cfg) {
+                Ok(status) => Check {
+                    label: "Compiler execution",
+                    pass: status.eligible,
+                    detail: status.detail,
+                    fix: None,
+                },
+                Err(error) => Check {
+                    label: "Compiler execution",
+                    pass: false,
+                    detail: error.to_string(),
+                    fix: Some("kache daemon restart".into()),
+                },
+            });
+        }
     }
 
     // 9. Daemon service installed
@@ -10689,6 +10711,8 @@ struct SetupResult {
     test_activation_required: bool,
     service_installed: bool,
     daemon_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compiler_execution: Option<kache_protocol::execution::unix::ExecutionStatus>,
 }
 
 /// What `kache init` found before it changes anything, or what a run did,
@@ -11338,6 +11362,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                     test_activation_required: test_activation,
                     service_installed,
                     daemon_running: None,
+                    compiler_execution: None,
                 },
                 Vec::new(),
             )?;
@@ -11394,6 +11419,15 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         println!("  Background cache setup failed. Run kache doctor for details.\n");
         anyhow::bail!("init did not complete: daemon not reachable");
     }
+    #[cfg(target_os = "linux")]
+    let compiler_execution = config
+        .as_ref()
+        .and_then(|config| crate::daemon::compiler_execution_status(config).ok());
+    #[cfg(not(target_os = "linux"))]
+    let compiler_execution: Option<kache_protocol::execution::unix::ExecutionStatus> = None;
+    if let Some(status) = &compiler_execution {
+        println!("  Compiler execution: {}", status.detail);
+    }
     if cargo_ready {
         println!("  Ready for Cargo builds. Use cargo as usual.");
     }
@@ -11428,6 +11462,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                     service_action_taken,
                 ),
                 daemon_running: Some(is_daemon_reachable(&config)),
+                compiler_execution,
             },
             Vec::new(),
         )?;

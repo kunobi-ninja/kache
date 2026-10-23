@@ -2414,6 +2414,7 @@ dependencies = [
  "blake3",
  "find-msvc-tools",
  "interprocess",
+ "kache-fs",
  "kache-protocol",
  "kunobi-daemon",
  "libc",

@@ -11,7 +11,14 @@ the daemon. The daemon runs concurrent cache pipelines, each with its own inputs
 jobserver, cancellation and accounting. It does not change its process-wide
 environment or working directory to serve a client.
 
-On Unix, the daemon starts native compiler children. On Windows, the client
+On Linux, the client starts native compiler children at the daemon's request.
+Private per-invocation channels carry process control and transfer output pipes;
+compiler output does not pass through control messages. The daemon selects cache
+entries and restore strategies, while the client performs artifact copies,
+clones, links, transformed writes, timestamp updates and staged publication.
+The client also owns child cleanup and unpublished restore stages.
+
+On macOS, the daemon starts native compiler children. On Windows, the client
 starts them at the daemon's request, preserving the client's token, job objects
 and console. The cache pipeline stays in the daemon on both platforms.
 Both Windows peers compare process-token context before committing execution.
@@ -24,6 +31,35 @@ client can run the local engine. The first Commit write attempt transfers
 execution responsibility to the daemon. A later disconnect fails the invocation.
 
 CLI commands and build-script launchers run in the engine.
+
+### Linux process restrictions
+
+By default, Linux execution delegation requires compatible process credentials,
+namespaces and security labels, with Seccomp and NoNewPrivs disabled on both
+peers. Otherwise the client uses its local engine.
+
+For a daemon you trust to access the workspace, enable this setting in both the
+daemon's startup configuration and the build's configuration:
+
+```toml
+[cache]
+trust_daemon_execution = true
+```
+
+`KACHE_TRUST_DAEMON_EXECUTION=1` sets the same option. Restart an existing daemon
+after changing its startup setting. This permits the client broker under Seccomp
+filters and NoNewPrivs; it does not compare their filter programs.
+
+Compiler children and brokered restore operations retain the client's
+restrictions. The daemon still discovers inputs, reads workspace files and
+maintains cache state under its own restrictions. This setting does not promise
+to reproduce an arbitrary client sandbox across the whole pipeline. Large-file
+prestaging is not used by brokered restores.
+
+`kache init` reports the current execution path after starting the daemon.
+`kache doctor` checks execution eligibility separately from daemon health. This
+probe runs no compiler and reserves no worker; each invocation checks admission
+again before Commit.
 
 ## Build path
 

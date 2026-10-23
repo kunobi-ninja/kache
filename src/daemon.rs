@@ -2679,6 +2679,7 @@ impl Daemon {
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
             | Request::ExecuteV1(_)
+            | Request::ExecutionStatus { .. }
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
             | Request::Prefetch(_)
@@ -7819,6 +7820,29 @@ async fn handle_connection_started_at(
         }
 
         let resp = match parsed {
+            Ok(Request::ExecutionStatus {
+                client_pid,
+                client_version,
+                trusted_pipeline,
+            }) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let mut response = Response::ok();
+                    response.execution_status = Some(execution::probe(
+                        &stream,
+                        client_pid,
+                        &client_version,
+                        trusted_pipeline,
+                        daemon,
+                    ));
+                    response
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (client_pid, client_version, trusted_pipeline);
+                    Response::err("compiler execution diagnostics are unavailable on this platform")
+                }
+            }
             Ok(Request::ExecuteV1(req)) => {
                 #[cfg(any(unix, windows))]
                 {
@@ -8778,6 +8802,23 @@ pub(crate) fn send_request_with_timeout(
     {
         send_request_with_socket_timeout(socket_path, req, read_timeout)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn compiler_execution_status(
+    config: &Config,
+) -> Result<kache_protocol::execution::unix::ExecutionStatus> {
+    let request = Request::ExecutionStatus {
+        client_pid: std::process::id(),
+        client_version: crate::VERSION.into(),
+        trusted_pipeline: config.trust_daemon_execution,
+    };
+    let response =
+        send_request_with_timeout(&config.socket_path(), &request, Duration::from_secs(3))?;
+    let response: Response = serde_json::from_str(&response)?;
+    response.execution_status.context(
+        "daemon does not support compiler execution diagnostics; restart it with this release",
+    )
 }
 
 #[cfg(not(windows))]

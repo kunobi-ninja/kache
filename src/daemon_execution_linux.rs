@@ -5,12 +5,23 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+#[cfg(test)]
 pub(super) fn peer_may_delegate(
     proc_root: &Path,
     kernel_pid: Option<u32>,
     reported_pid: u32,
 ) -> bool {
-    kernel_pid == Some(reported_pid) && permits_delegation(proc_root, reported_pid).unwrap_or(false)
+    peer_may_delegate_with_trust(proc_root, kernel_pid, reported_pid, false)
+}
+
+pub(super) fn peer_may_delegate_with_trust(
+    proc_root: &Path,
+    kernel_pid: Option<u32>,
+    reported_pid: u32,
+    trusted_pipeline: bool,
+) -> bool {
+    kernel_pid == Some(reported_pid)
+        && permits_delegation_with_trust(proc_root, reported_pid, trusted_pipeline).unwrap_or(false)
 }
 
 fn field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
@@ -20,7 +31,16 @@ fn field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+#[cfg(test)]
 pub(super) fn permits_delegation(proc_root: &Path, pid: u32) -> io::Result<bool> {
+    permits_delegation_with_trust(proc_root, pid, false)
+}
+
+fn permits_delegation_with_trust(
+    proc_root: &Path,
+    pid: u32,
+    trusted_pipeline: bool,
+) -> io::Result<bool> {
     let host = proc_root.join("self");
     let peer = proc_root.join(pid.to_string());
     let host_status = std::fs::read_to_string(host.join("status"))?;
@@ -28,7 +48,13 @@ pub(super) fn permits_delegation(proc_root: &Path, pid: u32) -> io::Result<bool>
     // The installed BPF program is not available through ordinary /proc reads.
     // Matching mode or filter count cannot prove equivalent restrictions.
     for name in ["Seccomp", "NoNewPrivs"] {
-        if field(&host_status, name) != Some("0") || field(&peer_status, name) != Some("0") {
+        let allowed = |value| {
+            matches!(
+                (trusted_pipeline, name, value),
+                (_, _, Some("0")) | (true, "Seccomp", Some("2")) | (true, "NoNewPrivs", Some("1"))
+            )
+        };
+        if !allowed(field(&host_status, name)) || !allowed(field(&peer_status, name)) {
             return Ok(false);
         }
     }
@@ -59,6 +85,57 @@ mod tests {
     use super::*;
 
     const STATUS: &str = "Uid:\t10 10 10 10\nGid:\t20 20 20 20\nGroups:\t20 30\nCapInh:\t0000\nCapPrm:\t0000\nCapEff:\t0000\nCapBnd:\tffff\nCapAmb:\t0000\nUmask:\t0022\nNoNewPrivs:\t0\nSeccomp:\t0\n";
+
+    #[test]
+    fn trusted_pipeline_still_requires_kernel_identity_credentials_and_namespaces() {
+        let root = fixture();
+        let filtered = STATUS
+            .replace("NoNewPrivs:\t0", "NoNewPrivs:\t1")
+            .replace("Seccomp:\t0", "Seccomp:\t2");
+        for side in ["self", "42"] {
+            std::fs::write(root.path().join(side).join("status"), &filtered).unwrap();
+        }
+        assert!(!peer_may_delegate_with_trust(
+            root.path(),
+            Some(42),
+            42,
+            false
+        ));
+        assert!(peer_may_delegate_with_trust(
+            root.path(),
+            Some(42),
+            42,
+            true
+        ));
+        assert!(!peer_may_delegate_with_trust(
+            root.path(),
+            Some(7),
+            42,
+            true
+        ));
+        assert!(!peer_may_delegate_with_trust(root.path(), None, 42, true));
+        for line in filtered.lines() {
+            let (key, _) = line.split_once(':').unwrap();
+            std::fs::write(
+                root.path().join("42/status"),
+                filtered.replace(line, &format!("{key}: invalid")),
+            )
+            .unwrap();
+            assert!(
+                !peer_may_delegate_with_trust(root.path(), Some(42), 42, true),
+                "{key}"
+            );
+        }
+        std::fs::write(root.path().join("42/status"), &filtered).unwrap();
+        std::fs::remove_file(root.path().join("42/ns/mnt")).unwrap();
+        std::fs::write(root.path().join("42/ns/mnt"), "other namespace").unwrap();
+        assert!(!peer_may_delegate_with_trust(
+            root.path(),
+            Some(42),
+            42,
+            true
+        ));
+    }
 
     fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();

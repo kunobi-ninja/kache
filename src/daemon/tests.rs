@@ -1314,6 +1314,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        trust_daemon_execution: false,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -1722,6 +1723,13 @@ async fn upgrade_requests_carry_the_executable_mtime_for_legacy_daemons() {
 #[test]
 fn only_build_requests_count_as_activity() {
     assert!(!Request::Shutdown.is_build_activity());
+    let probe = Request::ExecutionStatus {
+        client_pid: 1,
+        client_version: "fixture".into(),
+        trusted_pipeline: false,
+    };
+    assert!(!probe.is_build_activity());
+    assert_eq!(probe.client_version(), None);
     let stats: Request = serde_json::from_str(
         r#"{"stats":{"include_entries":false,"sort_by":null,"event_hours":null}}"#,
     )

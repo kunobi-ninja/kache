@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 
+pub mod unix;
 pub mod windows;
 
 pub const EXECUTION_VERSION: u32 = 1;
@@ -115,6 +116,14 @@ impl std::fmt::Debug for ExecutionRequest {
 pub enum ExecutionChannels {
     /// Descriptors arrive in stdin/stdout/stderr, optional terminal, jobserver order.
     Unix { terminal: bool, jobserver: Vec<i32> },
+    /// Linux clients retain native process creation. Two private broker
+    /// descriptors follow the standard streams and precede the jobserver.
+    UnixClient {
+        terminal: bool,
+        jobserver: Vec<i32>,
+        #[serde(default)]
+        trusted_pipeline: bool,
+    },
     /// The server duplicates these from its authenticated named-pipe peer.
     Windows {
         stdin: u64,

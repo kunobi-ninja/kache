@@ -308,6 +308,12 @@ fn try_hard_link(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(kind) = injected_restore_hardlink_error() {
         return Err(std::io::Error::new(kind, "injected hardlink failure"));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        crate::workspace::dispatch(crate::workspace::Operation::Hardlink(src, dst))
+    {
+        return result;
+    }
     fs::hard_link(src, dst)
 }
 
@@ -429,6 +435,24 @@ pub enum LinkStrategy {
     ExecutableHardlink,
 }
 
+fn remove_restore_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Remove(path)) {
+        return result;
+    }
+    fs::remove_file(path)
+}
+
+fn create_restore_directories(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        crate::workspace::dispatch(crate::workspace::Operation::CreateDirectories(path))
+    {
+        return result;
+    }
+    fs::create_dir_all(path)
+}
+
 /// Link a cached file to the target output path.
 ///
 /// Every strategy tries reflink first, then uses its own fallback.
@@ -544,7 +568,7 @@ fn link_to_target_via(
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     }) && let Some(parent) = target_path.parent()
     {
-        fs::create_dir_all(parent)
+        create_restore_directories(parent)
             .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
         if let Err(e) = do_link() {
             err = e;
@@ -683,7 +707,7 @@ fn hardlink_or_copy_with_prelink_hook(
                     store_path.display(),
                     target_path.display()
                 );
-                fs::remove_file(target_path).with_context(|| {
+                remove_restore_file(target_path).with_context(|| {
                     format!(
                         "removing non-exclusive hardlink at {}",
                         target_path.display()
@@ -1122,6 +1146,13 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     permissions.set_readonly(false);
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Permissions(
+        path,
+        std::os::unix::fs::PermissionsExt::mode(&permissions),
+    )) {
+        return result.map_err(Into::into);
+    }
     fs::set_permissions(path, permissions)
         .with_context(|| format!("setting owner write permission on {}", path.display()))
 }
@@ -1129,18 +1160,35 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
 /// Set 0o755 after an executable/dylib reflink. Reflink preserves the store
 /// blob's read-only mode, but runtime-loaded artifacts must be executable.
 fn set_executable_permissions(path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        crate::workspace::dispatch(crate::workspace::Operation::Permissions(path, 0o755))
+    {
+        return result.map_err(Into::into);
+    }
     kache_fs::set_writable_permissions(path, true)
         .with_context(|| format!("setting executable permissions on {}", path.display()))
 }
 
 /// Clone a file using the shared filesystem implementation.
 pub fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Reflink(src, dst))
+    {
+        return result.map_err(Into::into);
+    }
     kache_fs::try_reflink(src, dst).map_err(Into::into)
 }
 
 /// Regular file copy with appropriate permissions.
 /// `executable`: if true, sets 0o755 (rwxr-xr-x); otherwise 0o644 (rw-r--r--).
 fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        crate::workspace::dispatch(crate::workspace::Operation::Copy(src, dst, executable))
+    {
+        return result.map_err(Into::into);
+    }
     kache_fs::copy_writable(src, dst, executable)
         .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
     tracing::debug!("copied {} -> {}", src.display(), dst.display());
@@ -1169,6 +1217,8 @@ pub struct PreparedWritableTarget {
 enum WritableStage {
     Staged(kache_fs::StagedFile),
     Cloned(ClonedFile),
+    #[cfg(target_os = "linux")]
+    Client(crate::workspace::Prepared),
 }
 
 /// A clone created under a temporary name. Dropping an unpublished clone
@@ -1214,6 +1264,8 @@ impl PreparedWritableTarget {
             reflinked,
         } = self;
         match stage {
+            #[cfg(target_os = "linux")]
+            WritableStage::Client(stage) => stage.publish(false)?,
             WritableStage::Staged(staged) => staged.publish_new(&target).with_context(|| {
                 format!(
                     "publishing cc output without replacing {}",
@@ -1247,6 +1299,8 @@ impl PreparedWritableTarget {
             reflinked,
         } = self;
         match stage {
+            #[cfg(target_os = "linux")]
+            WritableStage::Client(stage) => stage.publish(true)?,
             WritableStage::Staged(staged) => staged
                 .replace(&target)
                 .with_context(|| format!("publishing cc output over {}", target.display()))?,
@@ -1284,6 +1338,20 @@ pub fn prepare_writable_target_from_file(
     src: &Path,
     target: &Path,
 ) -> Result<PreparedWritableTarget> {
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = crate::workspace::current() {
+        let (stage, bytes, reflinked) = crate::workspace::Prepared::new(
+            owner,
+            crate::workspace::Operation::PrepareFile(src, target),
+        )?;
+        return Ok(PreparedWritableTarget {
+            stage: WritableStage::Client(stage),
+            target: target.to_path_buf(),
+            bytes,
+            source: Some(src.to_path_buf()),
+            reflinked,
+        });
+    }
     prepare_writable_target_from_file_via(
         src,
         target,
@@ -1476,6 +1544,20 @@ pub fn prepare_writable_target_from_bytes(
     target: &Path,
     content: &[u8],
 ) -> Result<PreparedWritableTarget> {
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = crate::workspace::current() {
+        let (stage, bytes, reflinked) = crate::workspace::Prepared::new(
+            owner,
+            crate::workspace::Operation::PrepareBytes(target, content),
+        )?;
+        return Ok(PreparedWritableTarget {
+            stage: WritableStage::Client(stage),
+            target: target.to_path_buf(),
+            bytes,
+            source: None,
+            reflinked,
+        });
+    }
     use std::io::Write;
 
     let mut staged = new_writable_staging_file(target)?;
@@ -1496,6 +1578,15 @@ pub fn prepare_writable_target_from_bytes(
 /// write can take its place. A previous restore may have left a
 /// read-only hardlink or reflink of a store blob here.
 fn clear_target(target_path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        crate::workspace::dispatch(crate::workspace::Operation::Remove(target_path))
+    {
+        return match result {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result.map_err(Into::into),
+        };
+    }
     if target_path.exists() || target_path.symlink_metadata().is_ok() {
         #[cfg(windows)]
         if let Ok(meta) = fs::metadata(target_path) {
@@ -1526,6 +1617,21 @@ fn clear_target(target_path: &Path) -> Result<()> {
 /// holds no matter which path materializes the file — including a future
 /// content transform applied to an executable artifact (issue #298).
 pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Write(
+        target_path,
+        content,
+        if matches!(
+            strategy,
+            LinkStrategy::Copy | LinkStrategy::ExecutableHardlink
+        ) {
+            0o755
+        } else {
+            0o644
+        },
+    )) {
+        return result.map_err(Into::into);
+    }
     let do_write = || -> Result<()> {
         clear_target(target_path)?;
         fs::write(target_path, content)
@@ -1559,7 +1665,7 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     }) && let Some(parent) = target_path.parent()
     {
-        fs::create_dir_all(parent)
+        create_restore_directories(parent)
             .with_context(|| format!("creating parent dir for {}", target_path.display()))?;
         if let Err(e) = do_write() {
             err = e;
@@ -1597,6 +1703,10 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
 /// green in the e2e suite on APFS but not the same mechanism), and network /
 /// FUSE filesystems make no such guarantee.
 pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Touch(path)) {
+        return result.map_err(Into::into);
+    }
     // Any failure below propagates to `restore_from_cache`'s callers, which
     // treat it as a clean miss and recompile (never a failed build) — so
     // fail-closed checks here cost a recompile, not correctness.

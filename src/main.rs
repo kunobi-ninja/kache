@@ -1440,9 +1440,12 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     #[cfg(any(unix, windows))]
     let config = if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         let config = config::Config::load_for(&context.env)?;
-        if let Some(exit) =
-            invocation::execution::try_execute(&config.socket_path(), args, &context)?
-        {
+        if let Some(exit) = invocation::execution::try_execute_with_trust(
+            &config.socket_path(),
+            args,
+            &context,
+            config.trust_daemon_execution,
+        )? {
             std::process::exit(exit);
         }
         if !cfg!(test)
@@ -1451,9 +1454,12 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         {
             match daemon::start(&config) {
                 Ok(_) => {
-                    if let Some(exit) =
-                        invocation::execution::try_execute(&config.socket_path(), args, &context)?
-                    {
+                    if let Some(exit) = invocation::execution::try_execute_with_trust(
+                        &config.socket_path(),
+                        args,
+                        &context,
+                        config.trust_daemon_execution,
+                    )? {
                         std::process::exit(exit);
                     }
                 }

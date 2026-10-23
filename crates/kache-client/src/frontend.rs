@@ -54,7 +54,9 @@ pub fn run(version: &str) -> Result<i32> {
                     client_version: version,
                 };
                 let socket = config.socket_path();
-                if let Some(exit) = execution.try_execute(&socket)? {
+                if let Some(exit) =
+                    execution.try_execute_with_trust(&socket, config.trust_daemon_execution)?
+                {
                     return Ok(exit);
                 }
                 #[cfg(windows)]

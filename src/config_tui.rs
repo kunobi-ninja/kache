@@ -2168,6 +2168,7 @@ mod tests {
                 out_dir_alias_root: None,
                 deferred_durability: None,
                 daemon_publish: None,
+                trust_daemon_execution: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 auto_clean_orphaned_targets: None,

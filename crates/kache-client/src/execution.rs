@@ -32,7 +32,17 @@ struct Prepared {
 impl Execution<'_> {
     /// `None` permits local execution. Errors after Commit prohibit a retry.
     pub fn try_execute(&self, socket: &Path) -> Result<Option<i32>> {
-        let prepared = match self.prepare() {
+        self.try_execute_with_trust(socket, false)
+    }
+
+    /// Both peers must opt in to daemon-side workspace accesses under the
+    /// daemon's restrictions. Native children remain owned by the client.
+    pub fn try_execute_with_trust(
+        &self,
+        socket: &Path,
+        trusted_pipeline: bool,
+    ) -> Result<Option<i32>> {
+        let prepared = match self.prepare(trusted_pipeline) {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::debug!(%error, "compiler request cannot be transferred");
@@ -56,7 +66,9 @@ impl Execution<'_> {
         }
     }
 
-    fn prepare(&self) -> Result<Prepared> {
+    fn prepare(&self, trusted_pipeline: bool) -> Result<Prepared> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = trusted_pipeline;
         #[cfg(unix)]
         anyhow::ensure!(
             self.files.len() == 3 + usize::from(self.terminal),
@@ -70,10 +82,16 @@ impl Execution<'_> {
         let env = self.env.vars_os().collect::<Vec<_>>();
         #[cfg(unix)]
         let (originals, jobserver) = kache_ipc::jobserver::capture(&env)?;
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "linux")))]
         let channels = ExecutionChannels::Unix {
             terminal: self.terminal,
             jobserver: originals,
+        };
+        #[cfg(target_os = "linux")]
+        let channels = ExecutionChannels::UnixClient {
+            terminal: self.terminal,
+            jobserver: originals,
+            trusted_pipeline,
         };
         #[cfg(windows)]
         let channels = {
@@ -207,12 +225,15 @@ mod tests {
                     version: EXECUTION_VERSION,
                     descriptors: Some(ticket.clone()),
                 });
-                let mut transferred =
-                    kache_ipc::descriptors::receive(datagram.as_fd(), &ticket.key, 3)
-                        .unwrap()
-                        .into_iter()
-                        .map(File::from)
-                        .collect::<Vec<_>>();
+                let mut transferred = kache_ipc::descriptors::receive(
+                    datagram.as_fd(),
+                    &ticket.key,
+                    if cfg!(target_os = "linux") { 5 } else { 3 },
+                )
+                .unwrap()
+                .into_iter()
+                .map(File::from)
+                .collect::<Vec<_>>();
                 let mut input = Vec::new();
                 transferred[0].read_to_end(&mut input).unwrap();
                 assert_eq!(input, b"client-input");
@@ -295,7 +316,7 @@ mod tests {
                         let Prepared {
                             request,
                             jobserver: descriptors,
-                        } = execution.prepare().unwrap();
+                        } = execution.prepare(false).unwrap();
                         assert_eq!(request.entry, entry);
                         assert_eq!(request.client_version, "fixture-release");
                         assert_eq!(request.client_pid, std::process::id());

@@ -14,6 +14,11 @@ enum Source {
     Process,
     Owned(Arc<Streams>),
     Borrowed(Weak<Streams>),
+    #[cfg(target_os = "linux")]
+    Linux {
+        streams: Arc<Streams>,
+        broker: Arc<super::linux_broker::Broker>,
+    },
     #[cfg(windows)]
     Windows(Arc<super::windows_broker::Broker>),
 }
@@ -48,6 +53,24 @@ impl Output {
 }
 
 impl InvocationIo {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_linux_broker(
+        self,
+        broker: Arc<super::linux_broker::Broker>,
+    ) -> io::Result<Self> {
+        let streams = self
+            .streams()?
+            .ok_or_else(|| io::Error::other("native broker requires captured streams"))?;
+        Ok(Self(Source::Linux { streams, broker }))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn linux_broker(&self) -> Option<Arc<super::linux_broker::Broker>> {
+        match &self.0 {
+            Source::Linux { broker, .. } => Some(Arc::clone(broker)),
+            _ => None,
+        }
+    }
     #[cfg(windows)]
     pub(crate) fn from_broker(broker: Arc<super::windows_broker::Broker>) -> Self {
         Self(Source::Windows(broker))
@@ -92,6 +115,8 @@ impl InvocationIo {
             Source::Process => Self::process(),
             Source::Owned(streams) => Self(Source::Borrowed(Arc::downgrade(streams))),
             Source::Borrowed(_) => self.clone(),
+            #[cfg(target_os = "linux")]
+            Source::Linux { streams, .. } => Self(Source::Borrowed(Arc::downgrade(streams))),
             #[cfg(windows)]
             Source::Windows(_) => self.clone(),
         }
@@ -101,6 +126,8 @@ impl InvocationIo {
         match &self.0 {
             Source::Process => Ok(None),
             Source::Owned(streams) => Ok(Some(Arc::clone(streams))),
+            #[cfg(target_os = "linux")]
+            Source::Linux { streams, .. } => Ok(Some(Arc::clone(streams))),
             Source::Borrowed(streams) => streams.upgrade().map(Some).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "compiler invocation finished")
             }),
@@ -159,10 +186,17 @@ pub(crate) struct InvocationIoScope {
     previous: Option<InvocationIo>,
     _warnings: kache_store::markers::InvocationWarningScope,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    #[cfg(target_os = "linux")]
+    _workspace: kache_store::workspace::Scope,
 }
 
 impl InvocationIoScope {
     pub(crate) fn enter(io: InvocationIo) -> Self {
+        #[cfg(target_os = "linux")]
+        let workspace = kache_store::workspace::Scope::enter(
+            io.linux_broker()
+                .map(|broker| broker as Arc<dyn kache_store::workspace::Workspace>),
+        );
         let previous = CURRENT.with(|slot| slot.replace(Some(io)));
         Self {
             previous,
@@ -170,6 +204,8 @@ impl InvocationIoScope {
                 let _ = writeln!(stderr(), "{message}");
             }),
             _thread: std::marker::PhantomData,
+            #[cfg(target_os = "linux")]
+            _workspace: workspace,
         }
     }
 }
@@ -304,6 +340,13 @@ fn process_terminal() -> Option<File> {
 /// Only inherited-stream executions use this. Captured-output probes and
 /// compiles keep their explicit pipe/null setup and replay through the writers.
 pub(crate) fn status(command: &mut Command) -> io::Result<ExitStatus> {
+    #[cfg(target_os = "linux")]
+    if current().linux_broker().is_some() {
+        use super::process::CommandExt as _;
+        return command
+            .invocation_spawn_with_io(kache_protocol::execution::windows::Stdio::INHERIT)?
+            .wait();
+    }
     #[cfg(windows)]
     if current().broker().is_some() {
         use super::process::CommandExt as _;

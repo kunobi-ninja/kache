@@ -4,10 +4,20 @@ use super::InvocationContext;
 use anyhow::Result;
 use std::path::Path;
 
+#[cfg(test)]
 pub(crate) fn try_execute(
     socket: &Path,
     args: &[String],
     context: &InvocationContext,
+) -> Result<Option<i32>> {
+    try_execute_with_trust(socket, args, context, false)
+}
+
+pub(crate) fn try_execute_with_trust(
+    socket: &Path,
+    args: &[String],
+    context: &InvocationContext,
+    trusted_pipeline: bool,
 ) -> Result<Option<i32>> {
     #[cfg(unix)]
     let (files, terminal) = match context.io.transfer_files() {
@@ -40,5 +50,5 @@ pub(crate) fn try_execute(
         terminal,
         client_version: crate::VERSION,
     }
-    .try_execute(socket)
+    .try_execute_with_trust(socket, trusted_pipeline)
 }

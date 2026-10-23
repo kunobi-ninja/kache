@@ -11,6 +11,14 @@ pub(super) struct Connection {
     inner: crate::SyncStream,
 }
 
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsFd for Connection {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        let crate::SyncStream::UdSocket(socket) = &self.inner;
+        socket.inner().as_fd()
+    }
+}
+
 impl Connection {
     pub(super) fn connect(socket: &Path) -> Result<Self> {
         let inner = crate::SyncStream::connect(crate::socket_name(socket)?)?;

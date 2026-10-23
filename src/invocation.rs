@@ -1,6 +1,8 @@
 #[cfg(any(unix, windows))]
 pub(crate) mod execution;
 pub(crate) mod io;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_broker;
 pub(crate) mod process;
 #[cfg(windows)]
 pub(crate) mod windows_broker;

@@ -102,8 +102,10 @@ pub(crate) fn check() -> io::Result<()> {
 }
 
 struct Running {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     child: std::process::Child,
+    #[cfg(target_os = "linux")]
+    child: super::linux_broker::Child,
     #[cfg(windows)]
     child: windows::Child,
     controlled: bool,
@@ -118,6 +120,10 @@ impl Running {
     fn kill(&mut self) -> io::Result<()> {
         if self.status.is_some() {
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if self.child.remote() {
+            return self.child.kill();
         }
         if self.controlled {
             #[cfg(unix)]
@@ -134,6 +140,18 @@ impl Running {
     fn wait(&mut self, blocking: bool) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
             return Ok(self.status);
+        }
+        #[cfg(target_os = "linux")]
+        if self.child.remote() {
+            let (status, max_rss) = self.child.try_wait_remote()?;
+            self.status = status;
+            if status.is_some()
+                && let Some(rss) = &self.rss
+                && let Some(bytes) = crate::scheduler::rss_from_getrusage(0, max_rss)
+            {
+                rss.record(bytes);
+            }
+            return Ok(status);
         }
         #[cfg(unix)]
         {
@@ -220,6 +238,16 @@ impl Child {
             .running
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        #[cfg(target_os = "linux")]
+        if running.child.remote() {
+            drop(running);
+            loop {
+                if let Some(status) = self.try_wait()? {
+                    return Ok(status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         if !running.controlled || running.status.is_some() {
             drop(running);
             return self.reap();
@@ -413,7 +441,18 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
     } else {
         (windows::Child::local(command.spawn()?), None)
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let mut child = if let Some(broker) = crate::invocation::io::current().linux_broker() {
+        broker.spawn(
+            command,
+            io.ok_or_else(|| {
+                io::Error::other("delegated compiler command requires an explicit IO plan")
+            })?,
+        )?
+    } else {
+        super::linux_broker::Child::local(command.spawn()?)
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
     let mut child = command.spawn()?;
     #[cfg(unix)]
     drop(descriptor_admission);

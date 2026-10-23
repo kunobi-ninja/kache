@@ -495,6 +495,11 @@ pub struct Config {
     /// false` keeps every put in the wrapper. Without a reachable daemon the
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
+    /// Permit a trusted daemon's pipeline to access the workspace under its
+    /// own restrictions. Linux native children still run in the client.
+    /// Disabled unless `KACHE_TRUST_DAEMON_EXECUTION=1` or
+    /// `[cache] trust_daemon_execution = true` is set on both peers.
+    pub trust_daemon_execution: bool,
     /// The project's `[cache] exclude` and `bypass_*` rule lists, read once
     /// with the rest of the file. Every wrapper invocation consults them
     /// before any key work; re-reading the file for each list cost a C
@@ -923,6 +928,7 @@ pub struct CacheFileConfig {
     pub deferred_durability: Option<bool>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
     pub daemon_publish: Option<bool>,
+    pub trust_daemon_execution: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub auto_gc: Option<bool>,
     /// Daemon index compaction toggle. See [`Config::index_auto_compact`].
@@ -1359,6 +1365,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
+    "KACHE_TRUST_DAEMON_EXECUTION",
     "KACHE_OUT_DIR_ALIAS",
     "KACHE_OUT_DIR_ALIAS_ROOT",
     "KACHE_DEFERRED_DURABILITY",
@@ -1469,6 +1476,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_OUT_DIR_ALIAS_ROOT", "cache.out_dir_alias_root"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
+    (
+        "KACHE_TRUST_DAEMON_EXECUTION",
+        "cache.trust_daemon_execution",
+    ),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_INDEX_AUTO_COMPACT", "cache.index_auto_compact"),
     (
@@ -2148,6 +2159,7 @@ impl Config {
         }
         let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
+        let trust_daemon_execution = Self::trust_daemon_execution_for(invocation, &file_config);
         let project_rules = ProjectRules::from_file_config(&file_config);
         let auto_gc = Self::auto_gc_enabled_for(invocation, &file_config);
         let index_auto_compact = Self::index_auto_compact_enabled_for(invocation, &file_config);
@@ -2288,6 +2300,7 @@ impl Config {
             out_dir_alias_root,
             deferred_durability,
             daemon_publish,
+            trust_daemon_execution,
             project_rules,
             auto_gc,
             index_auto_compact,
@@ -2955,6 +2968,25 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.daemon_publish)
             .unwrap_or(true)
+    }
+
+    fn trust_daemon_execution_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
+        if let Ok(value) = env_or_ignored_for(
+            invocation,
+            "KACHE_TRUST_DAEMON_EXECUTION",
+            Self::ignore_env_enabled(file_config),
+        ) {
+            return value == "1" || value.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|config| config.cache.as_ref())
+            .and_then(|cache| cache.trust_daemon_execution)
+            .unwrap_or(false)
     }
 
     /// Shared read-only OUT_DIR: `KACHE_OUT_DIR_ALIAS` (env wins), else

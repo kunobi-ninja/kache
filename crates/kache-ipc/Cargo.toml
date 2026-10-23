@@ -15,6 +15,7 @@ async = ["interprocess/tokio", "kunobi-daemon/local-async", "dep:tokio"]
 
 [dependencies]
 kache-protocol = { version = "1.2.2", path = "../kache-protocol" }
+kache-fs = { version = "1.2.2", path = "../kache-fs", features = ["staging"] }
 serde = "1"
 serde_json = "1"
 tracing = "0.1"

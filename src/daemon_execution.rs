@@ -26,23 +26,59 @@ mod linux;
 #[path = "daemon_execution_macos.rs"]
 mod macos;
 
-fn peer_may_delegate(stream: &TokioStream, reported_pid: u32) -> bool {
+fn peer_may_delegate(stream: &TokioStream, reported_pid: u32, trusted_pipeline: bool) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    let _ = trusted_pipeline;
     #[cfg(target_os = "macos")]
     {
         macos::peer_may_delegate(stream, reported_pid)
     }
     #[cfg(target_os = "linux")]
     {
-        linux::peer_may_delegate(
+        linux::peer_may_delegate_with_trust(
             Path::new("/proc"),
             crate::transport::peer_pid(stream),
             reported_pid,
+            trusted_pipeline,
         )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (stream, reported_pid);
         false
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn probe(
+    stream: &TokioStream,
+    client_pid: u32,
+    version: &str,
+    client_trust: bool,
+    daemon: &Daemon,
+) -> kache_protocol::execution::unix::ExecutionStatus {
+    let daemon_trust = daemon.config.trust_daemon_execution;
+    let eligible = version == daemon.version
+        && peer_may_delegate(stream, client_pid, client_trust && daemon_trust);
+    let detail = if version != daemon.version {
+        "client and daemon releases differ; local engine required".to_owned()
+    } else if eligible {
+        if client_trust && daemon_trust {
+            "client process and restore broker; trusted daemon pipeline"
+        } else {
+            "client process and restore broker"
+        }
+        .to_owned()
+    } else {
+        format!(
+            "local engine: process restrictions or security context are incompatible (client trust: {client_trust}, daemon trust: {daemon_trust})"
+        )
+    };
+    kache_protocol::execution::unix::ExecutionStatus {
+        eligible,
+        client_trust_enabled: client_trust,
+        daemon_trust_enabled: daemon_trust,
+        detail,
     }
 }
 
@@ -53,6 +89,7 @@ struct Prepared {
     executable: PathBuf,
     terminal: bool,
     originals: Vec<i32>,
+    client_processes: bool,
     started_at: Instant,
 }
 
@@ -71,12 +108,18 @@ impl Prepared {
                 && request.creation_mask == kache_client::creation_mask(),
             "compiler file creation policy requires local execution"
         );
-        let ExecutionChannels::Unix {
-            terminal,
-            jobserver,
-        } = request.channels
-        else {
-            anyhow::bail!("compiler channels belong to another platform");
+        let (terminal, jobserver, client_processes) = match request.channels {
+            ExecutionChannels::Unix {
+                terminal,
+                jobserver,
+            } => (terminal, jobserver, false),
+            #[cfg(target_os = "linux")]
+            ExecutionChannels::UnixClient {
+                terminal,
+                jobserver,
+                ..
+            } => (terminal, jobserver, true),
+            _ => anyhow::bail!("compiler channels belong to another platform"),
         };
         let vars = request
             .env
@@ -152,6 +195,7 @@ impl Prepared {
             executable,
             terminal,
             originals: jobserver,
+            client_processes,
             started_at,
         })
     }
@@ -163,7 +207,8 @@ impl Prepared {
         daemon: Arc<Daemon>,
     ) -> Result<(ExecutionEntry, PathBuf, Vec<String>, InvocationContext)> {
         let jobserver = kache_ipc::jobserver::Descriptors::new(
-            descriptors.split_off(3 + usize::from(self.terminal)),
+            descriptors
+                .split_off(3 + usize::from(self.terminal) + 2 * usize::from(self.client_processes)),
         )?;
         let vars = kache_ipc::jobserver::rewrite(
             &self.env.vars_os().collect::<Vec<_>>(),
@@ -184,8 +229,26 @@ impl Prepared {
             files.next().context("missing compiler stdin")?,
             files.next().context("missing compiler stdout")?,
             files.next().context("missing compiler stderr")?,
-            files.next(),
+            self.terminal.then(|| files.next()).flatten(),
         );
+        #[cfg(target_os = "linux")]
+        let io = if self.client_processes {
+            let broker = crate::invocation::linux_broker::Broker::new(
+                files
+                    .next()
+                    .context("missing native process channel")?
+                    .into(),
+                files
+                    .next()
+                    .context("missing native process pipe channel")?
+                    .into(),
+                env.clone(),
+                jobserver.clone(),
+            )?;
+            io.with_linux_broker(broker)?
+        } else {
+            io
+        };
         Ok((
             self.entry,
             self.executable.clone(),
@@ -272,7 +335,14 @@ pub(super) async fn handle(
     lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
     let client_pid = request.client_pid;
-    if !peer_may_delegate(stream, client_pid) {
+    let trusted_pipeline = matches!(
+        request.channels,
+        ExecutionChannels::UnixClient {
+            trusted_pipeline: true,
+            ..
+        }
+    ) && daemon.config.trust_daemon_execution;
+    if !peer_may_delegate(stream, client_pid, trusted_pipeline) {
         return write_reply(
             stream,
             &ExecutionReply::Declined {
@@ -331,7 +401,7 @@ pub(super) async fn handle(
             let _ = incoming?;
             anyhow::bail!("compiler client disconnected or wrote before preparation");
         }
-        result = tokio::time::timeout(PREPARE_TIMEOUT, channel.receive(3 + usize::from(prepared.terminal) + prepared.originals.len())) => result??,
+        result = tokio::time::timeout(PREPARE_TIMEOUT, channel.receive(3 + usize::from(prepared.terminal) + 2 * usize::from(prepared.client_processes) + prepared.originals.len())) => result??,
     };
     drop(channel);
     let cancellation = Cancellation::default();
@@ -346,7 +416,7 @@ pub(super) async fn handle(
     }.context("compiler client disconnected before Commit")?;
     let _: ExecutionCommand = serde_json::from_str(&commit)?;
     anyhow::ensure!(
-        peer_may_delegate(stream, client_pid),
+        peer_may_delegate(stream, client_pid, trusted_pipeline),
         "compiler process isolation changed before execution"
     );
     write_reply(stream, &ExecutionReply::Accepted).await?;
@@ -511,7 +581,22 @@ mod tests {
         Arc<Lifecycle>,
         tokio::task::JoinHandle<Vec<Result<()>>>,
     ) {
-        let config = super::super::tests::test_config(root);
+        server_with_trust(root, connections, workers, false).await
+    }
+
+    async fn server_with_trust(
+        root: &Path,
+        connections: usize,
+        workers: usize,
+        trust: bool,
+    ) -> (
+        PathBuf,
+        Arc<Daemon>,
+        Arc<Lifecycle>,
+        tokio::task::JoinHandle<Vec<Result<()>>>,
+    ) {
+        let mut config = super::super::tests::test_config(root);
+        config.trust_daemon_execution = trust;
         let socket = config.socket_path();
         let listener = crate::transport::bind_daemon_listener(&socket)
             .await
@@ -549,6 +634,140 @@ mod tests {
             results
         });
         (socket, daemon, lifecycle, task)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn trusted_linux_clients_stream_concurrently_and_release_worker_permits() {
+        let root = tempfile::tempdir().unwrap();
+        let (socket, daemon, _, server) = server_with_trust(root.path(), 3, 2, true).await;
+        let mut clients = Vec::new();
+        let mut paths = Vec::new();
+        for name in ["broker-left", "broker-right"] {
+            let (args, context) = fixture(root.path(), name);
+            paths.push(context.env.cwd().unwrap().to_owned());
+            let socket = socket.clone();
+            clients.push(tokio::task::spawn_blocking(move || {
+                crate::invocation::execution::try_execute_with_trust(&socket, &args, &context, true)
+            }));
+        }
+        for (name, path) in ["broker-left", "broker-right"].into_iter().zip(&paths) {
+            ready(&path.join("ready")).await;
+            assert_eq!(
+                std::fs::read_to_string(path.join("stdout")).unwrap(),
+                format!("metadata-{name}\n")
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.join("stderr")).unwrap(),
+                format!("diagnostic-{name}\n")
+            );
+        }
+        assert!(clients.iter().all(|client| !client.is_finished()));
+        assert_eq!(daemon.execution_workers.available_permits(), 0);
+        let (args, context) = fixture(root.path(), "untrusted-client");
+        let third = socket.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || {
+                crate::invocation::execution::try_execute_with_trust(&third, &args, &context, true)
+            })
+            .await
+            .unwrap()
+            .unwrap(),
+            None
+        );
+        for path in &paths {
+            std::fs::write(path.join("release"), b"go").unwrap();
+        }
+        for client in clients {
+            assert_eq!(client.await.unwrap().unwrap(), Some(7));
+        }
+        assert!(
+            server
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
+        assert_eq!(daemon.execution_workers.available_permits(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn filtered_execution_requires_both_peers_to_trust_the_pipeline() {
+        let filtered =
+            !linux::permits_delegation(Path::new("/proc"), std::process::id()).unwrap_or(false);
+        for (client_trust, daemon_trust) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let (socket, _, _, server) = server_with_trust(root.path(), 1, 1, daemon_trust).await;
+            let (args, context) = fixture(root.path(), "policy-client");
+            let path = context.env.cwd().unwrap().to_owned();
+            std::fs::write(path.join("release"), b"go").unwrap();
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::invocation::execution::try_execute_with_trust(
+                    &socket,
+                    &args,
+                    &context,
+                    client_trust,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let accepted = !filtered || (client_trust && daemon_trust);
+            assert_eq!(outcome, accepted.then_some(7));
+            assert_eq!(path.join("record").exists(), accepted);
+            assert!(
+                server
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .all(|result| result.is_ok())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn execution_probe_authenticates_the_peer_and_reserves_no_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let (socket, daemon, _, server) = server_with_trust(root.path(), 3, 2, true).await;
+        for (pid, version, accepted) in [
+            (std::process::id(), crate::VERSION, true),
+            (std::process::id() + 1, crate::VERSION, false),
+            (std::process::id(), "different-release", false),
+        ] {
+            let socket = socket.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                let request = Request::ExecutionStatus {
+                    client_pid: pid,
+                    client_version: version.into(),
+                    trusted_pipeline: true,
+                };
+                let response = super::super::send_request_with_timeout(
+                    &socket,
+                    &request,
+                    Duration::from_secs(3),
+                )
+                .unwrap();
+                serde_json::from_str::<Response>(&response).unwrap()
+            })
+            .await
+            .unwrap();
+            let status = response.execution_status.unwrap();
+            assert_eq!(status.eligible, accepted);
+            assert!(status.client_trust_enabled);
+            assert!(status.daemon_trust_enabled);
+            assert_eq!(daemon.execution_workers.available_permits(), 2);
+        }
+        assert!(
+            server
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
     }
 
     #[tokio::test]

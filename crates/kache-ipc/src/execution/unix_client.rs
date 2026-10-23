@@ -343,7 +343,6 @@ mod tests {
     use std::io::{Read, Seek, Write};
     use std::os::unix::process::ExitStatusExt;
 
-    #[cfg(target_os = "linux")]
     fn isolated_test(name: &str) {
         let root = tempfile::tempdir().unwrap();
         let stdout = root.path().join("stdout");

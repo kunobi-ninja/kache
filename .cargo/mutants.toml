@@ -276,6 +276,9 @@ exclude_globs = [
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # touch uses two disjoint kernel flags. XOR and OR produce the same mask;
+    # symlink and FIFO tests exercise the meaningful removal of either flag.
+    "crates/kache-ipc/src/execution/linux_client/workspace.rs:.*replace \\| with \\^ in touch$",
     # Drive-prefix components are a Windows Path API. The native Windows
     # tests check client drive selection and invalid per-drive directories.
     # InvocationEnv's shared resolution and command policy stay in scope.

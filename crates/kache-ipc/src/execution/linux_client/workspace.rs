@@ -201,6 +201,45 @@ mod tests {
     }
 
     #[test]
+    fn touching_outputs_refuses_symlinks_and_never_blocks_on_a_fifo() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("file");
+        let alias = root.path().join("alias");
+        fs::write(&target, b"bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert_eq!(touch(&alias).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        let fifo = root.path().join("fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (done, waiting) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let writer_fifo = fifo.clone();
+            let rescue = threads.spawn(move || {
+                if waiting
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .is_ok()
+                {
+                    return false;
+                }
+                // Release a blocking open before asserting, including under mutation.
+                let _writer = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&writer_fifo)
+                    .unwrap();
+                true
+            });
+            assert!(touch(&fifo).is_err());
+            let _ = done.send(());
+            assert!(
+                !rescue.join().unwrap(),
+                "touch blocked while opening a FIFO"
+            );
+        });
+    }
+
+    #[test]
     fn client_copy_keeps_the_blob_independent_and_sets_the_requested_mode() {
         let root = tempfile::tempdir().unwrap();
         let blob = root.path().join("blob");

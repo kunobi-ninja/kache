@@ -348,6 +348,125 @@ impl Drop for Child {
 mod tests {
     use super::*;
 
+    fn sized_frame(bytes: usize) -> Command {
+        let command = |units| {
+            Command::Workspace(kache_protocol::execution::unix::Workspace::Remove {
+                path: NativeString::Unix(units),
+            })
+        };
+        let overhead = serde_json::to_vec(&command(Vec::new())).unwrap().len() + 1;
+        let count = (bytes - overhead).div_ceil(2);
+        let mut units = vec![0; count];
+        if overhead + count * 2 - 1 < bytes {
+            units[0] = 99;
+        }
+        let command = command(units);
+        assert_eq!(serde_json::to_vec(&command).unwrap().len() + 1, bytes);
+        command
+    }
+
+    #[test]
+    fn frame_limit_accepts_the_boundary_and_rejects_larger_requests_before_writing() {
+        let (broker, client) = pair();
+        let error = broker.call(sized_frame(8_388_609), 0).unwrap_err();
+        assert!(error.to_string().contains("exceeds frame limit"));
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = Vec::new();
+                reader.read_until(b'\n', &mut frame).unwrap();
+                assert_eq!(frame.len(), 8_388_608);
+                assert_eq!(frame.last(), Some(&b'\n'));
+                reader
+                    .get_mut()
+                    .write_all(b"{\"operation_result\":\"done\"}\n")
+                    .unwrap();
+            });
+            assert_eq!(
+                broker.call(sized_frame(8_388_608), 0).unwrap().0,
+                Reply::Done
+            );
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn workspace_permissions_strip_file_type_and_special_bits() {
+        use kache_store::workspace::{Operation, Workspace};
+        let (broker, client) = pair();
+        let root = tempfile::tempdir().unwrap();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                let Command::Workspace(kache_protocol::execution::unix::Workspace::Permissions {
+                    mode,
+                    ..
+                }) = serde_json::from_str(&frame).unwrap()
+                else {
+                    panic!("missing permissions operation");
+                };
+                assert_eq!(mode, 0o644);
+                reader
+                    .get_mut()
+                    .write_all(b"{\"operation_result\":\"done\"}\n")
+                    .unwrap();
+            });
+            broker
+                .execute(Operation::Permissions(root.path(), 0o104644))
+                .unwrap();
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn content_files_accept_descriptor_zero_and_propagate_creation_errors() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "invocation::linux_broker::tests::content_descriptor_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    #[ignore = "isolated process closes stdin and changes its descriptor limit"]
+    fn content_descriptor_fixture() {
+        unsafe {
+            libc::close(0);
+        }
+        let mut file = content_file(b"transformed bytes").unwrap();
+        assert_eq!(file.as_raw_fd(), 0);
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"transformed bytes");
+        drop(file);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let exhausted = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+            0
+        );
+        let error = content_file(b"").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    }
+
     fn pair() -> (Arc<Broker>, UnixStream) {
         let (control, client) = UnixStream::pair().unwrap();
         client
@@ -362,6 +481,50 @@ mod tests {
         )
         .unwrap();
         (broker, client)
+    }
+
+    #[test]
+    fn remote_children_report_status_and_release_their_client_owner() {
+        let (broker, client) = pair();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                for (expected, reply) in [
+                    (
+                        Command::TryWait { id: 5 },
+                        Reply::Waited {
+                            status: Some(7 << 8),
+                            max_rss: 99,
+                        },
+                    ),
+                    (Command::Kill { id: 5 }, Reply::Done),
+                    (Command::Release { id: 5 }, Reply::Done),
+                ] {
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    assert_eq!(serde_json::from_str::<Command>(&frame).unwrap(), expected);
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).unwrap();
+                }
+            });
+            let mut child = Child {
+                inner: Inner::Remote {
+                    id: 5,
+                    pid: 7,
+                    broker,
+                },
+                stdin: None,
+                stdout: None,
+                stderr: None,
+            };
+            let (status, max_rss) = child.try_wait_remote().unwrap();
+            assert_eq!(status.unwrap().code(), Some(7));
+            assert_eq!(max_rss, 99);
+            child.kill().unwrap();
+            drop(child);
+            peer.join().unwrap();
+        });
     }
 
     #[test]

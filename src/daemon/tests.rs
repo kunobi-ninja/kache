@@ -15233,6 +15233,7 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     let listener = bind_listener(&socket);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let first_daemon = daemon.clone();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
     let first_server = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         // The connected stats probe can finish after the listener disappears.
@@ -15241,6 +15242,7 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
         handle_connection(stream, &first_daemon, &Arc::new(Lifecycle::default()))
             .await
             .unwrap();
+        closed_tx.send(()).unwrap();
     });
     let runtime = tokio::runtime::Handle::current();
     let calls = Arc::new(AtomicU64::new(0));
@@ -15249,6 +15251,29 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     let outcome = tokio::task::spawn_blocking(move || {
         send_gc_request_with_timeout(&config, Some(17), Duration::from_secs(2), || {
             starter_calls.fetch_add(1, Ordering::SeqCst);
+            closed_rx.recv_timeout(Duration::from_secs(2))?;
+            // Windows may still hold the old named-pipe instance while its
+            // asynchronous close finishes. The old handler has exited above.
+            #[cfg(windows)]
+            let deadline = Instant::now() + Duration::from_secs(2);
+            #[cfg(windows)]
+            let listener = loop {
+                match ListenerOptions::new()
+                    .name(socket_name(&socket)?)
+                    .create_tokio()
+                {
+                    Ok(listener) => break listener,
+                    #[cfg(windows)]
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::PermissionDenied
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            #[cfg(not(windows))]
             let listener = bind_listener(&socket);
             let daemon = daemon.clone();
             let server = runtime.spawn(async move {

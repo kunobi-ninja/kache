@@ -48,28 +48,21 @@ impl Pending {
         }
         let mut status = 0;
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        loop {
-            let result = unsafe {
+        let result = retry_interrupted(|| {
+            checked(unsafe {
                 libc::wait4(
                     self.child.id() as libc::pid_t,
                     &mut status,
                     flags,
                     usage.as_mut_ptr(),
                 )
-            };
-            if result > 0 {
-                self.status = Some(status);
-                self.max_rss = unsafe { usage.assume_init() }.ru_maxrss;
-                return Ok(());
-            }
-            if result == 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+            })
+        })?;
+        if result > 0 {
+            self.status = Some(status);
+            self.max_rss = unsafe { usage.assume_init() }.ru_maxrss;
         }
+        Ok(())
     }
 }
 
@@ -142,15 +135,8 @@ impl Client {
                 revents: 0,
             },
         ];
-        loop {
-            if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } >= 0 {
-                return Ok(fds[0].revents == 0);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+        retry_interrupted(|| checked(unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) }))?;
+        Ok(fds[0].revents == 0)
     }
 
     pub(super) fn service(&mut self) -> anyhow::Result<bool> {
@@ -323,6 +309,23 @@ impl Client {
     }
 }
 
+fn checked(result: libc::c_int) -> io::Result<libc::c_int> {
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
 }
@@ -338,12 +341,60 @@ mod tests {
     use std::io::{Read, Seek, Write};
     use std::os::unix::process::ExitStatusExt;
 
+    fn isolated_test(name: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let stdout = root.path().join("stdout");
+        let stderr = root.path().join("stderr");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("execution::linux_client::tests::{name}"),
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(File::create(&stdout).unwrap())
+            .stderr(File::create(&stderr).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            status.success(),
+            "{name}: {status}\n{}\n{}",
+            std::fs::read_to_string(stdout).unwrap(),
+            std::fs::read_to_string(stderr).unwrap()
+        );
+    }
+
     fn fixture(root: &std::path::Path) -> Client {
-        let files = [
+        fixture_with_manifest(root, false, 0).0
+    }
+
+    fn fixture_with_manifest(
+        root: &std::path::Path,
+        terminal: bool,
+        jobservers: usize,
+    ) -> (Client, [OwnedFd; 2]) {
+        let mut files = vec![
             tempfile::tempfile().unwrap(),
             tempfile::tempfile().unwrap(),
             tempfile::tempfile().unwrap(),
         ];
+        for _ in 0..usize::from(terminal) + jobservers {
+            files.push(tempfile::tempfile().unwrap());
+        }
         let request = ExecutionRequest {
             version: EXECUTION_VERSION,
             entry: ExecutionEntry::Compiler,
@@ -359,14 +410,12 @@ mod tests {
             executable: NativeString::capture("/bin/true".as_ref()),
             startup_micros: 0,
             channels: ExecutionChannels::UnixClient {
-                terminal: false,
-                jobserver: Vec::new(),
+                terminal,
+                jobserver: (0..jobservers as i32).collect(),
                 trusted_pipeline: false,
             },
         };
-        Client::prepare(&request, &files.iter().map(AsFd::as_fd).collect::<Vec<_>>())
-            .unwrap()
-            .0
+        Client::prepare(&request, &files.iter().map(AsFd::as_fd).collect::<Vec<_>>()).unwrap()
     }
 
     fn spawn(root: &std::path::Path, script: &str, stdio: Plan) -> Command {
@@ -381,6 +430,66 @@ mod tests {
             }),
             jobserver: Vec::new(),
         }
+    }
+
+    #[test]
+    fn terminal_and_jobserver_descriptors_follow_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        for terminal in [false, true] {
+            let (client, _peer) = fixture_with_manifest(root.path(), terminal, 2);
+            assert_eq!(client.jobserver.files().len(), 2);
+        }
+    }
+
+    #[test]
+    fn readiness_waits_for_an_event_and_prioritizes_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let (client, endpoints) = fixture_with_manifest(root.path(), false, 0);
+        let mut control = UnixStream::from(endpoints.into_iter().next().unwrap());
+        let (completion, mut producer) = UnixStream::pair().unwrap();
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                producer.write_all(b"complete").unwrap();
+            });
+            let start = std::time::Instant::now();
+            assert!(!client.ready(completion.as_fd()).unwrap());
+            assert!(start.elapsed() >= std::time::Duration::from_millis(10));
+        });
+        let (empty, _producer) = UnixStream::pair().unwrap();
+        control.write_all(b"request").unwrap();
+        assert!(client.ready(empty.as_fd()).unwrap());
+        assert!(!client.ready(completion.as_fd()).unwrap());
+    }
+
+    #[test]
+    fn interrupted_syscalls_retry_and_other_errors_return_immediately() {
+        let mut calls = 0;
+        assert_eq!(
+            retry_interrupted(|| {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(7)
+                }
+            })
+            .unwrap(),
+            7
+        );
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let error = retry_interrupted::<()>(|| {
+            calls += 1;
+            assert_eq!(calls, 1, "non-interrupted errors must not retry");
+            Err(io::ErrorKind::PermissionDenied.into())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(checked(0).unwrap(), 0);
+        assert_eq!(checked(17).unwrap(), 17);
+        assert!(checked(-1).is_err());
     }
 
     #[test]
@@ -418,7 +527,12 @@ mod tests {
         let mut error = String::new();
         files.next().unwrap().read_to_string(&mut error).unwrap();
         assert_eq!(error, "error");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let status = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native child was never reaped"
+            );
             let (Reply::Waited { status, max_rss }, files) =
                 client.execute(Command::TryWait { id }).unwrap()
             else {
@@ -442,6 +556,12 @@ mod tests {
 
     #[test]
     fn dropping_the_client_kills_and_reaps_its_live_child_group() {
+        isolated_test("dropping_client_fixture");
+    }
+
+    #[test]
+    #[ignore = "bounded subprocess fixture"]
+    fn dropping_client_fixture() {
         let root = tempfile::tempdir().unwrap();
         let mut client = fixture(root.path());
         let (Reply::Spawned { id, pid }, files) = client
@@ -549,16 +669,7 @@ mod tests {
 
     #[test]
     fn native_children_keep_the_original_clients_seccomp_and_no_new_privs() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "execution::linux_client::tests::restricted_client_fixture",
-                "--ignored",
-                "--nocapture",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
+        isolated_test("restricted_client_fixture");
     }
 
     #[test]
@@ -680,7 +791,12 @@ mod tests {
                 bytes
             })
             .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let status = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native child was never reaped"
+            );
             let (Reply::Waited { status, .. }, _) =
                 client.execute(Command::TryWait { id }).unwrap()
             else {

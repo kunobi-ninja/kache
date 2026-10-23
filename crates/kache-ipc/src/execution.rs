@@ -250,15 +250,24 @@ mod tests {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("control");
         let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let mut fixture = fixture(root.path());
+        fixture
+            .files
+            .extend((0..3).map(|_| tempfile::tempfile().unwrap()));
         fixture.request.channels = ExecutionChannels::UnixClient {
-            terminal: false,
-            jobserver: Vec::new(),
+            terminal: true,
+            jobserver: vec![70, 71],
             trusted_pipeline: false,
         };
         std::thread::scope(|threads| {
             let server = threads.spawn(|| {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) =
+                    retry_until(Some(std::time::Instant::now() + PREPARE_TIMEOUT), || {
+                        listener.accept()
+                    })
+                    .unwrap();
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
@@ -279,10 +288,10 @@ mod tests {
                 )
                 .unwrap();
                 let mut files =
-                    crate::descriptors::receive(datagram.as_fd(), &ticket.key, 5).unwrap();
-                let pipes = UnixDatagram::from(files.pop().unwrap());
+                    crate::descriptors::receive(datagram.as_fd(), &ticket.key, 8).unwrap();
+                let control = UnixStream::from(files.remove(4));
+                let pipes = UnixDatagram::from(files.remove(4));
                 pipes.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
-                let control = UnixStream::from(files.pop().unwrap());
                 control.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
                 let mut control = std::io::BufReader::new(control);
                 write_message(&mut stream, &ExecutionReply::Prepared).unwrap();
@@ -330,7 +339,12 @@ mod tests {
                 let mut error = String::new();
                 outputs.next().unwrap().read_to_string(&mut error).unwrap();
                 assert_eq!(error, "native-error");
+                let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
                 let raw = loop {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "native child was never reaped"
+                    );
                     write_message(control.get_mut(), &Command::TryWait { id }).unwrap();
                     let mut line = String::new();
                     control.read_line(&mut line).unwrap();

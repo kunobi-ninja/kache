@@ -48,6 +48,14 @@ pub enum Reply {
 /// Stream framing is bounded independently of compiler output pipes.
 pub const MAX_FRAME_BYTES: u64 = 8 << 20;
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn control_frames_allow_eight_mebibytes() {
+        assert_eq!(super::MAX_FRAME_BYTES, 8_388_608);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionStatus {
     pub eligible: bool,

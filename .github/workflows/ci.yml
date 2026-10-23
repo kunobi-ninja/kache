@@ -470,9 +470,9 @@ jobs:
           test -s tmp/mutants/pr.diff
           # Shard 0 checks the unmutated baseline for the whole matrix.
           # The proof-only crate is compiled and exercised by the Kani job.
-          # --timeout bounds the baseline too. The kache and kache-store
-          # suites ran 146 s, 179 s and 171 s on three consecutive merges,
-          # so 180 left no room and the next test added failed the baseline.
+          # --timeout also bounds the baseline. Its full suite reached the
+          # final integration binary at 300 s in run 39962317701. Give shard
+          # zero 450 s; keep the other workers' 300 s bound.
           ./scripts/with-test-resources.sh cargo mutants \
             --workspace \
             --all-features \
@@ -485,7 +485,7 @@ jobs:
             --in-place \
             --baseline "${{ matrix.index == 0 && 'run' || 'skip' }}" \
             --caught \
-            --timeout 300 \
+            --timeout '${{ matrix.index == 0 && 450 || 300 }}' \
             --build-timeout 600 \
             --annotations github \
             --output 'tmp/mutants/diff-${{ matrix.display }}'

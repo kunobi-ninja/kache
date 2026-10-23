@@ -118,6 +118,103 @@ impl Drop for Prepared {
 mod tests {
     use super::*;
 
+    struct Stages {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail_publish: bool,
+    }
+
+    impl Workspace for Stages {
+        fn execute(&self, operation: Operation<'_>) -> io::Result<Outcome> {
+            let mut calls = self.calls.lock().unwrap();
+            match operation {
+                Operation::PrepareBytes(_, bytes) => {
+                    calls.push("prepare".into());
+                    Ok(Outcome::Prepared {
+                        id: 42,
+                        bytes: bytes.len() as u64,
+                        reflinked: false,
+                    })
+                }
+                Operation::Publish(id, replace) => {
+                    calls.push(format!("publish:{id}:{replace}"));
+                    if self.fail_publish {
+                        Err(io::ErrorKind::PermissionDenied.into())
+                    } else {
+                        Ok(Outcome::Done)
+                    }
+                }
+                Operation::Discard(id) => {
+                    calls.push(format!("discard:{id}"));
+                    Ok(Outcome::Done)
+                }
+                _ => panic!("unexpected workspace operation"),
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_files_discard_only_unpublished_stages() {
+        for (publish, replace, fail_publish, expected) in [
+            (false, false, false, vec!["prepare", "discard:42"]),
+            (true, false, false, vec!["prepare", "publish:42:false"]),
+            (true, true, false, vec!["prepare", "publish:42:true"]),
+            (
+                true,
+                true,
+                true,
+                vec!["prepare", "publish:42:true", "discard:42"],
+            ),
+        ] {
+            let owner = Arc::new(Stages {
+                calls: Default::default(),
+                fail_publish,
+            });
+            let (stage, bytes, reflinked) = Prepared::new(
+                owner.clone(),
+                Operation::PrepareBytes(Path::new("output"), b"bytes"),
+            )
+            .unwrap();
+            assert_eq!(bytes, 5);
+            assert!(!reflinked);
+            if publish {
+                assert_eq!(stage.publish(replace).is_err(), fail_publish);
+            } else {
+                drop(stage);
+            }
+            assert_eq!(*owner.calls.lock().unwrap(), expected);
+        }
+    }
+
+    struct RemoveError(io::ErrorKind);
+    impl Workspace for RemoveError {
+        fn execute(&self, operation: Operation<'_>) -> io::Result<Outcome> {
+            match operation {
+                Operation::Remove(_) => Err(self.0.into()),
+                Operation::Reflink(_, _) | Operation::Permissions(_, _) => Ok(Outcome::Done),
+                _ => panic!("unexpected restore fallback"),
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_an_absent_target_succeeds_but_other_client_errors_propagate() {
+        for (kind, succeeds) in [
+            (io::ErrorKind::NotFound, true),
+            (io::ErrorKind::PermissionDenied, false),
+        ] {
+            let _scope = Scope::enter(Some(Arc::new(RemoveError(kind))));
+            assert_eq!(
+                crate::link::link_to_target(
+                    Path::new("blob"),
+                    Path::new("output"),
+                    crate::link::LinkStrategy::Copy
+                )
+                .is_ok(),
+                succeeds
+            );
+        }
+    }
+
     struct Denied;
     impl Workspace for Denied {
         fn execute(&self, _operation: Operation<'_>) -> io::Result<Outcome> {

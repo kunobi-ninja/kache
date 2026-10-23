@@ -168,27 +168,19 @@ fn cargo_refuses_the_original_frontend_as_its_real_cargo_program() {
 }
 
 #[test]
-fn direct_engine_bootstraps_a_daemon_and_delegates_the_compiler() {
+fn direct_engine_bootstraps_a_daemon_and_keeps_the_platform_process_owner() {
     let fixture = Fixture::new();
     let (engine_pid, status) = fixture.run_compiler(false);
     let parents = fixture.assert_compiler_output(status);
+    // Linux keeps native children in the requesting process on both the
+    // delegated and local paths. macOS still creates them in the daemon.
     #[cfg(target_os = "linux")]
-    let filtered = std::fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .any(|(name, value)| matches!(name, "Seccomp" | "NoNewPrivs") && value.trim() != "0");
+    assert_eq!(parents, vec![engine_pid]);
     #[cfg(not(target_os = "linux"))]
-    let filtered = false;
-    if filtered {
-        // Linux filters cannot be compared across processes; execution stays local.
-        assert_eq!(parents, vec![engine_pid]);
-    } else {
-        assert!(
-            parents.iter().all(|parent| *parent != engine_pid),
-            "{parents:?}"
-        );
-    }
+    assert!(
+        parents.iter().all(|parent| *parent != engine_pid),
+        "{parents:?}"
+    );
     assert!(
         parents.iter().all(|parent| *parent == parents[0]),
         "{parents:?}"

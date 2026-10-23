@@ -4,7 +4,7 @@ use super::InvocationContext;
 use anyhow::Result;
 use std::path::Path;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn try_execute(
     socket: &Path,
     args: &[String],

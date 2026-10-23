@@ -396,7 +396,7 @@ mod windows_tests {
             terminal: false,
             client_version: "fixture",
         }
-        .prepare()
+        .prepare(false)
         .unwrap();
         assert_eq!(prepared.request.argv[1].decode().unwrap(), native);
         assert_eq!(prepared.request.env[0].1.decode().unwrap(), native);

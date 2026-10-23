@@ -516,7 +516,8 @@ pub(crate) fn validate_closed_windows_runtime_archive(bytes: &[u8]) -> Option<()
         pos = if size & 1 == 0 {
             end
         } else {
-            if bytes.get(end) != Some(&b'\n') {
+            // Windows SDK COFF libraries use NUL padding; GNU ar uses newline.
+            if !matches!(bytes.get(end), Some(0 | b'\n')) {
                 return None;
             }
             end.checked_add(1)?
@@ -1801,6 +1802,52 @@ mod tests {
                 "supported import type/name flags {flags}"
             );
         }
+    }
+
+    #[test]
+    fn closed_windows_runtime_member_padding_accepts_coff_and_gnu_bytes() {
+        let first = runtime_coff_object(b".text", b"x");
+        let second = runtime_coff_object(b".data", b"yz");
+        assert_eq!(first.len(), 61);
+        assert_eq!(second.len(), 62);
+        // A 16-byte symbol table puts these member headers at 84 and 206.
+        // Both index offsets must still select their checked COFF member.
+        let mut index = 2_u32.to_be_bytes().to_vec();
+        index.extend_from_slice(&84_u32.to_be_bytes());
+        index.extend_from_slice(&206_u32.to_be_bytes());
+        index.extend_from_slice(b"a\0b\0");
+        let archive = raw_archive(&[
+            ("/", &index),
+            ("first.obj/", &first),
+            ("second.obj/", &second),
+        ]);
+        assert_eq!(archive.len(), 328);
+        assert_eq!(archive[205], b'\n');
+        assert_eq!(&archive[206..222], b"second.obj/     ");
+        for padding in [0, b'\n'] {
+            let mut valid = archive.clone();
+            valid[205] = padding;
+            assert!(
+                validate_closed_windows_runtime_archive(&valid).is_some(),
+                "supported member padding {padding}"
+            );
+            valid.push(padding);
+            assert!(validate_closed_windows_runtime_archive(&valid).is_none());
+        }
+        for padding in [b'x', 0xff] {
+            let mut bad = archive.clone();
+            bad[205] = padding;
+            assert!(
+                validate_closed_windows_runtime_archive(&bad).is_none(),
+                "unsupported member padding {padding}"
+            );
+        }
+        let mut missing_between_members = archive;
+        missing_between_members.remove(205);
+        assert!(validate_closed_windows_runtime_archive(&missing_between_members).is_none());
+        let mut missing_at_end = raw_archive(&[("first.obj/", &first)]);
+        assert_eq!(missing_at_end.pop(), Some(b'\n'));
+        assert!(validate_closed_windows_runtime_archive(&missing_at_end).is_none());
     }
 
     #[test]

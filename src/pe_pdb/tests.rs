@@ -539,6 +539,33 @@ fn debug_directory_extents_and_counts_are_bounded_before_reading() {
 }
 
 #[test]
+fn the_first_section_can_start_exactly_where_the_headers_end() {
+    for magic in [0x20b, 0x10b] {
+        let mut bytes = pe(magic, rsds("app.pdb"));
+        let section = if magic == 0x20b { 0x188 } else { 0x178 };
+        // Pad the headers to the ordinary section alignment and move .rdata
+        // beside them, keeping its RVA and both CodeView locations coherent.
+        bytes.resize(0x1200, 0);
+        bytes.copy_within(0x400..0x600, 0x1000);
+        bytes[0x400..0x600].fill(0);
+        if magic == 0x10b {
+            put_u16(&mut bytes, 0x84, 0x014c);
+        }
+        put_u32(&mut bytes, 0x98 + 32, 0x1000);
+        put_u32(&mut bytes, 0x98 + 36, 0x200);
+        put_u32(&mut bytes, 0x98 + 56, 0x2000);
+        put_u32(&mut bytes, 0x98 + 60, 0x1000);
+        put_u32(&mut bytes, section + 20, 0x1000);
+        put_u32(&mut bytes, 0x1000 + 28 + 24, 0x1040);
+        let unit = Unit::new(&[("app.exe", bytes), ("app.pdb", pdb(GUID, 1, Some(1)))]);
+        assert!(
+            matches!(unit.check().unwrap()[..], [Pairing::Paired { .. }]),
+            "first section at SizeOfHeaders, magic {magic:#x}"
+        );
+    }
+}
+
+#[test]
 fn header_debug_directories_and_section_ambiguity_are_checked() {
     let mut bytes = pe(0x20b, rsds("app.pdb"));
     let directory = bytes[0x400..0x438].to_vec();
@@ -722,10 +749,16 @@ fn reported_or_pending_pdb_names_must_be_unique_and_beside_the_executable() {
     let moved = nested.join("app.pdb");
     std::fs::rename(&unit.files[1].0, &moved).unwrap();
     unit.files[1].0 = moved;
-    assert!(
-        unit.check().is_err(),
-        "a bare recorded name needs its sibling output"
-    );
+    let error = unit.check().unwrap_err();
+    assert!(error.to_string().contains("not beside"), "{error:#}");
+    // Cached blobs need not preserve the compiler's sibling layout.
+    check_cached_outputs(
+        unit.files
+            .iter()
+            .map(|(path, name)| (path.as_path(), name.as_str())),
+        None,
+    )
+    .unwrap();
 
     let unit = Unit::new(&[
         ("one.exe", pe(0x20b, rsds("shared.pdb"))),
@@ -1091,6 +1124,25 @@ fn info_stream_and_directory_reads_use_their_logical_extents() {
     put_u32(&mut short_directory, 44, 24);
     assert!(
         identity(short_directory)
+            .unwrap_err()
+            .to_string()
+            .contains("stream directory is truncated")
+    );
+
+    // Keep two directory blocks after truncation: the DBI reference remains
+    // in the final physical block, just beyond the declared logical extent.
+    let mut large_info = pdb_info(GUID, 1);
+    while large_info.len() < 62_980 {
+        large_info.extend(20140508u32.to_le_bytes());
+    }
+    assert_eq!(large_info.len(), 62_980);
+    let mut split_directory = msf_with_info(&large_info, Some(1));
+    assert_eq!(u32_at(&split_directory, 44), 520);
+    assert_eq!(u32_at(&split_directory, 1024 + 516), 128);
+    assert_eq!(identity(split_directory.clone()).unwrap().guid, GUID);
+    put_u32(&mut split_directory, 44, 516);
+    assert!(
+        identity(split_directory)
             .unwrap_err()
             .to_string()
             .contains("stream directory is truncated")

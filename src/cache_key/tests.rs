@@ -19296,3 +19296,72 @@ fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
         "legacy producers cannot write this namespace"
     );
 }
+
+#[test]
+fn custom_target_full_keys_keep_the_pdb_admission_namespace() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").unwrap();
+    let spec_name = format!(
+        "{}-custom.json",
+        workspace.file_name().unwrap().to_str().unwrap()
+    );
+    let spec = workspace.join(&spec_name);
+    std::fs::write(&spec, br#"{"llvm-target":"x86_64","data-layout":"e-m:e"}"#).unwrap();
+    // The relative spec exists in this invocation's cwd, not the daemon's.
+    assert!(!Path::new(&spec_name).is_file());
+    let invocation =
+        client_invocation(&workspace, &[("OUT_DIR", None), ("RUST_TARGET_PATH", None)]);
+    let has_namespace = |target: &str, target_path: Option<&Path>| {
+        let mut invocation = invocation.clone();
+        if let Some(path) = target_path {
+            invocation.set("RUST_TARGET_PATH", path.as_os_str());
+        }
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-name=app".into(),
+                "--crate-type=bin".into(),
+                format!("--target={target}"),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        let (key, output) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new_for(&invocation),
+            &PathNormalizer::from_invocation(Some(&workspace), &invocation),
+            &KeyEnv::from_invocation(&invocation),
+        );
+        key.unwrap();
+        output.fields.unwrap().contains_key("pe_pdb_admission")
+    };
+    assert!(
+        has_namespace(&spec_name, None),
+        "a relative JSON spec can select PE without naming Windows"
+    );
+    let absolute_spec = spec.to_str().unwrap();
+    assert!(
+        has_namespace(absolute_spec, None),
+        "an existing target file keeps the same admission policy"
+    );
+    let target_name = spec_name.strip_suffix(".json").unwrap();
+    assert!(
+        has_namespace(target_name, Some(&workspace)),
+        "RUST_TARGET_PATH can resolve a bare custom target name"
+    );
+    assert!(
+        !has_namespace("x86_64-unknown-linux-gnu", None),
+        "a known non-Windows built-in target keeps its previous namespace"
+    );
+}

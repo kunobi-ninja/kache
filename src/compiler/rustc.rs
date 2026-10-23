@@ -713,6 +713,78 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn execution_discovers_a_named_pdb_only_for_a_linked_bin() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let rustc = workspace.join("fixture-rustc");
+        let (pe, pdb) = crate::pe_pdb::fixture_pair();
+        std::fs::write(workspace.join("compiler-output"), pe).unwrap();
+        std::fs::write(workspace.join("app.pdb"), pdb).unwrap();
+        std::fs::write(workspace.join("source.rs"), "fn main() {}\n").unwrap();
+        kache_fs::testutil::write_executable(
+            &rustc,
+            r##"#!/bin/sh
+set -eu
+case "$1" in
+    --version) printf 'rustc 1.99.0\nhost: x86_64-pc-windows-msvc\n'; exit 0 ;;
+    --print) exit 1 ;;
+esac
+cp compiler-output "$KACHE_TEST_PRIMARY_OUTPUT"
+if test "$KACHE_TEST_REPORT_ARTIFACTS" = yes; then
+    printf '{"$message_type":"artifact","artifact":"%s","emit":"link"}\n' "$KACHE_TEST_PRIMARY_OUTPUT" >&2
+fi
+"##,
+        );
+        let captured = crate::invocation::InvocationEnv::capture();
+        let mut invocation = crate::invocation::InvocationEnv::from_parts(
+            captured.vars_os(),
+            Some(workspace.clone()),
+            captured.home_dir().map(Path::to_path_buf),
+            workspace.clone(),
+        );
+        invocation.set("KACHE_CACHE_DIR", workspace.join("cache"));
+        for report in ["yes", "no"] {
+            invocation.set("KACHE_TEST_REPORT_ARTIFACTS", report);
+            for (kind, output, expected_pdb) in [
+                ("bin", "program.out", true),
+                ("cdylib", "library.dll", false),
+            ] {
+                invocation.set("KACHE_TEST_PRIMARY_OUTPUT", output);
+                let compiler = RustcCompiler::new_for(&invocation);
+                let parsed = compiler
+                    .parse(&[
+                        rustc.to_str().unwrap().into(),
+                        "--crate-name=fixture".into(),
+                        format!("--crate-type={kind}"),
+                        "--emit=link".into(),
+                        "--target=x86_64-pc-windows-msvc".into(),
+                        "-o".into(),
+                        output.into(),
+                        "source.rs".into(),
+                    ])
+                    .unwrap();
+                let result = compiler.execute(&parsed).unwrap();
+                assert_eq!(result.exit_code, 0, "{}", result.stderr);
+                let names: Vec<_> = result
+                    .artifacts
+                    .outputs()
+                    .iter()
+                    .map(|artifact| artifact.store_name.as_str())
+                    .collect();
+                let expected = if expected_pdb {
+                    vec![output, "app.pdb"]
+                } else {
+                    vec![output]
+                };
+                assert_eq!(names, expected, "{kind}, artifact reports={report}");
+                assert!(workspace.join("app.pdb").is_file());
+            }
+        }
+    }
+
     fn proc_macro_args(extra: &[&str]) -> RustcArgs {
         let mut argv = vec![
             "rustc",

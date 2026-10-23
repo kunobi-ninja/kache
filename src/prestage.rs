@@ -799,6 +799,16 @@ mod tests {
         checkout(dir, name, "app")
     }
 
+    #[test]
+    fn missing_activity_is_absent_but_other_read_errors_propagate() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(activity_at(&dir.path().join("missing")).unwrap(), None);
+        assert!(
+            activity_at(dir.path()).is_err(),
+            "a directory read error must not become absent activity"
+        );
+    }
+
     /// A recorded executable is staged beside its missing destination and
     /// the restore takes it: the destination ends up with the blob's bytes
     /// in a file of its own, and nothing is left behind.
@@ -953,6 +963,87 @@ mod tests {
         publish_stage(&cache, &target, &first, copy, &None).unwrap();
         assert!(!staged_path(&first_dest, &first_hash).unwrap().exists());
         assert_eq!(std::fs::read(&first_dest).unwrap(), b"compiler won");
+    }
+
+    #[test]
+    fn beginning_a_stage_preserves_foreign_and_identical_valid_predictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (own_blob, own_hash) = blob(dir.path(), b"own prediction");
+        let (foreign_blob, foreign_hash) = blob(dir.path(), b"foreign prediction");
+        let own_dest = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        remember(&cache, &target, &own_dest, &own_hash, MIN_BYTES);
+        let own = records_for(&cache, &target).pop().unwrap();
+        let foreign = Record {
+            dest: target.join("debug/deps/other-aaaaaaaaaaaaaaaa"),
+            rel: own.rel.clone(),
+            blob: foreign_hash,
+            size: MIN_BYTES,
+        };
+        stage_one(&foreign, &foreign_blob).unwrap();
+        with_activity(&cache, &target, &own.rel, |path| {
+            write_atomic(
+                path,
+                &serde_json::to_vec(&Activity::Pending {
+                    record: foreign.clone(),
+                    generation: None,
+                })?,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_file(&foreign_blob).unwrap();
+        assert!(begin_stage(&cache, &target, &own, &None).unwrap());
+        assert!(
+            take(&foreign.dest, &foreign.blob),
+            "beginning our artifact must not discard another artifact's prediction"
+        );
+        assert_eq!(std::fs::read(&foreign.dest).unwrap(), b"foreign prediction");
+
+        stage_record(&cache, &target, &own, &own_blob, &None).unwrap();
+        let staged = staged_path(&own.dest, &own.blob).unwrap();
+        let fingerprint = std::fs::read(fingerprint_path(&staged)).unwrap();
+        std::fs::remove_file(&own_blob).unwrap();
+        // A duplicate request must keep the published prediction. With its
+        // blob gone, a needless discard cannot be hidden by making a new copy.
+        stage_record(&cache, &target, &own, &own_blob, &None).unwrap();
+        assert_eq!(
+            std::fs::read(fingerprint_path(&staged)).unwrap(),
+            fingerprint
+        );
+        assert!(
+            take(&own.dest, &own.blob),
+            "an identical Pending must keep the already-valid staged copy"
+        );
+        assert_eq!(std::fs::read(&own.dest).unwrap(), b"own prediction");
+    }
+
+    #[test]
+    fn a_different_own_record_discards_a_published_prediction_without_a_new_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (old_blob, old_hash) = blob(dir.path(), b"old prediction");
+        let old_dest = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        remember(&cache, &target, &old_dest, &old_hash, MIN_BYTES);
+        let old = records_for(&cache, &target).pop().unwrap();
+        stage_record(&cache, &target, &old, &old_blob, &None).unwrap();
+        let staged = staged_path(&old_dest, &old_hash).unwrap();
+        assert!(staged.is_file() && fingerprint_path(&staged).is_file());
+
+        let (new_blob, new_hash) = blob(dir.path(), b"new prediction");
+        let new_dest = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        remember(&cache, &target, &new_dest, &new_hash, MIN_BYTES);
+        let new = records_for(&cache, &target).pop().unwrap();
+        std::fs::remove_file(&new_blob).unwrap();
+        stage_record(&cache, &target, &new, &new_blob, &None).unwrap();
+        assert!(
+            !staged.exists() && !fingerprint_path(&staged).exists(),
+            "a different own Pending retires the published old prediction even without a new blob"
+        );
+        assert!(!staged_path(&new_dest, &new_hash).unwrap().exists());
+        assert!(!old_dest.exists() && !new_dest.exists());
     }
 
     #[test]
@@ -1159,6 +1250,192 @@ mod tests {
                     .path()
                     .extension()
                     .is_some_and(|extension| extension == "lock"))
+        );
+    }
+
+    #[test]
+    fn pruning_counts_an_expired_activity_once_and_keeps_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let dest = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(records_dir(&cache, &target)).unwrap();
+        std::fs::write(&dest, b"completed").unwrap();
+        complete(&cache, &target, &dest, &None);
+        let path = with_activity(
+            &cache,
+            &target,
+            dest.strip_prefix(&target).unwrap(),
+            |path| Ok(path.to_path_buf()),
+        )
+        .unwrap();
+        assert!(path.is_file());
+        let at = changed_at(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert_eq!(
+            prune(&cache, at),
+            0,
+            "the completed activity is not expired"
+        );
+        let expired = at + RECORD_TTL + Duration::from_secs(1);
+        assert_eq!(
+            prune(&cache, expired),
+            1,
+            "only the expired activity was removed"
+        );
+        assert!(!path.exists());
+        assert!(
+            path.with_extension("lock").is_file(),
+            "the coordination inode remains stable"
+        );
+        assert_eq!(prune(&cache, expired), 0, "a second sweep removes nothing");
+    }
+
+    #[test]
+    fn pruning_removes_a_fresh_activity_after_its_target_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let dest = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(records_dir(&cache, &target)).unwrap();
+        std::fs::write(&dest, b"completed").unwrap();
+        complete(&cache, &target, &dest, &None);
+        let path = with_activity(
+            &cache,
+            &target,
+            dest.strip_prefix(&target).unwrap(),
+            |path| Ok(path.to_path_buf()),
+        )
+        .unwrap();
+        assert!(path.is_file());
+        let at = changed_at(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert_eq!(prune(&cache, at), 0, "the target and fresh activity remain");
+        std::fs::remove_dir_all(&target).unwrap();
+        assert_eq!(
+            prune(&cache, at),
+            1,
+            "the target disappeared without aging the activity"
+        );
+        assert!(!path.exists());
+        assert!(path.with_extension("lock").is_file());
+        assert_eq!(prune(&cache, at), 0);
+    }
+
+    #[test]
+    #[ignore = "child fixture for activity_lock_releases_before_its_owner_process_exits"]
+    fn activity_lock_probe_child() {
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_PRESTAGE_ACTIVITY_ROOT").unwrap());
+        let path = std::env::var_os("KACHE_TEST_PRESTAGE_ACTIVITY_LOCK").unwrap();
+        let lock = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        assert!(
+            matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "with_activity must hold the lock while its closure runs"
+        );
+        std::fs::write(root.join("blocked"), b"blocked").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !root.join("release").is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent did not return from with_activity"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        lock.try_lock()
+            .expect("the same child must acquire after with_activity returns");
+        std::fs::write(root.join("acquired"), b"acquired").unwrap();
+    }
+
+    #[test]
+    fn activity_lock_releases_before_its_owner_process_exits() {
+        struct ProbeChild(std::process::Child);
+        impl Drop for ProbeChild {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        std::fs::create_dir_all(records_dir(&cache, &target)).unwrap();
+        let log_path = dir.path().join("activity-probe.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let child_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+        let mut ran = false;
+        let mut child = None;
+        with_activity(
+            &cache,
+            &target,
+            Path::new("debug/deps/app-0123456789abcdef"),
+            |path| {
+                ran = true;
+                child = Some(ProbeChild(
+                    std::process::Command::new(std::env::current_exe()?)
+                        .args([
+                            "--exact",
+                            "prestage::tests::activity_lock_probe_child",
+                            "--ignored",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env("KACHE_TEST_PRESTAGE_ACTIVITY_ROOT", dir.path())
+                        .env(
+                            "KACHE_TEST_PRESTAGE_ACTIVITY_LOCK",
+                            path.with_extension("lock"),
+                        )
+                        .current_dir(dir.path())
+                        .stdout(log.try_clone()?)
+                        .stderr(log.try_clone()?)
+                        .spawn()?,
+                ));
+                let probe = child.as_mut().unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !dir.path().join("blocked").is_file() {
+                    let status = probe.0.try_wait()?;
+                    assert!(
+                        status.is_none(),
+                        "child exited before its blocked probe: {status:?}\n{}",
+                        child_log()
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child did not probe the held lock\n{}",
+                        child_log()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(std::fs::read(dir.path().join("blocked"))?, b"blocked");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(ran, "with_activity must execute the closure");
+        // This signal is written only after the actual owner's File has
+        // dropped; the parent process is still alive and checking the child.
+        std::fs::write(dir.path().join("release"), b"release").unwrap();
+        let child = child.as_mut().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "child failed its released probe: {status}\n{}",
+                    child_log()
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not finish its released probe\n{}",
+                child_log()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("acquired")).unwrap(),
+            b"acquired"
         );
     }
 
@@ -1469,11 +1746,26 @@ mod tests {
         let rel = Path::new("debug/deps/app-0123456789abcdef");
         let now = SystemTime::now();
 
+        assert!(!has_predictions(&cache, &first));
+        assert!(!has_predictions(&cache, &second));
         assert!(!hint_due(&cache, &second, now), "nothing to borrow yet");
         remember(&cache, &first, &first.join(rel), &hash, MIN_BYTES);
+        assert!(
+            has_predictions(&cache, &first),
+            "a real own record is eligible"
+        );
+        assert!(
+            !has_predictions(&cache, &second),
+            "an unhinted borrower is not yet eligible"
+        );
         assert!(hint_due(&cache, &second, now), "the second borrows");
+        assert!(
+            has_predictions(&cache, &second),
+            "a borrowed hint is eligible"
+        );
         for other in [&unrelated, &elsewhere] {
             assert!(!hint_due(&cache, other, now));
+            assert!(!has_predictions(&cache, other));
             stage(&cache, other, |_| blob_path.clone());
             assert!(!staged_path(&other.join(rel), &hash).unwrap().exists());
         }

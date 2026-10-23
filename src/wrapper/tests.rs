@@ -12408,6 +12408,163 @@ fn successful_metadata_or_rlib_compiles_keep_existing_executable_predictions() {
 
 #[cfg(unix)]
 #[test]
+fn executable_retirement_covers_windows_output_names_and_implicit_bin_outputs() {
+    let _lock = crate::test_support::process_state_test_lock();
+    for (target_triple, suffix) in [(Some("x86_64-pc-windows-msvc"), ".exe"), (None, "")] {
+        for exit in [7, 0] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let target = root.join("target");
+            let profile = target_triple
+                .map_or_else(|| target.clone(), |triple| target.join(triple))
+                .join("debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            let mut config = test_config(root.join("cache"));
+            config.cache_executables = false;
+            let blob = root.join("blob");
+            std::fs::write(&blob, b"predicted executable").unwrap();
+            let hash = blake3::hash(b"predicted executable").to_hex().to_string();
+            let predicted = deps.join(format!("app-aaaaaaaaaaaaaaaa{suffix}"));
+            crate::prestage::remember(
+                &config.cache_dir,
+                &target,
+                &predicted,
+                &hash,
+                crate::prestage::MIN_BYTES,
+            );
+            let output = deps.join(format!("app-bbbbbbbbbbbbbbbb{suffix}"));
+            let source = root.join("main.rs");
+            std::fs::write(&source, "fn main() {}\n").unwrap();
+            let compiler_path = root.join("rustc-fixture");
+            kache_fs::testutil::write_executable(
+                &compiler_path,
+                "#!/bin/sh\nprintf '%s' 'new executable' > \"$PRESTAGE_OUTPUT\"\nexit \"$PRESTAGE_EXIT\"\n",
+            );
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [
+                    ("PATH", "/usr/bin:/bin".to_string()),
+                    ("PRESTAGE_OUTPUT", output.to_str().unwrap().to_string()),
+                    ("PRESTAGE_EXIT", exit.to_string()),
+                ],
+                Some(root.to_path_buf()),
+                None,
+                root.to_path_buf(),
+            );
+            let compiler = RustcCompiler::new_for(&env);
+            let mut argv = vec![
+                compiler_path.to_str().unwrap().to_string(),
+                source.to_str().unwrap().to_string(),
+                "--crate-name".into(),
+                "app".into(),
+                "--out-dir".into(),
+                deps.to_str().unwrap().into(),
+                "-C".into(),
+                "extra-filename=-bbbbbbbbbbbbbbbb".into(),
+            ];
+            if let Some(triple) = target_triple {
+                argv.extend([
+                    "--crate-type".into(),
+                    "bin".into(),
+                    "--target".into(),
+                    triple.into(),
+                ]);
+            }
+            let args = compiler.parse(&argv).unwrap();
+            let output_name = output.file_name().unwrap().to_str().unwrap();
+            assert!(args.output.is_none(), "exercise rustc's --out-dir naming");
+            assert_eq!(
+                prestage_target_dir(&args).as_deref(),
+                Some(target.as_path())
+            );
+            assert!(args.is_user_facing_executable() && args.emits_link());
+            if target_triple.is_some() {
+                assert_eq!(
+                    compiler.classify_output(&args, output_name),
+                    ArtifactKind::Executable
+                );
+                assert_ne!(
+                    args.output_stem().as_deref(),
+                    Some(output_name),
+                    "the .exe filename is selected by its artifact kind"
+                );
+            } else {
+                assert!(args.crate_types.is_empty(), "rustc defaults to a bin");
+                assert_eq!(
+                    compiler.classify_output(&args, output_name).link_strategy(),
+                    link::LinkStrategy::Hardlink
+                );
+                assert_eq!(
+                    args.output_stem().as_deref(),
+                    Some(output_name),
+                    "the implicit bin needs invocation-owned primary selection"
+                );
+            }
+
+            // A prior bin can use -o with a metadata-looking filename. Its
+            // private-copy record is valid, but this invocation does not
+            // produce that companion and must not retire its prediction.
+            let custom_name = "app-aaaaaaaaaaaaaaaa.rmeta";
+            let custom = deps.join(custom_name);
+            let mut prior_argv = vec![
+                compiler_path.to_str().unwrap().to_string(),
+                source.to_str().unwrap().to_string(),
+                "--crate-name".into(),
+                "app".into(),
+                "--crate-type".into(),
+                "bin".into(),
+                "-o".into(),
+                custom.to_str().unwrap().into(),
+            ];
+            if let Some(triple) = target_triple {
+                prior_argv.extend(["--target".into(), triple.into()]);
+            }
+            let prior = compiler.parse(&prior_argv).unwrap();
+            assert_eq!(
+                compiler.classify_output(&prior, custom_name),
+                ArtifactKind::Executable
+            );
+            let mut file = cached_file(custom_name, &hash);
+            file.executable = true;
+            file.size = crate::prestage::MIN_BYTES;
+            let meta = entry_meta(&"1".repeat(64), vec![file], &["link"]);
+            remember_prestaged_executables(&config, &compiler, &prior, &deps, None, &meta);
+            assert!(crate::prestage::recorded_dests(&config.cache_dir).contains(&custom));
+            crate::prestage::stage(&config.cache_dir, &target, |_| blob.clone());
+            let custom_companion = deps.join("app-bbbbbbbbbbbbbbbb.rmeta");
+            kache_fs::testutil::write_executable(
+                &custom_companion,
+                "prior custom-named executable",
+            );
+
+            assert_eq!(run_for(&config, &argv, &env).unwrap(), exit);
+            assert_eq!(std::fs::read(&output).unwrap(), b"new executable");
+            let staged = crate::prestage::staged_path(&predicted, &hash).unwrap();
+            let mut fingerprint = staged.as_os_str().to_owned();
+            fingerprint.push(".fp");
+            assert_eq!(
+                staged.exists(),
+                exit != 0,
+                "{target_triple:?}: successful executable compilation retires its prediction"
+            );
+            assert_eq!(Path::new(&fingerprint).exists(), exit != 0);
+            let custom_staged = crate::prestage::staged_path(&custom, &hash).unwrap();
+            assert!(
+                custom_staged.is_file(),
+                "a non-primary companion is not this invocation's output"
+            );
+            assert!(crate::prestage::take(&custom, &hash));
+            assert_eq!(
+                std::fs::read(&custom_companion).unwrap(),
+                b"prior custom-named executable"
+            );
+            assert_eq!(std::fs::read(&blob).unwrap(), b"predicted executable");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn concurrent_passthroughs_and_fallbacks_use_each_clients_environment_and_directory() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();

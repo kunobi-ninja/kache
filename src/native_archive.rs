@@ -702,7 +702,7 @@ fn validate_closed_coff_member(bytes: &[u8]) -> Option<()> {
         }
         Some(bytes.get(start..start.checked_add(size)?)?)
     };
-    for section in bytes.get(20..sections_end)?.chunks_exact(40) {
+    for section in bytes.get(20..sections_end)?.as_chunks::<40>().0 {
         let raw_name = &section[..8];
         let end = raw_name.iter().position(|&byte| byte == 0).unwrap_or(8);
         if raw_name[end..].iter().any(|&byte| byte != 0) {
@@ -1682,7 +1682,7 @@ mod tests {
         h
     }
 
-    fn raw_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn raw_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut a = AR_MAGIC.to_vec();
         for (n, d) in members {
             a.extend_from_slice(&member(n, d));

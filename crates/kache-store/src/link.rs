@@ -1821,52 +1821,9 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
 /// writable); the caller propagates it, degrading to a recompile.
 #[cfg(not(unix))]
 fn sample_write_clock(path: &Path) -> Result<filetime::FileTime> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    // `create_new` refuses to open an existing file (and does not follow a
-    // symlink/reparse point squatting on the name), so a PID-reuse leftover
-    // or a planted file can never be truncated or sampled — the attempt
-    // just moves to the next name. Leftovers from a crash between create
-    // and remove are benign litter under a distinctive dotted name.
-    let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..8 {
-        let probe = dir.join(format!(
-            ".kache-clock-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let created = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe);
-        let mut file = match created {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                last_err = Some(e);
-                break;
-            }
-        };
-        let sampled = (|| {
-            file.write_all(b"t")?;
-            drop(file);
-            let meta = fs::metadata(&probe)?;
-            Ok::<_, std::io::Error>(filetime::FileTime::from_last_modification_time(&meta))
-        })();
-        let _ = fs::remove_file(&probe);
-        return sampled.with_context(|| format!("write-clock probe {}", probe.display()));
-    }
-    Err(last_err
-        .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow::anyhow!("no free probe name after 8 attempts")))
-    .with_context(|| format!("creating write-clock probe in {}", dir.display()))
+    kache_fs::sample_write_clock(path)
+        .map(filetime::FileTime::from_system_time)
+        .with_context(|| format!("sampling write clock next to {}", path.display()))
 }
 
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";

@@ -14,6 +14,9 @@ pub mod paths;
 pub mod process_state_test;
 pub mod volume;
 
+mod clock;
+pub use clock::sample_write_clock;
+
 mod copy;
 #[cfg(windows)]
 pub use copy::windows_cluster_size;

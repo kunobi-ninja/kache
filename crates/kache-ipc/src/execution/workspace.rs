@@ -214,20 +214,33 @@ fn remove(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 pub(super) fn touch(path: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
     };
+    let sampled = kache_fs::sample_write_clock(path)?;
     let file = fs::OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(invalid("restored output is not a regular file"));
     }
-    file.set_modified(std::time::SystemTime::now())
+    let permissions = metadata.permissions();
+    let readonly = permissions.readonly();
+    if readonly {
+        let mut writable = permissions.clone();
+        writable.set_readonly(false);
+        file.set_permissions(writable)?;
+    }
+    let result = file.set_modified(sampled);
+    if readonly {
+        let _ = file.set_permissions(permissions);
+    }
+    result
 }
 
 #[cfg(test)]

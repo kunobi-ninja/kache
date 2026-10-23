@@ -27,6 +27,12 @@
 //! - The restore renames a staged copy into place when the copy still has the
 //!   fingerprint the daemon wrote. Anything else is removed and the blob is
 //!   copied as before.
+//! - A successful wrapper retires the unused prediction for its artifact,
+//!   including a prediction under an older Cargo metadata hash. Publication
+//!   and retirement share a short per-artifact lock; copying and hashing do
+//!   not hold it. A completed output also stops an already queued daemon pass
+//!   from publishing that prediction after the wrapper returns. A new hint
+//!   starts another generation, so other metadata variants can still stage.
 //!
 //! What lands at the destination is the blob's bytes in a file of its own,
 //! exactly what the restore's copy would have produced. The fingerprint is
@@ -58,6 +64,7 @@ const STAGED_PREFIX: &str = ".kache-prestage-";
 const FINGERPRINT_SUFFIX: &str = ".fp";
 const HINT_MARKER: &str = ".hinted";
 const STAGING_LOCK: &str = ".staging.lock";
+const ACTIVITY_PREFIX: &str = ".activity-";
 /// `latest-<project>` names the target directory of the project that
 /// recorded last.
 const LATEST_PREFIX: &str = "latest-";
@@ -79,6 +86,145 @@ struct Staged {
     fingerprint: FileFingerprint,
 }
 
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Activity {
+    Pending {
+        record: Record,
+        generation: Option<FileFingerprint>,
+    },
+    Completed {
+        dest: PathBuf,
+        generation: Option<FileFingerprint>,
+    },
+}
+
+/// Only publication and retirement hold this lock. In particular, a wrapper
+/// never waits for the daemon's potentially large copy or hash.
+fn with_activity<T>(
+    cache_dir: &Path,
+    target_dir: &Path,
+    rel: &Path,
+    action: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let path = records_dir(cache_dir, target_dir).join(format!(
+        "{ACTIVITY_PREFIX}{}",
+        short_hash(artifact_key(rel).as_bytes())
+    ));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    let result = action(&path);
+    // A fork can inherit this descriptor until exec. Release explicitly.
+    let _ = lock.unlock();
+    result
+}
+
+fn activity_at(path: &Path) -> anyhow::Result<Option<Activity>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn belongs_to_artifact(target_dir: &Path, dest: &Path, rel: &Path) -> bool {
+    dest.strip_prefix(target_dir).is_ok_and(|candidate| {
+        candidate
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && artifact_key(candidate) == artifact_key(rel)
+    })
+}
+
+fn discard_prediction(record: &Record) {
+    if let Some(staged) = staged_path(&record.dest, &record.blob) {
+        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(fingerprint_path(&staged));
+    }
+}
+
+/// Retire this artifact's prediction after a successful restore or compile.
+/// Point lookups only: neither other units nor the target directory are scanned.
+/// Missing outputs leave staging available for a later build.
+pub(crate) fn complete(
+    cache_dir: &Path,
+    target_dir: &Path,
+    dest: &Path,
+    generation: &Option<FileFingerprint>,
+) {
+    let Ok(rel) = dest.strip_prefix(target_dir) else {
+        return;
+    };
+    if !dest.is_file() || !records_dir(cache_dir, target_dir).is_dir() {
+        return;
+    }
+    let result = with_activity(cache_dir, target_dir, rel, |path| {
+        let previous = activity_at(path)?;
+        write_atomic(
+            path,
+            &serde_json::to_vec(&Activity::Completed {
+                dest: dest.to_path_buf(),
+                generation: generation.clone(),
+            })?,
+        )?;
+        if let Some(Activity::Pending { record, .. }) = previous
+            && belongs_to_artifact(target_dir, &record.dest, rel)
+        {
+            discard_prediction(&record);
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        tracing::debug!(
+            "prestage retirement for {} failed: {error:#}",
+            dest.display()
+        );
+    }
+}
+
+fn begin_stage(
+    cache_dir: &Path,
+    target_dir: &Path,
+    record: &Record,
+    generation: &Option<FileFingerprint>,
+) -> anyhow::Result<bool> {
+    with_activity(cache_dir, target_dir, &record.rel, |path| {
+        if hint_generation(cache_dir, target_dir) != *generation {
+            return Ok(false);
+        }
+        match activity_at(path)? {
+            Some(Activity::Completed {
+                dest,
+                generation: completed,
+            }) if completed == *generation
+                && belongs_to_artifact(target_dir, &dest, &record.rel)
+                && dest.is_file() =>
+            {
+                return Ok(false);
+            }
+            Some(Activity::Pending {
+                record: previous, ..
+            }) if previous != *record
+                && belongs_to_artifact(target_dir, &previous.dest, &record.rel) =>
+            {
+                discard_prediction(&previous);
+            }
+            _ => {}
+        }
+        write_atomic(
+            path,
+            &serde_json::to_vec(&Activity::Pending {
+                record: record.clone(),
+                generation: generation.clone(),
+            })?,
+        )?;
+        Ok(true)
+    })
+}
+
 fn short_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex()[..16].to_string()
 }
@@ -90,6 +236,15 @@ fn prestage_dir(cache_dir: &Path) -> PathBuf {
 /// The records of one target directory.
 fn records_dir(cache_dir: &Path, target_dir: &Path) -> PathBuf {
     prestage_dir(cache_dir).join(short_hash(target_dir.as_os_str().as_encoded_bytes()))
+}
+
+pub(crate) fn has_predictions(cache_dir: &Path, target_dir: &Path) -> bool {
+    records_dir(cache_dir, target_dir).is_dir()
+}
+
+/// Atomic hint replacement gives each staging pass a bounded lifetime.
+pub(crate) fn hint_generation(cache_dir: &Path, target_dir: &Path) -> Option<FileFingerprint> {
+    FileFingerprint::from_path(&records_dir(cache_dir, target_dir).join(HINT_MARKER)).ok()
 }
 
 /// The project a target directory belongs to: a hash of the `Cargo.toml`
@@ -311,7 +466,7 @@ fn hint_due(cache_dir: &Path, target_dir: &Path, now: SystemTime) -> bool {
     if recent {
         return false;
     }
-    std::fs::write(&marker, b"").is_ok()
+    write_atomic(&marker, b"").is_ok()
 }
 
 /// Ask the daemon to stage what `target_dir` will restore, when due. Two
@@ -383,10 +538,17 @@ fn stage_pass(
         .write(true)
         .open(directory.join(STAGING_LOCK))?;
     lock.try_lock().map_err(std::io::Error::from)?;
+    let generation = hint_generation(cache_dir, target_dir);
     let results = records_for(cache_dir, target_dir)
         .into_iter()
         .map(|record| {
-            let result = stage_one(&record, &blob_path(&record.blob));
+            let result = stage_record(
+                cache_dir,
+                target_dir,
+                &record,
+                &blob_path(&record.blob),
+                &generation,
+            );
             (record.dest, result)
         })
         .collect();
@@ -397,21 +559,87 @@ fn stage_pass(
     Ok(results)
 }
 
-fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {
-    let Some(directory) = record.dest.parent() else {
+fn stage_record(
+    cache_dir: &Path,
+    target_dir: &Path,
+    record: &Record,
+    blob: &Path,
+    generation: &Option<FileFingerprint>,
+) -> anyhow::Result<()> {
+    if !begin_stage(cache_dir, target_dir, record, generation)? {
         return Ok(());
+    }
+    if let Some(prepared) = prepare_stage(record, blob)? {
+        publish_stage(cache_dir, target_dir, record, prepared, generation)?;
+    }
+    Ok(())
+}
+
+fn publish_stage(
+    cache_dir: &Path,
+    target_dir: &Path,
+    record: &Record,
+    prepared: PreparedStage,
+    generation: &Option<FileFingerprint>,
+) -> anyhow::Result<()> {
+    with_activity(cache_dir, target_dir, &record.rel, |path| {
+        if hint_generation(cache_dir, target_dir) == *generation
+            && activity_at(path)?
+                == Some(Activity::Pending {
+                    record: record.clone(),
+                    generation: generation.clone(),
+                })
+            && !record.dest.exists()
+        {
+            prepared.publish(record)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {
+    if let Some(prepared) = prepare_stage(record, blob)? {
+        prepared.publish(record)?;
+    }
+    Ok(())
+}
+
+struct PreparedStage {
+    temporary: tempfile::TempPath,
+    staged: PathBuf,
+}
+
+impl PreparedStage {
+    fn publish(self, record: &Record) -> anyhow::Result<()> {
+        self.temporary.persist(&self.staged)?;
+        let staged_file = Staged {
+            blob: record.blob.clone(),
+            fingerprint: FileFingerprint::from_path(&self.staged)?,
+        };
+        write_atomic(
+            &fingerprint_path(&self.staged),
+            &serde_json::to_vec(&staged_file)?,
+        )?;
+        Ok(())
+    }
+}
+
+fn prepare_stage(record: &Record, blob: &Path) -> anyhow::Result<Option<PreparedStage>> {
+    let Some(directory) = record.dest.parent() else {
+        return Ok(None);
     };
     sweep_stale(directory, SystemTime::now());
     if !record.dest.is_absolute() || record.dest.exists() || !directory.is_dir() || !blob.is_file()
     {
-        return Ok(());
+        return Ok(None);
     }
     let staged = staged_path(&record.dest, &record.blob)
         .ok_or_else(|| anyhow::anyhow!("no staging name"))?;
     let fingerprint = fingerprint_path(&staged);
     if fingerprint.is_file() {
         if staged.is_file() {
-            return Ok(());
+            return Ok(None);
         }
         std::fs::remove_file(&fingerprint)?;
     }
@@ -428,13 +656,7 @@ fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {
         "blob {} reads back as {hash}",
         record.blob
     );
-    temporary.persist(&staged)?;
-    let staged_file = Staged {
-        blob: record.blob.clone(),
-        fingerprint: FileFingerprint::from_path(&staged)?,
-    };
-    write_atomic(&fingerprint, &serde_json::to_vec(&staged_file)?)?;
-    Ok(())
+    Ok(Some(PreparedStage { temporary, staged }))
 }
 
 /// Remove staged copies and fingerprints in `directory` that nobody took
@@ -498,8 +720,52 @@ pub(crate) fn prune(cache_dir: &Path, now: SystemTime) -> usize {
                 removed += 1;
             }
         }
+        // A target borrowing predictions can have no records of its own.
+        // Expire its handshake data under the same publication lock.
+        if let Ok(states) = std::fs::read_dir(&path) {
+            for state in states.flatten().filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(ACTIVITY_PREFIX)
+                    && entry.path().extension().is_none()
+            }) {
+                let Ok(lock) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(state.path().with_extension("lock"))
+                else {
+                    continue;
+                };
+                if lock.try_lock().is_err() {
+                    continue;
+                }
+                let gone = activity_at(&state.path())
+                    .ok()
+                    .flatten()
+                    .is_none_or(|activity| {
+                        let dest = match &activity {
+                            Activity::Pending { record, .. } => &record.dest,
+                            Activity::Completed { dest, .. } => dest,
+                        };
+                        !dest.ancestors().any(|ancestor| {
+                            records_dir(cache_dir, ancestor) == path && ancestor.is_dir()
+                        })
+                    });
+                let expired = std::fs::metadata(state.path())
+                    .is_ok_and(|metadata| older_than(&metadata, RECORD_TTL, now));
+                if (gone || expired) && std::fs::remove_file(state.path()).is_ok() {
+                    removed += 1;
+                }
+                let _ = lock.unlock();
+            }
+        }
         if read_records(&path).is_empty() {
-            let _ = std::fs::remove_dir_all(&path);
+            // Never unlink coordination files: a wrapper may have opened a
+            // lock but not written its first state yet. Recreating the same
+            // lock path would give two owners different locked inodes.
+            let _ = std::fs::remove_dir(&path);
         }
     }
     removed
@@ -574,6 +840,379 @@ mod tests {
         for (dest, result) in results {
             result.unwrap_or_else(|error| panic!("staging {}: {error:#}", dest.display()));
         }
+    }
+
+    #[test]
+    fn completion_retires_each_publication_phase_and_allows_a_later_build() {
+        for phase in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = target(dir.path(), "a");
+            let (blob_path, hash) = blob(dir.path(), b"predicted executable");
+            let predicted = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+            let completed = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+            remember(&cache, &target, &predicted, &hash, MIN_BYTES);
+            let record = records_for(&cache, &target).pop().unwrap();
+            let staged = staged_path(&predicted, &hash).unwrap();
+            let finish = || {
+                std::fs::write(&completed, b"compiled executable").unwrap();
+                complete(&cache, &target, &completed, &None);
+            };
+            match phase {
+                0 => {
+                    // The daemon has queued the record, but has not begun it.
+                    finish();
+                    stage_ok(&cache, &target, &blob_path);
+                }
+                1 => {
+                    assert!(begin_stage(&cache, &target, &record, &None).unwrap());
+                    finish();
+                    let prepared = prepare_stage(&record, &blob_path).unwrap().unwrap();
+                    publish_stage(&cache, &target, &record, prepared, &None).unwrap();
+                }
+                2 => {
+                    assert!(begin_stage(&cache, &target, &record, &None).unwrap());
+                    let prepared = prepare_stage(&record, &blob_path).unwrap().unwrap();
+                    finish();
+                    publish_stage(&cache, &target, &record, prepared, &None).unwrap();
+                }
+                3 => {
+                    assert!(begin_stage(&cache, &target, &record, &None).unwrap());
+                    let prepared = prepare_stage(&record, &blob_path).unwrap().unwrap();
+                    // An interrupted writer can leave the data without .fp.
+                    prepared.temporary.persist(&staged).unwrap();
+                    assert!(!fingerprint_path(&staged).exists());
+                    finish();
+                }
+                4 => {
+                    stage_ok(&cache, &target, &blob_path);
+                    assert!(staged.is_file() && fingerprint_path(&staged).is_file());
+                    finish();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !staged.exists() && !fingerprint_path(&staged).exists(),
+                "phase {phase}"
+            );
+            assert_eq!(std::fs::read(&completed).unwrap(), b"compiled executable");
+            let leftovers: Vec<_> = std::fs::read_dir(predicted.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(STAGED_PREFIX)
+                })
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "discarded copies must drop their temporary file"
+            );
+
+            // Cargo removes the output before a later rebuild. Completion
+            // must not permanently suppress this artifact's staging.
+            std::fs::remove_file(&completed).unwrap();
+            stage_ok(&cache, &target, &blob_path);
+            assert!(
+                take(&predicted, &hash),
+                "phase {phase}: next build can stage"
+            );
+            assert_eq!(std::fs::read(&predicted).unwrap(), b"predicted executable");
+        }
+    }
+
+    #[test]
+    fn publication_requires_its_own_pending_record_and_a_missing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (first_blob, first_hash) = blob(dir.path(), b"first prediction");
+        let (second_blob, second_hash) = blob(dir.path(), b"second prediction");
+        let first_dest = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        let second_dest = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        remember(&cache, &target, &first_dest, &first_hash, MIN_BYTES);
+        let first = records_for(&cache, &target).pop().unwrap();
+        assert!(begin_stage(&cache, &target, &first, &None).unwrap());
+        let first_copy = prepare_stage(&first, &first_blob).unwrap().unwrap();
+        remember(&cache, &target, &second_dest, &second_hash, MIN_BYTES);
+        let second = records_for(&cache, &target).pop().unwrap();
+        assert!(begin_stage(&cache, &target, &second, &None).unwrap());
+        let second_copy = prepare_stage(&second, &second_blob).unwrap().unwrap();
+        publish_stage(&cache, &target, &first, first_copy, &None).unwrap();
+        assert!(!staged_path(&first_dest, &first_hash).unwrap().exists());
+        publish_stage(&cache, &target, &second, second_copy, &None).unwrap();
+        assert!(take(&second_dest, &second_hash));
+
+        // Even without a wrapper acknowledgement, never publish over a
+        // destination that appeared while the daemon copied.
+        assert!(begin_stage(&cache, &target, &first, &None).unwrap());
+        let copy = prepare_stage(&first, &first_blob).unwrap().unwrap();
+        std::fs::write(&first_dest, b"compiler won").unwrap();
+        publish_stage(&cache, &target, &first, copy, &None).unwrap();
+        assert!(!staged_path(&first_dest, &first_hash).unwrap().exists());
+        assert_eq!(std::fs::read(&first_dest).unwrap(), b"compiler won");
+    }
+
+    #[test]
+    fn a_new_hint_stages_another_metadata_variant_while_the_completed_output_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"predicted executable");
+        let predicted = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        let completed = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        remember(&cache, &target, &predicted, &hash, MIN_BYTES);
+        assert!(hint_due(&cache, &target, SystemTime::now()));
+        let first = hint_generation(&cache, &target);
+        assert!(first.is_some());
+        stage_ok(&cache, &target, &blob_path);
+        std::fs::write(&completed, b"completed variant").unwrap();
+        complete(&cache, &target, &completed, &first);
+        let staged = staged_path(&predicted, &hash).unwrap();
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+        stage_ok(&cache, &target, &blob_path);
+        assert!(
+            !staged.exists(),
+            "the completed generation cannot publish late"
+        );
+
+        assert!(hint_due(
+            &cache,
+            &target,
+            SystemTime::now() + HINT_INTERVAL + Duration::from_secs(1)
+        ));
+        assert_ne!(hint_generation(&cache, &target), first);
+        stage_ok(&cache, &target, &blob_path);
+        assert!(staged.is_file() && fingerprint_path(&staged).is_file());
+        assert_eq!(std::fs::read(&completed).unwrap(), b"completed variant");
+        assert!(take(&predicted, &hash));
+    }
+
+    #[test]
+    fn an_old_copy_cannot_publish_over_a_new_pending_generation_of_the_same_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"predicted executable");
+        let predicted = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        let completed = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        remember(&cache, &target, &predicted, &hash, MIN_BYTES);
+        assert!(hint_due(&cache, &target, SystemTime::now()));
+        let first = hint_generation(&cache, &target);
+        let record = records_for(&cache, &target).pop().unwrap();
+        assert!(begin_stage(&cache, &target, &record, &first).unwrap());
+        let old_copy = prepare_stage(&record, &blob_path).unwrap().unwrap();
+        std::fs::write(&completed, b"completed variant").unwrap();
+        complete(&cache, &target, &completed, &first);
+        assert!(hint_due(
+            &cache,
+            &target,
+            SystemTime::now() + HINT_INTERVAL + Duration::from_secs(1)
+        ));
+        let second = hint_generation(&cache, &target);
+        assert_ne!(first, second);
+        assert!(begin_stage(&cache, &target, &record, &second).unwrap());
+        let new_copy = prepare_stage(&record, &blob_path).unwrap().unwrap();
+        publish_stage(&cache, &target, &record, old_copy, &first).unwrap();
+        let staged = staged_path(&predicted, &hash).unwrap();
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+        publish_stage(&cache, &target, &record, new_copy, &second).unwrap();
+        assert!(take(&predicted, &hash));
+        assert_eq!(std::fs::read(&completed).unwrap(), b"completed variant");
+    }
+
+    #[test]
+    fn an_obsolete_pass_cannot_begin_after_a_new_generations_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"predicted executable");
+        let predicted = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        let completed = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        remember(&cache, &target, &predicted, &hash, MIN_BYTES);
+        assert!(hint_due(&cache, &target, SystemTime::now()));
+        let first = hint_generation(&cache, &target);
+        let record = records_for(&cache, &target).pop().unwrap();
+        assert!(begin_stage(&cache, &target, &record, &first).unwrap());
+        let old_copy = prepare_stage(&record, &blob_path).unwrap().unwrap();
+        assert!(hint_due(
+            &cache,
+            &target,
+            SystemTime::now() + HINT_INTERVAL + Duration::from_secs(1)
+        ));
+        let second = hint_generation(&cache, &target);
+        assert_ne!(first, second);
+        // A new hint alone fences an old copy, even before a new Pending or
+        // Completed record replaces the otherwise identical pending state.
+        publish_stage(&cache, &target, &record, old_copy, &first).unwrap();
+        let staged = staged_path(&predicted, &hash).unwrap();
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+
+        std::fs::write(&completed, b"completed variant").unwrap();
+        complete(&cache, &target, &completed, &second);
+        // Another g1 record was queued before begin_stage. It must not erase
+        // the g2 completion and then publish after that wrapper has returned.
+        assert!(!begin_stage(&cache, &target, &record, &first).unwrap());
+        assert!(
+            !begin_stage(&cache, &target, &record, &second).unwrap(),
+            "the newer completion remains indexed"
+        );
+        stage_ok(&cache, &target, &blob_path);
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+        assert_eq!(std::fs::read(&completed).unwrap(), b"completed variant");
+    }
+
+    #[test]
+    fn retirement_checks_index_ownership_and_requires_a_real_completed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"prediction");
+        let predicted = target.join("debug/deps/app-aaaaaaaaaaaaaaaa");
+        let completed = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        remember(&cache, &target, &predicted, &hash, MIN_BYTES);
+        stage_ok(&cache, &target, &blob_path);
+        let staged = staged_path(&predicted, &hash).unwrap();
+        complete(&cache, &target, &completed, &None);
+        assert!(staged.is_file() && fingerprint_path(&staged).is_file());
+
+        let rel = completed.strip_prefix(&target).unwrap();
+        for foreign_dest in [
+            target.join("debug/deps/other-aaaaaaaaaaaaaaaa"),
+            dir.path().join("app-aaaaaaaaaaaaaaaa"),
+        ] {
+            let foreign = Record {
+                dest: foreign_dest,
+                rel: rel.to_path_buf(),
+                blob: hash.clone(),
+                size: MIN_BYTES,
+            };
+            stage_one(&foreign, &blob_path).unwrap();
+            let foreign_staged = staged_path(&foreign.dest, &hash).unwrap();
+            with_activity(&cache, &target, rel, |path| {
+                write_atomic(
+                    path,
+                    &serde_json::to_vec(&Activity::Pending {
+                        record: foreign.clone(),
+                        generation: None,
+                    })?,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            std::fs::write(&completed, b"completed").unwrap();
+            complete(&cache, &target, &completed, &None);
+            assert!(foreign_staged.is_file() && fingerprint_path(&foreign_staged).is_file());
+        }
+        assert!(
+            staged.is_file(),
+            "an unrelated indexed prediction cannot name this staged file"
+        );
+    }
+
+    #[test]
+    fn pruning_preserves_borrowed_inflight_and_completed_activity_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let donor = target(dir.path(), "donor");
+        let recipient = target(dir.path(), "recipient");
+        let (blob_path, hash) = blob(dir.path(), b"prediction");
+        remember(
+            &cache,
+            &donor,
+            &donor.join("debug/deps/app-aaaaaaaaaaaaaaaa"),
+            &hash,
+            MIN_BYTES,
+        );
+        std::fs::create_dir_all(records_dir(&cache, &recipient)).unwrap();
+        let record = records_for(&cache, &recipient).pop().unwrap();
+        assert!(begin_stage(&cache, &recipient, &record, &None).unwrap());
+        let prepared = prepare_stage(&record, &blob_path).unwrap().unwrap();
+        assert!(read_records(&records_dir(&cache, &recipient)).is_empty());
+        prune(&cache, SystemTime::now());
+        publish_stage(&cache, &recipient, &record, prepared, &None).unwrap();
+        let staged = staged_path(&record.dest, &hash).unwrap();
+        assert!(staged.is_file());
+        let completed = recipient.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        std::fs::write(&completed, b"compiled").unwrap();
+        complete(&cache, &recipient, &completed, &None);
+        prune(&cache, SystemTime::now());
+        assert!(records_dir(&cache, &recipient).is_dir());
+        assert!(!begin_stage(&cache, &recipient, &record, &None).unwrap());
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+        prune(
+            &cache,
+            SystemTime::now() + RECORD_TTL + Duration::from_secs(1),
+        );
+        let recipient_records = records_dir(&cache, &recipient);
+        assert!(
+            recipient_records.is_dir(),
+            "coordination inodes remain stable"
+        );
+        assert!(
+            std::fs::read_dir(recipient_records)
+                .unwrap()
+                .flatten()
+                .all(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock"))
+        );
+    }
+
+    #[test]
+    fn pruning_cannot_replace_a_lock_before_its_first_activity_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let donor = target(dir.path(), "donor");
+        let recipient = target(dir.path(), "recipient");
+        let (blob_path, hash) = blob(dir.path(), b"prediction");
+        remember(
+            &cache,
+            &donor,
+            &donor.join("debug/deps/app-aaaaaaaaaaaaaaaa"),
+            &hash,
+            MIN_BYTES,
+        );
+        std::fs::create_dir_all(records_dir(&cache, &recipient)).unwrap();
+        let record = records_for(&cache, &recipient).pop().unwrap();
+        with_activity(&cache, &recipient, &record.rel, |path| {
+            assert!(!path.exists());
+            // The coordination file exists, but no activity data does yet.
+            prune(&cache, SystemTime::now());
+            let contender = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.with_extension("lock"))?;
+            assert!(
+                contender.try_lock().is_err(),
+                "GC must leave the same locked inode"
+            );
+            write_atomic(
+                path,
+                &serde_json::to_vec(&Activity::Pending {
+                    record: record.clone(),
+                    generation: None,
+                })?,
+            )?;
+            // GC also must not expire a state while its publisher owns it.
+            prune(
+                &cache,
+                SystemTime::now() + RECORD_TTL + Duration::from_secs(1),
+            );
+            assert!(path.is_file());
+            Ok(())
+        })
+        .unwrap();
+        let prepared = prepare_stage(&record, &blob_path).unwrap().unwrap();
+        publish_stage(&cache, &recipient, &record, prepared, &None).unwrap();
+        let staged = staged_path(&record.dest, &hash).unwrap();
+        assert!(staged.is_file() && fingerprint_path(&staged).is_file());
+        let completed = recipient.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        std::fs::write(&completed, b"completed").unwrap();
+        complete(&cache, &recipient, &completed, &None);
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
     }
 
     /// A staged copy written to after staging, or staged for another blob,

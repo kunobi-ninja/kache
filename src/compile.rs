@@ -610,7 +610,7 @@ fn emit_may_produce_per_cgu_files(emit: &[String]) -> bool {
 }
 
 /// Invoke `f` for each `--out-dir` candidate basename (no intermediate `Vec`).
-fn for_each_out_dir_candidate(crate_name: &str, extra: &str, mut f: impl FnMut(&str)) {
+pub(crate) fn for_each_out_dir_candidate(crate_name: &str, extra: &str, mut f: impl FnMut(&str)) {
     let bare = crate::args::format_crate_output_stem(crate_name, extra);
     let mut buf = String::with_capacity(bare.len() + 8 + 16);
     for suffix in ARTIFACT_SUFFIXES {

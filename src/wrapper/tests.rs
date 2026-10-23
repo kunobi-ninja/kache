@@ -12228,6 +12228,186 @@ fn reused_workers_discard_unfinished_compile_and_event_state() {
 
 #[cfg(unix)]
 #[test]
+fn successful_uncached_rustc_retires_only_its_unused_prestage() {
+    let _lock = crate::test_support::process_state_test_lock();
+    for exit in [7, 0] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cache = root.join("cache");
+        let donor = root.join("donor/target");
+        let target = root.join("recipient/target");
+        for checkout in [&donor, &target] {
+            std::fs::create_dir_all(checkout.join("debug/deps")).unwrap();
+            std::fs::create_dir_all(checkout.join("release/deps")).unwrap();
+            std::fs::write(
+                checkout.parent().unwrap().join("Cargo.toml"),
+                "[package]\nname = \"demo\"\n",
+            )
+            .unwrap();
+        }
+        let blob = root.join("blob");
+        std::fs::write(&blob, b"old executable").unwrap();
+        let hash = blake3::hash(b"old executable").to_hex().to_string();
+        let old_rel = Path::new("debug/deps/app-aaaaaaaaaaaaaaaa");
+        let other_rel = Path::new("debug/deps/other-aaaaaaaaaaaaaaaa");
+        let release_rel = Path::new("release/deps/app-aaaaaaaaaaaaaaaa");
+        for rel in [old_rel, other_rel, release_rel] {
+            crate::prestage::remember(
+                &cache,
+                &donor,
+                &donor.join(rel),
+                &hash,
+                crate::prestage::MIN_BYTES,
+            );
+        }
+        crate::prestage::stage(&cache, &target, |_| blob.clone());
+        let staged = |rel: &Path| crate::prestage::staged_path(&target.join(rel), &hash).unwrap();
+        let fingerprint = |path: &Path| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".fp");
+            PathBuf::from(name)
+        };
+        assert!(staged(old_rel).is_file() && fingerprint(&staged(old_rel)).is_file());
+        let compiler = root.join("rustc-fixture");
+        kache_fs::testutil::write_executable(
+            &compiler,
+            "#!/bin/sh\nprintf '%s' 'new executable' > \"$PRESTAGE_OUTPUT\"\nexit \"$PRESTAGE_EXIT\"\n",
+        );
+        let output = target.join("debug/deps/app-bbbbbbbbbbbbbbbb");
+        let source = root.join("main.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [
+                ("PATH", "/usr/bin:/bin".to_string()),
+                ("CARGO_PRIMARY_PACKAGE", "1".to_string()),
+                ("PRESTAGE_OUTPUT", output.to_str().unwrap().to_string()),
+                ("PRESTAGE_EXIT", exit.to_string()),
+            ],
+            Some(root.to_path_buf()),
+            None,
+            root.to_path_buf(),
+        );
+        let mut config = test_config(cache);
+        config.cache_executables = false;
+        let argv = vec![
+            compiler.to_str().unwrap().to_string(),
+            source.to_str().unwrap().to_string(),
+            "--crate-name".into(),
+            "app".into(),
+            "--crate-type".into(),
+            "bin".into(),
+            "--out-dir".into(),
+            target.join("debug/deps").to_str().unwrap().to_string(),
+            "-C".into(),
+            "extra-filename=-bbbbbbbbbbbbbbbb".into(),
+        ];
+        assert_eq!(run_for(&config, &argv, &env).unwrap(), exit);
+        assert_eq!(std::fs::read(&output).unwrap(), b"new executable");
+        assert_eq!(
+            staged(old_rel).exists(),
+            exit != 0,
+            "successful compilation retires the borrowed metadata variant"
+        );
+        assert_eq!(fingerprint(&staged(old_rel)).exists(), exit != 0);
+        for rel in [other_rel, release_rel] {
+            assert!(
+                staged(rel).is_file() && fingerprint(&staged(rel)).is_file(),
+                "other units and profiles keep their predictions"
+            );
+        }
+        assert_eq!(std::fs::read(blob).unwrap(), b"old executable");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_metadata_or_rlib_compiles_keep_existing_executable_predictions() {
+    let _lock = crate::test_support::process_state_test_lock();
+    for (crate_type, emit, output_name) in [
+        ("bin", "metadata", "libapp-bbbbbbbbbbbbbbbb.rmeta"),
+        ("rlib", "link", "libapp-bbbbbbbbbbbbbbbb.rlib"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cache = root.join("cache");
+        let target = root.join("target");
+        let deps = target.join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let blob = root.join("blob");
+        std::fs::write(&blob, b"predicted executable").unwrap();
+        let hash = blake3::hash(b"predicted executable").to_hex().to_string();
+        let predicted =
+            ["app-aaaaaaaaaaaaaaaa", "app-aaaaaaaaaaaaaaaa.exe"].map(|name| deps.join(name));
+        for path in &predicted {
+            crate::prestage::remember(&cache, &target, path, &hash, crate::prestage::MIN_BYTES);
+        }
+        crate::prestage::stage(&cache, &target, |_| blob.clone());
+        let companions = [
+            deps.join("app-bbbbbbbbbbbbbbbb"),
+            deps.join("app-bbbbbbbbbbbbbbbb.exe"),
+        ];
+        for companion in &companions {
+            kache_fs::testutil::write_executable(companion, "existing executable");
+        }
+        let compiler = root.join("rustc-fixture");
+        kache_fs::testutil::write_executable(
+            &compiler,
+            "#!/bin/sh\nprintf '%s' 'new compiler output' > \"$PRESTAGE_OUTPUT\"\n",
+        );
+        let source = root.join("main.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let output = deps.join(output_name);
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [
+                ("PATH", "/usr/bin:/bin".to_string()),
+                ("PRESTAGE_OUTPUT", output.to_str().unwrap().to_string()),
+            ],
+            Some(root.to_path_buf()),
+            None,
+            root.to_path_buf(),
+        );
+        let mut config = test_config(cache);
+        // Exercise a successful real wrapper route without requiring a
+        // toolchain for the fixture compiler. Retirement still runs at exit.
+        config.project_rules.bypass_crates = vec!["app".into()];
+        let argv = vec![
+            compiler.to_str().unwrap().to_string(),
+            source.to_str().unwrap().to_string(),
+            "--crate-name".into(),
+            "app".into(),
+            "--crate-type".into(),
+            crate_type.into(),
+            "--emit".into(),
+            emit.into(),
+            "--out-dir".into(),
+            deps.to_str().unwrap().into(),
+            "-C".into(),
+            "extra-filename=-bbbbbbbbbbbbbbbb".into(),
+        ];
+        assert_eq!(run_for(&config, &argv, &env).unwrap(), 0);
+        assert_eq!(std::fs::read(output).unwrap(), b"new compiler output");
+        for companion in &companions {
+            assert_eq!(std::fs::read(companion).unwrap(), b"existing executable");
+        }
+        for path in &predicted {
+            let staged = crate::prestage::staged_path(path, &hash).unwrap();
+            let mut fingerprint = staged.as_os_str().to_owned();
+            fingerprint.push(".fp");
+            assert!(
+                staged.is_file() && Path::new(&fingerprint).is_file(),
+                "{crate_type}/{emit} did not produce an executable"
+            );
+            assert!(
+                crate::prestage::take(path, &hash),
+                "the later executable restore can still take its prediction"
+            );
+        }
+        assert_eq!(std::fs::read(blob).unwrap(), b"predicted executable");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn concurrent_passthroughs_and_fallbacks_use_each_clients_environment_and_directory() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();

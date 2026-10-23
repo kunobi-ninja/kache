@@ -4053,6 +4053,7 @@ fn compute_key_into(
                 &search_dirs.rustc,
                 &search_dirs.linker,
                 &args.link_libs,
+                &search_dirs.default_libraries,
                 |path| file_hasher.hash_static_lib(path),
                 invocation,
             )

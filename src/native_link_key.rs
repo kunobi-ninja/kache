@@ -28,6 +28,8 @@
 //! `NODEFAULTLIB` excludes libraries rather than introducing file inputs.
 //! `DEFAULTLIB` is admitted only for the modeled CRT/vcruntime/UCRT names,
 //! using their selected runtime hashes rather than rustc's `-l` lookup.
+//! Explicit requests also require a closed embedded COFF archive: directive
+//! and CodeView type sections, thin members and unsupported formats bypass.
 //! Invalid runtime candidates (non-files, metadata errors other than absence,
 //! or unreadable selected files) fail closed instead of falling back.
 
@@ -893,6 +895,8 @@ pub(crate) struct WindowsProbeEnvironment {
     pub(crate) variables: BTreeMap<String, String>,
     pub(crate) path: Vec<PathBuf>,
     pub(crate) cwd: Option<PathBuf>,
+    /// Only explicit DEFAULTLIB requests opt into closed-container validation.
+    pub(crate) requested_default_libraries: Vec<WindowsDefaultLibrary>,
     /// The tool directories of rustc's sysroots (see [`rustc_tool_dir`]).
     /// rustc puts them before `PATH` for the linker it runs, so a linker
     /// named without a directory is looked up there first.
@@ -2291,7 +2295,7 @@ const UCRT: &[&str] = &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"];
 /// Arbitrary archives are excluded: hashing their bytes does not model further
 /// inputs introduced by COFF directives. Paths and quoted or compound arguments
 /// are excluded rather than borrowing Rust's different `-l` resolution rules.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowsDefaultLibrary(&'static str);
 
 impl WindowsDefaultLibrary {
@@ -2340,7 +2344,10 @@ fn hash_windows_runtime_libraries(
     for name in MSVC_RUNTIME.iter().chain(VCRUNTIME).chain(UCRT) {
         let found = first_windows_library(&directories, &[(*name).to_string()])?;
         if let Some(path) = found {
-            let digest = hash_file(&path)
+            let requested = environment
+                .requested_default_libraries
+                .contains(&WindowsDefaultLibrary(name));
+            let digest = hash_windows_runtime_library(&path, requested)
                 .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
             libraries.insert((*name).to_string(), digest);
         }
@@ -2356,6 +2363,34 @@ fn hash_windows_runtime_libraries(
         bail!("no selected UCRT library was found in LIB");
     }
     Ok(libraries)
+}
+
+// Closed-runtime validation needs member contents. Cap its owned buffer; other
+// runtime hashes retain the existing streaming path and its digest format.
+const MAX_WINDOWS_DEFAULTLIB_BYTES: usize = 64 << 20;
+
+fn hash_windows_runtime_library(path: &Path, requested: bool) -> Result<String> {
+    if !requested {
+        return hash_file(path);
+    }
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening explicit DEFAULTLIB {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_WINDOWS_DEFAULTLIB_BYTES as u64 {
+        bail!("explicit DEFAULTLIB is not a regular file of at most 64 MiB");
+    }
+    let mut bytes = vec![0; usize::try_from(metadata.len())?];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("reading explicit DEFAULTLIB {}", path.display()))?;
+    if file.read(&mut [0_u8; 1])? != 0 {
+        bail!("explicit DEFAULTLIB changed size while being read");
+    }
+    if crate::native_archive::validate_closed_windows_runtime_archive(&bytes).is_none() {
+        bail!("explicit DEFAULTLIB is not a supported closed COFF archive");
+    }
+    // Validation and hashing consume this same read, never a reopened path.
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 /// Discover a Windows MSVC identity while honoring rustc/linker search paths
@@ -2382,6 +2417,7 @@ where
         rustc_library_dirs,
         linker_library_dirs,
         link_libraries,
+        &[],
         hash_library,
         &InvocationEnv::capture(),
     )
@@ -2394,6 +2430,7 @@ pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
     rustc_library_dirs: &[PathBuf],
     linker_library_dirs: &[PathBuf],
     link_libraries: &[String],
+    requested_default_libraries: &[WindowsDefaultLibrary],
     hash_library: HashLibrary,
     env: &InvocationEnv,
 ) -> Result<WindowsMsvcIdentity>
@@ -2416,6 +2453,7 @@ where
         .context("capturing Windows MSVC environment")?;
     environment.root_invocation_paths(env)?;
     environment.rustc_tool_dirs = rustc_tool_dirs.to_vec();
+    environment.requested_default_libraries = requested_default_libraries.to_vec();
     environment.augment_from_installed_msvc(target_architecture, env)?;
     environment.root_invocation_paths(env)?;
     let mut identity = probe_windows_msvc_identity_with(
@@ -3088,6 +3126,7 @@ esac
             let identity = probe_windows_msvc_identity_with_library_dirs_for(
                 None,
                 "x64",
+                &[],
                 &[],
                 &[],
                 &[],
@@ -4366,6 +4405,125 @@ esac
         assert!(hash_windows_runtime_libraries(&environment, "x64", "10", "10", &[]).is_ok());
         std::fs::create_dir(cwd.join("ucrt.lib")).unwrap();
         assert!(hash_windows_runtime_libraries(&environment, "x64", "10", "10", &[]).is_err());
+    }
+
+    #[test]
+    fn windows_defaultlib_runtime_hashes_validate_the_selected_bytes_only() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let lib = root.path().join("lib");
+        for directory in [&cwd, &lib] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for name in ["msvcrt.lib", "vcruntime.lib"] {
+            std::fs::write(lib.join(name), name).unwrap();
+        }
+        let valid = crate::native_archive::closed_coff_archive_for_tests(b"first");
+        std::fs::write(lib.join("ucrt.lib"), &valid).unwrap();
+        let mut environment = WindowsProbeEnvironment {
+            variables: BTreeMap::from([("LIB".into(), lib.to_string_lossy().into_owned())]),
+            cwd: Some(cwd.clone()),
+            requested_default_libraries: vec![
+                WindowsDefaultLibrary::parse("/DEFAULTLIB:ucrt").unwrap(),
+            ],
+            ..WindowsProbeEnvironment::default()
+        };
+        let hash = |environment: &WindowsProbeEnvironment| {
+            hash_windows_runtime_libraries(environment, "x64", "10", "10", &[])
+        };
+        let first = hash(&environment).unwrap();
+        assert_eq!(first["ucrt.lib"], hash_file(&lib.join("ucrt.lib")).unwrap());
+        let changed = crate::native_archive::closed_coff_archive_for_tests(b"changed");
+        std::fs::write(lib.join("ucrt.lib"), &changed).unwrap();
+        assert_ne!(hash(&environment).unwrap()["ucrt.lib"], first["ucrt.lib"]);
+
+        std::fs::write(cwd.join("ucrt.lib"), &valid).unwrap();
+        let selected = hash(&environment).unwrap();
+        std::fs::write(lib.join("ucrt.lib"), b"invalid but shadowed").unwrap();
+        assert_eq!(hash(&environment).unwrap(), selected);
+        std::fs::write(lib.join("ucrt.lib"), &valid).unwrap();
+        for invalid in [
+            b"!<thin>\nexternal.obj".to_vec(),
+            b"unknown container".to_vec(),
+            crate::native_archive::coff_archive_with_section_for_tests(
+                b".drectve",
+                b"/DEFAULTLIB:helper.lib",
+            ),
+            crate::native_archive::coff_archive_with_section_for_tests(
+                b".debug$T",
+                b"external PDB",
+            ),
+            crate::native_archive::coff_archive_with_section_for_tests(
+                b".debug$P",
+                b"external PCH",
+            ),
+        ] {
+            std::fs::write(cwd.join("ucrt.lib"), &invalid).unwrap();
+            assert!(
+                hash(&environment).is_err(),
+                "a later valid copy must not rescue the selected input"
+            );
+            environment.requested_default_libraries.clear();
+            assert_eq!(
+                hash(&environment).unwrap()["ucrt.lib"],
+                blake3::hash(&invalid).to_hex().to_string(),
+                "unrequested runtimes keep their existing raw digest/policy"
+            );
+            environment
+                .requested_default_libraries
+                .push(WindowsDefaultLibrary::parse("/DEFAULTLIB:ucrt").unwrap());
+        }
+    }
+
+    #[test]
+    fn windows_defaultlib_runtime_reads_reject_oversized_and_non_file_inputs() {
+        assert_eq!(MAX_WINDOWS_DEFAULTLIB_BYTES, 67_108_864);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ucrt.lib");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(67_108_865).unwrap(); // One byte above the independent 64 MiB limit.
+        drop(file);
+        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        assert!(error.to_string().contains("at most 64 MiB"), "{error:#}");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(67_108_864)
+            .unwrap();
+        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        assert!(
+            error.to_string().contains("supported closed COFF archive"),
+            "an exactly 64 MiB regular file reaches format validation: {error:#}"
+        );
+        assert!(hash_windows_runtime_library(root.path(), true).is_err());
+    }
+
+    #[test]
+    fn windows_defaultlib_names_cover_each_modeled_runtime_family() {
+        for name in [
+            "libcmt",
+            "libcmtd",
+            "msvcrt",
+            "msvcrtd",
+            "vcruntime",
+            "vcruntimed",
+            "libvcruntime",
+            "libvcruntimed",
+            "ucrt",
+            "ucrtd",
+            "libucrt",
+            "libucrtd",
+        ] {
+            let plain = WindowsDefaultLibrary::parse(&format!("/DEFAULTLIB:{name}")).unwrap();
+            let suffixed = WindowsDefaultLibrary::parse(&format!(
+                "-defaultlib:{}.LIB",
+                name.to_ascii_uppercase()
+            ))
+            .unwrap();
+            assert_eq!(plain, suffixed);
+            assert_eq!(plain.0, format!("{name}.lib"));
+        }
     }
 
     #[test]

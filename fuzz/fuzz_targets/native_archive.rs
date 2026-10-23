@@ -17,6 +17,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
+    let _ = native_archive::validate_closed_windows_runtime_archive(data);
+
     let first = native_archive::portable_static_archive_identity(data);
     let second = native_archive::portable_static_archive_identity(data);
     assert_eq!(

@@ -32,6 +32,8 @@ Host-loaded Linux and macOS links, and native Windows MSVC links, pass through i
 
 For eligible native Windows MSVC links, absolute `.res` inputs also enter the key by content. Kache checks a resource's standard binary header and streams the file on each key. Raw `.obj`, `.o`, `.a` and `.lib` inputs, explicit `/MANIFESTINPUT` files, linker response files, and a `link-args` value that mixes `/LIBPATH` with other arguments still pass through.
 
+`/NODEFAULTLIB` and `/NODEFAULTLIB:name` are exclusions, not file inputs; a name ending in `.lib` does not make an exclusion uncacheable.
+
 On macOS, every cached executable link gets ld64 `-oso_prefix` set to Cargo's profile directory, so `N_OSO` object paths in the binary are not checkout-local. A cached proc-macro link gets `-install_name @rpath/lib<crate>.dylib`. A cached executable or test binary built with debug info also stores a `.dSYM` bundle, made with `dsymutil` while its object files still exist. A restore unpacks it beside the binary, where lldb looks first. Without `dsymutil`, the binary is cached without one.
 
 On Windows, executable caching remains opt-in. A cached PE executable and the sibling PDB named by its CodeView record are stored and restored together after checking their GUID and executable-validation ages. The check also covers explicit `-o` names without an `.exe` suffix. Ambiguous or malformed debug records, missing or incompatible PDBs, non-sibling PDB paths, and an incremental-link `.ilk` sidecar leave the compilation uncached. A PE without a CodeView record needs no PDB; non-PE executables keep their existing handling.

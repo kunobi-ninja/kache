@@ -3057,6 +3057,58 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     }
 }
 
+/// A shell whose `XDG_CONFIG_HOME` names a private config (a test rig's own
+/// store and runtime folder) runs an instance the login service does not
+/// own: the service reads the home folder's config. `daemon start` used to
+/// take the private config for the service's, kick the service manager and
+/// wait out its 8 s budget for a socket that never came ("daemon did not
+/// start within timeout"); every compile's auto-start did the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_private_xdg_config_starts_its_own_daemon_beside_the_login_service() {
+    let e = env();
+    let unit = e.home.join(".config/systemd/user/kache.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "installed test service").unwrap();
+    let xdg = e.home.join("rig/xdg");
+    std::fs::create_dir_all(xdg.join("kache")).unwrap();
+    std::fs::write(
+        xdg.join("kache/config.toml"),
+        format!(
+            "[cache]\nlocal_store = {:?}\nruntime_dir = {:?}\n",
+            e.cache.to_str().unwrap(),
+            e.cache.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let calls = e.home.join("systemctl.calls");
+    let path = fake_systemd_path(
+        &e.home.join("fake-bin"),
+        &format!("echo \"$*\" >> {:?}; exit 0", calls.to_str().unwrap()),
+    );
+    let output = e
+        .cmd()
+        .args(["daemon", "start"])
+        .env_remove("KACHE_CONFIG")
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("PATH", path)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    e.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|call| call.contains("start")),
+        "the service manager was asked to start the private instance: {calls}"
+    );
+    assert!(
+        state.is_ok(),
+        "the private instance's daemon recorded no state"
+    );
+}
+
 #[test]
 fn daemon_restart_preserves_another_cache_daemon() {
     let a = env();

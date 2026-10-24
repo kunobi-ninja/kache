@@ -742,6 +742,49 @@ impl RustcArgs {
         })
     }
 
+    /// Exclude one valid terminal width when lint warnings are silenced.
+    /// Preserve malformed and repeated options so a
+    /// cached success cannot hide rustc's argument errors.
+    pub(crate) fn cache_key_diagnostic_flags(&self) -> impl Iterator<Item = &String> {
+        let mut widths = self.diagnostic_flags.iter().filter(|flag| {
+            flag.as_str() == "--diagnostic-width" || flag.starts_with("--diagnostic-width=")
+        });
+        let valid_width = widths
+            .next()
+            .and_then(|flag| flag.strip_prefix("--diagnostic-width="))
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|columns| columns > 0);
+        let omit_width = valid_width && widths.next().is_none() && self.lints_silenced();
+        self.diagnostic_flags
+            .iter()
+            .filter(move |flag| !omit_width || !flag.starts_with("--diagnostic-width="))
+    }
+
+    fn lints_silenced(&self) -> bool {
+        let mut cap = None;
+        let mut flags = self.outcome_lint_flags.iter();
+        while let Some(flag) = flags.next() {
+            if flag == "--force-warn" || flag.starts_with("--force-warn=") {
+                return false;
+            }
+            let value = if flag == "--cap-lints" {
+                flags.next().map(String::as_str)
+            } else if let Some(value) = flag.strip_prefix("--cap-lints=") {
+                Some(value)
+            } else {
+                if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&flag.as_str()) {
+                    let _ = flags.next();
+                }
+                continue;
+            };
+            if cap.is_some() {
+                return false;
+            }
+            cap = value;
+        }
+        cap == Some("allow")
+    }
+
     /// Original compact argv. This differs from [`Self::all_args`] only after
     /// a response file was expanded successfully.
     pub(crate) fn raw_args(&self) -> &[String] {
@@ -1219,6 +1262,31 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn key_diagnostic_flags_preserve_forwarded_arguments() {
+        for width in [
+            vec!["--diagnostic-width=80"],
+            vec!["--diagnostic-width", "80"],
+        ] {
+            let mut argv = vec!["rustc", "lib.rs", "--cap-lints=allow", "--color=never"];
+            argv.extend(width);
+            let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
+            let parsed = RustcArgs::parse(&argv).unwrap();
+            let forwarded = parsed.all_args.clone();
+            let diagnostics = parsed.diagnostic_flags.clone();
+            assert_eq!(
+                parsed
+                    .cache_key_diagnostic_flags()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["--color=never"]
+            );
+            assert_eq!(parsed.all_args, forwarded);
+            assert_eq!(parsed.diagnostic_flags, diagnostics);
+            assert_eq!(forwarded, argv[1..]);
+        }
+    }
+
     #[test]
     fn codegen_backend_name_is_a_sysroot_backend() {
         let flags = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();

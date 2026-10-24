@@ -3915,7 +3915,7 @@ fn compute_key_into(
     // older clients stored arbitrary diagnostic formats under that default key.
     hasher.set_group("diagnostics");
     fold_field(&mut hasher, b"diagnostics.v1:", b"");
-    for flag in &args.diagnostic_flags {
+    for flag in args.cache_key_diagnostic_flags() {
         fold_field(&mut hasher, b"diagnostic_arg:", flag.as_bytes());
     }
 

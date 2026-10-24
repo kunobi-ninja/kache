@@ -10701,6 +10701,85 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     assert_eq!(base, key_of_flags(&flag_base(&source, &["--verbose"])));
 }
 
+#[test]
+fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    for cap in [vec!["--cap-lints=allow"], vec!["--cap-lints", "allow"]] {
+        let key = |extra: &[&str]| {
+            let mut flags = cap.clone();
+            flags.extend_from_slice(extra);
+            key_of_flags(&flag_base(&source, &flags))
+        };
+        let base = key(&[]);
+        for width in ["1", "80", "120", "65535"] {
+            assert_eq!(base, key(&["--diagnostic-width", width]), "{width}");
+            assert_eq!(
+                base,
+                key(&[&format!("--diagnostic-width={width}")]),
+                "{width}"
+            );
+        }
+        for flag in ["--color=always", "--error-format=json", "--json=artifacts"] {
+            let other = key(&[flag]);
+            assert_ne!(base, other, "{flag}");
+            assert_eq!(other, key(&[flag, "--diagnostic-width=80"]), "{flag}");
+        }
+    }
+}
+
+#[test]
+fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    let key = |flags: &[&str]| key_of_flags(&flag_base(&source, flags));
+    let capped = key(&["--cap-lints=allow"]);
+    for retained in [
+        vec!["--diagnostic-width"],
+        vec!["--diagnostic-width="],
+        vec!["--diagnostic-width=not-a-number"],
+        vec!["--diagnostic-width=0"],
+        vec!["--diagnostic-width=65536"],
+        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
+        vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
+    ] {
+        let mut flags = vec!["--cap-lints=allow"];
+        flags.extend_from_slice(&retained);
+        assert_ne!(capped, key(&flags), "{retained:?}");
+    }
+    for lint_flags in [
+        vec![],
+        vec!["--cap-lints=warn"],
+        vec!["--cap-lints=allow", "--cap-lints", "warn"],
+        vec!["--cap-lints", "allow", "--cap-lints=warn"],
+        vec!["--cap-lints=warn", "--cap-lints", "allow"],
+        vec!["--cap-lints", "warn", "--cap-lints=allow"],
+        vec!["--cap-lints=allow", "--cap-lints=allow"],
+        vec!["--cap-lints=allow", "--cap-lints"],
+        vec!["--cap-lints=allow", "--force-warn=unused"],
+        vec!["--force-warn", "unused", "--cap-lints=allow"],
+        vec!["--check-cfg", "--cap-lints=allow"],
+    ] {
+        let mut narrow = lint_flags.clone();
+        narrow.push("--diagnostic-width=80");
+        let mut wide = lint_flags.clone();
+        wide.push("--diagnostic-width=120");
+        assert_ne!(key(&narrow), key(&wide), "{lint_flags:?}");
+    }
+    for lint_flags in [
+        vec!["--cap-lints=allow", "-W", "unused"],
+        vec!["--cap-lints=allow", "-D", "warnings"],
+    ] {
+        let mut narrow = lint_flags.clone();
+        narrow.push("--diagnostic-width=80");
+        assert_eq!(key(&lint_flags), key(&narrow), "{lint_flags:?}");
+    }
+}
+
 /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.
 /// Output uses the host separator (so it lines up with canonical rule
 /// prefixes); built with MAIN_SEPARATOR so the test is host-independent.

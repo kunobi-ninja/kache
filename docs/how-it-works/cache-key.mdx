@@ -52,6 +52,12 @@ Incremental directory names and harmless local path spellings are excluded or no
 
 Changing diagnostic presentation can cause a miss even when the artifact bytes would match. Builds with the same diagnostic flags still share entries. The diagnostic-key update also causes existing rustc entries to miss once, including invocations without explicit presentation flags.
 
+Dependencies with a single `--cap-lints=allow` and no `--force-warn` share entries
+across terminal widths and piped builds. Kache excludes a single terminal width
+between 1 and 65,535 columns from those keys and forwards it unchanged to rustc.
+Other diagnostic options remain keyed. Builds that can emit warnings retain
+their width in the key, as do malformed or repeated width options and repeated lint caps.
+
 Explicit per-kind Rust output destinations, such as `--emit=metadata=custom.rmeta`, pass through to rustc so it writes the requested file. Emit kinds without destinations still use the cache. This fix changes Rust cache keys, so existing Rust entries miss once after upgrading.
 
 Use `kache explain` and trace logging to see the components for a particular build.

@@ -202,9 +202,8 @@ fn thin_lto_seed_keeps_the_donor_unchanged_and_linkable() {
     let donor = root.join("donor");
     let receiver = root.join("receiver");
     let flags = "-Clto=thin -Copt-level=2 -Cembed-bitcode=yes -Ccodegen-units=8";
-    let _donor_daemon = common::DaemonGuard::new(common::kache_binary(), &donor.join("cache"));
-    let _receiver_daemon =
-        common::DaemonGuard::new(common::kache_binary(), &receiver.join("cache"));
+    let _donor_daemon = common::DaemonGuard::new(common::kache_binary(), donor.join("cache"));
+    let _receiver_daemon = common::DaemonGuard::new(common::kache_binary(), receiver.join("cache"));
 
     project(&donor, 1);
     build(&donor, None, flags);

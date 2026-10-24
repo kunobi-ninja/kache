@@ -45,6 +45,68 @@ impl CompileResult {
     }
 }
 
+/// The longest command line `CreateProcessW` takes, in UTF-16 code units,
+/// its terminating NUL included.
+pub(crate) const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;
+
+/// An upper bound of the command line the standard library builds on Windows
+/// for a program and its arguments (`words`, program first), in UTF-16 code
+/// units with separators and the terminating NUL: every word counted as
+/// quoted, and every quote and backslash in it as escaped.
+pub(crate) fn windows_command_line_bound<'a>(
+    words: impl IntoIterator<Item = &'a std::ffi::OsStr>,
+) -> usize {
+    1 + words
+        .into_iter()
+        .map(|word| {
+            let word = word.to_string_lossy();
+            word.encode_utf16().count() + word.matches(['"', '\\']).count() + 3
+        })
+        .sum::<usize>()
+}
+
+/// Whether the compiler's own arguments go to rustc in a response file
+/// (`@file`): Cargo used one (it does once its own command line is too long),
+/// or the command Kache spawns, with the flags Kache adds (path remapping,
+/// above all, several of them on Windows), could pass `limit` although
+/// Cargo's own line fit. `limit` is [`WINDOWS_COMMAND_LINE_LIMIT`] on Windows
+/// and `None` where the limits are far above any compile's.
+pub(crate) fn needs_response_file(
+    cargo_used_one: bool,
+    line_bound: impl FnOnce() -> usize,
+    limit: Option<usize>,
+) -> bool {
+    cargo_used_one || limit.is_some_and(|limit| line_bound() > limit)
+}
+
+/// [`WINDOWS_COMMAND_LINE_LIMIT`] on Windows, where a compile's command line
+/// is bounded; `None` elsewhere.
+pub(crate) const COMMAND_LINE_LIMIT: Option<usize> = if cfg!(windows) {
+    Some(WINDOWS_COMMAND_LINE_LIMIT)
+} else {
+    None
+};
+
+/// [`needs_response_file`] for `cmd` (its program and the arguments it has so
+/// far) followed by `args`.
+pub(crate) fn command_needs_response_file<'a>(
+    cargo_used_one: bool,
+    cmd: &'a std::process::Command,
+    args: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    needs_response_file(
+        cargo_used_one,
+        || {
+            windows_command_line_bound(
+                std::iter::once(cmd.get_program())
+                    .chain(cmd.get_args())
+                    .chain(args.into_iter().map(std::ffi::OsStr::new)),
+            )
+        },
+        COMMAND_LINE_LIMIT,
+    )
+}
+
 /// A securely-created standard rustc response file that owns its lifetime.
 ///
 /// Every argument is written verbatim followed by `\n`. This is the inverse
@@ -199,6 +261,14 @@ pub(crate) fn run_rustc(
         IncrementalMode::Strip => strip_incremental_flags(args),
         IncrementalMode::PreserveIsolated { .. } => args.iter().collect(),
     };
+    // Cargo's own line fit when it used no response file, but the remapping
+    // flags above make Kache's longer: on Windows a line past the limit fails
+    // to spawn, and the compile would run uncached and unremapped.
+    let use_response_file = command_needs_response_file(
+        use_response_file,
+        &cmd,
+        compiler_args.iter().map(|arg| arg.as_str()),
+    );
     let response_file = if use_response_file {
         let temp_dir = env
             .resolve(env.temp_dir())
@@ -2031,5 +2101,110 @@ fi
 
         pre_clean_outputs(None, Some(dir.path()), Some("foo"), Some("-abc"), &[]);
         assert!(rlib.exists(), "writable candidates must not be removed");
+    }
+
+    /// A unit whose own command line Cargo spawned directly (it fit) but that
+    /// Kache's remapping flags lengthen past Windows' limit: seen on the crates
+    /// of a large GUI framework (one line was 29,610 characters), which failed to spawn ("compiler spawn failed"), ran
+    /// uncached and unremapped, and made every crate above them miss in the
+    /// next checkout. Their arguments go through a response file instead.
+    #[test]
+    fn a_line_kache_lengthens_past_the_windows_limit_takes_a_response_file() {
+        let cargo_args: Vec<String> = (0..490)
+            .map(|i| format!("--check-cfg=cfg(feature, values(\"feature-number-{i:04}\"))"))
+            .chain(["--crate-name".to_string(), "platform".to_string()])
+            .collect();
+        let program = std::ffi::OsStr::new(r"C:\Users\user\.rustup\toolchains\x\bin\rustc.exe");
+        let cargo_line = windows_command_line_bound(
+            std::iter::once(program).chain(cargo_args.iter().map(std::ffi::OsStr::new)),
+        );
+        assert!(cargo_line < WINDOWS_COMMAND_LINE_LIMIT, "{cargo_line}");
+        let remaps: Vec<String> = (0..48)
+            .map(|i| {
+                format!(
+                    r"--remap-path-prefix=\\?\C:\src\checkout-{i:02}\target\debug=/kache/target"
+                )
+            })
+            .collect();
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&remaps);
+        let args = || cargo_args.iter().map(String::as_str);
+
+        assert!(command_needs_response_file(false, &cmd, args()) == cfg!(windows));
+        let kache_line = || {
+            windows_command_line_bound(
+                std::iter::once(program)
+                    .chain(remaps.iter().map(std::ffi::OsStr::new))
+                    .chain(cargo_args.iter().map(std::ffi::OsStr::new)),
+            )
+        };
+        assert!(
+            kache_line() > WINDOWS_COMMAND_LINE_LIMIT,
+            "{}",
+            kache_line()
+        );
+        assert!(needs_response_file(
+            false,
+            kache_line,
+            Some(WINDOWS_COMMAND_LINE_LIMIT)
+        ));
+        // Elsewhere, and for a line that fits, nothing changes; a response
+        // file Cargo used is always kept.
+        assert!(!needs_response_file(false, kache_line, None));
+        assert!(!needs_response_file(
+            false,
+            || cargo_line,
+            Some(WINDOWS_COMMAND_LINE_LIMIT)
+        ));
+        assert!(needs_response_file(true, || 0, None));
+    }
+
+    /// The bound counts every escape the standard library may add: quotes
+    /// around a word, a backslash before each quote and doubled backslashes.
+    #[test]
+    fn the_windows_command_line_bound_counts_quotes_escapes_and_wide_characters() {
+        let bound = |words: &[&str]| {
+            windows_command_line_bound(words.iter().map(|w| std::ffi::OsStr::new(*w)))
+        };
+        assert_eq!(bound(&[]), 1);
+        assert_eq!(bound(&["rustc"]), 1 + 5 + 3);
+        // `a "b"\` is quoted and escaped as `"a \"b\"\\"`: 11 units, under 6 + 4 + 3.
+        assert_eq!(bound(&[r#"a "b"\"#]), 1 + 6 + 3 + 3);
+        // Characters outside the BMP take two UTF-16 units each.
+        assert_eq!(bound(&["\u{1F600}"]), 1 + 2 + 3);
+    }
+
+    /// On Windows the bound is safe and the limit real: a line the bound puts
+    /// at the limit spawns, and one past it does not.
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawns_a_line_within_the_bound_and_refuses_one_past_the_limit() {
+        let exe = std::env::current_exe().unwrap();
+        // libtest takes every further word as a filter; none matches, so the
+        // child runs no test and exits at once.
+        let word = r#"C:\src dir\target\deps\lib"named"\"#;
+        let mut args = vec!["--exact".to_string(), "--test-threads=1".to_string()];
+        let line = |args: &[String]| {
+            windows_command_line_bound(
+                std::iter::once(exe.as_os_str()).chain(args.iter().map(std::ffi::OsStr::new)),
+            )
+        };
+        while line(&[args.clone(), vec![word.to_string()]].concat()) <= WINDOWS_COMMAND_LINE_LIMIT {
+            args.push(word.to_string());
+        }
+        let status = std::process::Command::new(&exe)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("a line within the bound spawns");
+        assert!(status.success());
+
+        let long = vec!["x".repeat(WINDOWS_COMMAND_LINE_LIMIT)];
+        let error = std::process::Command::new(&exe)
+            .args(&long)
+            .status()
+            .expect_err("a line past the limit does not spawn");
+        assert_eq!(error.raw_os_error(), Some(206), "{error}");
     }
 }

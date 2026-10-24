@@ -18,8 +18,8 @@ kache-core = { path = "../kache-core", default-features = false, features = ["pl
 k8s-openapi = { version = "0.28", features = ["v1_34"] }
 kube = { version = "4", features = ["client"] }
 prometheus = "0.14"
-kunobi-auth = { version = "1.0.0", default-features = false, features = ["server", "rust_crypto"] }
-kunobi-ha = { git = "https://github.com/kunobi-ninja/kunobi-ha.git", branch = "main" }
+kunobi-auth = { version = "1.1.0", default-features = false, features = ["server", "rust_crypto"] }
+kunobi-ha = "0.6.1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,7 +30,7 @@ uuid = { version = "1", features = ["v4"] }
 zstd = "0.14"
 
 [dev-dependencies]
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["time"] }

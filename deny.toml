@@ -26,10 +26,8 @@ ignore = [
 # graph this size (aws-sdk + kube pull wide trees).
 multiple-versions = "warn"
 wildcards = "deny"
-# kache-service's path dep (kache-core) and first-party git deps
-# (kunobi-auth, kunobi-ha) carry no version req, which cargo-deny counts
-# as a wildcard. Permit wildcards for path/git deps of unpublished crates
-# only; registry wildcards stay denied.
+# kache-service's unpublished path dependency on kache-core omits a version.
+# Permit that workspace dependency; registry wildcards stay denied.
 allow-wildcard-paths = true
 deny = []
 skip = []
@@ -68,7 +66,4 @@ exceptions = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# First-party dependencies.
-allow-git = [
-    "https://github.com/kunobi-ninja/kunobi-ha.git",
-]
+allow-git = []

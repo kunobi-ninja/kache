@@ -29,9 +29,6 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../../Cargo.lock;
-    outputHashes = {
-      "kunobi-ha-0.6.0" = "sha256-T3k7lmqm1dgFNPvHXJxkp6zsNQ32uxlJPn3zzLcLUeE=";
-    };
   };
 
   cargoBuildFlags = [

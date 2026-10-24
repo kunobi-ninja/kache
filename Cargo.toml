@@ -58,7 +58,7 @@ kache-config = { version = "1.2.2", path = "crates/kache-config" }
 kache-protocol = { version = "1.2.2", path = "crates/kache-protocol" }
 kache-ipc = { version = "1.2.2", path = "crates/kache-ipc", features = ["async"] }
 foldhash = "0.2"
-kunobi-daemon = { version = "0.10.1", features = ["wire-async", "local-async", "launch"] }
+kunobi-daemon = { version = "0.10.2", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "1.2.2", path = "crates/kache-format" }
 kache-fs = { version = "1.2.2", path = "crates/kache-fs" }
 kache-store = { version = "1.2.2", path = "crates/kache-store" }
@@ -119,7 +119,7 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # `kache login` and planner bearer sessions. The -core features keep reqwest
 # on `rustls-no-provider`, so ring stays the only TLS provider (no aws-lc).
-kunobi-auth = { version = "1.0.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
+kunobi-auth = { version = "1.1.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
 interprocess = { version = "2.4.6", features = ["tokio"] }
 # Unicode tables affect persisted cache-key bytes. Keep Unicode 17 until
 # normalization changes have a reviewed cache-key compatibility migration.

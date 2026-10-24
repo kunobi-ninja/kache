@@ -1122,6 +1122,53 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
 }
 
 #[test]
+fn unfiltered_and_workspace_sync_do_not_resolve_unavailable_dependencies() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let cargo_home = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::create_dir(project.path().join(".cargo")).unwrap();
+    std::fs::write(project.path().join("src").join("lib.rs"), "").unwrap();
+    std::fs::write(
+        project.path().join(".cargo").join("config.toml"),
+        "[net]\noffline = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"sync-mode-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nintentionally-missing-sync-dependency = \"=0.0.0\"\n",
+    )
+    .unwrap();
+    let lock = "version = 3\n[[package]]\nname = \"sync-mode-fixture\"\nversion = \"0.1.0\"\n";
+    std::fs::write(project.path().join("Cargo.lock"), lock).unwrap();
+    let client = Client::new(shared.path());
+    for args in [
+        vec!["sync", "--pull", "--all"],
+        vec!["sync", "--pull", "--workspace"],
+        vec!["sync", "--push"],
+    ] {
+        let output = client.run_within_at_env(
+            Some(project.path()),
+            &args,
+            &[("CARGO_HOME", cargo_home.path())],
+            Duration::from_secs(90),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("cannot resolve dependency target names"),
+            "{args:?} unexpectedly resolved dependencies: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("Cargo.lock")).unwrap(),
+            lock
+        );
+    }
+}
+
+#[test]
 fn concurrent_bulk_sync_clients_hydrate_shared_store_without_errors() {
     build_kache();
     let shared = TempDir::new().unwrap();

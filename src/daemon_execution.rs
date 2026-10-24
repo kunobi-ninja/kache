@@ -1557,7 +1557,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(results[0].is_ok(), "{:?}", results[0]);
+        // The final reply can race the disconnect reader after the client dies.
+        // Either path must reap the compiler and release its worker below.
+        if let Err(error) = &results[0] {
+            assert!(
+                error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                }),
+                "{error:#}"
+            );
+        }
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(
             std::fs::read_to_string(path.join("record"))

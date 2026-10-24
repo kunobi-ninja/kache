@@ -2020,6 +2020,84 @@ fn a_read_only_blob_flushes_and_a_missing_one_reports_not_found() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn strict_flush_serializes_the_windows_readonly_open_window() {
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Step {
+        WaitingForWriter,
+        PermissionsRead(bool),
+    }
+    thread_local! {
+        static NEXT_STEP: std::cell::RefCell<Option<(Sender<Step>, Receiver<()>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    fn notify_and_wait(step: Step) -> bool {
+        NEXT_STEP.with(|slot| {
+            let Some((notify, resume)) = slot.borrow_mut().take() else {
+                return true;
+            };
+            notify.send(step).is_ok() && resume.recv_timeout(Duration::from_secs(10)).is_ok()
+        })
+    }
+    fn waiting_for_writer(_: i32) -> bool {
+        notify_and_wait(Step::WaitingForWriter)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let holder = Store::open(&config).unwrap();
+    let bytes = b"a shared pending Windows blob";
+    let cache_key = put_entry(&holder, dir.path(), 92, "pending", bytes);
+    let blob = holder.blob_path(blake3::hash(bytes).to_hex().as_str());
+    config.deferred_durability = false;
+    let flusher = Store::open(&config).unwrap();
+    let permissions = fs::metadata(&blob).unwrap().permissions();
+    assert!(permissions.readonly());
+
+    let writer =
+        rusqlite::Transaction::new_unchecked(&holder.db, rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+    // Reproduce another opener/publisher's temporary writable window. It
+    // restores read-only while holding the writer guard, before our opener
+    // may inspect permissions. Without that guard our opener snapshots false
+    // and then tries a write-open after this test has restored read-only.
+    let mut writable = permissions.clone();
+    writable.set_readonly(false);
+    fs::set_permissions(&blob, writable).unwrap();
+    let (notify, notified) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let worker_key = cache_key.clone();
+    let worker = std::thread::spawn(move || {
+        NEXT_STEP.with(|slot| *slot.borrow_mut() = Some((notify, resumed)));
+        DURABILITY_OPEN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|readonly| {
+                assert!(notify_and_wait(Step::PermissionsRead(readonly)));
+            }));
+        });
+        flusher.db.busy_handler(Some(waiting_for_writer)).unwrap();
+        flusher.finish_strict_durability(&worker_key)
+    });
+
+    // Always finish the held window and release the worker before asserting,
+    // including when its first operation failed or a handshake timed out.
+    let step = notified.recv_timeout(Duration::from_secs(10));
+    let restored = fs::set_permissions(&blob, permissions);
+    let committed = writer.commit();
+    let _ = resume.send(());
+    let result = worker.join();
+    restored.unwrap();
+    committed.unwrap();
+    assert_eq!(step.unwrap(), Step::WaitingForWriter);
+    result.unwrap().expect("the shared pending blob must flush");
+    assert!(holder.entry_is_durable(&cache_key));
+    assert_eq!(fs::read(&blob).unwrap(), bytes);
+    assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+}
+
 /// Opening another handle must not change the first store's flush policy.
 #[test]
 fn blob_ingest_keeps_each_stores_durability_policy() {

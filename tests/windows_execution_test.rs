@@ -310,7 +310,12 @@ fn cold_daemon_survives_the_client_and_warm_frontends_need_no_engine() {
 fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
     let fixture = Fixture::new();
     let rustc = fixture.rustc();
-    let out = fixture.path("work/target/debug/deps");
+    // Match the native spelling used when dep-info paths are restored.
+    let out = fixture
+        .path("work")
+        .join("target")
+        .join("debug")
+        .join("deps");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(
         fixture.path("work/main.rs"),
@@ -384,6 +389,13 @@ fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
         "the cache restores every compiler output"
     );
     for (name, expected) in &expected {
+        if name == OsStr::new("defaultlib_canary.d") {
+            assert_eq!(
+                std::str::from_utf8(&restored[name]).unwrap(),
+                std::str::from_utf8(expected).unwrap(),
+                "restored dep-info differs from the stored compiler output"
+            );
+        }
         assert!(
             restored[name] == *expected,
             "restored {name:?} differs from the stored compiler output"

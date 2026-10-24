@@ -306,6 +306,106 @@ fn cold_daemon_survives_the_client_and_warm_frontends_need_no_engine() {
 }
 
 #[test]
+#[cfg(target_env = "msvc")]
+fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
+    let fixture = Fixture::new();
+    let rustc = fixture.rustc();
+    // Match the native spelling used when dep-info paths are restored.
+    let out = fixture
+        .path("work")
+        .join("target")
+        .join("debug")
+        .join("deps");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        fixture.path("work/main.rs"),
+        "fn main() {print!(\"msvc-defaultlib\");}\n",
+    )
+    .unwrap();
+    common::settle_writes(&[fixture.root.path()]);
+    let name = "defaultlib_canary";
+    let build = |frontend: &str| {
+        let mut command = fixture.command(fixture.path(frontend));
+        command
+            .arg(&rustc)
+            .args([
+                "--crate-name",
+                name,
+                "--crate-type=bin",
+                "--emit=link,dep-info",
+            ])
+            .arg("--out-dir")
+            .arg(&out)
+            .args([
+                "-Cdebuginfo=0",
+                "-Clink-args=/NODEFAULTLIB:kache-unused.lib /DEFAULTLIB:ucrt.lib",
+                "main.rs",
+            ])
+            .env("KACHE_CACHE_EXECUTABLES", "1")
+            .env_remove("OUT_DIR");
+        command
+    };
+    // Capture every generated sidecar, including a PDB if this linker emits one.
+    let outputs = || {
+        std::fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    fixture.success(&mut build("install/kache.exe"));
+    let expected = outputs();
+    assert!(expected.contains_key(OsStr::new("defaultlib_canary.exe")));
+    assert!(expected.contains_key(OsStr::new("defaultlib_canary.d")));
+    for name in expected.keys() {
+        std::fs::remove_file(out.join(name)).unwrap();
+    }
+    assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+    fixture.success(&mut build("frontend-only/kache.exe"));
+    let events = fixture.events(name, 2);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["result"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["miss", "local_hit"],
+        "cache events: {events:#?}"
+    );
+    assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
+    assert!(
+        events[0]["cache_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty())
+    );
+    let restored = outputs();
+    assert_eq!(
+        restored.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "the cache restores every compiler output"
+    );
+    for (name, expected) in &expected {
+        if name == OsStr::new("defaultlib_canary.d") {
+            assert_eq!(
+                std::str::from_utf8(&restored[name]).unwrap(),
+                std::str::from_utf8(expected).unwrap(),
+                "restored dep-info differs from the stored compiler output"
+            );
+        }
+        assert!(
+            restored[name] == *expected,
+            "restored {name:?} differs from the stored compiler output"
+        );
+    }
+    let restored = fixture.success(&mut fixture.command(out.join("defaultlib_canary.exe")));
+    assert_eq!(restored.stdout, b"msvc-defaultlib");
+}
+
+#[test]
 fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
     let fixture = Fixture::new();
     let rustc = fixture.rustc();

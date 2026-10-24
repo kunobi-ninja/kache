@@ -4046,18 +4046,16 @@ fn compute_key_into(
         cfg!(target_os = "windows"),
         file_hasher,
         |linker, architecture, host, search_dirs| {
-            Ok(
-                crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
-                    linker,
-                    architecture,
-                    &rustc_tool_dirs_for(args, host, invocation)?,
-                    &search_dirs.rustc,
-                    &search_dirs.linker,
-                    &args.link_libs,
-                    |path| file_hasher.hash_static_lib(path),
-                    invocation,
-                )?
-                .encode(),
+            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+                linker,
+                architecture,
+                &rustc_tool_dirs_for(args, host, invocation)?,
+                &search_dirs.rustc,
+                &search_dirs.linker,
+                &args.link_libs,
+                &search_dirs.default_libraries,
+                |path| file_hasher.hash_static_lib(path),
+                invocation,
             )
         },
         invocation,
@@ -10672,6 +10670,7 @@ struct WindowsNativeLinkSearchDirs {
     /// Files `-C link-arg` hands LINK by absolute path, which the key hashes
     /// (see `windows_link_argument_input_files`), in argument order.
     files: Vec<PathBuf>,
+    default_libraries: Vec<crate::native_link_key::WindowsDefaultLibrary>,
 }
 
 fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {
@@ -10691,6 +10690,7 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
     }
     let mut linker = rustc.clone();
     let mut files = Vec::new();
+    let mut default_libraries = Vec::new();
     for (key, value) in &args.codegen_opts {
         if !matches!(key.as_str(), "link-arg" | "link-args") {
             continue;
@@ -10710,12 +10710,18 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
                 "Windows linker input files other than absolute compiled resources, and unmodeled file-carrying LINK options, are not cacheable"
             );
         };
-        files.extend(inputs);
+        let crate::native_link_key::WindowsLinkArgumentInputs {
+            files: argument_files,
+            default_libraries: argument_libraries,
+        } = inputs;
+        files.extend(argument_files);
+        default_libraries.extend(argument_libraries);
     }
     Ok(WindowsNativeLinkSearchDirs {
         rustc,
         linker,
         files,
+        default_libraries,
     })
 }
 
@@ -10839,7 +10845,18 @@ where
         rustc_version,
         running_on_windows,
         &FileHasher::new_for(&invocation),
-        |linker, architecture, host, _| probe(linker, architecture, host),
+        |linker, architecture, host, _| {
+            Ok(crate::native_link_key::WindowsMsvcIdentity {
+                linker: probe(linker, architecture, host)?,
+                compiler: "cl".into(),
+                toolset: "14".into(),
+                sdk: "10".into(),
+                ucrt: "10".into(),
+                architecture: architecture.into(),
+                wrapper: None,
+                libraries: BTreeMap::new(),
+            })
+        },
         &invocation,
     )
 }
@@ -10855,7 +10872,12 @@ fn fold_native_windows_msvc_identity_for<H, Probe>(
 ) -> Result<()>
 where
     H: KeyFold,
-    Probe: FnOnce(Option<&Path>, &str, &str, &WindowsNativeLinkSearchDirs) -> Result<String>,
+    Probe: FnOnce(
+        Option<&Path>,
+        &str,
+        &str,
+        &WindowsNativeLinkSearchDirs,
+    ) -> Result<crate::native_link_key::WindowsMsvcIdentity>,
 {
     if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
         return Ok(());
@@ -10903,6 +10925,9 @@ where
     let search_dirs = windows_native_link_search_dirs(args)?;
     let identity = probe(linker, architecture, host, &search_dirs)
         .context("determining native Windows MSVC link identity")?;
+    let identity = identity
+        .with_default_libraries(&search_dirs.default_libraries)?
+        .encode();
     let identity =
         windows_link_identity_with_argument_files(identity, &search_dirs.files, file_hasher)?;
     fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());

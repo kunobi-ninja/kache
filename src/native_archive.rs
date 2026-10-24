@@ -98,6 +98,10 @@
 //! and anything malformed. Thin archives are made uncacheable because their
 //! external member bytes are absent from the container. Other fallbacks bind
 //! both the archive bytes and lexical absolute archive path.
+//!
+//! Explicit Windows DEFAULTLIB inputs use a separate closed-container check,
+//! [`validate_closed_windows_runtime_archive`], while retaining their raw file
+//! digest. That check does not change structural hashing or header-only readers.
 
 use crate::checked_regions::checked_file_region;
 
@@ -456,6 +460,302 @@ pub struct ArchiveMember {
 /// The first four bytes of a COFF short import object: `Sig1` 0 and `Sig2`
 /// 0xFFFF, little-endian.
 const SHORT_IMPORT_SIGNATURE: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+
+/// The closed COFF subset for explicit Windows DEFAULTLIB inputs.
+/// Every indexed member must be embedded, recognized COFF, and free of linker
+/// directives or external CodeView type inputs. An index may not point at an
+/// unchecked nested member header. Other archive users retain their existing
+/// readers and policy. BSD and GNU64 containers stay outside this subset.
+pub(crate) fn validate_closed_windows_runtime_archive(bytes: &[u8]) -> Option<()> {
+    bytes.strip_prefix(AR_MAGIC)?;
+    let mut pos = AR_MAGIC.len();
+    let mut objects = Vec::new();
+    let mut indexes: Vec<(RuntimeArchiveIndex, &[u8])> = Vec::new();
+    let mut longnames = None;
+    while pos < bytes.len() {
+        let header = bytes.get(pos..pos.checked_add(AR_HEADER_LEN)?)?;
+        if header.get(58..60)? != b"`\n" {
+            return None;
+        }
+        let field = ar_name(&header[..16])?;
+        let size = parse_ar_decimal(&header[48..58])?;
+        let start = pos.checked_add(AR_HEADER_LEN)?;
+        let end = start.checked_add(size)?;
+        let data = bytes.get(start..end)?;
+        if field == "//" {
+            if longnames.is_some() || !objects.is_empty() {
+                return None;
+            }
+            validate_runtime_longnames(data)?;
+            longnames = Some(data);
+        } else if field == "/" {
+            if !objects.is_empty() || longnames.is_some() {
+                return None;
+            }
+            let kind = match indexes.len() {
+                0 => RuntimeArchiveIndex::Gnu32,
+                1 => RuntimeArchiveIndex::CoffSecond,
+                _ => return None,
+            };
+            indexes.push((kind, data));
+        } else {
+            if field.starts_with("#1/") {
+                return None;
+            }
+            let name = if let Some(offset) = field.strip_prefix('/') {
+                runtime_longname(longnames?, offset)?
+            } else {
+                field.strip_suffix('/').unwrap_or(field)
+            };
+            if name.is_empty() || is_bsd_symdef(name) {
+                return None;
+            }
+            validate_closed_coff_member(data)?;
+            objects.push(pos);
+        }
+        pos = if size & 1 == 0 {
+            end
+        } else {
+            // Windows SDK COFF libraries use NUL padding; GNU ar uses newline.
+            if !matches!(bytes.get(end), Some(0 | b'\n')) {
+                return None;
+            }
+            end.checked_add(1)?
+        };
+    }
+    if objects.is_empty() {
+        return None;
+    }
+    for (kind, data) in indexes {
+        validate_runtime_archive_index(kind, data, &objects)?;
+    }
+    Some(())
+}
+
+const MAX_RUNTIME_NAME_BYTES: usize = 256;
+
+/// Bound each reference lookup, including GNU's two-byte `/\n` terminator.
+fn runtime_archive_name(bytes: &[u8]) -> Option<&str> {
+    let end = match bytes
+        .iter()
+        .take(MAX_RUNTIME_NAME_BYTES + 1)
+        .position(|&byte| byte == 0 || byte == b'\n')
+    {
+        Some(end) => end,
+        None if bytes.get(MAX_RUNTIME_NAME_BYTES..MAX_RUNTIME_NAME_BYTES + 2) == Some(b"/\n") => {
+            return std::str::from_utf8(bytes.get(..MAX_RUNTIME_NAME_BYTES)?).ok();
+        }
+        None => return None,
+    };
+    let name = if bytes[end] == b'\n' {
+        bytes.get(..end)?.strip_suffix(b"/")?
+    } else {
+        bytes.get(..end)?
+    };
+    if name.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(name).ok()
+}
+
+fn validate_runtime_longnames(bytes: &[u8]) -> Option<()> {
+    let mut entries = bytes.split_inclusive(|&byte| byte == 0 || byte == b'\n');
+    while let Some(entry) = entries.next() {
+        // COFF librarians may pad their string table with NUL bytes.
+        if entry == b"\0" {
+            return entries.all(|padding| padding == b"\0").then_some(());
+        }
+        runtime_archive_name(entry)?;
+    }
+    Some(())
+}
+
+fn runtime_longname<'a>(table: &'a [u8], offset: &str) -> Option<&'a str> {
+    let offset = parse_ar_decimal(offset.as_bytes())?;
+    if offset != 0 && !matches!(table.get(offset.checked_sub(1)?), Some(0 | b'\n')) {
+        return None;
+    }
+    runtime_archive_name(table.get(offset..)?)
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeArchiveIndex {
+    Gnu32,
+    CoffSecond,
+}
+
+fn runtime_archive_u32(bytes: &[u8], offset: usize, endian: MachEndian) -> Option<usize> {
+    usize::try_from(endian.u32(bytes, offset)?).ok()
+}
+
+fn runtime_index_names(mut bytes: &[u8], count: usize) -> Option<()> {
+    for _ in 0..count {
+        let end = bytes.iter().position(|&byte| byte == 0)?;
+        if end == 0 {
+            return None;
+        }
+        bytes = bytes.get(end.checked_add(1)?..)?;
+    }
+    bytes.iter().all(|&byte| byte == 0).then_some(())
+}
+
+fn validate_runtime_archive_index(
+    kind: RuntimeArchiveIndex,
+    bytes: &[u8],
+    objects: &[usize],
+) -> Option<()> {
+    let indexed = |offset| objects.binary_search(&offset).ok().map(|_| ());
+    match kind {
+        RuntimeArchiveIndex::Gnu32 => {
+            let count = runtime_archive_u32(bytes, 0, MachEndian::Big)?;
+            let names = 4_usize.checked_add(count.checked_mul(4)?)?;
+            bytes.get(..names)?;
+            for index in 0..count {
+                indexed(runtime_archive_u32(bytes, 4 + index * 4, MachEndian::Big)?)?;
+            }
+            runtime_index_names(bytes.get(names..)?, count)
+        }
+        RuntimeArchiveIndex::CoffSecond => {
+            let count = runtime_archive_u32(bytes, 0, MachEndian::Little)?;
+            let symbols = 4_usize.checked_add(count.checked_mul(4)?)?;
+            let symbol_count = runtime_archive_u32(bytes, symbols, MachEndian::Little)?;
+            let indices = symbols.checked_add(4)?;
+            let names = indices.checked_add(symbol_count.checked_mul(2)?)?;
+            bytes.get(..names)?;
+            for index in 0..count {
+                indexed(runtime_archive_u32(
+                    bytes,
+                    4 + index * 4,
+                    MachEndian::Little,
+                )?)?;
+            }
+            for index in 0..symbol_count {
+                let member = usize::from(MachEndian::Little.u16(bytes, indices + index * 2)?);
+                if member == 0 || member > count {
+                    return None;
+                }
+            }
+            runtime_index_names(bytes.get(names..)?, symbol_count)
+        }
+    }
+}
+
+fn supported_runtime_coff_machine(machine: u16) -> bool {
+    matches!(machine, 0x014c | 0x8664 | 0x01c4 | 0xaa64)
+}
+
+fn validate_closed_coff_member(bytes: &[u8]) -> Option<()> {
+    let le = MachEndian::Little;
+    let header = bytes.get(..20)?;
+    if header.starts_with(&SHORT_IMPORT_SIGNATURE) {
+        // Version 2 uses the same signature for bigobj; never treat that
+        // different header as an import object.
+        if le.u16(header, 4)? != 0 || !supported_runtime_coff_machine(le.u16(header, 6)?) {
+            return None;
+        }
+        let flags = le.u16(header, 18)?;
+        if flags & !0x1f != 0 || flags & 3 > 2 || (flags >> 2) & 7 > 3 {
+            return None;
+        }
+        let size = usize::try_from(le.u32(header, 12)?).ok()?;
+        let end = 20_usize.checked_add(size)?;
+        if end != bytes.len() {
+            return None;
+        }
+        let mut strings = bytes.get(20..end)?;
+        for _ in 0..2 {
+            let end = strings.iter().position(|&byte| byte == 0)?;
+            if end == 0 {
+                return None;
+            }
+            strings = strings.get(end.checked_add(1)?..)?;
+        }
+        return strings.is_empty().then_some(());
+    }
+    if !supported_runtime_coff_machine(le.u16(header, 0)?)
+        || le.u16(header, 16)? != 0
+        || le.u16(header, 18)? & !0x030c != 0
+    {
+        return None;
+    }
+    let section_count = usize::from(le.u16(header, 2)?);
+    let sections_end = 20_usize.checked_add(section_count.checked_mul(40)?)?;
+    bytes.get(..sections_end)?;
+    if section_count == 0 {
+        return None;
+    }
+    let symbols = usize::try_from(le.u32(header, 8)?).ok()?;
+    let symbol_count = usize::try_from(le.u32(header, 12)?).ok()?;
+    let strings = if symbols == 0 {
+        if symbol_count != 0 {
+            return None;
+        }
+        None
+    } else {
+        if symbols < sections_end {
+            return None;
+        }
+        let start = symbols.checked_add(symbol_count.checked_mul(18)?)?;
+        let size = usize::try_from(le.u32(bytes, start)?).ok()?;
+        if size < 4 {
+            return None;
+        }
+        Some(bytes.get(start..start.checked_add(size)?)?)
+    };
+    for section in bytes.get(20..sections_end)?.as_chunks::<40>().0 {
+        let raw_name = &section[..8];
+        let end = raw_name.iter().position(|&byte| byte == 0).unwrap_or(8);
+        if raw_name[end..].iter().any(|&byte| byte != 0) {
+            return None;
+        }
+        let name = &raw_name[..end];
+        let name = if let Some(offset) = name.strip_prefix(b"/") {
+            let offset = parse_ar_decimal(offset)?;
+            if offset < 4 {
+                return None;
+            }
+            let name = strings?.get(offset..)?;
+            let end = name
+                .iter()
+                .take(MAX_RUNTIME_NAME_BYTES + 1)
+                .position(|&byte| byte == 0)?;
+            name.get(..end)?
+        } else {
+            name
+        };
+        if name.is_empty()
+            || [b".drectve", b".debug$T", b".debug$P"]
+                .iter()
+                .any(|unsupported| name.eq_ignore_ascii_case(*unsupported))
+        {
+            return None;
+        }
+        let flags = le.u32(section, 36)?;
+        if flags & 0x0100_0000 != 0 {
+            return None; // Extended relocation counts are outside this subset.
+        }
+        let size = u64::from(le.u32(section, 16)?);
+        let offset = u64::from(le.u32(section, 20)?);
+        if size != 0 && !(offset == 0 && flags & 0x80 != 0) {
+            checked_file_region(bytes.len(), offset, size, sections_end)?;
+        }
+        validate_counted_region(
+            bytes,
+            le.u32(section, 24)?,
+            u32::from(le.u16(section, 32)?),
+            10,
+            sections_end,
+        )?;
+        validate_counted_region(
+            bytes,
+            le.u32(section, 28)?,
+            u32::from(le.u16(section, 34)?),
+            6,
+            sections_end,
+        )?;
+    }
+    Some(())
+}
 
 /// The member names of the `ar` archive at `path`, in archive order, read
 /// from the headers alone. A GNU `/N` name resolves through the `//` table and
@@ -1330,6 +1630,17 @@ fn parse_ar_decimal(field: &[u8]) -> Option<usize> {
     s.parse::<usize>().ok()
 }
 
+/// A small closed COFF archive for runtime-selection/cache-key regressions.
+#[cfg(test)]
+pub(crate) fn closed_coff_archive_for_tests(payload: &[u8]) -> Vec<u8> {
+    coff_archive_with_section_for_tests(b".text", payload)
+}
+
+#[cfg(test)]
+pub(crate) fn coff_archive_with_section_for_tests(name: &[u8], payload: &[u8]) -> Vec<u8> {
+    tests::raw_archive(&[("runtime.obj/", &tests::runtime_coff_object(name, payload))])
+}
+
 /// A BSD archive with one DWARF-bearing Mach-O member, for `cache_key` tests.
 #[cfg(test)]
 pub(crate) fn dwarf_bsd_archive_for_tests(payload: &[u8]) -> Vec<u8> {
@@ -1371,12 +1682,677 @@ mod tests {
         h
     }
 
-    fn raw_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn raw_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut a = AR_MAGIC.to_vec();
         for (n, d) in members {
             a.extend_from_slice(&member(n, d));
         }
         a
+    }
+
+    pub(super) fn runtime_coff_object(name: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut object = vec![0; 60];
+        object[..2].copy_from_slice(&0x8664_u16.to_le_bytes());
+        object[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        if name.len() <= 8 {
+            object[20..20 + name.len()].copy_from_slice(name);
+        } else {
+            object[20..22].copy_from_slice(b"/4");
+            let symbols = u32::try_from(60 + payload.len()).unwrap();
+            object[8..12].copy_from_slice(&symbols.to_le_bytes());
+        }
+        object[36..40].copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        object[40..44].copy_from_slice(&60_u32.to_le_bytes());
+        object[56..60].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
+        object.extend_from_slice(payload);
+        if name.len() > 8 {
+            let size = u32::try_from(4 + name.len() + 1).unwrap();
+            object.extend_from_slice(&size.to_le_bytes());
+            object.extend_from_slice(name);
+            object.push(0);
+        }
+        object
+    }
+
+    fn runtime_short_import() -> Vec<u8> {
+        let names = b"runtime_symbol\0ucrtbase.dll\0";
+        let mut object = vec![0; 20];
+        object[..4].copy_from_slice(&SHORT_IMPORT_SIGNATURE);
+        object[6..8].copy_from_slice(&0x8664_u16.to_le_bytes());
+        object[12..16].copy_from_slice(&u32::try_from(names.len()).unwrap().to_le_bytes());
+        object[18..20].copy_from_slice(&4_u16.to_le_bytes()); // IMPORT_OBJECT_NAME
+        object.extend_from_slice(names);
+        object
+    }
+
+    /// Real COFF linker-index layouts, including both `/` members and a
+    /// NUL-terminated long-name table. No compiler or linker is needed.
+    fn indexed_runtime_archive(object: &[u8]) -> Vec<u8> {
+        let symbol = b"runtime_symbol\0";
+        let mut first = 1_u32.to_be_bytes().to_vec();
+        first.extend_from_slice(&0_u32.to_be_bytes());
+        first.extend_from_slice(symbol);
+        let mut second = 1_u32.to_le_bytes().to_vec();
+        second.extend_from_slice(&0_u32.to_le_bytes());
+        second.extend_from_slice(&1_u32.to_le_bytes());
+        second.extend_from_slice(&1_u16.to_le_bytes());
+        second.extend_from_slice(symbol);
+        let names = b"long_runtime_member_name.obj\0";
+        let offset = AR_MAGIC.len()
+            + member("/", &first).len()
+            + member("/", &second).len()
+            + member("//", names).len();
+        first[4..8].copy_from_slice(&u32::try_from(offset).unwrap().to_be_bytes());
+        second[4..8].copy_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+        raw_archive(&[("/", &first), ("/", &second), ("//", names), ("/0", object)])
+    }
+
+    #[test]
+    fn closed_windows_runtime_archives_accept_embedded_code_data_and_imports() {
+        // Ordinary import-descriptor objects have .idata contributions,
+        // relocations, a symbol table and its trailing string table.
+        let mut descriptor = runtime_coff_object(b".idata$2", &[0; 20]);
+        descriptor[44..48].copy_from_slice(&80_u32.to_le_bytes());
+        descriptor[52..54].copy_from_slice(&1_u16.to_le_bytes());
+        descriptor[56..60].copy_from_slice(&0x4000_0040_u32.to_le_bytes());
+        let mut relocation = [0; 10];
+        relocation[8..10].copy_from_slice(&3_u16.to_le_bytes());
+        descriptor.extend_from_slice(&relocation);
+        descriptor[8..12].copy_from_slice(&90_u32.to_le_bytes());
+        descriptor[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        let mut symbol = [0; 18];
+        symbol[..8].copy_from_slice(b"runtime\0");
+        symbol[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        symbol[16] = 2;
+        descriptor.extend_from_slice(&symbol);
+        descriptor.extend_from_slice(&4_u32.to_le_bytes());
+        for object in [
+            runtime_coff_object(b".text", b"code"),
+            runtime_coff_object(b".data", b"data"),
+            runtime_coff_object(b".data", b".drectve /DEFAULTLIB:helper.lib"),
+            runtime_coff_object(b".long_data_section", b"data"),
+            runtime_short_import(),
+            descriptor,
+        ] {
+            assert!(
+                validate_closed_windows_runtime_archive(&indexed_runtime_archive(&object))
+                    .is_some()
+            );
+        }
+        for machine in [0x014c_u16, 0x8664, 0x01c4, 0xaa64] {
+            let mut object = runtime_coff_object(b".text", b"code");
+            object[..2].copy_from_slice(&machine.to_le_bytes());
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("code.obj/", &object)]))
+                    .is_some()
+            );
+            let mut import = runtime_short_import();
+            import[6..8].copy_from_slice(&machine.to_le_bytes());
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("import.obj/", &import)]))
+                    .is_some()
+            );
+        }
+        for flags in [0_u16, 1, 2, 4, 8, 12, 14] {
+            let mut import = runtime_short_import();
+            import[18..20].copy_from_slice(&flags.to_le_bytes());
+            assert!(
+                validate_closed_windows_runtime_archive(&indexed_runtime_archive(&import))
+                    .is_some(),
+                "supported import type/name flags {flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_member_padding_accepts_coff_and_gnu_bytes() {
+        let first = runtime_coff_object(b".text", b"x");
+        let second = runtime_coff_object(b".data", b"yz");
+        assert_eq!(first.len(), 61);
+        assert_eq!(second.len(), 62);
+        // A 16-byte symbol table puts these member headers at 84 and 206.
+        // Both index offsets must still select their checked COFF member.
+        let mut index = 2_u32.to_be_bytes().to_vec();
+        index.extend_from_slice(&84_u32.to_be_bytes());
+        index.extend_from_slice(&206_u32.to_be_bytes());
+        index.extend_from_slice(b"a\0b\0");
+        let archive = raw_archive(&[
+            ("/", &index),
+            ("first.obj/", &first),
+            ("second.obj/", &second),
+        ]);
+        assert_eq!(archive.len(), 328);
+        assert_eq!(archive[205], b'\n');
+        assert_eq!(&archive[206..222], b"second.obj/     ");
+        for padding in [0, b'\n'] {
+            let mut valid = archive.clone();
+            valid[205] = padding;
+            assert!(
+                validate_closed_windows_runtime_archive(&valid).is_some(),
+                "supported member padding {padding}"
+            );
+            valid.push(padding);
+            assert!(validate_closed_windows_runtime_archive(&valid).is_none());
+        }
+        for padding in [b'x', 0xff] {
+            let mut bad = archive.clone();
+            bad[205] = padding;
+            assert!(
+                validate_closed_windows_runtime_archive(&bad).is_none(),
+                "unsupported member padding {padding}"
+            );
+        }
+        let mut missing_between_members = archive;
+        missing_between_members.remove(205);
+        assert!(validate_closed_windows_runtime_archive(&missing_between_members).is_none());
+        let mut missing_at_end = raw_archive(&[("first.obj/", &first)]);
+        assert_eq!(missing_at_end.pop(), Some(b'\n'));
+        assert!(validate_closed_windows_runtime_archive(&missing_at_end).is_none());
+    }
+
+    #[test]
+    fn closed_windows_runtime_bss_has_no_raw_file_extent() {
+        let mut bss = runtime_coff_object(b".bss", &[]);
+        bss[36..40].copy_from_slice(&16_u32.to_le_bytes());
+        bss[40..44].copy_from_slice(&0_u32.to_le_bytes());
+        bss[56..60].copy_from_slice(&0x80_u32.to_le_bytes());
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("zero.obj/", &bss)])).is_some(),
+            "BSS reserves memory without storing those bytes in the object"
+        );
+        let mut initialized = bss;
+        initialized[20..28].copy_from_slice(b".data\0\0\0");
+        initialized[56..60].copy_from_slice(&0x40_u32.to_le_bytes());
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("data.obj/", &initialized)]))
+                .is_none(),
+            "initialized data cannot point at file offset zero"
+        );
+    }
+
+    #[test]
+    fn closed_windows_runtime_indexes_check_every_member_offset() {
+        let first_object = runtime_short_import();
+        let mut second_object = runtime_short_import();
+        second_object[20..34].copy_from_slice(b"second_symbol_");
+        let names = b"runtime_symbol\0second_symbol_\0";
+        let mut first = 2_u32.to_be_bytes().to_vec();
+        first.extend_from_slice(&[0; 8]);
+        first.extend_from_slice(names);
+        first.extend_from_slice(&[0; 2]);
+        let mut second = 2_u32.to_le_bytes().to_vec();
+        second.extend_from_slice(&[0; 8]);
+        second.extend_from_slice(&2_u32.to_le_bytes());
+        second.extend_from_slice(&1_u16.to_le_bytes());
+        second.extend_from_slice(&2_u16.to_le_bytes());
+        second.extend_from_slice(names);
+        second.extend_from_slice(&[0; 2]);
+        let first_header = AR_MAGIC.len() + member("/", &first).len() + member("/", &second).len();
+        let second_header = first_header + member("first.obj/", &first_object).len();
+        for (index, offset) in [first_header, second_header].into_iter().enumerate() {
+            let offset = u32::try_from(offset).unwrap();
+            first[4 + index * 4..8 + index * 4].copy_from_slice(&offset.to_be_bytes());
+            second[4 + index * 4..8 + index * 4].copy_from_slice(&offset.to_le_bytes());
+        }
+        let valid = raw_archive(&[
+            ("/", &first),
+            ("/", &second),
+            ("first.obj/", &first_object),
+            ("second.obj/", &second_object),
+        ]);
+        assert!(validate_closed_windows_runtime_archive(&valid).is_some());
+        let first_data = AR_MAGIC.len() + AR_HEADER_LEN;
+        let second_data = AR_MAGIC.len() + member("/", &first).len() + AR_HEADER_LEN;
+        let inside_object = u32::try_from(first_header + AR_HEADER_LEN).unwrap();
+        for (slot, wrong) in [
+            (first_data + 8, inside_object.to_be_bytes()),
+            (second_data + 8, inside_object.to_le_bytes()),
+        ] {
+            let mut bad_second = valid.clone();
+            bad_second[slot..slot + 4].copy_from_slice(&wrong);
+            assert!(
+                validate_closed_windows_runtime_archive(&bad_second).is_none(),
+                "each index must reject its second offset into a member body"
+            );
+        }
+        // Two members, then the symbol count, place the two u16 references
+        // at offsets 16 and 18 in the second linker's payload.
+        for member in [0_u16, 3] {
+            let mut bad_second_symbol = valid.clone();
+            let slot = second_data + 18;
+            bad_second_symbol[slot..slot + 2].copy_from_slice(&member.to_le_bytes());
+            assert!(
+                validate_closed_windows_runtime_archive(&bad_second_symbol).is_none(),
+                "the second symbol's member index {member} is outside 1..=2"
+            );
+        }
+        for (data, len) in [(first_data, first.len()), (second_data, second.len())] {
+            let mut trailing_junk = valid.clone();
+            trailing_junk[data + len - 2..data + len].copy_from_slice(b"xy");
+            assert!(
+                validate_closed_windows_runtime_archive(&trailing_junk).is_none(),
+                "index-name padding must contain only NUL bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_names_end_at_the_first_record_terminator() {
+        assert_eq!(
+            runtime_archive_name(b"member.obj\0rest"),
+            Some("member.obj")
+        );
+        assert_eq!(
+            runtime_archive_name(b"member.obj/\nrest"),
+            Some("member.obj")
+        );
+        for bytes in [
+            b"\0".as_slice(),
+            b"/\n",
+            b"member.obj\n",
+            b"unterminated",
+            b"\xff\0",
+        ] {
+            assert!(runtime_archive_name(bytes).is_none(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_longname_tables_require_complete_names_before_padding() {
+        for table in [
+            b"".as_slice(),
+            b"\0\0",
+            b"coff.obj\0\0",
+            b"gnu.obj/\n\0\0",
+            b"first.obj\0second.obj/\n\0",
+        ] {
+            assert!(validate_runtime_longnames(table).is_some(), "{table:?}");
+        }
+        for table in [
+            b"\0later.obj\0".as_slice(),
+            b"first.obj\0\0later.obj\0",
+            b"first.obj\0unterminated",
+            b"first.obj/\ninvalid\n",
+        ] {
+            assert!(validate_runtime_longnames(table).is_none(), "{table:?}");
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_zero_data_symbols_can_follow_section_headers() {
+        // One 20-byte COFF header and one 40-byte section header end at 60.
+        for symbol_count in [0_u32, 1] {
+            let mut object = runtime_coff_object(b".data", &[]);
+            object[8..12].copy_from_slice(&60_u32.to_le_bytes());
+            object[12..16].copy_from_slice(&symbol_count.to_le_bytes());
+            object[40..44].copy_from_slice(&0_u32.to_le_bytes());
+            object[56..60].copy_from_slice(&0x40_u32.to_le_bytes());
+            if symbol_count != 0 {
+                let mut symbol = [0; 18];
+                symbol[..8].copy_from_slice(b"empty\0\0\0");
+                symbol[12..14].copy_from_slice(&1_u16.to_le_bytes());
+                symbol[16] = 2; // External symbol at the start of the empty section.
+                object.extend_from_slice(&symbol);
+            }
+            object.extend_from_slice(&4_u32.to_le_bytes()); // Empty string table.
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("empty.obj/", &object)]))
+                    .is_some(),
+                "a table with {symbol_count} symbols may start immediately after the headers"
+            );
+            object[8..12].copy_from_slice(&59_u32.to_le_bytes());
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &object)]))
+                    .is_none(),
+                "the symbol table must not overlap the section header"
+            );
+        }
+        // The overlapping pointer targets the BSS flags, which form a
+        // complete 128-byte string table in this padded object. Only the
+        // header-overlap check rejects it; no later read is out of bounds.
+        let mut overlap = runtime_coff_object(b".bss", &[]);
+        overlap[8..12].copy_from_slice(&56_u32.to_le_bytes());
+        overlap[36..40].copy_from_slice(&16_u32.to_le_bytes());
+        overlap[40..44].copy_from_slice(&0_u32.to_le_bytes());
+        overlap[56..60].copy_from_slice(&0x80_u32.to_le_bytes());
+        overlap.resize(184, 0);
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &overlap)]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn closed_windows_runtime_longnames_are_unique_before_objects_and_allow_nul_padding() {
+        let object = runtime_coff_object(b".text", b"code");
+        let mut padded = b"long_runtime_member_name.obj\0".to_vec();
+        padded.extend_from_slice(&[0; 4]);
+        let empty_index = 0_u32.to_be_bytes();
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[
+                ("/", &empty_index),
+                ("//", &padded),
+                ("/0", &object),
+            ]))
+            .is_some(),
+            "a long-name table may end with all-NUL librarian padding"
+        );
+        for (case, members) in [
+            (
+                "duplicate long-name table before objects",
+                vec![
+                    ("//", padded.as_slice()),
+                    ("//", padded.as_slice()),
+                    ("/0", object.as_slice()),
+                ],
+            ),
+            (
+                "long-name table after an object",
+                vec![("code.obj/", object.as_slice()), ("//", padded.as_slice())],
+            ),
+            (
+                "unterminated nonzero long-name table",
+                vec![
+                    ("//", b"unterminated".as_slice()),
+                    ("code.obj/", object.as_slice()),
+                ],
+            ),
+            (
+                "index after a long-name table",
+                vec![
+                    ("//", padded.as_slice()),
+                    ("/", empty_index.as_slice()),
+                    ("/0", object.as_slice()),
+                ],
+            ),
+            (
+                "index after an object",
+                vec![
+                    ("code.obj/", object.as_slice()),
+                    ("/", empty_index.as_slice()),
+                ],
+            ),
+        ] {
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&members)).is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_archives_refuse_direct_and_indirect_external_inputs() {
+        for name in [b".drectve".as_slice(), b".debug$T", b".debug$P"] {
+            let direct = runtime_coff_object(name, b"/DEFAULTLIB:helper.lib");
+            assert!(
+                validate_closed_windows_runtime_archive(&indexed_runtime_archive(&direct))
+                    .is_none()
+            );
+            // A valid COFF string table can name the same eight-byte section
+            // indirectly. Keep an unrelated long name to build that layout.
+            let mut indirect = runtime_coff_object(b"long_section_name", b"external");
+            let table = 60 + b"external".len();
+            indirect.truncate(table);
+            indirect.extend_from_slice(&13_u32.to_le_bytes());
+            indirect.extend_from_slice(name);
+            indirect.push(0);
+            assert!(
+                validate_closed_windows_runtime_archive(&indexed_runtime_archive(&indirect))
+                    .is_none()
+            );
+        }
+        let mut thin = indexed_runtime_archive(&runtime_short_import());
+        thin[..8].copy_from_slice(b"!<thin>\n");
+        assert!(validate_closed_windows_runtime_archive(&thin).is_none());
+        for unknown in [
+            b"opaque".as_slice(),
+            b"BC\xc0\xdeLLVM bitcode",
+            b"\0\0\xff\xff\x01\0LTCG object",
+            b"\0\0\xff\xff\x02\0bigobj",
+        ] {
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("unknown.obj/", unknown)]))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_archive_bounds_and_import_versions_fail_closed() {
+        let good = closed_coff_archive_for_tests(b"payload");
+        for end in 0..good.len() {
+            assert!(
+                validate_closed_windows_runtime_archive(&good[..end]).is_none(),
+                "truncation {end}"
+            );
+        }
+        let import = runtime_short_import();
+        for (offset, bytes) in [
+            (4, 1_u16.to_le_bytes().to_vec()),
+            (4, 2_u16.to_le_bytes().to_vec()),
+            (6, 0xffff_u16.to_le_bytes().to_vec()),
+            (12, u32::MAX.to_le_bytes().to_vec()),
+            (18, 3_u16.to_le_bytes().to_vec()),
+            (18, 16_u16.to_le_bytes().to_vec()),
+            (18, 0x8000_u16.to_le_bytes().to_vec()),
+        ] {
+            let mut bad = import.clone();
+            bad[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &bad)]))
+                    .is_none(),
+                "import field {offset}"
+            );
+        }
+        for names in [b"\0ucrtbase.dll\0".as_slice(), b"runtime_symbol\0\0"] {
+            let mut bad = import[..20].to_vec();
+            bad[12..16].copy_from_slice(&u32::try_from(names.len()).unwrap().to_le_bytes());
+            bad.extend_from_slice(names);
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &bad)]))
+                    .is_none(),
+                "short imports require both nonempty names, even with a correct data size"
+            );
+        }
+        let mut bad = import;
+        *bad.last_mut().unwrap() = b'x';
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &bad)])).is_none()
+        );
+        let object = runtime_coff_object(b".text", b"code");
+        for (offset, bytes) in [
+            (0, 0xffff_u16.to_le_bytes().to_vec()),
+            (2, 0_u16.to_le_bytes().to_vec()),
+            (2, u16::MAX.to_le_bytes().to_vec()),
+            (8, u32::MAX.to_le_bytes().to_vec()),
+            (12, 1_u32.to_le_bytes().to_vec()),
+            (16, 1_u16.to_le_bytes().to_vec()),
+            (18, 0x2000_u16.to_le_bytes().to_vec()),
+            (36, u32::MAX.to_le_bytes().to_vec()),
+            (40, 1_u32.to_le_bytes().to_vec()),
+            (44, u32::MAX.to_le_bytes().to_vec()),
+            (52, 1_u16.to_le_bytes().to_vec()),
+            (56, 0x6100_0020_u32.to_le_bytes().to_vec()),
+        ] {
+            let mut bad = object.clone();
+            bad[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            if offset == 44 {
+                bad[52..54].copy_from_slice(&1_u16.to_le_bytes());
+            }
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &bad)]))
+                    .is_none(),
+                "COFF field {offset}"
+            );
+        }
+        let valid = runtime_coff_object(b"long_section_name", b"code");
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("code.obj/", &valid)]))
+                .is_some()
+        );
+        for offset in [b"/0", b"/3"] {
+            let mut bad = valid.clone();
+            bad[20..22].copy_from_slice(offset);
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("bad.obj/", &bad)]))
+                    .is_none(),
+                "a long section name cannot start inside the string-table length field"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_indexes_cannot_hide_unvalidated_members() {
+        let good = indexed_runtime_archive(&runtime_short_import());
+        assert!(validate_closed_windows_runtime_archive(&good).is_some());
+        // Redirect either linker index into member data instead of an actual
+        // validated archive header, even if that byte offset is in bounds.
+        let first_data = AR_MAGIC.len() + AR_HEADER_LEN;
+        let first_size = parse_ar_decimal(&good[AR_MAGIC.len() + 48..AR_MAGIC.len() + 58]).unwrap();
+        let second_header = first_data + first_size + (first_size & 1);
+        let second_data = second_header + AR_HEADER_LEN;
+        for symbol_start in [first_data + 8, second_data + 14] {
+            let mut empty_symbol = good.clone();
+            empty_symbol[symbol_start] = 0;
+            assert!(validate_closed_windows_runtime_archive(&empty_symbol).is_none());
+        }
+        let mut unterminated_symbol = good.clone();
+        unterminated_symbol[first_data + first_size - 1] = b'x';
+        assert!(validate_closed_windows_runtime_archive(&unterminated_symbol).is_none());
+        for (offset, wrong) in [
+            (first_data + 4, 9_u32.to_be_bytes()),
+            (second_data + 4, 9_u32.to_le_bytes()),
+        ] {
+            let mut bad = good.clone();
+            bad[offset..offset + 4].copy_from_slice(&wrong);
+            assert!(validate_closed_windows_runtime_archive(&bad).is_none());
+        }
+        for member in [0_u16, 2] {
+            let mut bad_index = good.clone();
+            bad_index[second_data + 12..second_data + 14].copy_from_slice(&member.to_le_bytes());
+            assert!(
+                validate_closed_windows_runtime_archive(&bad_index).is_none(),
+                "the fixture has one member, so index {member} is outside 1..=1"
+            );
+        }
+        for (names, reference) in [
+            (b"member.obj\0".as_slice(), "/1"),
+            (b"unterminated".as_slice(), "/0"),
+            (b"member.obj\0".as_slice(), "/999"),
+            (b"\0\0".as_slice(), "/0"),
+        ] {
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[
+                    ("//", names),
+                    (reference, &runtime_short_import())
+                ]))
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_archives_refuse_unmodeled_index_and_name_formats() {
+        let object = runtime_coff_object(b".text", b"code");
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("code.obj/", &object)]))
+                .is_some()
+        );
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[("__.SYMDEF", &object)]))
+                .is_none(),
+            "a raw BSD index name must not be treated as an ordinary COFF member"
+        );
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[
+                ("/SYM64/", &[0; 8]),
+                ("code.obj/", &object),
+            ]))
+            .is_none()
+        );
+        assert!(
+            validate_closed_windows_runtime_archive(&bsd_archive(&[(
+                "long_runtime_member_name.obj",
+                32,
+                &object
+            ),]))
+            .is_none()
+        );
+        for name in [
+            "__.SYMDEF",
+            "__.SYMDEF SORTED",
+            "__.SYMDEF_64",
+            "__.SYMDEF_64 SORTED",
+        ] {
+            assert!(
+                validate_closed_windows_runtime_archive(&bsd_archive(&[
+                    (name, 24, &[0; 8]),
+                    ("code.obj", 12, &object),
+                ]))
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn closed_windows_runtime_name_limits_bound_each_reference_lookup() {
+        let object = runtime_coff_object(b".text", b"code");
+        let expected = "n".repeat(256);
+        for terminator in [b"\0".as_slice(), b"/\n"] {
+            let mut at_limit = vec![b'n'; 256];
+            at_limit.extend_from_slice(terminator);
+            assert_eq!(runtime_archive_name(&at_limit), Some(expected.as_str()));
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[
+                    ("//", &at_limit),
+                    ("/0", &object),
+                    ("/0", &object),
+                ]))
+                .is_some(),
+                "both NUL and GNU names admit exactly 256 logical bytes"
+            );
+            let mut too_long = vec![b'n'; 257];
+            too_long.extend_from_slice(terminator);
+            assert!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[
+                    ("//", &too_long),
+                    ("/0", &object),
+                ]))
+                .is_none()
+            );
+        }
+        let mut utf8_name = "n".repeat(254);
+        utf8_name.push('é');
+        assert_eq!(utf8_name.len(), 256);
+        let mut utf8_gnu = utf8_name.as_bytes().to_vec();
+        utf8_gnu.extend_from_slice(b"/\n");
+        assert_eq!(runtime_archive_name(&utf8_gnu), Some(utf8_name.as_str()));
+        assert!(
+            validate_closed_windows_runtime_archive(&raw_archive(&[
+                ("//", &utf8_gnu),
+                ("/0", &object),
+            ]))
+            .is_some()
+        );
+        for (length, accepted) in [(256, true), (257, false), (4096, false)] {
+            let name = vec![b's'; length];
+            let object = runtime_coff_object(&name, b"code");
+            assert_eq!(
+                validate_closed_windows_runtime_archive(&raw_archive(&[("code.obj/", &object)]))
+                    .is_some(),
+                accepted,
+                "indirect COFF section name length {length}"
+            );
+        }
+        let mut large_names = vec![b'a'; 4096];
+        large_names.push(0);
+        let second = large_names.len();
+        large_names.extend(std::iter::repeat_n(b'b', 4096));
+        large_names.push(0);
+        for offset in [0, second, 0, second] {
+            assert!(runtime_longname(&large_names, &offset.to_string()).is_none());
+        }
+        assert!(validate_runtime_longnames(&large_names).is_none());
     }
 
     fn elf_object_with_section_type(

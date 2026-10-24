@@ -24,6 +24,14 @@
 //! validated bytes. Objects, archives, explicit manifest inputs and other
 //! file-carrying options stay refused; their further inputs or side outputs
 //! are not modeled.
+//!
+//! `NODEFAULTLIB` excludes libraries rather than introducing file inputs.
+//! `DEFAULTLIB` is admitted only for the modeled CRT/vcruntime/UCRT names,
+//! using their selected runtime hashes rather than rustc's `-l` lookup.
+//! Explicit requests also require a closed embedded COFF archive: directive
+//! and CodeView type sections, thin members and unsupported formats bypass.
+//! Invalid runtime candidates (non-files, metadata errors other than absence,
+//! or unreadable selected files) fail closed instead of falling back.
 
 use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result, bail};
@@ -833,6 +841,27 @@ pub(crate) struct WindowsMsvcIdentity {
 }
 
 impl WindowsMsvcIdentity {
+    /// Keys explicit default libraries using the runtime's LINK search results.
+    ///
+    /// `default:index:name` entries record request presence and order even though
+    /// the runtime map already contains the selected bytes for each name.
+    /// Missing libraries fail closed even when NODEFAULTLIB might suppress them.
+    pub(crate) fn with_default_libraries(
+        mut self,
+        libraries: &[WindowsDefaultLibrary],
+    ) -> Result<Self> {
+        for (index, WindowsDefaultLibrary(name)) in libraries.iter().enumerate() {
+            let digest = self
+                .libraries
+                .get(*name)
+                .with_context(|| format!("DEFAULTLIB:{name} has no selected runtime library"))?
+                .clone();
+            self.libraries
+                .insert(format!("default:{index}:{name}"), digest);
+        }
+        Ok(self)
+    }
+
     /// Stable, sorted representation suitable for a length-prefixed key field.
     pub(crate) fn encode(&self) -> String {
         let mut fields = vec![
@@ -866,6 +895,8 @@ pub(crate) struct WindowsProbeEnvironment {
     pub(crate) variables: BTreeMap<String, String>,
     pub(crate) path: Vec<PathBuf>,
     pub(crate) cwd: Option<PathBuf>,
+    /// Only explicit DEFAULTLIB requests opt into closed-container validation.
+    pub(crate) requested_default_libraries: Vec<WindowsDefaultLibrary>,
     /// The tool directories of rustc's sysroots (see [`rustc_tool_dir`]).
     /// rustc puts them before `PATH` for the linker it runs, so a linker
     /// named without a directory is looked up there first.
@@ -1201,11 +1232,25 @@ pub(crate) fn is_windows_msvc_target(target: &str) -> bool {
 /// and `@response` files are refused earlier by the generic side-file check.
 /// Libraries requested through `-l` never reach this function; they are
 /// resolved and hashed by [`hash_windows_selected_libraries`].
+/// `NODEFAULTLIB` names exclusions, not input files. Single DEFAULTLIB options
+/// for modeled CRT names are parsed by [`windows_link_argument_input_files`]
+/// before this conservative file-input check;
+/// [`WindowsMsvcIdentity::with_default_libraries`] requires their selected hashes.
 pub(crate) fn windows_link_argument_has_unmodeled_input(value: &str) -> bool {
     value
         .split([',', ' ', '\t', '\n', '\r'])
         .map(|token| token.trim_matches('"'))
-        .any(|token| link_token_names_input_file(token) || windows_link_token_is_file_option(token))
+        .any(|token| {
+            if let Some(option) = token.strip_prefix(['/', '-']) {
+                let name = option
+                    .split_once([':', '='])
+                    .map_or(option, |(name, _)| name);
+                if name.eq_ignore_ascii_case("NODEFAULTLIB") {
+                    return false;
+                }
+            }
+            link_token_names_input_file(token) || windows_link_token_is_file_option(token)
+        })
 }
 
 /// A bare or option-value token whose extension marks a linker input file.
@@ -1261,6 +1306,15 @@ fn manifest_value_writes_no_side_file(value: Option<&str>) -> bool {
     })
 }
 
+/// Holds modeled inputs in Windows linker argument order.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowsLinkArgumentInputs {
+    pub files: Vec<PathBuf>,
+    pub default_libraries: Vec<WindowsDefaultLibrary>,
+}
+
+/// Parses modeled inputs carried by one link-arg or link-args value.
+///
 /// Absolute compiled-resource files carried by one link-arg or
 /// whitespace-split link-args value. Their binary format is checked by the
 /// hasher. Objects and archives can name further inputs; XML manifests need
@@ -1269,21 +1323,29 @@ fn manifest_value_writes_no_side_file(value: Option<&str>) -> bool {
 /// A bare token is a possible input even without a recognized extension.
 /// Embedded quotes, relative paths and C-driver spellings stay outside this
 /// parser's accepted subset. Plain LINK options retain the existing guards.
-pub(crate) fn windows_link_argument_input_files(key: &str, value: &str) -> Option<Vec<PathBuf>> {
+/// DEFAULTLIB requests are limited to modeled CRT names and retain their order.
+pub(crate) fn windows_link_argument_input_files(
+    key: &str,
+    value: &str,
+) -> Option<WindowsLinkArgumentInputs> {
     let arguments: Vec<&str> = if key == "link-args" {
         value.split_whitespace().collect()
     } else {
         vec![value]
     };
-    let mut files = Vec::new();
+    let mut inputs = WindowsLinkArgumentInputs::default();
     for argument in arguments {
-        if windows_link_argument_has_unmodeled_input(argument) {
-            files.push(windows_link_argument_input_file(argument)?);
+        if let Some(library) = WindowsDefaultLibrary::parse(argument) {
+            inputs.default_libraries.push(library);
+        } else if windows_link_argument_has_unmodeled_input(argument) {
+            inputs
+                .files
+                .push(windows_link_argument_input_file(argument)?);
         } else if !argument.starts_with(['/', '-']) {
             return None;
         }
     }
-    Some(files)
+    Some(inputs)
 }
 
 fn windows_link_argument_input_file(argument: &str) -> Option<PathBuf> {
@@ -2219,6 +2281,42 @@ where
     Ok(selected)
 }
 
+const MSVC_RUNTIME: &[&str] = &["libcmt.lib", "libcmtd.lib", "msvcrt.lib", "msvcrtd.lib"];
+const VCRUNTIME: &[&str] = &[
+    "vcruntime.lib",
+    "vcruntimed.lib",
+    "libvcruntime.lib",
+    "libvcruntimed.lib",
+];
+const UCRT: &[&str] = &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"];
+
+/// An explicit default library covered by the runtime dependency model.
+///
+/// Arbitrary archives are excluded: hashing their bytes does not model further
+/// inputs introduced by COFF directives. Paths and quoted or compound arguments
+/// are excluded rather than borrowing Rust's different `-l` resolution rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowsDefaultLibrary(&'static str);
+
+impl WindowsDefaultLibrary {
+    /// Parses a single LINK default-library option for an already modeled runtime.
+    pub(crate) fn parse(argument: &str) -> Option<Self> {
+        let (option, name) = argument.strip_prefix(['/', '-'])?.split_once(':')?;
+        if !option.eq_ignore_ascii_case("DEFAULTLIB") {
+            return None;
+        }
+        MSVC_RUNTIME
+            .iter()
+            .chain(VCRUNTIME)
+            .chain(UCRT)
+            .find_map(|candidate| {
+                (name.eq_ignore_ascii_case(candidate)
+                    || name.eq_ignore_ascii_case(candidate.strip_suffix(".lib")?))
+                .then_some(Self(candidate))
+            })
+    }
+}
+
 fn hash_windows_runtime_libraries(
     environment: &WindowsProbeEnvironment,
     architecture: &str,
@@ -2242,22 +2340,14 @@ fn hash_windows_runtime_libraries(
     // copy further along is never read, so it does not enter the key. A
     // host with two toolsets, such as Firefox's mozbuild toolchain on LIB
     // beside the machine's Visual Studio, has several copies that differ.
-    const MSVC_RUNTIME: &[&str] = &["libcmt.lib", "libcmtd.lib", "msvcrt.lib", "msvcrtd.lib"];
-    const VCRUNTIME: &[&str] = &[
-        "vcruntime.lib",
-        "vcruntimed.lib",
-        "libvcruntime.lib",
-        "libvcruntimed.lib",
-    ];
-    const UCRT: &[&str] = &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"];
     let mut libraries = BTreeMap::new();
     for name in MSVC_RUNTIME.iter().chain(VCRUNTIME).chain(UCRT) {
-        let found = directories
-            .iter()
-            .map(|directory| directory.join(name))
-            .find(|path| path.is_file());
+        let found = first_windows_library(&directories, &[(*name).to_string()])?;
         if let Some(path) = found {
-            let digest = hash_file(&path)
+            let requested = environment
+                .requested_default_libraries
+                .contains(&WindowsDefaultLibrary(name));
+            let digest = hash_windows_runtime_library(&path, requested)
                 .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
             libraries.insert((*name).to_string(), digest);
         }
@@ -2273,6 +2363,34 @@ fn hash_windows_runtime_libraries(
         bail!("no selected UCRT library was found in LIB");
     }
     Ok(libraries)
+}
+
+// Closed-runtime validation needs member contents. Cap its owned buffer; other
+// runtime hashes retain the existing streaming path and its digest format.
+const MAX_WINDOWS_DEFAULTLIB_BYTES: usize = 64 << 20;
+
+fn hash_windows_runtime_library(path: &Path, requested: bool) -> Result<String> {
+    if !requested {
+        return hash_file(path);
+    }
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening explicit DEFAULTLIB {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_WINDOWS_DEFAULTLIB_BYTES as u64 {
+        bail!("explicit DEFAULTLIB is not a regular file of at most 64 MiB");
+    }
+    let mut bytes = vec![0; usize::try_from(metadata.len())?];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("reading explicit DEFAULTLIB {}", path.display()))?;
+    if file.read(&mut [0_u8; 1])? != 0 {
+        bail!("explicit DEFAULTLIB changed size while being read");
+    }
+    if crate::native_archive::validate_closed_windows_runtime_archive(&bytes).is_none() {
+        bail!("explicit DEFAULTLIB is not a supported closed COFF archive");
+    }
+    // Validation and hashing consume this same read, never a reopened path.
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 /// Discover a Windows MSVC identity while honoring rustc/linker search paths
@@ -2299,6 +2417,7 @@ where
         rustc_library_dirs,
         linker_library_dirs,
         link_libraries,
+        &[],
         hash_library,
         &InvocationEnv::capture(),
     )
@@ -2311,6 +2430,7 @@ pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
     rustc_library_dirs: &[PathBuf],
     linker_library_dirs: &[PathBuf],
     link_libraries: &[String],
+    requested_default_libraries: &[WindowsDefaultLibrary],
     hash_library: HashLibrary,
     env: &InvocationEnv,
 ) -> Result<WindowsMsvcIdentity>
@@ -2333,6 +2453,7 @@ where
         .context("capturing Windows MSVC environment")?;
     environment.root_invocation_paths(env)?;
     environment.rustc_tool_dirs = rustc_tool_dirs.to_vec();
+    environment.requested_default_libraries = requested_default_libraries.to_vec();
     environment.augment_from_installed_msvc(target_architecture, env)?;
     environment.root_invocation_paths(env)?;
     let mut identity = probe_windows_msvc_identity_with(
@@ -3005,6 +3126,7 @@ esac
             let identity = probe_windows_msvc_identity_with_library_dirs_for(
                 None,
                 "x64",
+                &[],
                 &[],
                 &[],
                 &[],
@@ -4265,6 +4387,146 @@ esac
     }
 
     #[test]
+    fn windows_runtime_libraries_reject_non_file_candidates_before_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let lib = root.path().join("lib");
+        for directory in [&cwd, &lib] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for name in ["msvcrt.lib", "vcruntime.lib", "ucrt.lib"] {
+            std::fs::write(lib.join(name), name).unwrap();
+        }
+        let environment = WindowsProbeEnvironment {
+            variables: BTreeMap::from([("LIB".into(), lib.to_string_lossy().into_owned())]),
+            cwd: Some(cwd.clone()),
+            ..WindowsProbeEnvironment::default()
+        };
+        assert!(hash_windows_runtime_libraries(&environment, "x64", "10", "10", &[]).is_ok());
+        std::fs::create_dir(cwd.join("ucrt.lib")).unwrap();
+        assert!(hash_windows_runtime_libraries(&environment, "x64", "10", "10", &[]).is_err());
+    }
+
+    #[test]
+    fn windows_defaultlib_runtime_hashes_validate_the_selected_bytes_only() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let lib = root.path().join("lib");
+        for directory in [&cwd, &lib] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for name in ["msvcrt.lib", "vcruntime.lib"] {
+            std::fs::write(lib.join(name), name).unwrap();
+        }
+        let valid = crate::native_archive::closed_coff_archive_for_tests(b"first");
+        std::fs::write(lib.join("ucrt.lib"), &valid).unwrap();
+        let mut environment = WindowsProbeEnvironment {
+            variables: BTreeMap::from([("LIB".into(), lib.to_string_lossy().into_owned())]),
+            cwd: Some(cwd.clone()),
+            requested_default_libraries: vec![
+                WindowsDefaultLibrary::parse("/DEFAULTLIB:ucrt").unwrap(),
+            ],
+            ..WindowsProbeEnvironment::default()
+        };
+        let hash = |environment: &WindowsProbeEnvironment| {
+            hash_windows_runtime_libraries(environment, "x64", "10", "10", &[])
+        };
+        let first = hash(&environment).unwrap();
+        assert_eq!(first["ucrt.lib"], hash_file(&lib.join("ucrt.lib")).unwrap());
+        let changed = crate::native_archive::closed_coff_archive_for_tests(b"changed");
+        std::fs::write(lib.join("ucrt.lib"), &changed).unwrap();
+        assert_ne!(hash(&environment).unwrap()["ucrt.lib"], first["ucrt.lib"]);
+
+        std::fs::write(cwd.join("ucrt.lib"), &valid).unwrap();
+        let selected = hash(&environment).unwrap();
+        std::fs::write(lib.join("ucrt.lib"), b"invalid but shadowed").unwrap();
+        assert_eq!(hash(&environment).unwrap(), selected);
+        std::fs::write(lib.join("ucrt.lib"), &valid).unwrap();
+        for invalid in [
+            b"!<thin>\nexternal.obj".to_vec(),
+            b"unknown container".to_vec(),
+            crate::native_archive::coff_archive_with_section_for_tests(
+                b".drectve",
+                b"/DEFAULTLIB:helper.lib",
+            ),
+            crate::native_archive::coff_archive_with_section_for_tests(
+                b".debug$T",
+                b"external PDB",
+            ),
+            crate::native_archive::coff_archive_with_section_for_tests(
+                b".debug$P",
+                b"external PCH",
+            ),
+        ] {
+            std::fs::write(cwd.join("ucrt.lib"), &invalid).unwrap();
+            assert!(
+                hash(&environment).is_err(),
+                "a later valid copy must not rescue the selected input"
+            );
+            environment.requested_default_libraries.clear();
+            assert_eq!(
+                hash(&environment).unwrap()["ucrt.lib"],
+                blake3::hash(&invalid).to_hex().to_string(),
+                "unrequested runtimes keep their existing raw digest/policy"
+            );
+            environment
+                .requested_default_libraries
+                .push(WindowsDefaultLibrary::parse("/DEFAULTLIB:ucrt").unwrap());
+        }
+    }
+
+    #[test]
+    fn windows_defaultlib_runtime_reads_reject_oversized_and_non_file_inputs() {
+        assert_eq!(MAX_WINDOWS_DEFAULTLIB_BYTES, 67_108_864);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ucrt.lib");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(67_108_865).unwrap(); // One byte above the independent 64 MiB limit.
+        drop(file);
+        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        assert!(error.to_string().contains("at most 64 MiB"), "{error:#}");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(67_108_864)
+            .unwrap();
+        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        assert!(
+            error.to_string().contains("supported closed COFF archive"),
+            "an exactly 64 MiB regular file reaches format validation: {error:#}"
+        );
+        assert!(hash_windows_runtime_library(root.path(), true).is_err());
+    }
+
+    #[test]
+    fn windows_defaultlib_names_cover_each_modeled_runtime_family() {
+        for name in [
+            "libcmt",
+            "libcmtd",
+            "msvcrt",
+            "msvcrtd",
+            "vcruntime",
+            "vcruntimed",
+            "libvcruntime",
+            "libvcruntimed",
+            "ucrt",
+            "ucrtd",
+            "libucrt",
+            "libucrtd",
+        ] {
+            let plain = WindowsDefaultLibrary::parse(&format!("/DEFAULTLIB:{name}")).unwrap();
+            let suffixed = WindowsDefaultLibrary::parse(&format!(
+                "-defaultlib:{}.LIB",
+                name.to_ascii_uppercase()
+            ))
+            .unwrap();
+            assert_eq!(plain, suffixed);
+            assert_eq!(plain.0, format!("{name}.lib"));
+        }
+    }
+
+    #[test]
     fn windows_runtime_libraries_require_each_family_and_take_the_first_copy() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
@@ -5195,7 +5457,6 @@ esac
             "-Wl,app.res",
             "/DEBUG app.res",
             "/OPT:REF\tapp.res",
-            "/NODEFAULTLIB:libcmt.lib",
         ] {
             assert!(
                 windows_link_argument_has_unmodeled_input(argument),
@@ -5284,7 +5545,10 @@ esac
         ] {
             assert_eq!(
                 windows_link_argument_input_files(key, value),
-                Some(expected.into_iter().map(PathBuf::from).collect()),
+                Some(WindowsLinkArgumentInputs {
+                    files: expected.into_iter().map(PathBuf::from).collect(),
+                    default_libraries: Vec::new(),
+                }),
                 "{key}={value}"
             );
         }
@@ -5366,6 +5630,38 @@ esac
         ] {
             assert!(
                 !windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_nodefaultlib_exclusions_do_not_name_input_files() {
+        for argument in [
+            "/NODEFAULTLIB:libc++.lib",
+            "/NODEFAULTLIB:libucrt.lib",
+            "/NODEFAULTLIB:libcmt.lib",
+            "-nodefaultlib:LIBCMT.LIB",
+            "/NoDefaultLib=libcmt.lib",
+        ] {
+            assert_eq!(
+                windows_link_argument_input_files("link-arg", argument),
+                Some(WindowsLinkArgumentInputs::default()),
+                "{argument}"
+            );
+            assert!(
+                windows_link_argument_has_unmodeled_input(&format!("{argument} helper.lib")),
+                "{argument}"
+            );
+        }
+        for argument in [
+            "NODEFAULTLIB:helper.lib",
+            "/NODEFAULTLIBRARY:helper.lib",
+            "/DEFAULTLIB:helper.lib",
+        ] {
+            assert_eq!(
+                windows_link_argument_input_files("link-arg", argument),
+                None,
                 "{argument}"
             );
         }

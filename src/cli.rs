@@ -21,6 +21,7 @@ mod doctor_probe;
 mod doctor_storage;
 pub mod login;
 mod miss_diagnosis;
+mod sync_scope;
 use miss_diagnosis::{Cause, MissDiagnosis};
 
 // ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
@@ -8861,16 +8862,7 @@ pub fn sync(
     let sync_lock_path = config.cache_dir.join("sync.lock");
     let _sync_lock = StoreLock::acquire(&sync_lock_path).context("locking cache sync")?;
     let store = Store::open(config)?;
-    let workspace_crates = workspace_filter(manifest_path);
-
-    // For the default filtered pull: parse Cargo.lock for every dependency crate
-    // name. Skipped under --workspace, which scopes the pull to workspace members
-    // only (the deps are expected to be provided some other way).
-    let lock_crates = if !pull_all && !pull_workspace && !push_only {
-        parse_cargo_lock_crate_names()
-    } else {
-        None
-    };
+    let scope = sync_scope::resolve(manifest_path, !pull_all && !pull_workspace && !push_only)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -8881,12 +8873,12 @@ pub fn sync(
         config,
         &store,
         remote,
-        workspace_crates.as_ref(),
+        scope.workspace.as_ref(),
         pull_only,
         push_only,
         dry_run,
         pull_all,
-        lock_crates.as_ref(),
+        scope.pull.as_ref(),
         pull_workspace,
         allow_partial,
     ))
@@ -9652,100 +9644,6 @@ async fn upload_shards(
 
 /// Build a workspace crate name filter from Cargo.toml metadata.
 /// Returns None if no manifest is found (= no filtering, include everything).
-fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::HashSet<String>> {
-    manifest_path
-        .map(|mp| match get_workspace_crate_names(mp) {
-            Ok(names) => names.into_iter().collect(),
-            Err(e) => {
-                eprintln!("warning: cargo metadata failed for {mp}: {e}");
-                std::collections::HashSet::new()
-            }
-        })
-        .or_else(|| {
-            if std::path::Path::new("Cargo.toml").exists() {
-                match get_workspace_crate_names("Cargo.toml") {
-                    Ok(names) => Some(names.into_iter().collect()),
-                    Err(e) => {
-                        eprintln!("warning: cargo metadata failed: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        })
-}
-
-/// Parse `cargo metadata` to get workspace package names.
-fn get_workspace_crate_names(manifest_path: &str) -> Result<Vec<String>> {
-    let output = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .arg("--manifest-path")
-        .arg(manifest_path)
-        .output()
-        .context("running cargo metadata")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
-
-    Ok(workspace_crate_names(&metadata))
-}
-
-/// Events use compiler crate names, including explicitly named Cargo targets.
-fn workspace_crate_names(metadata: &serde_json::Value) -> Vec<String> {
-    metadata
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|package| {
-            package
-                .get("targets")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|target| target.get("name").and_then(serde_json::Value::as_str))
-        .map(|name| name.replace('-', "_"))
-        .collect()
-}
-
-#[cfg(test)]
-#[test]
-fn workspace_sync_matches_hyphenated_and_custom_compiler_target_names() {
-    let metadata = serde_json::json!({"packages": [
-        {"name":"package-label", "targets":[
-            {"name":"warm-dep"}, {"name":"custom_library"}, {"name":"tool-app"},
-            {}, {"name":1}
-        ]},
-        {"name":"no-targets"}
-    ]});
-    assert_eq!(
-        workspace_crate_names(&metadata),
-        ["warm_dep", "custom_library", "tool_app"]
-    );
-    for malformed in [
-        serde_json::json!({}),
-        serde_json::json!({"packages":null}),
-        serde_json::json!({"packages":[{"targets":null}]}),
-    ] {
-        assert!(workspace_crate_names(&malformed).is_empty());
-    }
-}
-
-/// Parse Cargo.lock to extract all crate names (direct + transitive dependencies).
-/// Returns None if no Cargo.lock is found in the current directory.
-fn parse_cargo_lock_crate_names() -> Option<std::collections::HashSet<String>> {
-    parse_cargo_lock_crate_names_from(std::path::Path::new("Cargo.lock"))
-}
-
 fn parse_cargo_lock_crate_names_from(
     lock_path: &std::path::Path,
 ) -> Option<std::collections::HashSet<String>> {

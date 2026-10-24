@@ -2787,13 +2787,6 @@ fn test_compute_project_stats_classifies_remaining_buckets() {
 }
 
 #[test]
-fn test_parse_cargo_lock_crate_names_nonexistent() {
-    // When Cargo.lock doesn't exist in cwd, should return None
-    // We can't guarantee cwd lacks Cargo.lock, so just test the function doesn't panic
-    let _ = parse_cargo_lock_crate_names();
-}
-
-#[test]
 fn test_parse_cargo_lock_crate_names_from_valid_missing_and_bad_files() {
     // Cargo.lock parser -> valid names, missing file, and malformed TOML.
     let dir = tempfile::tempdir().unwrap();
@@ -3424,9 +3417,12 @@ fn test_get_workspace_crate_names_lists_members() {
         std::fs::write(root.join(m).join("src/lib.rs"), "").unwrap();
     }
 
-    let names = get_workspace_crate_names(root.join("Cargo.toml").to_str().unwrap()).unwrap();
-    assert!(names.contains(&"a".to_string()), "got {names:?}");
-    assert!(names.contains(&"b".to_string()), "got {names:?}");
+    let names = sync_scope::resolve(Some(root.join("Cargo.toml").to_str().unwrap()), false)
+        .unwrap()
+        .workspace
+        .unwrap();
+    assert!(names.contains("a"), "got {names:?}");
+    assert!(names.contains("b"), "got {names:?}");
 }
 
 #[test]
@@ -3434,18 +3430,7 @@ fn test_get_workspace_crate_names_errors_on_bad_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("Cargo.toml");
     std::fs::write(&bad, "this is not valid toml [[[").unwrap();
-    assert!(get_workspace_crate_names(bad.to_str().unwrap()).is_err());
-}
-
-#[test]
-fn test_workspace_filter_bad_manifest_is_empty_set() {
-    // Explicit bad manifest path -> warning branch with empty filter.
-    let dir = tempfile::tempdir().unwrap();
-    let bad = dir.path().join("Cargo.toml");
-    std::fs::write(&bad, "not toml [[[[").unwrap();
-
-    let filter = workspace_filter(Some(bad.to_str().unwrap())).unwrap();
-    assert!(filter.is_empty());
+    assert!(sync_scope::resolve(Some(bad.to_str().unwrap()), false).is_err());
 }
 
 // ── backend-neutral remote tests ──────────────────────────────────────────

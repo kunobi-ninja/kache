@@ -147,6 +147,43 @@ mod tests {
     }
 
     #[test]
+    fn file_budget_warns_only_when_it_reduces_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("warnings.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            DaemonCapacity::for_resources(None, 6, None);
+            DaemonCapacity::for_resources(Some(32), 256, None);
+            // Exactly enough descriptors and excess headroom both keep the
+            // requested capacity, so neither should warn.
+            DaemonCapacity::for_resources(Some(32), 1, Some(640));
+            DaemonCapacity::for_resources(Some(32), 1, Some(656));
+            assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+
+            let reduced = DaemonCapacity::for_resources(Some(32), 1, Some(624));
+            assert_eq!(reduced.executions, 31);
+        });
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        for expected in [
+            "WARN",
+            "daemon pipeline capacity reduced by the open-file limit",
+            "requested=32",
+            "executions=31",
+            "open_files=624",
+        ] {
+            assert!(log.contains(expected), "{expected} missing from {log}");
+        }
+    }
+
+    #[test]
     fn oversized_inputs_keep_all_semaphores_representable() {
         let capacity = DaemonCapacity::for_resources(None, usize::MAX, None);
         assert_eq!(capacity.executions, usize::MAX >> 5);

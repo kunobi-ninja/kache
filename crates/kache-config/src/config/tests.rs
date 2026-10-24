@@ -2614,6 +2614,90 @@ fn daemon_publish_is_on_unless_switched_off() {
 }
 
 #[test]
+fn daemon_execution_concurrency_respects_environment_file_and_automatic_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let file = |text| Ok(toml::from_str::<FileConfig>(text).unwrap());
+    let invocation = |value: Option<&str>| {
+        InvocationEnv::from_parts(
+            value
+                .into_iter()
+                .map(|value| ("KACHE_DAEMON_EXECUTION_CONCURRENCY", value))
+                .chain(std::iter::once((
+                    "KACHE_CACHE_DIR",
+                    root.path().to_str().unwrap(),
+                ))),
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    for (text, expected) in [
+        ("", None),
+        ("[cache]\ndaemon_execution_concurrency = 0", None),
+        ("[cache]\ndaemon_execution_concurrency = 24", Some(24)),
+        ("[cache]\ndaemon_execution_concurrency = 1024", Some(1024)),
+    ] {
+        assert_eq!(
+            Config::daemon_execution_concurrency_for(&invocation(None), &file(text)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            Config::load_resolved_for(&invocation(None), file(text))
+                .unwrap()
+                .daemon_execution_concurrency,
+            expected,
+        );
+        for (value, expected) in [("0", None), ("1", Some(1)), ("1024", Some(1024))] {
+            assert_eq!(
+                Config::daemon_execution_concurrency_for(&invocation(Some(value)), &file(text))
+                    .unwrap(),
+                expected
+            );
+        }
+        for value in ["", "-1", "1.5", "auto", "invalid", "18446744073709551616"] {
+            assert!(
+                Config::daemon_execution_concurrency_for(&invocation(Some(value)), &file(text))
+                    .is_err()
+            );
+        }
+    }
+    assert_eq!(
+        Config::daemon_execution_concurrency_for(
+            &invocation(Some("invalid")),
+            &file("[cache]\nignore_env = true\ndaemon_execution_concurrency = 64")
+        )
+        .unwrap(),
+        Some(64)
+    );
+    let maximum = (usize::MAX >> 5).to_string();
+    assert_eq!(
+        Config::daemon_execution_concurrency_for(&invocation(Some(&maximum)), &file("")).unwrap(),
+        maximum.parse::<usize>().ok()
+    );
+    let too_large = ((usize::MAX >> 5) + 1).to_string();
+    assert!(
+        Config::daemon_execution_concurrency_for(&invocation(Some(&too_large)), &file("")).is_err()
+    );
+    assert!(
+        Config::daemon_execution_concurrency_for(
+            &invocation(None),
+            &file(&format!(
+                "[cache]\ndaemon_execution_concurrency = {too_large}"
+            ))
+        )
+        .is_err()
+    );
+    assert_eq!(
+        Config::daemon_execution_concurrency_for(
+            &invocation(None),
+            &Err(anyhow::anyhow!("no file"))
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn trusted_daemon_execution_requires_an_explicit_setting() {
     let file = |text| Ok(toml::from_str::<FileConfig>(text).unwrap());
     let invocation = |value: Option<&str>| {
@@ -2737,6 +2821,7 @@ fn test_file_config_roundtrip() {
             deferred_durability: None,
             daemon_publish: None,
             trust_daemon_execution: None,
+            daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
@@ -3393,6 +3478,7 @@ fn test_config_store_dir() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -3478,6 +3564,7 @@ fn test_config_index_db_path() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -3559,6 +3646,7 @@ fn test_config_event_log_path() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -3659,6 +3747,7 @@ fn test_config_socket_path() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -4396,6 +4485,7 @@ fn test_save_and_load_file_config() {
             deferred_durability: None,
             daemon_publish: None,
             trust_daemon_execution: None,
+            daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,

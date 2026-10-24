@@ -15909,7 +15909,7 @@ fn a_units_headers_come_from_one_memo_lookup_once_settled() {
             first
                 .recent_hashes
                 .borrow()
-                .contains_key(&absolute_path(path))
+                .contains_key(absolute_path(path).as_os_str())
         );
     }
     first.flush_memo_as_if_settled();

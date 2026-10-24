@@ -8,7 +8,7 @@ pub(crate) use kache_store::file_hash::*;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::key_env::KeyEnv;
@@ -7407,7 +7407,7 @@ pub struct FileHasher<'db> {
     prediction_flight_dir: Option<PathBuf>,
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
-    recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
+    recent_hashes: RefCell<HashMap<OsString, RecentHash>>, // Match raw fingerprint paths.
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
@@ -7826,7 +7826,7 @@ impl<'db> FileHasher<'db> {
         distinct.into_iter().any(|keyed| {
             let path = Path::new(&keyed.path);
             let holds_hashed_bytes = || {
-                recent.get(path).is_some_and(|hashed| {
+                recent.get(path.as_os_str()).is_some_and(|hashed| {
                     hashed.fingerprint.as_ref() == Some(keyed)
                         && hash_file(path).is_ok_and(|bytes| bytes == hashed.hash)
                 })
@@ -8123,7 +8123,7 @@ impl<'db> FileHasher<'db> {
                 // any input the key hashed.
                 self.guard_input(&current);
                 self.recent_hashes.borrow_mut().insert(
-                    resolved.clone(),
+                    resolved.clone().into_os_string(),
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
@@ -8284,8 +8284,9 @@ impl<'db> FileHasher<'db> {
         let mut known = std::collections::HashMap::new();
         for path in paths {
             let selected = {
+                let resolved = self.resolve_path(path)?;
                 let recent = self.recent_hashes.borrow();
-                recent.get(&absolute_path(path)).and_then(|recent| {
+                recent.get(resolved.as_os_str()).and_then(|recent| {
                     recent
                         .fingerprint
                         .as_ref()
@@ -8509,6 +8510,10 @@ impl<'db> FileHasher<'db> {
 
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
+        self.hash_and_record(path).map(|recent| recent.hash)
+    }
+
+    fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {
         let _trace = crate::phase_trace::phase("input_hash");
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
@@ -8516,15 +8521,15 @@ impl<'db> FileHasher<'db> {
         if let Some(observed) = &observed {
             self.guard_input(observed);
         }
-        self.recent_hashes.borrow_mut().insert(
-            resolved.clone(),
-            RecentHash {
-                hash: hash.clone(),
-                fingerprint: observed.map(|observed| observed.fingerprint),
-                header_scan: None,
-            },
-        );
-        Ok(hash)
+        let recent = RecentHash {
+            hash,
+            fingerprint: observed.map(|observed| observed.fingerprint),
+            header_scan: None,
+        };
+        self.recent_hashes
+            .borrow_mut()
+            .insert(resolved.into_os_string(), recent.clone());
+        Ok(recent)
     }
 
     /// Validate and hash a compiled resource from one open file. Whole-file
@@ -8561,7 +8566,7 @@ impl<'db> FileHasher<'db> {
         let (observed, _) = self.restat_after_read(path, before, true);
         self.guard_input(&observed);
         self.recent_hashes.borrow_mut().insert(
-            resolved,
+            resolved.into_os_string(),
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
@@ -8800,22 +8805,14 @@ impl<'db> FileHasher<'db> {
     /// Decisions are keyed by the already-computed content hash, so warm key
     /// construction can reuse them without opening the source again (#557).
     fn env_dep_use(&self, path: &Path, var: &str) -> Result<SourceEnvDepUse> {
-        let absolute = self.resolve_path(path)?;
-        let path = absolute.as_path();
-        let recent = self.recent_hashes.borrow().get(&absolute).cloned();
+        let path = self.resolve_path(path)?;
+        let recent = self.recent_hashes.borrow().get(path.as_os_str()).cloned();
         let recent = match recent {
             Some(recent) => recent,
-            None => {
-                self.hash(path)?;
-                self.recent_hashes
-                    .borrow()
-                    .get(&absolute)
-                    .cloned()
-                    .expect("a successful hash records its fingerprint")
-            }
+            None => self.hash_and_record(&path)?,
         };
         if let Some(expected) = recent.fingerprint {
-            let current = FileFingerprint::from_path(path)
+            let current = FileFingerprint::from_path(&path)
                 .with_context(|| format!("revalidating {} before env-use scan", path.display()))?;
             if current != expected {
                 anyhow::bail!(
@@ -8823,12 +8820,12 @@ impl<'db> FileHasher<'db> {
                     path.display()
                 );
             }
-            return self.env_dep_use_for_hash(path, var, &recent.hash);
+            return self.env_dep_use_for_hash(&path, var, &recent.hash);
         }
 
         // Without a trustworthy fingerprint, bypass memo lookup. The scan
         // still verifies the content hash before recording a reusable result.
-        self.scan_env_dep_use(path, var, &recent.hash)
+        self.scan_env_dep_use(&path, var, &recent.hash)
     }
 
     fn env_dep_use_for_hash(
@@ -9069,7 +9066,7 @@ impl<'db> FileHasher<'db> {
         };
         self.guard_input(&reported);
         self.recent_hashes.borrow_mut().insert(
-            resolved.clone(),
+            resolved.clone().into_os_string(),
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),

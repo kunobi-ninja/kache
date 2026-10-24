@@ -53,3 +53,4 @@ recompile_marker = "Compiling"
 [assertions.relocate]
 min_hits = 1
 max_misses = 0
+max_compiler_runs = 0

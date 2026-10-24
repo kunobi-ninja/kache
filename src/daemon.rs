@@ -67,6 +67,9 @@ const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
 const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
 const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
+#[path = "daemon_capacity.rs"]
+mod capacity;
+use capacity::DaemonCapacity;
 
 fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
     let configured_ms = if configured_secs == 0 {
@@ -1841,10 +1844,11 @@ pub(crate) struct Daemon {
     /// When this read-only daemon last warned that it skipped a writable
     /// build's upload.
     readonly_skip_warned: Mutex<Option<Instant>>,
-    /// Keep compile workers below the connection cap, leaving RPC capacity
-    /// for their own remote checks and publication requests.
+    /// Bound pipeline requests, leaving RPC capacity for their remote checks
+    /// and publication requests. Compiler scheduling has its own permits.
     #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
+    capacity: DaemonCapacity,
 }
 
 /// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
@@ -1934,12 +1938,14 @@ impl Daemon {
     #[cfg(test)]
     pub fn new(config: Config) -> Self {
         let provenance = crate::config::ConfigFileProvenance::current();
-        Self::new_with_provenance(config, &provenance)
+        let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
+        Self::new_with_provenance(config, &provenance, capacity)
     }
 
     fn new_with_provenance(
         config: Config,
         provenance: &crate::config::ConfigFileProvenance,
+        capacity: DaemonCapacity,
     ) -> Self {
         let permits = config.s3_concurrency.max(1) as usize;
         let (warming_tx, _) = tokio::sync::watch::channel(false);
@@ -1985,11 +1991,8 @@ impl Daemon {
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
-            execution_workers: Arc::new(tokio::sync::Semaphore::new(
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(32),
-            )),
+            execution_workers: Arc::new(tokio::sync::Semaphore::new(capacity.executions)),
+            capacity,
             config,
         }
     }
@@ -6342,13 +6345,28 @@ pub fn run_server(
     let manifest_path = crate::platform::release_daemon_working_directory(&config.runtime_dir)
         .context("releasing the build working directory")?;
 
+    let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
+    tracing::info!(
+        pipeline_requests = capacity.executions,
+        rpc_handlers = capacity.connections,
+        blocking_threads = capacity.blocking_threads,
+        "daemon request capacity"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(capacity.blocking_threads)
         .enable_all()
         .build()?;
 
     run_daemon_runtime(
         rt,
-        server_main(config, provenance, coord, readiness, manifest_path),
+        server_main(
+            config,
+            provenance,
+            coord,
+            readiness,
+            manifest_path,
+            capacity,
+        ),
     )
 }
 
@@ -6494,6 +6512,7 @@ async fn server_main(
     mut coord: DaemonCoordFile,
     readiness: Option<kunobi_daemon::readiness::channel::Notifier>,
     manifest_path: PathBuf,
+    capacity: DaemonCapacity,
 ) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -6509,7 +6528,11 @@ async fn server_main(
     coord.control_version = Some(kunobi_daemon::wire::VERSION);
     coord.write_phase(DaemonPhase::Starting)?;
 
-    let daemon = Arc::new(Daemon::new_with_provenance(config.clone(), provenance));
+    let daemon = Arc::new(Daemon::new_with_provenance(
+        config.clone(),
+        provenance,
+        capacity,
+    ));
 
     tracing::info!("daemon listening on {}", socket_path.display());
 
@@ -7130,8 +7153,7 @@ async fn accept_loop(
     // Bound the number of connection handlers doing work at once. Excess
     // connections park on `acquire_owned` (cheap) instead of all running
     // concurrently, so a burst of local clients can't pile up active handlers.
-    const MAX_CONCURRENT_CONNECTIONS: usize = 128;
-    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(daemon.capacity.connections));
 
     loop {
         if !lifecycle.accepting_calls() {

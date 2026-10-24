@@ -500,6 +500,10 @@ pub struct Config {
     /// Disabled unless `KACHE_TRUST_DAEMON_EXECUTION=1` or
     /// `[cache] trust_daemon_execution = true` is set on both peers.
     pub trust_daemon_execution: bool,
+    /// Concurrent daemon pipeline requests. None selects a CPU-based default.
+    /// Zero in the file or environment selects automatic sizing too.
+    /// The daemon can lower this to fit its open-file limit.
+    pub daemon_execution_concurrency: Option<usize>,
     /// The project's `[cache] exclude` and `bypass_*` rule lists, read once
     /// with the rest of the file. Every wrapper invocation consults them
     /// before any key work; re-reading the file for each list cost a C
@@ -929,6 +933,8 @@ pub struct CacheFileConfig {
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
     pub daemon_publish: Option<bool>,
     pub trust_daemon_execution: Option<bool>,
+    /// See [`Config::daemon_execution_concurrency`].
+    pub daemon_execution_concurrency: Option<usize>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub auto_gc: Option<bool>,
     /// Daemon index compaction toggle. See [`Config::index_auto_compact`].
@@ -1366,6 +1372,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
     "KACHE_TRUST_DAEMON_EXECUTION",
+    "KACHE_DAEMON_EXECUTION_CONCURRENCY",
     "KACHE_OUT_DIR_ALIAS",
     "KACHE_OUT_DIR_ALIAS_ROOT",
     "KACHE_DEFERRED_DURABILITY",
@@ -1479,6 +1486,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_TRUST_DAEMON_EXECUTION",
         "cache.trust_daemon_execution",
+    ),
+    (
+        "KACHE_DAEMON_EXECUTION_CONCURRENCY",
+        "cache.daemon_execution_concurrency",
     ),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_INDEX_AUTO_COMPACT", "cache.index_auto_compact"),
@@ -2160,6 +2171,8 @@ impl Config {
         let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
         let trust_daemon_execution = Self::trust_daemon_execution_for(invocation, &file_config);
+        let daemon_execution_concurrency =
+            Self::daemon_execution_concurrency_for(invocation, &file_config)?;
         let project_rules = ProjectRules::from_file_config(&file_config);
         let auto_gc = Self::auto_gc_enabled_for(invocation, &file_config);
         let index_auto_compact = Self::index_auto_compact_enabled_for(invocation, &file_config);
@@ -2301,6 +2314,7 @@ impl Config {
             deferred_durability,
             daemon_publish,
             trust_daemon_execution,
+            daemon_execution_concurrency,
             project_rules,
             auto_gc,
             index_auto_compact,
@@ -2968,6 +2982,34 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.daemon_publish)
             .unwrap_or(true)
+    }
+
+    fn daemon_execution_concurrency_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> Result<Option<usize>> {
+        let configured =
+            match env_or_ignored_for(
+                invocation,
+                "KACHE_DAEMON_EXECUTION_CONCURRENCY",
+                Self::ignore_env_enabled(file_config),
+            ) {
+                Ok(value) => Some(value.parse::<usize>().context(
+                    "KACHE_DAEMON_EXECUTION_CONCURRENCY must be a non-negative integer",
+                )?),
+                Err(_) => file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|config| config.cache.as_ref())
+                    .and_then(|cache| cache.daemon_execution_concurrency),
+            };
+        // Four RPC handlers per pipeline must fit Tokio's semaphore limit
+        // (usize::MAX >> 3), including on 32-bit clients.
+        anyhow::ensure!(
+            configured.is_none_or(|value| value <= usize::MAX >> 5),
+            "cache.daemon_execution_concurrency is too large"
+        );
+        Ok(configured.filter(|value| *value != 0))
     }
 
     fn trust_daemon_execution_for(

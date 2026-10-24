@@ -22,6 +22,11 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
     ] {
         let dir = tempfile::tempdir_in(common::scratch_dir()).unwrap();
         let root = dir.path().canonicalize().unwrap();
+        // Canonicalization adds the Windows device prefix. Use ordinary paths
+        // for the Cargo project and its SQLite-backed cache in this fixture.
+        let root = std::path::PathBuf::from(
+            kache_fs::paths::strip_verbatim_prefix(root.to_str().unwrap()).into_owned(),
+        );
         let project = root.join("project");
         let target = root.join("target");
         let cache = root.join("cache");
@@ -57,6 +62,7 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
                 "{args:?} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            output
         };
         for warm in [false, true] {
             fs::write(project.join("src/lib.rs"), source).unwrap();
@@ -64,7 +70,7 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
                 fs::remove_dir_all(&target).unwrap();
             }
             common::settle_writes(&[&project]);
-            run(&["check"]);
+            let output = run(&["check"]);
             let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
                 .unwrap()
                 .lines()
@@ -74,7 +80,8 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
             assert_eq!(
                 events.last().unwrap()["result"],
                 if warm { "local_hit" } else { "miss" },
-                "{events:#?}"
+                "{events:#?}\ncargo stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
             if fix_command == "clippy" {
                 run(&["clippy", "--fix", "--allow-dirty", "--allow-no-vcs"]);

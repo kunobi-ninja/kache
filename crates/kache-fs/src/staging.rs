@@ -36,9 +36,22 @@ pub fn private_clone_directory(
     prefix: &str,
 ) -> io::Result<tempfile::TempDir> {
     #[cfg(target_os = "macos")]
+    let check_acl = |path: &Path| {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
+            fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+        }
+        let file = File::open(path)?;
+        let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
+        require_no_acl(acl, io::Error::last_os_error(), |acl| {
+            unsafe { acl_free(acl) };
+        })
+    };
+    #[cfg(target_os = "macos")]
     {
-        require_no_acl(source)?;
-        require_no_acl(parent)?;
+        check_acl(source)?;
+        check_acl(parent)?;
     }
     #[cfg(not(target_os = "macos"))]
     let _ = source;
@@ -51,29 +64,25 @@ pub fn private_clone_directory(
     }
     let directory = builder.tempdir_in(parent)?;
     #[cfg(target_os = "macos")]
-    require_no_acl(directory.path())?;
+    check_acl(directory.path())?;
     Ok(directory)
 }
 
-#[cfg(target_os = "macos")]
-fn require_no_acl(path: &Path) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
-        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
-    }
-    let file = File::open(path)?;
+#[cfg(any(test, target_os = "macos"))]
+fn require_no_acl(
+    acl: *mut libc::c_void,
+    error: io::Error,
+    release: impl FnOnce(*mut libc::c_void),
+) -> io::Result<()> {
     // acl_get_fd returns ENOENT for a file without an extended ACL on macOS.
-    let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
     if acl.is_null() {
-        let error = io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ENOENT) {
             Ok(())
         } else {
             Err(error)
         };
     }
-    unsafe { acl_free(acl) };
+    release(acl);
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "restore by copy to preserve the destination ACL",
@@ -182,7 +191,6 @@ impl StagedFile {
 mod tests {
     use super::StagedFile;
     use std::fs;
-    #[cfg(target_os = "macos")]
     use std::io;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -199,6 +207,34 @@ mod tests {
             fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn acl_queries_allow_only_a_confirmed_absent_acl_and_release_present_acls() {
+        let release_count = std::cell::Cell::new(0);
+        let mut token = 0u8;
+        let acl = std::ptr::from_mut(&mut token).cast();
+        let error =
+            super::require_no_acl(acl, io::Error::from_raw_os_error(libc::ENOENT), |seen| {
+                assert_eq!(seen, acl);
+                release_count.set(release_count.get() + 1);
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(release_count.get(), 1);
+
+        for errno in [libc::ENOENT, libc::EACCES, libc::ENOTSUP] {
+            let result = super::require_no_acl(
+                std::ptr::null_mut(),
+                io::Error::from_raw_os_error(errno),
+                |_| panic!("an absent ACL must not be freed"),
+            );
+            if errno == libc::ENOENT {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(errno));
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -221,6 +257,20 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         };
+        let acl_entries = |path: &Path| {
+            let output = std::process::Command::new("/bin/ls")
+                .args(["-le"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(|line| line.trim().to_owned())
+                .collect::<Vec<_>>()
+        };
         add_acl(&source, "everyone allow read");
         assert_eq!(
             super::private_clone_directory(&source, &destination, ".clone-")
@@ -234,7 +284,7 @@ mod tests {
         io::copy(&mut fs::File::open(&source).unwrap(), stage.writer()).unwrap();
         let target = destination.join("output");
         stage.publish_new(&target).unwrap();
-        super::require_no_acl(&target).unwrap();
+        assert!(acl_entries(&target).is_empty());
 
         assert!(
             std::process::Command::new("/bin/chmod")
@@ -255,17 +305,12 @@ mod tests {
             io::ErrorKind::Unsupported
         );
         let mut stage = StagedFile::new_in(&destination, ".stage-").unwrap();
-        assert_eq!(
-            super::require_no_acl(stage.file.path()).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
+        let expected_acl = acl_entries(stage.file.path());
+        assert!(!expected_acl.is_empty());
         assert!(stage.try_clone_from(&source).is_err());
         io::copy(&mut fs::File::open(&source).unwrap(), stage.writer()).unwrap();
         stage.replace(&target).unwrap();
-        assert_eq!(
-            super::require_no_acl(&target).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
+        assert_eq!(acl_entries(&target), expected_acl);
         assert_eq!(fs::read(&target).unwrap(), b"cached");
         assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
     }

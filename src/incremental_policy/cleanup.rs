@@ -45,15 +45,17 @@ fn sweep(
     }
     // Profiles can outlive their last Cargo fingerprint. Look at both the
     // native and target-triple layouts without descending into graph data.
-    for profile in crate::unit_prune::subdirectories(target)
+    for (profile, version) in crate::unit_prune::subdirectories(target)
         .into_iter()
         .flat_map(|profile| {
             let nested = crate::unit_prune::subdirectories(&profile);
             std::iter::once(profile).chain(nested)
         })
+        // Retired state still expires under the same locks and age policy.
+        .flat_map(|profile| ["v1", POLICY_VERSION].map(|version| (profile.clone(), version)))
     {
         let auto_root = profile.join(AUTO_ROOT);
-        let root = auto_root.join(POLICY_VERSION);
+        let root = auto_root.join(version);
         if !real_directory(&auto_root) || !real_directory(&root) {
             continue;
         }
@@ -135,6 +137,50 @@ fn stale_bytes(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_state_expires_without_touching_busy_or_unknown_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let unit = |version: &str| {
+            profile
+                .join("incremental.kache-auto")
+                .join(version)
+                .join("a".repeat(64))
+        };
+        for version in ["v1", "v2", "v3"] {
+            let path = unit(version);
+            fs::create_dir_all(path.join("rustc")).unwrap();
+            fs::write(path.join("rustc/graph.bin"), b"payload").unwrap();
+            fs::write(path.join("unit.lock"), b"").unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+        }
+        let old_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(unit("v1").join("unit.lock"))
+            .unwrap();
+        old_lock.try_lock().unwrap();
+        let window = Duration::from_secs(10);
+        let at = UNIX_EPOCH + Duration::from_secs(110);
+        let preview = sweep(dir.path(), window, at, false, Some(true));
+        assert_eq!(preview.units, 2);
+        assert_eq!(preview.bytes, 14);
+        assert!(unit("v1").join("rustc/graph.bin").is_file());
+        assert!(unit("v2").join("rustc/graph.bin").is_file());
+
+        assert_eq!(sweep(dir.path(), window, at, true, Some(true)).units, 1);
+        assert!(unit("v1").join("rustc/graph.bin").is_file());
+        assert!(!unit("v2").join("rustc").exists());
+        old_lock.unlock().unwrap();
+        assert_eq!(sweep(dir.path(), window, at, true, Some(true)).units, 1);
+        assert!(!unit("v1").join("rustc").exists());
+        assert!(unit("v1").join("unit.lock").is_file());
+        assert_eq!(
+            fs::read(unit("v3").join("rustc/graph.bin")).unwrap(),
+            b"payload"
+        );
+    }
 
     #[test]
     fn an_unverified_filesystem_keeps_graphs_and_creates_no_cargo_locks() {

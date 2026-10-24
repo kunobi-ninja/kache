@@ -5754,7 +5754,7 @@ printf 'state' > "$incremental/state.bin"
     };
     // A reset removes rustc/ and state.json but leaves the unit directory.
     let state_kept = || {
-        let units = profile.join("incremental.kache-auto/v1");
+        let units = profile.join("incremental.kache-auto/v2");
         let unit_dir = std::fs::read_dir(units).unwrap().next().unwrap().unwrap();
         unit_dir.path().join("rustc/state.bin").is_file()
     };

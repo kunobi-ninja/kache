@@ -2616,6 +2616,14 @@ mod tests {
     }
 
     #[test]
+    fn run_cli_rejects_unsupported_json_before_loading_configuration() {
+        let cli = Cli::try_parse_from(["kache", "config", "--json"]).unwrap();
+        let error = run_cli(cli, None).unwrap_err();
+        assert!(is_invalid_arguments(&error), "{error:#}");
+        assert!(error.to_string().contains("config"), "{error:#}");
+    }
+
+    #[test]
     fn json_refusals_name_the_command_or_list_visible_ones() {
         let general = json_refusal(&None).unwrap();
         assert!(general.contains("is supported on"), "{general}");

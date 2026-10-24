@@ -215,12 +215,14 @@ fn outputs(target: &Path) -> [String; 4] {
 }
 
 fn key(events: &BTreeMap<String, Value>, unit: &str) -> String {
-    events
+    let key = events
         .get(unit)
         .unwrap_or_else(|| panic!("no event for {unit}: {events:?}"))["cache_key"]
         .as_str()
         .unwrap_or_else(|| panic!("{unit} has no key: {}", events[unit]))
-        .to_string()
+        .to_string();
+    assert!(!key.is_empty(), "{unit} was not cached: {}", events[unit]);
+    key
 }
 
 fn result<'a>(events: &'a BTreeMap<String, Value>, unit: &str) -> &'a str {

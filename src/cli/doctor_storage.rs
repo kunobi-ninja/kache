@@ -36,7 +36,10 @@ pub(super) fn disk_checks(config: &Config, build: Option<&Path>, temporary: &Pat
             };
             let existing = super::closest_existing(path.to_owned());
             let usage = existing.as_deref().and_then(kache_fs::volume_usage);
+            #[cfg(unix)]
             let inodes = existing.as_deref().and_then(available_inodes);
+            #[cfg(not(unix))]
+            let inodes = None;
             disk_check(label, path, usage, inodes, floor)
         })
         .collect()
@@ -87,11 +90,6 @@ fn available_inodes(path: &Path) -> Option<u64> {
 #[cfg(unix)]
 fn inode_count(value: impl Into<u64>) -> u64 {
     value.into()
-}
-
-#[cfg(not(unix))]
-fn available_inodes(_path: &Path) -> Option<u64> {
-    None
 }
 
 fn access_check(cache_dir: &Path, index: &Path) -> Check {
@@ -204,6 +202,15 @@ fn display_limit(limit: libc::rlim_t) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn inode_counts_preserve_zero_and_the_full_platform_range() {
+        assert_eq!(inode_count(0_u32), 0);
+        assert_eq!(inode_count(42_u32), 42);
+        assert_eq!(inode_count(u32::MAX), 4_294_967_295);
+        assert_eq!(inode_count(u64::MAX), 18_446_744_073_709_551_615);
+    }
 
     #[test]
     fn space_and_inode_pressure_are_independent_and_missing_data_is_explicit() {

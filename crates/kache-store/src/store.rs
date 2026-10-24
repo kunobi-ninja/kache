@@ -52,8 +52,11 @@ thread_local! {
 }
 
 #[cfg(all(test, windows))]
+type DurabilityOpenHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(all(test, windows))]
 thread_local! {
-    static DURABILITY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(bool)>>> =
+    static DURABILITY_OPEN_HOOK: std::cell::RefCell<Option<DurabilityOpenHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

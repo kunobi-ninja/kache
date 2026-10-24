@@ -9757,7 +9757,7 @@ fn parse_cargo_lock_crate_names_from(
     let packages = lock.get("package")?.as_array()?;
     let names: std::collections::HashSet<String> = packages
         .iter()
-        .filter_map(|p| p.get("name")?.as_str().map(String::from))
+        .filter_map(|p| p.get("name")?.as_str().map(|name| name.replace('-', "_")))
         .collect();
     Some(names)
 }

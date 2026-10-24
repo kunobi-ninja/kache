@@ -6974,6 +6974,74 @@ fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn lockfile_sync_pulls_hyphenated_packages_from_compiler_crate_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let backend = TestBackend::memory();
+    let packages = [
+        ("aho-corasick", "aho_corasick"),
+        ("wasm-bindgen-shared", "wasm_bindgen_shared"),
+        ("serde", "serde"),
+    ];
+    let lock = dir.path().join("Cargo.lock");
+    let mut content = String::from("version = 3\n");
+    let mut expected_lists = Vec::new();
+    let mut expected_gets = Vec::new();
+    let mut keys = Vec::new();
+    for (package, crate_name) in packages {
+        content.push_str(&format!(
+            "\n[[package]]\nname = {package:?}\nversion = \"1.0.0\"\n"
+        ));
+        let key = sync_test_cache_key(crate_name);
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/{crate_name}/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        let pack_path = format!("prefix/v3/packs/{crate_name}/{key}.tar.zst");
+        backend
+            .seed(&pack_path, build_entry_pack(&key, crate_name))
+            .await;
+        expected_lists.push(format!("prefix/v3/manifests/{crate_name}/"));
+        expected_gets.push(pack_path);
+        keys.push(key);
+    }
+    // Different versions of one package still need only one prefix listing.
+    content.push_str("\n[[package]]\nname = \"aho-corasick\"\nversion = \"2.0.0\"\n");
+    std::fs::write(&lock, content).unwrap();
+    let crates = parse_cargo_lock_crate_names_from(&lock).unwrap();
+    sync_with_client(
+        &as_cache_remote(as_remote_backend(&backend), &remote),
+        &config,
+        &store,
+        None,
+        true,
+        false,
+        false,
+        false,
+        Some(&crates),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let mut listed = backend.list_calls();
+    listed.sort();
+    expected_lists.sort();
+    assert_eq!(listed, expected_lists);
+    let mut downloaded = backend.get_calls();
+    downloaded.sort();
+    expected_gets.sort();
+    assert_eq!(downloaded, expected_gets);
+    for key in keys {
+        assert!(config.store_dir().join(key).join("meta.json").exists());
+    }
+}
+
+#[tokio::test]
 async fn sync_with_client_pull_downloads_and_imports_entry() {
     // Remote lists a key absent locally; the GET returns a VALID pack, so
     // the pull downloads, extracts, and imports it into the local store.

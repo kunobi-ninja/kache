@@ -21,10 +21,13 @@ kache sync --allow-partial # report failures but exit successfully
 
 Pull and push use different scopes:
 
-- Pull normally lists crates from `Cargo.lock` in the current directory. With no usable lockfile it falls back to listing the full remote.
+- Pull normally lists crates from `Cargo.lock` in the current directory, replacing package-name hyphens with underscores to match compiler crate names. With no usable lockfile it falls back to listing the full remote.
 - `--workspace` lists only Cargo workspace members and fails if it cannot resolve the workspace. It conflicts with `--all`.
+
 - Inside a Cargo workspace, push uploads only the workspace members' targets, from `cargo metadata --no-deps`. It uploads every local entry when the directory has no `Cargo.toml` and no `--manifest-path` is given, and also when `cargo metadata` fails on `./Cargo.toml` (Kache prints a warning). With `--manifest-path`, a failed `cargo metadata` uploads nothing. Build-script runs are never pushed. With remote writes off (`remote_readonly` or the [CI write policy](/docs/remote-cache/ci#who-may-write)), push uploads nothing.
 - `--manifest-path` selects the workspace for push and for `--workspace` pulls.
+
+`Cargo.lock` does not record custom library target names. Use `--all` when a dependency sets a different `[lib] name`; use `--workspace` to resolve the target names of workspace members.
 
 Narrowing the initial pull does not disable on-demand dependency restores during a later daemon-backed build.
 

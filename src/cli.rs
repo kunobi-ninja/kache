@@ -16,6 +16,7 @@ use crate::machine::{PathIdentity, directory_identity};
 use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store, StoreLock};
 
+mod doctor_storage;
 pub mod login;
 mod miss_diagnosis;
 use miss_diagnosis::{Cause, MissDiagnosis};
@@ -7355,6 +7356,8 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == "Install path"
         || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
+        || label == "Store build warning"
+        || label == "Store file limits"
 }
 
 const OTHER_CHECKOUTS: &str = "Other checkouts";
@@ -8038,7 +8041,7 @@ pub fn doctor(
             Err(e) => checks.push(Check {
                 label: "Store DB",
                 pass: false,
-                detail: format!("{} ({e})", cfg.index_db_path().display()),
+                detail: format!("{} ({e:#})", cfg.index_db_path().display()),
                 fix: Some(format!(
                     "ensure {} is writable; if builds run in a sandboxed or ephemeral env, move `cache.local_store`/`KACHE_CACHE_DIR` to a stable local directory",
                     cfg.cache_dir.display()
@@ -8046,6 +8049,7 @@ pub fn doctor(
             }),
         }
 
+        checks.extend(doctor_storage::checks(cfg));
         checks.push(doctor_index_quarantines(cfg));
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {

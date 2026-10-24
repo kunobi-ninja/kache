@@ -455,6 +455,8 @@ fn store_unavailable_message_is_actionable() {
     );
     // Gives the actionable remediation.
     assert!(msg.contains("KACHE_CACHE_DIR"), "msg = {msg}");
+    assert!(msg.contains("kache doctor"), "msg = {msg}");
+    assert!(msg.contains("permissions and file limits"), "msg = {msg}");
     // Reassures the build still succeeds.
     assert!(
         msg.contains("uncached") || msg.contains("succeeds"),

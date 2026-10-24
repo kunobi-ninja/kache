@@ -5078,6 +5078,39 @@ fn same_release_copy_keeps_the_running_daemon() {
 }
 
 #[test]
+fn doctor_reports_recent_store_warning_when_database_is_healthy() {
+    let e = env();
+    let hash = blake3::hash(e.cache.as_os_str().as_encoded_bytes()).to_hex();
+    let marker = e.home.join(format!("kache-store-warn-{}", &hash[..16]));
+    let file = std::fs::File::create(&marker).unwrap();
+    kache_store::markers::write_marker_timestamp(&file);
+    drop(file);
+
+    let output = e
+        .cmd()
+        .env("TMPDIR", &e.home)
+        .env("TMP", &e.home)
+        .env("TEMP", &e.home)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = body["checks"].as_array().unwrap();
+    for label in ["Store DB", "Store access"] {
+        let check = checks.iter().find(|check| check["label"] == label).unwrap();
+        assert_eq!(check["pass"], true, "{check}");
+    }
+    let warning = checks
+        .iter()
+        .find(|check| check["label"] == "Store build warning")
+        .expect("doctor preserves the warning despite its successful database open");
+    assert_eq!(warning["pass"], false);
+    assert_eq!(warning["optional"], true);
+    assert!(warning["fix"].as_str().unwrap().contains("KACHE_LOG_FILE"));
+}
+
+#[test]
 fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
     let e = env();
     let names = [

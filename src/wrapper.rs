@@ -114,23 +114,15 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
     ));
 }
 
-/// Build the user-facing diagnostic shown when the cache index can't be
-/// opened (e.g. `Store::open` fails with a disk I/O / locking error).
-///
-/// Kept pure — takes the error, returns the text — so it's unit-testable
-/// without touching stderr. Deliberately **generic**: it must not name any
-/// specific environment (containers, cross, podman, network mounts). The
-/// cause is described in terms of the underlying storage requirement so the
-/// guidance applies to every case where the index can't be opened.
+/// Explain the fallback without inferring a cause from a SQLite open error.
 fn store_unavailable_message(err: &anyhow::Error) -> String {
     format!(
         "[kache] the cache index could not be opened after retries ({err:#}).\n\
          [kache] Caching is disabled for this build — compilation still succeeds,\n\
          [kache] just without cache hits or stores (everything builds uncached).\n\
-         [kache] This is usually a storage issue: the cache directory is on a\n\
-         [kache] filesystem that doesn't support reliable file locking, or it is\n\
-         [kache] being accessed from more than one machine at the same time.\n\
-         [kache] → set KACHE_CACHE_DIR to a fast, local, single-machine path"
+         [kache] Run `kache doctor` to check cache permissions and file limits.\n\
+         [kache] SQLite also requires reliable file locking: use KACHE_CACHE_DIR\n\
+         [kache] to select a local, single-machine path."
     )
 }
 

@@ -193,6 +193,49 @@ fn edited_project(root: &Path, answer: u64) {
 }
 
 #[test]
+fn thin_lto_seed_keeps_the_donor_unchanged_and_linkable() {
+    if !supports_cwd_remap() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let donor = root.join("donor");
+    let receiver = root.join("receiver");
+    let flags = "-Clto=thin -Copt-level=2 -Cembed-bitcode=yes -Ccodegen-units=8";
+    let _donor_daemon = common::DaemonGuard::new(common::kache_binary(), donor.join("cache"));
+    let _receiver_daemon = common::DaemonGuard::new(common::kache_binary(), receiver.join("cache"));
+
+    project(&donor, 1);
+    build(&donor, None, flags);
+    check_binary(&donor, 1);
+    let state = donor.join("target/debug/incremental.kache-auto");
+    let before = graph_contents(&state);
+    assert!(
+        before
+            .keys()
+            .any(|path| path.extension().is_some_and(|ext| ext == "bc"))
+    );
+
+    project(&receiver, 2);
+    let output = build(&receiver, Some(&donor.join("target/debug")), flags);
+    assert!(
+        reused(&output),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    check_binary(&receiver, 2);
+    assert_eq!(graph_contents(&state), before);
+    project(&receiver, 3);
+    build(&receiver, Some(&donor.join("target/debug")), flags);
+    check_binary(&receiver, 3);
+    assert_eq!(graph_contents(&state), before);
+
+    project(&donor, 4);
+    build(&donor, None, flags);
+    check_binary(&donor, 4);
+}
+
+#[test]
 fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
     if !automatic_supported() {
         return;
@@ -815,7 +858,7 @@ fn absolute_source_keeps_file_macro_semantics_without_publishing_a_seed() {
         String::from_utf8(result.stdout).unwrap().trim(),
         "/src/src/main.rs"
     );
-    for unit in fs::read_dir(profile.join("incremental.kache-auto/v1")).unwrap() {
+    for unit in fs::read_dir(profile.join("incremental.kache-auto/v2")).unwrap() {
         assert!(!unit.unwrap().path().join("worktree-seed-v1").exists());
     }
 }
@@ -865,7 +908,7 @@ fn automatic_command(
 }
 
 fn marker_count(root: &Path) -> usize {
-    fs::read_dir(root.join("target/debug/incremental.kache-auto/v1"))
+    fs::read_dir(root.join("target/debug/incremental.kache-auto/v2"))
         .unwrap()
         .filter_map(Result::ok)
         .filter(|unit| unit.path().join("worktree-seed-v1").is_file())

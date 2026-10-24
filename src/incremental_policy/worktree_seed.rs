@@ -458,7 +458,6 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
     if depth > 8 {
         return Err(io::Error::other("incremental tree too deep"));
     }
-    let finalized = finalized_session(source, depth);
     let entries = fs::read_dir(source)?
         .take(budget.files.saturating_add(1))
         .collect::<io::Result<Vec<_>>>()?;
@@ -489,23 +488,22 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
                 .checked_sub(meta.len())
                 .ok_or_else(|| io::Error::other("incremental state too large"))?;
             let path = entry.path();
-            // rustc never changes finalized sessions. Share only their graph
-            // and codegen data; locks and unfamiliar files keep private inodes.
-            let immutable = finalized
-                && matches!(
-                    path.extension().and_then(|extension| extension.to_str()),
-                    Some("bin" | "o" | "obj" | "bc")
-                );
-            if !immutable || fs::hard_link(&path, &target).is_err() {
+            // Codegen can rewrite inherited ThinLTO bitcode in place. Share
+            // filesystem blocks where possible, never the donor's inode.
+            if kache_fs::try_reflink(&path, &target).is_err() {
                 // Never overwrite a stage file that might already link to a donor.
                 let mut input = File::open(path)?;
                 let mut output = OpenOptions::new()
                     .write(true)
                     .create_new(true)
-                    .open(target)?;
+                    .open(&target)?;
                 io::copy(&mut input, &mut output)?;
-                output.set_permissions(meta.permissions())?;
             }
+            filetime::set_file_mtime(
+                &target,
+                filetime::FileTime::from_last_modification_time(&meta),
+            )?;
+            fs::set_permissions(&target, meta.permissions())?;
         } else {
             return Err(io::Error::other("non-regular incremental entry"));
         }
@@ -831,6 +829,42 @@ mod tests {
         assert_eq!(fs::read(graph.join("dep-graph.bin")).unwrap(), b"complete");
     }
 
+    #[test]
+    fn old_shared_state_is_neither_reused_nor_imported() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (args, donor) = fixture(&root.join("donor"));
+        let (_, receiver) = fixture(&root.join("receiver"));
+        let lease = donor.try_immediate().unwrap();
+        let _receiver_lease = receiver.try_immediate().unwrap();
+        fs::write(donor.rustc_dir.join("unit.pre-lto.bc"), b"old shared state").unwrap();
+        let key = "a".repeat(64);
+        publish(&donor, Some(&key));
+        assert!(lease.finish(CompileOutcome::Success));
+
+        let profile = root.join("donor/target/debug");
+        let current = profile.join("incremental.kache-auto/v2");
+        assert_eq!(donor.unit_dir.parent(), Some(current.as_path()));
+        let legacy = profile.join("incremental.kache-auto/v1");
+        fs::rename(&current, &legacy).unwrap();
+        assert!(!import(&receiver, &profile, &key));
+        assert!(empty_directory(&receiver.rustc_dir));
+
+        let fresh = AdaptiveUnit::eligible(&args, b"guard").unwrap();
+        let lease = fresh.try_immediate().unwrap();
+        assert!(empty_directory(&fresh.rustc_dir));
+        fs::write(
+            fresh.rustc_dir.join("unit.pre-lto.bc"),
+            b"new private state",
+        )
+        .unwrap();
+        assert!(lease.finish(CompileOutcome::Success));
+        assert_eq!(
+            fs::read(legacy.join(&donor.unit_key).join("rustc/unit.pre-lto.bc")).unwrap(),
+            b"old shared state"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn donor_import_rejects_linked_or_invalid_metadata_and_abandoned_state() {
@@ -1069,7 +1103,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn seed_files_share_only_finalized_graphs_and_codegen() {
+    fn seed_files_never_share_writable_state_with_the_donor() {
         use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1077,48 +1111,53 @@ mod tests {
         let dest = temp.path().join("dest");
         fs::create_dir(&dest).unwrap();
         let cases = [
-            ("crate/s-123-456-abcdef/dep-graph.bin", true),
-            ("crate/s-123-456-abcdef/unit.o", true),
-            ("crate/s-123-456-abcdef/unit.obj", true),
-            ("crate/s-123-456-abcdef/unit.bc", true),
-            ("crate/s-123-456-abcdef/session.lock", false),
-            ("crate/s-123-456-abcdef/unknown.txt", false),
-            ("s-123-456-abcdef/dep-graph.bin", false),
-            ("crate/s-123-finished/dep-graph.bin", false),
-            ("crate/unknown/dep-graph.bin", false),
-            ("crate/s-123-456-bad_name/dep-graph.bin", false),
-            ("crate/s--456-abcdef/dep-graph.bin", false),
+            "crate/s-123-456-abcdef/dep-graph.bin",
+            "crate/s-123-456-abcdef/unit.o",
+            "crate/s-123-456-abcdef/unit.obj",
+            "crate/s-123-456-abcdef/unit.bc",
+            "crate/s-123-456-abcdef/session.lock",
+            "crate/s-123-456-abcdef/unknown.txt",
+            "s-123-456-abcdef/dep-graph.bin",
+            "crate/s-123-finished/dep-graph.bin",
+            "crate/unknown/dep-graph.bin",
+            "crate/s-123-456-bad_name/dep-graph.bin",
+            "crate/s--456-abcdef/dep-graph.bin",
         ];
-        for (name, _) in cases {
+        let modified = filetime::FileTime::from_unix_time(100, 123_456_789);
+        for name in cases {
             let input = source.join(name);
             fs::create_dir_all(input.parent().unwrap()).unwrap();
             fs::write(&input, b"original").unwrap();
+            filetime::set_file_mtime(&input, modified).unwrap();
         }
         let mut budget = CopyBudget {
             files: 128,
             bytes: 4096,
         };
         copy_tree(&source, &dest, &mut budget, 0).unwrap();
-        for (name, shared) in cases {
+        for name in cases {
             let input = source.join(name);
             let output = dest.join(name);
             assert_eq!(fs::read(&output).unwrap(), b"original");
-            assert_eq!(
-                fs::metadata(&input).unwrap().ino() == fs::metadata(&output).unwrap().ino(),
-                shared,
+            assert_ne!(
+                fs::metadata(&input).unwrap().ino(),
+                fs::metadata(&output).unwrap().ino(),
                 "{name}"
             );
-            if !shared {
-                fs::write(&output, b"receiver").unwrap();
-                assert_eq!(fs::read(&input).unwrap(), b"original", "{name}");
-            }
+            assert_eq!(
+                filetime::FileTime::from_last_modification_time(&fs::metadata(&output).unwrap()),
+                filetime::FileTime::from_last_modification_time(&fs::metadata(&input).unwrap()),
+                "{name}"
+            );
+            fs::write(&output, b"receiver").unwrap();
+            assert_eq!(fs::read(&input).unwrap(), b"original", "{name}");
         }
         assert!(!finalized_session(Path::new("s-123-456-working"), 2));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn finalized_seed_copies_when_donor_is_on_another_filesystem() {
+    fn seed_copy_fallback_keeps_the_donor_private() {
         use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::tempdir().unwrap();

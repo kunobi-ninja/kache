@@ -4634,7 +4634,15 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
 
 #[test]
 fn restore_link_strategy_shares_only_the_named_loadable_kind() {
-    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink};
+    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink, WritableCopy};
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Metadata, false, None),
+        WritableCopy
+    );
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Metadata, true, None),
+        Copy
+    );
     let proc_macro = Some(ArtifactKind::DynamicLibrary);
     let build_script = Some(ArtifactKind::Executable);
     assert_eq!(
@@ -5746,7 +5754,7 @@ printf 'state' > "$incremental/state.bin"
     };
     // A reset removes rustc/ and state.json but leaves the unit directory.
     let state_kept = || {
-        let units = profile.join("incremental.kache-auto/v1");
+        let units = profile.join("incremental.kache-auto/v2");
         let unit_dir = std::fs::read_dir(units).unwrap().next().unwrap().unwrap();
         unit_dir.path().join("rustc/state.bin").is_file()
     };

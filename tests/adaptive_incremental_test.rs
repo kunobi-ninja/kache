@@ -260,7 +260,7 @@ fn newest_finalized_session(policy_root: &Path) -> Option<PathBuf> {
             .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
             .unwrap_or_default()
     };
-    children(&policy_root.join("v1"))
+    children(&policy_root.join("v2"))
         .iter()
         .flat_map(|unit| children(&unit.join("rustc")))
         .flat_map(|crate_dir| children(&crate_dir))
@@ -282,7 +282,7 @@ fn assert_passthrough(event: &Value, reason: &str) {
 }
 
 fn assert_no_private_graph(policy_root: &Path) {
-    for unit in fs::read_dir(policy_root.join("v1")).unwrap() {
+    for unit in fs::read_dir(policy_root.join("v2")).unwrap() {
         let rustc = unit.unwrap().path().join("rustc");
         if rustc.exists() {
             assert!(
@@ -704,7 +704,7 @@ fn local_unqualified_cold_seed_resets_learning_so_the_next_build_can_store() {
     let first = build();
     assert_eq!(first["result"], "miss", "event: {first:#}");
     assert_eq!(first["compiler_runs"], 1, "event: {first:#}");
-    let policy_state = fs::read_dir(policy_root.join("v1"))
+    let policy_state = fs::read_dir(policy_root.join("v2"))
         .unwrap()
         .map(|entry| entry.unwrap().path().join("state.json"))
         .find(|path| path.is_file())
@@ -840,7 +840,7 @@ fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane(
         "event: {event:#}"
     );
 
-    let policy_version = target.join("debug/incremental.kache-auto/v1");
+    let policy_version = target.join("debug/incremental.kache-auto/v2");
     let unit_dirs: Vec<_> = fs::read_dir(&policy_version)
         .unwrap_or_else(|error| panic!("missing {}: {error}", policy_version.display()))
         .filter_map(Result::ok)
@@ -1097,7 +1097,7 @@ exit 0
     assert!(
         first_args.lines().any(|arg| {
             arg.starts_with("-Cincremental=")
-                && arg.contains("/incremental.kache-auto/v1/")
+                && arg.contains("/incremental.kache-auto/v2/")
                 && arg.ends_with("/rustc")
         }),
         "first wrapper did not hold isolated incremental state: {first_args:?}",

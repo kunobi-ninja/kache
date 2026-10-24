@@ -10,8 +10,9 @@
 //! protected by a cross-process lock held for the complete compiler invocation.
 //!
 //! A compile error keeps the private state. rustc compiles in a copy of its
-//! newest finalized session, finalizes the copy only after codegen succeeds,
-//! and never changes a finalized session. A crash, a signal, an unknown exit
+//! newest finalized session and finalizes the copy after codegen succeeds.
+//! Cross-worktree imports keep independent files because codegen can rewrite
+//! data inherited from a finalized session. A crash, a signal, an unknown exit
 //! or an error about rustc's incremental files resets the unit (see
 //! [`compile_outcome`]).
 
@@ -29,7 +30,8 @@ pub(crate) use worktree_seed::compiler_supports_automatic_seed;
 
 /// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
 const AUTO_ROOT: &str = "incremental.kache-auto";
-const POLICY_VERSION: &str = "v1";
+// Older state may share writable files across checkouts. Never reuse or import it.
+const POLICY_VERSION: &str = "v2";
 const STATE_SCHEMA: u32 = 1;
 /// How long an active unit may sit idle and still skip the cache: a person
 /// between two edits, not a return to the checkout after a break.

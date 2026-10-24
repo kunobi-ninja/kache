@@ -20,14 +20,16 @@ Entries refer to blobs through metadata and the SQLite index. Identical bytes sh
 Kache uses the first of these methods that applies to an artifact:
 
 1. copy-on-write clone on APFS, ReFS, btrfs, or reflink-capable XFS
-2. on Unix, a hardlink to the blob for a Rust output that is neither an executable nor a loadable library, such as an `.rlib` or `.rmeta`, and on Linux also for proc-macro libraries and build-script binaries. Only one target directory may link a given blob; later restores copy it.
+2. on Unix, a hardlink to the blob for an immutable Rust output such as an `.rlib`, and on Linux also for proc-macro libraries and build-script binaries. Only one target directory may link a given blob; later restores copy it.
 3. byte copy
 
-C/C++ objects and the files a cached build script wrote are cloned onto their own inode or copied, never hardlinked. So is anything restored from a `cache.readonly_store`. `[cache] shared_hardlink_restores = true` lets every target directory hardlink the same blob; use it only for target directories nothing reads after the job, such as a CI job's.
+C/C++ objects, Rust metadata (`.rmeta`), and the files a cached build script wrote are cloned onto their own inode or copied, never hardlinked. So is anything restored from a `cache.readonly_store`. Metadata restores use the destination directory's creation permissions, including the current umask and inherited ACLs, and stay non-executable. `[cache] shared_hardlink_restores = true` lets every target directory hardlink an eligible blob; use it only for target directories nothing reads after the job, such as a CI job's.
 
 Other executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. On Linux, proc-macro libraries and build-script binaries share the blob's inode when the blob is read-only and executable, since nothing rewrites them after a restore. A blob without every execute bit, such as one imported from a remote cache, is copied. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
 
-Restored reflinks and copies are writable by their owner, so a later compiler invocation can overwrite them after you remove the Kache wrapper. Adding owner write access to a reflink preserves its other permissions and leaves the cache blob read-only. A hardlink carrier shares permissions with the blob and stays read-only; rebuilding those outputs without Kache can require removing them first.
+Restored reflinks and copies are writable by their owner, so a later compiler invocation can overwrite them after you remove the Kache wrapper. Immutable Rust reflinks gain owner write access while retaining their other permissions and leaving the cache blob read-only. A hardlink carrier shares permissions with the blob and stays read-only; rebuilding those outputs without Kache can require removing them first.
+
+Upgrading does not rewrite outputs Cargo already considers fresh. If older read-only metadata blocks `cargo fix`, [rebuild the affected package's outputs](/docs/getting-started/troubleshooting#cargo-fix-cannot-write-old-metadata). The shared artifact cache can stay in place.
 
 Reflinks have independent inodes. A later write copies changed blocks instead of modifying the store blob.
 

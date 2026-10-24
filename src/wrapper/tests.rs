@@ -11761,6 +11761,73 @@ fn a_read_only_store_restores_by_copy() {
 
 #[cfg(unix)]
 #[test]
+fn readonly_metadata_restores_honor_private_creation_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const CHILD: &str = "KACHE_TEST_PRIVATE_READONLY_METADATA_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wrapper::tests::readonly_metadata_restores_honor_private_creation_permissions",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private read-only metadata child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // The child runs only this test, keeping umask changes out of the suite.
+    unsafe { libc::umask(0o077) };
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let owner = Store::open(&config).unwrap();
+    let bytes = b"private metadata";
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    create_blob(&owner, &hash, bytes);
+    let blob = owner.blob_path(&hash);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let readonly = Store::open_read_only(&config).unwrap();
+    let target_dir = dir.path().join("target");
+    std::fs::create_dir(&target_dir).unwrap();
+    std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = target_dir.join("libfoo.rmeta");
+    let cached = cached_file("libfoo.rmeta", &hash);
+    let platform = platform::current();
+    materialize_cached_artifact(
+        &readonly,
+        &cached,
+        &target,
+        ArtifactKind::Metadata,
+        None,
+        dir.path(),
+        dir.path(),
+        None,
+        &[],
+        &*platform,
+        "test private metadata restore",
+        None,
+    )
+    .unwrap();
+    let metadata = std::fs::metadata(&target).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_ne!(metadata.ino(), std::fs::metadata(&blob).unwrap().ino());
+    std::fs::write(&target, b"changed").unwrap();
+    assert_eq!(std::fs::read(&blob).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn readonly_restore_keeps_executable_and_transformed_file_modes() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();

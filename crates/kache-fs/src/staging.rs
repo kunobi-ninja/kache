@@ -25,6 +25,61 @@ struct Clone {
     _directory: tempfile::TempDir,
 }
 
+/// Create a private directory for a clone awaiting its destination permissions.
+///
+/// On macOS, ACLs can override directory mode bits, and `clonefile` copies the
+/// source ACL. Refuse that path when either side has an ACL; callers can stream
+/// bytes into their existing stage to retain its inherited access policy.
+pub fn private_clone_directory(
+    source: &Path,
+    parent: &Path,
+    prefix: &str,
+) -> io::Result<tempfile::TempDir> {
+    #[cfg(target_os = "macos")]
+    {
+        require_no_acl(source)?;
+        require_no_acl(parent)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = source;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let directory = builder.tempdir_in(parent)?;
+    #[cfg(target_os = "macos")]
+    require_no_acl(directory.path())?;
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn require_no_acl(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    let file = File::open(path)?;
+    // acl_get_fd returns ENOENT for a file without an extended ACL on macOS.
+    let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    unsafe { acl_free(acl) };
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "restore by copy to preserve the destination ACL",
+    ))
+}
+
 impl StagedFile {
     /// Create a stage in an existing directory with the supplied filename prefix.
     ///
@@ -70,14 +125,14 @@ impl StagedFile {
                 return Ok(());
             }
             let permissions = self.file_mut().metadata()?.permissions();
-            let directory = tempfile::Builder::new()
-                .prefix(".kache-clone-")
-                .tempdir_in(
-                    self.file
-                        .path()
-                        .parent()
-                        .ok_or_else(|| io::Error::other("stage has no parent"))?,
-                )?;
+            let directory = private_clone_directory(
+                source,
+                self.file
+                    .path()
+                    .parent()
+                    .ok_or_else(|| io::Error::other("stage has no parent"))?,
+                ".kache-clone-",
+            )?;
             let path = directory.path().join("artifact");
             crate::try_reflink(source, &path)?;
             std::fs::set_permissions(&path, permissions)?;
@@ -127,8 +182,93 @@ impl StagedFile {
 mod tests {
     use super::StagedFile;
     use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::io;
     use std::io::Write;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_directories_are_private_before_receiving_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("blob");
+        fs::write(&source, b"cached").unwrap();
+        let directory = super::private_clone_directory(&source, root.path(), ".clone-").unwrap();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn acl_restores_keep_the_destination_policy_by_copying() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("blob");
+        let destination = root.path().join("destination");
+        fs::write(&source, b"cached").unwrap();
+        fs::create_dir(&destination).unwrap();
+        let add_acl = |path: &Path, acl: &str| {
+            let output = std::process::Command::new("/bin/chmod")
+                .args(["+a", acl])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        add_acl(&source, "everyone allow read");
+        assert_eq!(
+            super::private_clone_directory(&source, &destination, ".clone-")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        // The source ACL must not be carried to a destination without one.
+        let mut stage = StagedFile::new_in(&destination, ".stage-").unwrap();
+        assert!(stage.try_clone_from(&source).is_err());
+        io::copy(&mut fs::File::open(&source).unwrap(), stage.writer()).unwrap();
+        let target = destination.join("output");
+        stage.publish_new(&target).unwrap();
+        super::require_no_acl(&target).unwrap();
+
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        add_acl(
+            &destination,
+            "everyone allow read,file_inherit,directory_inherit",
+        );
+        assert_eq!(
+            super::private_clone_directory(&source, &destination, ".clone-")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        let mut stage = StagedFile::new_in(&destination, ".stage-").unwrap();
+        assert_eq!(
+            super::require_no_acl(stage.file.path()).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(stage.try_clone_from(&source).is_err());
+        io::copy(&mut fs::File::open(&source).unwrap(), stage.writer()).unwrap();
+        stage.replace(&target).unwrap();
+        assert_eq!(
+            super::require_no_acl(&target).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"cached");
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+    }
 
     #[test]
     fn cloned_stages_keep_writable_modes_and_publish_independent_bytes() {

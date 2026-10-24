@@ -30,7 +30,7 @@ pub use identity::{directory_identity, file_identity, handle_identity};
 #[cfg(feature = "staging")]
 mod staging;
 #[cfg(feature = "staging")]
-pub use staging::StagedFile;
+pub use staging::{StagedFile, private_clone_directory};
 
 mod ledger;
 pub use ledger::{InodeId, InodeLedger};

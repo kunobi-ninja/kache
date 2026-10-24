@@ -3,6 +3,44 @@ use super::*;
 use std::fs;
 use std::sync::mpsc;
 
+#[cfg(any(unix, windows))]
+#[test]
+fn compiler_request_capacity_handles_bursts_and_recovers_after_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = test_config(root.path());
+    config.daemon_execution_concurrency = Some(32);
+    let daemon = Daemon::new(config);
+    let workers = daemon.execution_workers.clone();
+    let mut requests = Vec::new();
+
+    // A cache-hit burst must fit even on a host with fewer than 32 CPUs.
+    for _ in 0..32 {
+        requests.push(
+            workers
+                .clone()
+                .try_acquire_owned()
+                .expect("pipeline request rejected before the burst limit"),
+        );
+    }
+    assert!(workers.clone().try_acquire_owned().is_err());
+
+    drop(requests.pop());
+    let replacement = workers
+        .clone()
+        .try_acquire_owned()
+        .expect("a finished request must release its slot");
+    assert!(workers.clone().try_acquire_owned().is_err());
+
+    drop(replacement);
+    drop(requests);
+    let next_burst = workers
+        .clone()
+        .try_acquire_many_owned(32)
+        .expect("all slots must be reusable after the burst finishes");
+    assert!(workers.try_acquire_owned().is_err());
+    drop(next_burst);
+}
+
 #[test]
 fn identity_publish_context_requires_both_nonempty_values() {
     assert_eq!(identity_publish_context(None, "session", true, false), None);
@@ -1315,6 +1353,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -1788,6 +1827,7 @@ async fn server_main_binds_socket_and_handles_shutdown() {
             coord,
             None,
             PathBuf::from("Cargo.lock"),
+            DaemonCapacity::discover(server_config.daemon_execution_concurrency),
         )
         .await
     });
@@ -4591,7 +4631,8 @@ fn daemon_keeps_the_load_time_config_provenance_after_a_file_edit() {
     config.max_size = 10 * 1024 * 1024;
     std::fs::write(&config_path, "[cache]\nlocal_max_size = \"20MiB\"\n").unwrap();
 
-    let daemon = Daemon::new_with_provenance(config, &provenance);
+    let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
+    let daemon = Daemon::new_with_provenance(config, &provenance, capacity);
     assert_eq!(daemon.effective_config.max_size, 10 * 1024 * 1024);
     assert_eq!(
         daemon.effective_config.config_path,

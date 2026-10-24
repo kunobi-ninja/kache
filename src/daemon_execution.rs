@@ -1022,12 +1022,15 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
         let daemon = Arc::new(Daemon::new_with_provenance(
-            super::super::tests::test_config(root.path()),
+            config,
             &crate::config::ConfigFileProvenance {
                 path: root.path().join("config.toml"),
                 fingerprint: "fixture".to_owned(),
             },
+            capacity,
         ));
         for terminal in [false, true] {
             for with_jobserver in [false, true] {

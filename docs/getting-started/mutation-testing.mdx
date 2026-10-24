@@ -49,15 +49,22 @@ dependencies and build scripts keep their existing compilation paths.
 
 Kache looks for compatible donors among eight recently built target directories
 in the local cache index. Each receiver keeps its own compiler state and lock.
-The import hard-links finalized rustc graph and codegen files when possible;
-locks and unfamiliar files are private copies. Failed hard links fall back to
-copies. A busy donor, incompatible flags, unsupported arguments or unfinished
+The import clones files with copy-on-write where the filesystem supports it
+and uses independent copies otherwise. No imported file shares an inode with
+the donor, including ThinLTO bitcode that rustc can rewrite in place.
+A busy donor, incompatible flags, unsupported arguments or unfinished
 state leaves the receiver compiling without an imported seed. Each candidate
 import is limited to 1 GiB, 65,536 entries and 256 donor units.
 
 For recognized rustc layouts, the import keeps the newest finalized session
 per crate, using the timestamp in its name. Tied timestamps and unfamiliar
 layouts retain their existing copying behavior.
+
+The first managed incremental compile after upgrading starts fresh in each
+checkout. Kache uses a new state version so it cannot reuse or import older
+state whose files may already be shared or modified. The old state remains
+eligible for the usual unused-unit cleanup. Finish builds using the older
+Kache before upgrading; those versions can still share files with each other.
 
 To disable automatic seeding for one build:
 

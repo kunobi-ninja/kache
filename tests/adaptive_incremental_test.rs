@@ -840,7 +840,7 @@ fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane(
         "event: {event:#}"
     );
 
-    let policy_version = target.join("debug/incremental.kache-auto/v1");
+    let policy_version = target.join("debug/incremental.kache-auto/v2");
     let unit_dirs: Vec<_> = fs::read_dir(&policy_version)
         .unwrap_or_else(|error| panic!("missing {}: {error}", policy_version.display()))
         .filter_map(Result::ok)
@@ -1097,7 +1097,7 @@ exit 0
     assert!(
         first_args.lines().any(|arg| {
             arg.starts_with("-Cincremental=")
-                && arg.contains("/incremental.kache-auto/v1/")
+                && arg.contains("/incremental.kache-auto/v2/")
                 && arg.ends_with("/rustc")
         }),
         "first wrapper did not hold isolated incremental state: {first_args:?}",

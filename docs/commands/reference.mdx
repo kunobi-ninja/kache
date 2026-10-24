@@ -182,6 +182,7 @@ The links point at a path that survives upgrades when one reaches the running bi
 
 ```bash
 kache doctor
+kache doctor --probe
 kache doctor --fix
 kache doctor --verify
 kache doctor --checksums
@@ -191,6 +192,7 @@ kache doctor --repair
 - `--fix` migrates from sccache: it stops a running sccache server, replaces `sccache` with `kache` in `$CARGO_HOME/config.toml`, and prints the lines to change in your shell startup files. It does not set up other missing pieces such as `rustc-wrapper` or the shims; run `kache init` for those.
 - `--purge-sccache` also deletes the sccache cache directory (`~/Library/Caches/Mozilla.sccache` on macOS, `~/.cache/sccache` on Linux) and runs `cargo uninstall sccache` when sccache was installed with Cargo. It requires `--fix`.
 - `--verify` checks entries, blobs, and metadata. It exits 1 while corrupted entries or index mismatches remain, so a scheduled job can gate on it. Orphan blobs do not count.
+- `--probe` compiles a small Rust library, removes its output, then checks that the second invocation restores identical bytes without running the compiler. It uses an isolated temporary cache and configuration, never accesses the remote, and removes its files afterwards. Each wrapped invocation has a 30-second deadline. It can also run with `--json`; findings appear in `checks` and `issues`.
 - `--checksums` also hashes blob contents and implies `--verify`.
 - `--repair` removes corrupted entries, reconciles the index with the entries on disk, reclaims orphan blobs, prunes stale C/C++ memos, input predictions and old file hashes, and compacts a large, sparse index when disk space allows. It implies `--verify`.
 
@@ -199,6 +201,10 @@ kache doctor --repair
 Doctor reports issues and still exits 0; scripts read them from `kache doctor --json`. Only `--verify`, and the options that imply it, exit 1 for what they find.
 
 Doctor checks cache-directory write access and read/write access to existing index, WAL and SHM files. On Unix it also shows this process's soft and hard open-file limits. Run it as the same user and in the same environment as the failing build.
+
+Where volume information is available, doctor checks free space for the cache, Cargo outputs and temporary files, using existing ancestor directories for paths not created yet. The cache warning uses `cache.auto_recover_min_free_bytes`, with a minimum working reserve of 1 GiB even when automatic recovery is off. Cargo output and temporary volumes use the 1 GiB reserve. Unix checks also report available inodes when the filesystem provides a capacity. These checks do not remove anything; `kache clean --dry-run` previews tracked build directories.
+
+When a daemon answers, doctor compares its reported configuration with this process's snapshot and names differences in store paths, remote state and other reported settings. New daemons also report their PID, effective user and open-file limits captured after startup raised the limit. Older daemons show an informational notice when those fields are unavailable. The temporary cache probe checks the local Rust pipeline separately from the configured store and project-specific flags.
 
 If a build emitted a store-open warning in the last 24 hours, doctor reports that history even when the database opens now. The history is informational and depends on the warning marker remaining in the same temporary directory. To capture the full error, rerun the failing Cargo command with `KACHE_LOG_FILE=kache=debug,kache_store=debug` and inspect `kache.log` (see [diagnostic logs](/docs/daemon/lifecycle)).
 

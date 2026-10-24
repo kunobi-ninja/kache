@@ -5187,6 +5187,7 @@ fn render_stats_prefetch_section_gated_on_activity() {
 /// from client-side rendering.
 fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
     crate::daemon::EffectiveConfig {
+        process: None,
         max_size: config.max_size,
         cache_dir: config.cache_dir.display().to_string(),
         runtime_dir: config.runtime_dir.display().to_string(),

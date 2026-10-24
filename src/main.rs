@@ -879,6 +879,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             verify,
             checksums,
             repair,
+            probe,
         }) => {
             if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
                 return Err(machine::invalid_arguments(
@@ -891,6 +892,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 verify || checksums || repair,
                 checksums,
                 repair,
+                probe,
                 json,
             )
         }

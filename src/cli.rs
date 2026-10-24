@@ -16,6 +16,8 @@ use crate::machine::{PathIdentity, directory_identity};
 use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store, StoreLock};
 
+mod doctor_daemon;
+mod doctor_probe;
 mod doctor_storage;
 pub mod login;
 mod miss_diagnosis;
@@ -1766,6 +1768,22 @@ pub(crate) fn config_mismatch_warnings(
              installed service takes the setting from its own environment and config"
         ));
     }
+    if let Some(floor) = eff.auto_recover_min_free_bytes
+        && floor != config.auto_recover_min_free_bytes
+    {
+        warnings.push(format!(
+            "warning: {daemon_side} has auto_recover_min_free_bytes={floor}; {client_side} says {} — {remedy}",
+            config.auto_recover_min_free_bytes
+        ));
+    }
+    if let Some(targets) = eff.auto_recover_targets
+        && targets != config.auto_recover_targets
+    {
+        warnings.push(format!(
+            "warning: {daemon_side} has auto_recover_targets={targets}; {client_side} says {} — {remedy}",
+            config.auto_recover_targets
+        ));
+    }
     warnings
 }
 
@@ -2095,7 +2113,20 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 "explain",
                 Body {
                     crate_name,
-                    diagnosis: "all_hits",
+                    diagnosis: if latest_uncached.is_some() {
+                        "not_cached"
+                    } else if crate_events.iter().any(|event| {
+                        matches!(
+                            event.result,
+                            events::EventResult::LocalHit
+                                | events::EventResult::RemoteHit
+                                | events::EventResult::PrefetchHit
+                        )
+                    }) {
+                        "all_hits"
+                    } else {
+                        "no_cache_lookups"
+                    },
                     stored_entries: stored.len(),
                     store_dirs: stored
                         .iter()
@@ -7299,7 +7330,12 @@ fn doctor_config_file_check(
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
-const DAEMON_CHECK_LABELS: [&str; 3] = ["Daemon version", "Daemon service", "Service exe"];
+const DAEMON_CHECK_LABELS: [&str; 4] = [
+    "Daemon version",
+    "Daemon service",
+    "Service exe",
+    "Daemon config",
+];
 
 /// The host config path `kache stats` names, only when the host file is
 /// actually merged in: absent, disabled or unusable files are not in effect.
@@ -7358,6 +7394,8 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == OTHER_CHECKOUTS
         || label == "Store build warning"
         || label == "Store file limits"
+        || label == "Store volume probe"
+        || label == "Daemon process"
 }
 
 const OTHER_CHECKOUTS: &str = "Other checkouts";
@@ -7858,10 +7896,14 @@ pub fn doctor(
     verify: bool,
     checksums: bool,
     repair: bool,
+    probe: bool,
     json: bool,
 ) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
-    let config = crate::config::Config::load().ok();
+    let (config, provenance) = crate::config::Config::load_with_provenance()
+        .map_or((None, None), |(config, provenance)| {
+            (Some(config), Some(provenance))
+        });
     let sccache_is_fallback = fallback_is_sccache(config.as_ref());
 
     // The daemon only matters when remote work is configured (cache remote or a
@@ -8050,6 +8092,11 @@ pub fn doctor(
         }
 
         checks.extend(doctor_storage::checks(cfg));
+        checks.extend(doctor_storage::disk_checks(
+            cfg,
+            cargo_output_dir().as_deref(),
+            &std::env::temp_dir(),
+        ));
         checks.push(doctor_index_quarantines(cfg));
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {
@@ -8208,6 +8255,13 @@ pub fn doctor(
         }
 
         healthy_daemon_reachable = stats.is_some();
+        if let Some(stats) = &stats {
+            checks.extend(doctor_daemon::checks(
+                cfg,
+                provenance.as_ref().expect("loaded config has provenance"),
+                stats.effective_config.as_ref(),
+            ));
+        }
 
         let (pass, detail, fix_hint) = daemon_version_check(
             stats.as_ref().map(|s| s.version.as_str()),
@@ -8362,6 +8416,10 @@ pub fn doctor(
         checks.push(native_linker_check(
             &crate::invocation::InvocationEnv::capture(),
         ));
+    }
+
+    if probe {
+        checks.push(doctor_probe::check());
     }
 
     // Print

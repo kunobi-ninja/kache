@@ -313,6 +313,8 @@ impl Drop for Child {
 }
 
 pub(crate) trait CommandExt {
+    /// Own the process tree while preserving explicitly configured stdio.
+    fn invocation_spawn_in_group(&mut self) -> io::Result<Child>;
     fn invocation_spawn(&mut self) -> io::Result<Child>;
     fn invocation_spawn_with_io(&mut self, io: ChildIo) -> io::Result<Child>;
     fn invocation_spawn_in_group_with_io(&mut self, io: ChildIo) -> io::Result<Child>;
@@ -325,6 +327,9 @@ pub(crate) trait CommandExt {
 }
 
 impl CommandExt for Command {
+    fn invocation_spawn_in_group(&mut self) -> io::Result<Child> {
+        spawn(self, true, None)
+    }
     fn invocation_spawn(&mut self) -> io::Result<Child> {
         spawn(self, false, None)
     }

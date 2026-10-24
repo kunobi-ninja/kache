@@ -918,6 +918,7 @@ fn compile_started_wire_tags_and_stats_default() {
             eta_s: None,
         }],
         effective_config: Some(EffectiveConfig {
+            process: None,
             max_size: 1,
             cache_dir: "/c".into(),
             runtime_dir: "/c".into(),

@@ -243,6 +243,7 @@ fn tui_uses_the_daemon_remote_status() {
     let snapshot = StatsSnapshot {
         daemon_connected: true,
         daemon_effective_config: Some(crate::daemon::EffectiveConfig {
+            process: None,
             max_size: config.max_size,
             cache_dir: daemon_cache_dir.to_string_lossy().into_owned(),
             runtime_dir: "/shared/runtime".to_string(),
@@ -1541,6 +1542,7 @@ fn store_names_the_daemon_and_now_leaves_the_version_off() {
     snap.event_stats.total_elapsed_ms = 5000;
     snap.event_stats.miss_elapsed_ms = 3000;
     snap.daemon_effective_config = Some(crate::daemon::EffectiveConfig {
+        process: None,
         max_size: snap.max_size,
         cache_dir: "/cache".to_string(),
         runtime_dir: "/runtime".to_string(),

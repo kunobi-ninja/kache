@@ -11,6 +11,43 @@
 
 static FRONTEND_IMAGE: std::sync::OnceLock<kache_shims::FrontendImage> = std::sync::OnceLock::new();
 
+pub(crate) fn process_context() -> kache_protocol::ProcessContext {
+    kache_protocol::ProcessContext {
+        pid: std::process::id(),
+        #[cfg(unix)]
+        // SAFETY: geteuid has no preconditions.
+        effective_uid: Some(unsafe { libc::geteuid() }),
+        #[cfg(not(unix))]
+        effective_uid: None,
+        open_file_limits: open_file_limits(),
+    }
+}
+
+fn open_file_limits() -> Option<kache_protocol::OpenFileLimits> {
+    #[cfg(unix)]
+    {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limits is a valid output slot.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+            return None;
+        }
+        Some(kache_protocol::OpenFileLimits {
+            soft: finite_file_limit(limits.rlim_cur),
+            hard: finite_file_limit(limits.rlim_max),
+        })
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+#[cfg(unix)]
+fn finite_file_limit(limit: libc::rlim_t) -> Option<u64> {
+    (limit != libc::RLIM_INFINITY).then_some(limit)
+}
+
 pub(crate) fn set_frontend_image(image: kache_shims::FrontendImage) -> anyhow::Result<()> {
     FRONTEND_IMAGE
         .set(image)
@@ -446,6 +483,17 @@ mod tests {
     fn ps_available() -> bool {
         std::env::var_os("PATH")
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reported_process_context_preserves_finite_and_unlimited_limits() {
+        assert_eq!(super::finite_file_limit(256), Some(256));
+        assert_eq!(super::finite_file_limit(libc::RLIM_INFINITY), None);
+        let context = super::process_context();
+        assert_eq!(context.pid, std::process::id());
+        assert!(context.effective_uid.is_some());
+        assert!(context.open_file_limits.is_some());
     }
 
     /// launchd's 256/unlimited must land on the per-process cap, never on

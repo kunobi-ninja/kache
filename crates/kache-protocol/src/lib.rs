@@ -232,6 +232,10 @@ pub struct DaemonHealth {
 /// invocation's own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EffectiveConfig {
+    /// Process identity and limits captured after daemon startup raised its limit.
+    /// Absent from older daemons.
+    #[serde(default)]
+    pub process: Option<ProcessContext>,
     /// `[cache] local_max_size` / `KACHE_MAX_SIZE` as the daemon resolved it.
     pub max_size: u64,
     /// The store directory the daemon's numbers describe.
@@ -288,6 +292,20 @@ pub struct EffectiveConfig {
     /// daemons that predate the field.
     #[serde(default)]
     pub auto_recover_targets: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessContext {
+    pub pid: u32,
+    pub effective_uid: Option<u32>,
+    pub open_file_limits: Option<OpenFileLimits>,
+}
+
+/// `None` for a limit means unlimited; a missing whole object means unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenFileLimits {
+    pub soft: Option<u64>,
+    pub hard: Option<u64>,
 }
 
 /// One in-flight compile as reported to stats consumers (`kache monitor`'s

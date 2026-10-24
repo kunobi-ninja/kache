@@ -15,6 +15,85 @@ pub(super) fn checks(config: &Config) -> Vec<Check> {
     checks
 }
 
+/// Keep a small working reserve even when automatic recovery is disabled.
+const MINIMUM_FREE_BYTES: u64 = 1 << 30;
+
+pub(super) fn disk_checks(config: &Config, build: Option<&Path>, temporary: &Path) -> Vec<Check> {
+    let mut paths = vec![
+        ("Cache free space", config.cache_dir.as_path()),
+        ("Store temp space", temporary),
+    ];
+    if let Some(build) = build {
+        paths.push(("Store build space", build));
+    }
+    paths
+        .into_iter()
+        .map(|(label, path)| {
+            let floor = if label == "Cache free space" {
+                config.auto_recover_min_free_bytes.max(MINIMUM_FREE_BYTES)
+            } else {
+                MINIMUM_FREE_BYTES
+            };
+            let existing = super::closest_existing(path.to_owned());
+            let usage = existing.as_deref().and_then(kache_fs::volume_usage);
+            let inodes = existing.as_deref().and_then(available_inodes);
+            disk_check(label, path, usage, inodes, floor)
+        })
+        .collect()
+}
+
+fn disk_check(
+    label: &'static str,
+    path: &Path,
+    usage: Option<kache_fs::VolumeUsage>,
+    inodes: Option<u64>,
+    floor: u64,
+) -> Check {
+    let Some(usage) = usage else {
+        return Check {
+            label: "Store volume probe",
+            pass: false,
+            detail: format!("{label}: free space unavailable for {}", path.display()),
+            fix: None,
+        };
+    };
+    let low = usage.free < floor;
+    let exhausted = inodes == Some(0);
+    let inode_note = inodes.map_or(String::new(), |count| format!("; {count} inodes available"));
+    Check {
+        label,
+        pass: !low && !exhausted,
+        detail: format!("{} free of {} at {}; warning floor {}{inode_note}", bytesize::ByteSize(usage.free), bytesize::ByteSize(usage.total), path.display(), bytesize::ByteSize(floor)),
+        fix: (low || exhausted).then(|| "preview tracked build directories with `kache clean --dry-run`; cache size limits do not cover incremental state, temporary files or all target artifacts. Check this volume before starting another large build".into()),
+    }
+}
+
+#[cfg(unix)]
+fn available_inodes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is plain data; path is NUL-terminated and the output slot is valid.
+    let mut usage: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut usage) } != 0 {
+        return None;
+    }
+    // A filesystem that does not report an inode capacity cannot vouch for headroom.
+    if usage.f_files == 0 {
+        return None;
+    }
+    Some(inode_count(usage.f_favail))
+}
+
+#[cfg(unix)]
+fn inode_count(value: impl Into<u64>) -> u64 {
+    value.into()
+}
+
+#[cfg(not(unix))]
+fn available_inodes(_path: &Path) -> Option<u64> {
+    None
+}
+
 fn access_check(cache_dir: &Path, index: &Path) -> Check {
     let result = probe_access(cache_dir, index);
     let pass = result.is_ok();
@@ -125,6 +204,109 @@ fn display_limit(limit: libc::rlim_t) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn space_and_inode_pressure_are_independent_and_missing_data_is_explicit() {
+        let path = Path::new("fixture-cache");
+        assert_eq!(MINIMUM_FREE_BYTES, 1_073_741_824);
+        let usage = |free| {
+            Some(kache_fs::VolumeUsage {
+                total: 4_294_967_296,
+                free,
+            })
+        };
+        let healthy = disk_check("Cache free space", path, usage(1024), Some(1), 1024);
+        assert!(healthy.pass);
+        assert!(healthy.fix.is_none());
+        let low = disk_check("Cache free space", path, usage(1023), Some(1), 1024);
+        assert!(!low.pass);
+        assert!(low.fix.unwrap().contains("clean --dry-run"));
+        let no_inodes = disk_check("Store build space", path, usage(2048), Some(0), 1024);
+        assert!(!no_inodes.pass);
+        assert!(no_inodes.detail.contains("0 inodes available"));
+        assert!(disk_check("Store temp space", path, usage(2048), None, 1024).pass);
+        let unknown = disk_check("Cache free space", path, None, None, 1024);
+        assert!(!unknown.pass);
+        assert_eq!(unknown.label, "Store volume probe");
+        assert!(unknown.detail.contains("unavailable"));
+        assert!(super::super::doctor_check_is_optional(
+            unknown.label,
+            false,
+            false
+        ));
+        assert!(!super::super::doctor_check_is_optional(
+            "Cache free space",
+            false,
+            false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_checks_cover_missing_build_paths_and_the_working_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().to_owned());
+        config.auto_recover_min_free_bytes = 0;
+        let _usage = kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage {
+                total: 4_294_967_296,
+                free: 536_870_912,
+            }),
+        );
+        let observations = disk_checks(
+            &config,
+            Some(&dir.path().join("not-created/target")),
+            dir.path(),
+        );
+        assert_eq!(observations.len(), 3);
+        for label in ["Cache free space", "Store temp space", "Store build space"] {
+            let check = observations
+                .iter()
+                .find(|check| check.label == label)
+                .unwrap();
+            assert!(
+                !check.pass,
+                "the 1 GiB reserve still applies when recovery is off"
+            );
+            assert!(check.detail.contains("warning floor"));
+        }
+        assert_eq!(disk_checks(&config, None, dir.path()).len(), 2);
+        assert!(available_inodes(dir.path()).is_some());
+        assert!(available_inodes(&dir.path().join("absent")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_recovery_floor_does_not_apply_to_build_and_temporary_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().to_owned());
+        config.auto_recover_min_free_bytes = 2_147_483_648;
+        let _usage = kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage {
+                total: 4_294_967_296,
+                free: 1_610_612_736,
+            }),
+        );
+        let checks = disk_checks(&config, Some(dir.path()), dir.path());
+        assert!(
+            !checks
+                .iter()
+                .find(|check| check.label == "Cache free space")
+                .unwrap()
+                .pass
+        );
+        for label in ["Store build space", "Store temp space"] {
+            assert!(
+                checks
+                    .iter()
+                    .find(|check| check.label == label)
+                    .unwrap()
+                    .pass
+            );
+        }
+    }
 
     #[test]
     fn access_probe_preserves_sqlite_files_and_removes_its_probe() {

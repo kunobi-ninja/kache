@@ -174,6 +174,10 @@ enum Commands {
         /// Remove corrupted entries (implies --verify)
         #[arg(long)]
         repair: bool,
+
+        /// Compile a temporary Rust library and verify a local cache hit (no remote access)
+        #[arg(long)]
+        probe: bool,
     },
 
     /// Pull from and push to the configured remote

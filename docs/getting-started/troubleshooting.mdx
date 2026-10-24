@@ -17,6 +17,11 @@ the directory that holds the build's target directory, which is the workspace
 for the default `target/`. Without it, both commands describe the newest build
 Kache recorded, from any project.
 
+For a functional check of the installed Rust cache pipeline, run `kache doctor --probe`.
+It compiles a temporary library twice in an isolated local cache and checks the
+second invocation restores it without compiling. It does not test your remote
+cache or the flags and policy of the affected project.
+
 ## A build shows no hits
 
 First check whether Cargo ran any compiler work. A second build in an already

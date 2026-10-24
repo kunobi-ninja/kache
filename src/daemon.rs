@@ -980,6 +980,7 @@ fn effective_config(
     provenance: &crate::config::ConfigFileProvenance,
 ) -> EffectiveConfig {
     EffectiveConfig {
+        process: Some(crate::platform::process_context()),
         max_size: config.max_size,
         cache_dir: config.cache_dir.display().to_string(),
         runtime_dir: config.runtime_dir.display().to_string(),

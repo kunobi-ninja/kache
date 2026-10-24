@@ -5078,6 +5078,153 @@ fn same_release_copy_keeps_the_running_daemon() {
 }
 
 #[test]
+fn doctor_probe_restores_a_rust_library_without_touching_the_configured_store() {
+    let e = env();
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup"));
+    let output = e
+        .cmd()
+        .env("RUSTUP_HOME", rustup_home)
+        .args(["--json", "doctor", "--probe"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Cache probe")
+        .unwrap();
+    assert_eq!(check["pass"], true, "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("identical bytes")
+    );
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("isolated temporary cache")
+    );
+    let db = rusqlite::Connection::open(e.cache.join("index.db")).unwrap();
+    let entries: i64 = db
+        .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        entries, 0,
+        "probe artifacts must not enter the configured store"
+    );
+    assert!(
+        !e.cache.join("events.jsonl").exists(),
+        "probe events remain isolated"
+    );
+}
+
+#[test]
+fn doctor_probe_reports_a_missing_compiler_without_polluting_json() {
+    let e = env();
+    let output = e
+        .cmd()
+        .env("PATH", &e.home)
+        .args(["--json", "doctor", "--probe"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Cache probe")
+        .unwrap();
+    assert_eq!(check["pass"], false, "{check}");
+    assert!(check["detail"].as_str().unwrap().contains("compilation"));
+    assert!(check["fix"].as_str().unwrap().contains("Rust toolchain"));
+    assert!(body["issues"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn doctor_compares_the_running_daemons_context_with_this_invocation() {
+    let e = env();
+    e.cmd()
+        .env("KACHE_PREFETCH_ENABLED", "1")
+        .args(["daemon", "start"])
+        .assert()
+        .success();
+    for enabled in ["1", "0"] {
+        let output = e
+            .cmd()
+            .env("KACHE_PREFETCH_ENABLED", enabled)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let checks = body["checks"].as_array().unwrap();
+        let config = checks
+            .iter()
+            .find(|check| check["label"] == "Daemon config")
+            .unwrap();
+        assert_eq!(config["pass"], enabled == "1", "{config}");
+        if enabled == "0" {
+            assert!(
+                config["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("prefetch_enabled")
+            );
+        }
+        let process = checks
+            .iter()
+            .find(|check| check["label"] == "Daemon process")
+            .unwrap();
+        assert!(
+            process["detail"].as_str().unwrap().contains("pid "),
+            "{process}"
+        );
+        #[cfg(unix)]
+        assert!(
+            process["detail"]
+                .as_str()
+                .unwrap()
+                .contains("open-file limits at startup: soft"),
+            "{process}"
+        );
+    }
+}
+
+#[test]
+fn explain_json_distinguishes_uncached_compiles_hits_and_compiler_queries() {
+    let e = env();
+    for (result, reason, expected) in [
+        ("passthrough", "store unavailable: fixture", "not_cached"),
+        ("local_hit", "", "all_hits"),
+        ("remote_hit", "", "all_hits"),
+        ("prefetch_hit", "", "all_hits"),
+        (
+            "passthrough",
+            "not-a-compile|--print cfg",
+            "no_cache_lookups",
+        ),
+    ] {
+        let event = serde_json::json!({"ts": chrono::Utc::now(), "crate_name":"demo", "result":result, "elapsed_ms":1, "size":1, "passthrough_reason":reason, "schema":26});
+        std::fs::write(e.cache.join("events.jsonl"), format!("{event}\n")).unwrap();
+        let output = e
+            .cmd()
+            .args(["--json", "explain", "demo"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["diagnosis"], expected, "{body}");
+    }
+}
+
+#[test]
 fn doctor_reports_recent_store_warning_when_database_is_healthy() {
     let e = env();
     let hash = blake3::hash(e.cache.as_os_str().as_encoded_bytes()).to_hex();

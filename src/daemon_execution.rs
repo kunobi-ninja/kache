@@ -1557,7 +1557,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(results[0].is_ok());
+        assert!(results[0].is_ok(), "{:?}", results[0]);
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(
             std::fs::read_to_string(path.join("record"))

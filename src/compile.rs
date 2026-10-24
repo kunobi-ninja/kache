@@ -2162,6 +2162,24 @@ fi
     /// The bound counts every escape the standard library may add: quotes
     /// around a word, a backslash before each quote and doubled backslashes.
     #[test]
+    fn response_file_selection_preserves_exact_fits_and_short_circuits() {
+        assert!(!needs_response_file(false, || 32_767, Some(32_767)));
+        assert!(needs_response_file(false, || 32_768, Some(32_767)));
+        assert!(needs_response_file(
+            true,
+            || panic!("Cargo's response file does not need a size check"),
+            None,
+        ));
+        assert!(!needs_response_file(
+            false,
+            || panic!("unlimited platforms do not need a size check"),
+            None,
+        ));
+        let cmd = std::process::Command::new("rustc");
+        assert!(command_needs_response_file(true, &cmd, ["lib.rs"]));
+    }
+
+    #[test]
     fn the_windows_command_line_bound_counts_quotes_escapes_and_wide_characters() {
         let bound = |words: &[&str]| {
             windows_command_line_bound(words.iter().map(|w| std::ffi::OsStr::new(*w)))

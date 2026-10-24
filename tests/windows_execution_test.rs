@@ -310,8 +310,8 @@ fn cold_daemon_survives_the_client_and_warm_frontends_need_no_engine() {
 fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
     let fixture = Fixture::new();
     let rustc = fixture.rustc();
-    let out = fixture.path("work/out");
-    std::fs::create_dir(&out).unwrap();
+    let out = fixture.path("work/target/debug/deps");
+    std::fs::create_dir_all(&out).unwrap();
     std::fs::write(
         fixture.path("work/main.rs"),
         "fn main() {print!(\"msvc-defaultlib\");}\n",
@@ -328,8 +328,10 @@ fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
                 name,
                 "--crate-type=bin",
                 "--emit=link,dep-info",
-                "--out-dir",
-                "out",
+            ])
+            .arg("--out-dir")
+            .arg(&out)
+            .args([
                 "-Cdebuginfo=0",
                 "-Clink-args=/NODEFAULTLIB:kache-unused.lib /DEFAULTLIB:ucrt.lib",
                 "main.rs",

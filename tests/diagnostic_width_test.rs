@@ -61,12 +61,12 @@ fn compile(project: &Path, cache: &Path, wrapped: bool, flags: &[&str]) -> Outpu
 }
 
 fn diagnostics(output: &Output, project: &Path) -> String {
-    // Kache compiles through /proc/self/cwd on Linux. Compare rendering apart
-    // from this existing source-path difference.
+    // Compare rendering apart from Kache's existing stable workspace paths.
     String::from_utf8(output.stderr.clone())
         .unwrap()
         .replace(project.to_str().unwrap(), "<PROJECT>")
         .replace("/proc/self/cwd", "<PROJECT>")
+        .replace("/kache/workspace", "<PROJECT>")
 }
 
 #[test]

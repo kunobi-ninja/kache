@@ -242,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn standalone_lockfile_filters_only_default_pulls_without_running_cargo() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.lock"),
+            "version = 3\n[[package]]\nname = \"stand-alone\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        for filtered in [false, true] {
+            let scope = resolve_at(None, root.path(), filtered, |_, _| {
+                panic!("a lockfile without a manifest must not invoke Cargo")
+            })
+            .unwrap();
+            assert!(scope.workspace.is_none());
+            assert_eq!(
+                scope.pull,
+                filtered.then(|| HashSet::from(["stand_alone".into()]))
+            );
+        }
+        std::fs::remove_file(root.path().join("Cargo.lock")).unwrap();
+        let scope = resolve_at(None, root.path(), true, |_, _| panic!("no Cargo project")).unwrap();
+        assert!(scope.workspace.is_none());
+        assert!(scope.pull.is_none());
+    }
+
+    #[test]
     fn targets_use_opaque_package_ids_and_exclude_build_scripts() {
         let metadata: Metadata = serde_json::from_value(serde_json::json!({
             "workspace_root": ".",

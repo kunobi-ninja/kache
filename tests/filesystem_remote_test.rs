@@ -1000,6 +1000,11 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
         client.stop_daemon_and_wait();
     };
     build(&alpha);
+    let unrelated_source = project.path().join("unrelated.rs");
+    std::fs::write(&unrelated_source, "pub fn unrelated() {}\n").unwrap();
+    let unrelated_output = TempDir::new().unwrap();
+    alpha.compile(&unrelated_source, unrelated_output.path());
+    alpha.stop_daemon_and_wait();
     // Publish outside the workspace so the explicit push includes dependencies.
     let pushed = alpha.run_within_at(
         Some(shared.path()),
@@ -1012,6 +1017,9 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     let cold = alpha.report();
+    let unrelated_key = crate_event(&cold, "fsremote")["cache_key"]
+        .as_str()
+        .unwrap();
     let lock_before = std::fs::read(project.path().join("Cargo.lock")).unwrap();
     let pulled = beta.run_within_at_env(
         Some(project.path()),
@@ -1036,6 +1044,10 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
             String::from_utf8_lossy(&pulled.stdout)
         );
     }
+    assert!(
+        !beta.cache_dir.join("store").join(unrelated_key).exists(),
+        "default pull must not import unrelated remote crates"
+    );
     // The workspace's lockfile also governs calls from a member subdirectory
     // and explicit manifests invoked beside an unrelated lockfile.
     let unrelated = TempDir::new().unwrap();
@@ -1083,6 +1095,10 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
                 String::from_utf8_lossy(&pulled.stdout)
             );
         }
+        assert!(
+            !client.cache_dir.join("store").join(unrelated_key).exists(),
+            "manifest selection must preserve filtered pulls"
+        );
     }
     assert_eq!(
         std::fs::read(project.path().join("Cargo.lock")).unwrap(),

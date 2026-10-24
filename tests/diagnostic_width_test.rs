@@ -158,7 +158,7 @@ fn terminal_output(mut command: std::process::Command, columns: u16) -> Output {
 
     let mut master = -1;
     let mut slave = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 24,
         ws_col: columns,
         ws_xpixel: 0,
@@ -171,8 +171,8 @@ fn terminal_output(mut command: std::process::Command, columns: u16) -> Output {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                &raw mut size,
             )
         },
         0

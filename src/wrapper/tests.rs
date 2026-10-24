@@ -4634,7 +4634,15 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
 
 #[test]
 fn restore_link_strategy_shares_only_the_named_loadable_kind() {
-    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink};
+    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink, WritableCopy};
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Metadata, false, None),
+        WritableCopy
+    );
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Metadata, true, None),
+        Copy
+    );
     let proc_macro = Some(ArtifactKind::DynamicLibrary);
     let build_script = Some(ArtifactKind::Executable);
     assert_eq!(

@@ -66,13 +66,13 @@ mod tests {
             "foo.wasm",
             "foo.d",
             "foo.pp",
+            "foo.rmeta",
             "foo",
         ] {
             assert!(!CompilerArtifactPolicy::allow_hardlink(name), "{name}");
         }
         for name in [
             "foo.rlib",
-            "foo.rmeta",
             "foo.o",
             "foo.obj",
             "foo.dwo",

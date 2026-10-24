@@ -252,14 +252,15 @@ pub enum ArtifactKind {
 
 impl ArtifactKind {
     /// Link strategy for restoring this kind. Mutable artifacts (executables,
-    /// dynamic libraries) must end up as independent files on filesystems
-    /// without CoW reflink, so post-build mutations don't propagate into the
+    /// dynamic libraries, and Rust metadata rewritten by cargo fix) must end
+    /// up as independent files without CoW reflink, so mutations cannot reach the
     /// cache blob. Immutable kinds may share an inode (hardlink fallback).
     pub fn link_strategy(self) -> LinkStrategy {
         match self {
             ArtifactKind::Executable | ArtifactKind::DynamicLibrary | ArtifactKind::WasmModule => {
                 LinkStrategy::Copy
             }
+            ArtifactKind::Metadata => LinkStrategy::WritableCopy,
             _ => LinkStrategy::Hardlink,
         }
     }
@@ -1910,6 +1911,10 @@ mod tests {
         assert_eq!(
             classify_by_filename("foo.tar"),
             ArtifactKind::Other("unknown-ext")
+        );
+        assert_eq!(
+            ArtifactKind::Metadata.link_strategy(),
+            LinkStrategy::WritableCopy
         );
         // DebugBundle restores via hardlink like every immutable kind — the
         // tar is never mutated in place (the unpack writes siblings).

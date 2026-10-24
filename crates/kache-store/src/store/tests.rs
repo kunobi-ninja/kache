@@ -546,7 +546,7 @@ impl ArtifactPolicy for TestPolicy {
             std::path::Path::new(name)
                 .extension()
                 .and_then(|ext| ext.to_str()),
-            Some("rlib" | "rmeta" | "o" | "obj" | "a" | "lib" | "pdb" | "dwo" | "tar" | "unknown")
+            Some("rlib" | "o" | "obj" | "a" | "lib" | "pdb" | "dwo" | "tar" | "unknown")
         )
     }
     fn allow_empty(name: &str, kinds: &[String]) -> bool {
@@ -674,13 +674,7 @@ fn hardlink_eligibility_mirrors_restore_strategy_with_insert_exclusions() {
     let gate_open = !cfg!(windows);
 
     // Immutable kinds the restore side hardlinks: eligible.
-    for name in [
-        "libserde-abc123.rlib",
-        "libserde-abc123.rmeta",
-        "foo.rcgu.o",
-        "foo.obj",
-        "foo.dwo",
-    ] {
+    for name in ["libserde-abc123.rlib", "foo.rcgu.o", "foo.obj", "foo.dwo"] {
         assert_eq!(
             hardlink_eligible::<TestPolicy>(name, false),
             gate_open,
@@ -688,7 +682,11 @@ fn hardlink_eligibility_mirrors_restore_strategy_with_insert_exclusions() {
         );
     }
 
-    // Mutable kinds (Copy strategy on restore): never eligible.
+    // Mutable kinds (independent copies on restore): never eligible.
+    assert!(!hardlink_eligible::<TestPolicy>(
+        "libserde-abc123.rmeta",
+        false
+    ));
     assert!(!hardlink_eligible::<TestPolicy>("libfoo.dylib", false));
     assert!(!hardlink_eligible::<TestPolicy>("libfoo.so", false));
     assert!(!hardlink_eligible::<TestPolicy>("foo.exe", false));
@@ -1049,6 +1047,52 @@ fn materialize_blob_without_hardlink_permission_does_not_share_inode() {
         "allow_hardlink=false must copy, not hardlink"
     );
     assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_put_without_reflink_keeps_outputs_writable() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let _force = ForceStoreHardlink::enable();
+    for name in ["foo.rmeta", "foo.rlib"] {
+        let output = dir.path().join(name);
+        // The second put finds an already-present blob.
+        for key in ["first", "existing"] {
+            if output.exists() {
+                fs::remove_file(&output).unwrap();
+            }
+            fs::write(&output, name).unwrap();
+            store
+                .put(
+                    key,
+                    "foo",
+                    &[],
+                    &[],
+                    "",
+                    "",
+                    &[(output.clone(), name.into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            let entry = store.get(key).unwrap().unwrap();
+            let blob = store.blob_path(&entry.files[0].hash);
+            let output_meta = fs::metadata(&output).unwrap();
+            let blob_meta = fs::metadata(&blob).unwrap();
+            assert!(blob_meta.permissions().readonly());
+            if name.ends_with(".rmeta") {
+                assert!(!output_meta.permissions().readonly());
+                assert_ne!(output_meta.ino(), blob_meta.ino());
+                fs::write(&output, b"fixed metadata").unwrap();
+                assert_eq!(fs::read(&blob).unwrap(), name.as_bytes());
+            } else if key == "first" {
+                assert_eq!(output_meta.ino(), blob_meta.ino());
+            }
+        }
+    }
 }
 
 #[test]

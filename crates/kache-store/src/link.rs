@@ -417,7 +417,9 @@ pub(crate) fn warn_hardlink_fallback_once(
 ///   only while the blob has no existing consumer. Later restores use private
 ///   copies so their required mtime stamp cannot mutate a still-linked artifact
 ///   another process is reading (#794). This is for immutable artifacts like
-///   `.rlib` / `.rmeta` where the build won't modify the content in place.
+///   `.rlib` / object files where the build won't modify the content in place.
+/// - `WritableCopy`: fall back to a writable, non-executable independent copy.
+///   Rust metadata may be rewritten by `cargo fix` without the wrapper.
 /// - `Copy`: fall back to a plain byte copy (independent file). For
 ///   executables, dylibs, and proc-macros that may be mutated post-build
 ///   (codesigning, stripping, etc.).
@@ -430,6 +432,7 @@ pub(crate) fn warn_hardlink_fallback_once(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkStrategy {
     Hardlink,
+    WritableCopy,
     Copy,
     ExecutableHardlink,
 }
@@ -484,9 +487,10 @@ fn link_to_target_via(
             Ok(()) => {
                 match strategy {
                     LinkStrategy::Hardlink => set_owner_write_permission(target_path)?,
+                    LinkStrategy::WritableCopy => set_copy_permissions(target_path, false)?,
                     // Executables and loadable libraries also need execute bits.
                     LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
-                        set_executable_permissions(target_path)?
+                        set_copy_permissions(target_path, true)?
                     }
                 }
                 tracing::debug!(
@@ -542,12 +546,16 @@ fn link_to_target_via(
             {
                 executable_hardlink_or_copy(store_path, target_path, bytes)
             }
-            LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
-                // Copying here is by design (executables/dylibs may be mutated after
-                // the build), so no storage-layout advice — but a large artifact that
+            LinkStrategy::WritableCopy | LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
+                // Copying here is by design (metadata and executables may be mutated
+                // after the build), so no storage-layout advice — but a large artifact that
                 // failed to block-clone on a CoW volume is still a real fault and is
                 // reported rather than swallowed.
-                copy_file(store_path, target_path, true)?;
+                copy_file(
+                    store_path,
+                    target_path,
+                    strategy != LinkStrategy::WritableCopy,
+                )?;
                 #[cfg(windows)]
                 warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, false);
                 crate::opcounts::record_copied(bytes);
@@ -1166,16 +1174,17 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
         .with_context(|| format!("setting owner write permission on {}", path.display()))
 }
 
-/// Set 0o755 after an executable/dylib reflink. Reflink preserves the store
-/// blob's read-only mode, but runtime-loaded artifacts must be executable.
-fn set_executable_permissions(path: &Path) -> Result<()> {
-    if let Some(result) =
-        crate::workspace::dispatch(crate::workspace::Operation::Permissions(path, 0o755))
-    {
+/// Restore writable permissions on a private clone, with execute bits only
+/// for executables and loadable libraries. Never call this on a hardlink.
+fn set_copy_permissions(path: &Path, executable: bool) -> Result<()> {
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Permissions(
+        path,
+        if executable { 0o755 } else { 0o644 },
+    )) {
         return result.map_err(Into::into);
     }
-    kache_fs::set_writable_permissions(path, true)
-        .with_context(|| format!("setting executable permissions on {}", path.display()))
+    kache_fs::set_writable_permissions(path, executable)
+        .with_context(|| format!("setting copy permissions on {}", path.display()))
 }
 
 /// Clone a file using the shared filesystem implementation.
@@ -4849,7 +4858,7 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             fs::set_permissions(&path, permissions).unwrap();
         }
 
-        set_executable_permissions(&path).unwrap();
+        set_copy_permissions(&path, true).unwrap();
 
         #[cfg(unix)]
         {
@@ -5324,6 +5333,86 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
     #[cfg(unix)]
     fn running_as_root() -> bool {
         unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_copy_restore_isolates_metadata_even_over_a_readonly_hardlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let target = dir.path().join("libfoo.rmeta");
+        fs::write(&blob, b"metadata").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        for existing in [false, true] {
+            if existing {
+                fs::remove_file(&target).unwrap();
+                fs::hard_link(&blob, &target).unwrap();
+            }
+            let copied = crate::opcounts::thread_copied_bytes();
+            link_to_target_via(&blob, &target, LinkStrategy::WritableCopy, no_reflink).unwrap();
+            assert_eq!(crate::opcounts::thread_copied_bytes() - copied, 8);
+            assert_ne!(ino_of(&target), ino_of(&blob));
+            assert_eq!(mode_of(&target), 0o644);
+            assert_eq!(fs::read(&target).unwrap(), b"metadata");
+            fs::write(&target, b"fixed").unwrap();
+            assert_eq!(fs::read(&blob).unwrap(), b"metadata");
+            assert_eq!(mode_of(&blob), 0o444);
+        }
+        write_restored(&target, b"in-memory metadata", LinkStrategy::WritableCopy).unwrap();
+        assert_eq!(mode_of(&target), 0o644);
+        assert_eq!(fs::read(&target).unwrap(), b"in-memory metadata");
+        assert_eq!(fs::read(&blob).unwrap(), b"metadata");
+
+        let missing = dir.path().join("missing");
+        let error = link_to_target_via(&missing, &target, LinkStrategy::WritableCopy, no_reflink)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        if !running_as_root() {
+            let denied = dir.path().join("denied");
+            fs::create_dir(&denied).unwrap();
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o555)).unwrap();
+            let error = link_to_target_via(
+                &blob,
+                &denied.join("metadata"),
+                LinkStrategy::WritableCopy,
+                no_reflink,
+            )
+            .unwrap_err();
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_copy_reflink_is_writable_and_non_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let target = dir.path().join("libfoo.rmeta");
+        fs::write(&blob, b"metadata").unwrap();
+        // Even an executable imported blob must restore as ordinary metadata.
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+        if let Err(error) = try_reflink(&blob, &dir.path().join("probe")) {
+            eprintln!("reflink unavailable on test filesystem: {error}");
+            return;
+        }
+        link_to_target(&blob, &target, LinkStrategy::WritableCopy).unwrap();
+        assert_ne!(ino_of(&target), ino_of(&blob));
+        assert_eq!(mode_of(&target), 0o644);
+        assert_eq!(fs::read(&target).unwrap(), b"metadata");
+        fs::write(&target, b"fixed").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"metadata");
+        assert_eq!(mode_of(&blob), 0o555);
     }
 
     #[test]

@@ -7392,6 +7392,37 @@ fn header_probe_scanner_refuses_conditionals_that_can_paste_an_operator_alias() 
 }
 
 #[test]
+fn header_probe_scanner_binds_constant_arguments_to_token_paste_helpers() {
+    let text = b"#define JOIN3(a,b,c) a##b##c\n#define INT_MAX_FOR(n) JOIN3(INT,n,_MAX)\n#define INT64_MAX 1\n#define HAS(x) __has_include(x)\n#if INT_MAX_FOR(64) && HAS(<optional.h>)\n#endif\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    let text = b"#define JOIN3(a,b,c) a##b##c\n#define INT64_MAX 1\n#define HAS(x) __has_include(x)\n#if JOIN3(INT,64,_MAX) && HAS(<optional.h>)\n#endif\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    for text in [
+        "#define JOIN(a,b) a##b\n#define ARG H\n#define HAS(x) __has_include(x)\n#if JOIN(ARG,AS)(<optional.h>)\n#endif\n",
+        "#define JOIN(a,b,...) a##b##__VA_ARGS__\n#define HAS(x) __has_include(x)\n#if JOIN(H,A,S,,)(<optional.h>)\n#endif\n",
+        "#define JOIN(a,b) a##b\n#define JOIN(a,b) OTHER(a,b)\n#define HAS(x) __has_include(x)\n#if JOIN(X,Y)(<optional.h>)\n#endif\n",
+        "#define JOIN(a,b) a##b\n#define WRAP(...) JOIN(__VA_ARGS__,AS)\n#define HAS(x) __has_include(x)\n#if WRAP(H)(<optional.h>)\n#endif\n",
+        "#define JOIN(a,b) a##b\n#define WRAP($) JOIN($,AS)\n#define HAS(x) __has_include(x)\n#if WRAP(H)(<optional.h>)\n#endif\n",
+        "#define JOIN$(a,b) a##b\n#define HAS(x) __has_include(x)\n#if JOIN$(H,AS)(<optional.h>)\n#endif\n",
+        "#define $JOIN(a,b) a##b\n#define HAS(x) __has_include(x)\n#if $JOIN(H,AS)(<optional.h>)\n#endif\n",
+    ] {
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{text}");
+    }
+}
+
+#[test]
 fn header_probe_aliases_from_compiler_definitions_follow_header_availability() {
     let temp = tempfile::tempdir().unwrap();
     let (mut parsed, source, include) =

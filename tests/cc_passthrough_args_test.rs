@@ -500,14 +500,15 @@ fn cc_header_availability_creation_uses_current_compiler_output() {
     }
 }
 
-/// Compile `unit.c` in `root` through kache with `args` after the source,
+/// Compile `unit.c` in `root` through kache with `args` before the source,
 /// then link and run it. Returns the cache key the compile used and the
 /// program's exit code.
 fn compile_and_run_unit(root: &std::path::Path, discovery: &str, args: &[&str]) -> (String, i32) {
     let _ = fs::remove_file(root.join("unit.o"));
     let compiled = cacheable_cc_command(root)
-        .args(["/usr/bin/cc", "-c", "unit.c", "-o", "unit.o"])
+        .args(["/usr/bin/cc", "-c"])
         .args(args)
+        .args(["unit.c", "-o", "unit.o"])
         .env("HOME", root.join("home"))
         .env("KACHE_DEFERRED_DISCOVERY", discovery)
         .env("KACHE_DAEMON_PUBLISH", "0")
@@ -686,6 +687,25 @@ fn cc_forwarded_header_probes_cache_and_follow_optional_header_changes() {
         .unwrap();
         assert_probe_follows_optional_header(&root, args, 11);
     }
+}
+
+#[test]
+fn cc_forwarded_header_probes_with_cpp_standard_headers() {
+    let dir = FixtureDir::new();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::create_dir(root.join("home")).unwrap();
+    fs::create_dir(root.join("inc")).unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include <cstddef>\n#include <type_traits>\n#include <string_view>\n\
+         #define HAS(x) __has_include(x)\n\
+         #if HAS(<optional.h>)\n#include <optional.h>\n#else\n#define VALUE 11\n#endif\n\
+         static_assert(std::is_integral_v<int>);\n\
+         int main() { return sizeof(std::string_view) ? VALUE : 255; }\n",
+    )
+    .unwrap();
+    assert_probe_follows_optional_header(&root, &["-x", "c++", "-std=c++17", "-Iinc"], 11);
 }
 
 #[test]

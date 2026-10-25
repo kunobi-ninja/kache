@@ -7435,6 +7435,18 @@ fn header_probe_macro_parameters_shadow_global_paste_helpers() {
 }
 
 #[test]
+fn header_probe_scanner_keeps_fixed_prefixes_on_parenthesized_paste_chains() {
+    let text = b"#define HAS(x) __has_include(x)\n#define PREFIX_HAS 1\n#define CHECK(a,b) (PREFIX_ ## a ## b)\n#if CHECK(H,AS) && HAS(<optional.h>)\n#endif\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+}
+
+#[test]
 fn header_probe_scanner_does_not_treat_cpp_control_flow_as_a_directive() {
     let text = b"#define JOIN(a,b) a##b\n#define HAS(x) __has_include(x)\nint HAS;\nint f(void) {\nif (JOIN(H,AS)) return 1;\nreturn 0;\n}\n#if HAS(<optional.h>)\n#endif\n";
     assert_eq!(
@@ -7510,14 +7522,19 @@ fn header_probe_aliases_from_compiler_definitions_follow_header_availability() {
     let header = sub.join("probe.h");
     fs::write(&header, "#if HAVE\n#endif\n").unwrap();
     parsed.defines = vec![("HAVE".into(), Some("__has_include(\"optional.h\")".into()))];
-    assert!(probed_header_moves_the_key(
-        &parsed,
-        &[source.clone(), header],
-        &sub.join("optional.h")
-    ));
+    assert!(digest_cc_include_shadowing(&parsed, &[source.clone(), header]).is_err());
     fs::write(&source, "#if HAS(HEADER)\n#endif\n").unwrap();
     parsed.defines = vec![("HAS(x)".into(), Some("__has_include(x)".into()))];
     assert!(digest_cc_include_shadowing(&parsed, &[source]).is_err());
+}
+
+#[test]
+fn header_probe_scanner_refuses_quoted_probes_inside_macro_bodies() {
+    for body in ["__has_include(\"optional.h\")", "HAS(\"optional.h\")"] {
+        let text =
+            format!("#define HAS(x) __has_include(x)\n#define HAVE {body}\n#if HAVE\n#endif\n");
+        assert!(cc_header_probes(text.as_bytes()).is_none(), "{body}");
+    }
 }
 
 #[test]

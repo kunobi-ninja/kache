@@ -5660,7 +5660,7 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = file_hasher.cc_header_scans(&read_inputs, 4, &|path| {
+    let scans = file_hasher.cc_header_scans(&read_inputs, 5, &|path| {
         let bytes = fs::read(path)
             .with_context(|| format!("reading header availability input {}", path.display()))?;
         let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
@@ -5716,9 +5716,6 @@ fn cc_shadowing_names(
                 input.display()
             );
         };
-        // A command-line macro can expand in any read header. Checking every
-        // enclosing directory overapproximates quoted lookup without guessing
-        // the expansion site; unquoted probes keep the usual search roots.
         for probe in probes.iter().chain(&argument_probes) {
             let mut candidates = Vec::new();
             if probe.quoted
@@ -6017,15 +6014,6 @@ fn cc_scan_header_probe_line(
         let name = String::from_utf8_lossy(directive[1]).into_owned();
         let function = directive.get(2) == Some(&b"(".as_slice())
             && spans[offset + 1].end == spans[offset + 2].start;
-        let target = match directive {
-            [_, _, target] if identifier(target) => Some(*target),
-            [_, _, b"(", param, b")", target, b"(", arg, b")"]
-                if function && identifier(param) && param == arg && identifier(target) =>
-            {
-                Some(*target)
-            }
-            _ => None,
-        };
         let body_at = if function {
             directive
                 .iter()
@@ -6050,6 +6038,17 @@ fn cc_scan_header_probe_line(
             .collect::<Vec<_>>();
         uses.sort_unstable();
         uses.dedup();
+        let target = match directive {
+            // `uses` already excludes literal tokens; an object alias has
+            // exactly one replacement token and at most one identifier use.
+            [_, _, _] => uses.first().map(|used| used.name.clone()),
+            [_, _, b"(", param, b")", target, b"(", arg, b")"]
+                if function && identifier(param) && param == arg && identifier(target) =>
+            {
+                Some(String::from_utf8_lossy(target).into_owned())
+            }
+            _ => None,
+        };
         let mut parameter_names = parameters
             .iter()
             .filter(|word| **word != b",")
@@ -6060,8 +6059,7 @@ fn cc_scan_header_probe_line(
         }
         scan.macro_uses.push((name.clone(), parameter_names, uses));
         if let Some(target) = target {
-            scan.aliases
-                .push((name, String::from_utf8_lossy(target).into_owned()));
+            scan.aliases.push((name, target));
             return Some(());
         }
         cc_header_macro_pastes(&name, body, parameters, function, scan);
@@ -6086,7 +6084,10 @@ fn cc_scan_header_probe_line(
         if conditional || definition || matches!(*word, b"__has_include" | b"__has_include_next") {
             scan.uses.push((
                 String::from_utf8_lossy(word).into_owned(),
-                cc_literal_header_probe(text, spans[index].end),
+                // A quoted probe in a macro searches beside its expansion
+                // site, which this definition scan cannot locate.
+                cc_literal_header_probe(text, spans[index].end)
+                    .filter(|probe| !definition || !probe.quoted),
             ));
         }
     }

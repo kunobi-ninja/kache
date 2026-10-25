@@ -156,7 +156,7 @@ Literal `__has_include` and `__has_include_next` probes track header availabilit
 
 Transparent aliases such as `#define HAS_INCLUDE(x) __has_include(x)` and `#define HAS_INCLUDE __has_include` use the same checks when called with literal header names. Definitions and calls can live in different headers.
 
-Kache caches the source analysis by content hash. A settled warm memo reuses that analysis without reading every header again. Probes whose header name comes from a macro, wrappers that transform the argument, and trigraph line continuations pass through.
+Kache caches the source analysis by content hash. A settled warm memo reuses that analysis without reading every header again. Probes whose header name comes from a macro, quoted probes inside macro bodies, wrappers that transform the argument, and trigraph line continuations pass through. Quoted probes in macro bodies search beside the expansion site, which the source analysis cannot locate.
 
 ## Passthroughs
 
@@ -172,7 +172,7 @@ Kache currently passes through:
 - assembly, including inline `asm` in C, that reads another file with `.incbin` or `.include`
 - assembly that uses macros or repetitions (`.macro`, `.irp`, `.irpc`, `.rept`, `.altmacro`) able to generate those directives
 - inline `asm` whose text is a computed expression rather than a string literal
-- header availability probes with macro header names, wrappers that transform the argument, or trigraph line continuations
+- header availability probes with macro header names, quoted probes inside macro bodies, wrappers that transform the argument, or trigraph line continuations
 - flags it has not classified
 
 With link caching enabled, explicit archive inputs such as `libvalue.a` remain eligible for caching. Links that select libraries by name (`-l`, `--library`) or read response files pass through because the link key cannot track their selected library inputs. Search-directory options such as `-L` and GNU ld's `--library-path` alone do not select a named library.

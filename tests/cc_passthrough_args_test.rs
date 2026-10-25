@@ -735,6 +735,53 @@ fn cc_opaque_header_probe_macros_remain_uncached() {
 }
 
 #[test]
+fn cc_quoted_header_probe_macro_expands_in_the_callers_directory() {
+    for body in ["__has_include(\"optional.h\")", "HAS(\"optional.h\")"] {
+        let dir = FixtureDir::new();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("kache.toml"), "").unwrap();
+        for path in ["home", "defs", "caller"] {
+            fs::create_dir(root.join(path)).unwrap();
+        }
+        fs::write(
+            root.join("defs/probes.h"),
+            format!("#define HAS(x) __has_include(x)\n#define HAVE {body}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("caller/use.h"),
+            "#if HAVE\n#define VALUE 23\n#else\n#define VALUE 11\n#endif\n",
+        )
+        .unwrap();
+        fs::write(root.join("unit.c"),
+            "#include \"defs/probes.h\"\n#include \"caller/use.h\"\nint main(void) { return VALUE; }\n"
+        ).unwrap();
+        for discovery in ["0", "1"] {
+            let _ = fs::remove_file(root.join("caller/optional.h"));
+            for (present, expected) in [
+                (false, 11),
+                (false, 11),
+                (true, 23),
+                (true, 23),
+                (false, 11),
+            ] {
+                if present {
+                    fs::write(root.join("caller/optional.h"), "").unwrap();
+                } else {
+                    let _ = fs::remove_file(root.join("caller/optional.h"));
+                }
+                let (key, value) = compile_and_run_unit(&root, discovery, &[]);
+                assert!(
+                    key.is_empty(),
+                    "{body}: unknown macro expansion sites must not cache"
+                );
+                assert_eq!(value, expected, "{body}: discovery={discovery}");
+            }
+        }
+    }
+}
+
+#[test]
 fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
     let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();

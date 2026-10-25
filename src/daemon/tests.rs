@@ -6226,12 +6226,14 @@ async fn prediction_fetch_deadline_cancels_stalled_get_and_degrades_reads() {
     let mut daemon = resilience_test_daemon(dir.path(), Arc::new(StallingGetBackend));
     daemon.config.remote_restore_timeout_secs = 1;
     daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(60)));
-    let response = tokio::time::timeout(
-        Duration::from_secs(5),
-        daemon.handle_prediction_fetch(&fetch_request(ROW_IDENTITY)),
-    )
-    .await
-    .expect("a stalled prediction GET must end within its budget");
+    let request = fetch_request(ROW_IDENTITY);
+    let fetch = daemon.handle_prediction_fetch(&request);
+    tokio::pin!(fetch);
+    // Establish the handler's deadline before starting the test's guard.
+    assert!(futures::poll!(&mut fetch).is_pending());
+    let response = tokio::time::timeout(Duration::from_millis(1_500), fetch)
+        .await
+        .expect("the configured one-second deadline must beat the two-second row cap");
     assert!(response.ok);
     assert_eq!(response.prediction, None);
     assert!(

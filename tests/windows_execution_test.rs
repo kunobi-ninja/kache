@@ -306,6 +306,67 @@ fn cold_daemon_survives_the_client_and_warm_frontends_need_no_engine() {
 }
 
 #[test]
+fn response_file_handles_injected_remaps_that_alone_exceed_the_windows_limit() {
+    let fixture = Fixture::new();
+    let rustc = fixture.rustc();
+    let roots: Vec<String> = (0..512)
+        .map(|index| format!("C:/kache-response-file-test/source-tree-{index:04}/a-long-prefix-for-the-remap-regression"))
+        .collect();
+    assert!(
+        roots
+            .iter()
+            .map(|root| root.encode_utf16().count())
+            .sum::<usize>()
+            > 32_767
+    );
+    let config = fixture.path("config.toml");
+    let mut contents = std::fs::read_to_string(&config).unwrap();
+    contents.push_str(&format!(
+        "\n[paths]\nbase_dirs = {}\n",
+        toml::Value::Array(roots.into_iter().map(toml::Value::String).collect())
+    ));
+    std::fs::write(config, contents).unwrap();
+    let out = fixture
+        .path("work")
+        .join("target")
+        .join("debug")
+        .join("deps");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        fixture.path("work/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    common::settle_writes(&[fixture.root.path()]);
+    let build = || {
+        let mut command = fixture.command(fixture.path("install/kache.exe"));
+        command
+            .arg(&rustc)
+            .args([
+                "--crate-name",
+                "response_canary",
+                "--crate-type=rlib",
+                "--emit=link,dep-info",
+                "--out-dir",
+            ])
+            .arg(&out)
+            .arg("lib.rs");
+        command
+    };
+    fixture.success(&mut build());
+    let artifact = out.join("libresponse_canary.rlib");
+    let expected = std::fs::read(&artifact).unwrap();
+    std::fs::remove_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    fixture.success(&mut build());
+    assert_eq!(std::fs::read(artifact).unwrap(), expected);
+    let events = fixture.events("response_canary", 2);
+    assert_eq!(events[0]["result"], "miss", "{events:#?}");
+    assert_eq!(events[1]["result"], "local_hit", "{events:#?}");
+    assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
+}
+
+#[test]
 #[cfg(target_env = "msvc")]
 fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
     let fixture = Fixture::new();

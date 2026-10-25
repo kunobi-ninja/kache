@@ -244,11 +244,11 @@ pub(crate) fn run_rustc(
     // Skipped under coverage instrumentation — tools like tarpaulin
     // and llvm-cov need original source paths in profraw data to
     // map coverage hits back to source files.
-    if !skip_remap {
-        for arg in path_normalizer.remap_args() {
-            cmd.arg(arg);
-        }
-    }
+    let remap_args = if skip_remap {
+        Vec::new()
+    } else {
+        path_normalizer.remap_args()
+    };
 
     // Normal artifact-cache compiles disable incremental compilation: the key
     // leaves the flag out, so a stored artifact must come from a compile
@@ -257,13 +257,14 @@ pub(crate) fn run_rustc(
     // instead, which preserve only a path Kache isolated and locked before
     // this call. CARGO_INCREMENTAL=0 alone would be too late: Cargo already
     // put the codegen flag in argv before the wrapper runs.
-    let compiler_args = match incremental_mode {
+    let mut compiler_args: Vec<&String> = remap_args.iter().collect();
+    compiler_args.extend(match incremental_mode {
         IncrementalMode::Strip => strip_incremental_flags(args),
         IncrementalMode::PreserveIsolated { .. } => args.iter().collect(),
-    };
+    });
     // Cargo's own line fit when it used no response file, but the remapping
-    // flags above make Kache's longer: on Windows a line past the limit fails
-    // to spawn, and the compile would run uncached and unremapped.
+    // flags above make Kache's longer. Include them in the response file too:
+    // remapping flags alone can exceed the Windows command-line limit.
     let use_response_file = command_needs_response_file(
         use_response_file,
         &cmd,
@@ -1011,6 +1012,16 @@ fi
                             "out/libsample.rlib".to_owned(),
                             "relative.rs".to_owned(),
                         ];
+                        let normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+                            Some(cwd),
+                            &env,
+                        );
+                        let expected_args: Vec<_> = normalizer
+                            .remap_args()
+                            .into_iter()
+                            .chain(args.iter().cloned())
+                            .collect();
+                        assert!(expected_args.len() > args.len());
                         let mut metadata = Vec::new();
                         let result = run_rustc(
                             &env,
@@ -1025,7 +1036,7 @@ fi
                             &[],
                             false,
                             false,
-                            &crate::path_normalizer::PathNormalizer::empty(),
+                            &normalizer,
                             IncrementalMode::Strip,
                             Some(&mut metadata),
                             None,
@@ -1035,7 +1046,7 @@ fi
                         assert!(!result.signaled);
                         assert_eq!(
                             fs::read_to_string(cwd.join("actual-args")).unwrap(),
-                            format!("{}\n", args.join("\n"))
+                            format!("{}\n", expected_args.join("\n"))
                         );
                         let lines: Vec<_> = result.stdout.lines().collect();
                         assert_eq!(lines.len(), 3);

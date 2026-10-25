@@ -789,9 +789,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.7"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc907c45bb7e9ef8fc3778defd0f3cd8c81288f1b4e748eba064948f20c47122"
+checksum = "d811ea23fdfbcce2e2d5132344d471abdb8f901ac496a0893a3df92e70525e52"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -1292,7 +1292,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ad4496221fcfc21015fd8c0e26fcfab00504832dc0604f52acdd7bad2a8dc81"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.7",
+ "crypto-bigint 0.7.9",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -2718,7 +2718,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
- "crypto-bigint 0.7.7",
+ "crypto-bigint 0.7.9",
  "dirs",
  "ed25519-dalek 3.0.0",
  "hex",
@@ -2787,7 +2787,7 @@ checksum = "4e400d93f569f2e3bd935232b4d99c9c6ad70da31701547703c574a08b9cf7a2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
- "crypto-bigint 0.7.7",
+ "crypto-bigint 0.7.9",
  "dyn-clone",
  "ed25519-dalek 3.0.0",
  "hmac 0.13.0",
@@ -3840,7 +3840,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.7",
+ "crypto-bigint 0.7.9",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -4452,7 +4452,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
- "crypto-bigint 0.7.7",
+ "crypto-bigint 0.7.9",
  "hmac 0.13.0",
 ]
 

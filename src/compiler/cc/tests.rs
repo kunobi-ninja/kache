@@ -7249,7 +7249,10 @@ fn include_shadowing_keys_a_probe_beside_fallback_definitions() {
 fn include_shadowing_refuses_a_probe_through_a_macro() {
     for text in [
         "#if __has_include(HEADER)\n#endif\n",
-        "#define HAS(h) __has_include_next(h)\n",
+        "#define HAS(h) __has_include_next(h)\n#if HAS(HEADER)\n#endif\n",
+        "#define HAS(h) __has_include_next(WRAP(h))\n",
+        "#define HAS(h, other) __has_include_next(h)\n",
+        "#define HAS (h) __has_include(h)\n",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let (parsed, source, _) = probing_unit(temp.path(), text);
@@ -7258,6 +7261,169 @@ fn include_shadowing_refuses_a_probe_through_a_macro() {
             "{text}: a probe through a macro must refuse the key"
         );
     }
+}
+
+#[test]
+fn header_probe_scanner_resolves_fmt_and_xxhash_forwarding_macros() {
+    for definition in [
+        "#ifdef __has_include\n# define HAS(x) __has_include(x)\n#else\n# define HAS(x) 0\n#endif\n",
+        "#ifndef HAS\n# ifdef __has_include\n# define HAS __has_include\n# else\n# define HAS(x) 0\n# endif\n#endif\n",
+        "#define HAS_IMPL(x) NEXT(x)\n#define HAS(x) HAS_IMPL(x)\n#define NEXT __has_include_next\n",
+        "#define HAS(x) __has_include(x) // forwarding\n",
+        "#define HAS(x) /* forwarding\n */ __has_include(x)\n",
+    ] {
+        assert_eq!(
+            cc_header_probes(format!("{definition}#if HAS(<optional.h>)\n#endif\n").as_bytes()),
+            Some(vec![CcHeaderProbe {
+                name: "optional.h".into(),
+                quoted: false
+            }]),
+            "{definition}",
+        );
+    }
+    assert_eq!(
+        cc_header_probes(b"#define HAS(x) __has_include(x)\n"),
+        Some(vec![])
+    );
+    assert_eq!(
+        cc_header_probes(b"#define A B\n#define B A\n#if A(unknown)\n#endif\n"),
+        Some(vec![])
+    );
+    assert_eq!(cc_header_probes(b"#define HAS OTHER\n#define OTHER HAS\n#define HAS __has_include\n#if OTHER(<optional.h>) // use\n#endif\n"), Some(vec![CcHeaderProbe { name: "optional.h".into(), quoted: false }]));
+}
+
+#[test]
+fn header_probe_aliases_resolve_across_read_headers_and_keep_local_lookup_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(temp.path(), "#include <use.h>\n");
+    let definitions = include.join("definitions.h");
+    fs::write(
+        &definitions,
+        "#define HAS(x) IMPL(x)\n#define IMPL __has_include\n",
+    )
+    .unwrap();
+    let sub = include.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let use_header = sub.join("use.h");
+    fs::write(&use_header, "#if HAS(\"optional.h\")\n#endif\n").unwrap();
+    for inputs in [
+        vec![source.clone(), use_header.clone(), definitions.clone()],
+        vec![definitions.clone(), source.clone(), use_header.clone()],
+    ] {
+        assert!(probed_header_moves_the_key(
+            &parsed,
+            &inputs,
+            &sub.join("optional.h")
+        ));
+    }
+    fs::write(&use_header, "#if HAS(HEADER)\n#endif\n").unwrap();
+    assert!(digest_cc_include_shadowing(&parsed, &[source, definitions, use_header]).is_err());
+}
+
+#[test]
+fn header_probe_aliases_refuse_opaque_uses_and_keep_conditional_alternatives() {
+    for usage in [
+        "#if HAS(HEADER)",
+        "#define CHECK HAS",
+        "#define WRAP(x) (HAS(x))",
+        "#define WRAP(x) HAS(OTHER(x))",
+    ] {
+        let text = format!("#define HAS(x) __has_include(x)\n{usage}\n#if CHECK(HEADER)\n");
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{usage}");
+    }
+    let text = b"#if OPTION\n#define HAS(x) __has_include(x)\n#else\n#define HAS(x) 0\n#endif\n#if defined(HAS) && HAS(<optional.h>)\n#endif\n#undef HAS\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+}
+
+#[test]
+fn header_probe_scanner_handles_digraphs_and_refuses_directive_trigraphs() {
+    assert_eq!(
+        cc_header_probes(b"%:define HAS(x) __has_include(x)\n%:if HAS(<optional.h>)\n%:endif\n"),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    assert_eq!(
+        cc_header_probes(b"#define HAS __has_include\n??=if HAS(<optional.h>)\n"),
+        None
+    );
+    assert_eq!(cc_header_probes(b"#define HAS(\n"), Some(vec![]));
+}
+
+#[test]
+fn header_probe_scanner_refuses_conditionals_that_can_paste_an_operator_alias() {
+    for paste in ["a ## b", "a %:%: b", "a ## b ## __VA_ARGS__"] {
+        let text = format!(
+            "#define JOIN(a,b,...) {paste}\n#define WRAP(a,b) JOIN(a,b)\n#define HAS(x) __has_include(x)\n#if WRAP(H,AS)(<optional.h>)\n#endif\n"
+        );
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{paste}");
+    }
+    assert_eq!(
+        cc_header_probes(
+            b"#define JOIN(a,b) a##b\n#if JOIN(__has_,include)(<optional.h>)\n#endif\n"
+        ),
+        None
+    );
+    let text = b"#define HAS(x) __has_include(x)\n#define FEATURE(x) FIXED_PREFIX_ ## x\n#if FEATURE(ENABLED) && HAS(<optional.h>)\n#endif\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    for unrelated in ["HAS_EXTRA", "PREFIX_HAS"] {
+        let text = format!(
+            "#define {unrelated}(x) __has_include(x)\n#define HAS(x) 0\n#define JOIN H##AS\n#if JOIN(<optional.h>)\n#endif\n"
+        );
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![]),
+            "a pasted ordinary macro must not match a probe alias by substring: {unrelated}"
+        );
+    }
+}
+
+#[test]
+fn header_probe_aliases_from_compiler_definitions_follow_header_availability() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut parsed, source, include) =
+        probing_unit(temp.path(), "#if HAS(<optional.h>)\n#endif\n");
+    for (name, value) in [("HAS", "__has_include"), ("HAS(x)", "__has_include(x)")] {
+        parsed.defines = vec![(name.into(), Some(value.into()))];
+        assert!(probed_header_moves_the_key(
+            &parsed,
+            std::slice::from_ref(&source),
+            &include.join("optional.h")
+        ));
+    }
+    fs::write(&source, "#if HAVE\n#endif\n").unwrap();
+    parsed.defines = vec![("HAVE".into(), Some("__has_include(<optional.h>)".into()))];
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        std::slice::from_ref(&source),
+        &include.join("optional.h")
+    ));
+    let sub = temp.path().join("elsewhere");
+    fs::create_dir(&sub).unwrap();
+    let header = sub.join("probe.h");
+    fs::write(&header, "#if HAVE\n#endif\n").unwrap();
+    parsed.defines = vec![("HAVE".into(), Some("__has_include(\"optional.h\")".into()))];
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source.clone(), header],
+        &sub.join("optional.h")
+    ));
+    fs::write(&source, "#if HAS(HEADER)\n#endif\n").unwrap();
+    parsed.defines = vec![("HAS(x)".into(), Some("__has_include(x)".into()))];
+    assert!(digest_cc_include_shadowing(&parsed, &[source]).is_err());
 }
 
 #[test]

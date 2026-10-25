@@ -5660,15 +5660,39 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = file_hasher.cc_header_scans(&read_inputs, 1, &|path| {
+    let scans = file_hasher.cc_header_scans(&read_inputs, 2, &|path| {
         let bytes = fs::read(path)
             .with_context(|| format!("reading header availability input {}", path.display()))?;
-        let probes = cc_header_probes(&cc_splice_lines(&bytes));
+        let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
         Ok((
             blake3::hash(&bytes).to_hex().to_string(),
             serde_json::to_string(&probes)?,
         ))
     })?;
+    let scans = scans
+        .iter()
+        .map(|scan| serde_json::from_str::<Option<CcHeaderProbeScan>>(scan))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let definitions = parsed
+        .defines
+        .iter()
+        .map(|(name, value)| format!("#define {name} {}\n", value.as_deref().unwrap_or("1")))
+        .collect::<String>();
+    let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
+        .context("cc: unresolved header availability probe in command-line definitions")?;
+    let all_scans = || {
+        scans
+            .iter()
+            .flatten()
+            .chain(std::iter::once(&argument_scan))
+    };
+    let aliases = cc_header_probe_aliases(all_scans());
+    anyhow::ensure!(
+        cc_header_probe_pastes_are_resolved(all_scans(), &aliases)?,
+        "cc: token pasting may construct a header availability probe"
+    );
+    let argument_probes = cc_resolve_header_probes(&argument_scan, &aliases)
+        .context("cc: unresolved header availability probe in command-line definitions")?;
     let mut result = CcShadowingNames::default();
     for (input, scan) in read_inputs.iter().zip(scans) {
         let absolute = absolutize_path(cwd, input);
@@ -5684,7 +5708,7 @@ fn cc_shadowing_names(
         if let Some(file_name) = absolute.file_name() {
             result.names.insert(PathBuf::from(file_name));
         }
-        let probes: Option<Vec<CcHeaderProbe>> = serde_json::from_str(&scan)?;
+        let probes = scan.and_then(|scan| cc_resolve_header_probes(&scan, &aliases));
         let Some(probes) = probes else {
             anyhow::bail!(
                 "cc: a header availability probe (__has_include) in {} cannot be resolved \
@@ -5692,7 +5716,10 @@ fn cc_shadowing_names(
                 input.display()
             );
         };
-        for probe in probes {
+        // A command-line macro can expand in any read header. Checking every
+        // enclosing directory overapproximates quoted lookup without guessing
+        // the expansion site; unquoted probes keep the usual search roots.
+        for probe in probes.iter().chain(&argument_probes) {
             let mut candidates = Vec::new();
             if probe.quoted
                 && let Some(parent) = absolute.parent()
@@ -5701,7 +5728,7 @@ fn cc_shadowing_names(
             }
             candidates.extend(probe_dirs.iter().map(|dir| dir.join(&probe.name)));
             result.probes.push(CcProbedHeader {
-                name: probe.name,
+                name: probe.name.clone(),
                 candidates,
             });
         }
@@ -5710,12 +5737,93 @@ fn cc_shadowing_names(
 }
 
 /// A header name an availability probe tests for.
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CcHeaderProbe {
     name: PathBuf,
     /// `"name"`, searched from the probing file's directory first; else
     /// `<name>`.
     quoted: bool,
+}
+
+/// Only transparent macro forwarding is modeled. Keep uses symbolic until
+/// every read header has been scanned: an alias can be defined in one header
+/// and used in another. Conditional definitions are an overapproximation;
+/// every possible literal probe participates in the availability guard.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct CcHeaderProbeScan {
+    aliases: Vec<(String, String)>,
+    uses: Vec<(String, Option<CcHeaderProbe>)>,
+    macro_uses: Vec<(String, Vec<String>)>,
+    conditionals: Vec<String>,
+    pastes: Vec<(String, String)>,
+}
+
+fn cc_header_probe_aliases<'a>(
+    scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
+) -> HashSet<String> {
+    let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (alias, target) in scans.flat_map(|scan| &scan.aliases) {
+        edges.entry(target).or_default().push(alias);
+    }
+    let mut aliases = HashSet::new();
+    let mut pending = vec!["__has_include", "__has_include_next"];
+    while let Some(target) = pending.pop() {
+        if aliases.insert(target.to_owned())
+            && let Some(forwarders) = edges.get(target)
+        {
+            pending.extend(forwarders);
+        }
+    }
+    aliases
+}
+
+fn cc_resolve_header_probes(
+    scan: &CcHeaderProbeScan,
+    aliases: &HashSet<String>,
+) -> Option<Vec<CcHeaderProbe>> {
+    scan.uses
+        .iter()
+        .filter(|(name, _)| aliases.contains(name))
+        .map(|(_, probe)| probe.clone())
+        .collect()
+}
+
+/// A macro can manufacture an operator or alias with `##`. Refuse when a
+/// conditional can reach such a constructor. Fixed pasted prefixes, such as
+/// glibc's `__GLIBC_USE_ ## feature`, cannot spell unrelated probe aliases.
+fn cc_header_probe_pastes_are_resolved<'a>(
+    scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
+    aliases: &HashSet<String>,
+) -> Result<bool> {
+    let scans = scans.collect::<Vec<_>>();
+    let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (name, target) in scans.iter().flat_map(|scan| &scan.aliases) {
+        edges.entry(target).or_default().push(name);
+    }
+    for (name, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+        for used in uses {
+            edges.entry(used).or_default().push(name);
+        }
+    }
+    let mut pending = Vec::new();
+    for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
+        let pattern = regex::Regex::new(pattern)?;
+        if aliases.iter().any(|alias| pattern.is_match(alias)) {
+            pending.push(name.as_str());
+        }
+    }
+    let mut constructors = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if constructors.insert(name)
+            && let Some(users) = edges.get(name)
+        {
+            pending.extend(users);
+        }
+    }
+    Ok(!scans
+        .iter()
+        .flat_map(|scan| &scan.conditionals)
+        .any(|name| constructors.contains(name.as_str())))
 }
 
 /// `bytes` with every backslash-newline removed, the line splice the
@@ -5740,87 +5848,207 @@ fn cc_splice_lines(bytes: &[u8]) -> Vec<u8> {
     spliced
 }
 
-/// Every `__has_include(...)` and `__has_include_next(...)` probe in
-/// spliced source `text`, or `None` when one names its header through a
-/// macro: the name it tests then depends on a definition this scan does not
-/// evaluate.
-///
-/// Feature tests and fallback definitions of the operator are skipped.
-/// An operator alias refuses the scan because later macro expansion can
-/// supply an arbitrary header name.
+/// Resolve a self-contained source fragment, also used by scanner tests.
+#[cfg(test)]
 fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
-    // In older C modes a trigraph can splice an otherwise invisible probe.
-    // Its meaning depends on compiler mode, so do not memoize this spelling.
-    if memchr::memmem::find(text, b"??/").is_some() {
+    let scan = cc_header_probe_scan(text)?;
+    let aliases = cc_header_probe_aliases(std::iter::once(&scan));
+    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &aliases)
+        .ok()?
+        .then(|| cc_resolve_header_probes(&scan, &aliases))?
+}
+
+fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
+    // A trigraph may splice an otherwise invisible operator or alias.
+    if memchr::memmem::find(text, b"??/").is_some() || memchr::memmem::find(text, b"??=").is_some()
+    {
         return None;
     }
-    let mut probes = Vec::new();
-    let mut line = Vec::<&[u8]>::new();
+    let mut scan = CcHeaderProbeScan::default();
+    let mut line = Vec::new();
     let mut i = 0;
     while let Some(&byte) = text.get(i) {
         if byte.is_ascii_whitespace() {
             if byte == b'\n' {
+                cc_scan_header_probe_line(text, &line, &mut scan);
                 line.clear();
             }
-            let next = i + 1;
-            debug_assert!(next > i, "header probe reader must advance");
-            i = next;
+            i += 1;
             continue;
         }
         if byte == b'/' && matches!(text.get(i + 1), Some(b'*' | b'/')) {
             let end = cc_skip_comment(text, i);
-            if text[i..end].contains(&b'\n') {
+            if text.get(i + 1) == Some(&b'/') {
+                cc_scan_header_probe_line(text, &line, &mut scan);
                 line.clear();
             }
+            // Do not discard a directive when its block comment spans lines.
+            // Keeping its tokens together can only add conservative uses.
             i = end;
             continue;
         }
-        let word_end = cc_word_end(text, i);
-        let word = &text[i..word_end];
-        if matches!(word, b"__has_include" | b"__has_include_next") {
-            let definition = line.as_slice() == [b"#".as_slice(), b"define".as_slice()];
-            let feature_test = line.last() == Some(&b"defined".as_slice())
-                || line.ends_with(&[b"defined".as_slice(), b"(".as_slice()])
-                || matches!(line.as_slice(), [b"#", b"ifdef" | b"ifndef"]);
-            if !definition && !feature_test {
-                let open = cc_skip_probe_trivia(text, word_end);
-                // An alias of the operator may later receive a macro argument.
-                // Without evaluating that macro its dependencies are unknown.
-                if text.get(open) != Some(&b'(') {
-                    return None;
-                }
-                let arg = cc_skip_probe_trivia(text, open + 1);
-                let (close, quoted) = match text.get(arg) {
-                    Some(b'<') => (b'>', false),
-                    Some(b'"') => (b'"', true),
-                    _ => return None,
-                };
-                let start = arg + 1;
-                let end = start + memchr::memchr(close, &text[start..])?;
-                let name = std::str::from_utf8(&text[start..end]).ok()?;
-                if name.is_empty() || name.contains('\n') {
-                    return None;
-                }
-                let after = cc_skip_probe_trivia(text, end + 1);
-                if text.get(after) != Some(&b')') {
-                    return None;
-                }
-                probes.push(CcHeaderProbe {
-                    name: PathBuf::from(name),
-                    quoted,
-                });
-                // The lexer consumes the closing parenthesis as punctuation.
-                i = after;
-                continue;
-            }
-        }
-        // Reuse the existing lexer to skip comments, strings (including C++
-        // raw strings), character literals and numbers as whole tokens.
         let end = cc_read_token(text, i, &mut CcStringLiterals::default(), &mut false);
-        line.push(&text[i..end]);
+        line.push(i..end);
         i = end;
     }
-    Some(probes)
+    cc_scan_header_probe_line(text, &line, &mut scan);
+    Some(scan)
+}
+
+fn cc_scan_header_probe_line(
+    text: &[u8],
+    spans: &[std::ops::Range<usize>],
+    scan: &mut CcHeaderProbeScan,
+) {
+    let tokens = spans
+        .iter()
+        .map(|span| &text[span.clone()])
+        .collect::<Vec<_>>();
+    // `%:` is the standard digraph spelling of a preprocessing `#`.
+    let offset = match tokens.as_slice() {
+        [b"#", ..] => 1,
+        [b"%", b":", ..] => 2,
+        _ => 0,
+    };
+    let directive = &tokens[offset..];
+    let definition = offset != 0 && directive.first() == Some(&b"define".as_slice());
+    if offset != 0 && matches!(directive.first(), Some(&b"ifdef" | &b"ifndef" | &b"undef")) {
+        return;
+    }
+    let identifier = |word: &[u8]| {
+        word.first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            && word.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    };
+    if definition && directive.len() >= 3 && identifier(directive[1]) {
+        let name = String::from_utf8_lossy(directive[1]).into_owned();
+        let function = directive.get(2) == Some(&b"(".as_slice())
+            && spans[offset + 1].end == spans[offset + 2].start;
+        let target = match directive {
+            [_, _, target] if identifier(target) => Some(*target),
+            [_, _, b"(", param, b")", target, b"(", arg, b")"]
+                if function && identifier(param) && param == arg && identifier(target) =>
+            {
+                Some(*target)
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            scan.aliases
+                .push((name, String::from_utf8_lossy(target).into_owned()));
+            return;
+        }
+        let body_at = if function {
+            directive
+                .iter()
+                .position(|token| *token == b")")
+                .map_or(directive.len(), |end| end + 1)
+        } else {
+            2
+        };
+        let parameters = if function {
+            directive
+                .get(3..body_at.saturating_sub(1))
+                .unwrap_or_default()
+        } else {
+            &[]
+        };
+        let body = &directive[body_at..];
+        let mut uses = body
+            .iter()
+            .filter(|word| identifier(word) && !parameters.contains(word))
+            .map(|word| String::from_utf8_lossy(word).into_owned())
+            .collect::<Vec<_>>();
+        uses.sort_unstable();
+        uses.dedup();
+        scan.macro_uses.push((name.clone(), uses));
+        cc_header_macro_pastes(&name, body, parameters, scan);
+    }
+    // Operators are valid in preprocessor expressions and macro bodies.
+    // Retain symbolic identifiers there so cross-header aliases are resolved
+    // without storing the C/C++ declarations in every shared header scan.
+    let conditional = offset != 0 && matches!(directive.first(), Some(&b"if" | &b"elif"));
+    for (index, word) in tokens.iter().enumerate() {
+        if !identifier(word) || (definition && index == offset + 1) {
+            continue;
+        }
+        let feature_test = tokens.get(index.wrapping_sub(1)) == Some(&b"defined".as_slice())
+            || (index >= 2 && tokens[index - 2..index] == [b"defined".as_slice(), b"(".as_slice()]);
+        if feature_test {
+            continue;
+        }
+        if conditional {
+            scan.conditionals
+                .push(String::from_utf8_lossy(word).into_owned());
+        }
+        if conditional || definition || matches!(*word, b"__has_include" | b"__has_include_next") {
+            scan.uses.push((
+                String::from_utf8_lossy(word).into_owned(),
+                cc_literal_header_probe(text, spans[index].end),
+            ));
+        }
+    }
+}
+
+fn cc_header_macro_pastes(
+    name: &str,
+    body: &[&[u8]],
+    parameters: &[&[u8]],
+    scan: &mut CcHeaderProbeScan,
+) {
+    let operand = |word: &[u8]| {
+        if parameters.contains(&word) || word == b"__VA_ARGS__" {
+            ".*".to_owned()
+        } else {
+            regex::escape(&String::from_utf8_lossy(word))
+        }
+    };
+    let mut index = 0;
+    while index < body.len() {
+        let mut end = index + 1;
+        let mut pattern = format!("^{}", operand(body[index]));
+        loop {
+            let paste_len = match body.get(end..) {
+                Some([b"#", b"#", ..]) => 2,
+                Some([b"%", b":", b"%", b":", ..]) => 4,
+                _ => break,
+            };
+            let Some(word) = body.get(end + paste_len) else {
+                break;
+            };
+            pattern.push_str(&operand(word));
+            end += paste_len + 1;
+        }
+        if end > index + 1 {
+            pattern.push('$');
+            scan.pastes.push((name.to_owned(), pattern));
+        }
+        index = end;
+    }
+}
+
+fn cc_literal_header_probe(text: &[u8], word_end: usize) -> Option<CcHeaderProbe> {
+    let open = cc_skip_probe_trivia(text, word_end);
+    if text.get(open) != Some(&b'(') {
+        return None;
+    }
+    let arg = cc_skip_probe_trivia(text, open + 1);
+    let (close, quoted) = match text.get(arg) {
+        Some(b'<') => (b'>', false),
+        Some(b'"') => (b'"', true),
+        _ => return None,
+    };
+    let start = arg + 1;
+    let end = start + memchr::memchr(close, &text[start..])?;
+    let name = std::str::from_utf8(&text[start..end]).ok()?;
+    if name.is_empty() || name.contains('\n') {
+        return None;
+    }
+    let after = cc_skip_probe_trivia(text, end + 1);
+    (text.get(after) == Some(&b')')).then(|| CcHeaderProbe {
+        name: PathBuf::from(name),
+        quoted,
+    })
 }
 
 fn cc_skip_probe_trivia(text: &[u8], mut i: usize) -> usize {

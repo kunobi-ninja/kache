@@ -652,6 +652,69 @@ fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
 }
 
 #[test]
+fn cc_forwarded_header_probes_cache_and_follow_optional_header_changes() {
+    for (definition, args) in [
+        (
+            "#ifdef __has_include\n#define HAS(x) __has_include(x)\n#else\n#define HAS(x) 0\n#endif\n",
+            &["-Iinc"][..],
+        ),
+        (
+            "#ifndef HAS\n#ifdef __has_include\n#define HAS __has_include\n#else\n#define HAS(x) 0\n#endif\n#endif\n",
+            &["-Iinc"][..],
+        ),
+        ("", &["-Iinc", "-DHAS(x)=__has_include(x)"][..]),
+        (
+            "#define HAS(x) HAVE\n",
+            &["-Iinc", "-DHAVE=__has_include(<optional.h>)"][..],
+        ),
+    ] {
+        let dir = FixtureDir::new();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("kache.toml"), "").unwrap();
+        fs::create_dir(root.join("home")).unwrap();
+        fs::create_dir(root.join("inc")).unwrap();
+        fs::write(root.join("aliases.h"), definition).unwrap();
+        fs::write(
+            root.join("use.h"),
+            "#if HAS(<optional.h>)\n#include <optional.h>\n#else\n#define VALUE 11\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("unit.c"),
+            "#include \"aliases.h\"\n#include \"use.h\"\nint main(void) { return VALUE; }\n",
+        )
+        .unwrap();
+        assert_probe_follows_optional_header(&root, args, 11);
+    }
+}
+
+#[test]
+fn cc_opaque_header_probe_macros_remain_uncached() {
+    for expression in ["HAS(HEADER)", "JOIN(H,AS)(<optional.h>)"] {
+        let dir = FixtureDir::new();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("kache.toml"), "").unwrap();
+        fs::create_dir(root.join("home")).unwrap();
+        fs::create_dir(root.join("inc")).unwrap();
+        fs::write(root.join("aliases.h"),
+            "#define HAS(x) __has_include(x)\n#define HEADER <optional.h>\n#define JOIN(a,b) a##b\n").unwrap();
+        fs::write(root.join("unit.c"), format!(
+            "#include \"aliases.h\"\n#if {expression}\n#include <optional.h>\n#else\n#define VALUE 11\n#endif\nint main(void) {{ return VALUE; }}\n")).unwrap();
+        for discovery in ["0", "1"] {
+            let _ = fs::remove_file(root.join("inc/optional.h"));
+            for expected in [11, 23] {
+                if expected == 23 {
+                    fs::write(root.join("inc/optional.h"), "#define VALUE 23\n").unwrap();
+                }
+                let (key, value) = compile_and_run_unit(&root, discovery, &["-Iinc"]);
+                assert!(key.is_empty(), "{expression}: opaque probes must not cache");
+                assert_eq!(value, expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
     let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();

@@ -379,6 +379,7 @@ pub(crate) enum RemoteOperation {
     WarmAllList,
     ShardGet,
     ManifestGet,
+    PredictionGet,
 }
 
 impl RemoteOperation {
@@ -399,6 +400,7 @@ impl RemoteOperation {
             Self::WarmAllList => "warm-all LIST",
             Self::ShardGet => "shard GET",
             Self::ManifestGet => "manifest GET",
+            Self::PredictionGet => "prediction GET",
         }
     }
 }
@@ -1751,6 +1753,11 @@ mod tests {
                 RemoteOperation::ManifestGet,
                 RemoteDirection::Read,
                 "manifest GET",
+            ),
+            (
+                RemoteOperation::PredictionGet,
+                RemoteDirection::Read,
+                "prediction GET",
             ),
         ] {
             assert_eq!(operation.direction(), direction, "{operation:?}");

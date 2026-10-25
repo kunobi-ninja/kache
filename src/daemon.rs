@@ -468,6 +468,14 @@ fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bo
 /// pre-pass, so waiting longer than a pre-pass takes would be a loss.
 const PREDICTION_FETCH_BUDGET: Duration = Duration::from_secs(2);
 
+/// Prediction lookup is optional work with a short cap, even when the
+/// configured daemon deadline is disabled or longer than the row budget.
+fn prediction_fetch_deadline(started_at: Instant, restore_timeout_secs: u64) -> RemoteDeadline {
+    RemoteDeadline::from_instant(started_at.checked_add(PREDICTION_FETCH_BUDGET)).min(
+        RemoteDeadline::from_secs_at(started_at, restore_timeout_secs),
+    )
+}
+
 /// How long a wrapper waits for a prediction row: the daemon's own budget
 /// plus the socket round trip.
 fn prediction_fetch_wait() -> Duration {
@@ -3531,16 +3539,32 @@ impl Daemon {
         if !prediction_identity_is_acceptable(&req.identity) {
             return Response::err("invalid prediction identity");
         }
+        // A row only saves a dependency pre-pass. Leave recovery probes to
+        // demand restores rather than retrying optional work while degraded.
+        let Some(breaker) = self
+            .remote_breaker
+            .try_acquire_speculative(RemoteOperation::PredictionGet)
+        else {
+            return response;
+        };
+        let deadline =
+            prediction_fetch_deadline(Instant::now(), self.config.remote_restore_timeout_secs);
         let fetch = async {
             let backend = self.get_remote_backend().await?;
             crate::remote_layout::RemoteLayout::new(backend.as_ref(), remote)
                 .download_prediction(&req.identity)
                 .await
         };
-        match tokio::time::timeout(PREDICTION_FETCH_BUDGET, fetch).await {
-            Ok(Ok(row)) => response.prediction = row,
-            Ok(Err(error)) => tracing::debug!("prediction row fetch failed: {error:#}"),
-            Err(_) => tracing::debug!("prediction row fetch timed out"),
+        match deadline.run("prediction row fetch", fetch).await {
+            Ok(row) => {
+                breaker.success();
+                response.prediction = row;
+            }
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                tracing::debug!("prediction row fetch failed: {error:#}");
+            }
         }
         response
     }

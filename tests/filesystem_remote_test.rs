@@ -1020,6 +1020,35 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
     let unrelated_key = crate_event(&cold, "fsremote")["cache_key"]
         .as_str()
         .unwrap();
+    // --all broadens pull discovery; its push must still respect membership.
+    let scoped_remote = TempDir::new().unwrap();
+    let publisher = Client::for_shared_store(scoped_remote.path(), &alpha.cache_dir);
+    let published = publisher.run_within_at_env(
+        Some(project.path()),
+        &["sync", "--all"],
+        &[("CARGO_HOME", fresh_cargo_home.path())],
+        Duration::from_secs(90),
+    );
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    for (name, expected) in [
+        ("hyphen_app", true),
+        ("custom_library", false),
+        ("fsremote", false),
+    ] {
+        let key = crate_event(&cold, name)["cache_key"].as_str().unwrap();
+        let manifest = scoped_remote
+            .path()
+            .join("artifacts")
+            .join("v3")
+            .join("manifests")
+            .join(name)
+            .join(format!("{key}.json"));
+        assert_eq!(manifest.is_file(), expected, "--all push scope for {name}");
+    }
     let lock_before = std::fs::read(project.path().join("Cargo.lock")).unwrap();
     let pulled = beta.run_within_at_env(
         Some(project.path()),
@@ -1118,6 +1147,25 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
     assert_eq!(
         std::fs::read(outputs.path().join("debug").join("libhyphen_app.rlib")).unwrap(),
         expected
+    );
+}
+
+#[test]
+fn full_pull_does_not_require_a_valid_cargo_project() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    std::fs::write(project.path().join("Cargo.toml"), "this is not TOML [[[").unwrap();
+    let client = Client::new(shared.path());
+    let output = client.run_within_at(
+        Some(project.path()),
+        &["sync", "--pull", "--all"],
+        Duration::from_secs(90),
+    );
+    assert!(
+        output.status.success(),
+        "full pull must not depend on Cargo metadata: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

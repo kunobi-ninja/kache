@@ -83,13 +83,20 @@ fn resolve_at(
         .map(PathBuf::from)
         .or_else(|| manifest_in_ancestors(cwd));
     let Some(manifest) = manifest else {
+        let pull = if filtered_pull {
+            super::parse_cargo_lock_crate_names_from(&cwd.join("Cargo.lock"))
+        } else {
+            None
+        };
+        if pull.is_some() {
+            eprintln!(
+                "warning: Cargo.lock without Cargo.toml cannot resolve renamed library targets; \
+                 using normalized package names. Use `kache sync --pull --all` for every remote crate."
+            );
+        }
         return Ok(Scope {
             workspace: None,
-            pull: if filtered_pull {
-                super::parse_cargo_lock_crate_names_from(&cwd.join("Cargo.lock"))
-            } else {
-                None
-            },
+            pull,
         });
     };
 

@@ -8862,7 +8862,14 @@ pub fn sync(
     let sync_lock_path = config.cache_dir.join("sync.lock");
     let _sync_lock = StoreLock::acquire(&sync_lock_path).context("locking cache sync")?;
     let store = Store::open(config)?;
-    let scope = sync_scope::resolve(manifest_path, !pull_all && !pull_workspace && !push_only)?;
+    let scope = if pull_only && pull_all {
+        sync_scope::Scope {
+            workspace: None,
+            pull: None,
+        }
+    } else {
+        sync_scope::resolve(manifest_path, !pull_all && !pull_workspace && !push_only)?
+    };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

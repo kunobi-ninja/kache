@@ -7423,6 +7423,69 @@ fn header_probe_scanner_binds_constant_arguments_to_token_paste_helpers() {
 }
 
 #[test]
+fn header_probe_macro_parameters_shadow_global_paste_helpers() {
+    let text = b"#define JOIN(a,b) a##b\n#define SAFE(JOIN) (JOIN)\n#define HAS(x) __has_include(x)\n#if SAFE(1) && HAS(<optional.h>)\n#endif\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+}
+
+#[test]
+fn header_probe_scanner_does_not_treat_cpp_control_flow_as_a_directive() {
+    let text = b"#define JOIN(a,b) a##b\n#define HAS(x) __has_include(x)\nint HAS;\nint f(void) {\nif (JOIN(H,AS)) return 1;\nreturn 0;\n}\n#if HAS(<optional.h>)\n#endif\n";
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+}
+
+#[test]
+fn header_probe_macro_arguments_keep_nested_commas_inside_the_argument() {
+    let tokens: &[&[u8]] = &[
+        b"CALL", b"(", b"FN", b"(", b"1", b",", b"2", b")", b",", b"TAIL", b")",
+    ];
+    assert_eq!(
+        cc_header_macro_use(tokens, 0).arguments,
+        Some(vec![
+            vec!["FN", "(", "1", ",", "2", ")"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec!["TAIL".to_owned()],
+        ])
+    );
+    assert!(cc_header_macro_use(&tokens[..7], 0).arguments.is_none());
+    assert!(cc_header_macro_use(&[b"BARE"], 0).arguments.is_none());
+}
+
+#[test]
+fn header_probe_scanner_refuses_wrong_arity_even_in_an_inactive_branch() {
+    for arguments in ["H", "", "H,AS,EXTRA"] {
+        let text = format!(
+            "#define JOIN(a,b) a##b\n#define HAS(x) __has_include(x)\n#if 0\n#if JOIN({arguments})(<optional.h>)\n#endif\n#endif\n"
+        );
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{arguments}");
+    }
+}
+
+#[test]
+fn header_probe_identifiers_exclude_numbers_and_literal_tokens() {
+    for name in ["HAS_INCLUDE", "_HAS", "has2"] {
+        assert!(cc_header_probe_identifier(name.as_bytes()), "{name}");
+    }
+    for token in ["", "7", "2HAS", "HAS(x)", "u8\"HAS\"", "HAS$", ","] {
+        assert!(!cc_header_probe_identifier(token.as_bytes()), "{token}");
+    }
+}
+
+#[test]
 fn header_probe_aliases_from_compiler_definitions_follow_header_availability() {
     let temp = tempfile::tempdir().unwrap();
     let (mut parsed, source, include) =
@@ -7476,6 +7539,25 @@ fn header_probe_scanner_keeps_each_probe_in_an_expression() {
                 },
             ]),
             "{text}",
+        );
+    }
+}
+
+#[test]
+fn header_probe_feature_tests_after_other_conditions_are_not_probes() {
+    for feature in [
+        "(FEATURE > 1) && defined(__has_include)",
+        "(FEATURE > 1) && defined __has_include",
+        "(FEATURE > 1) && defined(__has_include_next)",
+    ] {
+        let text = format!("#if {feature} && __has_include(<optional.h>)\n#endif\n");
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![CcHeaderProbe {
+                name: "optional.h".into(),
+                quoted: false
+            }]),
+            "{feature}"
         );
     }
 }

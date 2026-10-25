@@ -5947,14 +5947,16 @@ fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
     }
     let mut scan = CcHeaderProbeScan::default();
     let mut line = Vec::new();
-    let mut i = 0;
-    while let Some(&byte) = text.get(i) {
+    let mut scanned_to = 0;
+    for (i, &byte) in text.iter().enumerate() {
+        if i < scanned_to {
+            continue;
+        }
         if byte.is_ascii_whitespace() {
             if byte == b'\n' {
                 cc_scan_header_probe_line(text, &line, &mut scan)?;
                 line.clear();
             }
-            i += 1;
             continue;
         }
         if byte == b'/' && matches!(text.get(i + 1), Some(b'*' | b'/')) {
@@ -5965,12 +5967,12 @@ fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
             }
             // Do not discard a directive when its block comment spans lines.
             // Keeping its tokens together can only add conservative uses.
-            i = end;
+            scanned_to = end;
             continue;
         }
         let end = cc_read_token(text, i, &mut CcStringLiterals::default(), &mut false);
         line.push(i..end);
-        i = end;
+        scanned_to = end;
     }
     cc_scan_header_probe_line(text, &line, &mut scan)?;
     Some(scan)
@@ -6072,8 +6074,9 @@ fn cc_scan_header_probe_line(
         if !identifier(word) || (definition && index == offset + 1) {
             continue;
         }
-        let feature_test = tokens.get(index.wrapping_sub(1)) == Some(&b"defined".as_slice())
-            || (index >= 2 && tokens[index - 2..index] == [b"defined".as_slice(), b"(".as_slice()]);
+        let before = &tokens[..index];
+        let feature_test = before.last() == Some(&b"defined".as_slice())
+            || before.ends_with(&[b"defined".as_slice(), b"(".as_slice()]);
         if feature_test {
             continue;
         }
@@ -6104,11 +6107,14 @@ fn cc_header_macro_pastes(
             regex::escape(&String::from_utf8_lossy(word))
         }
     };
-    let mut index = 0;
-    while index < body.len() {
+    let mut scanned_to = 0;
+    for (index, word) in body.iter().enumerate() {
+        if index < scanned_to {
+            continue;
+        }
         let mut end = index + 1;
-        let mut pattern = format!("^{}", operand(body[index]));
-        let mut parts = vec![String::from_utf8_lossy(body[index]).into_owned()];
+        let mut pattern = format!("^{}", operand(word));
+        let mut parts = vec![String::from_utf8_lossy(word).into_owned()];
         loop {
             let paste_len = match body.get(end..) {
                 Some([b"#", b"#", ..]) => 2,
@@ -6144,7 +6150,7 @@ fn cc_header_macro_pastes(
                 });
             }
         }
-        index = end;
+        scanned_to = end;
     }
 }
 

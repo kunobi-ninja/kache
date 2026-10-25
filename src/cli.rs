@@ -11346,14 +11346,14 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if is_daemon_reachable(&config) {
         println!("  \x1b[32m✓\x1b[0m Background cache: running");
     } else if service_action_taken {
-        // Service install typically starts the daemon. Give it a moment and re-check.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if is_daemon_reachable(&config) {
+        // Registration is not readiness. Wait through the same coordinator
+        // used by `daemon start`, including a service still opening its store.
+        let cfg = config.as_ref().context("loading daemon configuration")?;
+        if crate::daemon::start(cfg)?.is_ready() {
             println!("  \x1b[32m✓\x1b[0m Background cache: started");
         } else {
-            println!(
-                "  \x1b[33m→\x1b[0m Background cache: still starting; check with kache doctor"
-            );
+            println!("  \x1b[31m✗\x1b[0m daemon did not start within timeout");
+            daemon_step_failed = true;
         }
     } else if service_installed {
         // Service is installed (from a previous run) but daemon isn't reachable.

@@ -139,6 +139,7 @@ fn recorded_exe_problem(
     recorded: &Path,
     current: &Path,
     current_id: Option<kache_shims::InodeId>,
+    frontend_id: Option<kache_shims::InodeId>,
     fs: &dyn kache_shims::Fs,
 ) -> Option<ServiceExeProblem> {
     let recorded_id = fs.identity(recorded);
@@ -155,7 +156,7 @@ fn recorded_exe_problem(
     let (recorded, current) = (recorded.to_path_buf(), current.to_path_buf());
     match current_id {
         None => Some(ServiceExeProblem::Unverifiable { recorded, current }),
-        Some(id) if recorded_id != Some(id) => {
+        Some(id) if recorded_id != Some(id) && recorded_id != frontend_id => {
             Some(ServiceExeProblem::OtherBinary { recorded, current })
         }
         Some(_) => None,
@@ -166,7 +167,19 @@ pub(crate) fn service_exe_problem(path: &Path) -> Option<ServiceExeProblem> {
     let recorded = parse_exe_from_service_file(path)?;
     let current = std::env::current_exe().unwrap_or_default();
     let current_id = kache_shims::running_identity();
-    recorded_exe_problem(&recorded, &current, current_id, &kache_shims::RealFs)
+    // A pre-v2 service may still enter through the paired frontend. Selection
+    // verifies this installation before accepting that path as an alias.
+    let fs = kache_shims::RealFs;
+    let frontend_id = crate::platform::frontend_selection()
+        .ok()
+        .filter(|_| {
+            kache_shims::engine_for(&recorded)
+                .ok()
+                .and_then(|engine| kache_shims::Fs::identity(&fs, &engine))
+                == current_id
+        })
+        .and_then(|selection| kache_shims::Fs::identity(&fs, &selection.path));
+    recorded_exe_problem(&recorded, &current, current_id, frontend_id, &fs)
 }
 
 // ── Install ──────────────────────────────────────────────────────
@@ -1673,7 +1686,7 @@ WantedBy=default.target
         fs::write(&plain, "").unwrap();
         let real = kache_shims::RealFs;
         let id = kache_shims::Fs::identity(&real, &current);
-        let check = |recorded: &Path| recorded_exe_problem(recorded, &current, id, &real);
+        let check = |recorded: &Path| recorded_exe_problem(recorded, &current, id, None, &real);
 
         assert_eq!(check(&current), None);
         assert_eq!(check(&link), None);
@@ -1701,12 +1714,42 @@ WantedBy=default.target
         // Without the running binary's identity there is nothing to compare
         // against, which is not the same as healthy.
         assert_eq!(
-            recorded_exe_problem(&current, &gone, None, &real),
+            recorded_exe_problem(&current, &gone, None, None, &real),
             Some(ServiceExeProblem::Unverifiable {
                 recorded: current.clone(),
                 current: gone.clone()
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn services_accept_the_paired_frontend_but_not_another_installation() {
+        use kache_shims::Fs;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("kache-engine");
+        let frontend = dir.path().join("kache");
+        let other = dir.path().join("other-kache");
+        for path in [&engine, &frontend, &other] {
+            kache_fs::testutil::write_executable(path, "#!/bin/sh\nexit 0\n");
+        }
+        let fs = kache_shims::RealFs;
+        let engine_id = fs.identity(&engine);
+        let frontend_id = fs.identity(&frontend);
+        let check = |recorded| recorded_exe_problem(recorded, &engine, engine_id, frontend_id, &fs);
+        assert_eq!(check(&frontend), None);
+        assert_eq!(check(&engine), None);
+        assert_eq!(
+            check(&other),
+            Some(ServiceExeProblem::OtherBinary {
+                recorded: other,
+                current: engine.clone(),
+            })
+        );
+        assert!(matches!(
+            recorded_exe_problem(&frontend, &engine, None, frontend_id, &fs),
+            Some(ServiceExeProblem::Unverifiable { .. })
+        ));
     }
 
     #[test]

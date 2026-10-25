@@ -2497,6 +2497,197 @@ fn init_rejects_unavailable_daemon_replacement() {
     );
 }
 
+/// The first compiler invocation after an upgrade must retire a v1 daemon,
+/// even though its lifetime lock still reports a running process.
+#[cfg(unix)]
+#[test]
+fn compiler_upgrades_a_legacy_daemon_without_another_init() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let e = env();
+    let socket = e.cache.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
+    run_lock.lock().unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let server_done = Arc::clone(&done);
+    let server = std::thread::spawn(move || {
+        let _run_lock = run_lock;
+        for incoming in listener.incoming() {
+            let mut stream = incoming.unwrap();
+            if server_done.load(Ordering::SeqCst) {
+                return false;
+            }
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let shutdown = request == "shutdown";
+            let response = if request == "health" {
+                serde_json::json!({"ok": true, "health": {"version": "1.2.2", "build_epoch": 1}})
+            } else {
+                serde_json::json!({"ok": shutdown, "error": "legacy execution protocol"})
+            };
+            // Probes can disconnect as soon as they recognize a legacy reply.
+            let _ = writeln!(stream, "{response}");
+            if shutdown {
+                return true;
+            }
+        }
+        false
+    });
+    let output = e
+        .cmd()
+        .args(["rustc", "--version"])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .unwrap();
+    done.store(true, Ordering::SeqCst);
+    drop(UnixStream::connect(&socket));
+    let retired = server.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        retired,
+        "compiler left the legacy daemon running: {output:?}"
+    );
+    let status = e
+        .cmd()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["daemon_running"], true);
+    assert_eq!(status["daemon_version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        !e.home.join(".cargo/config.toml").exists(),
+        "upgrade must not repeat setup"
+    );
+}
+
+/// Services installed before the engine split remain valid entry points.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn init_recognizes_both_binaries_from_the_current_installation() {
+    let e = env();
+    let service = if cfg!(target_os = "macos") {
+        e.home.join("Library/LaunchAgents/ninja.kunobi.kache.plist")
+    } else {
+        e.home.join(".config/systemd/user/kache.service")
+    };
+    std::fs::create_dir_all(service.parent().unwrap()).unwrap();
+    let other = e.home.join("other-kache");
+    std::fs::copy(KACHE_BIN, &other).unwrap();
+    // A hardlinked frontend can belong to a different engine installation.
+    // Keep the fixture on the binary's volume so the hardlink is portable.
+    let foreign = tempfile::tempdir_in(Path::new(KACHE_BIN).parent().unwrap()).unwrap();
+    let foreign_frontend = foreign.path().join("kache");
+    std::fs::hard_link(KACHE_BIN, &foreign_frontend).unwrap();
+    kache_fs::testutil::write_executable(
+        &foreign.path().join("kache-engine"),
+        "#!/bin/sh\nexit 1\n",
+    );
+    let fake_bin = e.home.join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    kache_fs::testutil::write_executable(&fake_bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths(std::iter::once(fake_bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    for (exe, action) in [
+        (Path::new(KACHE_BIN), "keep"),
+        (Path::new(env!("CARGO_BIN_EXE_kache-engine")), "keep"),
+        (other.as_path(), "update"),
+        (foreign_frontend.as_path(), "update"),
+    ] {
+        let content = if cfg!(target_os = "macos") {
+            format!(
+                "<plist><dict><key>ProgramArguments</key><array><string>{}</string><string>daemon</string><string>run</string></array></dict></plist>",
+                exe.display()
+            )
+        } else {
+            format!("[Service]\nExecStart={} daemon run\n", exe.display())
+        };
+        std::fs::write(&service, content).unwrap();
+        let output = e
+            .cmd()
+            .args(["init", "--check", "--no-shell", "--json"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let service = body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["component"] == "login_service")
+            .unwrap();
+        assert_eq!(service["action"], action, "{}: {body}", exe.display());
+    }
+}
+
+/// Service registration can succeed before the daemon is ready, or even when
+/// it never starts. Init must report the health result in both cases.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn init_waits_for_a_new_service_and_rejects_failed_startup() {
+    for fails in [false, true] {
+        let e = env();
+        let bin = e.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tool = if cfg!(target_os = "macos") {
+            "launchctl"
+        } else {
+            "systemctl"
+        };
+        let script = r#"#!/bin/sh
+case " $* " in
+  *" bootstrap "*|*" enable "*)
+    if [ "$KACHE_TEST_START_FAILS" = 0 ]; then
+      (sleep 1.5; "$KACHE_TEST_BIN" daemon run) >/dev/null 2>&1 &
+    fi
+    ;;
+esac
+exit 0
+"#;
+        kache_fs::testutil::write_executable(&bin.join(tool), script);
+        kache_fs::testutil::write_executable(&bin.join("loginctl"), "#!/bin/sh\nexit 0\n");
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let user_config = e.home.join(".config/kache/config.toml");
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_config,
+            format!("[cache]\nlocal_store = {:?}\n", e.cache.to_str().unwrap()),
+        )
+        .unwrap();
+        let output = e
+            .cmd()
+            .args(["init", "--yes", "--no-shell", "--json"])
+            .env("PATH", path)
+            .env("KACHE_TEST_BIN", KACHE_BIN)
+            .env("KACHE_TEST_START_FAILS", if fails { "1" } else { "0" })
+            .timeout(std::time::Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), !fails, "{output:?}");
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["success"], !fails, "{body}");
+        if !fails {
+            assert_eq!(body["daemon_running"], true, "{body}");
+            assert_eq!(body["service_installed"], true, "{body}");
+        }
+    }
+}
+
 /// A stale daemon must be replaced through the installed service manager.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
@@ -2708,7 +2899,7 @@ fn init_with_user_systemd_installs_the_login_service() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Service installed"))
-        .stdout(predicates::str::contains("still starting"));
+        .stdout(predicates::str::contains("Background cache: started"));
     assert!(e.home.join(".config/systemd/user/kache.service").exists());
 }
 

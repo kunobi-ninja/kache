@@ -1450,10 +1450,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         )? {
             std::process::exit(exit);
         }
-        if !cfg!(test)
-            && !config.disabled
-            && daemon::is_running(&config).is_ok_and(|running| !running)
-        {
+        // A held run lock can belong to the release we just upgraded from.
+        // The coordinator checks its version and drains it before replacing it.
+        if !cfg!(test) && !config.disabled {
             match daemon::start(&config) {
                 Ok(_) => {
                     if let Some(exit) = invocation::execution::try_execute_with_trust(

@@ -32,7 +32,7 @@ On Unix, a daemon that a build starts runs in its own session, so Ctrl-C in the 
 kache daemon install
 ```
 
-`kache init` installs this service unless you pass `--no-service` or, on Linux, no systemd user session is available. Without the service, it starts the daemon directly. The install also starts the daemon.
+`kache init` installs this service unless you pass `--no-service` or, on Linux, no systemd user session is available. Without the service, it starts the daemon directly. Init waits for the daemon to become ready after registration and returns an error if startup fails or times out.
 
 On macOS it writes `~/Library/LaunchAgents/ninja.kunobi.kache.plist` and sends the service's output to `~/Library/Logs/kache/`. On Linux it writes and enables the `kache.service` user unit in `~/.config/systemd/user/` and tries to enable lingering, so the daemon keeps running after you log out. This needs a systemd user session. Containers and most CI runners have none; start the daemon there with `kache daemon start`. On Windows it registers the Task Scheduler task `kache-daemon`, which runs `kache daemon run` at logon. If `schtasks` is denied access, run the install from an elevated terminal.
 
@@ -47,6 +47,8 @@ kache daemon uninstall
 On recent macOS releases, the first connection to a cache server on the local network can show a Local Network prompt for `kache`. Allow it; you can change the decision later under System Settings > Privacy & Security > Local Network. If the installed daemon fails with `No route to host (os error 65)` for a LAN endpoint, reinstall the service with the current binary. If you still cannot grant the permission, run `kache daemon uninstall`. The next build that uses the remote then starts the daemon from your terminal, under the terminal's permission.
 
 ## Updates and config changes
+
+After installing a newer Kache release, keep your existing configuration. The next compiler invocation replaces an older daemon through its installed service when that service owns the cache. Services that still launch `kache` remain valid with v2's paired `kache-engine`; you do not need to repeat `kache init` when both binaries are installed at the same paths.
 
 Kache compares semantic release versions when deciding whether to replace a daemon. A client from a newer release can request a drain and replacement. Rebuilding or copying the same release does not request an upgrade. Build metadata such as `+local` does not affect release precedence. An older client keeps a newer daemon running.
 

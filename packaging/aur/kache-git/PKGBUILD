@@ -18,8 +18,10 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd "$srcdir/kache"
+  local version
+  version="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' 2>/dev/null | sed 's/^v//')"
   printf '%s.r%s.g%s' \
-    "$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0)" \
+    "${version:-0.0.0}" \
     "$(git rev-list --count HEAD)" \
     "$(git rev-parse --short=7 HEAD)"
 }

@@ -40,7 +40,9 @@ fi
 
 # Mirrors packaging/aur/*-git/PKGBUILD's pkgver() exactly, including the 0.0.0 fallback
 # for a repo with no tags yet.
-version="$(git -C "$repo" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+# Prerelease tags contain a hyphen, which AUR pkgver forbids. Keep VCS builds
+# ordered by the latest stable tag and the full revision count.
+version="$(git -C "$repo" describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' 2>/dev/null | sed 's/^v//')"
 [ -n "$version" ] || version="0.0.0"
 count="$(git -C "$repo" rev-list --count HEAD)"
 sha="$(git -C "$repo" rev-parse --short=7 HEAD)"

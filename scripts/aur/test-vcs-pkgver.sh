@@ -85,6 +85,12 @@ r="$(make_repo 2)"
 sha="$(git -C "$r" rev-parse --short=7 HEAD)"
 expect_output "untagged repo falls back to 0.0.0" "0.0.0.r2.g$sha" "$r"
 
+r="$(make_repo 3 v2.0.0-rc.1)"
+sha="$(git -C "$r" rev-parse --short=7 HEAD)"
+expect_output "prerelease-only history uses a valid fallback" "0.0.0.r3.g$sha" "$r"
+git -C "$r" tag v1.2.2 HEAD~1
+expect_output "newer prerelease tags do not replace the stable version" "1.2.2.r3.g$sha" "$r"
+
 # The AUR sorts pkgver with the same rules pacman uses, so the r<count> field
 # is what orders two builds of the same tag. It must track real depth.
 r="$(make_repo 7 v1.0.0)"
@@ -121,21 +127,30 @@ if [ -f "$pkgbuild" ]; then
     no "source= names a git checkout directory" "could not parse it from $pkgbuild"
   else
     r="$(make_repo 4 v2.5.1)"
+    echo prerelease >"$r/f"
+    git -C "$r" add f
+    git -C "$r" commit -qm "prerelease"
+    git -C "$r" tag v2.6.0-rc.1
     holder="$(mktemp -d)"
     cp -R "$r" "$holder/$srcname"
-    from_pkgbuild="$(
-      srcdir="$holder"
-      export srcdir
-      eval "$(sed -n '/^pkgver() {/,/^}/p' "$pkgbuild")"
-      pkgver 2>/dev/null
-    )"
-    from_script="$("$script" "$holder/$srcname" 2>&1)"
-    if [ "$from_pkgbuild" = "$from_script" ] && [ -n "$from_script" ]; then
-      ok "output matches the PKGBUILD's own pkgver() byte for byte"
-    else
-      no "output matches the PKGBUILD's own pkgver() byte for byte" \
-        "PKGBUILD gave '$from_pkgbuild', script gave '$from_script'"
-    fi
+    for history in stable prerelease-only; do
+      if [ "$history" = prerelease-only ]; then
+        git -C "$holder/$srcname" tag -d v2.5.1 >/dev/null
+      fi
+      from_pkgbuild="$(
+        srcdir="$holder"
+        export srcdir
+        eval "$(sed -n '/^pkgver() {/,/^}/p' "$pkgbuild")"
+        pkgver 2>/dev/null
+      )"
+      from_script="$("$script" "$holder/$srcname" 2>&1)"
+      if [ "$from_pkgbuild" = "$from_script" ] && [ -n "$from_script" ]; then
+        ok "$history output matches the PKGBUILD's own pkgver() byte for byte"
+      else
+        no "$history output matches the PKGBUILD's own pkgver() byte for byte" \
+          "PKGBUILD gave '$from_pkgbuild', script gave '$from_script'"
+      fi
+    done
   fi
 else
   no "a packaging/aur/*-git/PKGBUILD is present" "not found under $repo_root/packaging/aur"

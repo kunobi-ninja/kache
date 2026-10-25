@@ -149,6 +149,17 @@ Other Rust-supported targets may work through `cargo install`, but they are not 
 
 The official AUR packages install completions for Bash, Zsh, Fish and Elvish. For other installs, generate a script with [`kache completions <shell>`](/docs/commands/reference#kache-completions) and save it where your shell loads completions.
 
+## Upgrading from 1.x
+
+Finish active builds before upgrading to 2.0. Install the matching `kache` and
+`kache-engine` executables together. Update custom install scripts and container
+images that previously copied only `kache`. Manual Windows installs now use the
+paired ZIP archive instead of a standalone EXE.
+
+Run `kache daemon restart` after upgrading so clients use the new execution
+protocol. Managed incremental state starts cold once; the next builds recreate
+it with private files that cannot modify another checkout's state.
+
 ## Verify the install
 
 ```bash

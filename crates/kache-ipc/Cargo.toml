@@ -1,6 +1,6 @@
 [package]
 name = "kache-ipc"
-version = "1.2.2"
+version = "2.0.0-rc.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Local sockets, endpoint naming, and peer checks for Kache."
@@ -14,8 +14,8 @@ default = []
 async = ["interprocess/tokio", "kunobi-daemon/local-async", "dep:tokio"]
 
 [dependencies]
-kache-protocol = { version = "1.2.2", path = "../kache-protocol" }
-kache-fs = { version = "1.2.2", path = "../kache-fs", features = ["staging"] }
+kache-protocol = { version = "2.0.0-rc.1", path = "../kache-protocol" }
+kache-fs = { version = "2.0.0-rc.1", path = "../kache-fs", features = ["staging"] }
 serde = "1"
 serde_json = "1"
 tracing = "0.1"

@@ -1,6 +1,6 @@
 [package]
 name = "kache-protocol"
-version = "1.2.2"
+version = "2.0.0-rc.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Shared data types for Kache's local client and daemon protocol."
@@ -14,8 +14,8 @@ test-support = ["chrono/now"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
-kache-format = { version = "1.2.2", path = "../kache-format" }
-kache-core = { version = "1.2.2", path = "../kache-core", default-features = false }
+kache-format = { version = "2.0.0-rc.1", path = "../kache-format" }
+kache-core = { version = "2.0.0-rc.1", path = "../kache-core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

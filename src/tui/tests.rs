@@ -206,6 +206,7 @@ fn test_state() -> AppState {
         sessions: Vec::new(),
         grouped_len: 0,
         selected_session: None,
+        now_page_size: 1,
         shown: None,
         why_cache: None,
         transfer_scroll: Viewport::new(ScrollAnchor::Top),
@@ -589,19 +590,23 @@ fn fmt_window_picks_the_largest_exact_unit() {
 
 #[test]
 fn tab_bar_click_targets_match_the_drawn_labels() {
-    let titles = tab_titles();
+    let titles = tab_titles(120);
     for (tab, label, start) in titles {
-        assert_eq!(tab_at_column(start), Some(tab), "first column of {label:?}");
         assert_eq!(
-            tab_at_column(start + label.len() as u16 - 1),
+            tab_at_column(start, 120),
+            Some(tab),
+            "first column of {label:?}"
+        );
+        assert_eq!(
+            tab_at_column(start + label.len() as u16 - 1, 120),
             Some(tab),
             "last column of {label:?}"
         );
     }
     // The two-space gutter between labels selects nothing.
     let (_, first, start) = titles[0];
-    assert_eq!(tab_at_column(start + first.len() as u16), None);
-    assert_eq!(tab_at_column(999), None);
+    assert_eq!(tab_at_column(start + first.len() as u16, 120), None);
+    assert_eq!(tab_at_column(999, 120), None);
 
     let mut s = test_state();
     let area = Rect::new(0, 0, 120, 40);
@@ -1189,11 +1194,15 @@ fn shift_tab_walks_backwards() {
 
 /// Render `tab` and return everything on screen as one string.
 fn rendered_tab(state: &mut AppState, tab: Tab) -> String {
+    rendered_tab_at(state, tab, 120, 40)
+}
+
+fn rendered_tab_at(state: &mut AppState, tab: Tab, width: u16, height: u16) -> String {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     state.active_tab = tab;
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| draw_ui(frame, state))
         .expect("draw should succeed");
@@ -1717,7 +1726,7 @@ fn draw_projects_tab_renders_populated_scan() {
 }
 #[test]
 fn tab_titles_advance_by_label_width_plus_gutter() {
-    let titles = tab_titles();
+    let titles = tab_titles(120);
     assert_eq!(titles[0].2, 0);
     for pair in titles.windows(2) {
         let (_, label, start) = pair[0];
@@ -1828,7 +1837,7 @@ fn terminal_events_dispatch_presses_and_mouse_only() {
     assert!(s.should_quit);
 
     let mut s = test_state();
-    let (_, _, store_x) = tab_titles()
+    let (_, _, store_x) = tab_titles(120)
         .into_iter()
         .find(|(tab, _, _)| *tab == Tab::Store)
         .unwrap();
@@ -1849,7 +1858,7 @@ fn terminal_events_dispatch_presses_and_mouse_only() {
 fn mouse_clicks_off_the_tab_row_do_nothing_and_the_wheel_goes_both_ways() {
     let area = Rect::new(0, 0, 120, 40);
     let mut s = test_state();
-    let (_, _, store_x) = tab_titles()[2];
+    let (_, _, store_x) = tab_titles(120)[2];
     handle_mouse(
         &mut s,
         MouseEvent {
@@ -2422,13 +2431,19 @@ fn now_list_layout_and_styling() {
     assert!(rows[other_y].contains("two"), "{}", rows[other_y]);
     let mut saw_zero = false;
     let mut saw_saved = false;
-    for x in 0..buffer.area.width {
+    let column = |label: &str| {
+        let byte = rows[header_y].find(label).unwrap();
+        rows[header_y][..byte].chars().count() as u16
+    };
+    let misses_x = column("Misses");
+    let saved_x = column("Saved");
+    for x in misses_x..buffer.area.width {
         let cell = &buffer[(x, other_y as u16)];
         if cell.symbol() == "0" {
             assert_eq!(cell.fg, Color::DarkGray, "misses at {x}: {cell:?}");
             saw_zero = true;
         }
-        if cell.symbol() == "2" {
+        if x >= saved_x && cell.symbol() == "2" {
             assert_eq!(cell.fg, Color::Green, "saved at {x}: {cell:?}");
             saw_saved = true;
         }
@@ -2437,7 +2452,7 @@ fn now_list_layout_and_styling() {
 
     // A real miss is white. The em dash and the zero are the muted ones.
     let mut saw_miss = false;
-    for x in 0..buffer.area.width {
+    for x in misses_x..saved_x {
         let cell = &buffer[(x, selected_y as u16)];
         if cell.symbol() == "1" {
             assert_eq!(cell.fg, Color::White, "misses at {x}: {cell:?}");
@@ -2524,7 +2539,7 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
         ));
     }
     s.refresh_sessions(chrono::Utc::now());
-    let screen = rendered_tab(&mut s, Tab::Now);
+    let screen = rendered_tab_at(&mut s, Tab::Now, 100, 23);
     assert!(screen.contains("following the top build"), "{screen}");
     assert!(screen.contains("3 more, older"), "{screen}");
     assert!(screen.contains("n7"), "{screen}");
@@ -2534,7 +2549,7 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
     s.active_tab = Tab::Now;
     handle_key(&mut s, KeyCode::Char('j'));
     assert_eq!(s.selected_session.as_deref(), Some("id:s6"));
-    let pinned = rendered_tab(&mut s, Tab::Now);
+    let pinned = rendered_tab_at(&mut s, Tab::Now, 100, 23);
     assert!(!pinned.contains("following"), "{pinned}");
     handle_key(&mut s, KeyCode::Char('k'));
     assert_eq!(s.selected_session.as_deref(), Some("id:s7"));
@@ -2551,7 +2566,7 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
     assert_eq!(s.selected_session.as_deref(), Some("id:s5"));
     handle_key(&mut s, KeyCode::End);
     assert_eq!(s.selected_session.as_deref(), Some("id:s0"));
-    let screen = rendered_tab(&mut s, Tab::Now);
+    let screen = rendered_tab_at(&mut s, Tab::Now, 100, 23);
     assert!(screen.contains("3 newer"), "{screen}");
     assert!(screen.contains("n0"), "{screen}");
     assert!(!screen.contains("n7"), "{screen}");
@@ -2571,6 +2586,408 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
     assert_eq!(s.selected_session.as_deref(), Some("id:s7"));
     handle_mouse(&mut s, wheel(MouseEventKind::ScrollUp), area);
     assert!(s.selected_session.is_none());
+}
+
+#[test]
+fn now_fills_the_terminal_and_pages_by_the_visible_height() {
+    let mut s = test_state();
+    for i in 0..40 {
+        s.push_event(session_event(
+            "a",
+            EventResult::Miss,
+            &format!("/w/project-{i:02}"),
+            &format!("s{i}"),
+            100 - i,
+        ));
+    }
+    s.refresh_sessions(chrono::Utc::now());
+
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert_eq!(s.now_page_size, 28);
+    assert!(screen.contains("12 more, older"), "{screen}");
+    for i in 12..40 {
+        assert!(screen.contains(&format!("project-{i:02}")), "{screen}");
+    }
+    assert!(!screen.contains("project-11"), "{screen}");
+    handle_key(&mut s, KeyCode::PageDown);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s11"));
+
+    // Shrinking keeps the selected row visible and updates the page step.
+    let screen = rendered_tab_at(&mut s, Tab::Now, 100, 23);
+    assert_eq!(s.now_page_size, 5);
+    assert!(screen.contains("▸ project-11"), "{screen}");
+    handle_key(&mut s, KeyCode::PageUp);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s16"));
+
+    // Growing enough to fit every build removes both overflow counts.
+    let screen = rendered_tab_at(&mut s, Tab::Now, 120, 60);
+    for i in 0..40 {
+        assert!(screen.contains(&format!("project-{i:02}")), "{screen}");
+    }
+    assert!(!screen.contains("more, older"), "{screen}");
+    assert!(!screen.contains("newer"), "{screen}");
+    handle_key(&mut s, KeyCode::PageUp);
+    assert!(s.selected_session.is_none());
+
+    let screen = rendered_tab_at(&mut s, Tab::Now, 60, 16);
+    assert!(screen.contains("▸ project-39"), "{screen}");
+    assert!(screen.contains("Enter: why"), "{screen}");
+    assert!(screen.contains("Selected build"), "{screen}");
+}
+
+fn region_text(buffer: &Buffer, area: Rect) -> String {
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn small_now_keeps_the_selector_compact_and_the_detail_readable() {
+    let mut s = test_state();
+    for i in 0..40 {
+        s.events.push(session_event(
+            &format!("crate_{i}"),
+            EventResult::Miss,
+            &format!("/w/project-{i:02}"),
+            &format!("s{i}"),
+            100 - i,
+        ));
+    }
+    for event in &mut s.events {
+        event.elapsed_ms = 2_100;
+    }
+    s.refresh_sessions(chrono::Utc::now());
+    for (width, height) in [
+        (60, 16),
+        (60, 24),
+        (80, 20),
+        (80, 24),
+        (100, 24),
+        (110, 24),
+        (120, 24),
+        (80, 30),
+        (80, 40),
+        (160, 44),
+    ] {
+        let layout = now_layout(Rect::new(0, 1, width, height - 1), s.sessions.len());
+        let buffer = rendered_buffer(&mut s, Tab::Now, width, height);
+        let help = region_text(&buffer, layout.help);
+        assert!(
+            help.contains("q: quit") && help.contains("Enter: why") && help.contains("2: events"),
+            "{width}x{height}: {help}"
+        );
+        let builds = region_text(&buffer, layout.builds);
+        assert!(
+            builds.contains("project-39") && builds.contains("Misses") && builds.contains("Saved"),
+            "{width}x{height}: {builds}"
+        );
+        let summary = region_text(&buffer, layout.summary);
+        assert!(
+            summary.contains("hits 0 · misses 1 · saved 0s"),
+            "{width}x{height}: {summary}"
+        );
+        if layout.builds.x == layout.summary.x {
+            assert!(layout.builds.height <= 8);
+        } else {
+            assert!(layout.builds.width <= 48);
+            assert!(layout.events.width >= 60);
+        }
+        if height >= 24 {
+            assert!(layout.events.height >= 6, "{width}x{height}");
+            let events = region_text(&buffer, layout.events);
+            assert!(
+                events.contains("crate_39") && events.contains("built + cached"),
+                "{width}x{height}: {events}"
+            );
+        }
+        if width == 60 {
+            assert!(row_text(&buffer, 0).contains("[6]Transfer"));
+        }
+    }
+    assert_eq!(now_layout(Rect::new(0, 1, 80, 23), 2).builds.height, 5);
+}
+
+#[test]
+fn now_reserves_readable_detail_rows_at_layout_boundaries() {
+    // Terminal size, header rows, selector width and height, summary rows,
+    // cause rows, and event rows. Six event rows leave room for three events.
+    for (width, height, figures, list_width, list_height, summary, causes, events) in [
+        (80, 22, 3, 80, 8, 6, 0, 0),
+        (80, 23, 3, 80, 8, 4, 0, 6),
+        (80, 29, 3, 80, 8, 6, 0, 10),
+        (80, 30, 7, 80, 8, 4, 0, 9),
+        (80, 32, 7, 80, 8, 4, 0, 11),
+        (80, 33, 7, 80, 8, 6, 0, 10),
+        (80, 39, 7, 80, 8, 6, 0, 16),
+        (80, 40, 7, 80, 8, 6, 6, 11),
+        (69, 44, 3, 69, 8, 6, 6, 19),
+        (70, 44, 7, 70, 8, 6, 6, 15),
+        (109, 44, 7, 109, 8, 6, 6, 15),
+        (110, 44, 7, 36, 35, 6, 6, 23),
+        (110, 16, 3, 110, 7, 4, 0, 0),
+        (110, 17, 3, 36, 12, 4, 0, 8),
+        (120, 40, 7, 40, 31, 6, 6, 19),
+        (143, 40, 7, 47, 31, 6, 6, 19),
+        (144, 40, 7, 48, 31, 6, 6, 19),
+        (180, 40, 7, 48, 31, 6, 6, 19),
+    ] {
+        let layout = now_layout(Rect::new(0, 1, width, height - 1), 40);
+        assert_eq!(
+            (
+                layout.figures.height,
+                layout.builds.width,
+                layout.builds.height,
+                layout.summary.height,
+                layout.causes.height,
+                layout.events.height
+            ),
+            (figures, list_width, list_height, summary, causes, events),
+            "{width}x{height}",
+        );
+        assert_eq!(layout.help.bottom(), height);
+    }
+    for (count, expected) in [(0, 5), (2, 5), (3, 6), (4, 7), (5, 8), (40, 8)] {
+        assert_eq!(
+            now_layout(Rect::new(0, 1, 80, 43), count).builds.height,
+            expected
+        );
+    }
+}
+
+#[test]
+fn compact_tabs_remain_clickable_at_the_minimum_width() {
+    let area = Rect::new(3, 2, 60, 16);
+    let mut s = test_state();
+    for (tab, label, start) in tab_titles(60) {
+        assert!(start + label.len() as u16 <= 60);
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + start,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(s.active_tab, tab);
+    }
+    assert_eq!(tab_titles(75)[0].1, "[1]Now");
+    assert_eq!(tab_titles(76)[0].1, " [1] Now ");
+}
+
+#[test]
+fn now_shows_events_and_causes_beside_the_list_and_stacks_on_narrow_terminals() {
+    let mut s = test_state();
+    s.events = vec![
+        session_event("crate_new", EventResult::Miss, "/w/one", "s1", 5),
+        session_event("crate_hot", EventResult::LocalHit, "/w/one", "s1", 5),
+        session_event("crate_other", EventResult::LocalHit, "/w/two", "s2", 400),
+    ];
+    s.refresh_sessions(chrono::Utc::now());
+    for (width, height) in [(160, 44), (80, 44)] {
+        let layout = now_layout(Rect::new(0, 1, width, height - 1), s.sessions.len());
+        if width == 160 {
+            assert_eq!(layout.builds.y, layout.summary.y);
+            assert_eq!(layout.builds.right(), layout.summary.x);
+            assert!(layout.builds.width <= 48);
+        } else {
+            assert_eq!(layout.builds.x, layout.summary.x);
+            assert_eq!(layout.builds.bottom(), layout.summary.y);
+        }
+        let buffer = rendered_buffer(&mut s, Tab::Now, width, height);
+        let builds = region_text(&buffer, layout.builds);
+        assert!(
+            builds.contains("Misses") && builds.contains("Saved"),
+            "{builds}"
+        );
+        let events = region_text(&buffer, layout.events);
+        assert!(events.contains("crate_new"), "{events}");
+        assert!(events.contains("built + cached"), "{events}");
+        assert!(events.contains("crate_hot"), "{events}");
+        assert!(!events.contains("crate_other"), "{events}");
+        let causes = region_text(&buffer, layout.causes);
+        assert!(causes.contains("no earlier compile"), "{causes}");
+        assert!(causes.contains("Enter for full analysis"), "{causes}");
+
+        handle_key(&mut s, KeyCode::Down);
+        let buffer = rendered_buffer(&mut s, Tab::Now, width, height);
+        let events = region_text(&buffer, layout.events);
+        assert!(events.contains("crate_other"), "{events}");
+        assert!(!events.contains("crate_new"), "{events}");
+        let causes = region_text(&buffer, layout.causes);
+        assert!(causes.contains("Every cache lookup hit."), "{causes}");
+        handle_key(&mut s, KeyCode::Home);
+    }
+}
+
+#[test]
+fn now_clicks_select_visible_rows_and_the_wheel_scrolls_the_pointed_panel() {
+    let mut s = test_state();
+    for i in 0..50 {
+        s.events.push(session_event(
+            &format!("crate_{i}"),
+            EventResult::Miss,
+            "/w/one",
+            "s1",
+            5,
+        ));
+    }
+    s.events.push(session_event(
+        "other",
+        EventResult::LocalHit,
+        "/w/two",
+        "s2",
+        400,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let area = Rect::new(3, 2, 160, 44);
+    let layout = now_layout(Rect::new(3, 3, 160, 43), s.sessions.len());
+    // Render at the same dimensions to establish the event viewport.
+    rendered_tab_at(&mut s, Tab::Now, 160, 44);
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    handle_mouse(
+        &mut s,
+        mouse(
+            MouseEventKind::ScrollUp,
+            layout.events.x + 2,
+            layout.events.y + 2,
+        ),
+        area,
+    );
+    assert_eq!(s.build_scroll.offset, 3);
+    assert!(s.selected_session.is_none());
+    handle_mouse(
+        &mut s,
+        mouse(
+            MouseEventKind::ScrollDown,
+            layout.events.x + 2,
+            layout.events.y + 2,
+        ),
+        area,
+    );
+    assert_eq!(s.build_scroll.offset, 0);
+
+    // Borders, headers, and unused rows must not select another build.
+    for (column, row) in [
+        (layout.builds.x, layout.builds.y + 3),
+        (layout.builds.right() - 1, layout.builds.y + 2),
+        (layout.builds.x + 2, layout.builds.bottom() - 1),
+        (layout.builds.x + 2, layout.builds.y + 1),
+        (layout.builds.x + 2, layout.builds.y + 4),
+        (layout.summary.x + 2, layout.summary.y + 2),
+    ] {
+        handle_mouse(
+            &mut s,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            area,
+        );
+        assert!(s.selected_session.is_none());
+    }
+    handle_mouse(
+        &mut s,
+        mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.builds.x + 2,
+            layout.builds.y + 3,
+        ),
+        area,
+    );
+    assert_eq!(s.selected_session.as_deref(), Some("id:s2"));
+    assert_eq!(s.build_scroll.offset, 0);
+    handle_mouse(
+        &mut s,
+        mouse(
+            MouseEventKind::ScrollUp,
+            layout.builds.x + 2,
+            layout.builds.y + 3,
+        ),
+        area,
+    );
+    assert!(s.selected_session.is_none());
+}
+
+#[test]
+fn now_explains_a_passthrough_without_claiming_a_cache_hit() {
+    let mut s = test_state();
+    let mut event = session_event("proc_macro", EventResult::Passthrough, "/w/one", "s1", 5);
+    event.passthrough_reason = "not-cacheable|non-relocatable proc macro".to_string();
+    s.events.push(event);
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(
+        screen.contains("No cache lookups in this build."),
+        "{screen}"
+    );
+    assert!(screen.contains("non-relocatable proc macro"), "{screen}");
+    assert!(screen.contains("built (not cached)"), "{screen}");
+    assert!(!screen.contains("Every cache lookup hit"), "{screen}");
+}
+
+#[test]
+fn now_previews_the_selected_build_and_keeps_it_across_detail_tabs() {
+    let mut s = test_state();
+    for (result, count) in [
+        (EventResult::Miss, 1),
+        (EventResult::Dup, 2),
+        (EventResult::LocalHit, 4),
+        (EventResult::Passthrough, 5),
+        (EventResult::Skipped, 6),
+        (EventResult::Error, 7),
+    ] {
+        for _ in 0..count {
+            s.events.push(session_event("a", result, "/w/one", "s1", 5));
+        }
+    }
+    for _ in 0..8 {
+        let mut probe = session_event("a", EventResult::Passthrough, "/w/one", "s1", 5);
+        probe.passthrough_reason = "not-a-compile".to_string();
+        s.events.push(probe);
+    }
+    s.events.push(session_event(
+        "b",
+        EventResult::LocalHit,
+        "/w/two",
+        "s2",
+        400,
+    ));
+    s.refresh_sessions(chrono::Utc::now());
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(screen.contains("Selected build"), "{screen}");
+    assert!(screen.contains("/w/one"), "{screen}");
+    assert!(screen.contains("running · started"), "{screen}");
+    assert!(screen.contains("hits 4 · misses 3 · saved 8s"), "{screen}");
+    assert!(
+        screen.contains("5 passed through · 8 probes · 6 skipped · 7 errors"),
+        "{screen}"
+    );
+
+    handle_key(&mut s, KeyCode::Down);
+    let screen = rendered_tab(&mut s, Tab::Now);
+    assert!(!screen.contains("/w/one"), "{screen}");
+    assert!(screen.contains("/w/two"), "{screen}");
+    assert!(screen.contains("done · started"), "{screen}");
+    assert!(screen.contains("hits 1 · misses 0 · saved 2s"), "{screen}");
+    assert!(
+        screen.contains("0 passed through · 0 probes · 0 skipped · 0 errors"),
+        "{screen}"
+    );
+    handle_key(&mut s, KeyCode::Char('2'));
+    assert_eq!(s.active_tab, Tab::Build);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s2"));
+    handle_key(&mut s, KeyCode::Enter);
+    assert_eq!(s.active_tab, Tab::Why);
+    assert_eq!(s.selected_session.as_deref(), Some("id:s2"));
 }
 
 fn project_tree(path: &str, size: u64) -> cli::TargetEntry {
@@ -2781,8 +3198,10 @@ fn count_hit_figure_is_blank_only_when_every_lookup_counter_is_zero() {
 
 #[test]
 fn now_window_keeps_the_selection_away_from_the_edges() {
-    assert_eq!(now_window_start(10, 5), 3);
-    assert_eq!(now_window_start(4, 3), 0);
+    assert_eq!(now_window_start(10, 5, 5), 3);
+    assert_eq!(now_window_start(4, 3, 5), 0);
+    assert_eq!(now_window_start(40, 20, 21), 10);
+    assert_eq!(now_window_start(40, 39, 21), 19);
 }
 
 #[test]

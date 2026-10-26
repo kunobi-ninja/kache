@@ -333,7 +333,6 @@ impl SortMode {
 type StatsSnapshot = cli::StatsSnapshot;
 
 /// Replace the user's home directory prefix with `~` for shorter, more private display.
-#[cfg(test)]
 fn shorten_home(path: &std::path::Path) -> String {
     if let Some(home) = dirs::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
@@ -442,6 +441,8 @@ struct AppState {
     /// The session the reader picked, by key; `None` follows the top row,
     /// which is the newest running build.
     selected_session: Option<String>,
+    /// Rows available in the Now list on its last draw.
+    now_page_size: usize,
     /// The build the panels showed last tick, and how many events it had,
     /// so a change of build resets the viewports and new rows in the same
     /// build keep a scrolled reader in place.
@@ -797,6 +798,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         sessions: Vec::new(),
         grouped_len: 0,
         selected_session: None,
+        now_page_size: 1,
         shown: None,
         why_cache: None,
         transfer_scroll: Viewport::new(ScrollAnchor::Top),
@@ -1006,20 +1008,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent, area: Rect) {
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) if mouse.row == area.y => {
-            if let Some(tab) = tab_at_column(mouse.column.saturating_sub(area.x)) {
+            if let Some(tab) = tab_at_column(mouse.column.saturating_sub(area.x), area.width) {
                 switch_tab(state, tab);
             }
         }
-        MouseEventKind::ScrollUp if state.active_tab == Tab::Now => {
-            for _ in 0..3 {
-                state.select_previous_session();
-            }
-        }
-        MouseEventKind::ScrollDown if state.active_tab == Tab::Now => {
-            for _ in 0..3 {
-                state.select_next_session();
-            }
-        }
+        _ if state.active_tab == Tab::Now => handle_now_mouse(state, mouse, area),
         MouseEventKind::ScrollUp => state.active_viewport().scroll_up_by(3),
         MouseEventKind::ScrollDown => state.active_viewport().scroll_down_by(3),
         _ => {}
@@ -1098,12 +1091,12 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.select_next_session();
         }
         KeyCode::PageUp if state.active_tab == Tab::Now => {
-            for _ in 0..5 {
+            for _ in 0..state.now_page_size {
                 state.select_previous_session();
             }
         }
         KeyCode::PageDown if state.active_tab == Tab::Now => {
-            for _ in 0..5 {
+            for _ in 0..state.now_page_size {
                 state.select_next_session();
             }
         }
@@ -1225,7 +1218,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let mut spans = Vec::with_capacity(Tab::ORDER.len() * 2);
-    for (tab, label, _) in tab_titles() {
+    for (tab, label, _) in tab_titles(area.width) {
         spans.push(Span::styled(label, style_for(tab)));
         spans.push(Span::raw("  "));
     }
@@ -1243,7 +1236,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 
 /// Every tab's label and the column it starts at in the tab bar. One place
 /// for the geometry so the drawing and the mouse hit-test cannot disagree.
-fn tab_titles() -> [(Tab, &'static str, u16); 6] {
+fn tab_titles(width: u16) -> [(Tab, &'static str, u16); 6] {
     const LABELS: [(Tab, &str); 6] = [
         (Tab::Now, " [1] Now "),
         (Tab::Build, "[2] Build "),
@@ -1252,8 +1245,20 @@ fn tab_titles() -> [(Tab, &'static str, u16); 6] {
         (Tab::Store, "[5] Store "),
         (Tab::Transfer, "[6] Transfer "),
     ];
+    let labels = if width < 76 {
+        [
+            (Tab::Now, "[1]Now"),
+            (Tab::Build, "[2]Build"),
+            (Tab::Why, "[3]Why"),
+            (Tab::Projects, "[4]Projects"),
+            (Tab::Store, "[5]Store"),
+            (Tab::Transfer, "[6]Transfer"),
+        ]
+    } else {
+        LABELS
+    };
     let mut x = 0u16;
-    LABELS.map(|(tab, label)| {
+    labels.map(|(tab, label)| {
         let start = x;
         x += label.len() as u16 + 2;
         (tab, label, start)
@@ -1261,17 +1266,14 @@ fn tab_titles() -> [(Tab, &'static str, u16); 6] {
 }
 
 /// The tab whose label covers `column` of the tab bar, if any.
-fn tab_at_column(column: u16) -> Option<Tab> {
-    tab_titles()
+fn tab_at_column(column: u16, width: u16) -> Option<Tab> {
+    tab_titles(width)
         .into_iter()
         .find(|(_, label, start)| column >= *start && column < start + label.len() as u16)
         .map(|(tab, _, _)| tab)
 }
 
 // ── Now ────────────────────────────────────────────────────────────────────
-
-/// How many builds the landing list shows at once. The rest are a count.
-const NOW_ROWS: usize = 5;
 
 /// Lookups the tally actually consulted. Passthroughs are not among them.
 fn lookup_count(tally: &tui_sessions::Tally) -> u64 {
@@ -1333,30 +1335,248 @@ fn miss_time_share(es: &daemon::EventStatsResponse) -> Option<f64> {
 }
 
 /// First visible row of the landing list, keeping the selection on screen.
-fn now_window_start(count: usize, selected: usize) -> usize {
-    if count <= NOW_ROWS {
-        return 0;
-    }
-    let max_start = count - NOW_ROWS;
-    selected.saturating_sub(NOW_ROWS / 2).min(max_start)
+fn now_window_start(count: usize, selected: usize, rows: usize) -> usize {
+    selected
+        .saturating_sub(rows / 2)
+        .min(count.saturating_sub(rows))
 }
 
-fn draw_now_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(7),
+struct NowLayout {
+    figures: Rect,
+    builds: Rect,
+    summary: Rect,
+    causes: Rect,
+    events: Rect,
+    help: Rect,
+}
+
+/// Shared geometry for rendering and mouse hit tests. Short terminals keep
+/// the list; wide terminals put the selected build beside it.
+fn now_layout(area: Rect, build_count: usize) -> NowLayout {
+    let figure_rows = if area.height < 29 || area.width < 70 {
+        3
+    } else {
+        7
+    };
+    let outer = Layout::vertical([
+        Constraint::Length(figure_rows),
         Constraint::Min(6),
         Constraint::Length(1),
     ])
     .split(area);
-    draw_now_figures(frame, state, chunks[0]);
-    draw_now_builds(frame, state, chunks[1]);
-    let help = help_line(
-        state,
-        "q: quit  p: pause  ↑↓: build  Enter: why  ⇥/⇧⇥: tabs",
-    );
+    let body = outer[1];
+    let panels = if body.width >= 110 && body.height >= 12 {
+        let list_width = (body.width / 3).min(48);
+        Layout::horizontal([Constraint::Length(list_width), Constraint::Min(60)]).split(body)
+    } else {
+        let list_rows = build_count.saturating_add(3).clamp(5, 8) as u16;
+        let list_rows = list_rows.min(body.height.saturating_sub(4));
+        Layout::vertical([Constraint::Length(list_rows), Constraint::Min(4)]).split(body)
+    };
+    let summary_rows = if panels[1].height >= 16 {
+        6
+    } else if panels[1].height >= 10 {
+        4
+    } else {
+        panels[1].height.min(6)
+    };
+    let cause_rows = if panels[1].height >= 23 { 6 } else { 0 };
+    let detail = Layout::vertical([
+        Constraint::Length(summary_rows),
+        Constraint::Length(cause_rows),
+        Constraint::Min(0),
+    ])
+    .split(panels[1]);
+    NowLayout {
+        figures: outer[0],
+        builds: panels[0],
+        summary: detail[0],
+        causes: detail[1],
+        events: if detail[2].height >= 6 {
+            detail[2]
+        } else {
+            Rect::default()
+        },
+        help: outer[2],
+    }
+}
+
+fn handle_now_mouse(state: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let content = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    let layout = now_layout(content, state.sessions.len());
+    let position = Position::new(mouse.column, mouse.row);
+    if layout.builds.contains(position) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let rows = Rect::new(
+                    layout.builds.x + 1,
+                    layout.builds.y + 2,
+                    layout.builds.width.saturating_sub(2),
+                    layout.builds.height.saturating_sub(3),
+                );
+                if rows.contains(position) {
+                    let start = now_window_start(
+                        state.sessions.len(),
+                        state.selected_index().unwrap_or(0),
+                        rows.height as usize,
+                    );
+                    let index = start + (mouse.row - rows.y) as usize;
+                    if let Some(session) = state.sessions.get(index) {
+                        state.selected_session = Some(session.key.clone());
+                        state.reconcile_shown_build();
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    state.select_previous_session();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    state.select_next_session();
+                }
+            }
+            _ => {}
+        }
+    } else if layout.events.contains(position) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => state.build_scroll.scroll_up_by(3),
+            MouseEventKind::ScrollDown => state.build_scroll.scroll_down_by(3),
+            _ => {}
+        }
+    }
+}
+
+fn draw_now_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let layout = now_layout(area, state.sessions.len());
+    draw_now_figures(frame, state, layout.figures);
+    draw_now_builds(frame, state, layout.builds);
+    if layout.summary.height > 0 {
+        draw_now_selection(frame, state, layout.summary);
+    }
+    if layout.causes.height > 0 {
+        draw_now_causes(frame, state, layout.causes);
+    }
+    if layout.events.height > 0 {
+        draw_live_build(frame, state, layout.events);
+    }
+    let keys = if area.width >= 100 {
+        "↑↓: build  PgUp/PgDn: page  Home: follow  Enter: why  2: events  p: pause  q: quit"
+    } else {
+        "↑↓: build  Home: follow  Enter: why  2: events  q: quit"
+    };
+    let help = help_line(state, keys);
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        layout.help,
+    );
+}
+
+fn draw_now_causes(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let block = Block::bordered().title(" Why · Enter for full analysis ");
+    let inner = block.inner(area);
+    let mut lines = Vec::new();
+    let lookups = state
+        .selected_session()
+        .map_or(0, |s| lookup_count(&s.tally));
+    if let Some(analysis) = state.why_analysis() {
+        if analysis.causes.is_empty() {
+            lines.push(Line::from(if lookups == 0 {
+                "No cache lookups in this build."
+            } else {
+                "Every cache lookup hit."
+            }));
+        }
+        for group in analysis.causes.iter().take(3) {
+            let color = if group.cause.is_failure() {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            lines.push(Line::styled(
+                clip(
+                    &format!(
+                        "{} · {} · {}",
+                        group.count,
+                        fmt_saved_ms(group.compile_ms),
+                        group.cause.describe()
+                    ),
+                    inner.width as usize,
+                ),
+                Style::default().fg(color),
+            ));
+        }
+        for group in analysis.passthroughs.iter().take(2) {
+            lines.push(Line::from(clip(
+                &format!("{} passed through · {}", group.count, group.reason),
+                inner.width as usize,
+            )));
+        }
+        if analysis.misses_analyzed < analysis.misses_total {
+            lines.insert(
+                0,
+                Line::from(format!(
+                    "Newest {} of {} misses analyzed",
+                    analysis.misses_analyzed, analysis.misses_total
+                )),
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_now_selection(frame: &mut Frame, state: &AppState, area: Rect) {
+    let Some(session) = state.selected_session() else {
+        return;
+    };
+    let t = &session.tally;
+    let totals = Line::from(format!(
+        "  hits {} · misses {} · saved {}",
+        t.hits,
+        t.compiled(),
+        figure_saved(t.saved_ms),
+    ));
+    let lines = if area.height < 6 {
+        vec![
+            Line::from(clip(
+                &format!(
+                    "  {} · {} · {}",
+                    session.state.label(),
+                    session
+                        .started
+                        .with_timezone(&chrono::Local)
+                        .format("%H:%M"),
+                    shorten_home(std::path::Path::new(&session.root)),
+                ),
+                area.width.saturating_sub(2) as usize,
+            )),
+            totals,
+        ]
+    } else {
+        vec![
+            Line::from(format!(
+                "  {}",
+                shorten_home(std::path::Path::new(&session.root))
+            )),
+            Line::from(format!(
+                "  {} · started {}",
+                session.state.label(),
+                session
+                    .started
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S"),
+            )),
+            totals,
+            Line::from(format!(
+                "  {} passed through · {} probes · {} skipped · {} errors",
+                t.passthroughs, t.probes, t.skipped, t.errors,
+            )),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Selected build ")),
+        area,
     );
 }
 
@@ -1387,6 +1607,27 @@ fn draw_now_figures(frame: &mut Frame, state: &AppState, area: Rect) {
     let window = SinceWindow::DEFAULT.label();
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(Color::DarkGray);
+    if area.height < 7 {
+        let lines = vec![
+            Line::styled(
+                format!("  {hit} lookups hit · {saved} saved ({window}) · {builds} builds"),
+                bold,
+            ),
+            Line::styled(
+                clip(
+                    &format!(
+                        "  cache {store} / {} · {}",
+                        cap.trim_start_matches("cap "),
+                        remote_sentence(&effective_remote_status(&state.config, snap))
+                    ),
+                    area.width as usize,
+                ),
+                muted,
+            ),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
     let figure = |text: &str| format!("{text:<16}");
     let mut lines = vec![
         Line::from(vec![
@@ -1424,27 +1665,34 @@ fn draw_now_figures(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_now_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let visible = area.height.saturating_sub(3) as usize;
+    state.now_page_size = visible.max(1);
     let count = state.sessions.len();
     let following = state.selected_session.is_none();
     let selected = state.selected_index().unwrap_or(0);
-    let start = now_window_start(count, selected);
-    let shown = count.min(NOW_ROWS);
+    let start = now_window_start(count, selected, state.now_page_size);
+    let shown = count.min(visible);
     let older = count.saturating_sub(start + shown);
     let newer = start;
-    let mut title = if following && count > 0 {
+    let title = if following && count > 0 {
         " Builds · following the top build".to_string()
     } else {
         " Builds".to_string()
     };
-    if newer > 0 {
-        title.push_str(&format!(" · {newer} newer"));
-    }
-    if older > 0 {
-        title.push_str(&format!(" · {older} more, older"));
-    }
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(format!("{title} "))
         .border_style(Style::default().fg(Color::Cyan));
+    let mut overflow = Vec::new();
+    if newer > 0 {
+        overflow.push(format!("{newer} newer"));
+    }
+    if older > 0 {
+        overflow.push(format!("{older} more, older"));
+    }
+    if !overflow.is_empty() {
+        block =
+            block.title_bottom(Line::from(format!(" {} ", overflow.join(" · "))).right_aligned());
+    }
     if count == 0 {
         frame.render_widget(
             Paragraph::new(
@@ -1456,12 +1704,19 @@ fn draw_now_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
         return;
     }
 
-    let header = Row::new([
-        Cell::from("Build"),
+    let show_context = area.width >= MIN_WIDTH;
+    let mut header = vec![Cell::from("Build")];
+    let mut widths = vec![Constraint::Min(16)];
+    if show_context {
+        header.extend([Cell::from("State"), Cell::from("Started")]);
+        widths.extend([Constraint::Length(7), Constraint::Length(8)]);
+    }
+    header.extend([
         Cell::from(Line::from("Misses").right_aligned()),
         Cell::from(Line::from("Saved").right_aligned()),
-    ])
-    .style(Style::default().fg(Color::DarkGray));
+    ]);
+    widths.extend([Constraint::Length(6), Constraint::Length(6)]);
+    let header = Row::new(header).style(Style::default().fg(Color::DarkGray));
     let right = |text: String, style: Style| Cell::from(Line::styled(text, style).right_aligned());
     let rows: Vec<Row> = state
         .sessions
@@ -1481,8 +1736,21 @@ fn draw_now_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 Color::White
             };
             let saved_ms = session.tally.saved_ms;
-            Row::new([
-                Cell::from(name),
+            let mut cells = vec![Cell::from(name)];
+            if show_context {
+                cells.extend([
+                    Cell::from(session.state.label()),
+                    Cell::from(
+                        session
+                            .started
+                            .with_timezone(&chrono::Local)
+                            .format("%H:%M:%S")
+                            .to_string(),
+                    )
+                    .style(Style::default().fg(Color::DarkGray)),
+                ]);
+            }
+            cells.extend([
                 right(misses, Style::default().fg(miss_color)),
                 right(
                     fmt_saved_ms(saved_ms),
@@ -1492,15 +1760,10 @@ fn draw_now_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
                         Color::Green
                     }),
                 ),
-            ])
+            ]);
+            Row::new(cells)
         })
         .collect();
-    let widths = [
-        Constraint::Min(16),
-        Constraint::Length(8),
-        Constraint::Length(8),
-    ];
-    let visible = area.height.saturating_sub(3) as usize;
     let highlight = selected.saturating_sub(start);
     let table = Table::new(rows, widths)
         .header(header)

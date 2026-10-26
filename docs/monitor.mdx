@@ -29,7 +29,11 @@ The Now size counts logical output bytes. The Store tab shows deduplicated blob 
 
 Under the figures: the share of compile time that came back from the cache, and the share of lookup time that was a miss. Remote is one line. When the daemon reports `not configured` or `local-only`, that line reads `remote is off`.
 
-The list under that shows five builds: name, misses, and time saved. Misses count compiles that missed, including ones whose output was already in the store. A build with no lookups shows `—`. Up and Down move the selection. The list follows the newest build until you move; Home returns to that. Enter opens Why.
+Select a build with Up, Down, or a click to see its summary and compiler events on the same screen. On a wide terminal, the build selector sits beside the detail and uses at most 48 columns. On a narrow terminal, it sits above the detail and shows up to five builds. With fewer builds it shrinks further. Page Up and Page Down move by the number of visible rows.
+
+Each row shows the build name, misses, and time saved. Wider rows also show the state and start time. Misses count compiles that missed, including ones whose output was already in the store. A build with no lookups shows `—`. The list follows the newest build until you move; Home returns to that. Press `2` for the full event view or Enter for Why.
+
+When there is room, the detail includes a preview of the miss causes and passthrough reasons. Short terminals use a compact header and summary, keeping room for events. At the minimum size, the selector and summary remain visible; use `2` or Enter to inspect the build.
 
 ## Tabs
 
@@ -58,7 +62,7 @@ Up / Down, j / k  on Now, Build, and Why: pick a build
                   elsewhere: scroll one row
 Enter             on Now and Build: open Why
                   on Projects: show or hide the other columns
-PgUp / PgDn       on Now: move five builds; elsewhere: scroll one page
+PgUp / PgDn       on Now: move one page of builds; elsewhere: scroll one page
 Home              on Now: follow the newest build again; elsewhere: first row
 End               on Now: select the oldest listed build
                   on Build: follow new events again
@@ -72,7 +76,7 @@ r                 rescan Projects
 
 The monitor starts by following the top build, and the Now list title says "following the top build". Pressing Up on the first row returns to that mode. The top build is the newest running one, or the newest finished one when nothing is running.
 
-Clicking a tab title selects it. On Now the mouse wheel moves the selected build by three. On the other tabs it scrolls the panel.
+Clicking a tab title selects it. On Now, clicking a build selects it. The mouse wheel over the build selector moves the selection by three; over the event panel it scrolls the events. On the other tabs it scrolls the panel.
 
 Narrow terminals drop the least important columns first instead of clipping every column. Below 60×16 the monitor says so and points at `kache stats`, which prints the same numbers as text and works in a pipe.
 

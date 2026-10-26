@@ -154,6 +154,22 @@ fn every_config_subcommand_emits_one_json_document() {
 }
 
 #[test]
+fn config_list_reports_a_file_read_error_instead_of_empty_values() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("selected.toml")).unwrap();
+    let out = run(root.path(), &["config", "list", "--json"]);
+    assert!(!out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reading")
+    );
+}
+
+#[test]
 fn malformed_keys_report_a_key_error_and_legacy_keys_remain_accessible() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(

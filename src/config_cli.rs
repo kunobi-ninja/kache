@@ -176,12 +176,11 @@ fn print_values(prefix: &str, value: &toml::Value) {
 fn edit(path: &Path, key: &str, value: Option<&str>) -> Result<()> {
     let keys = key_parts(key)?;
     // Resolve existing symlinks before choosing a stable lock or replacing the file.
-    let path = match fs::symlink_metadata(path) {
-        Ok(_) => path
-            .canonicalize()
-            .context("resolving configuration file")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
-        Err(error) => return Err(error).context("inspecting configuration file"),
+    let path = if fs::symlink_metadata(path).is_ok() {
+        path.canonicalize()
+            .context("resolving configuration file")?
+    } else {
+        path.to_owned()
     };
     let parent = path
         .parent()

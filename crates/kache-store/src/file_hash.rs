@@ -1600,13 +1600,19 @@ mod tests {
     fn input_prediction_read_and_record_stamp_the_wall_clock() {
         let dir = tempfile::tempdir().unwrap();
         let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
-        let before = unix_now();
-        assert!(before > 1_700_000_000);
+        // SQLite writes use Windows' coarse clock; Rust reads use its precise
+        // clock. Compare each stamp with a sample from the clock that wrote it.
+        let before_sqlite: i64 = cache
+            .db()
+            .query_row("SELECT unixepoch()", [], |row| row.get(0))
+            .unwrap();
+        assert!(before_sqlite > 1_700_000_000);
         cache
             .put_input_prediction("unit", 1, None, "payload")
             .unwrap();
-        assert!(prediction_last_used(&cache, "unit") >= before);
+        assert!(prediction_last_used(&cache, "unit") >= before_sqlite);
 
+        let before = unix_now();
         set_prediction_last_used(&cache, "unit", 1);
         cache.get_input_prediction("unit").unwrap();
         assert!(prediction_last_used(&cache, "unit") >= before);
@@ -1616,7 +1622,7 @@ mod tests {
         cache
             .put_input_prediction("unit", 2, None, "payload-2")
             .unwrap();
-        assert!(prediction_last_used(&cache, "unit") >= before);
+        assert!(prediction_last_used(&cache, "unit") >= before_sqlite);
     }
 
     #[test]

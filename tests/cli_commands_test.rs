@@ -51,6 +51,7 @@ fn kache_process_as(program: &Path, home: &Path, cache_dir: &Path) -> std::proce
         .env("SHELL", "/bin/bash")
         .env_remove("ZDOTDIR")
         .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS);
     cmd
 }
@@ -966,17 +967,203 @@ fn init_preview_backs_up_existing_startup_files_before_each_edit() {
         .iter()
         .position(|step| step.starts_with("test_runner "))
         .unwrap();
+    let completions = steps
+        .iter()
+        .position(|step| step.starts_with("completions "))
+        .unwrap();
     assert_eq!(steps[shell + 1], "backup create .bashrc", "{steps:?}");
     assert_eq!(steps[tests + 1], "backup create .bashrc", "{steps:?}");
+    assert_eq!(steps[completions + 1], "backup create .bashrc", "{steps:?}");
     assert_eq!(
         steps
             .iter()
             .filter(|step| step.starts_with("backup "))
             .count(),
-        2,
+        3,
         "{steps:?}"
     );
     assert_eq!(plan["test_activation_required"], true, "{plan}");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_installs_and_updates_shell_completions() {
+    for (shell, relative_script, startup) in [
+        (
+            "bash",
+            ".local/share/kache/completions/kache.bash",
+            Some(".bashrc"),
+        ),
+        (
+            "zsh",
+            ".local/share/kache/completions/kache.zsh",
+            Some(".zshrc"),
+        ),
+        ("fish", ".config/fish/completions/kache.fish", None),
+    ] {
+        let e = env();
+        let script = e.home.join(relative_script);
+        let run = |check| {
+            let mut command = e.cmd();
+            command
+                .args(["init", "--yes", "--no-service", "--json"])
+                .env("SHELL", format!("/bin/{shell}"));
+            if check {
+                command.arg("--check");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{shell}: {output:?}");
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        let completion_step = |result: &serde_json::Value| {
+            result["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["component"] == "completions")
+                .unwrap_or_else(|| panic!("completions missing: {result}"))
+                .clone()
+        };
+        assert_eq!(completion_step(&run(true))["action"], "configure");
+        assert!(!script.exists(), "preview wrote {script:?}");
+        assert_eq!(completion_step(&run(false))["action"], "configure");
+        let generated = e.cmd().args(["completions", shell]).output().unwrap();
+        assert!(generated.status.success());
+        assert_eq!(std::fs::read(&script).unwrap(), generated.stdout);
+        if let Some(startup) = startup {
+            let text = std::fs::read_to_string(e.home.join(startup)).unwrap();
+            assert!(text.contains("# >>> kache shell completions >>>"), "{text}");
+            assert!(text.contains(script.to_str().unwrap()), "{text}");
+        }
+        assert_eq!(completion_step(&run(true))["action"], "keep");
+        assert_eq!(completion_step(&run(false))["action"], "keep");
+        std::fs::write(&script, "# old completions\n").unwrap();
+        assert_eq!(completion_step(&run(false))["action"], "configure");
+        assert_eq!(std::fs::read(&script).unwrap(), generated.stdout);
+        assert!(
+            std::fs::read_dir(script.parent().unwrap())
+                .unwrap()
+                .any(|entry| {
+                    let entry = entry.unwrap();
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".kache-shell-backup-")
+                        && std::fs::read(entry.path()).unwrap() == b"# old completions\n"
+                })
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_leaves_completions_alone_when_shell_setup_is_skipped_or_cancelled() {
+    let e = env();
+    let output = e
+        .cmd()
+        .args(["init", "--yes", "--no-service", "--no-shell", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !result["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["component"] == "completions")
+    );
+    assert!(!e.home.join(".local/share/kache/completions").exists());
+    assert!(!e.home.join(".bashrc").exists());
+
+    let cancelled = env();
+    cancelled
+        .cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("n\n")
+        .assert()
+        .success();
+    assert!(
+        !cancelled
+            .home
+            .join(".local/share/kache/completions")
+            .exists()
+    );
+    assert!(!cancelled.home.join(".bashrc").exists());
+
+    let unsupported = env();
+    let output = unsupported
+        .cmd()
+        .args(["init", "--check", "--no-service", "--json"])
+        .env("SHELL", "/bin/tcsh")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let completions = result["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["component"] == "completions")
+        .unwrap();
+    assert_eq!(completions["action"], "unsupported");
+    assert!(
+        !unsupported
+            .home
+            .join(".local/share/kache/completions")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_completions_follow_custom_shell_and_data_directories() {
+    for shell in ["zsh", "fish"] {
+        let e = env();
+        let data = e.home.join("custom ' data");
+        let config = e.home.join("custom ' config");
+        let dots = e.home.join("dotfiles");
+        let output = e
+            .cmd()
+            .args(["init", "--yes", "--no-service", "--json"])
+            .env("SHELL", format!("/bin/{shell}"))
+            .env("ZDOTDIR", &dots)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", &data)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{shell}: {output:?}");
+        let script = if shell == "zsh" {
+            data.join("kache/completions/kache.zsh")
+        } else {
+            config.join("fish/completions/kache.fish")
+        };
+        assert!(script.exists(), "{script:?}");
+        assert!(!e.home.join(".local/share/kache/completions").exists());
+        if shell == "zsh" {
+            assert!(
+                std::fs::read_to_string(dots.join(".zshrc"))
+                    .unwrap()
+                    .contains("kache shell completions")
+            );
+            assert!(!e.home.join(".zshrc").exists());
+        }
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let completion = receipt["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["component"] == "completions")
+            .unwrap();
+        assert!(
+            completion["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path.as_str() == script.to_str())
+        );
+        assert_eq!(completion["action"], "configure");
+    }
 }
 
 /// With a login shell init cannot set up, it installs no shims, so there is

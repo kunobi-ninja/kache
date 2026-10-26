@@ -29,6 +29,8 @@ mod identity;
 mod incremental_policy;
 mod index_compact;
 #[cfg(unix)]
+mod init_completions;
+#[cfg(unix)]
 mod init_shell;
 mod invocation;
 mod key_env;
@@ -296,6 +298,13 @@ fn config_without_terminal(path: &std::path::Path) -> String {
         "`kache config` needs a terminal. Edit {} directly, or set KACHE_* environment variables.",
         path.display()
     )
+}
+
+/// Use the same visible command tree for `init` and `completions`.
+fn generate_completions(shell: clap_complete::Shell, output: &mut dyn std::io::Write) {
+    let mut command = without_hidden(&Cli::command());
+    let name = command.get_name().to_string();
+    clap_complete::generate(shell, &mut command, name, output);
 }
 
 /// `command` with its hidden subcommands and flags left out, for shell
@@ -767,10 +776,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Logout) => return cli::login::logout(),
         Some(Commands::Cargo { args }) => return cargo_proxy::run(args.clone()),
         Some(Commands::Completions { shell }) => {
-            use clap_complete::generate;
-            let mut cmd = without_hidden(&Cli::command());
-            let name = cmd.get_name().to_string();
-            generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            generate_completions(*shell, &mut std::io::stdout());
             return Ok(());
         }
         _ => {}

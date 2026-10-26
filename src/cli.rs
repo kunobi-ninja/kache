@@ -10697,6 +10697,8 @@ struct SetupFacts {
     rustdoc: Option<&'static str>,
     test_runner: Option<SetupStep>,
     test_changes: Vec<(std::path::PathBuf, bool)>,
+    completions: Option<SetupStep>,
+    completion_changes: Vec<(std::path::PathBuf, bool)>,
     /// The `free_space_recovery` step's action.
     recovery: &'static str,
     recovery_path: std::path::PathBuf,
@@ -10741,6 +10743,10 @@ fn setup_steps(facts: &SetupFacts) -> Vec<SetupStep> {
     for (path, exists) in &facts.test_changes {
         steps.extend(backup_step(&mut created, path, *exists));
     }
+    steps.extend(facts.completions);
+    for (path, exists) in &facts.completion_changes {
+        steps.extend(backup_step(&mut created, path, *exists));
+    }
     steps.push(SetupStep::new(
         "free_space_recovery",
         facts.recovery,
@@ -10775,6 +10781,8 @@ struct RunOutcome {
     /// have written the same startup files.
     test_runner: Option<SetupStep>,
     test_changes: Vec<(std::path::PathBuf, bool)>,
+    completions: Option<SetupStep>,
+    completion_changes: Vec<(std::path::PathBuf, bool)>,
     recovery: &'static str,
     /// Whether the login service was installed or updated now.
     service_installed_now: bool,
@@ -10796,6 +10804,8 @@ fn run_facts(plan: &SetupFacts, outcome: RunOutcome) -> SetupFacts {
         rustdoc: outcome.rustdoc,
         test_runner: outcome.test_runner,
         test_changes: outcome.test_changes,
+        completions: outcome.completions,
+        completion_changes: outcome.completion_changes,
         recovery: outcome.recovery,
         service,
         ..plan.clone()
@@ -11094,6 +11104,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     #[cfg(unix)]
     let tests = plan_test_runner(no_shell)?;
     #[cfg(unix)]
+    let completions = plan_completions(no_shell)?;
+    #[cfg(unix)]
     let shell_facts = (
         compiler.step(),
         existing_paths(compiler.changed_paths()),
@@ -11110,6 +11122,15 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         (None, Vec::new(), None, None, Vec::new())
     };
     let (shell, shell_changes, rustdoc, test_runner, test_changes) = shell_facts;
+    #[cfg(unix)]
+    let completion_facts = (
+        completions.step(),
+        existing_paths(completions.changed_paths()),
+        completions.activation_required(),
+    );
+    #[cfg(not(unix))]
+    let completion_facts = (None, Vec::new(), false);
+    let (completion_step, completion_changes, completion_activation) = completion_facts;
     let (recovery, recovery_path, _) = target_recovery_offer(yes)?;
     // Asking runs the service manager, which --no-service must not touch.
     let service_available = !no_service && crate::service::login_service_available();
@@ -11128,6 +11149,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         rustdoc,
         test_runner,
         test_changes,
+        completions: completion_step,
+        completion_changes,
         recovery: recovery_action(&recovery),
         recovery_path,
         service: service_action(
@@ -11159,6 +11182,11 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             ("Config", term::home_path(&cargo_path), String::new()),
         ];
         if !no_shell && shell_supported {
+            plan_rows.push((
+                "Completions",
+                "tab completion".into(),
+                "kache commands and flags".into(),
+            ));
             plan_rows.push((
                 "Shell",
                 "new terminals".into(),
@@ -11282,6 +11310,24 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     let (shell_pending, tests_pending, rustdoc_done, tests_done, tests_changes) =
         (false, false, None, None, Vec::new());
 
+    #[cfg(unix)]
+    let (completions_pending, completions_done, completion_changes) = {
+        let completions = if check {
+            completions
+        } else {
+            plan_completions(no_shell)?
+        };
+        let step = completions.step();
+        let changes = existing_paths(completions.changed_paths());
+        (
+            init_completions(completions, check, &mut created)?,
+            step,
+            changes,
+        )
+    };
+    #[cfg(not(unix))]
+    let (completions_pending, completions_done, completion_changes) = (false, None, Vec::new());
+
     let recovery_done = offer_target_recovery(yes, check)?;
 
     // ── Step 2: daemon service ───────────────────────────────────
@@ -11324,7 +11370,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                     preview: true,
                     steps,
                     cargo_configured: cargo_ready,
-                    shell_activation_required: shell_activation,
+                    shell_activation_required: shell_activation || completion_activation,
                     test_activation_required: test_activation,
                     service_installed,
                     daemon_running: None,
@@ -11401,6 +11447,9 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if tests_pending {
         println!("  Open a new terminal to pace test binaries.");
     }
+    if completions_pending {
+        println!("  Open a new terminal to activate shell completions.");
+    }
     println!("  Run kache doctor to check this terminal.\n");
     if crate::machine::is_json() {
         crate::machine::emit(
@@ -11414,12 +11463,14 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                         rustdoc: rustdoc_done,
                         test_runner: tests_done,
                         test_changes: tests_changes,
+                        completions: completions_done,
+                        completion_changes,
                         recovery: recovery_done,
                         service_installed_now: service_action_taken,
                     },
                 )),
                 cargo_configured: cargo_ready,
-                shell_activation_required: shell_pending,
+                shell_activation_required: shell_pending || completions_pending,
                 test_activation_required: tests_pending,
                 service_installed: login_service_configured(
                     service_installed,
@@ -11691,6 +11742,113 @@ fn shell_startup_files() -> Result<Option<(crate::init_shell::Shell, Vec<std::pa
         .map(std::path::PathBuf::from);
     let paths = shell.paths(&home, zdotdir.as_deref(), xdg.as_deref())?;
     Ok(Some((shell, paths)))
+}
+
+#[cfg(unix)]
+enum CompletionsPlan {
+    Skipped,
+    Unsupported,
+    Manual(String),
+    Ready(crate::init_completions::Plan),
+}
+
+#[cfg(unix)]
+impl CompletionsPlan {
+    fn step(&self) -> Option<SetupStep> {
+        let (action, paths) = match self {
+            Self::Skipped => return None,
+            Self::Unsupported => ("unsupported", Vec::new()),
+            Self::Manual(_) => ("manual", Vec::new()),
+            Self::Ready(plan) => (
+                edit_action(self.activation_required(), false),
+                plan.edits.iter().map(|edit| edit.path.clone()).collect(),
+            ),
+        };
+        Some(SetupStep::new("completions", action, paths))
+    }
+
+    fn changed_paths(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::Ready(plan) => plan
+                .edits
+                .iter()
+                .filter(|edit| edit.changed())
+                .map(|edit| edit.path.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn activation_required(&self) -> bool {
+        matches!(self, Self::Ready(plan) if plan.edits.iter().any(|edit| edit.changed()))
+    }
+}
+
+#[cfg(unix)]
+fn plan_completions(no_shell: bool) -> Result<CompletionsPlan> {
+    if no_shell {
+        return Ok(CompletionsPlan::Skipped);
+    }
+    let Some((shell, paths)) = shell_startup_files()? else {
+        return Ok(CompletionsPlan::Unsupported);
+    };
+    let home = dirs::home_dir().context("could not find your home directory")?;
+    let path_var = |name| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    let config = path_var("XDG_CONFIG_HOME");
+    let data = path_var("XDG_DATA_HOME");
+    Ok(
+        match crate::init_completions::plan(shell, paths, &home, config.as_deref(), data.as_deref())
+        {
+            Ok(plan) => CompletionsPlan::Ready(plan),
+            Err(error) => CompletionsPlan::Manual(error.to_string()),
+        },
+    )
+}
+
+#[cfg(unix)]
+fn init_completions(
+    plan: CompletionsPlan,
+    check: bool,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<bool> {
+    let plan = match plan {
+        CompletionsPlan::Skipped => {
+            println!("  • Shell completions: skipped (--no-shell)");
+            return Ok(false);
+        }
+        CompletionsPlan::Unsupported => {
+            println!("  • Shell completions: run kache completions <shell> for manual setup");
+            return Ok(false);
+        }
+        CompletionsPlan::Manual(error) => {
+            println!("  • Shell completions need manual setup: {error}");
+            return Ok(false);
+        }
+        CompletionsPlan::Ready(plan) => plan,
+    };
+    let changed = plan.edits.iter().any(|edit| edit.changed());
+    if check {
+        println!(
+            "  Shell completions: {} ({})",
+            if changed {
+                "would configure"
+            } else {
+                "configured"
+            },
+            crate::wrapper_config::display_path(&plan.script)
+        );
+        return Ok(false);
+    }
+    apply_shell_edits(&plan.edits, created)?;
+    println!(
+        "  ✓ Shell completions: configured ({})",
+        crate::wrapper_config::display_path(&plan.script)
+    );
+    Ok(changed)
 }
 
 /// What `kache init` sets as Cargo's runner for the host target.

@@ -32,6 +32,12 @@ pub(crate) const TEST_RUNNER_BLOCK: Block = Block {
     last: false,
 };
 
+pub(crate) const COMPLETIONS_BLOCK: Block = Block {
+    begin: "# >>> kache shell completions >>>",
+    end: "# <<< kache shell completions <<<",
+    last: false,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Shell {
     Zsh,
@@ -80,11 +86,11 @@ impl Shell {
         Ok(paths)
     }
 
-    fn quote_path(self, dir: &Path) -> Result<String> {
-        let path = dir.to_str().context("compiler directory must be UTF-8")?;
+    pub(crate) fn quote_path(self, dir: &Path) -> Result<String> {
+        let path = dir.to_str().context("shell path must be UTF-8")?;
         ensure!(
             !path.chars().any(char::is_control) && !path.contains(':'),
-            "compiler directory cannot contain control characters or ':'"
+            "shell path cannot contain control characters or ':'"
         );
         Ok(match self {
             Self::Fish => format!("'{}'", path.replace('\\', "\\\\").replace('\'', "\\'")),
@@ -183,6 +189,15 @@ fn read_regular(path: &Path) -> Result<Option<String>> {
 }
 
 impl Edit {
+    pub fn plan_file(path: PathBuf, updated: String) -> Result<Self> {
+        let original = read_regular(&path)?;
+        Ok(Self {
+            path,
+            original,
+            updated,
+        })
+    }
+
     pub fn plan(path: PathBuf, activation: &str) -> Result<Self> {
         Self::plan_block(path, COMPILER_BLOCK, activation)
     }

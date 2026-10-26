@@ -147,7 +147,11 @@ Other Rust-supported targets may work through `cargo install`, but they are not 
 
 ## Shell completions
 
-The official AUR packages install completions for Bash, Zsh, Fish and Elvish. For other installs, generate a script with [`kache completions <shell>`](/docs/commands/reference#kache-completions) and save it where your shell loads completions.
+`kache init` installs completions for your login shell on Unix: Bash, Zsh, or Fish. Open a new terminal after setup. Run `kache init` again after an upgrade to refresh the scripts; `--check` previews changes and `--no-shell` skips them.
+
+Bash and Zsh load a generated script from `${XDG_DATA_HOME:-~/.local/share}/kache/completions`. Fish uses `${XDG_CONFIG_HOME:-~/.config}/fish/completions/kache.fish`. Existing files are backed up before replacement.
+
+The official AUR packages also install completions for Elvish. For manual setup or another supported shell, use [`kache completions <shell>`](/docs/commands/reference#kache-completions).
 
 ## Upgrading from 1.x
 

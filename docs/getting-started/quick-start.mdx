@@ -18,6 +18,8 @@ kache doctor
 
 `kache init` configures Cargo's Rust wrapper and makes sure the background daemon is running. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so Kache caches the C and C++ that build scripts compile, and offers Cargo and compiler shims with a `PATH` line for your zsh, bash or fish startup file, [test pacing](/docs/getting-started/configuration#test-runner), and a `build.rustdoc` setting for the `rustdoc` shim when you have none. It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
 
+`init` also installs tab completions for Zsh, Bash, or Fish. Open a new terminal to load them. Use `--no-shell` to leave shell setup alone.
+
 `doctor` checks the wrapper configuration, conflicting wrappers, cache configuration, daemon access, and Cargo and compiler shims. Resolve any setup issues it reports before continuing.
 
 ## Build in two worktrees

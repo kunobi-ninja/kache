@@ -164,18 +164,6 @@ fn linux_fragment_bytes(frsize: u64, bsize: u64) -> u64 {
     if frsize > 0 { frsize } else { bsize }
 }
 
-/// Windows `GetDiskFreeSpaceExW` reports success as a nonzero BOOL. A zero
-/// total is treated as a failed probe, not a zero-byte disk.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn accepted_volume_total(ok: bool, total: u64) -> Option<u64> {
-    (ok && total > 0).then_some(total)
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn win32_succeeded(ok: i32) -> bool {
-    ok != 0
-}
-
 // ── macOS ───────────────────────────────────────────────────────────────────
 //
 // `statfs` carries both answers directly: `MNT_LOCAL` is the kernel's own
@@ -429,27 +417,14 @@ fn probe_windows(path: &Path) -> FsProbe {
 
 #[cfg(windows)]
 fn volume_total_bytes_windows(path: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut total: u64 = 0;
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            std::ptr::null_mut(),
-            &mut total,
-            std::ptr::null_mut(),
-        )
-    };
-    accepted_volume_total(win32_succeeded(ok), total)
+    crate::capacity::windows_space(path).map(|usage| usage.total)
 }
 
 /// Volume mount root (`C:\`) holding `path`. Mirrors `link::windows_volume_root`
 /// — duplicated rather than shared because that one is private to the restore
 /// path and this module must not depend on it.
 #[cfg(windows)]
-fn volume_root(path: &Path) -> Option<String> {
+pub(crate) fn volume_root(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
 
@@ -615,16 +590,6 @@ mod tests {
         assert_eq!(linux_fragment_bytes(4096, 512), 4096);
         assert_eq!(linux_fragment_bytes(0, 512), 512);
         assert_eq!(linux_fragment_bytes(0, 0), 0);
-    }
-
-    #[test]
-    fn accepted_volume_total_requires_success_and_nonzero() {
-        assert_eq!(accepted_volume_total(false, 99), None);
-        assert_eq!(accepted_volume_total(true, 0), None);
-        assert_eq!(accepted_volume_total(true, 1), Some(1));
-        assert_eq!(accepted_volume_total(false, 0), None);
-        assert!(win32_succeeded(1));
-        assert!(!win32_succeeded(0));
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub mod paths;
 pub mod process_state_test;
 pub mod volume;
 
+mod capacity;
+pub use capacity::{InodeUsage, VolumeId, VolumeStats, volume_stats};
+
 #[cfg(feature = "staging")]
 mod clock;
 #[cfg(feature = "staging")]
@@ -463,23 +466,7 @@ pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
 
 #[cfg(unix)]
 fn volume_usage_unix(path: &Path) -> Option<VolumeUsage> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `s` is a valid out-param.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return None;
-    }
-    // f_frsize is the fragment size; f_bavail is what a non-root user can use,
-    // which is the number a human recognises as "free".
-    Some(volume_bytes(
-        s.f_blocks as u64,
-        s.f_bavail as u64,
-        s.f_frsize as u64,
-        s.f_bsize as u64,
-    ))
+    volume_stats(path).map(|stats| stats.usage)
 }
 
 #[cfg(any(unix, test))]

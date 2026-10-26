@@ -35,12 +35,8 @@ pub(super) fn disk_checks(config: &Config, build: Option<&Path>, temporary: &Pat
                 MINIMUM_FREE_BYTES
             };
             let existing = super::closest_existing(path.to_owned());
-            let usage = existing.as_deref().and_then(kache_fs::volume_usage);
-            #[cfg(unix)]
-            let inodes = existing.as_deref().and_then(available_inodes);
-            #[cfg(not(unix))]
-            let inodes = None;
-            disk_check(label, path, usage, inodes, floor)
+            let stats = existing.as_deref().and_then(kache_fs::volume_stats);
+            disk_check(label, path, stats, floor)
         })
         .collect()
 }
@@ -48,11 +44,10 @@ pub(super) fn disk_checks(config: &Config, build: Option<&Path>, temporary: &Pat
 fn disk_check(
     label: &'static str,
     path: &Path,
-    usage: Option<kache_fs::VolumeUsage>,
-    inodes: Option<u64>,
+    stats: Option<kache_fs::VolumeStats>,
     floor: u64,
 ) -> Check {
-    let Some(usage) = usage else {
+    let Some(stats) = stats else {
         return Check {
             label: "Store volume probe",
             pass: false,
@@ -60,38 +55,40 @@ fn disk_check(
             fix: None,
         };
     };
+    let usage = stats.usage;
     let low = usage.free < floor;
-    let exhausted = inodes == Some(0);
-    let inode_note = inodes.map_or(String::new(), |count| format!("; {count} inodes available"));
+    let exhausted = stats.inodes.is_some_and(|inodes| inodes.available == 0);
+    let inode_note = stats.inodes.map_or_else(
+        || "; inode capacity unavailable".to_owned(),
+        |inodes| {
+            format!(
+                "; {} inodes available of {}",
+                inodes.available, inodes.total
+            )
+        },
+    );
+    let volume_note = stats
+        .id
+        .map_or(String::new(), |id| format!("; volume {id}"));
+    let fix = if exhausted {
+        Some("this volume has no inodes available: creating files can fail even with free bytes. Review file counts and free files on this volume, or move the cache/build directory to another volume".into())
+    } else if low {
+        Some("preview tracked build directories with `kache clean --dry-run`; cache size limits do not cover incremental state, temporary files or all target artifacts. Check this volume before starting another large build".into())
+    } else {
+        None
+    };
     Check {
         label,
         pass: !low && !exhausted,
-        detail: format!("{} free of {} at {}; warning floor {}{inode_note}", bytesize::ByteSize(usage.free), bytesize::ByteSize(usage.total), path.display(), bytesize::ByteSize(floor)),
-        fix: (low || exhausted).then(|| "preview tracked build directories with `kache clean --dry-run`; cache size limits do not cover incremental state, temporary files or all target artifacts. Check this volume before starting another large build".into()),
+        detail: format!(
+            "{} free of {} at {}; warning floor {}{inode_note}{volume_note}",
+            bytesize::ByteSize(usage.free),
+            bytesize::ByteSize(usage.total),
+            path.display(),
+            bytesize::ByteSize(floor)
+        ),
+        fix,
     }
-}
-
-#[cfg(unix)]
-fn available_inodes(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs is plain data; path is NUL-terminated and the output slot is valid.
-    let mut usage: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut usage) } != 0 {
-        return None;
-    }
-    // A filesystem that does not report an inode capacity cannot vouch for headroom.
-    reported_inodes(inode_count(usage.f_files), inode_count(usage.f_favail))
-}
-
-#[cfg(unix)]
-fn reported_inodes(capacity: u64, available: u64) -> Option<u64> {
-    (capacity != 0).then_some(available)
-}
-
-#[cfg(unix)]
-fn inode_count(value: impl Into<u64>) -> u64 {
-    value.into()
 }
 
 fn access_check(cache_dir: &Path, index: &Path) -> Check {
@@ -205,46 +202,47 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[cfg(unix)]
-    #[test]
-    fn inode_counts_preserve_zero_and_the_full_platform_range() {
-        assert_eq!(inode_count(0_u32), 0);
-        assert_eq!(inode_count(42_u32), 42);
-        assert_eq!(inode_count(u32::MAX), 4_294_967_295);
-        assert_eq!(inode_count(u64::MAX), 18_446_744_073_709_551_615);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn inode_capacity_can_be_unreported_without_meaning_exhaustion() {
-        assert_eq!(reported_inodes(0, 0), None);
-        assert_eq!(reported_inodes(0, 42), None);
-        assert_eq!(reported_inodes(100, 0), Some(0));
-        assert_eq!(reported_inodes(100, 42), Some(42));
-        assert_eq!(reported_inodes(u64::MAX, u64::MAX), Some(u64::MAX));
-    }
-
     #[test]
     fn space_and_inode_pressure_are_independent_and_missing_data_is_explicit() {
         let path = Path::new("fixture-cache");
         assert_eq!(MINIMUM_FREE_BYTES, 1_073_741_824);
-        let usage = |free| {
-            Some(kache_fs::VolumeUsage {
-                total: 4_294_967_296,
-                free,
+        let stats = |free, available: Option<u64>| {
+            Some(kache_fs::VolumeStats {
+                id: Some(kache_fs::VolumeId::Unix(27)),
+                usage: kache_fs::VolumeUsage {
+                    total: 4_294_967_296,
+                    free,
+                },
+                inodes: available.map(|available| kache_fs::InodeUsage {
+                    total: 100,
+                    available,
+                }),
             })
         };
-        let healthy = disk_check("Cache free space", path, usage(1024), Some(1), 1024);
+        let healthy = disk_check("Cache free space", path, stats(1024, Some(1)), 1024);
         assert!(healthy.pass);
         assert!(healthy.fix.is_none());
-        let low = disk_check("Cache free space", path, usage(1023), Some(1), 1024);
+        assert!(healthy.detail.contains("1 inodes available of 100"));
+        assert!(healthy.detail.contains("volume unix:1b"));
+        let low = disk_check("Cache free space", path, stats(1023, Some(1)), 1024);
         assert!(!low.pass);
         assert!(low.fix.unwrap().contains("clean --dry-run"));
-        let no_inodes = disk_check("Store build space", path, usage(2048), Some(0), 1024);
+        let no_inodes = disk_check("Store build space", path, stats(2048, Some(0)), 1024);
         assert!(!no_inodes.pass);
         assert!(no_inodes.detail.contains("0 inodes available"));
-        assert!(disk_check("Store temp space", path, usage(2048), None, 1024).pass);
-        let unknown = disk_check("Cache free space", path, None, None, 1024);
+        assert!(no_inodes.fix.unwrap().contains("even with free bytes"));
+        let both_low = disk_check("Cache free space", path, stats(1, Some(0)), 1024);
+        assert!(!both_low.pass);
+        assert!(both_low.fix.unwrap().contains("no inodes available"));
+        let unavailable = disk_check("Store temp space", path, stats(2048, None), 1024);
+        assert!(unavailable.pass);
+        assert!(unavailable.detail.contains("inode capacity unavailable"));
+        let mut no_id = stats(2048, Some(1)).unwrap();
+        no_id.id = None;
+        let anonymous = disk_check("Store temp space", path, Some(no_id), 1024);
+        assert!(anonymous.pass);
+        assert!(!anonymous.detail.contains("volume unix:"));
+        let unknown = disk_check("Cache free space", path, None, 1024);
         assert!(!unknown.pass);
         assert_eq!(unknown.label, "Store volume probe");
         assert!(unknown.detail.contains("unavailable"));
@@ -263,7 +261,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn volume_checks_cover_missing_build_paths_and_the_working_reserve() {
-        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::test_support::test_config(dir.path().to_owned());
         config.auto_recover_min_free_bytes = 0;
@@ -292,13 +289,6 @@ mod tests {
             assert!(check.detail.contains("warning floor"));
         }
         assert_eq!(disk_checks(&config, None, dir.path()).len(), 2);
-        let path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
-        // SAFETY: statvfs is plain data and the path and output slot are valid.
-        let mut inode_usage: libc::statvfs = unsafe { std::mem::zeroed() };
-        let reports_capacity = unsafe { libc::statvfs(path.as_ptr(), &mut inode_usage) } == 0
-            && inode_usage.f_files != 0;
-        assert_eq!(available_inodes(dir.path()).is_some(), reports_capacity);
-        assert!(available_inodes(&dir.path().join("absent")).is_none());
     }
 
     #[cfg(unix)]

@@ -258,7 +258,6 @@ exclude_globs = [
     "crates/kache-client/src/frontend_windows.rs",
     "crates/kache-ipc/src/windows_handles.rs",
     "crates/kache-ipc/src/windows_process.rs",
-    "crates/kache-ipc/src/windows_security.rs",
     "crates/kache-ipc/src/windows_msvc.rs",
     "crates/kache-ipc/src/execution/windows.rs",
     "crates/kache-ipc/src/execution/windows_client.rs",
@@ -280,6 +279,9 @@ exclude_globs = [
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
+    # Only this thin syscall adapter is Windows-only; the delegation policy
+    # is compiled and mutation-tested on Linux.
+    "crates/kache-ipc/src/windows_security.rs:.*matches_daemon",
     # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
     "src/invocation/unix_broker.rs:.*can_track_client",
     "src/fallback.rs:.*compiler_peer_may_delegate",

@@ -58,7 +58,7 @@ kache-config = { version = "2.0.0-rc.2", path = "crates/kache-config" }
 kache-protocol = { version = "2.0.0-rc.2", path = "crates/kache-protocol" }
 kache-ipc = { version = "2.0.0-rc.2", path = "crates/kache-ipc", features = ["async"] }
 foldhash = "0.2"
-kunobi-daemon = { version = "0.10.2", features = ["wire-async", "local-async", "launch"] }
+kunobi-daemon = { version = "0.10.3", features = ["wire-async", "local-async", "launch"] }
 kache-format = { version = "2.0.0-rc.2", path = "crates/kache-format" }
 kache-fs = { version = "2.0.0-rc.2", path = "crates/kache-fs" }
 kache-store = { version = "2.0.0-rc.2", path = "crates/kache-store" }

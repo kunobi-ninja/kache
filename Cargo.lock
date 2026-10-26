@@ -2751,9 +2751,9 @@ dependencies = [
 
 [[package]]
 name = "kunobi-daemon"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3ef2ba93529e353562cf17ad9d71e671745e79a099179b3cb7039d9010fe84"
+checksum = "2b11bb5c42634f728bb205f682a5a20ab96cc404653f48bec4a3c4bfbf194a33"
 dependencies = [
  "buffa",
  "interprocess",
@@ -2762,6 +2762,7 @@ dependencies = [
  "socket2",
  "tokio",
  "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

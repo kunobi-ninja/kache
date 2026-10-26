@@ -1029,7 +1029,7 @@ jobs:
           cargo test -p kache-fs --all-features
           cargo test -p kache-store --lib
           library_tests=(cargo test -p kache --lib)
-          for filter in store:: wrapper::tests::materialize_cached_artifact; do
+          for filter in store:: wrapper::tests::materialize_cached_artifact cli::doctor_storage::; do
             selected=$("${library_tests[@]}" -- --list "$filter")
             printf '%s\n' "$selected"
             if ! grep -q ': test$' <<< "$selected"; then
@@ -1037,7 +1037,13 @@ jobs:
               exit 1
             fi
           done
-          "${library_tests[@]}" -- store:: wrapper::tests::materialize_cached_artifact
+          "${library_tests[@]}" -- store:: wrapper::tests::materialize_cached_artifact cli::doctor_storage::
+      - name: Check daemon admission with unavailable security labels on btrfs
+        env:
+          KACHE_TEST_SCRATCH_DIR: /mnt/cow/scratch
+          TMPDIR: /mnt/cow/tmp
+          RUSTC_WRAPPER: ""
+        run: ./scripts/test-unavailable-proc-labels.sh
       - name: Report mount usage
         if: always()
         run: df -h /mnt/cow || true

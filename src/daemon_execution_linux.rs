@@ -36,7 +36,7 @@ pub(super) fn permits_delegation(proc_root: &Path, pid: u32) -> io::Result<bool>
     permits_delegation_with_trust(proc_root, pid, false)
 }
 
-fn permits_delegation_with_trust(
+pub(super) fn permits_delegation_with_trust(
     proc_root: &Path,
     pid: u32,
     trusted_pipeline: bool,
@@ -135,6 +135,30 @@ mod tests {
             42,
             true
         ));
+    }
+
+    #[test]
+    fn trusted_execution_still_rejects_unreadable_security_labels() {
+        for side in ["self", "42"] {
+            let root = fixture();
+            let label = root.path().join(side).join("attr/current");
+            std::fs::remove_file(&label).unwrap();
+            assert!(permits_delegation_with_trust(root.path(), 42, true).is_err());
+            assert!(!peer_may_delegate_with_trust(
+                root.path(),
+                Some(42),
+                42,
+                true
+            ));
+            std::fs::create_dir(&label).unwrap();
+            assert!(permits_delegation_with_trust(root.path(), 42, true).is_err());
+            assert!(!peer_may_delegate_with_trust(
+                root.path(),
+                Some(42),
+                42,
+                true
+            ));
+        }
     }
 
     fn fixture() -> tempfile::TempDir {

@@ -64,6 +64,11 @@ A mixed pull request runs the union. Required checks that a group skips
 still count as passed. Run the mapping's tests with
 `python3 scripts/test-ci-changes.py`.
 
+The btrfs job also runs the doctor storage tests. It repeats the Linux daemon
+admission tests with `/proc/*/attr/current` reads returning `EINVAL`, covering
+builders that cannot expose security labels. This must exercise rejection
+without starting a compiler or consuming a worker permit.
+
 ## Checking workflow changes
 
 The Repository consistency job evaluates runner and publication expressions

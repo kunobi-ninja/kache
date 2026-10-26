@@ -81,10 +81,12 @@ fn available_inodes(path: &Path) -> Option<u64> {
         return None;
     }
     // A filesystem that does not report an inode capacity cannot vouch for headroom.
-    if usage.f_files == 0 {
-        return None;
-    }
-    Some(inode_count(usage.f_favail))
+    reported_inodes(inode_count(usage.f_files), inode_count(usage.f_favail))
+}
+
+#[cfg(unix)]
+fn reported_inodes(capacity: u64, available: u64) -> Option<u64> {
+    (capacity != 0).then_some(available)
 }
 
 #[cfg(unix)]
@@ -212,6 +214,16 @@ mod tests {
         assert_eq!(inode_count(u64::MAX), 18_446_744_073_709_551_615);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inode_capacity_can_be_unreported_without_meaning_exhaustion() {
+        assert_eq!(reported_inodes(0, 0), None);
+        assert_eq!(reported_inodes(0, 42), None);
+        assert_eq!(reported_inodes(100, 0), Some(0));
+        assert_eq!(reported_inodes(100, 42), Some(42));
+        assert_eq!(reported_inodes(u64::MAX, u64::MAX), Some(u64::MAX));
+    }
+
     #[test]
     fn space_and_inode_pressure_are_independent_and_missing_data_is_explicit() {
         let path = Path::new("fixture-cache");
@@ -279,7 +291,6 @@ mod tests {
             assert!(check.detail.contains("warning floor"));
         }
         assert_eq!(disk_checks(&config, None, dir.path()).len(), 2);
-        assert!(available_inodes(dir.path()).is_some());
         assert!(available_inodes(&dir.path().join("absent")).is_none());
     }
 

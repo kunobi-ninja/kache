@@ -20,6 +20,23 @@ Open the editor:
 kache config
 ```
 
+For scripts, use the file commands:
+
+```bash
+kache config path
+kache config list --json
+kache config set --project cache.local_only true
+kache config get --project cache.local_only
+kache config unset --project cache.local_only
+kache config set --global cache.local_max_size 50GiB
+```
+
+`get` and `list` report values written in the selected file, before environment overrides, host settings or defaults. `get` and `unset` fail when the key is absent. `set` accepts known keys with matching TOML types; quote array values for the shell, for example `kache config set paths.base_dirs '["/work", "/sources"]'`. Workspace declarations and entire tables are edited directly in TOML.
+
+`--project` uses the nearest existing `.kache.toml`, or creates one in the current directory on `set`. `--global` chooses the user config even when `KACHE_CONFIG` or a project file exists. `--file PATH` selects another file. These selectors are mutually exclusive and follow the subcommand. Without a selector, the commands use the same file selection as the editor. All five subcommands support `--json`.
+
+The commands change the file only. A daemon setting takes effect when the daemon next loads it; restart the daemon when you need a running instance to use the changed value.
+
 Or edit TOML directly. Kache chooses the first file in this order:
 
 1. `KACHE_CONFIG`
@@ -32,7 +49,7 @@ Each process walks up from its own current directory. Cargo compiles packages un
 
 If the chosen file is not valid TOML, or a key has the wrong type, Kache ignores the whole file, and the host config with it, and runs on environment variables and defaults without a warning. Size keys (`local_max_size`, `event_log_max_size`, `prefetch_max_bytes`) take quoted strings such as `"50GiB"`.
 
-The editor covers common fields and keeps the other settings Kache knows. Saving rewrites the whole file: comments and keys Kache does not recognize are dropped, and a file that does not parse is replaced. The editor asks before it first overwrites an existing file.
+The editor covers common fields and updates changed keys while keeping comments and other settings. It asks before its first save to an existing file and refuses a file it cannot read or parse. The file subcommands also preserve comments and unrelated settings; `unset` can remove an unknown key.
 
 ```toml title="~/.config/kache/config.toml"
 [cache]

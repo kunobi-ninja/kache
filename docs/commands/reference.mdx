@@ -531,9 +531,18 @@ do not include setup or an explicit warm step.
 
 ```bash
 kache config
+kache config path
+kache config list --json
+kache config get cache.local_only
+kache config set --project cache.local_only true
+kache config unset --project cache.local_only
 ```
 
-This command can open even when the current config file is invalid. See [Configuration](/docs/getting-started/configuration).
+Without a subcommand, opens the interactive editor. The subcommands read or edit the selected TOML file without starting a daemon. `get` and `list` show explicit file values, excluding environment overrides, host settings and defaults. A missing key makes `get` or `unset` fail.
+
+Each subcommand accepts `--project`, `--global`, or `--file PATH`. Without one, it uses Kache's normal config-file selection. `--project` selects the nearest existing `.kache.toml`, or creates it in the current directory when setting a value. `--global` selects the user config and ignores `KACHE_CONFIG` and project files. `--file` selects an explicit path. These selectors cannot be combined.
+
+`set` validates known keys and their TOML types. Boolean, number and array values use TOML syntax; strings such as `50GiB` can be unquoted. Workspace declarations and entire tables are edited directly in TOML. Edits preserve comments and other keys, follow existing file symlinks, and replace the file atomically under a writer lock. Invalid TOML is refused. All subcommands support `--json`; the interactive editor does not. See [Configuration](/docs/getting-started/configuration).
 
 ## `kache login`
 

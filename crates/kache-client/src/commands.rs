@@ -369,9 +369,12 @@ enum Commands {
         redact: bool,
     },
 
-    /// Open the configuration editor
+    /// Edit or inspect configuration (opens the editor without a subcommand)
     #[command(display_order = 3)]
-    Config,
+    Config {
+        #[command(subcommand)]
+        command: Option<config_cli::Command>,
+    },
 
     /// Log in to the planner with your Kunobi account
     #[command(display_order = 31)]

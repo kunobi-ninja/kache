@@ -14,6 +14,7 @@ mod cli;
 mod compile;
 mod compiler;
 mod config;
+mod config_cli;
 mod config_tui;
 mod daemon;
 mod daemon_publish;
@@ -263,6 +264,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
         | Commands::Diff { .. }
         | Commands::Report { .. } => true,
         Commands::Init { shims, .. } => shims.is_none(),
+        Commands::Config { command } => command.is_some(),
         Commands::Daemon { command } => match command {
             None | Some(DaemonCommands::Status) => true,
             Some(
@@ -277,7 +279,6 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
         },
         // Interactive, or Cargo's own output.
         Commands::Cargo { .. }
-        | Commands::Config
         | Commands::Monitor { .. }
         | Commands::Login { .. }
         | Commands::Completions { .. } => false,
@@ -339,7 +340,9 @@ fn json_refusal(command: &Option<Commands>) -> Option<&'static str> {
         return None;
     }
     Some(match command {
-        Some(Commands::Config) => "`kache config` is interactive and has no JSON form.",
+        Some(Commands::Config { command: None }) => {
+            "`kache config` is interactive; use a config subcommand with --json."
+        }
         Some(Commands::Login { .. }) => "`kache login` is interactive and has no JSON form.",
         Some(Commands::Monitor { .. }) => {
             "`kache monitor` is interactive; use `kache stats --json`."
@@ -764,7 +767,10 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
 
     // Config and Completions run before Config::load() (broken/missing config).
     match &cli.command {
-        Some(Commands::Config) => {
+        Some(Commands::Config { command }) => {
+            if let Some(command) = command {
+                return config_cli::run(command, json);
+            }
             if !std::io::stdout().is_terminal() {
                 anyhow::bail!(config_without_terminal(&config::resolve_config_path()));
             }
@@ -786,7 +792,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
     // Doctor reports this as a failing check, and the editor refuses to open.
     if !matches!(
         cli.command,
-        Some(Commands::Doctor { .. } | Commands::Config)
+        Some(Commands::Doctor { .. } | Commands::Config { .. })
     ) && let Some((path, reason)) = config::unusable_config_file()
     {
         eprintln!(
@@ -1101,7 +1107,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         #[cfg(not(unix))]
         Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(UNIX_ONLY_SHIMS)),
         Some(Commands::Cargo { .. }) => unreachable!(),
-        Some(Commands::Config) => unreachable!(),
+        Some(Commands::Config { .. }) => unreachable!(),
         Some(Commands::Login { .. } | Commands::Logout) => unreachable!(),
         Some(Commands::Completions { .. }) => unreachable!(),
         None => {
@@ -2652,7 +2658,7 @@ mod tests {
             Some(general)
         );
         assert!(
-            json_refusal(&Some(Commands::Config))
+            json_refusal(&Some(Commands::Config { command: None }))
                 .unwrap()
                 .contains("kache config")
         );
@@ -3081,7 +3087,9 @@ mod tests {
         assert!(command_supports_json(&Some(Commands::Daemon {
             command: Some(DaemonCommands::Status),
         })));
-        assert!(!command_supports_json(&Some(Commands::Config)));
+        assert!(!command_supports_json(&Some(Commands::Config {
+            command: None
+        })));
         assert!(!command_supports_json(&Some(Commands::Monitor {
             since: None
         })));

@@ -10,6 +10,24 @@ $compiler = (& $rustc -vV 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0 -or $compiler -notmatch 'host: .*windows-msvc') {
     throw 'The probe requires a native Windows MSVC Rust toolchain.'
 }
+# Resolve rustup's shim before changing directories, so every invocation uses
+# the same toolchain whose version is recorded above.
+$rustup = Get-Command rustup -ErrorAction SilentlyContinue
+if ($null -ne $rustup) {
+    $resolved = (& $rustup.Source which rustc 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resolved)) {
+        throw 'Could not resolve the active rustc executable.'
+    }
+    $rustc = $resolved
+    $compiler = (& $rustc -vV 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the resolved rustc.' }
+}
+
+function Publish-Notice([string]$Title, [string]$Message) {
+    $escaped = $Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+    Write-Host ('::notice title={0}::{1}' -f $Title, $escaped)
+}
+Publish-Notice 'Manifest probe compiler' ($rustc + "`n" + $compiler)
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('kache-manifest-' + [guid]::NewGuid())
 [IO.Directory]::CreateDirectory($root) | Out-Null
@@ -32,7 +50,8 @@ function Invoke-Case([string]$Name, [string]$Xml, [bool]$Unicode = $false) {
         '-C', 'debuginfo=0', '-C', 'link-arg=/MANIFEST:EMBED',
         '-C', ('link-arg=/MANIFESTINPUT:' + $manifest), '-o', $exe
     )
-    & $rustc @arguments *> (Join-Path $OutputDirectory ($Name + '.log'))
+    $log = Join-Path $OutputDirectory ($Name + '.log')
+    & $rustc @arguments *> $log
     $exitCode = $LASTEXITCODE
     [byte[]]$bytes = @()
     if (Test-Path -LiteralPath $exe) { $bytes = [IO.File]::ReadAllBytes($exe) }
@@ -43,6 +62,11 @@ function Invoke-Case([string]$Name, [string]$Xml, [bool]$Unicode = $false) {
         markerV2 = $text.Contains('KACHE_MANIFEST_V2')
     }
     $results.Add($result)
+    Publish-Notice $Name ($result | ConvertTo-Json -Compress)
+    if ($exitCode -ne 0) {
+        $diagnostic = [IO.File]::ReadAllText($log)
+        Publish-Notice ($Name + ' diagnostic') ($diagnostic.Substring(0, [Math]::Min(4000, $diagnostic.Length)))
+    }
     return $result
 }
 

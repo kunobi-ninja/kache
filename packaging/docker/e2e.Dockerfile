@@ -20,7 +20,7 @@
 # e2e-cmake-file-macro-oot) — the LLVM-bench build-system shape. Without these,
 # `requires = ["cmake"]` fixtures SKIP silently in the container instead of
 # running the path-normalization checks they exist to guard.
-FROM rust:1.98-bookworm
+FROM rust:1.99.1-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential clang make cmake ninja-build rsync ca-certificates \

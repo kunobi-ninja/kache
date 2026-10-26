@@ -3440,6 +3440,7 @@ fn test_config(dir: &Path) -> Config {
         cache_dir: dir.to_path_buf(),
         max_size: 1024 * 1024,
         gc_evict_shared: false,
+        held_bytes_budget: Default::default(),
         upload_spool_max_jobs: 65_536,
         deferred_durability: false,
         index_mode: IndexMode::default(),
@@ -14266,6 +14267,33 @@ fn a_size_sweep_leaves_bytes_held_by_target_directories_out_of_its_budget() {
     let stats = store.evict().unwrap();
     assert_eq!(stats.bytes_held, 0, "{stats:?}");
     assert!(!store.contains("held"));
+}
+
+/// Counted toward `max_size`, held bytes stay (evicting them frees no
+/// disk) and the sweep evicts other entries, least valuable first, until the
+/// whole store is under its target.
+#[test]
+fn a_size_sweep_counting_held_bytes_evicts_other_entries_to_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    // Trigger at 100 kB, target 90 kB; entries big enough to rank by size.
+    config.max_size = 100_000;
+    config.held_bytes_budget = crate::eviction::HeldBytesBudget::Counted;
+    let store = Store::open(&config).unwrap();
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 50_000);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    put_idle_entry(&store, dir.path(), "large", 60_000);
+    put_idle_entry(&store, dir.path(), "small", 30_000);
+    assert_eq!(store.physical_size().unwrap(), 140_000);
+
+    // Left out, 140 - 50 held = 90 kB is already at the target. Counted,
+    // the store must lose 50 kB it can free: "large" ranks first.
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.bytes_held, 50_000, "{stats:?}");
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(store.contains("held") && store.contains("small"));
+    assert!(!store.contains("large"));
+    assert_eq!(store.physical_size().unwrap(), 80_000);
 }
 
 /// A blob two entries share is not either one's last reference, so

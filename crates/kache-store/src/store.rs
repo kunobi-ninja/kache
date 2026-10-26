@@ -5481,7 +5481,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             std::collections::HashMap::new()
         };
         let bytes_held: u64 = held.values().sum();
-        let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(bytes_held), target));
+        let left_out = self.config.held_bytes_budget.left_out(bytes_held);
+        let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(left_out), target));
         let shadow = stop_at.map(|(current, target)| {
             use crate::eviction::EvictionPolicy as _;
             let candidate = crate::eviction::ValueDensityPolicy;

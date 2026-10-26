@@ -1102,11 +1102,15 @@ fn option_env_presence_changes_cached_behavior() {
             );
             assert_eq!(compile_and_observe(value, true), direct);
             let events = std::fs::read_to_string(cache.path().join("events.jsonl")).unwrap();
-            let last: serde_json::Value =
-                serde_json::from_str(events.lines().last().unwrap()).unwrap();
+            let last = events
+                .lines()
+                .rev()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|event| event["crate_name"] == "presence")
+                .expect("presence compilation event");
             assert_eq!(
                 last["result"], "local_hit",
-                "unchanged value must actually hit"
+                "unchanged value must actually hit: {last}"
             );
         }
     }

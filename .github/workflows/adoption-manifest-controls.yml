@@ -1,0 +1,50 @@
+name: Adoption manifest controls
+
+on:
+  push:
+    branches: [review-contribution/pr-1680-manifest-controls]
+    paths:
+      - .github/workflows/adoption-manifest-controls.yml
+      - scripts/adoption/msvc-manifest-probe.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Adoption preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - run: just check
+
+  manifest:
+    name: MSVC manifest dependency probe
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Probe the native manifest merger
+        shell: pwsh
+        run: |
+          ./scripts/adoption/msvc-manifest-probe.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'manifest-evidence')
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: manifest-dependency-evidence
+          path: ${{ runner.temp }}/manifest-evidence
+          retention-days: 7

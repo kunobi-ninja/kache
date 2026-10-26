@@ -84,6 +84,8 @@ to see the workload, platform, and validation behind each result.
 kache monitor             # live build and cache activity
 kache stats --last-build  # latest recorded build session
 kache explain             # why the latest build missed
+kache explain --skips     # every skip and passthrough in that build
+kache explain --skips --all # all retained history, grouped by reason
 kache doctor              # check your setup
 ```
 

@@ -5748,3 +5748,176 @@ fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
     assert!(e.cache.join("index.db").is_file());
     e.cmd().args(["--json", "list"]).assert().success();
 }
+
+/// The skips view must retain every reason and invocation, including fast
+/// entries below the full report's slowest-table threshold.
+#[test]
+fn explain_skips_lists_complete_history_and_latest_session() {
+    let e = env();
+    let root_a = e.home.join("a").to_string_lossy().into_owned();
+    let root_b = e.home.join("b").to_string_lossy().into_owned();
+    let mut events = (0..15)
+        .map(|index| {
+            serde_json::json!({
+                "ts": format!("2026-01-01T00:00:{index:02}Z"),
+                "crate_name": format!("crate_{index}"),
+                "root": root_a,
+                "session_id": "earlier",
+                "result": "passthrough",
+                "passthrough_reason": format!("unsupported|flag {index}"),
+                "elapsed_ms": index + 1,
+                "size": 0,
+                "cache_key": "",
+                "schema": 14
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut skipped = events[0].clone();
+    skipped["ts"] = "2026-01-01T01:00:00Z".into();
+    skipped["root"] = root_b.clone().into();
+    skipped["session_id"] = "latest".into();
+    skipped["crate_name"] = "store_declined".into();
+    skipped["result"] = "skipped".into();
+    skipped["skip_reason"] = "inputs-changed".into();
+    events.push(skipped.clone());
+    let mut probe = skipped.clone();
+    probe["result"] = "passthrough".into();
+    probe["crate_name"] = "rustc".into();
+    probe["passthrough_reason"] = "not-a-compile|--print cfg".into();
+    events.push(probe);
+    let mut hit = skipped.clone();
+    hit["result"] = "local_hit".into();
+    events.push(hit);
+    let mut repeated = skipped;
+    repeated["crate_name"] = "another_declined".into();
+    events.push(repeated);
+    std::fs::write(
+        e.cache.join("events.jsonl"),
+        events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    let read = |args: &[&str]| {
+        let output = e.cmd().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let all = read(&["--json", "explain", "--skips", "--all"]);
+    assert_eq!(all["command"], "explain");
+    assert_eq!(all["scope"], "retained history");
+    assert_eq!(all["passthroughs"], 15);
+    assert_eq!(all["skipped"], 2);
+    assert_eq!(all["probes"], 1);
+    assert_eq!(all["entries"].as_array().unwrap().len(), 18);
+    assert_eq!(all["reasons"].as_array().unwrap().len(), 17);
+    assert_eq!(all["reasons"][0]["reason"], "inputs-changed");
+    assert_eq!(all["reasons"][0]["count"], 2);
+    assert_eq!(all["entries"][0]["crate_name"], "crate_14");
+    assert_eq!(all["entries"][0]["root"], root_a);
+
+    let latest = read(&["--json", "explain", "--skips"]);
+    assert_eq!(latest["scope"], "latest build");
+    assert_eq!(latest["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(latest["reasons"].as_array().unwrap().len(), 2);
+    assert_eq!(latest["skipped"], 2);
+    let rooted = read(&["--json", "explain", "--skips", "--root", &root_a]);
+    assert_eq!(rooted["entries"].as_array().unwrap().len(), 15);
+    assert_eq!(rooted["root"], root_a);
+    let rooted_all = read(&["--json", "explain", "--skips", "--all", "--root", &root_b]);
+    assert_eq!(rooted_all["entries"].as_array().unwrap().len(), 3);
+    let missing_root = e.home.join("missing");
+    let empty = read(&[
+        "--json",
+        "explain",
+        "--skips",
+        "--root",
+        missing_root.to_str().unwrap(),
+    ]);
+    assert!(empty["entries"].as_array().unwrap().is_empty());
+
+    e.cmd()
+        .args(["explain", "--skips", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "15 passthroughs, 2 skipped, 1 compiler queries",
+        ))
+        .stdout(predicates::str::contains("crate_0"))
+        .stdout(predicates::str::contains("crate_14"))
+        .stdout(predicates::str::contains("store_declined"))
+        .stdout(predicates::str::contains("inputs-changed"))
+        .stdout(predicates::str::contains("--print cfg"))
+        .stdout(predicates::str::contains("retained event-log history"));
+    e.cmd()
+        .args([
+            "explain",
+            "--skips",
+            "--root",
+            missing_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "No skips or passthroughs recorded",
+        ));
+    for args in [
+        vec!["explain", "--all"],
+        vec!["explain", "serde", "--skips"],
+    ] {
+        e.cmd().args(args).assert().failure().code(2);
+    }
+}
+
+#[test]
+fn explain_skips_all_includes_rotated_history() {
+    let e = env();
+    let archive = e.cache.join("events.jsonl.archive");
+    std::fs::create_dir(&archive).unwrap();
+    let event = serde_json::json!({
+        "ts": "2026-01-01T00:00:00Z",
+        "crate_name": "archived_crate",
+        "root": e.home.to_str().unwrap(),
+        "result": "passthrough",
+        "passthrough_reason": "adaptive seed",
+        "elapsed_ms": 2,
+        "size": 0,
+        "cache_key": "",
+        "schema": 14
+    });
+    let compressed = zstd::stream::encode_all(format!("{event}\n").as_bytes(), 1).unwrap();
+    std::fs::write(
+        archive.join("1767225600-1767225600-1-1.jsonl.zst"),
+        compressed,
+    )
+    .unwrap();
+    // An archived-only history is still available after the live log is gone.
+    let output = e
+        .cmd()
+        .args(["--json", "explain", "--skips", "--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(value["entries"][0]["crate_name"], "archived_crate");
+    e.cmd()
+        .args(["explain", "--skips", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("edit rebuild:"))
+        .stdout(predicates::str::contains("archived_crate"));
+    e.cmd()
+        .args(["explain", "--skips"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "No skips or passthroughs recorded",
+        ));
+}

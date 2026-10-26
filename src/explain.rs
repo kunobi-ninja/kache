@@ -323,6 +323,140 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
 
 const NO_BUILD: &str = "no recorded build to explain";
 
+/// List all recorded bypasses in the selected scope, without a top-N limit.
+pub fn run_skips(config: &Config, root: Option<&Path>, all: bool, json: bool) -> Result<()> {
+    let mut events = if all {
+        events::read_events_since(
+            &config.event_log_path(),
+            chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        )?
+    } else {
+        events::read_events(&config.event_log_path())?
+    };
+    let root = root.map(crate::report::normalize_filter_root);
+    if let Some(root) = &root {
+        events.retain(|event| event.root == *root);
+    }
+    if !all {
+        let sessions = tui_sessions::group(
+            &events,
+            Duration::from_secs(crate::wrapper::BUILD_SESSION_SECS),
+        );
+        let indices = latest_builds(&sessions, root.as_deref())
+            .map(|builds| builds.latest.events.clone())
+            .unwrap_or_default();
+        events = indices
+            .into_iter()
+            .map(|index| events[index].clone())
+            .collect();
+    }
+    let bypass = crate::report::build_bypass_analysis(&events, usize::MAX);
+    let body = SkipsBody {
+        scope: if all {
+            "retained history"
+        } else {
+            "latest build"
+        },
+        root,
+        passthroughs: bypass.passthroughs,
+        skipped: bypass.skipped,
+        probes: bypass.probes,
+        reasons: bypass.reasons,
+        entries: bypass.slowest,
+    };
+    if json {
+        return crate::machine::emit("explain", body, Vec::new());
+    }
+    for line in render_skips(&body) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct SkipsBody {
+    scope: &'static str,
+    root: Option<String>,
+    passthroughs: usize,
+    skipped: usize,
+    probes: usize,
+    reasons: Vec<crate::report::BypassReason>,
+    entries: Vec<crate::report::BypassDetail>,
+}
+
+fn render_skips(body: &SkipsBody) -> Vec<String> {
+    let mut lines = vec![
+        term::heading(format!("kache · explain · skips · {}", body.scope)),
+        String::new(),
+    ];
+    if let Some(root) = &body.root {
+        lines.push(format!("Build tree: {}", term::home_path(Path::new(root))));
+    }
+    lines.push(format!(
+        "{} passthroughs, {} skipped, {} compiler queries (nothing to cache).",
+        term::count(body.passthroughs as u64),
+        term::count(body.skipped as u64),
+        term::count(body.probes as u64),
+    ));
+    if body.entries.is_empty() {
+        lines.push("No skips or passthroughs recorded in this scope.".to_string());
+        return lines;
+    }
+    lines.push(String::new());
+    lines.push(term::heading("Reasons"));
+    let reasons = body
+        .reasons
+        .iter()
+        .map(|reason| {
+            vec![
+                term::count(reason.count as u64),
+                reason.result.clone(),
+                reason.route.clone(),
+                tui_sessions::passthrough_words(&reason.reason),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.extend(term::table(
+        &["COUNT", "RESULT", "ROUTE", "WHY"],
+        &[Align::Right, Align::Left, Align::Left, Align::Left],
+        &reasons,
+    ));
+    lines.push(String::new());
+    lines.push(term::heading("Every skip and passthrough, slowest first"));
+    let entries = body
+        .entries
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.timestamp.clone(),
+                entry.crate_name.clone(),
+                term::home_path(Path::new(&entry.root)),
+                entry.result.clone(),
+                term::duration_ms(entry.elapsed_ms),
+                tui_sessions::passthrough_words(&entry.reason),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.extend(term::table(
+        &["WHEN", "CRATE", "ROOT", "RESULT", "TIME", "WHY"],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Left,
+        ],
+        &entries,
+    ));
+    lines.push(String::new());
+    lines.push(
+        "Only retained event-log history is available; deleted events cannot be recovered."
+            .to_string(),
+    );
+    lines
+}
+
 /// One cause in `kache --json explain`.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct CauseBody {

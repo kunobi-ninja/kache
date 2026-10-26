@@ -1820,7 +1820,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
     }
 }
 
-fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
+pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> BypassAnalysis {
     let mut details: Vec<BypassDetail> = events
         .iter()
         .filter(|event| {

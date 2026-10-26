@@ -324,39 +324,18 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
 const NO_BUILD: &str = "no recorded build to explain";
 
 /// List all recorded bypasses in the selected scope, without a top-N limit.
-pub fn run_skips(config: &Config, root: Option<&Path>, all: bool, json: bool) -> Result<()> {
-    let mut events = if all {
-        events::read_events_since(
-            &config.event_log_path(),
-            chrono::DateTime::<chrono::Utc>::MIN_UTC,
-        )?
-    } else {
-        events::read_events(&config.event_log_path())?
-    };
+pub fn run_all(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
+    let mut events = events::read_events_since(
+        &config.event_log_path(),
+        chrono::DateTime::<chrono::Utc>::MIN_UTC,
+    )?;
     let root = root.map(crate::report::normalize_filter_root);
     if let Some(root) = &root {
         events.retain(|event| event.root == *root);
     }
-    if !all {
-        let sessions = tui_sessions::group(
-            &events,
-            Duration::from_secs(crate::wrapper::BUILD_SESSION_SECS),
-        );
-        let indices = latest_builds(&sessions, root.as_deref())
-            .map(|builds| builds.latest.events.clone())
-            .unwrap_or_default();
-        events = indices
-            .into_iter()
-            .map(|index| events[index].clone())
-            .collect();
-    }
     let bypass = crate::report::build_bypass_analysis(&events, usize::MAX);
     let body = SkipsBody {
-        scope: if all {
-            "retained history"
-        } else {
-            "latest build"
-        },
+        scope: "retained history",
         root,
         passthroughs: bypass.passthroughs,
         skipped: bypass.skipped,

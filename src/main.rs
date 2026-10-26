@@ -1065,11 +1065,8 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             cli::telemetry_push(&config, &selection, &labels, dry_run)
         }
         Some(Commands::Explain {
-            skips: true,
-            all,
-            root,
-            ..
-        }) => explain::run_skips(&config, root.as_deref(), all, json),
+            all: true, root, ..
+        }) => explain::run_all(&config, root.as_deref(), json),
         Some(Commands::Explain {
             crate_name: Some(crate_name),
             ..

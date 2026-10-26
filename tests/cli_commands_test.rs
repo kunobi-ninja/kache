@@ -5752,7 +5752,7 @@ fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
 /// The skips view must retain every reason and invocation, including fast
 /// entries below the full report's slowest-table threshold.
 #[test]
-fn explain_skips_lists_complete_history_and_latest_session() {
+fn explain_all_lists_complete_history() {
     let e = env();
     let root_a = e.home.join("a").to_string_lossy().into_owned();
     let root_b = e.home.join("b").to_string_lossy().into_owned();
@@ -5809,7 +5809,7 @@ fn explain_skips_lists_complete_history_and_latest_session() {
         );
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
-    let all = read(&["--json", "explain", "--skips", "--all"]);
+    let all = read(&["--json", "explain", "--all"]);
     assert_eq!(all["command"], "explain");
     assert_eq!(all["scope"], "retained history");
     assert_eq!(all["passthroughs"], 15);
@@ -5822,28 +5822,30 @@ fn explain_skips_lists_complete_history_and_latest_session() {
     assert_eq!(all["entries"][0]["crate_name"], "crate_14");
     assert_eq!(all["entries"][0]["root"], root_a);
 
-    let latest = read(&["--json", "explain", "--skips"]);
-    assert_eq!(latest["scope"], "latest build");
-    assert_eq!(latest["entries"].as_array().unwrap().len(), 3);
-    assert_eq!(latest["reasons"].as_array().unwrap().len(), 2);
-    assert_eq!(latest["skipped"], 2);
-    let rooted = read(&["--json", "explain", "--skips", "--root", &root_a]);
+    let latest = read(&["--json", "explain"]);
+    assert_eq!(latest["root"], root_b);
+    assert_eq!(latest["misses"], 0);
+    assert!(
+        latest.get("entries").is_none(),
+        "plain explain keeps its build summary"
+    );
+    let rooted = read(&["--json", "explain", "--all", "--root", &root_a]);
     assert_eq!(rooted["entries"].as_array().unwrap().len(), 15);
     assert_eq!(rooted["root"], root_a);
-    let rooted_all = read(&["--json", "explain", "--skips", "--all", "--root", &root_b]);
+    let rooted_all = read(&["--json", "explain", "--all", "--root", &root_b]);
     assert_eq!(rooted_all["entries"].as_array().unwrap().len(), 3);
     let missing_root = e.home.join("missing");
     let empty = read(&[
         "--json",
         "explain",
-        "--skips",
+        "--all",
         "--root",
         missing_root.to_str().unwrap(),
     ]);
     assert!(empty["entries"].as_array().unwrap().is_empty());
 
     e.cmd()
-        .args(["explain", "--skips", "--all"])
+        .args(["explain", "--all"])
         .assert()
         .success()
         .stdout(predicates::str::contains(
@@ -5856,27 +5858,22 @@ fn explain_skips_lists_complete_history_and_latest_session() {
         .stdout(predicates::str::contains("--print cfg"))
         .stdout(predicates::str::contains("retained event-log history"));
     e.cmd()
-        .args([
-            "explain",
-            "--skips",
-            "--root",
-            missing_root.to_str().unwrap(),
-        ])
+        .args(["explain", "--all", "--root", missing_root.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicates::str::contains(
             "No skips or passthroughs recorded",
         ));
     for args in [
-        vec!["explain", "--all"],
-        vec!["explain", "serde", "--skips"],
+        vec!["explain", "serde", "--all"],
+        vec!["explain", "--skips"],
     ] {
         e.cmd().args(args).assert().failure().code(2);
     }
 }
 
 #[test]
-fn explain_skips_all_includes_rotated_history() {
+fn explain_all_includes_rotated_history() {
     let e = env();
     let archive = e.cache.join("events.jsonl.archive");
     std::fs::create_dir(&archive).unwrap();
@@ -5900,7 +5897,7 @@ fn explain_skips_all_includes_rotated_history() {
     // An archived-only history is still available after the live log is gone.
     let output = e
         .cmd()
-        .args(["--json", "explain", "--skips", "--all"])
+        .args(["--json", "explain", "--all"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -5908,16 +5905,14 @@ fn explain_skips_all_includes_rotated_history() {
     assert_eq!(value["entries"].as_array().unwrap().len(), 1);
     assert_eq!(value["entries"][0]["crate_name"], "archived_crate");
     e.cmd()
-        .args(["explain", "--skips", "--all"])
+        .args(["explain", "--all"])
         .assert()
         .success()
         .stdout(predicates::str::contains("edit rebuild:"))
         .stdout(predicates::str::contains("archived_crate"));
     e.cmd()
-        .args(["explain", "--skips"])
+        .args(["explain"])
         .assert()
         .success()
-        .stdout(predicates::str::contains(
-            "No skips or passthroughs recorded",
-        ));
+        .stdout(predicates::str::contains("no recorded build to explain"));
 }

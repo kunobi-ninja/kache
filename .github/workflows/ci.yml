@@ -1109,6 +1109,12 @@ jobs:
       - name: Install cross gcc (riscv64 + armv7)
         if: env.RUN_E2E == 'true' && runner.os == 'Linux'
         run: |
+          # A slow Azure mirror can keep delivering bytes without timing out.
+          # Prefer the image's official Ubuntu fallback when it is available.
+          if [ -f /etc/apt/apt-mirrors.txt ] &&
+             grep -q '^https://archive[.]ubuntu[.]com/ubuntu' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/azure[.]archive[.]ubuntu[.]com/d' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update
           sudo apt-get install -y gcc-riscv64-linux-gnu gcc-arm-linux-gnueabihf
 

@@ -4707,6 +4707,11 @@ fn store_with_one_evictable_entry(dir: &Path, key: &str) -> (Store, Config) {
 fn evict_counts_an_entry_it_fails_to_remove() {
     let dir = tempfile::tempdir().unwrap();
     let (store, _config) = store_with_one_evictable_entry(dir.path(), "broken");
+    // Unparseable meta with no blob mapping: its references are unknown.
+    store
+        .db
+        .execute("DELETE FROM entry_blobs WHERE cache_key = 'broken'", [])
+        .unwrap();
     std::fs::write(store.entry_dir("broken").join("meta.json"), b"{not json").unwrap();
 
     let stats = store.evict().unwrap();
@@ -7067,21 +7072,13 @@ fn test_store_remove_entry() {
     assert_eq!(store.entry_count().unwrap(), 0);
 }
 
-/// #276: removing an entry whose meta.json is unparseable must NOT delete
-/// the entry row or silently drop blob refcounts — that orphans the blobs
-/// forever (they keep a DB row and evade size-based eviction). It must
-/// refuse, leaving the entry and its refcounts intact.
-#[test]
-fn remove_entry_refuses_on_corrupt_meta_no_refcount_leak() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = test_config(dir.path());
-    let store = Store::open(&config).unwrap();
-
-    let output = dir.path().join("lib.rlib");
-    std::fs::write(&output, b"content").unwrap();
+/// Put `key` with one blob and return the store's blob refcount sum.
+fn put_one_blob_entry(store: &Store, dir: &Path, key: &str) {
+    let output = dir.join(format!("{key}.rlib"));
+    std::fs::write(&output, key.as_bytes()).unwrap();
     store
         .put(
-            "corrupt1",
+            key,
             "c1",
             &["lib".into()],
             &[],
@@ -7092,45 +7089,92 @@ fn remove_entry_refuses_on_corrupt_meta_no_refcount_leak() {
             "",
         )
         .unwrap();
+}
 
-    let refcount_sum = |s: &Store| -> i64 {
-        s.db.query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
+fn blob_refcount_sum(store: &Store) -> i64 {
+    store
+        .db
+        .query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
             r.get(0)
         })
         .unwrap()
-    };
-    let row_present = |s: &Store| -> i64 {
-        s.db.query_row(
-            "SELECT COUNT(*) FROM entries WHERE cache_key = 'corrupt1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
-    assert_eq!(refcount_sum(&store), 1, "one blob at refcount 1 after put");
-    assert_eq!(row_present(&store), 1);
+}
 
-    // Corrupt the entry's meta.json so its blob list can't be loaded.
+/// A crash can leave a meta.json zero-filled while the index still maps
+/// the entry's blobs. The mapping names every reference the entry holds,
+/// so removal releases them from it instead of refusing forever: such an
+/// entry used to be logged as evicted on every durability flush and kept
+/// by every sweep.
+#[test]
+fn remove_entry_releases_a_corrupt_meta_entry_through_its_blob_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    put_one_blob_entry(&store, dir.path(), "corrupt1");
+    let meta = store.get("corrupt1").unwrap().unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    assert_eq!(blob_refcount_sum(&store), 1);
+
+    let meta_path = store.entry_dir("corrupt1").join("meta.json");
+    std::fs::write(&meta_path, vec![0u8; 64]).unwrap();
+
+    store.remove_entry("corrupt1").unwrap();
+    assert!(!store.contains("corrupt1"));
+    assert_eq!(
+        blob_refcount_sum(&store),
+        0,
+        "the mapped reference is released"
+    );
+    assert!(!blob.exists(), "the last reference took the blob with it");
+    assert!(!store.entry_dir("corrupt1").exists());
+    assert_eq!(store.blob_index_drift().unwrap().total(), 0);
+}
+
+/// #276: without a blob mapping an unparseable meta.json leaves the
+/// entry's references unknown, so removal still refuses rather than leak
+/// them.
+#[test]
+fn remove_entry_refuses_on_corrupt_meta_without_a_blob_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    put_one_blob_entry(&store, dir.path(), "corrupt1");
+    store
+        .db
+        .execute("DELETE FROM entry_blobs WHERE cache_key = 'corrupt1'", [])
+        .unwrap();
     let meta_path = store.entry_dir("corrupt1").join("meta.json");
     std::fs::write(&meta_path, b"{ not valid json").unwrap();
 
+    let err = store.remove_entry("corrupt1").unwrap_err();
     assert!(
-        store.remove_entry("corrupt1").is_err(),
-        "remove_entry must error on unparseable meta.json rather than leak"
+        format!("{err:#}").contains("meta.json unparseable"),
+        "wrong refusal shape: {err:#}"
     );
-    assert_eq!(
-        row_present(&store),
-        1,
-        "corrupt entry row must survive a refused removal"
+    assert!(
+        store.contains("corrupt1"),
+        "the row survives a refused removal"
     );
-    assert_eq!(
-        refcount_sum(&store),
-        1,
-        "blob refcounts must be unchanged — no orphan"
-    );
+    assert_eq!(blob_refcount_sum(&store), 1, "no reference was dropped");
 }
 
-/// #276: a missing meta.json while the DB row persists is the same hazard.
+/// A settled-missing meta.json is released through the mapping the same way.
+#[test]
+fn remove_entry_releases_a_missing_meta_entry_through_its_blob_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    put_one_blob_entry(&store, dir.path(), "m1");
+    std::fs::remove_file(store.entry_dir("m1").join("meta.json")).unwrap();
+
+    store.remove_entry("m1").unwrap();
+    assert!(!store.contains("m1"));
+    assert_eq!(blob_refcount_sum(&store), 0);
+    assert_eq!(store.blob_index_drift().unwrap().total(), 0);
+}
+
+/// #276: a missing meta.json while the DB row persists and no mapping
+/// names its blobs is the same hazard.
 #[test]
 fn remove_entry_refuses_when_meta_missing_but_row_present() {
     let dir = tempfile::tempdir().unwrap();
@@ -7150,6 +7194,10 @@ fn remove_entry_refuses_when_meta_missing_but_row_present() {
             "",
             "",
         )
+        .unwrap();
+    store
+        .db
+        .execute("DELETE FROM entry_blobs WHERE cache_key = 'm1'", [])
         .unwrap();
     std::fs::remove_file(store.entry_dir("m1").join("meta.json")).unwrap();
     let err = store.remove_entry("m1").unwrap_err();
@@ -7215,11 +7263,10 @@ fn reput_over_refused_removal_releases_stale_refcounts() {
     put(&store, "one", b"generation one");
     assert_eq!(refcount_sum(&store), 1);
 
-    // Strand the row: meta.json gone, DB row present. Removal
-    // refuses (#276), and lookup's discarded-error path then drives
-    // a miss, a recompile, and this re-put over the surviving row.
+    // Strand the row: meta.json gone, DB row present. Lookup's
+    // discarded-error path then drives a miss, a recompile, and this
+    // re-put over the surviving row.
     std::fs::remove_file(store.entry_dir("strand1").join("meta.json")).unwrap();
-    assert!(store.remove_entry("strand1").is_err());
     put(&store, "two", b"generation two");
 
     assert_eq!(
@@ -13415,8 +13462,9 @@ fn evict_duplicate_entries_stops_at_the_physical_target() {
 }
 
 #[test]
-fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
-    // Covers evict_duplicate_entries remove_entry_guarded error branch.
+fn evict_duplicate_entries_releases_victim_with_corrupt_meta_through_its_mapping() {
+    // A corrupt victim's blob mapping still names its references, so the
+    // duplicate pass removes it rather than skipping it forever.
     let tmp = tempfile::tempdir().unwrap();
     let mut config = test_config(tmp.path());
     config.max_size = 1;
@@ -13490,9 +13538,10 @@ fn evict_duplicate_entries_skips_victim_with_corrupt_meta() {
 
     let stats = store.evict_duplicate_entries().unwrap();
 
-    assert_eq!(stats.entries_evicted, 0, "corrupt victim is skipped");
-    assert!(store.contains("dup_corrupt_old"));
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(!store.contains("dup_corrupt_old"));
     assert!(store.contains("dup_corrupt_new"));
+    assert_eq!(store.blob_index_drift().unwrap().total(), 0);
 }
 
 #[test]

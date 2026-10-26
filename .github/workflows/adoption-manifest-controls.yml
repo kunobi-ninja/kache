@@ -13,7 +13,8 @@ permissions:
 jobs:
   preflight:
     name: Adoption preflight
-    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.private }}
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 45
     env:
       RUSTC_WRAPPER: ""
@@ -32,7 +33,13 @@ jobs:
 
   manifest:
     name: MSVC manifest dependency probe
-    runs-on: windows-latest
+    if: ${{ !github.event.repository.private }}
+    strategy:
+      matrix:
+        include:
+          - os: Windows
+            runner: ${{ fromJSON(!github.event.repository.private && '"windows-latest"' || vars.CI_RUNNER_WINDOWS) }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

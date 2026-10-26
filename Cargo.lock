@@ -2130,9 +2130,9 @@ dependencies = [
 
 [[package]]
 name = "interprocess"
-version = "2.4.6"
+version = "2.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7529951166d4dd4d2a6b9f0bb97919b810623f75eeb76e81ee9e6644886cae37"
+checksum = "a4a4fff6c51dece332bdbf3af5fe376c49cfc8dced782725e95be0bb489e35d7"
 dependencies = [
  "doctest-file",
  "futures-core",
@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "kache"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "kache-client"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "heck",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "kache-config"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "kache-core"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "kache-e2e"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "kache-format"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "kache-fs"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "libc",
  "serde",
@@ -2527,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "kache-ipc"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2547,11 +2547,11 @@ dependencies = [
 
 [[package]]
 name = "kache-proofs"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 
 [[package]]
 name = "kache-protocol"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "chrono",
  "kache-core",
@@ -2562,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "kache-service"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "kache-shims"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "kache-fs",
  "libc",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "kache-store"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6038,18 +6038,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]

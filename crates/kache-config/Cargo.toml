@@ -1,6 +1,6 @@
 [package]
 name = "kache-config"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Invocation inputs and shared configuration for Kache."
@@ -13,9 +13,9 @@ readme = "README.md"
 test-support = ["kache-fs/testing"]
 
 [dependencies]
-kache-core = { version = "2.0.0-rc.1", path = "../kache-core", default-features = false }
-kache-fs = { version = "2.0.0-rc.1", path = "../kache-fs" }
-kache-shims = { version = "2.0.0-rc.1", path = "../kache-shims" }
+kache-core = { version = "2.0.0-rc.2", path = "../kache-core", default-features = false }
+kache-fs = { version = "2.0.0-rc.2", path = "../kache-fs" }
+kache-shims = { version = "2.0.0-rc.2", path = "../kache-shims" }
 anyhow = "1"
 blake3 = "1"
 bytesize = "2"
@@ -28,7 +28,7 @@ toml_edit = "0.25"
 tracing = "0.1"
 
 [dev-dependencies]
-kache-fs = { version = "2.0.0-rc.1", path = "../kache-fs", features = ["testing"] }
+kache-fs = { version = "2.0.0-rc.2", path = "../kache-fs", features = ["testing"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

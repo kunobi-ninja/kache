@@ -1,6 +1,6 @@
 [package]
 name = "kache-client"
-version = "2.0.0-rc.1"
+version = "2.0.0-rc.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Synchronous compiler client for the Kache daemon."
@@ -10,13 +10,13 @@ homepage = "https://kunobi.ninja/docs/kache"
 readme = "README.md"
 
 [dependencies]
-kache-config = { version = "2.0.0-rc.1", path = "../kache-config" }
-kache-ipc = { version = "2.0.0-rc.1", path = "../kache-ipc" }
-kache-protocol = { version = "2.0.0-rc.1", path = "../kache-protocol" }
+kache-config = { version = "2.0.0-rc.2", path = "../kache-config" }
+kache-ipc = { version = "2.0.0-rc.2", path = "../kache-ipc" }
+kache-protocol = { version = "2.0.0-rc.2", path = "../kache-protocol" }
 anyhow = "1"
 tracing = "0.1"
 
-kache-shims = { version = "2.0.0-rc.1", path = "../kache-shims" }
+kache-shims = { version = "2.0.0-rc.2", path = "../kache-shims" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

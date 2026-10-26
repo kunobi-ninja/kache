@@ -10505,6 +10505,40 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
         ]
     );
     assert_eq!(components(&kept)[4], "login_service keep");
+
+    // Completion edits are replanned after other shell edits. Report the
+    // backups from the applied plan, not the earlier preview.
+    let completion_path = PathBuf::from("/home/me/.local/share/kache/completions/kache.bash");
+    let completed = run_facts(
+        &SetupFacts {
+            completion_changes: vec![(PathBuf::from("/old-preview"), true)],
+            ..plan
+        },
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: None,
+            test_changes: Vec::new(),
+            completions: Some(SetupStep::new(
+                "completions",
+                "configure",
+                vec![completion_path.clone()],
+            )),
+            completion_changes: vec![(completion_path.clone(), true)],
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    let steps = setup_steps(&completed);
+    let completion = steps.iter().find(|s| s.component == "completions").unwrap();
+    assert_eq!(completion.action, "configure");
+    assert_eq!(
+        completion.paths.as_slice(),
+        std::slice::from_ref(&completion_path)
+    );
+    let backups: Vec<_> = steps.iter().filter(|s| s.component == "backup").collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(backups[0].paths, [completion_path]);
 }
 
 #[test]

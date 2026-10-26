@@ -1166,6 +1166,59 @@ fn init_completions_follow_custom_shell_and_data_directories() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn init_reports_completion_activation_even_when_compiler_shims_are_active() {
+    let e = env();
+    let original_path = std::env::var_os("PATH").unwrap();
+    e.cmd()
+        .args(["init", "--yes", "--no-service"])
+        .env("PATH", &original_path)
+        .assert()
+        .success();
+    let shims = e.home.join(".local/lib/kache/shims");
+    let active_path =
+        std::env::join_paths(std::iter::once(shims).chain(std::env::split_paths(&original_path)))
+            .unwrap();
+    let script = e.home.join(".local/share/kache/completions/kache.bash");
+    let generated = std::fs::read(&script).unwrap();
+    let run = |check, path: &std::ffi::OsStr| {
+        let mut command = e.cmd();
+        command
+            .args(["init", "--yes", "--no-service", "--json"])
+            .env("PATH", path);
+        if check {
+            command.arg("--check");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    // A configured terminal needs no reload until the completion script changes.
+    let ready = run(true, &active_path);
+    assert_eq!(ready["shell_activation_required"], false, "{ready}");
+    std::fs::write(&script, "# old completions\n").unwrap();
+    let preview = run(true, &active_path);
+    assert_eq!(preview["shell_activation_required"], true, "{preview}");
+    let shell = preview["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["component"] == "shell")
+        .unwrap();
+    assert_eq!(shell["action"], "keep", "only completions need an update");
+    assert_eq!(std::fs::read(&script).unwrap(), b"# old completions\n");
+    let applied = run(false, &active_path);
+    assert_eq!(applied["shell_activation_required"], true, "{applied}");
+    assert_eq!(std::fs::read(&script).unwrap(), generated);
+    // Compiler activation alone must still request a new terminal.
+    let compiler_only = run(true, &original_path);
+    assert_eq!(
+        compiler_only["shell_activation_required"], true,
+        "{compiler_only}"
+    );
+}
+
 /// With a login shell init cannot set up, it installs no shims, so there is
 /// no rustdoc shim to point Cargo at and no terminal to replace.
 #[cfg(unix)]

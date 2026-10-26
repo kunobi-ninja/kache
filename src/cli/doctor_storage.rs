@@ -263,6 +263,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn volume_checks_cover_missing_build_paths_and_the_working_reserve() {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::test_support::test_config(dir.path().to_owned());
         config.auto_recover_min_free_bytes = 0;
@@ -291,6 +292,12 @@ mod tests {
             assert!(check.detail.contains("warning floor"));
         }
         assert_eq!(disk_checks(&config, None, dir.path()).len(), 2);
+        let path = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // SAFETY: statvfs is plain data and the path and output slot are valid.
+        let mut inode_usage: libc::statvfs = unsafe { std::mem::zeroed() };
+        let reports_capacity = unsafe { libc::statvfs(path.as_ptr(), &mut inode_usage) } == 0
+            && inode_usage.f_files != 0;
+        assert_eq!(available_inodes(dir.path()).is_some(), reports_capacity);
         assert!(available_inodes(&dir.path().join("absent")).is_none());
     }
 

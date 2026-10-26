@@ -37,9 +37,10 @@ peers. Otherwise the client uses its local engine.
 
 On macOS, both peers must be outside Seatbelt sandboxes by default. Peer identity
 is checked with the kernel audit token. Windows requires matching process-token
-contexts; the trust setting does not relax this check.
+contexts. Different token generations carrying security attributes require local
+execution by default, even when both processes belong to the same user.
 
-For a daemon you trust to access the workspace on Linux or macOS, enable this
+For a daemon you trust to access the workspace, enable this
 setting in both the daemon's startup configuration and the build's configuration:
 
 ```toml
@@ -52,6 +53,14 @@ after changing its startup setting. On Linux this permits the client broker unde
 Seccomp filters and NoNewPrivs; it does not compare filter programs. On macOS
 it permits a sandboxed client or daemon after authenticating the peer. Unknown
 sandbox status still requires local execution.
+
+On Windows, this setting permits different `TSA://ProcUnique` values when both
+tokens contain only that known process-identity attribute, or both attribute
+lists are empty. Unknown attributes and changes to the attribute's type, flags
+or value count still require local execution. User, logon session, groups,
+privileges and the other token-context checks still apply. Token attributes can
+affect access rules, so enabling this option trusts the daemon to read inputs
+under its own token.
 
 Compiler children and brokered restore operations retain the client's
 restrictions. The daemon still discovers inputs, reads workspace files and

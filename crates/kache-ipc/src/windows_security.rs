@@ -7,10 +7,17 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-pub(crate) fn matches_daemon(process: BorrowedHandle<'_>) -> io::Result<bool> {
+pub(crate) fn matches_daemon(
+    process: BorrowedHandle<'_>,
+    trusted_pipeline: bool,
+) -> io::Result<bool> {
     let client = token(process.as_raw_handle(), TOKEN_QUERY)?;
     let daemon = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
-    equivalent(client.as_raw_handle(), daemon.as_raw_handle())
+    equivalent(
+        client.as_raw_handle(),
+        daemon.as_raw_handle(),
+        trusted_pipeline,
+    )
 }
 
 fn token(process: HANDLE, access: u32) -> io::Result<OwnedHandle> {
@@ -114,7 +121,7 @@ impl Information {
     }
 }
 
-fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
+fn equivalent(client: HANDLE, daemon: HANDLE, trusted_pipeline: bool) -> io::Result<bool> {
     for token in [client, daemon] {
         if Information::read(token, TokenIsAppContainer)?.value::<u32>()? != 0 {
             return Ok(false);
@@ -149,15 +156,23 @@ fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
         == daemon_statistics.ModifiedId.HighPart
         && client_statistics.ModifiedId.LowPart == daemon_statistics.ModifiedId.LowPart;
     // Windows exposes opaque security attributes even on ordinary tokens.
-    // Compare every documented access field below; permit opaque attributes
-    // only on unchanged token copies with the same kernel-issued ModifiedId.
+    // Unchanged token copies can retain opaque attributes. Independently
+    // created processes may have different TSA://ProcUnique values. That
+    // exception needs explicit trust: access rules can use token attributes.
     // https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-token_statistics
     let client_access = Information::read(client, TokenAccessInformation)?;
     let daemon_access = Information::read(daemon, TokenAccessInformation)?;
     let a = client_access.value::<TOKEN_ACCESS_INFORMATION>()?;
     let b = daemon_access.value::<TOKEN_ACCESS_INFORMATION>()?;
-    if ((!a.SecurityAttributes.is_null() || !b.SecurityAttributes.is_null()) && !same_generation)
-        || a.TokenType != TokenPrimary
+    if !crate::windows_security_attributes::token_generations_match(
+        same_generation,
+        !a.SecurityAttributes.is_null() || !b.SecurityAttributes.is_null(),
+        trusted_pipeline,
+        || ordinary_attributes_match(client, daemon),
+    )? {
+        return Ok(false);
+    }
+    if a.TokenType != TokenPrimary
         || b.TokenType != TokenPrimary
         || a.Flags != b.Flags
         || optional_sid(&client_access, a.TrustLevelSid)?
@@ -200,6 +215,13 @@ fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
         return Ok(false);
     }
     Ok(default_dacl(client)? == default_dacl(daemon)?)
+}
+
+fn ordinary_attributes_match(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
+    use crate::windows_security_attributes::matching_ordinary_attributes;
+    let client = Information::read(client, TokenSecurityAttributes)?;
+    let daemon = Information::read(daemon, TokenSecurityAttributes)?;
+    matching_ordinary_attributes(client.bytes(), daemon.bytes())
 }
 
 fn optional_sid(info: &Information, pointer: PSID) -> io::Result<Option<Vec<u8>>> {
@@ -250,6 +272,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_child_waits_for_input() {
+        use std::io::{Read, Write};
+        if std::env::var_os("KACHE_TOKEN_TEST_CHILD").is_none() {
+            return;
+        }
+        println!("token child ready");
+        io::stdout().flush().unwrap();
+        let mut finish = [0];
+        io::stdin().read_exact(&mut finish).unwrap();
+    }
+
+    #[test]
+    fn a_trusted_pipeline_accepts_a_separately_created_process() {
+        use std::io::{BufRead, Write};
+        use std::os::windows::io::AsHandle;
+        use std::process::{Command, Stdio};
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows_security::tests::token_child_waits_for_input",
+                    "--nocapture",
+                ])
+                .env("KACHE_TOKEN_TEST_CHILD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = io::BufReader::new(child.0.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "token child exited early"
+            );
+            if line.contains("token child ready") {
+                break;
+            }
+        }
+        let client = token(child.0.as_handle().as_raw_handle(), TOKEN_QUERY).unwrap();
+        let daemon = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        assert!(matches_daemon(child.0.as_handle(), true).unwrap());
+
+        let statistics = |token: HANDLE| {
+            Information::read(token, TokenStatistics)
+                .unwrap()
+                .value::<TOKEN_STATISTICS>()
+                .unwrap()
+        };
+        let a = statistics(client.as_raw_handle()).ModifiedId;
+        let b = statistics(daemon.as_raw_handle()).ModifiedId;
+        let opaque = |token: HANDLE| {
+            !Information::read(token, TokenAccessInformation)
+                .unwrap()
+                .value::<TOKEN_ACCESS_INFORMATION>()
+                .unwrap()
+                .SecurityAttributes
+                .is_null()
+        };
+        // Some runners copy ModifiedId unchanged. On affected Windows hosts,
+        // the strict default must still refuse the distinct process identity.
+        if (a.HighPart, a.LowPart) != (b.HighPart, b.LowPart)
+            && (opaque(client.as_raw_handle()) || opaque(daemon.as_raw_handle()))
+        {
+            assert!(!matches_daemon(child.0.as_handle(), false).unwrap());
+        }
+        child.0.stdin.take().unwrap().write_all(&[1]).unwrap();
+        assert!(child.0.wait().unwrap().success());
+    }
+
+    #[test]
     fn the_same_primary_token_has_the_same_context() {
         let token = token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
         if Information::read(token.as_raw_handle(), TokenIsAppContainer)
@@ -258,7 +362,7 @@ mod tests {
             .unwrap()
             == 0
         {
-            assert!(equivalent(token.as_raw_handle(), token.as_raw_handle()).unwrap());
+            assert!(equivalent(token.as_raw_handle(), token.as_raw_handle(), false).unwrap());
         }
     }
 
@@ -298,7 +402,7 @@ mod tests {
             (original.TokenId.HighPart, original.TokenId.LowPart),
             (copied.TokenId.HighPart, copied.TokenId.LowPart)
         );
-        assert!(equivalent(token.as_raw_handle(), duplicate.as_raw_handle()).unwrap());
+        assert!(equivalent(token.as_raw_handle(), duplicate.as_raw_handle(), false).unwrap());
     }
 
     #[test]
@@ -326,7 +430,23 @@ mod tests {
             0
         );
         let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
-        assert!(!equivalent(restricted.as_raw_handle(), token.as_raw_handle()).unwrap());
-        assert!(!equivalent(token.as_raw_handle(), restricted.as_raw_handle()).unwrap());
+        for trusted_pipeline in [false, true] {
+            assert!(
+                !equivalent(
+                    restricted.as_raw_handle(),
+                    token.as_raw_handle(),
+                    trusted_pipeline
+                )
+                .unwrap()
+            );
+            assert!(
+                !equivalent(
+                    token.as_raw_handle(),
+                    restricted.as_raw_handle(),
+                    trusted_pipeline
+                )
+                .unwrap()
+            );
+        }
     }
 }

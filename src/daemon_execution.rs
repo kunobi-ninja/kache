@@ -1408,6 +1408,7 @@ mod tests {
                     stdout: 2,
                     stderr: 3,
                     process_broker: false,
+                    trusted_pipeline: false,
                 }
             }),
             ("argv", |r| r.argv.clear()),

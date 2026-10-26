@@ -60,7 +60,12 @@ pub fn run(version: &str) -> Result<i32> {
                     return Ok(exit);
                 }
                 #[cfg(windows)]
-                if let Some(exit) = windows::try_bootstrap(&execution, &socket, config.disabled)? {
+                if let Some(exit) = windows::try_bootstrap(
+                    &execution,
+                    &socket,
+                    config.disabled,
+                    config.trust_daemon_execution,
+                )? {
                     return Ok(exit);
                 }
             }

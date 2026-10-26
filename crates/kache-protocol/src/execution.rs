@@ -135,7 +135,26 @@ pub enum ExecutionChannels {
         /// Native children and console writes remain in the original client.
         #[serde(default)]
         process_broker: bool,
+        /// Permit the daemon pipeline to use its own file-access context.
+        #[serde(default)]
+        trusted_pipeline: bool,
     },
+}
+
+impl ExecutionChannels {
+    /// Both peers must opt in before the daemon uses its own access context.
+    pub fn trusted_pipeline(&self, daemon_trust: bool) -> bool {
+        daemon_trust
+            && match self {
+                Self::UnixClient {
+                    trusted_pipeline, ..
+                }
+                | Self::Windows {
+                    trusted_pipeline, ..
+                } => *trusted_pipeline,
+                Self::Unix { .. } => false,
+            }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +225,38 @@ impl ExecutionStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pipeline_trust_requires_both_peers_and_defaults_to_false() {
+        use super::ExecutionChannels;
+        for platform in ["windows", "unix_client"] {
+            let legacy = if platform == "windows" {
+                r#"{"platform":"windows","stdin":0,"stdout":0,"stderr":0,"process_broker":true}"#
+            } else {
+                r#"{"platform":"unix_client","terminal":false,"jobserver":[]}"#
+            };
+            let channels: ExecutionChannels = serde_json::from_str(legacy).unwrap();
+            assert!(!channels.trusted_pipeline(true));
+            for client in [false, true] {
+                let mut json: serde_json::Value = serde_json::from_str(legacy).unwrap();
+                json["trusted_pipeline"] = client.into();
+                let channels: ExecutionChannels = serde_json::from_value(json).unwrap();
+                for daemon in [false, true] {
+                    assert_eq!(channels.trusted_pipeline(daemon), client && daemon);
+                }
+                let round_trip: ExecutionChannels =
+                    serde_json::from_str(&serde_json::to_string(&channels).unwrap()).unwrap();
+                assert_eq!(round_trip, channels);
+            }
+        }
+        assert!(
+            !ExecutionChannels::Unix {
+                terminal: false,
+                jobserver: vec![]
+            }
+            .trusted_pipeline(true)
+        );
+    }
+
     #[test]
     fn execution_diagnostics_reject_legacy_and_foreign_protocols() {
         let mut status: super::ExecutionStatus = serde_json::from_str(r#"{"eligible":true,"client_trust_enabled":false,"daemon_trust_enabled":false,"detail":"old daemon"}"#).unwrap();

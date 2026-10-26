@@ -25,8 +25,10 @@ pub(super) fn probe(
     daemon: &Daemon,
 ) -> kache_protocol::execution::ExecutionStatus {
     let eligible = version == daemon.version
-        && PeerProcess::for_connection(stream, client_pid)
-            .is_ok_and(|peer| peer.permits_delegation().unwrap_or(false));
+        && PeerProcess::for_connection(stream, client_pid).is_ok_and(|peer| {
+            peer.permits_delegation(client_trust && daemon.config.trust_daemon_execution)
+                .unwrap_or(false)
+        });
     kache_protocol::execution::ExecutionStatus {
         protocol_version: EXECUTION_VERSION,
         eligible,
@@ -182,8 +184,11 @@ pub(super) async fn handle(
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
+    let trusted_pipeline = request
+        .channels
+        .trusted_pipeline(daemon.config.trust_daemon_execution);
     let peer = match PeerProcess::for_connection(stream, request.client_pid) {
-        Ok(peer) if peer.permits_delegation().unwrap_or(false) => Arc::new(peer),
+        Ok(peer) if peer.permits_delegation(trusted_pipeline).unwrap_or(false) => Arc::new(peer),
         _ => return decline(stream, "compiler security context requires local execution").await,
     };
     let prepared = match Prepared::decode(request, &daemon.version) {
@@ -217,7 +222,7 @@ pub(super) async fn handle(
     );
     peer.verify_connection(stream)?;
     anyhow::ensure!(
-        peer.permits_delegation()?,
+        peer.permits_delegation(trusted_pipeline)?,
         "compiler security context changed before Commit"
     );
     tokio::time::timeout(

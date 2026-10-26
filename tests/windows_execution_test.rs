@@ -50,7 +50,7 @@ impl Fixture {
             std::fs::create_dir(fixture.path(name)).unwrap();
         }
         std::fs::write(fixture.path("config.toml"),
-            "[cache]\nlocal_only=true\nauto_gc=false\nindex_auto_compact=false\nscheduler=false\ndaemon_publish=false\nprefetch_enabled=false\nmin_store_compile_ms=0\n").unwrap();
+            "[cache]\ntrust_daemon_execution=true\nlocal_only=true\nauto_gc=false\nindex_auto_compact=false\nscheduler=false\ndaemon_publish=false\nprefetch_enabled=false\nmin_store_compile_ms=0\n").unwrap();
         std::fs::copy(FRONTEND, fixture.path("install/kache.exe")).unwrap();
         std::fs::copy(ENGINE, fixture.path("install/kache-engine.exe")).unwrap();
         std::fs::copy(FRONTEND, fixture.path("frontend-only/kache.exe")).unwrap();

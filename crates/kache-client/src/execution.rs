@@ -67,8 +67,6 @@ impl Execution<'_> {
     }
 
     fn prepare(&self, trusted_pipeline: bool) -> Result<Prepared> {
-        #[cfg(not(unix))]
-        let _ = trusted_pipeline;
         #[cfg(unix)]
         anyhow::ensure!(
             self.files.len() == 3 + usize::from(self.terminal),
@@ -105,6 +103,7 @@ impl Execution<'_> {
                 stdout: handle(1),
                 stderr: handle(2),
                 process_broker: true,
+                trusted_pipeline,
             }
         };
         let native_path = |path: &Path| NativeString::capture(path.as_os_str());
@@ -378,7 +377,7 @@ mod windows_tests {
             root.path().to_owned(),
         );
         let executable = std::env::current_exe().unwrap();
-        let prepared = Execution {
+        let execution = Execution {
             entry: ExecutionEntry::Original,
             args: &args,
             env: &env,
@@ -387,21 +386,23 @@ mod windows_tests {
             files: &files,
             terminal: false,
             client_version: "fixture",
+        };
+        for trusted_pipeline in [false, true] {
+            let prepared = execution.prepare(trusted_pipeline).unwrap();
+            assert_eq!(prepared.request.argv[1].decode().unwrap(), native);
+            assert_eq!(prepared.request.env[0].1.decode().unwrap(), native);
+            assert_eq!(prepared.request.creation_mask, None);
+            assert_eq!(
+                prepared.request.channels,
+                ExecutionChannels::Windows {
+                    stdin: files[0].as_raw_handle() as usize as u64,
+                    stdout: files[1].as_raw_handle() as usize as u64,
+                    stderr: files[2].as_raw_handle() as usize as u64,
+                    process_broker: true,
+                    trusted_pipeline,
+                }
+            );
         }
-        .prepare(false)
-        .unwrap();
-        assert_eq!(prepared.request.argv[1].decode().unwrap(), native);
-        assert_eq!(prepared.request.env[0].1.decode().unwrap(), native);
-        assert_eq!(prepared.request.creation_mask, None);
-        assert_eq!(
-            prepared.request.channels,
-            ExecutionChannels::Windows {
-                stdin: files[0].as_raw_handle() as usize as u64,
-                stdout: files[1].as_raw_handle() as usize as u64,
-                stderr: files[2].as_raw_handle() as usize as u64,
-                process_broker: true,
-            }
-        );
         for file in files {
             assert!(
                 file.metadata().is_ok(),

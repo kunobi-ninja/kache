@@ -9,6 +9,7 @@ pub(super) fn try_bootstrap(
     execution: &Execution<'_>,
     socket: &Path,
     disabled: bool,
+    trusted_pipeline: bool,
 ) -> Result<Option<i32>> {
     let bootstrap = ["kache".into(), "daemon".into(), "start".into()];
     if !disabled
@@ -25,7 +26,7 @@ pub(super) fn try_bootstrap(
             .status()
             .is_ok_and(|status| status.success())
     {
-        execution.try_execute(socket)
+        execution.try_execute_with_trust(socket, trusted_pipeline)
     } else {
         Ok(None)
     }

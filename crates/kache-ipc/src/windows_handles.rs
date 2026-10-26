@@ -34,9 +34,9 @@ pub struct CompilerHandles {
 }
 
 impl PeerProcess {
-    pub fn permits_delegation(&self) -> io::Result<bool> {
+    pub fn permits_delegation(&self, trusted_pipeline: bool) -> io::Result<bool> {
         self.require_alive()?;
-        crate::windows_security::matches_daemon(self.process.as_handle())
+        crate::windows_security::matches_daemon(self.process.as_handle(), trusted_pipeline)
     }
     /// Duplicate only from the pinned frontend, before acknowledging Release.
     pub fn duplicate_compiler(

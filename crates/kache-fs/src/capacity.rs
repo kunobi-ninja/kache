@@ -65,7 +65,26 @@ pub fn volume_stats(path: &Path) -> Option<VolumeStats> {
     }
     #[cfg(windows)]
     {
-        windows_stats(path)
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+        std::fs::metadata(path).ok()?;
+        let root = crate::volume::volume_root(path)?;
+        let usage = volume_space(Path::new(&root))?;
+        let root: Vec<u16> = std::ffi::OsStr::new(&root)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut name = [0u16; 64];
+        // SAFETY: root and the GUID output buffer are valid for their stated lengths.
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(root.as_ptr(), name.as_mut_ptr(), name.len() as u32)
+        };
+        Some(VolumeStats {
+            id: windows_id(ok, &name),
+            usage,
+            inodes: None,
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -131,42 +150,32 @@ fn unix_counts(
     })
 }
 
-#[cfg(windows)]
-fn windows_stats(path: &Path) -> Option<VolumeStats> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+/// Byte-only observation used by the locality probe as well as full statistics.
+#[cfg(any(windows, test))]
+pub(crate) fn volume_space(path: &Path) -> Option<VolumeUsage> {
+    #[cfg(unix)]
+    {
+        unix_stats(path).map(|stats| stats.usage)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-    std::fs::metadata(path).ok()?;
-    let root = crate::volume::volume_root(path)?;
-    let usage = windows_space(Path::new(&root))?;
-    let root: Vec<u16> = std::ffi::OsStr::new(&root)
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let mut name = [0u16; 64];
-    // SAFETY: root and the GUID output buffer are valid for their stated lengths.
-    let ok = unsafe {
-        GetVolumeNameForVolumeMountPointW(root.as_ptr(), name.as_mut_ptr(), name.len() as u32)
-    };
-    Some(VolumeStats {
-        id: windows_id(ok, &name),
-        usage,
-        inodes: None,
-    })
-}
-
-#[cfg(windows)]
-pub(crate) fn windows_space(path: &Path) -> Option<VolumeUsage> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut free = 0;
-    let mut total = 0;
-    // SAFETY: wide is NUL-terminated and both output counters are valid.
-    let ok =
-        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
-    windows_usage(ok, total, free)
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut free = 0;
+        let mut total = 0;
+        // SAFETY: wide is NUL-terminated and both output counters are valid.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut())
+        };
+        windows_usage(ok, total, free)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -287,6 +296,10 @@ mod tests {
         assert!(root.usage.total > 0);
         assert!(volume_stats(&dir.path().join("missing")).is_none());
         assert!(volume_stats(Path::new("\0")).is_none());
+        let bytes = volume_space(dir.path()).unwrap();
+        assert_eq!(bytes.total, root.usage.total);
+        assert!(bytes.free > 0);
+        assert!(volume_space(&dir.path().join("missing")).is_none());
         #[cfg(unix)]
         {
             let alias = dir.path().join("alias");

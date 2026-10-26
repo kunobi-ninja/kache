@@ -415,9 +415,9 @@ fn probe_windows(path: &Path) -> FsProbe {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn volume_total_bytes_windows(path: &Path) -> Option<u64> {
-    crate::capacity::windows_space(path).map(|usage| usage.total)
+    crate::capacity::volume_space(path).map(|usage| usage.total)
 }
 
 /// Volume mount root (`C:\`) holding `path`. Mirrors `link::windows_volume_root`
@@ -460,6 +460,19 @@ fn probe_unsupported(_path: &Path) -> FsProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn volume_total_projection_preserves_capacity_and_failed_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let total = crate::volume_stats(dir.path()).unwrap().usage.total;
+        assert!(total > 1);
+        assert_eq!(volume_total_bytes_windows(dir.path()), Some(total));
+        assert_eq!(
+            volume_total_bytes_windows(&dir.path().join("missing")),
+            None
+        );
+    }
 
     #[test]
     fn local_filesystem_says_nothing() {

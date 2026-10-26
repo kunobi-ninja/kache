@@ -71,7 +71,7 @@ fn disk_check(
         .id
         .map_or(String::new(), |id| format!("; volume {id}"));
     let fix = if exhausted {
-        Some("this volume has no inodes available: creating files can fail even with free bytes. Review file counts and free files on this volume, or move the cache/build directory to another volume".into())
+        Some("this volume has no inodes available: creating files can fail even with free bytes. Review file counts and free files on this volume, or move the affected directory to another volume".into())
     } else if low {
         Some("preview tracked build directories with `kache clean --dry-run`; cache size limits do not cover incremental state, temporary files or all target artifacts. Check this volume before starting another large build".into())
     } else {

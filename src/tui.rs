@@ -1452,9 +1452,7 @@ fn draw_now_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let layout = now_layout(area, state.sessions.len());
     draw_now_figures(frame, state, layout.figures);
     draw_now_builds(frame, state, layout.builds);
-    if layout.summary.height > 0 {
-        draw_now_selection(frame, state, layout.summary);
-    }
+    draw_now_selection(frame, state, layout.summary);
     if layout.causes.height > 0 {
         draw_now_causes(frame, state, layout.causes);
     }

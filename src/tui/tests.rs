@@ -2760,6 +2760,139 @@ fn now_reserves_readable_detail_rows_at_layout_boundaries() {
 }
 
 #[test]
+fn now_uses_two_lines_for_figures_only_when_space_is_limited() {
+    let mut s = test_state();
+    for (width, height, compact) in [(80, 24, true), (60, 44, true), (160, 44, false)] {
+        let layout = now_layout(Rect::new(0, 1, width, height - 1), 0);
+        let buffer = rendered_buffer(&mut s, Tab::Now, width, height);
+        let figures = region_text(&buffer, layout.figures);
+        if compact {
+            assert!(figures.contains("lookups hit ·"), "{figures}");
+            assert!(figures.contains("cache "), "{figures}");
+            assert!(!figures.contains("saved, "), "{figures}");
+        } else {
+            assert!(row_text(&buffer, layout.figures.y + 1).contains("lookups hit"));
+            assert!(row_text(&buffer, layout.figures.y + 1).contains("saved, "));
+            assert!(!figures.contains("lookups hit ·"), "{figures}");
+        }
+    }
+}
+
+#[test]
+fn now_keeps_hidden_analysis_and_event_scroll_untouched() {
+    let mut s = test_state();
+    for i in 0..50 {
+        s.events.push(session_event(
+            &format!("crate_{i}"),
+            EventResult::Miss,
+            "/w/one",
+            "s1",
+            5,
+        ));
+    }
+    s.refresh_sessions(chrono::Utc::now());
+    rendered_buffer(&mut s, Tab::Now, 160, 44);
+    s.build_scroll.scroll_up_by(7);
+    let before = s.build_scroll;
+    assert!(before.page > 1);
+    s.why_cache = None;
+    let layout = now_layout(Rect::new(0, 1, 60, 15), 1);
+    assert_eq!(layout.causes.height, 0);
+    assert_eq!(layout.events.height, 0);
+    rendered_buffer(&mut s, Tab::Now, 60, 16);
+    assert!(
+        s.why_cache.is_none(),
+        "hidden analysis must not be computed"
+    );
+    assert_eq!(s.build_scroll.page, before.page);
+    assert_eq!(s.build_scroll.offset, before.offset);
+    assert_eq!(s.build_scroll.max_offset, before.max_offset);
+}
+
+#[test]
+fn now_warns_only_when_the_cause_preview_omits_older_misses() {
+    for (misses, capped) in [(1, false), (401, true)] {
+        let mut s = test_state();
+        for i in 0..misses {
+            s.events.push(session_event(
+                &format!("crate_{i}"),
+                EventResult::Miss,
+                "/w/one",
+                "s1",
+                5,
+            ));
+        }
+        s.refresh_sessions(chrono::Utc::now());
+        let layout = now_layout(Rect::new(0, 1, 160, 43), 1);
+        let buffer = rendered_buffer(&mut s, Tab::Now, 160, 44);
+        let causes = region_text(&buffer, layout.causes);
+        assert_eq!(causes.contains("misses analyzed"), capped, "{causes}");
+        if capped {
+            assert!(
+                causes.contains("Newest 400 of 401 misses analyzed"),
+                "{causes}"
+            );
+        }
+        assert!(causes.contains("no earlier compile"), "{causes}");
+    }
+}
+
+#[test]
+fn now_mouse_uses_the_rendered_rows_at_the_minimum_side_by_side_height() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut s = test_state();
+    s.active_tab = Tab::Now;
+    for i in 0..40 {
+        s.events.push(session_event(
+            &format!("crate_{i}"),
+            EventResult::Miss,
+            &format!("/w/project-{i}"),
+            &format!("s{i}"),
+            100 - i,
+        ));
+    }
+    s.refresh_sessions(chrono::Utc::now());
+    let mut terminal = Terminal::new(TestBackend::new(116, 21)).unwrap();
+    let area = Rect::new(3, 2, 110, 17);
+    let content = Rect::new(3, 3, 110, 16);
+    terminal
+        .draw(|frame| draw_now_tab(frame, &mut s, content))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    // This is the last visible build. The next row is the list border.
+    let row = 16;
+    let text: String = (4..38).map(|x| buffer[(x, row)].symbol()).collect();
+    assert!(text.contains("project-31"), "{text}");
+    handle_mouse(
+        &mut s,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: row + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    );
+    assert!(
+        s.selected_session.is_none(),
+        "the border is not a build row"
+    );
+    handle_mouse(
+        &mut s,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    );
+    assert_eq!(s.selected_session.as_deref(), Some("id:s31"));
+}
+
+#[test]
 fn compact_tabs_remain_clickable_at_the_minimum_width() {
     let area = Rect::new(3, 2, 60, 16);
     let mut s = test_state();

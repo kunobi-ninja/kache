@@ -705,7 +705,8 @@ fn record_linker_placement_memo(
 /// Apple's `xcrun` accepts a filesystem path as `--sdk`. xcbuild's `xcrun`
 /// only accepts a name such as `macosx`. When `xcrun` rejects a path that is
 /// still a real SDK directory, read the same version and build from
-/// `SystemVersion.plist` inside that root.
+/// `SystemVersion.plist` inside that root. For a named or default SDK, ask
+/// `xcrun` for its selected path before reading that manifest.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
     sdk_identity_for_invocation(root, &InvocationEnv::capture())
@@ -716,24 +717,40 @@ pub(crate) fn sdk_identity_for_invocation(
     root: Option<String>,
     env: &InvocationEnv,
 ) -> Result<Option<String>> {
-    let sdk = root.as_deref().unwrap_or("macosx");
-    if let Some(identity) = xcrun_identity(sdk, env) {
-        return Ok(Some(identity));
-    }
-    let path = env
-        .resolve(Path::new(sdk))
-        .context("resolving selected SDK root")?;
-    if path.is_dir() {
-        return identity_from_sdk_root(&path).map(Some);
-    }
-    bail!("xcrun --show-sdk-version failed");
+    sdk_identity_with_queries(root.as_deref(), env, |arguments| xcrun(arguments, env)).map(Some)
 }
 
-#[cfg(target_os = "macos")]
-fn xcrun_identity(sdk: &str, env: &InvocationEnv) -> Option<String> {
-    let version = xcrun(&["--sdk", sdk, "--show-sdk-version"], env)?;
-    let build = xcrun(&["--sdk", sdk, "--show-sdk-build-version"], env)?;
-    Some(format!("{version} ({build})"))
+#[cfg(any(test, target_os = "macos"))]
+fn sdk_identity_with_queries(
+    root: Option<&str>,
+    env: &InvocationEnv,
+    mut query: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<String> {
+    let sdk = root.unwrap_or("macosx");
+    let metadata = (|| -> Result<String> {
+        let version = query(&["--sdk", sdk, "--show-sdk-version"])?;
+        let build = query(&["--sdk", sdk, "--show-sdk-build-version"])?;
+        Ok(format!("{version} ({build})"))
+    })();
+    let probe_error = match metadata {
+        Ok(identity) => return Ok(identity),
+        Err(error) => error,
+    };
+    if let Some(root) = root {
+        let path = env
+            .resolve(Path::new(root))
+            .context("resolving selected SDK root")?;
+        if path.is_dir() {
+            return identity_from_sdk_root(&path);
+        }
+    }
+    let selected = query(&["--sdk", sdk, "--show-sdk-path"]).with_context(|| {
+        format!("locating SDK {sdk} after metadata query failed: {probe_error:#}")
+    })?;
+    let path = env
+        .resolve(Path::new(&selected))
+        .context("resolving located SDK path")?;
+    identity_from_sdk_root(&path)
 }
 
 /// `ProductVersion` / `ProductBuildVersion` as `xcrun --show-sdk-version` and
@@ -744,13 +761,8 @@ fn xcrun_identity(sdk: &str, env: &InvocationEnv) -> Option<String> {
 #[cfg(any(test, target_os = "macos"))]
 fn identity_from_sdk_root(root: &Path) -> Result<String> {
     let plist = root.join("System/Library/CoreServices/SystemVersion.plist");
-    let body = std::fs::read_to_string(&plist).with_context(|| {
-        format!(
-            "xcrun rejected --sdk {} and {} is unreadable",
-            root.display(),
-            plist.display()
-        )
-    })?;
+    let body = std::fs::read_to_string(&plist)
+        .with_context(|| format!("reading SDK identity from {}", plist.display()))?;
     let version = plist_string(&body, "ProductVersion").ok_or_else(|| {
         anyhow::anyhow!(
             "{} has no ProductVersion; not a usable macOS SDK",
@@ -790,18 +802,26 @@ pub(crate) fn sdk_identity_for_invocation(
 }
 
 #[cfg(target_os = "macos")]
-fn xcrun(arguments: &[&str], env: &InvocationEnv) -> Option<String> {
+fn xcrun(arguments: &[&str], env: &InvocationEnv) -> Result<String> {
+    let description = format!("xcrun {}", arguments.join(" "));
     let output = env
         .command("xcrun")
-        .ok()?
+        .with_context(|| format!("resolving {description}"))?
         .args(arguments)
         .invocation_output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|value| !value.is_empty())
+        .with_context(|| format!("running {description}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{description} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    anyhow::ensure!(
+        !value.is_empty(),
+        "{description} returned an empty SDK identity"
+    );
+    Ok(value)
 }
 
 /// Encode resolved CRT objects as a stable `name=digest` list.
@@ -3864,6 +3884,140 @@ esac
         let plist_dir = root.join("System/Library/CoreServices");
         std::fs::create_dir_all(&plist_dir).unwrap();
         std::fs::write(plist_dir.join("SystemVersion.plist"), body).unwrap();
+    }
+
+    fn sdk_invocation(root: &Path) -> InvocationEnv {
+        InvocationEnv::from_parts(
+            std::iter::empty::<(OsString, OsString)>(),
+            Some(root.to_path_buf()),
+            None,
+            root.to_path_buf(),
+        )
+    }
+
+    #[test]
+    fn sdk_metadata_success_needs_no_filesystem_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let env = sdk_invocation(directory.path());
+        let identity = sdk_identity_with_queries(None, &env, |arguments| {
+            assert_eq!(&arguments[..2], &["--sdk", "macosx"]);
+            match arguments[2] {
+                "--show-sdk-version" => Ok("14.4".into()),
+                "--show-sdk-build-version" => Ok("23E208".into()),
+                _ => panic!("successful metadata probe must not locate a fallback"),
+            }
+        })
+        .unwrap();
+        assert_eq!(identity, "14.4 (23E208)");
+    }
+
+    #[test]
+    fn sdk_fallback_locates_the_selected_default_or_named_sdk() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let selected = root.join("selected.sdk");
+        write_system_version_plist(&selected, SYSTEM_VERSION_PLIST);
+        write_system_version_plist(
+            &root.join("macosx"),
+            &SYSTEM_VERSION_PLIST.replace("14.4", "99.0"),
+        );
+        let env = sdk_invocation(root);
+        for (given, expected, fail_version) in [
+            (None, "macosx", true),
+            (Some("macosx14.4"), "macosx14.4", false),
+        ] {
+            let identity = sdk_identity_with_queries(given, &env, |arguments| {
+                assert_eq!(&arguments[..2], &["--sdk", expected]);
+                match arguments[2] {
+                    "--show-sdk-version" if !fail_version => Ok("14.4".into()),
+                    "--show-sdk-path" => Ok("selected.sdk".into()),
+                    _ => bail!("metadata unavailable"),
+                }
+            })
+            .unwrap();
+            assert_eq!(identity, "14.4 (23E208)");
+        }
+    }
+
+    #[test]
+    fn sdk_fallback_keeps_explicit_filesystem_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let selected = root.join("selected.sdk");
+        write_system_version_plist(&selected, SYSTEM_VERSION_PLIST);
+        std::fs::create_dir(root.join("invalid.sdk")).unwrap();
+        let env = sdk_invocation(root);
+        for given in ["selected.sdk", "invalid.sdk"] {
+            let result = sdk_identity_with_queries(Some(given), &env, |arguments| {
+                assert_eq!(arguments, &["--sdk", given, "--show-sdk-version"]);
+                bail!("metadata unavailable")
+            });
+            if given == "selected.sdk" {
+                assert_eq!(result.unwrap(), "14.4 (23E208)");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "an invalid explicit root must not use the default SDK"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_location_failures_preserve_metadata_errors_and_reject_non_sdks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let env = sdk_invocation(root);
+        let error = sdk_identity_with_queries(None, &env, |arguments| {
+            if arguments[2] == "--show-sdk-path" {
+                bail!("SDK path unavailable");
+            }
+            bail!("metadata unavailable")
+        })
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("metadata unavailable"));
+        assert!(message.contains("SDK path unavailable"));
+        std::fs::create_dir(root.join("invalid.sdk")).unwrap();
+        for given in ["invalid.sdk", "missing.sdk"] {
+            assert!(
+                sdk_identity_with_queries(None, &env, |arguments| {
+                    if arguments[2] == "--show-sdk-path" {
+                        return Ok(given.into());
+                    }
+                    bail!("metadata unavailable")
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_sdk_identity_survives_failed_xcrun_metadata_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let selected = root.join("selected.sdk");
+        write_system_version_plist(&selected, SYSTEM_VERSION_PLIST);
+        let tools = root.join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        kache_fs::testutil::write_executable(
+            &tools.join("xcrun"),
+            "#!/bin/sh\ncase \"$3\" in\n--show-sdk-path) printf '%s\\n' \"$SELECTED_SDK\" ;;\n*) echo 'metadata query unavailable' >&2; exit 29 ;;\nesac\n",
+        );
+        let env = InvocationEnv::from_parts(
+            [
+                ("PATH", tools.into_os_string()),
+                ("SELECTED_SDK", selected.into_os_string()),
+            ],
+            Some(root.clone()),
+            None,
+            root,
+        );
+        assert_eq!(
+            sdk_identity_for_invocation(None, &env).unwrap(),
+            Some("14.4 (23E208)".to_owned()),
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::cache_key::FileHashStats;
 use crate::compiler_store::StoreHashExt as _;
 use crate::config::Config;
 use crate::events::EventResult;
-use crate::store::{EntryMeta, Store, StorePutResult, link};
+use crate::store::{EntryMeta, Store, StorePutResult};
 use crate::wrapper::EventInputs;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +52,7 @@ pub(crate) mod declarations;
 mod hermetic;
 pub(crate) mod inputs;
 mod outside;
+mod restore;
 mod rooted_links;
 
 use rooted_links::RootedSymlink;
@@ -1611,7 +1612,8 @@ impl Run {
         for directory in &manifest.directories {
             std::fs::create_dir_all(out_dir.join(checked_relative(directory)?))?;
         }
-        let mut prepared = Vec::new();
+        let mut files = Vec::new();
+        let mut attributes = Vec::new();
         let mut texts = Vec::new();
         let mut size = 0;
         for cached in &meta.files {
@@ -1633,19 +1635,17 @@ impl Run {
                 texts.push((blob, target, cached.executable));
                 continue;
             }
-            prepared.push((
-                link::prepare_writable_target_from_file(&blob, &target)?,
-                cached.executable,
-                cached.hash.as_str(),
-                cached.size,
-            ));
+            files.push((blob, target));
+            attributes.push((cached.executable, cached.hash.as_str(), cached.size));
         }
         // Each file published here is a verbatim copy of its blob, so the
         // blob's name is its hash: memoised at the stamp the file has once
         // its mode is set, the units that read it next (a static library a
         // crate links) take the hash from the memo instead of reading it.
         let mut restored = Vec::new();
-        for (artifact, executable, hash, size) in prepared {
+        for (artifact, (executable, hash, size)) in
+            restore::prepare(&files)?.into_iter().zip(attributes)
+        {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
             set_executable(&target, executable)?;

@@ -358,11 +358,13 @@ pub(crate) fn run_rustc(
 
     // Discover output files. rustc's own `artifact` JSON notifications
     // are authoritative — when cargo invokes rustc it passes
-    // `--error-format=json --json=artifacts`, so rustc reports every
-    // file it writes by exact path. Candidate path probing is the fallback
-    // for invocations that don't emit those messages (a bare `rustc`
-    // without `--json=artifacts`), where filename guessing is the best
-    // available signal.
+    // `--error-format=json --json=artifacts`, so rustc reports the files
+    // it wrote by exact path. The linker import library beside a DLL is
+    // not in that list; `include_dll_import_libs` keeps an existing
+    // sibling. Candidate path probing is the fallback for invocations
+    // that don't emit those messages (a bare `rustc` without
+    // `--json=artifacts`), where filename guessing is the best available
+    // signal.
     let artifacts = if exit_code == 0 {
         let mut from_json = resolve_artifacts_in(&captured_stderr.artifacts, cwd);
         // rustc reports a Windows `.exe` but not the `.pdb` it names.
@@ -648,7 +650,33 @@ fn resolve_artifacts_in(artifacts: &[PathBuf], cwd: &Path) -> Vec<(PathBuf, Stri
         }
         files.push((abs, name));
     }
+    // Reported `.dll` names do not include the import library beside them.
+    include_dll_import_libs(&mut files);
     files
+}
+
+/// Linker import libraries written beside a DLL and omitted from rustc's
+/// artifact JSON.
+///
+/// The stem of `foo.dll` is `foo`, so the siblings are `foo.dll.lib`,
+/// `foo.dll.exp`, and `foo.dll.a` in the same directory. A missing file is
+/// left out. Another crate's sidecar is not a candidate: this probes those
+/// three names only, and does not scan the output directory.
+fn include_dll_import_libs(files: &mut Vec<(PathBuf, String)>) {
+    let mut extra = Vec::new();
+    for (path, name) in files.iter() {
+        let Some(stem) = name.strip_suffix(".dll") else {
+            continue;
+        };
+        for suffix in ["dll.lib", "dll.exp", "dll.a"] {
+            let sibling_name = format!("{stem}.{suffix}");
+            let sibling = path.with_file_name(&sibling_name);
+            if sibling.is_file() && !files.iter().any(|(existing, _)| existing == &sibling) {
+                extra.push((sibling, sibling_name));
+            }
+        }
+    }
+    files.extend(extra);
 }
 
 /// Product suffixes for rustc/cargo artifacts (`{base}.{suffix}`).
@@ -1753,6 +1781,89 @@ fi
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, present);
         assert_eq!(resolved[0].1, "libfoo-9a.rlib");
+    }
+
+    #[test]
+    fn json_artifact_list_includes_the_import_lib_beside_the_reported_dll() {
+        let dir = tempfile::tempdir().unwrap();
+        let dll = dir.path().join("foo.dll");
+        let import_lib = dir.path().join("foo.dll.lib");
+        let exports = dir.path().join("foo.dll.exp");
+        let gnu_import = dir.path().join("foo.dll.a");
+        let other_import = dir.path().join("bar.dll.lib");
+        let other_meta = dir.path().join("bar.rmeta");
+        for path in [
+            &dll,
+            &import_lib,
+            &exports,
+            &gnu_import,
+            &other_import,
+            &other_meta,
+        ] {
+            fs::write(path, b"artifact").unwrap();
+        }
+
+        // `bar.rmeta` is a reported non-dll. Its stem must not pick up
+        // `bar.dll.lib`, and neither does a directory scan.
+        let reported = [dll.clone(), other_meta.clone()];
+        let with_sidecars = artifact_set_from_json(&reported, dir.path());
+        assert_eq!(
+            artifact_names(&with_sidecars),
+            [
+                "bar.rmeta",
+                "foo.dll",
+                "foo.dll.a",
+                "foo.dll.exp",
+                "foo.dll.lib",
+            ]
+        );
+        assert_eq!(artifact_path(&with_sidecars, "foo.dll.lib"), import_lib);
+        assert!(
+            !with_sidecars
+                .outputs()
+                .iter()
+                .any(|artifact| artifact.path == other_import)
+        );
+
+        fs::remove_file(&import_lib).unwrap();
+        fs::remove_file(&exports).unwrap();
+        fs::remove_file(&gnu_import).unwrap();
+        let without_sidecars =
+            artifact_set_from_json(&[dll.clone(), other_meta.clone()], dir.path());
+        assert_eq!(artifact_names(&without_sidecars), ["bar.rmeta", "foo.dll"]);
+
+        // Already named in the JSON list: still one copy, not a second probe.
+        fs::write(&import_lib, b"artifact").unwrap();
+        let already_reported =
+            artifact_set_from_json(&[dll, import_lib.clone(), other_meta], dir.path());
+        assert_eq!(
+            artifact_names(&already_reported),
+            ["bar.rmeta", "foo.dll", "foo.dll.lib"]
+        );
+        assert_eq!(artifact_path(&already_reported, "foo.dll.lib"), import_lib);
+    }
+
+    fn artifact_set_from_json(reported: &[PathBuf], cwd: &Path) -> ArtifactSet {
+        ArtifactSet::from_output_files(resolve_artifacts_in(reported, cwd), classify_by_filename)
+    }
+
+    fn artifact_names(set: &ArtifactSet) -> Vec<&str> {
+        let mut names: Vec<&str> = set
+            .outputs()
+            .iter()
+            .map(|artifact| artifact.store_name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn artifact_path(set: &ArtifactSet, name: &str) -> PathBuf {
+        set.outputs()
+            .iter()
+            .find(|artifact| artifact.store_name == name)
+            .unwrap()
+            .path
+            .clone()
     }
 
     #[test]

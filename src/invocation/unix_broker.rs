@@ -76,17 +76,33 @@ impl Broker {
                 "native process request exceeds frame limit",
             ));
         }
+        let workspace = matches!(command, Command::Workspace(_));
         let exchanged = (|| -> io::Result<(Reply, Vec<OwnedFd>)> {
             channel.reader.get_mut().write_all(&frame)?;
             if let Some(contents) = contents {
                 kache_ipc::descriptors::send(channel.pipes.as_fd(), &[0; 16], &[contents.as_fd()])?;
             }
             frame.clear();
-            channel
-                .reader
-                .by_ref()
-                .take(MAX_FRAME_BYTES)
-                .read_until(b'\n', &mut frame)?;
+            let mut reply = channel.reader.by_ref().take(MAX_FRAME_BYTES);
+            loop {
+                match reply.read_until(b'\n', &mut frame) {
+                    Err(error)
+                        if workspace
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                    {
+                        // File restores can exceed a socket deadline under I/O
+                        // pressure. Keep waiting while the request is active.
+                        super::process::check()?;
+                    }
+                    result => {
+                        result?;
+                        break;
+                    }
+                }
+            }
             if frame.last() != Some(&b'\n') {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -482,6 +498,131 @@ mod tests {
         )
         .unwrap();
         (broker, client)
+    }
+
+    #[test]
+    fn slow_workspace_replies_outlive_the_native_control_deadline() {
+        let (broker, client) = pair();
+        broker
+            .channel
+            .lock()
+            .unwrap()
+            .reader
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let result = std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Workspace(_)
+                ));
+                reader.get_mut().write_all(b"{\"operation_").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = reader.get_mut().write_all(b"result\":\"done\"}\n");
+            });
+            let result = broker.done(Command::Workspace(
+                kache_protocol::execution::unix::Workspace::Permissions {
+                    path: NativeString::capture(std::ffi::OsStr::new("/tmp/slow-restore")),
+                    mode: 0o644,
+                },
+            ));
+            peer.join().unwrap();
+            result
+        });
+        result.unwrap();
+        assert_eq!(
+            broker
+                .channel
+                .lock()
+                .unwrap()
+                .reader
+                .get_ref()
+                .read_timeout()
+                .unwrap(),
+            Some(std::time::Duration::from_millis(20))
+        );
+        assert!(
+            broker
+                .done(Command::Workspace(
+                    kache_protocol::execution::unix::Workspace::Permissions {
+                        path: NativeString::capture(std::ffi::OsStr::new(
+                            "/tmp/disconnected-restore"
+                        )),
+                        mode: 0o644,
+                    },
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_control_replies_still_fail_at_their_deadline() {
+        let (broker, client) = pair();
+        broker
+            .channel
+            .lock()
+            .unwrap()
+            .reader
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Kill { id: 1 }
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            });
+            let error = broker.done(Command::Kill { id: 1 }).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ));
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn cancellation_ends_a_slow_workspace_reply() {
+        let (broker, client) = pair();
+        broker
+            .channel
+            .lock()
+            .unwrap()
+            .reader
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let cancellation = super::super::process::Cancellation::default();
+        let _scope = super::super::process::CancellationScope::borrow(Some(cancellation.clone()));
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                cancellation.cancel();
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            });
+            let error = broker
+                .done(Command::Workspace(
+                    kache_protocol::execution::unix::Workspace::Permissions {
+                        path: NativeString::capture(std::ffi::OsStr::new("/tmp/cancelled-restore")),
+                        mode: 0o644,
+                    },
+                ))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            peer.join().unwrap();
+        });
     }
 
     #[test]

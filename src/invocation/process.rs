@@ -4,25 +4,32 @@ use kache_protocol::execution::process::{Stdio as ChildIo, Stream as ChildStream
 use std::cell::RefCell;
 use std::io::{self, Read};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[cfg(windows)]
 mod windows;
 
 #[derive(Clone, Default)]
-pub(crate) struct Cancellation(Arc<Mutex<Request>>);
+pub(crate) struct Cancellation(Arc<Request>);
 
 #[derive(Default)]
 struct Request {
-    cancelled: bool,
-    children: Vec<Weak<Mutex<Running>>>,
+    cancelled: AtomicBool,
+    children: Mutex<Vec<Weak<Mutex<Running>>>>,
 }
 
 impl Cancellation {
     pub(crate) fn cancel(&self) {
-        let mut request = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        request.cancelled = true;
-        request.children.retain(|child| {
+        // A broker reply can be waiting while child shutdown needs that same
+        // broker. Publish cancellation before taking the child registry lock.
+        self.0.cancelled.store(true, Ordering::Release);
+        let mut children = self
+            .0
+            .children
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        children.retain(|child| {
             let Some(child) = child.upgrade() else {
                 return false;
             };
@@ -35,12 +42,7 @@ impl Cancellation {
     }
 
     fn check(&self) -> io::Result<()> {
-        if self
-            .0
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .cancelled
-        {
+        if self.0.cancelled.load(Ordering::Acquire) {
             Err(cancelled())
         } else {
             Ok(())
@@ -404,13 +406,20 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
     #[cfg(unix)]
     kache_ipc::jobserver::configure(command);
     let cancellation = CURRENT.with(|slot| slot.borrow().clone());
-    let mut request = cancellation
+    let mut children = cancellation.as_ref().map(|token| {
+        token
+            .0
+            .children
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    });
+    if cancellation
         .as_ref()
-        .map(|token| token.0.lock().unwrap_or_else(|poison| poison.into_inner()));
-    if request.as_ref().is_some_and(|request| request.cancelled) {
+        .is_some_and(|token| token.0.cancelled.load(Ordering::Acquire))
+    {
         return Err(cancelled());
     }
-    let controlled = force_group || request.is_some();
+    let controlled = force_group || children.is_some();
     if let Some(io) = io {
         let stream = |mode| match mode {
             ChildStream::Inherit => Stdio::inherit(),
@@ -471,9 +480,9 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
         #[cfg(windows)]
         tree,
     }));
-    if let Some(request) = request.as_mut() {
-        request.children.retain(|child| child.strong_count() != 0);
-        request.children.push(Arc::downgrade(&running));
+    if let Some(children) = children.as_mut() {
+        children.retain(|child| child.strong_count() != 0);
+        children.push(Arc::downgrade(&running));
     }
     Ok(Child {
         running,
@@ -487,6 +496,33 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checking_cancellation_does_not_wait_for_child_shutdown() {
+        let cancellation = Cancellation::default();
+        let children = cancellation.0.children.lock().unwrap();
+        std::thread::scope(|threads| {
+            let cancelling = cancellation.clone();
+            let cancel = threads.spawn(move || cancelling.cancel());
+            let checking = cancellation.clone();
+            let (ready, observed) = std::sync::mpsc::channel();
+            let checker = threads.spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while checking.check().is_ok() {
+                    if std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                ready.send(()).unwrap();
+            });
+            let result = observed.recv_timeout(std::time::Duration::from_secs(1));
+            drop(children);
+            cancel.join().unwrap();
+            checker.join().unwrap();
+            result.expect("cancellation check waited for child shutdown");
+        });
+    }
 
     #[test]
     fn cancellation_scopes_restore_after_panic_and_worker_reuse() {
@@ -532,10 +568,10 @@ mod tests {
         drop(first);
         let mut second = shell("exit 9").invocation_spawn().unwrap();
         {
-            let registered = request.0.lock().unwrap();
-            assert_eq!(registered.children.len(), 1);
+            let registered = request.0.children.lock().unwrap();
+            assert_eq!(registered.len(), 1);
             assert!(Arc::ptr_eq(
-                &registered.children[0].upgrade().unwrap(),
+                &registered[0].upgrade().unwrap(),
                 &second.running,
             ));
         }

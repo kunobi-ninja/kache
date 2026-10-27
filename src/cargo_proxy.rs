@@ -95,12 +95,31 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
 }
 
 /// Cargo reached through the `cargo` link in Kache's shim directory.
-pub(crate) fn run_shim(cargo_args: Vec<OsString>) -> Result<()> {
+pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let cargo = real_cargo_program(true)?;
+    let env = crate::invocation::InvocationEnv::capture();
+    let config =
+        crate::config::Config::load_for(&env).context("loading the cache configuration")?;
+    let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
+    let lease = crate::target_use::shared_for(
+        &config.cache_dir,
+        &what,
+        cargo_args.iter().map(OsString::as_os_str),
+    )
+    .context("protecting target directories while Cargo runs")?;
+    if let Some(status) = crate::blaze::try_run(&config, &env, shim, &cargo, &cargo_args)? {
+        drop(lease);
+        std::process::exit(crate::test_runner::finish(
+            crate::test_runner::exit_disposition(
+                status.code(),
+                crate::test_runner::signals::of(&status),
+            ),
+        ));
+    }
     let mut command = Command::new(&cargo);
     command.args(&cargo_args);
     crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
-    run_cargo_with_target_protection(command, &cargo)
+    run_cargo_guarded(command, &cargo, lease, &config)
 }
 
 fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
@@ -220,6 +239,7 @@ fn cargo_command_label<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> String 
 
 fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
     let program = std::env::var_os("KACHE_REAL_CARGO")
+        .or_else(|| crate::blaze::returning_cargo(&crate::invocation::InvocationEnv::capture()))
         .or_else(|| (!shimmed).then(|| std::env::var_os("CARGO")).flatten())
         .or_else(|| {
             crate::compiler::shim::resolve_real_compiler_from_env("cargo")

@@ -2803,6 +2803,7 @@ fn test_file_config_roundtrip() {
         paths: None,
         workspace: None,
         cache: Some(CacheFileConfig {
+            blaze: None,
             readonly_store: None,
             bypass_env: None,
             bypass_argv: None,
@@ -3459,6 +3460,7 @@ fn test_env_overrides_detect() {
 #[test]
 fn test_config_store_dir() {
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3545,6 +3547,7 @@ fn test_config_store_dir() {
 #[test]
 fn test_config_index_db_path() {
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3627,6 +3630,7 @@ fn test_config_index_db_path() {
 #[test]
 fn test_config_event_log_path() {
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3728,6 +3732,7 @@ fn test_config_socket_path() {
     let _lock = config_path_lock();
     let _env_guard = set_env_for_test("KACHE_SOCKET_PATH", None);
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -4467,6 +4472,7 @@ fn test_save_and_load_file_config() {
         paths: None,
         workspace: None,
         cache: Some(CacheFileConfig {
+            blaze: None,
             readonly_store: None,
             bypass_env: None,
             bypass_argv: None,
@@ -6069,4 +6075,34 @@ fn the_default_floor_is_ten_gib_and_the_user_file_never_a_project_one() {
     assert_eq!(user_config_path(), chosen);
     let _unset = set_env_for_test("KACHE_CONFIG", None);
     assert_eq!(user_config_path(), config_file_path());
+}
+#[test]
+fn blaze_requires_explicit_opt_in_and_honors_the_selected_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join(".kache.toml");
+    let load = |extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            (
+                "KACHE_CONFIG".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ),
+            ("KACHE_HOST_CONFIG".into(), String::new()),
+        ];
+        vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let env = InvocationEnv::from_parts(
+            vars,
+            Some(root.path().into()),
+            Some(root.path().into()),
+            root.path().into(),
+        );
+        Config::load_for(&env).unwrap().blaze
+    };
+    std::fs::write(&path, "[cache]\nunstable=true\n").unwrap();
+    assert!(!load(&[]));
+    assert!(load(&[("KACHE_BLAZE", "true")]));
+    std::fs::write(&path, "[cache]\nblaze=true\n").unwrap();
+    assert!(load(&[]));
+    assert!(!load(&[("KACHE_BLAZE", "0")]));
+    std::fs::write(&path, "[cache]\nblaze=true\nignore_env=true\n").unwrap();
+    assert!(load(&[("KACHE_BLAZE", "false")]));
 }

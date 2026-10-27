@@ -9,6 +9,19 @@ fn write_gc_stats(dir: &std::path::Path, last_run: chrono::DateTime<Utc>) {
     std::fs::write(dir.join("gc_stats.json"), persisted).unwrap();
 }
 
+#[test]
+fn a_blaze_command_is_separate_from_uncached_compiler_invocations() {
+    let mut command = BuildEvent::new_for_test("blaze", EventResult::Passthrough);
+    command.passthrough_reason = "blaze-command|Cargo command handled by Blaze".into();
+    command.elapsed_ms = 500;
+    let mut workspace = BuildEvent::new_for_test("app", EventResult::Passthrough);
+    workspace.passthrough_reason = "blaze|workspace compilation handled by Blaze".into();
+    workspace.elapsed_ms = 20;
+    assert!(!ran_compiler_uncached(&command));
+    assert!(ran_compiler_uncached(&workspace));
+    assert_eq!(uncached_compile_totals(&[command, workspace]), (1, 0, 20));
+}
+
 /// A run at exactly the cutoff is inside the window: the comparison is
 /// "older than the cutoff is excluded", not "at or older". One second
 /// either side of that instant decides it.
@@ -550,6 +563,7 @@ fn write_test_events(dir: &std::path::Path) -> Config {
         .into_owned();
 
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -1936,6 +1950,7 @@ fn test_markdown_contains_sections() {
 fn test_missing_transfer_data() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2042,6 +2057,7 @@ fn test_missing_transfer_data() {
 fn test_suggestion_high_miss_share() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2147,6 +2163,7 @@ fn test_suggestion_high_miss_share() {
 fn test_suggestion_high_hit_overhead() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2253,6 +2270,7 @@ fn test_suggestion_high_hit_overhead() {
 fn test_suggestion_network_download_failures_and_fanout() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2364,6 +2382,7 @@ fn test_suggestion_network_latency_thresholds() {
     // fixed-ratio test_transfer helper can't reach.
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2878,6 +2897,7 @@ fn render_network_and_error_sections_with_all_optional_fields() {
 fn test_empty_report() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3365,6 +3385,7 @@ fn report_counts_each_download_transfer_format() {
     // the other tests use).
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
+        blaze: false,
         readonly_store: None,
         fallback: None,
         key_salt: None,

@@ -7776,7 +7776,7 @@ fn cargo_home_dir_from(env: &CargoEnvironment, cwd: &std::path::Path) -> std::pa
 ///
 /// Cargo reads the workspace from the manifest rather than from the lockfile,
 /// so a workspace that has not been built yet still resolves.
-fn cargo_workspace_root(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(crate) fn cargo_workspace_root(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut package = None;
     for dir in cwd.ancestors() {
         let manifest = dir.join("Cargo.toml");
@@ -11440,6 +11440,12 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     }
     if cargo_ready {
         println!("  Ready for Cargo builds. Use cargo as usual.");
+        let env = crate::invocation::InvocationEnv::capture();
+        if crate::blaze::installed(&env).is_some() {
+            println!(
+                "  Blaze detected. Opt in per project: kache config set --project cache.blaze true"
+            );
+        }
     }
     if shell_pending {
         println!("  Open a new terminal to activate C/C++ caching.");

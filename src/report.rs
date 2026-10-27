@@ -1933,7 +1933,11 @@ fn uncached_compile_totals(events: &[BuildEvent]) -> (usize, usize, u64) {
 /// fallback wrapper may have served its own hit without compiling.
 pub(crate) fn ran_compiler_uncached(event: &BuildEvent) -> bool {
     match event.result {
-        EventResult::Passthrough => !event.fallback && !is_probe_passthrough(event),
+        EventResult::Passthrough => {
+            !event.fallback
+                && !is_probe_passthrough(event)
+                && !event.passthrough_reason.starts_with("blaze-command|")
+        }
         EventResult::Skipped => !event.skip_reason.is_empty(),
         _ => false,
     }

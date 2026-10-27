@@ -3814,6 +3814,7 @@ fn save_manifest_config(
         DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
     };
     Config {
+        blaze: false,
         remote_error: None,
         socket_path_override: None,
         fallback: None,

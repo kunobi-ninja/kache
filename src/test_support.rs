@@ -78,6 +78,7 @@ pub(crate) fn without_terminal(command: &mut std::process::Command) -> &mut std:
 
 pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
     crate::config::Config {
+        blaze: false,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),

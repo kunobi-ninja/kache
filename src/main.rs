@@ -3,6 +3,7 @@ mod blob_heal;
 mod build_script;
 mod build_script_inputs;
 use kache_store::atomic;
+mod blaze;
 mod build_intent;
 mod cache_fs;
 mod cache_key;
@@ -616,7 +617,7 @@ fn run_main() -> Result<()> {
     }) && std::env::var_os(platform::SELF_SPAWN_ENV).is_none()
     {
         init_logging(LogMode::Cli);
-        return cargo_proxy::run_shim(raw_args[1..].to_vec());
+        return cargo_proxy::run_shim(&raw_args[0], raw_args[1..].to_vec());
     }
     if let Some(args) = test_runner_args(&raw_args) {
         init_logging(LogMode::Wrapper);
@@ -1223,7 +1224,11 @@ fn run_workspace_wrapper_chain_for(
     let extra_inputs = wrapper::resolve_extra_inputs_for_passthrough(config, &parsed)?;
     let preserve_incremental =
         preserve_workspace_wrapper_incremental(config.preserve_incremental, extra_inputs.is_some());
-    let exit = run_compiler_directly_for(config, args, preserve_incremental, env)?;
+    let exit = if blaze::workspace_wrapper(&args[0]) {
+        blaze::run_workspace_wrapper(config, args, &parsed, env)?
+    } else {
+        run_compiler_directly_for(config, args, preserve_incremental, env)?
+    };
     if exit == 0 {
         wrapper::complete_current_extra_inputs_after_success(
             config,

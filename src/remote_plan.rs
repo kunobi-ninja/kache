@@ -66,6 +66,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            blaze: false,
             readonly_store: None,
             fallback: None,
             key_salt: None,

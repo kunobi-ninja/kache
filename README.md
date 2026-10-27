@@ -78,6 +78,35 @@ Nightly workflows measure cold and warm builds of real projects, including
 Firefox, LLVM, and SurrealDB. [Browse the benchmark reports][benchmark-guide]
 to see the workload, platform, and validation behind each result.
 
+## Optional Blaze builds
+
+For experimental local development with [Blaze](https://github.com/indexable-inc/blaze),
+install Blaze separately, run `kache init` to put the Cargo shim on your PATH,
+and opt in from the project:
+
+```sh
+kache config set --project cache.blaze true
+cargo build
+```
+
+For one command with your current config, use `KACHE_BLAZE=1 cargo build`.
+Creating a `.kache.toml` selects that project file instead of the user config,
+following Kache's existing configuration rules.
+
+Routing supports Linux and Apple silicon macOS. The setting defaults to off.
+The Cargo shim checks for Blaze's `ra-jit`
+executable on each eligible command, so installing it later needs no new
+`init`. Local `build`, `run`, `test` and `check` commands can use Blaze;
+CI, release builds, explicit profiles and `+toolchain` invocations use ordinary
+Cargo. Other subcommands and leading global options also use Cargo.
+If Blaze is missing or cannot start, Kache runs Cargo. Once Blaze
+starts, its build errors are returned without retrying them through Cargo.
+
+Blaze uses its own compiler and cache. Cargo work that returns through Kache
+can reuse compatible artifacts, including across worktrees. Results produced
+by Blaze are recorded as passthroughs, separately from Kache hits and misses.
+Blaze manages its own worker state and function cache.
+
 ## Watch a build and explain a miss
 
 ```bash

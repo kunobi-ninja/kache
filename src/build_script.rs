@@ -25,8 +25,10 @@
 //! its previous run. A script that declares nothing depends on its whole
 //! package directory, exactly as in Cargo. Serving a recorded run under those
 //! rules is no less correct than Cargo skipping the rerun, which is what it
-//! does with a warm target directory. Entries stay in the local store; they
-//! are never published to a remote.
+//! does with a warm target directory. A run is recorded in the local store
+//! and is never published to a remote. A local miss is restored from
+//! `readonly_store` when that store has the run; the read-only store is not
+//! written.
 //!
 //! The named files are the link search paths and `-L` flags in the script's
 //! stdout. A directory Cargo fills itself (`deps`, `incremental`, `build`,
@@ -532,7 +534,11 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         anyhow::bail!("kache is disabled");
     }
     let environment = Environment::capture()?;
-    let store = Store::open(&config)?;
+    let options = crate::store::StoreOptions::from_env(|name| std::env::var(name).ok());
+    let store = Store::open_with_options(&config, options.clone())?;
+    // Same directory as the local store, or unset: no second store, and the
+    // lookup below is the local one this function has always done.
+    let readonly = crate::wrapper::open_readonly_store(&config, options);
     let binary_hash = stored_binary_hash(real)?;
     let run = Run {
         config,
@@ -542,13 +548,23 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         start,
     };
 
-    let prediction = run.prediction()?;
-    if let Some(prediction) = &prediction
+    let local_prediction = run.prediction()?;
+    if let Some(prediction) = &local_prediction
         && run.config.build_script_hermetic
         && let Some(code) = hermetic::run(&run, real, argv, prediction)?
     {
         return Ok(code);
     }
+    // The action key folds the declarations stored with the run. A reader
+    // that has never run this script takes them from the read-only store,
+    // which is where the entry lives too.
+    let prediction = match local_prediction {
+        Some(prediction) => Some(prediction),
+        None => match &readonly {
+            Some(store) => stored_prediction(store, &run.identity())?,
+            None => None,
+        },
+    };
     // Everything below writes into `OUT_DIR` itself.
     detach_out_dir(&run.environment.out_dir)?;
     if let Some(prediction) = &prediction {
@@ -556,11 +572,11 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         let key = run.action_key(prediction)?;
         let key_ms = key_start.elapsed().as_millis() as u64;
         let lookup_start = std::time::Instant::now();
-        let meta = run.store.get(&key)?;
+        let found = lookup_recorded_run(&run.store, readonly.as_ref(), &key)?;
         let lookup_ms = lookup_start.elapsed().as_millis() as u64;
-        if let Some(meta) = meta {
+        if let Some((blobs, meta)) = found {
             let restore_start = std::time::Instant::now();
-            match run.restore(&meta) {
+            match run.restore_from(blobs, &meta) {
                 Ok(size) => {
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     run.log(
@@ -702,6 +718,33 @@ fn continue_after_restore_failure(error: anyhow::Error) -> Result<()> {
     }
     tracing::debug!("build-script result not restored, running it: {error:#}");
     Ok(())
+}
+
+/// The local store answers first. The read-only store is only a miss there,
+/// and it is never the store a new run is recorded into.
+fn lookup_recorded_run<'a>(
+    local: &'a Store,
+    readonly: Option<&'a Store>,
+    key: &str,
+) -> Result<Option<(&'a Store, EntryMeta)>> {
+    if let Some(meta) = local.get(key)? {
+        return Ok(Some((local, meta)));
+    }
+    let Some(readonly) = readonly else {
+        return Ok(None);
+    };
+    Ok(readonly.get(key)?.map(|meta| (readonly, meta)))
+}
+
+fn stored_prediction(store: &Store, identity: &str) -> Result<Option<Prediction>> {
+    let Some((schema, json)) = store.file_hash_cache().get_input_prediction(identity)? else {
+        return Ok(None);
+    };
+    if schema != PREDICTION_SCHEMA {
+        return Ok(None);
+    }
+    let prediction: Prediction = serde_json::from_str(&json)?;
+    Ok((prediction.version == PREDICTION_SCHEMA).then_some(prediction))
 }
 
 /// A rejected restore whose outputs could not be removed cannot fall back to
@@ -1415,18 +1458,7 @@ impl Run {
     }
 
     fn prediction(&self) -> Result<Option<Prediction>> {
-        let Some((schema, json)) = self
-            .store
-            .file_hash_cache()
-            .get_input_prediction(&self.identity())?
-        else {
-            return Ok(None);
-        };
-        if schema != PREDICTION_SCHEMA {
-            return Ok(None);
-        }
-        let prediction: Prediction = serde_json::from_str(&json)?;
-        Ok((prediction.version == PREDICTION_SCHEMA).then_some(prediction))
+        stored_prediction(&self.store, &self.identity())
     }
 
     fn record_prediction(&self, prediction: &Prediction) -> Result<()> {
@@ -1579,14 +1611,21 @@ impl Run {
         Ok(hasher.finalize().to_hex().to_string())
     }
 
+    #[cfg(test)]
     fn restore(&self, meta: &EntryMeta) -> Result<u64> {
+        self.restore_from(&self.store, meta)
+    }
+
+    /// Restore `meta` using blobs from `blobs`. Hash memos are written to this
+    /// run's own store, so a read-only source is left unchanged.
+    fn restore_from(&self, blobs: &Store, meta: &EntryMeta) -> Result<u64> {
         let manifest = meta
             .files
             .iter()
             .find(|file| file.name == MANIFEST_NAME)
             .context("recorded run has no manifest")?;
         let manifest: Manifest =
-            serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.hash))?)?;
+            serde_json::from_slice(&std::fs::read(blobs.blob_path(&manifest.hash))?)?;
         anyhow::ensure!(
             matches!(manifest.version, 1..=rooted_links::MANIFEST_VERSION),
             "unsupported build-script manifest"
@@ -1600,12 +1639,12 @@ impl Run {
         // The recorded run started from an empty OUT_DIR (see `record`), so
         // the restored state is exact only if this one does too.
         clear_directory(&self.environment.out_dir)?;
-        finish_restore(self.restore_outputs(meta, &manifest), || {
+        finish_restore(self.restore_outputs(blobs, meta, &manifest), || {
             clear_directory(&self.environment.out_dir)
         })
     }
 
-    fn restore_outputs(&self, meta: &EntryMeta, manifest: &Manifest) -> Result<u64> {
+    fn restore_outputs(&self, blobs: &Store, meta: &EntryMeta, manifest: &Manifest) -> Result<u64> {
         let rewritten: BTreeSet<&str> = manifest.rewritten.iter().map(String::as_str).collect();
         let out_dir = &self.environment.out_dir;
         for directory in &manifest.directories {
@@ -1622,7 +1661,7 @@ impl Run {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let blob = self.store.blob_path(&cached.hash);
+            let blob = blobs.blob_path(&cached.hash);
             anyhow::ensure!(
                 blob.is_file(),
                 "blob for {} was evicted before restore",
@@ -1678,7 +1717,7 @@ impl Run {
             rooted_links::restore(&self.environment, symlink)?;
         }
         rooted_links::validate_restored_relative(&self.environment, &manifest.symlinks)?;
-        size += outside::restore(&self.store, &self.environment, meta, manifest, &rewritten)?;
+        size += outside::restore(blobs, &self.environment, meta, manifest, &rewritten)?;
         replay(
             &self.environment.denormalize(manifest.stdout.as_bytes()),
             &self.environment.denormalize(manifest.stderr.as_bytes()),
@@ -6371,5 +6410,300 @@ mod tests {
             .nth(fields[2].matches("../").count())
             .unwrap();
         (fields[0].to_string(), profile.join(fields[1]))
+    }
+
+    /// Puts back the process environment this module's cache tests change.
+    #[cfg(unix)]
+    struct EnvRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    #[cfg(unix)]
+    impl EnvRestore {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        fn set(&mut self, key: &'static str, value: &std::ffi::OsStr) {
+            self.remember(key);
+            // SAFETY: the caller holds the process-state lock.
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn unset(&mut self, key: &'static str) {
+            self.remember(key);
+            // SAFETY: the caller holds the process-state lock.
+            unsafe { std::env::remove_var(key) };
+        }
+
+        fn remember(&mut self, key: &'static str) {
+            if self.saved.iter().any(|(name, _)| *name == key) {
+                return;
+            }
+            self.saved.push((key, std::env::var_os(key)));
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..).rev() {
+                // SAFETY: the process-state lock is still held; this guard is
+                // dropped before that lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn quote_path(path: &Path) -> String {
+        toml::Value::String(path.display().to_string()).to_string()
+    }
+
+    /// `readonly` of `None` writes an empty value so a host config cannot
+    /// fill one in. An empty value is the same as leaving it unset.
+    #[cfg(unix)]
+    fn write_reader_config(path: &Path, cache: &Path, readonly: Option<&Path>) {
+        let readonly = match readonly {
+            Some(dir) => format!("readonly_store = {}\n", quote_path(dir)),
+            None => "readonly_store = \"\"\n".to_string(),
+        };
+        std::fs::write(
+            path,
+            format!(
+                "[cache]\nignore_env = true\nbuild_script_hermetic = false\nlocal_store = {}\nruntime_dir = {}\n{readonly}",
+                quote_path(cache),
+                quote_path(cache),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ScriptFixture {
+        dir: tempfile::TempDir,
+        script: PathBuf,
+        package: PathBuf,
+        sentinel: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn script_fixture() -> ScriptFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        std::fs::create_dir(&package).unwrap();
+        let build_rs = package.join("build.rs");
+        std::fs::write(&build_rs, "fn main() {}\n").unwrap();
+        filetime::set_file_mtime(
+            &build_rs,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+        let script = dir.path().join("build_script_build.kache-real");
+        kache_fs::testutil::write_executable(
+            &script,
+            "#!/bin/sh\nset -e\nprintf 'from-script' > \"$OUT_DIR/marker\"\nprintf x >> \"$1\"\nprintf 'cargo:rerun-if-changed=build.rs\\n'\n",
+        );
+        let sentinel = dir.path().join("ran");
+        ScriptFixture {
+            dir,
+            script,
+            package,
+            sentinel,
+        }
+    }
+
+    #[cfg(unix)]
+    fn prepare_out(path: &Path) {
+        if path.exists() {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_reader(
+        env: &mut EnvRestore,
+        config: &Path,
+        out: &Path,
+        package: &Path,
+        script: &Path,
+        sentinel: &Path,
+    ) -> i32 {
+        env.set("KACHE_CONFIG", config.as_os_str());
+        env.set("OUT_DIR", out.as_os_str());
+        env.set("CARGO_MANIFEST_DIR", package.as_os_str());
+        env.unset("KACHE_DISABLED");
+        env.unset("KACHE_TRUST_DOMAIN");
+        run_cached(script, &[sentinel.as_os_str().to_os_string()])
+            .unwrap_or_else(|error| panic!("{error:#}"))
+    }
+
+    #[cfg(unix)]
+    fn event_results(cache: &Path) -> Vec<String> {
+        let path = cache.join("events.jsonl");
+        if !path.is_file() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|event| event["result"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn entry_metas(cache: &Path) -> Vec<(String, Vec<u8>)> {
+        let store = cache.join("store");
+        let mut found = Vec::new();
+        if !store.is_dir() {
+            return found;
+        }
+        let mut dirs: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let meta = dir.join("meta.json");
+            if meta.is_file() {
+                found.push((
+                    dir.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(meta).unwrap(),
+                ));
+            }
+        }
+        found
+    }
+
+    /// The entry is only in the read-only store. The reader restores it and
+    /// that store gains no entry.
+    #[cfg(unix)]
+    #[test]
+    fn build_script_readonly_store_restores_and_gains_no_entry() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        let host = root.join("host");
+        let job = root.join("job");
+        let host_out = root.join("host-out");
+        let job_out = root.join("job-out");
+        prepare_out(&host_out);
+        prepare_out(&job_out);
+        let host_config = root.join("host.toml");
+        let job_config = root.join("job.toml");
+        write_reader_config(&host_config, &host, None);
+        write_reader_config(&job_config, &job, Some(&host));
+
+        let code = run_reader(
+            &mut env,
+            &host_config,
+            &host_out,
+            &fixture.package,
+            &fixture.script,
+            &fixture.sentinel,
+        );
+        assert_eq!(code, 0, "{}", event_results(&host).join(","));
+        assert_eq!(
+            std::fs::read(host_out.join("marker")).unwrap(),
+            b"from-script"
+        );
+        assert_eq!(std::fs::read(&fixture.sentinel).unwrap(), b"x");
+        assert_eq!(event_results(&host), ["miss"]);
+
+        let host_store = Store::open(&Config::load().unwrap()).unwrap();
+        let entries = host_store.entry_count().unwrap();
+        assert_eq!(entries, 1);
+        let metas = entry_metas(&host);
+
+        let code = run_reader(
+            &mut env,
+            &job_config,
+            &job_out,
+            &fixture.package,
+            &fixture.script,
+            &fixture.sentinel,
+        );
+        assert_eq!(
+            code,
+            0,
+            "job {:?}; host {:?}",
+            event_results(&job),
+            event_results(&host)
+        );
+        assert_eq!(
+            std::fs::read(job_out.join("marker")).unwrap(),
+            b"from-script"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sentinel).unwrap(),
+            b"x",
+            "the script ran instead of restoring from the read-only store"
+        );
+        assert_eq!(host_store.entry_count().unwrap(), entries);
+        assert_eq!(entry_metas(&host), metas);
+        assert_eq!(event_results(&job), ["local_hit"]);
+    }
+
+    /// No read-only store is configured. A miss still records into the local
+    /// store, and the next run restores that entry instead of running again.
+    #[cfg(unix)]
+    #[test]
+    fn build_script_readonly_store_unset_still_records_locally() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        let cache = root.join("cache");
+        let out = root.join("out");
+        prepare_out(&out);
+        let config = root.join("kache.toml");
+        write_reader_config(&config, &cache, None);
+
+        let code = run_reader(
+            &mut env,
+            &config,
+            &out,
+            &fixture.package,
+            &fixture.script,
+            &fixture.sentinel,
+        );
+        assert_eq!(code, 0, "{}", event_results(&cache).join(","));
+        assert_eq!(std::fs::read(out.join("marker")).unwrap(), b"from-script");
+        assert_eq!(std::fs::read(&fixture.sentinel).unwrap(), b"x");
+        let store = Store::open(&Config::load().unwrap()).unwrap();
+        assert_eq!(
+            store.entry_count().unwrap(),
+            1,
+            "{:?}",
+            event_results(&cache)
+        );
+        assert_eq!(event_results(&cache), ["miss"]);
+
+        std::fs::remove_file(out.join("marker")).unwrap();
+        let code = run_reader(
+            &mut env,
+            &config,
+            &out,
+            &fixture.package,
+            &fixture.script,
+            &fixture.sentinel,
+        );
+        assert_eq!(code, 0, "{:?}", event_results(&cache));
+        assert_eq!(std::fs::read(out.join("marker")).unwrap(), b"from-script");
+        assert_eq!(
+            std::fs::read(&fixture.sentinel).unwrap(),
+            b"x",
+            "the recorded run was executed again"
+        );
+        assert_eq!(store.entry_count().unwrap(), 1);
+        assert_eq!(event_results(&cache), ["miss", "local_hit"]);
     }
 }

@@ -1145,7 +1145,10 @@ fn lookup_or_miss_with_clock<T>(
 /// The store named by [`Config::readonly_store`], opened read-only, or `None`
 /// when none is set, when it is this process's own store, or when it cannot be
 /// opened that way (said at warn level).
-fn open_readonly_store(config: &Config, options: crate::store::StoreOptions) -> Option<Store> {
+pub(crate) fn open_readonly_store(
+    config: &Config,
+    options: crate::store::StoreOptions,
+) -> Option<Store> {
     let dir = config.readonly_store.as_ref()?;
     if *dir == config.cache_dir {
         return None;

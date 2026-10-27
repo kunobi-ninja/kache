@@ -133,6 +133,7 @@ local_max_size = "200GiB"
 | none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size, and moves the dropped lines to `events.jsonl.archive/`, pruned at each rotation to 8 days and 512 MiB |
 | none | `cache.event_log_keep_lines` | `1000` | Minimum lines retained when the event log rotates |
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
+| `KACHE_BLAZE` | `cache.blaze` | `false` | Route eligible local Cargo commands through an installed Blaze client. See [Optional Blaze builds](#optional-blaze-builds). |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. On GitHub Actions and GitLab CI, every job except a push to a protected branch is also forced read-only, and `=0` does not turn that off. A pull request job with `pull_request_prefix` set writes under that prefix instead, unless this setting is on or the remote is OCI. See [Who may write](/docs/remote-cache/ci#who-may-write). |
 | `KACHE_DAEMON_EXECUTION_CONCURRENCY` | `cache.daemon_execution_concurrency` | automatic | Concurrent daemon pipeline requests: four per available CPU, at least 32. A positive integer overrides that default; `0` selects automatic sizing. On Unix, the daemon can lower the count to fit its open-file limit and logs the reduction. RPC and blocking-thread capacity grow with this setting. It does not change compiler scheduler permits. Restart the daemon after changing it; an installed service reads its own environment and config. |
@@ -140,6 +141,30 @@ local_max_size = "200GiB"
 | `KACHE_SCHEDULER_MEMORY_PRESSURE` | `cache.scheduler_memory_pressure` | `true` | Under memory pressure, run compiles one after another. See [Limits](/docs/how-it-works/limits). |
 
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
+
+## Optional Blaze builds
+
+Install [Blaze](https://github.com/indexable-inc/blaze) separately, run `kache init`
+to activate the Cargo shim, then opt in from the project:
+
+```sh
+kache config set --project cache.blaze true
+cargo build
+```
+
+The shim checks for `ra-jit` on each eligible command, so installing Blaze later
+needs no new `init`. Routing supports Linux and Apple silicon macOS. Local
+`build`, `run`, `test` and `check` commands can use Blaze. CI, release builds,
+explicit profiles, `+toolchain` invocations and leading global options use Cargo.
+
+Missing or unstartable Blaze falls back to Cargo. Once Blaze starts, its build
+errors are returned without retrying through Cargo. Blaze manages its own compiler
+and cache; eligible dependency compilations can still use Kache. Workspace results
+handled by Blaze appear as passthroughs, separately from Kache hits and misses.
+
+Use `KACHE_BLAZE=1 cargo build` to opt in for one command with the current config.
+Creating a `.kache.toml` selects that file instead of the user config, following
+the [config file precedence](#config-file).
 
 ## Test runner
 

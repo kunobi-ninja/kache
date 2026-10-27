@@ -114,6 +114,10 @@ futures = "0.3"
 getrandom = "0.4"
 glob = "0.3"
 libc = "0.2"
+# `#[mutants::skip]` is a no-op. cargo-mutants reads it so a body the Linux
+# lane never runs (the Win32 volume query, the macOS permit wait) is not
+# scored as a survivor.
+mutants = "0.0.4"
 memchr = "2"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
@@ -133,9 +137,6 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm"] }
 
 [target.'cfg(windows)'.dependencies]
-# `#[mutants::skip]` on the Win32 volume query. The attribute is a no-op;
-# cargo-mutants reads it so a body Linux never compiles is not a survivor.
-mutants = "0.0.4"
 # `pure` drops blake3's C SIMD (`c/blake3_neon.c` / SSE intrinsics), whose
 # arm64 NEON path doesn't cross-compile under cargo-xwin's clang + MSVC
 # sysroot. Windows-only so native/Linux/macOS keep the fast C SIMD backend.

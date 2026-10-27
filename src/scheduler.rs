@@ -7,7 +7,9 @@
 //!
 //! Lease files live under `<cache>/scheduler/`. Each admitted compile holds
 //! an OS file lock; the kernel releases it if the wrapper dies — the same
-//! invariant as [`crate::store::Store::try_lock`].
+//! invariant as [`crate::store::Store::try_lock`]. A waiter that finds those
+//! locks held sleeps until one is released, instead of scanning the pool at
+//! [`POLL_INTERVAL`].
 //!
 //! The permit pool size is [`default_pool_size`]:
 //! `std::thread::available_parallelism()`, with a floor of 1. Unmeasured
@@ -31,6 +33,7 @@
 //! is covered by the test's slots and takes none of its own; see
 //! [`lease_covers`].
 
+mod permit_wait;
 pub(crate) mod pressure;
 use anyhow::Result;
 use std::fs;
@@ -59,8 +62,8 @@ pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 /// How long a test lease waits for its marker, never longer than its wait
 /// for slots.
 const MARKER_WAIT: Duration = Duration::from_secs(1);
-/// A waiter learns of the owner's publish within this; at 10 ms a hundred
-/// polls a second is nothing, and a cargo slot is not held 100 ms for nothing.
+/// How soon a discovery flight or an empty permit scan retries. A permit
+/// scan that found a held slot sleeps in [`permit_wait`] instead.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// What [`join_discovery_flight`] found: the flight, and whether another
@@ -225,7 +228,16 @@ pub struct MissGuard {
 }
 
 struct Permit {
+    root: PathBuf,
     _slots: Vec<(u32, StoreLock)>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        // Unlock before publishing, so a waiter that wakes can take the slot.
+        self._slots.clear();
+        permit_wait::notify(&self.root);
+    }
 }
 
 struct Scheduler {
@@ -472,40 +484,56 @@ impl Scheduler {
             compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
         });
         crate::opcounts::record_permit_wait(started.elapsed());
-        slots.map(|slots| Permit { _slots: slots })
+        slots.map(|slots| Permit {
+            root: self.root.clone(),
+            _slots: slots,
+        })
     }
 
     /// Wait for `need(waited)` free slots in `range`. The need is asked again
-    /// on every poll, with `waited` false on the first: a compile's need
+    /// on every scan, with `waited` false on the first: a compile's need
     /// shrinks while tests hold slots.
+    ///
+    /// A scan that locked nothing another process is holding retries on
+    /// [`POLL_INTERVAL`]. A scan that found held slots arms a release watch
+    /// and scans once more, so an unlock during the arm is not missed, then
+    /// sleeps in [`permit_wait`].
     fn wait_for_permit(
         &self,
         range: Range<u32>,
         need: impl Fn(bool) -> u32,
     ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
-        let mut attempt = 0;
         let mut waited = false;
         loop {
             crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
-            match try_collect_slots(self, range.clone(), need(waited).max(1) as usize) {
-                Ok(Some(slots)) => return Some(slots),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::debug!(
-                        "scheduler permit lock failed ({error:#}); running without a permit"
-                    );
-                    return None;
+            let asking = need(waited).max(1) as usize;
+            match self.collect_permits(range.clone(), asking, start) {
+                WaitStep::Ready(slots) => return Some(slots),
+                WaitStep::Stop => return None,
+                WaitStep::Busy(busy) if !busy.is_empty() => {
+                    let armed = permit_wait::arm(&self.root, &busy);
+                    let seen = permit_wait::snapshot(&self.root);
+                    match self.collect_permits(range.clone(), asking, start) {
+                        WaitStep::Ready(slots) => return Some(slots),
+                        WaitStep::Stop => return None,
+                        WaitStep::Busy(_) => {
+                            let remaining = self.wait_timeout.saturating_sub(start.elapsed());
+                            permit_wait::park(
+                                &self.root,
+                                armed,
+                                seen,
+                                permit_wait::SATURATED_SLICE.min(remaining),
+                            );
+                        }
+                    }
+                }
+                WaitStep::Busy(_) => {
+                    let remaining = self.wait_timeout.saturating_sub(start.elapsed());
+                    std::thread::sleep(self.poll_interval.min(remaining));
                 }
             }
-            if start.elapsed() >= self.wait_timeout {
-                tracing::debug!("scheduler permit wait timed out; running without a permit");
-                return None;
-            }
-            let nap = crate::store::lock_poll_interval(attempt).min(self.poll_interval);
-            std::thread::sleep(nap.min(self.wait_timeout.saturating_sub(start.elapsed())));
-            attempt += 1;
             waited = true;
         }
     }
@@ -723,25 +751,86 @@ fn tests_dir(root: &Path) -> PathBuf {
     root.join("tests")
 }
 
-fn try_collect_slots(
-    scheduler: &Scheduler,
-    range: Range<u32>,
-    need: usize,
-) -> Result<Option<Vec<(u32, StoreLock)>>> {
-    let mut slots = Vec::with_capacity(need);
-    for index in range {
-        match StoreLock::try_acquire(&scheduler.permit_path(index)) {
-            Ok(Some(lock)) => {
-                slots.push((index, lock));
-                if slots.len() == need {
-                    return Ok(Some(slots));
+#[cfg(test)]
+thread_local! {
+    static PERMIT_SCANS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_permit_scan() {
+    PERMIT_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+#[inline]
+fn note_permit_scan() {}
+
+#[cfg(test)]
+fn reset_permit_scans() {
+    PERMIT_SCANS.with(|scans| scans.set(0));
+}
+
+#[cfg(test)]
+fn permit_scans() -> u32 {
+    PERMIT_SCANS.with(|scans| scans.get())
+}
+
+enum Collect {
+    Ready(Vec<(u32, StoreLock)>),
+    /// Indexes whose locks another holder already had. Slots this scan
+    /// locked and could not keep are not listed: they were released.
+    Busy(Vec<u32>),
+}
+
+enum WaitStep {
+    Ready(Vec<(u32, StoreLock)>),
+    Busy(Vec<u32>),
+    Stop,
+}
+
+impl Scheduler {
+    fn collect_permits(
+        &self,
+        range: Range<u32>,
+        need: usize,
+        start: std::time::Instant,
+    ) -> WaitStep {
+        note_permit_scan();
+        match try_collect_slots(self, range, need) {
+            Ok(Collect::Ready(slots)) => WaitStep::Ready(slots),
+            Ok(Collect::Busy(busy)) => {
+                if start.elapsed() >= self.wait_timeout {
+                    tracing::debug!("scheduler permit wait timed out; running without a permit");
+                    WaitStep::Stop
+                } else {
+                    WaitStep::Busy(busy)
                 }
             }
-            Ok(None) => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                tracing::debug!(
+                    "scheduler permit lock failed ({error:#}); running without a permit"
+                );
+                WaitStep::Stop
+            }
         }
     }
-    Ok(None)
+}
+
+fn try_collect_slots(scheduler: &Scheduler, range: Range<u32>, need: usize) -> Result<Collect> {
+    let mut slots = Vec::with_capacity(need);
+    let mut busy = Vec::new();
+    for index in range {
+        match StoreLock::try_acquire(&scheduler.permit_path(index))? {
+            Some(lock) => {
+                slots.push((index, lock));
+                if slots.len() == need {
+                    return Ok(Collect::Ready(slots));
+                }
+            }
+            None => busy.push(index),
+        }
+    }
+    Ok(Collect::Busy(busy))
 }
 
 pub(crate) fn scheduler_root(cache_dir: &Path) -> PathBuf {
@@ -2385,6 +2474,7 @@ mod tests {
         let scheduler = test_scheduler(dir.path(), 1);
         let started = std::time::Instant::now();
         let permit_wait_before = crate::opcounts::permit_wait_ms();
+        reset_permit_scans();
         let permit = scheduler.acquire_permit(1);
         assert!(
             permit.is_some(),
@@ -2398,7 +2488,147 @@ mod tests {
             crate::opcounts::permit_wait_ms() >= permit_wait_before + 50,
             "the wait must be attributed to permit_wait_ms"
         );
+        let scans = permit_scans();
+        assert!(
+            scans >= 2 && u128::from(scans) * 40 < started.elapsed().as_millis(),
+            "scanned {scans} times in {:?}; a 10 ms poll of a held slot does that many",
+            started.elapsed()
+        );
         let _ = child.wait();
+    }
+
+    #[test]
+    fn permit_pool_unblocks_when_its_holder_is_killed() {
+        let dir = temp_cache();
+        let mut child = spawn_fixture(dir.path(), "scheduler::tests::permit_owner_child_fixture");
+        wait_ready(dir.path(), &mut child);
+        let root = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let scheduler = test_scheduler(&root, 1);
+            scheduler.acquire_permit(1).is_some()
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            waiter.join().unwrap(),
+            "a killed holder must not keep the pool"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the pool must open without waiting out the permit timeout"
+        );
+    }
+
+    #[test]
+    fn an_unsatisfiable_permit_need_retries_on_the_short_poll() {
+        let dir = temp_cache();
+        let scheduler = Scheduler::open_with(
+            dir.path(),
+            1,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        reset_permit_scans();
+        let started = std::time::Instant::now();
+        assert!(scheduler.wait_for_permit(0..1, |_| 2).is_none());
+        let scans = permit_scans();
+        assert!(
+            scans >= 6,
+            "only {scans} scans in {:?}; nothing was held, so this stays on the 5 ms poll",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_saturated_permit_wait_stops_at_its_timeout() {
+        let dir = temp_cache();
+        let scheduler = Scheduler::open_with(
+            dir.path(),
+            1,
+            Duration::from_millis(80),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        let _held = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(190),
+            "stopped after {:?}; the wait slept a full slice past the timeout",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_permit_wakes_the_waiter() {
+        let dir = temp_cache();
+        let holder = test_scheduler(dir.path(), 1);
+        let permit = holder
+            .acquire_permit(1)
+            .expect("holder takes the only slot");
+        let root = dir.path().to_path_buf();
+        let waiter =
+            std::thread::spawn(move || test_scheduler(&root, 1).acquire_permit(1).is_some());
+        // Inside the wait, and early enough that a 200 ms slice is still running
+        // when the permit is dropped.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must still be blocked on the held slot"
+        );
+        let started = std::time::Instant::now();
+        drop(permit);
+        assert!(
+            waiter.join().unwrap(),
+            "the waiter must take the slot after it is released"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "woke after {:?}; releasing a permit has to interrupt the wait",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_permit_release_advances_the_wake_word() {
+        let dir = temp_cache();
+        let root = dir.path().join("scheduler");
+        fs::create_dir_all(&root).unwrap();
+        let seen = super::permit_wait::snapshot(&root);
+        super::permit_wait::notify(&root);
+        assert_eq!(super::permit_wait::snapshot(&root), seen.wrapping_add(1));
+        let started = std::time::Instant::now();
+        super::permit_wait::park(&root, None, seen, Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "parked for {:?}; the release counter did not move",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wake_mapping_is_released_with_the_permit() {
+        let dir = temp_cache();
+        let root = dir.path().join("scheduler");
+        fs::create_dir_all(&root).unwrap();
+        for _ in 0..16 {
+            super::permit_wait::notify(&root);
+        }
+        let needle = root.join("wake").display().to_string();
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let left = maps
+            .lines()
+            .filter(|line| line.contains(needle.as_str()))
+            .count();
+        assert_eq!(left, 0, "wake mappings still present:\n{maps}");
     }
 
     #[test]

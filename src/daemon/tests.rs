@@ -590,6 +590,74 @@ fn active_plan_cancel_latch_fires_once() {
 }
 
 #[test]
+fn prefetch_waits_for_candidates_before_judging_pending_demands() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    daemon.ensure_active_session(&BuildStartedRequest {
+        intent: Default::default(),
+        client_epoch: 0,
+        client_version: None,
+        session_id: "session".into(),
+    });
+
+    let mut plan = daemon.active_plan.lock().unwrap();
+    let plan = plan.as_mut().unwrap();
+    for i in 0..12 {
+        assert!(!plan.record_demand(&format!("key-{i}")));
+    }
+    assert!(!plan.cancelled);
+    assert_eq!(plan.demanded.len(), 12);
+    assert!(plan.demanded_candidates.is_empty());
+}
+
+#[test]
+fn prefetch_reclassifies_earlier_demands_when_candidates_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    daemon.ensure_active_session(&BuildStartedRequest {
+        intent: Default::default(),
+        client_epoch: 0,
+        client_version: None,
+        session_id: "session".into(),
+    });
+    {
+        let mut plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_mut().unwrap();
+        for i in 0..9 {
+            assert!(!plan.record_demand(&format!("key-{i}")));
+        }
+    }
+
+    daemon.install_plan(
+        "session",
+        "matching",
+        "fallback",
+        (0..10).map(|i| format!("key-{i}")),
+        None,
+    );
+    {
+        let mut plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_mut().unwrap();
+        assert_eq!(plan.demanded_candidates.len(), 9);
+        assert!(!plan.record_demand("key-9"));
+        assert!(!plan.cancelled);
+    }
+
+    // Replacing a matching plan must also discard its candidate-hit credit.
+    daemon.install_plan(
+        "session",
+        "unrelated",
+        "advisory",
+        ["unrelated-key".to_string()].into_iter(),
+        None,
+    );
+    let mut plan = daemon.active_plan.lock().unwrap();
+    let plan = plan.as_mut().unwrap();
+    assert!(plan.demanded_candidates.is_empty());
+    assert!(plan.record_demand("key-10"));
+}
+
+#[test]
 fn planned_candidates_upgrade_the_tracked_session_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

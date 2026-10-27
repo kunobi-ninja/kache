@@ -1519,7 +1519,9 @@ impl ActivePlan {
                 self.used.insert(key.to_string());
             }
         }
-        if self.cancelled {
+        // `none` is the placeholder installed before candidates exist. Keep the
+        // demand, but do not treat that empty plan as a reason to cancel.
+        if self.cancelled || self.plan_source == "none" {
             return false;
         }
         let downloaded_not_demanded = self
@@ -5383,6 +5385,13 @@ impl Daemon {
                 existing.plan_id = plan.plan_id;
                 existing.plan_source = plan.plan_source;
                 existing.candidates = plan.candidates;
+                // Demands recorded against the previous candidate set, including
+                // the empty placeholder, count only where they match this plan.
+                existing.demanded_candidates = existing
+                    .demanded
+                    .intersection(&existing.candidates)
+                    .cloned()
+                    .collect();
                 existing.cancelled = false;
                 existing.last_activity_ms = plan.last_activity_ms;
                 if plan.identity_key.is_some() {

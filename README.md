@@ -88,6 +88,11 @@ kache explain --all       # all recorded skips and passthroughs, by reason
 kache doctor              # check your setup
 ```
 
+Reports describe recorded builds. `Details missing` means those builds did
+not record enough information to explain a miss. Enable detailed recording
+before the next build with `kache config set cache.explain_miss true`;
+this cannot reconstruct details from earlier builds.
+
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="assets/monitor-9dd7cee8.png">
   <img src="assets/monitor-9dd7cee8.gif" alt="Kache's monitor showing builds, miss explanations, projects, and stored outputs.">

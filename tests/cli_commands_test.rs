@@ -5856,6 +5856,9 @@ fn explain_all_lists_complete_history() {
         .stdout(predicates::str::contains("store_declined"))
         .stdout(predicates::str::contains("inputs-changed"))
         .stdout(predicates::str::contains("--print cfg"))
+        .stdout(predicates::str::contains(
+            "These records describe past builds. Rebuild to check the installed version.",
+        ))
         .stdout(predicates::str::contains("retained event-log history"));
     e.cmd()
         .args(["explain", "--all", "--root", missing_root.to_str().unwrap()])

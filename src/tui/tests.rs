@@ -992,7 +992,7 @@ fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
         .map(|line| line.to_string())
         .collect();
     let text = text.join("\n");
-    assert!(text.contains("unexplained"), "{text}");
+    assert!(text.contains("miss details were not recorded"), "{text}");
     assert!(
         text.contains("no earlier compile in the loaded history"),
         "{text}"

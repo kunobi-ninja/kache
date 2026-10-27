@@ -528,6 +528,42 @@ fn input_predictions_have_last_used(db: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
+const INPUT_PREDICTIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS input_predictions (
+    identity TEXT PRIMARY KEY,
+    schema INTEGER NOT NULL,
+    crate_name TEXT,
+    prediction_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used INTEGER NOT NULL DEFAULT (unixepoch())
+);";
+
+fn input_predictions_have_current_payload(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('input_predictions')
+                       WHERE name = 'prediction_json')
+            AND EXISTS(SELECT 1 FROM pragma_table_info('input_predictions')
+                       WHERE name = 'crate_name' AND \"notnull\" = 0)",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Old indexes used `record_json` and required a crate name. Their memo
+/// payloads have no supported migration; relearn predictions from source.
+/// Compiled entries and blobs are separate tables and stay intact.
+fn ensure_input_predictions_payload(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(INPUT_PREDICTIONS_SCHEMA)?;
+    if input_predictions_have_current_payload(db)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !input_predictions_have_current_payload(&tx)? {
+        tx.execute_batch("DROP TABLE input_predictions;")?;
+        tx.execute_batch(INPUT_PREDICTIONS_SCHEMA)?;
+    }
+    tx.commit()
+}
+
 /// Add `last_used` to a table created before the column existed.
 ///
 /// The default is the migration time as a literal: SQLite refuses an
@@ -620,8 +656,8 @@ fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(sql.is_some_and(|sql| !sql.to_ascii_uppercase().contains("WITHOUT ROWID")))
 }
 
-/// Whether every rule column [`ensure_file_hash_cache_schema`] adds is
-/// present: `file_hashes.rule` and the C/C++ memo's. The index generation
+/// Whether the memo schemas are current: the rule columns and the
+/// prediction payload and retention columns. The index generation
 /// cannot vouch for them. GC in releases 0.27 to 1.0 rebuilds a rowid
 /// `file_hashes` table without `rule` and leaves the generation alone, so
 /// an index this release stamped while that GC ran keeps the stamp and
@@ -629,7 +665,10 @@ fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
 /// also stamped generation 9 before the columns existed. A memo without
 /// its column fails every read and write.
 pub(crate) fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
-    Ok(file_hashes_have_rule(db)? && crate::cc_memo::has_rule_columns(db)?)
+    Ok(file_hashes_have_rule(db)?
+        && crate::cc_memo::has_rule_columns(db)?
+        && input_predictions_have_current_payload(db)?
+        && input_predictions_have_last_used(db)?)
 }
 
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
@@ -640,16 +679,9 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS file_hashes ({FILE_HASHES_COLUMNS}) WITHOUT ROWID;"
     ))?;
+    ensure_input_predictions_payload(db)?;
     db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS input_predictions (
-            identity        TEXT PRIMARY KEY,
-            schema          INTEGER NOT NULL,
-            crate_name      TEXT,
-            prediction_json TEXT NOT NULL,
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-            last_used       INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        CREATE TABLE IF NOT EXISTS source_env_dep_uses (
+        "CREATE TABLE IF NOT EXISTS source_env_dep_uses (
             content_hash TEXT NOT NULL,
             env_var      TEXT NOT NULL,
             scanner      INTEGER NOT NULL,
@@ -1764,6 +1796,47 @@ mod tests {
         let cache = FileHashCache::open(&db_path).unwrap();
         assert_eq!(prediction_last_used(&cache, "old-a"), 1_700_000_000);
         assert_eq!(prediction_last_used(&cache, "old-b"), 1_700_000_000);
+    }
+
+    #[test]
+    fn legacy_payload_upgrade_survives_concurrent_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Connection::open(&db_path).unwrap();
+        db.pragma_update(None, "journal_mode", "WAL").unwrap();
+        db.execute_batch(
+            "CREATE TABLE input_predictions (
+                identity TEXT PRIMARY KEY, schema INTEGER NOT NULL,
+                crate_name TEXT NOT NULL, record_json TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(db);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = Connection::open(&db_path).unwrap();
+                    db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    ensure_input_predictions_payload(&db).unwrap();
+                    let cache = FileHashCache::Borrowed(&db);
+                    cache
+                        .put_input_prediction("new", 2, None, "current")
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let cache = FileHashCache::open(&db_path).unwrap();
+        assert_eq!(
+            cache.get_input_prediction("new").unwrap(),
+            Some((2, "current".into()))
+        );
     }
 
     #[test]

@@ -439,7 +439,7 @@ impl Cause {
                 groups.join(", ")
             ),
             Cause::NoHistory => "no earlier compile in the loaded history".to_string(),
-            Cause::Unexplained => "unexplained (no key diff recorded)".to_string(),
+            Cause::Unexplained => "miss details were not recorded".to_string(),
         }
     }
 
@@ -659,6 +659,12 @@ pub(crate) fn passthrough_parts(reason: &str) -> (&str, &str) {
 /// reason that has no kind.
 pub(crate) fn passthrough_words(reason: &str) -> String {
     let (kind, detail) = passthrough_parts(reason);
+    let detail =
+        if detail.starts_with("build-script cache bypassed: no such column: prediction_json in ") {
+            "build-script cache bypassed: incompatible prediction metadata in the cache index"
+        } else {
+            detail
+        };
     if kind.is_empty() {
         crate::report::uncached_reason_words(detail)
     } else {

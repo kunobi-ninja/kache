@@ -1,6 +1,77 @@
 mod cost_backfill_tests;
 
 #[test]
+fn incompatible_predictions_are_relearned_without_removing_compiled_entries() {
+    for generation in [11, INDEX_SCHEMA_GENERATION] {
+        for payload in ["record_json", "prediction_json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("index.db");
+            let db = open_index_db(&path).unwrap();
+            db.execute_batch(&format!(
+                "INSERT INTO entries (cache_key, crate_name, size) VALUES ('kept', 'compiled', 123);
+                 DROP TABLE input_predictions;
+                 CREATE TABLE input_predictions (
+                    identity TEXT PRIMARY KEY,
+                    schema INTEGER NOT NULL,
+                    crate_name TEXT NOT NULL,
+                    {payload} TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_used INTEGER NOT NULL DEFAULT 1789842208
+                 );
+                 INSERT INTO input_predictions (identity, schema, crate_name, {payload})
+                 VALUES ('legacy', 2, 'old', 'unsupported-payload');"
+            ))
+            .unwrap();
+            db.pragma_update(None, "user_version", generation).unwrap();
+            drop(db);
+
+            let db = open_index_db(&path).unwrap();
+            let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+            assert_eq!(cache.get_input_prediction("legacy").unwrap(), None);
+            cache
+                .put_input_prediction("new", 2, None, "current")
+                .unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT crate_name, size FROM entries WHERE cache_key='kept'",
+                    [],
+                    |r| { Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)) }
+                )
+                .unwrap(),
+                ("compiled".into(), 123)
+            );
+            drop(db);
+
+            let db = open_index_db(&path).unwrap();
+            let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+            assert_eq!(
+                cache.get_input_prediction("new").unwrap(),
+                Some((2, "current".into()))
+            );
+        }
+    }
+}
+
+#[test]
+fn current_generation_still_repairs_missing_prediction_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch("ALTER TABLE input_predictions DROP COLUMN last_used;")
+        .unwrap();
+    drop(db);
+    let db = open_index_db(&path).unwrap();
+    let cache = crate::file_hash::FileHashCache::Borrowed(&db);
+    cache
+        .put_input_prediction("new", 2, None, "current")
+        .unwrap();
+    assert_eq!(
+        cache.get_input_prediction("new").unwrap(),
+        Some((2, "current".into()))
+    );
+}
+
+#[test]
 fn lock_polls_back_off_from_a_millisecond_to_the_interval() {
     let naps: Vec<u64> = (0..10)
         .map(|attempt| lock_poll_interval(attempt).as_millis() as u64)

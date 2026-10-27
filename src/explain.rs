@@ -64,10 +64,10 @@ pub(crate) fn fix(cause: &Cause, max_size: u64) -> String {
         }
         Cause::OtherCheckout { groups, .. } => checkout_fix(groups),
         Cause::NoHistory => {
-            "first build of these crates in this tree; the next build can reuse them".to_string()
+            "no earlier compile was retained; later builds can reuse a stored result".to_string()
         }
         Cause::Unexplained => {
-            "nothing recorded why; `[cache] explain_miss = true` records it from the next build"
+            "`kache config set cache.explain_miss true` records details for future builds; earlier details cannot be reconstructed"
                 .to_string()
         }
     }
@@ -154,6 +154,10 @@ pub(crate) fn render(
         "kache · explain · latest build of {}",
         term::home_path(Path::new(&latest.root))
     ))];
+    lines.push(format!(
+        "Recorded build: {}",
+        latest.last_activity.to_rfc3339()
+    ));
     lines.push(String::new());
 
     let misses = analysis.misses_total;
@@ -171,9 +175,9 @@ pub(crate) fn render(
             },
         ),
     )];
-    if misses > 0 {
+    if unexplained > 0 {
         rows.push((
-            "Unexplained",
+            "Details missing",
             term::percent(percent(unexplained, misses)),
             String::new(),
         ));
@@ -246,11 +250,7 @@ pub(crate) fn render(
             .map(|group| {
                 vec![
                     term::count(group.count as u64),
-                    if group.kind.is_empty() {
-                        crate::report::uncached_reason_words(&group.reason)
-                    } else {
-                        format!("{}: {}", group.kind, group.reason)
-                    },
+                    tui_sessions::passthrough_words(&format!("{}|{}", group.kind, group.reason)),
                 ]
             })
             .collect();
@@ -377,6 +377,9 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
         term::count(body.skipped as u64),
         term::count(body.probes as u64),
     ));
+    lines.push(
+        "These records describe past builds. Rebuild to check the installed version.".to_string(),
+    );
     if body.entries.is_empty() {
         lines.push("No skips or passthroughs recorded in this scope.".to_string());
         return lines;
@@ -471,6 +474,7 @@ pub(crate) struct KeepsMissing {
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct Body {
     pub root: String,
+    pub recorded_at: String,
     pub misses: usize,
     pub earlier_misses: Option<usize>,
     pub unexplained: usize,
@@ -494,6 +498,7 @@ pub(crate) fn json_body(
     });
     Body {
         root: builds.latest.root.clone(),
+        recorded_at: builds.latest.last_activity.to_rfc3339(),
         misses: analysis.misses_total,
         earlier_misses: builds
             .earlier
@@ -595,7 +600,7 @@ mod tests {
             ),
             "its source files changed, an environment variable it reads changed; `kache explain <crate>` names the exact input"
         );
-        assert!(fix(&Cause::NoHistory, max).starts_with("first build"));
+        assert!(fix(&Cause::NoHistory, max).starts_with("no earlier compile was retained"));
         let checkout = |groups: &[&str]| {
             fix(
                 &Cause::OtherCheckout {
@@ -677,10 +682,10 @@ mod tests {
         let text = lines.join("\n");
         assert_eq!(lines[0], "kache · explain · latest build of /w");
         assert!(
-            text.contains("  Misses        2   1 in the build before"),
+            text.contains("  Misses   2   1 in the build before"),
             "{text}"
         );
-        assert!(text.contains("  Unexplained   0.0%"), "{text}");
+        assert!(!text.contains("Details missing"), "{text}");
         let costly = lines.iter().position(|l| l.contains("costly")).unwrap();
         let cheap = lines.iter().position(|l| l.contains("cheap")).unwrap();
         assert!(costly < cheap, "costliest first: {text}");
@@ -742,7 +747,7 @@ mod tests {
         let analysis = tui_sessions::analyze_session(&events, builds.latest, &all);
         let text = render(&builds, &analysis, &events, 1 << 30).join("\n");
         assert!(text.contains("no earlier build of this tree"), "{text}");
-        assert!(!text.contains("Unexplained"), "{text}");
+        assert!(!text.contains("Details missing"), "{text}");
         assert!(!text.contains("Why it missed"), "{text}");
         assert!(text.ends_with("the build's timeline: `kache stats --format trace -o trace.json`"));
         assert_eq!(percent(1, 4), 25.0);
@@ -757,6 +762,49 @@ mod tests {
             render(&builds, &analysis, events, 1 << 30),
             json_body(&builds, &analysis, events, 1 << 30),
         )
+    }
+
+    #[test]
+    fn missing_details_are_a_recording_gap_and_historical_errors_remain_in_json() {
+        let mut bypass = ev("build_script_run", EventResult::Passthrough, "s2", 22, "");
+        let sql_error = "build-script cache bypassed: no such column: prediction_json in SELECT schema, prediction_json, last_used FROM input_predictions WHERE identity = ?1 at offset 15";
+        bypass.passthrough_reason = format!("refused|{sql_error}");
+        let events = vec![
+            ev("a", EventResult::Miss, "s1", 1, "old"),
+            ev("a", EventResult::Miss, "s2", 21, "new"),
+            bypass,
+        ];
+        let (lines, body) = report(&events);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("Recorded build: 2023-11-14T22:13:42+00:00"),
+            "{text}"
+        );
+        assert!(text.contains("Details missing"), "{text}");
+        assert!(text.contains("miss details were not recorded"), "{text}");
+        assert!(
+            text.contains("earlier details cannot be reconstructed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("kache config set cache.explain_miss true"),
+            "{text}"
+        );
+        assert!(
+            text.contains("incompatible prediction metadata in the cache index"),
+            "{text}"
+        );
+        assert!(!text.contains("SELECT"), "{text}");
+        assert_eq!(body.recorded_at, "2023-11-14T22:13:42+00:00");
+        assert_eq!(body.unexplained, 1);
+        assert!(!body.causes[0].failure);
+        assert_eq!(body.not_cached[0].reason, sql_error);
+        assert_eq!(
+            tui_sessions::passthrough_words(
+                "refused|build-script cache bypassed: no such column: other in SELECT other"
+            ),
+            "refused: build-script cache bypassed: no such column: other in SELECT other"
+        );
     }
 
     #[test]

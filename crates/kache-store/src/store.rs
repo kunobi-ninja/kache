@@ -1879,7 +1879,9 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// 11: `cc_header_scans` (#1638 added the table without a bump, so an index
 ///    already at 10 never gained it, and every C/C++ preprocess memo read,
 ///    which joins it, failed there).
-const INDEX_SCHEMA_GENERATION: i64 = 11;
+/// 12: replace incompatible `record_json` prediction memos with the current
+///    payload schema. Compiled cache entries are retained.
+const INDEX_SCHEMA_GENERATION: i64 = 12;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's

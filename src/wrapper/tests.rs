@@ -3393,6 +3393,126 @@ fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
     );
 }
 
+/// A `0600` dep-info snapshot is published as `0400`, which another user of a
+/// shared store cannot read. Staging at `0644` is what makes the blob `0444`.
+#[cfg(unix)]
+#[test]
+fn stored_dep_info_blobs_are_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn blob_mode(store: &Store, key: &str, name: &str) -> u32 {
+        let meta = store.get(key).unwrap().expect("entry stored");
+        let file = meta
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .unwrap_or_else(|| panic!("missing stored {name}"));
+        std::fs::metadata(store.blob_path(&file.hash))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&test_config(dir.path().join("cache"))).unwrap();
+
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    let depfile = target.join("debug/deps/foo.d");
+    std::fs::create_dir_all(depfile.parent().unwrap()).unwrap();
+    std::fs::write(
+        &depfile,
+        format!(
+            "{}/libfoo.rlib: {}/src/lib.rs\n",
+            target.display(),
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
+        path: depfile,
+        store_name: "foo.d".to_string(),
+        kind: ArtifactKind::DepInfo,
+        required: true,
+    }]);
+    let temp = dir.path().join("tmp");
+    std::fs::create_dir_all(&temp).unwrap();
+    let prepared = prepare_rustc_store_files_for(
+        &outputs,
+        Some(&target),
+        &workspace,
+        Some(&workspace),
+        &[],
+        &temp,
+    )
+    .unwrap();
+    store
+        .put(
+            "rustc-depinfo-mode",
+            "foo",
+            &["lib".into()],
+            &[],
+            "host",
+            "dev",
+            &prepared.files,
+            "",
+            "",
+        )
+        .unwrap();
+    assert_eq!(
+        blob_mode(&store, "rustc-depinfo-mode", "foo.d"),
+        0o444,
+        "rustc dep-info"
+    );
+
+    let object = dir.path().join("foo.o");
+    let depinfo = dir.path().join("foo.d");
+    std::fs::write(&object, b"object").unwrap();
+    std::fs::write(
+        &depinfo,
+        format!(
+            "{}/foo.o: {}/foo.c\n",
+            dir.path().display(),
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let artifacts = ArtifactSet::new(vec![
+        crate::compiler::Artifact {
+            path: object,
+            store_name: "foo.o".to_string(),
+            kind: ArtifactKind::Object,
+            required: true,
+        },
+        crate::compiler::Artifact {
+            path: depinfo,
+            store_name: "foo.d".to_string(),
+            kind: ArtifactKind::DepInfo,
+            required: true,
+        },
+    ]);
+    let prepared = prepare_cc_store_files(&artifacts, Some(dir.path())).unwrap();
+    store
+        .put(
+            "cc-depinfo-mode",
+            "foo.c",
+            &[],
+            &[],
+            "host",
+            "dev",
+            &prepared.files,
+            "",
+            "",
+        )
+        .unwrap();
+    assert_eq!(
+        blob_mode(&store, "cc-depinfo-mode", "foo.d"),
+        0o444,
+        "cc dep-info"
+    );
+}
+
 /// Any staging failure skips cache publication without changing an output
 /// that was already read successfully.
 #[test]

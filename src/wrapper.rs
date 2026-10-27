@@ -5415,6 +5415,22 @@ fn prepare_cc_store_files_for(
     prepare_cc_store_files_in(artifacts, depinfo_anchor, None, &[], env.temp_dir())
 }
 
+/// Tempfiles are created mode `0600`. Publishing only clears write bits, so a
+/// dep-info snapshot would be stored `0400` and another user of a shared store
+/// could not read it. `0644` becomes the `0444` of every other non-executable
+/// blob. Other staged files keep the mode copied from the compiler output.
+fn set_depinfo_staging_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("setting dep-info staging mode on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Prepare snapshots in `staging_dir` when one
 /// is given: a hand-off then links them into place instead of copying the
 /// object a second time. An unusable directory falls back to the system
@@ -5464,6 +5480,7 @@ fn prepare_cc_store_files_in(
             );
             std::fs::write(&staged, normalized.as_bytes())
                 .context("cc store: writing normalized dep-info staging file")?;
+            set_depinfo_staging_mode(&staged).context("cc store: setting dep-info staging mode")?;
         } else if artifact.kind == ArtifactKind::DebugBundle
             && std::fs::metadata(&artifact.path).is_ok_and(|meta| meta.is_dir())
         {
@@ -5574,6 +5591,8 @@ fn prepare_rustc_store_files_for(
         staged
             .flush()
             .context("rustc store: flushing private artifact staging file")?;
+        set_depinfo_staging_mode(staged.path())
+            .context("rustc store: setting dep-info staging mode")?;
         let staged = staged.into_temp_path();
         files.push((staged.to_path_buf(), artifact.store_name.clone()));
         temporary_files.push(staged);

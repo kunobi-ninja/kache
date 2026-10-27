@@ -218,6 +218,9 @@ mod linux {
                 .read(true)
                 .write(true)
                 .create(true)
+                // The counter has to survive the next open. Truncating it
+                // would drop a wake that landed between two waits.
+                .truncate(false)
                 .open(root.join("wake"))
                 .ok()?;
             if file.metadata().ok()?.len() < 4 {

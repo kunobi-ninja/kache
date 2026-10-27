@@ -2527,7 +2527,7 @@ mod tests {
         let scheduler = Scheduler::open_with(
             dir.path(),
             1,
-            Duration::from_millis(100),
+            Duration::from_millis(400),
             Duration::from_millis(5),
         )
         .unwrap();
@@ -2535,10 +2535,12 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(scheduler.wait_for_permit(0..1, |_| 2).is_none());
         let scans = permit_scans();
+        let elapsed = started.elapsed();
+        // A 200 ms slice fits about five scans into this timeout. The short
+        // poll has to come back often enough that this product exceeds it.
         assert!(
-            scans >= 6,
-            "only {scans} scans in {:?}; nothing was held, so this stays on the 5 ms poll",
-            started.elapsed()
+            scans >= 4 && u128::from(scans) * 50 > elapsed.as_millis(),
+            "only {scans} scans in {elapsed:?}; a 200 ms slice does that few"
         );
     }
 

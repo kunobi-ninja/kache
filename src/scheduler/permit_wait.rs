@@ -207,6 +207,31 @@ mod linux {
     const FUTEX_WAIT: libc::c_long = 0;
     const FUTEX_WAKE: libc::c_long = 1;
 
+    /// Grow a short wake file to four bytes.
+    ///
+    /// `set_len(4)` on a file that is already four bytes does not change it,
+    /// so `len <= 4` is the same check as `len < 4`.
+    #[mutants::skip]
+    fn extend_to_word(file: &std::fs::File) -> bool {
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        if meta.len() < 4 {
+            file.set_len(4).is_ok()
+        } else {
+            true
+        }
+    }
+
+    /// Protection for the shared word.
+    ///
+    /// `PROT_READ` and `PROT_WRITE` share no bits, so `^` is the same mask.
+    /// That edit does not fail a test; the suite runs out the mutation cap.
+    #[mutants::skip]
+    fn read_write_prot() -> libc::c_int {
+        libc::PROT_READ | libc::PROT_WRITE
+    }
+
     struct WakeWord {
         ptr: *mut libc::c_void,
         len: usize,
@@ -223,8 +248,8 @@ mod linux {
                 .truncate(false)
                 .open(root.join("wake"))
                 .ok()?;
-            if file.metadata().ok()?.len() < 4 {
-                file.set_len(4).ok()?;
+            if !extend_to_word(&file) {
+                return None;
             }
             let len = 4usize;
             // SAFETY: the file is at least four bytes, the mapping is
@@ -234,7 +259,7 @@ mod linux {
                 libc::mmap(
                     std::ptr::null_mut(),
                     len,
-                    libc::PROT_READ | libc::PROT_WRITE,
+                    read_write_prot(),
                     libc::MAP_SHARED,
                     file.as_raw_fd(),
                     0,

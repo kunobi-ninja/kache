@@ -15909,7 +15909,7 @@ fn a_units_headers_come_from_one_memo_lookup_once_settled() {
             first
                 .recent_hashes
                 .borrow()
-                .contains_key(absolute_path(path).as_os_str())
+                .contains_key(&absolute_path(path))
         );
     }
     first.flush_memo_as_if_settled();
@@ -19797,5 +19797,74 @@ fn custom_target_full_keys_keep_the_pdb_admission_namespace() {
     assert!(
         !has_namespace("x86_64-unknown-linux-gnu", None),
         "a known non-Windows built-in target keeps its previous namespace"
+    );
+}
+
+#[test]
+fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let crate_dir = dir.path().join("crate");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    std::fs::write(out.join("consts.rs"), "pub const N: u32 = 42;\n").unwrap();
+    std::fs::write(crate_dir.join("src/init.js"), "export {}\n").unwrap();
+
+    let env = client_invocation(&crate_dir, &[("OUT_DIR", Some(out.as_os_str()))]);
+    let hasher = FileHasher::new_for(&env);
+    let plain = out.join("consts.rs");
+    let dotted = PathBuf::from(format!("{}/./consts.rs", out.display()));
+    let collapsed = lexically_resolve_path(&plain.to_string_lossy());
+    // Hash the dotted spelling first and read the fingerprint before the plain
+    // spelling can overwrite the one map entry.
+    let dotted_hash = hasher.hash(&dotted).unwrap();
+    {
+        let recent = hasher.recent_hashes.borrow();
+        assert_eq!(recent.len(), 1, "the dotted spelling is one OUT_DIR file");
+        let recorded = recent.get(Path::new(&collapsed)).expect("collapsed key");
+        let fingerprint = recorded.fingerprint.as_ref().unwrap();
+        assert_eq!(fingerprint.path, collapsed);
+        assert!(!fingerprint.path.contains("/./"));
+    }
+    let plain_hash = hasher.hash(&plain).unwrap();
+    assert_eq!(dotted_hash, plain_hash);
+    {
+        let recent = hasher.recent_hashes.borrow();
+        assert_eq!(recent.len(), 1, "both spellings stay one OUT_DIR file");
+        let fingerprint = recent
+            .get(Path::new(&collapsed))
+            .expect("collapsed key")
+            .fingerprint
+            .as_ref()
+            .unwrap();
+        assert_eq!(fingerprint.path, collapsed);
+    }
+
+    #[cfg(unix)]
+    {
+        let literal = out.join(r"a\b.rs");
+        std::fs::write(&literal, "pub const M: u32 = 1;\n").unwrap();
+        hasher.hash(&literal).unwrap();
+        let recent = hasher.recent_hashes.borrow();
+        assert!(
+            recent.values().any(|row| {
+                row.fingerprint
+                    .as_ref()
+                    .is_some_and(|fp| fp.path.contains(r"a\b.rs"))
+            }),
+            "a Unix backslash under OUT_DIR stays part of the filename"
+        );
+    }
+
+    hasher.hash(Path::new("src/./init.js")).unwrap();
+    let recent = hasher.recent_hashes.borrow();
+    assert_eq!(recent.len(), if cfg!(unix) { 3 } else { 2 });
+    assert!(
+        recent.values().any(|row| {
+            row.fingerprint
+                .as_ref()
+                .is_some_and(|fp| fp.path.contains("src/./init.js"))
+        }),
+        "a crate-relative dotted spelling stays as rustc recorded it"
     );
 }

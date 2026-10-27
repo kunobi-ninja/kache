@@ -8,7 +8,7 @@ pub(crate) use kache_store::file_hash::*;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::key_env::KeyEnv;
@@ -4390,6 +4390,32 @@ fn lexically_resolve_path(input: &str) -> String {
     }
 }
 
+/// Collapse `.`, `..`, and repeated separators without asking the filesystem.
+/// Components follow the platform: on Unix `\` is a filename character, so
+/// `a\b.rs` stays one file. `..` that would climb past the root is dropped.
+fn collapse_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut collapsed = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    collapsed.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    collapsed.pop();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                collapsed.push(component.as_os_str());
+            }
+        }
+    }
+    collapsed
+}
+
 /// Resolve a `-l` spec to a `static` archive in one of `search_dirs` and
 /// return `(path, content_hash)`, or `None` when it is not a `static` kind, no
 /// candidate is found, or the unit neither links (`links`) nor bundles it
@@ -7407,7 +7433,7 @@ pub struct FileHasher<'db> {
     prediction_flight_dir: Option<PathBuf>,
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
-    recent_hashes: RefCell<HashMap<OsString, RecentHash>>, // Match raw fingerprint paths.
+    recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
@@ -7677,10 +7703,37 @@ impl<'db> FileHasher<'db> {
     }
 
     fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
-        self.invocation_env
+        let resolved = self
+            .invocation_env
             .resolve(path)
             .filter(|path| path.is_absolute())
-            .context("relative input requires the invocation working directory")
+            .context("relative input requires the invocation working directory")?;
+        Ok(self.collapse_out_dir_spelling(resolved))
+    }
+
+    /// One stored path for every spelling of a file under this invocation's
+    /// `OUT_DIR`. `Path` already equates `/out/./file` with `/out/file`, so the
+    /// recent-hash map has one entry and its fingerprint string is whichever
+    /// spelling was hashed. A later relocate then misses the other spelling.
+    /// Collapse `.`, `..`, and repeated separators by path component, and only
+    /// when the result is still under `OUT_DIR`. On Unix a backslash stays
+    /// part of the filename. A crate-relative `src/./init.js` is outside that
+    /// directory and stays spelled as rustc recorded it. This does not resolve
+    /// symlinks.
+    fn collapse_out_dir_spelling(&self, path: PathBuf) -> PathBuf {
+        let Some(out_dir) = self.invocation_env.var_os("OUT_DIR") else {
+            return path;
+        };
+        let Some(out_dir) = self.invocation_env.resolve(Path::new(&out_dir)) else {
+            return path;
+        };
+        let collapsed = collapse_lexical(&path);
+        let out = collapse_lexical(&out_dir);
+        if collapsed.starts_with(&out) {
+            collapsed
+        } else {
+            path
+        }
     }
 
     /// Let key computation derive its input set from a recorded closure
@@ -7826,7 +7879,7 @@ impl<'db> FileHasher<'db> {
         distinct.into_iter().any(|keyed| {
             let path = Path::new(&keyed.path);
             let holds_hashed_bytes = || {
-                recent.get(path.as_os_str()).is_some_and(|hashed| {
+                recent.get(path).is_some_and(|hashed| {
                     hashed.fingerprint.as_ref() == Some(keyed)
                         && hash_file(path).is_ok_and(|bytes| bytes == hashed.hash)
                 })
@@ -8123,7 +8176,7 @@ impl<'db> FileHasher<'db> {
                 // any input the key hashed.
                 self.guard_input(&current);
                 self.recent_hashes.borrow_mut().insert(
-                    resolved.clone().into_os_string(),
+                    resolved.clone(),
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
@@ -8286,7 +8339,7 @@ impl<'db> FileHasher<'db> {
             let selected = {
                 let resolved = self.resolve_path(path)?;
                 let recent = self.recent_hashes.borrow();
-                recent.get(resolved.as_os_str()).and_then(|recent| {
+                recent.get(&resolved).and_then(|recent| {
                     recent
                         .fingerprint
                         .as_ref()
@@ -8528,7 +8581,7 @@ impl<'db> FileHasher<'db> {
         };
         self.recent_hashes
             .borrow_mut()
-            .insert(resolved.into_os_string(), recent.clone());
+            .insert(resolved, recent.clone());
         Ok(recent)
     }
 
@@ -8566,7 +8619,7 @@ impl<'db> FileHasher<'db> {
         let (observed, _) = self.restat_after_read(path, before, true);
         self.guard_input(&observed);
         self.recent_hashes.borrow_mut().insert(
-            resolved.into_os_string(),
+            resolved,
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
@@ -8806,7 +8859,7 @@ impl<'db> FileHasher<'db> {
     /// construction can reuse them without opening the source again (#557).
     fn env_dep_use(&self, path: &Path, var: &str) -> Result<SourceEnvDepUse> {
         let path = self.resolve_path(path)?;
-        let recent = self.recent_hashes.borrow().get(path.as_os_str()).cloned();
+        let recent = self.recent_hashes.borrow().get(&path).cloned();
         let recent = match recent {
             Some(recent) => recent,
             None => self.hash_and_record(&path)?,
@@ -9066,7 +9119,7 @@ impl<'db> FileHasher<'db> {
         };
         self.guard_input(&reported);
         self.recent_hashes.borrow_mut().insert(
-            resolved.clone().into_os_string(),
+            resolved.clone(),
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),

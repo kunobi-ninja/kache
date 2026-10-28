@@ -5248,12 +5248,25 @@ fn push_cwd_source_roots(
         // relocate (kunobi-ninja/kache#304, #394). Fall back to `<CC_SOURCE>`
         // only when there is no usable shared root, so a sibling source's
         // absolute path still cannot leak into the key.
+        //
+        // Do not anchor that fallback at `source_parent` when the parent is
+        // nested under the filesystem root (`/obj` + `/src/base/location.cc`).
+        // Mapping `/src/base` drops every directory below the first and
+        // `__FILE__` becomes `<CC_SOURCE>/location.cc`, which fails Chromium's
+        // `base/location.cc` assert (kunobi-ninja/kache#1755). A configured
+        // base dir of `/src` does not win either: the more specific parent map
+        // is applied last. Anchor at the root plus the source's first normal
+        // component (`/src`, or `C:\src` with the Windows prefix kept) so the
+        // relative path below it survives. A file whose parent is already that
+        // anchor (`/src/foo.c`) still maps the anchor. Never map the bare root.
         match common {
             Some(common) if has_normal_component(&common) => {
                 roots.push((common, CC_ROOT_SENTINEL));
             }
             _ => {
-                roots.push((source_parent.to_path_buf(), CC_SOURCE_SENTINEL));
+                if let Some(anchor) = cc_source_anchor(source_parent) {
+                    roots.push((anchor.to_path_buf(), CC_SOURCE_SENTINEL));
+                }
             }
         }
     }
@@ -5265,6 +5278,19 @@ fn push_cwd_source_roots(
 fn has_normal_component(path: &Path) -> bool {
     path.components()
         .any(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// The filesystem root plus `source_parent`'s first normal component.
+///
+/// `/src/base` is `/src`. A Windows path keeps its prefix (`C:\src\base` is
+/// `C:\src`; a UNC path keeps the server and share). `None` when
+/// `source_parent` is itself a bare root, so that root is never a map source.
+/// Lexical only: the caller passes the absolute parent it already computed.
+fn cc_source_anchor(source_parent: &Path) -> Option<&Path> {
+    source_parent
+        .ancestors()
+        .take_while(|path| has_normal_component(path))
+        .last()
 }
 
 fn prefix_maps_from_roots<I>(roots: I) -> Vec<CcPrefixMap>

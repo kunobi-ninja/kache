@@ -5029,12 +5029,14 @@ fn run_parsed_rustc(
 
     // Store-time debug bundle (kunobi-ninja/kache#319): a macOS `-g`
     // executable's `N_OSO` debug map points at per-build `.o` files that a
-    // restoring build won't have — so while they still exist, bake a
-    // self-contained `.dSYM` and cache it (as one flat tar; the store holds
-    // flat files only) alongside the entry. Restore unpacks it next to the
-    // binary, where lldb prefers it over the stale debug map. The staging
-    // TempDir must outlive `store.put*` below, which hashes the tar at this
-    // path — same lifetime pattern as `prepare_cc_store_files`.
+    // restoring build won't have. Unpacked debug info still has those
+    // objects, so the platform runs dsymutil. Packed debug info, including
+    // rustc's macOS default when `-Csplit-debuginfo` was not passed, already
+    // wrote the adjacent `.dSYM` (kunobi-ninja/kache#1752); that bundle is
+    // what gets cached. The store holds one flat tar. Restore unpacks it
+    // next to the binary, where lldb prefers it over the stale debug map.
+    // The staging TempDir must outlive `store.put*` below, which hashes the
+    // tar at this path — same lifetime pattern as `prepare_cc_store_files`.
     let mut _debug_bundle_staging: Option<tempfile::TempDir> = None;
     if wants_debug_bundle(args)
         && let Some((exec_path, exec_name)) =
@@ -5042,9 +5044,11 @@ fn run_parsed_rustc(
     {
         match tempfile::tempdir_in(args.invocation_env().temp_dir()) {
             Ok(staging) => {
-                match platform::current_for(args.invocation_env())
-                    .package_debug_bundle(&exec_path, staging.path())
-                {
+                match platform::current_for(args.invocation_env()).package_debug_bundle(
+                    &exec_path,
+                    staging.path(),
+                    args.get_codegen_opt("split-debuginfo"),
+                ) {
                     Ok(Some(tar_path)) => {
                         result.artifacts.push(crate::compiler::Artifact {
                             path: tar_path,
@@ -5057,9 +5061,9 @@ fn run_parsed_rustc(
                         });
                         _debug_bundle_staging = Some(staging);
                     }
-                    // None (non-macOS host, tool missing/failed) is the
-                    // documented best-effort degradation: cache the
-                    // binary without a bundle.
+                    // None (non-macOS host, packed with no bundle, tool
+                    // missing/failed) is the documented best-effort
+                    // degradation: cache the binary without a bundle.
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(

@@ -26,11 +26,13 @@
 //! cached executables** ([`Platform::package_debug_bundle`],
 //! kunobi-ninja/kache#319): a macOS `-g` binary carries `N_OSO`
 //! debug-map records pointing at per-build `.o` files, so a restored
-//! binary loses source-level debugging elsewhere. At store time —
-//! while the `.o`s still exist — the macOS impl bakes a self-contained
-//! `.dSYM` via `dsymutil` and hands the wrapper a single flat tar of
-//! it for the cache entry. lldb prefers an adjacent UUID-matched
-//! `.dSYM` over the debug map, so no binary mutation is needed.
+//! binary loses source-level debugging elsewhere. At store time the
+//! macOS impl hands the wrapper one flat tar of a `.dSYM`. Unpacked
+//! debug info still has the `.o` files, so that tar comes from
+//! `dsymutil`. Packed debug info, including rustc's default when
+//! `-Csplit-debuginfo` was not passed, already has the adjacent bundle.
+//! lldb prefers an adjacent UUID-matched `.dSYM` over the debug map, so
+//! no binary mutation is needed.
 //!
 //! ## Future methods
 //!
@@ -101,19 +103,28 @@ pub trait Platform: Send + Sync {
     /// just-linked binary, as ONE flat file inside `staging_dir`
     /// (kunobi-ninja/kache#319).
     ///
-    /// Called on the store path while the binary's build-local debug
-    /// inputs (macOS: the `.o` files its `N_OSO` debug map points at)
-    /// still exist. Returns `Ok(None)` when the platform has no such
-    /// companion (Linux embeds DWARF; Windows stores the `.pdb` as an
-    /// output of its own) or when the packaging tool is unavailable/fails — the
-    /// best-effort failure contract of this trait: a missing debug
-    /// bundle degrades debuggability of the cached binary, never the
-    /// build.
+    /// `split_debuginfo` is rustc's `-Csplit-debuginfo` value, or `None`
+    /// when that flag was not passed. On macOS, `unpacked` still has the
+    /// `.o` files the `N_OSO` debug map points at, so the impl runs
+    /// `dsymutil`. `packed`, and an absent flag (rustc's macOS default),
+    /// already wrote an adjacent `.dSYM` and removed those objects
+    /// (kunobi-ninja/kache#1752): the impl packages that bundle and does
+    /// not run `dsymutil` again. Returns `Ok(None)` when the platform has
+    /// no such companion (Linux embeds DWARF; Windows stores the `.pdb`
+    /// as an output of its own), when packed debug info left no bundle,
+    /// or when the packaging tool is unavailable or fails. A missing
+    /// debug bundle degrades debuggability of the cached binary, never
+    /// the build.
     ///
     /// The macOS impl also leaves the `.dSYM` bundle itself next to the
     /// binary (see [`MacOsPlatform`]), so the producing build and a
     /// restoring build converge on the same on-disk shape.
-    fn package_debug_bundle(&self, binary: &Path, staging_dir: &Path) -> Result<Option<PathBuf>>;
+    fn package_debug_bundle(
+        &self,
+        binary: &Path,
+        staging_dir: &Path,
+        split_debuginfo: Option<&str>,
+    ) -> Result<Option<PathBuf>>;
 
     /// Whether a restored executable or dynamic library may share its inode
     /// with the store blob when nothing else rewrites it in place. True only
@@ -254,74 +265,138 @@ impl Platform for MacOsPlatform {
         )
     }
 
-    fn package_debug_bundle(&self, binary: &Path, staging_dir: &Path) -> Result<Option<PathBuf>> {
-        // Compiled on every host (same convention as ensure_binary_loadable):
-        // the actual `dsymutil` spawn is runtime-gated so a Linux test can
-        // construct MacOsPlatform and exercise this method as a no-op.
-        if std::env::consts::OS != "macos" {
-            return Ok(None);
-        }
-        let binary_path = self
-            .env
-            .resolve(binary)
-            .context("debug binary requires the invocation directory")?;
-        let staging_path = self
-            .env
-            .resolve(staging_dir)
-            .context("debug staging requires the invocation directory")?;
-        let binary = binary_path.as_path();
-        let staging_dir = staging_path.as_path();
-        let Some(file_name) = binary.file_name().and_then(|n| n.to_str()) else {
-            tracing::warn!(
-                "not packaging a debug bundle: binary has no usable file name: {}",
-                binary.display()
-            );
-            return Ok(None);
-        };
+    fn package_debug_bundle(
+        &self,
+        binary: &Path,
+        staging_dir: &Path,
+        split_debuginfo: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
+        package_macos_debug_bundle(
+            &self.env,
+            binary,
+            staging_dir,
+            split_debuginfo,
+            std::env::consts::OS,
+        )
+    }
+}
 
-        // Bake the `.dSYM` NEXT TO the binary, not in the staging dir. Two
-        // reasons (kunobi-ninja/kache#319):
-        //   1. cold/warm parity — a restoring build unpacks the bundle next
-        //      to the binary, so the producing build should end up with the
-        //      same on-disk shape (and gets a usable dSYM for its own lldb
-        //      sessions out of the link work it already paid for);
-        //   2. lldb's adjacent-bundle lookup is by `<binary>.dSYM` sibling
-        //      path, which is exactly this location.
-        let bundle_dir = binary.with_file_name(format!("{file_name}.dSYM"));
-        let Some(mut command) = macho_debug_bundle_command_for(binary, &bundle_dir, &self.env)?
-        else {
-            return Ok(None);
-        };
-        let status = match crate::invocation::io::status(&mut command) {
-            Ok(status) => status,
-            Err(err) => {
-                // Best-effort per the trait contract: no dsymutil (unusual
-                // but possible without Xcode CLT) → cache the binary
-                // without a bundle rather than fail the store.
-                tracing::warn!("unable to run dsymutil for {}: {err}", binary.display());
+/// What to do at the dsymutil spawn for one macOS binary.
+enum DebugBundleSpawn {
+    /// Packed debug info left no bundle, or this output is not Mach-O.
+    /// Cache the binary and do not warn.
+    Skip,
+    /// rustc already wrote the adjacent `.dSYM`. Tar it; do not spawn.
+    Reuse,
+    /// Objects are still on disk. Run this command, then tar its output.
+    Run(Command),
+}
+
+/// Package a macOS debug bundle, or `Ok(None)` on any other host.
+///
+/// `host_os` is [`std::env::consts::OS`] in production. Tests pass `"macos"`
+/// so the spawn decision runs on hosts that are not macOS.
+fn package_macos_debug_bundle(
+    env: &InvocationEnv,
+    binary: &Path,
+    staging_dir: &Path,
+    split_debuginfo: Option<&str>,
+    host_os: &str,
+) -> Result<Option<PathBuf>> {
+    // Compiled on every host (same convention as ensure_binary_loadable):
+    // the actual `dsymutil` spawn is runtime-gated so a Linux test can
+    // construct MacOsPlatform and exercise this method as a no-op.
+    if host_os != "macos" {
+        return Ok(None);
+    }
+    let binary_path = env
+        .resolve(binary)
+        .context("debug binary requires the invocation directory")?;
+    let staging_path = env
+        .resolve(staging_dir)
+        .context("debug staging requires the invocation directory")?;
+    let binary = binary_path.as_path();
+    let staging_dir = staging_path.as_path();
+    let Some(file_name) = binary.file_name().and_then(|n| n.to_str()) else {
+        tracing::warn!(
+            "not packaging a debug bundle: binary has no usable file name: {}",
+            binary.display()
+        );
+        return Ok(None);
+    };
+
+    // The `.dSYM` stays next to the binary, not in the staging dir
+    // (kunobi-ninja/kache#319): a restoring build unpacks the bundle to
+    // that sibling path, and lldb looks up `<binary>.dSYM` there.
+    let bundle_dir = binary.with_file_name(format!("{file_name}.dSYM"));
+    let tar_path = staging_dir.join(format!("{file_name}.dsym.tar"));
+    match debug_bundle_spawn(binary, &bundle_dir, env, split_debuginfo)? {
+        DebugBundleSpawn::Skip => return Ok(None),
+        DebugBundleSpawn::Reuse => {}
+        DebugBundleSpawn::Run(mut command) => {
+            let status = match crate::invocation::io::status(&mut command) {
+                Ok(status) => status,
+                Err(err) => {
+                    // Best-effort per the trait contract: no dsymutil (unusual
+                    // but possible without Xcode CLT) → cache the binary
+                    // without a bundle rather than fail the store.
+                    tracing::warn!("unable to run dsymutil for {}: {err}", binary.display());
+                    return Ok(None);
+                }
+            };
+            if !status.success() {
+                tracing::warn!("dsymutil failed for {}", binary.display());
                 return Ok(None);
-            }
-        };
-        if !status.success() {
-            tracing::warn!("dsymutil failed for {}", binary.display());
-            return Ok(None);
-        }
-
-        // Tar the bundle into the ONE flat file the store can hold
-        // (single-component artifact names, file-level hashing/linking).
-        let tar_path = staging_dir.join(format!("{file_name}.dsym.tar"));
-        match build_deterministic_tar(&bundle_dir, &tar_path) {
-            Ok(()) => Ok(Some(tar_path)),
-            Err(err) => {
-                tracing::warn!(
-                    "failed to package debug bundle for {}: {err:#}",
-                    binary.display()
-                );
-                let _ = std::fs::remove_file(&tar_path);
-                Ok(None)
             }
         }
     }
+
+    // Tar the bundle into the ONE flat file the store can hold
+    // (single-component artifact names, file-level hashing/linking).
+    match build_deterministic_tar(&bundle_dir, &tar_path) {
+        Ok(()) => Ok(Some(tar_path)),
+        Err(err) => {
+            tracing::warn!(
+                "failed to package debug bundle for {}: {err:#}",
+                binary.display()
+            );
+            let _ = std::fs::remove_file(&tar_path);
+            Ok(None)
+        }
+    }
+}
+
+/// Decide whether the spawn below builds a `dsymutil` command.
+///
+/// `None` and `"packed"` are rustc's packed macOS debug info
+/// (kunobi-ninja/kache#1752): rustc already ran dsymutil, wrote the
+/// adjacent `.dSYM`, and deleted the `.o` files. Spawning again warns
+/// that it cannot open those objects and the new bundle drops compile
+/// units. `"unpacked"` keeps the objects, so dsymutil still runs.
+/// `split-debuginfo=off` never reaches here.
+fn debug_bundle_spawn(
+    binary: &Path,
+    bundle_dir: &Path,
+    env: &InvocationEnv,
+    split_debuginfo: Option<&str>,
+) -> Result<DebugBundleSpawn> {
+    if split_debuginfo_already_packed(split_debuginfo) {
+        return Ok(if bundle_dir.is_dir() {
+            DebugBundleSpawn::Reuse
+        } else {
+            DebugBundleSpawn::Skip
+        });
+    }
+    match macho_debug_bundle_command_for(binary, bundle_dir, env)? {
+        Some(command) => Ok(DebugBundleSpawn::Run(command)),
+        None => Ok(DebugBundleSpawn::Skip),
+    }
+}
+
+/// `packed`, or no `-Csplit-debuginfo` at all. rustc's macOS default for
+/// an absent flag is packed.
+fn split_debuginfo_already_packed(split_debuginfo: Option<&str>) -> bool {
+    matches!(split_debuginfo, None | Some("packed"))
 }
 
 /// Cross-compilation can produce ELF or PE executables on a macOS host.
@@ -487,7 +562,12 @@ impl Platform for LinuxPlatform {
         Ok(Loadability::Unverified)
     }
 
-    fn package_debug_bundle(&self, _binary: &Path, _staging_dir: &Path) -> Result<Option<PathBuf>> {
+    fn package_debug_bundle(
+        &self,
+        _binary: &Path,
+        _staging_dir: &Path,
+        _split_debuginfo: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
         // Linux embeds DWARF in the binary under default `-Cdebuginfo`
         // settings, so a restored executable is already self-contained
         // (kunobi-ninja/kache#319) — nothing to package.
@@ -521,7 +601,12 @@ impl Platform for WindowsPlatform {
         Ok(Loadability::Unverified)
     }
 
-    fn package_debug_bundle(&self, _binary: &Path, _staging_dir: &Path) -> Result<Option<PathBuf>> {
+    fn package_debug_bundle(
+        &self,
+        _binary: &Path,
+        _staging_dir: &Path,
+        _split_debuginfo: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
         // Nothing to package: rustc names the `.pdb` by file name
         // (`/PDBALTPATH:%_PDB%`) and it is stored with the `.exe` as an
         // output of its own; the store checks the pair (`pe_pdb`).
@@ -636,6 +721,7 @@ pub(crate) mod tests {
             &self,
             _binary: &Path,
             _staging_dir: &Path,
+            _split_debuginfo: Option<&str>,
         ) -> Result<Option<PathBuf>> {
             self.package_debug_bundle_calls
                 .fetch_add(1, Ordering::Relaxed);
@@ -845,7 +931,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             platform
-                .package_debug_bundle(Path::new("/no/such/binary"), dir.path())
+                .package_debug_bundle(Path::new("/no/such/binary"), dir.path(), None)
                 .unwrap()
                 .is_none()
         );
@@ -857,7 +943,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             platform
-                .package_debug_bundle(Path::new("/no/such/binary"), dir.path())
+                .package_debug_bundle(Path::new("/no/such/binary"), dir.path(), None)
                 .unwrap()
                 .is_none()
         );
@@ -874,7 +960,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             platform
-                .package_debug_bundle(Path::new("/no/such/binary"), dir.path())
+                .package_debug_bundle(Path::new("/no/such/binary"), dir.path(), None)
                 .unwrap()
                 .is_none()
         );
@@ -939,6 +1025,132 @@ pub(crate) mod tests {
         );
     }
 
+    /// Packed debug info, and an absent `-Csplit-debuginfo` (rustc's macOS
+    /// default), must not build a dsymutil command when rustc already wrote
+    /// the adjacent bundle. Unpacked still does: the objects are on disk.
+    #[test]
+    fn dsymutil_packed_or_absent_does_not_build_a_command_when_the_bundle_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("build_script_build");
+        std::fs::write(&binary, b"\xcf\xfa\xed\xfe").unwrap();
+        let bundle = dir.path().join("build_script_build.dSYM");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"plist").unwrap();
+        let env = debug_env(dir.path());
+
+        for split in [None, Some("packed")] {
+            let plan = debug_bundle_spawn(&binary, &bundle, &env, split).unwrap();
+            assert!(
+                matches!(plan, DebugBundleSpawn::Reuse),
+                "{split:?} must package the existing bundle and not build a dsymutil command"
+            );
+        }
+
+        match debug_bundle_spawn(&binary, &bundle, &env, Some("unpacked")).unwrap() {
+            DebugBundleSpawn::Run(command) => {
+                assert_eq!(
+                    Path::new(command.get_program()).file_stem().unwrap(),
+                    "dsymutil",
+                    "unpacked still builds a dsymutil command when a bundle is already present"
+                );
+            }
+            DebugBundleSpawn::Skip | DebugBundleSpawn::Reuse => {
+                panic!("unpacked still builds a dsymutil command when a bundle is already present");
+            }
+        }
+    }
+
+    /// No adjacent bundle and a packed or absent flag: do not point dsymutil
+    /// at objects rustc already deleted.
+    #[test]
+    fn dsymutil_packed_or_absent_does_not_build_a_command_without_a_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("build_script_build");
+        std::fs::write(&binary, b"\xcf\xfa\xed\xfe").unwrap();
+        let bundle = dir.path().join("build_script_build.dSYM");
+        let env = debug_env(dir.path());
+        assert!(!bundle.exists());
+
+        for split in [None, Some("packed")] {
+            let plan = debug_bundle_spawn(&binary, &bundle, &env, split).unwrap();
+            assert!(
+                matches!(plan, DebugBundleSpawn::Skip),
+                "{split:?} must cache the binary without building a dsymutil command"
+            );
+        }
+
+        assert!(
+            matches!(
+                debug_bundle_spawn(&binary, &bundle, &env, Some("unpacked")).unwrap(),
+                DebugBundleSpawn::Run(_)
+            ),
+            "unpacked still builds a dsymutil command when no bundle exists yet"
+        );
+    }
+
+    /// The spawn site packages rustc's bundle instead of running dsymutil.
+    /// The fixture `dsymutil` exits 1, so a spawn returns `Ok(None)`.
+    #[test]
+    fn dsymutil_packed_bundle_is_packaged_without_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("demo");
+        std::fs::write(&binary, b"\xcf\xfa\xed\xfe").unwrap();
+        let bundle = dir.path().join("demo.dSYM");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"plist").unwrap();
+        let env = debug_env(dir.path());
+        let dsymutil = dir.path().join("tools").join(if cfg!(windows) {
+            "dsymutil.exe"
+        } else {
+            "dsymutil"
+        });
+        std::fs::write(&dsymutil, b"#!/bin/sh\nexit 1\n").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+
+        for split in [None, Some("packed")] {
+            let tar = package_macos_debug_bundle(&env, &binary, staging.path(), split, "macos")
+                .unwrap()
+                .unwrap_or_else(|| panic!("{split:?} must package the existing bundle"));
+            assert_eq!(tar.file_name().unwrap(), "demo.dsym.tar");
+            let bytes = std::fs::read(&tar).unwrap();
+            let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+            let names: Vec<String> = archive
+                .entries()
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .path()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert!(
+                names.iter().any(|name| name == "Contents/Info.plist"),
+                "{split:?} tar must contain the bundle rustc wrote, got {names:?}"
+            );
+        }
+
+        assert!(
+            package_macos_debug_bundle(&env, &binary, staging.path(), Some("unpacked"), "macos")
+                .unwrap()
+                .is_none(),
+            "unpacked still spawns dsymutil; this fixture cannot run, so no bundle is packaged"
+        );
+        assert!(
+            package_macos_debug_bundle(&env, &binary, staging.path(), None, "linux")
+                .unwrap()
+                .is_none(),
+            "only a macOS host packages a debug bundle"
+        );
+
+        let via_platform = MacOsPlatform { env: env.clone() }
+            .package_debug_bundle(&binary, staging.path(), None)
+            .unwrap();
+        assert_eq!(via_platform.is_some(), std::env::consts::OS == "macos");
+    }
+
     #[test]
     fn counting_platform_records_package_calls() {
         let platform = CountingPlatform::new();
@@ -946,7 +1158,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             platform
-                .package_debug_bundle(Path::new("/x"), dir.path())
+                .package_debug_bundle(Path::new("/x"), dir.path(), None)
                 .unwrap()
                 .is_none()
         );
@@ -1032,7 +1244,7 @@ pub(crate) mod tests {
         }
         let staging = tempfile::tempdir().unwrap();
         MacOsPlatform::default()
-            .package_debug_bundle(&binary, staging.path())
+            .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
             .unwrap()
             .unwrap();
         let dwarf = dir.join("hello-bin.dSYM/Contents/Resources/DWARF/hello-bin");
@@ -1261,7 +1473,7 @@ pub(crate) mod tests {
         let staging = tempfile::tempdir().unwrap();
 
         let tar_path = MacOsPlatform::default()
-            .package_debug_bundle(&binary, staging.path())
+            .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
             .unwrap()
             .expect("macOS host with dsymutil must produce a bundle tar");
         assert_eq!(
@@ -1305,11 +1517,11 @@ pub(crate) mod tests {
         let staging_b = tempfile::tempdir().unwrap();
 
         let tar_a = MacOsPlatform::default()
-            .package_debug_bundle(&binary, staging_a.path())
+            .package_debug_bundle(&binary, staging_a.path(), Some("unpacked"))
             .unwrap()
             .expect("first packaging must succeed");
         let tar_b = MacOsPlatform::default()
-            .package_debug_bundle(&binary, staging_b.path())
+            .package_debug_bundle(&binary, staging_b.path(), Some("unpacked"))
             .unwrap()
             .expect("second packaging must succeed");
 

@@ -4422,6 +4422,53 @@ fn build_preprocess_args_strips_dep_info_flags() {
     }
 }
 
+/// #1751: GCC treats `-g3` as `-dD` under `-E`, so the probe would print
+/// every `#define` and a libc redirect macro would look like a computed
+/// `asm`. Drop it from the GNU preprocess argv. A computed `asm` that is
+/// actually in the expansion is still a hidden input.
+#[test]
+fn gnu_preprocess_argv_drops_g3_and_still_refuses_computed_asm() {
+    use crate::compiler::flags::Dialect;
+    let parsed = CcArgs::parse(&s(&["gcc", "-g3", "-c", "file.c"])).unwrap();
+    assert_eq!(parsed.family.dialect(), Dialect::Gnu);
+    assert_eq!(parsed.debug_level, Some(3));
+    assert!(parsed.rest.iter().any(|arg| arg == "-g3"));
+    let pp = build_preprocess_args(&parsed);
+    assert!(
+        !pp.iter().any(|arg| arg == "-g3"),
+        "GNU preprocess argv must not contain -g3, got {pp:?}"
+    );
+    assert!(pp.iter().any(|arg| arg == "file.c"), "{pp:?}");
+    assert_eq!(&pp[..2], &["-E".to_string(), "-P".to_string()]);
+    assert_eq!(
+        cc_assembler_hidden_input(b"void f() { asm((text())); }"),
+        Some("asm((...))")
+    );
+
+    let dumped = CcArgs::parse(&s(&[
+        "gcc", "-c", "file.c", "-g", "-g0", "-g1", "-g2", "-g3", "-dD", "-dM", "-dN", "-dI", "-dU",
+    ]))
+    .unwrap();
+    let pp = build_preprocess_args(&dumped);
+    for flag in [
+        "-g", "-g0", "-g1", "-g2", "-g3", "-dD", "-dM", "-dN", "-dI", "-dU",
+    ] {
+        assert!(
+            !pp.iter().any(|arg| arg == flag),
+            "{flag} should be absent from the GNU preprocess argv, got {pp:?}"
+        );
+    }
+    assert!(pp.iter().any(|arg| arg == "file.c"), "{pp:?}");
+
+    let cl = CcArgs::parse(&s(&["clang-cl", "-g3", "-c", "file.c"])).unwrap();
+    assert_eq!(cl.family.dialect(), Dialect::Cl);
+    let cl_pp = build_preprocess_args(&cl);
+    assert!(
+        cl_pp.iter().any(|arg| arg == "-g3"),
+        "only the GNU preprocess argv drops -g3, got {cl_pp:?}"
+    );
+}
+
 #[test]
 fn build_preprocess_args_uses_ep_for_clang_cl() {
     use crate::compiler::flags::Dialect;

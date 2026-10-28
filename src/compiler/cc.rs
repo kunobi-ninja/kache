@@ -1475,6 +1475,11 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
 /// - `-MMD` / `-MD` / `-MF` / `-MT` / `-MQ` / `-MP` / `-MG` removed —
 ///   dep-info generation is irrelevant to preprocessor *content* and
 ///   `-MF` would redirect output.
+/// - `-g` / `-g0`..`-g3` and `-dD` / `-dM` / `-dN` / `-dI` / `-dU`
+///   removed. GCC treats `-g3` as `-dD` under `-E` and prints every
+///   `#define`; a libc redirect macro then looks like a computed
+///   `asm`. The object does not assemble that text. Debug level stays
+///   in the key, and the real compile keeps the flags (#1751).
 /// - `-E -P` prepended. `-P` suppresses line markers
 ///   (`# 1 "/abs/path/header.h"`), so the hash captures expanded
 ///   *content* without leaking machine-local header paths — that's
@@ -1497,6 +1502,9 @@ fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
                         iter.next(); // also drop the flag's value
                     }
                     "-MMD" | "-MD" | "-MP" | "-MG" => {}
+                    // Not a value-taking flag: the following source stays.
+                    "-g" | "-g0" | "-g1" | "-g2" | "-g3" | "-dD" | "-dM" | "-dN" | "-dI"
+                    | "-dU" => {}
                     _ => out.push(arg.clone()),
                 }
             }

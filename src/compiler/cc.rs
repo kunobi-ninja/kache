@@ -5259,13 +5259,16 @@ fn push_cwd_source_roots(
         // component (`/src`, or `C:\src` with the Windows prefix kept) so the
         // relative path below it survives. A file whose parent is already that
         // anchor (`/src/foo.c`) still maps the anchor. Never map the bare root.
+        // If the canonical paths still share a directory (`/var` and
+        // `/private/var` on macOS), keep `source_parent`: widening to `/var`
+        // would leave the checkout id in the key.
         match common {
             Some(common) if has_normal_component(&common) => {
                 roots.push((common, CC_ROOT_SENTINEL));
             }
             _ => {
-                if let Some(anchor) = cc_source_anchor(source_parent) {
-                    roots.push((anchor.to_path_buf(), CC_SOURCE_SENTINEL));
+                if let Some(anchor) = cc_source_anchor_for(cwd_abs, source_parent) {
+                    roots.push((anchor, CC_SOURCE_SENTINEL));
                 }
             }
         }
@@ -5291,6 +5294,28 @@ fn cc_source_anchor(source_parent: &Path) -> Option<&Path> {
         .ancestors()
         .take_while(|path| has_normal_component(path))
         .last()
+}
+
+/// Where `<CC_SOURCE>` anchors when the lexical common ancestor is the
+/// filesystem root.
+///
+/// Widen to the first directory only when the canonical paths also fail to
+/// meet. `/obj` and `/src/base` stay apart, so `/src` is the anchor and
+/// `base/location.cc` survives. `/private/var/.../clone-a` and
+/// `/var/.../clone-a/src` are the same directory once the `/var` symlink is
+/// resolved; mapping `/var` there would leave the clone id in the key.
+fn cc_source_anchor_for(cwd: &Path, source_parent: &Path) -> Option<PathBuf> {
+    let widened = cc_source_anchor(source_parent)?;
+    let shares_directory = common_ancestor(
+        &canonicalize_or_self(cwd),
+        &canonicalize_or_self(source_parent),
+    )
+    .is_some_and(|common| has_normal_component(&common));
+    if shares_directory {
+        Some(source_parent.to_path_buf())
+    } else {
+        Some(widened.to_path_buf())
+    }
 }
 
 fn prefix_maps_from_roots<I>(roots: I) -> Vec<CcPrefixMap>

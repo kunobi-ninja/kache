@@ -5973,6 +5973,44 @@ fn cc_prefix_maps_anchor_root_source_at_its_first_directory() {
     );
 }
 
+/// `/var` and `/private/var` are one directory. Widening the anchor to `/var`
+/// leaves the checkout id in the key, so a relocated clone misses.
+#[cfg(unix)]
+#[test]
+fn cc_prefix_maps_keep_the_source_parent_when_var_and_private_var_meet() {
+    let canonical = std::fs::canonicalize("/var").unwrap_or_else(|_| PathBuf::from("/var"));
+    if canonical == Path::new("/var") {
+        return;
+    }
+    let dir = std::env::temp_dir();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let via_private = dir.strip_prefix("/private").is_ok();
+    if !via_private {
+        return;
+    }
+    let via_var = PathBuf::from("/var").join(dir.strip_prefix("/private/var").unwrap());
+    let cwd = dir.join("clone-a");
+    let source_parent = via_var.join("clone-a/src");
+    std::fs::create_dir_all(&cwd.join("src")).unwrap();
+    std::fs::create_dir_all(&source_parent).unwrap();
+    let source = source_parent.join("foo.c");
+    std::fs::write(&source, "int answer(void) { return 1; }\n").unwrap();
+    let parsed =
+        CcArgs::parse(&s(&["cc", "-c", &source.to_string_lossy(), "-o", "foo.o"])).unwrap();
+    let maps = cc_prefix_maps_for(&parsed, &cwd);
+    assert!(
+        maps.iter()
+            .all(|map| Path::new(&map.from) != Path::new("/var")
+                && Path::new(&map.from) != Path::new("/private")),
+        "a /var spelling must not anchor at the volume root, got {maps:?}"
+    );
+    assert!(
+        maps.iter().any(|map| Path::new(&map.from) == source_parent),
+        "the source parent must stay the <CC_SOURCE> anchor, got {maps:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir.join("clone-a"));
+}
+
 /// Issue #78: an explicit `-isysroot <sdk>` is mapped to `<SDKROOT>` so
 /// the SDK path that rides in the resolved `cc -###` tokens stops
 /// keying the artifact per-install.

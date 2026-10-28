@@ -5991,8 +5991,8 @@ fn cc_prefix_maps_keep_the_source_parent_when_var_and_private_var_meet() {
     let via_var = PathBuf::from("/var").join(dir.strip_prefix("/private/var").unwrap());
     let cwd = dir.join("clone-a");
     let source_parent = via_var.join("clone-a/src");
-    std::fs::create_dir_all(&cwd.join("src")).unwrap();
-    std::fs::create_dir_all(&source_parent).unwrap();
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    std::fs::create_dir_all(source_parent.as_path()).unwrap();
     let source = source_parent.join("foo.c");
     std::fs::write(&source, "int answer(void) { return 1; }\n").unwrap();
     let parsed =

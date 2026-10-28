@@ -46,6 +46,11 @@ The PE's mapped CodeView address and raw file pointer must identify the same byt
 
 Windows executable keys use a separate pairing-admission field, so older EXE-only entries cannot win local, remote or concurrent lookups. Linked executables for custom targets, or an explicit target with `RUST_TARGET_PATH` set, use that field conservatively because their file format is not inferred from the target name. Those entries miss once after upgrading; libraries and known non-Windows executable targets without that custom-target ambiguity retain their keys. Cached pairs are checked again before any output is restored.
 
+On main, a reported Windows DLL also stores existing sibling import/export
+artifacts with that DLL's name (`foo.dll.lib`, `foo.dll.exp`, or `foo.dll.a`).
+Missing sidecars are omitted. Cargo builds do not scan the directory or collect
+another crate's import library.
+
 `-C split-debuginfo=off` skips Kache's `.dSYM` generation and restoration, including bundles in older cache entries. `-C debuginfo=0` and `-C debuginfo=none` also skip bundling. Without a bundle, source-level debugging of a cached binary can depend on the producing build's object files.
 
 Incremental directory names and harmless local path spellings are excluded or normalized.

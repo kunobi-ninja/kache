@@ -7,6 +7,11 @@ The daemon keeps compiler cache pipelines, network connections and maintenance
 state warm across invocations. The local engine can still use the cache when
 compiler delegation is unavailable.
 
+V2 starts or uses this daemon for eligible local builds as well as remote-backed
+builds. It is a per-user cache process, separate from the optional remote planner
+service. Keep using `kache`; the matching `kache-engine` companion runs its CLI
+and daemon entry points.
+
 ## Responsibilities
 
 - Run concurrent cache pipelines for delegated compiler invocations.
@@ -47,7 +52,8 @@ The daemon lists the remote's keys only when `cache.remote_key_listing` is on. I
 
 ## When it is required
 
-Local-only caching works with no daemon. Compiler-driven remote reads, writes,
+Local-only caching can fall back to the local engine when delegation is
+unavailable; this is not the normal way to disable the daemon. Compiler-driven remote reads, writes,
 and prefetch need the daemon. `kache sync` can transfer entries directly without
 it. If delegation is unavailable before Commit, the engine continues with the
 local store. After Commit, a lost daemon connection fails the invocation; see

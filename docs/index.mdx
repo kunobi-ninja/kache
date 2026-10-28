@@ -1,6 +1,6 @@
 ---
 title: Kache
-description: Install Kache, verify reuse, and find the guide for your workflow
+description: Install Kache v2, verify reuse, and find the guide for your workflow
 ---
 
 Kache reuses matching compiler outputs for Rust, C/C++, and CUDA. Keep using your
@@ -9,11 +9,19 @@ the rest. Optional remote storage shares that work between machines.
 
 ## Start with a local build
 
+These docs follow v2 on `main`. To use the published v2 preview:
+
 ```bash
-cargo install kache --locked
+cargo install kache --locked --version 2.0.0-rc.2
 kache init
+kache doctor --probe
 cargo build
 ```
+
+An unversioned install selects the stable channel. Features marked **main**,
+including Blaze, were added after this release
+candidate. The [upgrade guide](/docs/getting-started/upgrade-v2) maps the versions
+and explains the paired `kache`/`kache-engine` installation.
 
 You need Rust 1.95 or newer to install through Cargo. Prebuilt packages are
 available in the [installation guide](/docs/getting-started/installation).
@@ -28,6 +36,10 @@ with separate target directories.
 
 | Task | Guide |
 | --- | --- |
+| Upgrade from 1.x or select a v2 release candidate | [Upgrading to v2](/docs/getting-started/upgrade-v2) |
+| Share artifacts and private incremental state between worktrees | [Worktrees](/docs/getting-started/worktrees) |
+| Understand disk use or reclaim old build output | [Storage and cleanup](/docs/getting-started/storage) |
+| Configure Windows Rust, PDB, clang-cl, or CUDA caching | [Windows builds](/docs/getting-started/windows) |
 | Cache Make, CMake, or build-script C/C++ | [C and C++](/docs/getting-started/c-cpp) |
 | Cache CUDA object compilations | [CUDA](/docs/getting-started/cuda) |
 | Cache Rust documentation | [Rustdoc](/docs/getting-started/rustdoc) |
@@ -35,6 +47,7 @@ with separate target directories.
 | Share work between machines | [Remote cache](/docs/remote-cache/overview) |
 | Configure GitHub Actions or another CI | [CI setup](/docs/remote-cache/ci) |
 | Change storage limits or build policy | [Configuration](/docs/getting-started/configuration) |
+| Use local Blaze routing on main | [Blaze](/docs/getting-started/blaze) |
 
 ## Understand a build
 
@@ -60,13 +73,15 @@ For the details, read [cache keys](/docs/how-it-works/cache-key),
 | Local cache | Content-addressed storage with automatic garbage collection |
 | Remote cache | S3-compatible storage, GCS, filesystems, and OCI registries |
 | Build visibility | Live monitor, stats, miss explanations, and reports |
+| Incremental edits | Managed target-local state and compatible donor seeds with supported rustc 1.98+ |
+| Optional Blaze routing | Main only; local default-profile commands on Linux and Apple silicon macOS |
 
 Kache passes unsupported compiler invocations through unchanged. A passthrough is not a cache hit or miss. Its reason appears in the monitor's Why tab and in the Not cached section of `kache stats --full`.
 
 ## Reference and measurements
 
 - [Command reference](/docs/commands/reference): commands, flags, and report formats.
-- [Compatibility](/docs/compatibility): what stays stable across 1.x releases, and the Rust version needed to build from source.
+- [Compatibility](/docs/compatibility): release channels, v2 interfaces, local state, and source-build requirements.
 - [Architecture](/docs/how-it-works/architecture): wrapper, store, daemon, and planner.
 - [Daemon lifecycle](/docs/daemon/lifecycle): services, restarts, and environment changes.
 - [Benchmarks](/docs/benchmarks): real-project workloads, measurements, and validation.

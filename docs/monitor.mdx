@@ -82,7 +82,9 @@ Narrow terminals drop the least important columns first instead of clipping ever
 
 ## Triage
 
+- Missing miss details or an old bypass error: check the selected build's date and the retained-history window. Enabling `explain_miss` records future comparisons; it cannot recover old fields. See [Historical diagnostics](/docs/getting-started/troubleshooting#miss-details-or-old-errors-are-missing-from-history).
 - Daemon offline: run `kache daemon status` and inspect `kache daemon log`.
 - Store near its limit: the daemon evicts entries on its own. If cloned outputs keep entries in place, preview stale targets with `kache clean --stale 14d --dry-run`.
+- Free space or inode pressure: use `kache doctor` and [Storage and cleanup](/docs/getting-started/storage); target size, registered blob bytes, and freeable blocks are different measurements.
 - No remote activity: check daemon state, credentials, and `kache doctor`.
 - Unexpected misses: run `kache explain`, or `kache explain <crate>`.

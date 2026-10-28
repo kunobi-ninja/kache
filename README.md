@@ -17,20 +17,43 @@ Built by [Kunobi][kunobi-brand].
 
 ## Install
 
+This README follows v2 on `main`. To install the published v2 preview:
+
 ```bash
-cargo install kache --locked
+cargo install kache --locked --version 2.0.0-rc.2
 kache init
+kache doctor --probe
 ```
 
+Unversioned install commands select the stable channel. Features added after
+`v2.0.0-rc.2`, including Blaze, require `main`.
+[Choose a version or upgrade an existing installation →](https://kunobi.ninja/docs/kache/getting-started/upgrade-v2)
+
 `kache init` shows the changes before applying them. It configures Cargo's compiler
-wrapper and offers a background service. On Unix it also sets up C/C++ compiler
-shims. Run `kache init --check` for a preview.
+wrapper and the background service. On Unix it also sets up Cargo and C/C++
+shims, test pacing, and shell completions. Open a new terminal after setup.
+Run `kache init --check` for a preview. The probe checks compile, store and
+restore in an isolated local cache without contacting a remote.
 
 Then use Cargo as usual in your project. Kache caches eligible compiler work
 automatically.
 
 Cargo installation needs Rust 1.95 or newer. Prefer a prebuilt package?
 [Homebrew, APT, AUR, Windows packages, mise, and Nix →](https://kunobi.ninja/docs/kache/getting-started/installation)
+
+V2 installs `kache` and its matching `kache-engine` companion. Keep both when
+copying an installation into a container or managing release archives yourself.
+
+## What v2 covers
+
+| Workflow | Start here |
+| --- | --- |
+| Upgrade from 1.x, including the paired binaries and daemon | [Upgrade guide](https://kunobi.ninja/docs/kache/getting-started/upgrade-v2) |
+| Reuse artifacts and private incremental state across worktrees | [Worktrees](https://kunobi.ninja/docs/kache/getting-started/worktrees) |
+| Inspect one build, its misses, and work Kache did not cache | [Monitor](https://kunobi.ninja/docs/kache/monitor) · [Troubleshooting](https://kunobi.ninja/docs/kache/getting-started/troubleshooting) |
+| Manage storage, cleanup, and configuration files | [Storage and cleanup](https://kunobi.ninja/docs/kache/getting-started/storage) · [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration) |
+| Understand the client, engine, and concurrent daemon pipelines | [Architecture](https://kunobi.ninja/docs/kache/how-it-works/architecture) |
+| Opt into local Blaze routing on main | [Blaze](https://kunobi.ninja/docs/kache/getting-started/blaze) |
 
 ## See it reuse a build
 
@@ -80,32 +103,21 @@ to see the workload, platform, and validation behind each result.
 
 ## Optional Blaze builds
 
-For experimental local development with [Blaze](https://github.com/indexable-inc/blaze),
-install Blaze separately, run `kache init` to put the Cargo shim on your PATH,
-and opt in from the project:
+On **main**, after `v2.0.0-rc.2`, the Cargo shim can route eligible local commands
+through an installed [Blaze](https://github.com/indexable-inc/blaze) client.
+Install Blaze separately and opt in from the project:
 
 ```sh
 kache config set --project cache.blaze true
 cargo build
 ```
 
-For one command with your current config, use `KACHE_BLAZE=1 cargo build`.
-Creating a `.kache.toml` selects that project file instead of the user config,
-following Kache's existing configuration rules.
-
-Routing supports Linux and Apple silicon macOS. The setting defaults to off.
-The Cargo shim checks for Blaze's `ra-jit`
-executable on each eligible command, so installing it later needs no new
-`init`. Local `build`, `run`, `test` and `check` commands can use Blaze;
-CI, release builds, explicit profiles and `+toolchain` invocations use ordinary
-Cargo. Other subcommands and leading global options also use Cargo.
-If Blaze is missing or cannot start, Kache runs Cargo. Once Blaze
-starts, its build errors are returned without retrying them through Cargo.
-
-Blaze uses its own compiler and cache. Cargo work that returns through Kache
-can reuse compatible artifacts, including across worktrees. Results produced
-by Blaze are recorded as passthroughs, separately from Kache hits and misses.
-Blaze manages its own worker state and function cache.
+It defaults to off and supports Linux and Apple silicon macOS. Installing Blaze
+after init works; the shim checks PATH for each eligible command. CI, release
+builds and explicit profiles stay on Cargo. Blaze has its own compiler/cache;
+compatible dependency work can still use Kache. See the
+[Blaze guide](https://kunobi.ninja/docs/kache/getting-started/blaze) for activation,
+fallback behavior, worktrees, and the project-config selection rules.
 
 ## Watch a build and explain a miss
 
@@ -118,9 +130,9 @@ kache doctor              # check your setup
 ```
 
 Reports describe recorded builds. `Details missing` means those builds did
-not record enough information to explain a miss. Enable detailed recording
-before the next build with `kache config set cache.explain_miss true`;
-this cannot reconstruct details from earlier builds.
+not record enough information to explain a miss. Enable `[cache] explain_miss = true`
+before the next build; this cannot reconstruct details from earlier builds.
+`kache config set cache.explain_miss true` edits the setting from the CLI.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="assets/monitor-9dd7cee8.png">
@@ -137,6 +149,8 @@ Install your Rust toolchain, then add the official action before your build:
 
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
+  with:
+    version: v2.0.0-rc.2
 - run: cargo build --locked
 ```
 

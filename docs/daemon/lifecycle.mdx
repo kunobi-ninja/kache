@@ -18,7 +18,7 @@ Use `KACHE_LOG=kache=debug kache daemon run` for foreground debugging. Stop the 
 
 When an installed service manages this cache, `start`, `restart` and automatic starts start the service instead of spawning a process. On macOS, Kache loads the job with `launchctl bootstrap` if launchd no longer has it.
 
-The service restarts the daemon only when it fails. After `kache daemon stop`, an idle timeout or a config change, the daemon exits cleanly and stays stopped until something starts it through the service, such as the next build that uses a remote, `kache stats`, `kache monitor` or `kache daemon start`.
+The service restarts the daemon only when it fails. After `kache daemon stop`, an idle timeout or a config change, the daemon exits cleanly and stays stopped until something starts it through the service, such as the next cache-enabled compiler invocation, `kache stats`, `kache monitor` or `kache daemon start`. V2 uses the daemon for local compiler pipelines too; a remote is not required to start it.
 
 Every daemon, and every other `kache` command, appends info-level lines to a diagnostic log: `~/Library/Logs/kache/kache.log` on macOS, and `kache.log` in the default cache directory elsewhere (`~/.cache/kache/kache.log` on Linux, `%LOCALAPPDATA%\kache\kache.log` on Windows). The log stays there when `cache.local_store` or `KACHE_CACHE_DIR` moves the store. `KACHE_LOG_FILE` changes its filter. A daemon that Kache starts without the service also writes its stderr to `<runtime_dir>/daemon.log`: warnings, errors and the reason a start failed.
 
@@ -113,16 +113,23 @@ Idle shutdown is off by default. Set a timeout in seconds to turn it on:
 daemon_idle_timeout_secs = 600
 ```
 
-The equivalent environment variable is `KACHE_DAEMON_IDLE_TIMEOUT`. Every connection counts as activity, including the stats polling of an open `kache monitor`. After an idle exit, the next build that uses a remote starts the daemon again. A local-only build does not; `kache stats`, `kache monitor` or `kache daemon start` do.
+The equivalent environment variable is `KACHE_DAEMON_IDLE_TIMEOUT`. Every connection counts as activity, including the stats polling of an open `kache monitor`. After an idle exit, the next cache-enabled compiler invocation can start the daemon again, including for local-only caching. `kache stats`, `kache monitor` and `kache daemon start` can also start it. Idle shutdown does not disable caching.
 
 ## Offline behavior
 
-When the daemon cannot be reached:
+V2 first tries to use or start the daemon for an eligible compiler invocation.
+When delegation cannot be established before Commit, the local engine can still
+compile and use the local store. On that fallback path:
 
 - local hits and local stores continue
 - exact remote checks and prefetch are skipped
 - validated upload intents remain in `<cache_dir>/upload-queue`
 - a later daemon replays queued uploads before retiring their files
+
+After the first Commit write attempt, execution belongs to the daemon pipeline.
+A later disconnect fails the invocation rather than starting a second compiler.
+See [Architecture](/docs/how-it-works/architecture) for admission and process
+restriction checks.
 
 The monitor falls back to direct store and event-log reads. When the daemon stays offline, run `kache daemon status`: it shows where the daemon logs and where a failed start left its error.
 

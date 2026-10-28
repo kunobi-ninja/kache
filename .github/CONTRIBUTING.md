@@ -40,7 +40,7 @@ All common tasks live in the `Justfile` — prefer these over raw `cargo` comman
 
 ```sh
 just check          # fmt + clippy + tests
-just pr             # check + changed-line mutants (run before every PR)
+just pr             # check + local changed-line mutants (optional; needs a capable Linux host)
 just ci             # mirrors the GitHub Actions verification flow
 just test           # run all tests
 just lint           # clippy with -D warnings
@@ -100,6 +100,26 @@ Some habits make text vague or padded. Prefer the plain form:
 
 Read a change aloud before opening the PR. If it sounds like marketing copy or a chat reply, rewrite it.
 
+### Keep the published docs in sync
+
+`docs/` is the canonical product documentation. The Ninja website imports it
+into `apps/ninja/content/docs/kache` in `Zondax/kunobi-web`, rewriting `/docs/...`
+links to `/docs/kache/...`. After a documentation change merges, refresh that
+copy with the website's `pnpm docs:sync` command and review the resulting diff.
+Edit the upstream pages here rather than maintaining a second version there.
+
+For behavior changes, check release notes and the PR, then confirm the current
+implementation. A release-preparation commit is not necessarily the release
+tag: use the tag's actual contents to decide which version contains a feature.
+Keep historical benchmark versions and measurements attached to their original
+runs.
+
+Check the README, the task guide, configuration and command references, and any
+affected crate README. CLI routing and options come from
+`crates/kache-client/src/commands.rs`; `kache --json --help` describes the visible
+command tree. Run `bash scripts/check-docs.sh` for routes, navigation, commands,
+and configuration-field coverage.
+
 ## Testing
 
 - **Unit tests**: Place `#[cfg(test)]` modules at the bottom of source files
@@ -120,13 +140,20 @@ just mutants-core
 
 Coding agents: read [AGENTS.md](../AGENTS.md) before opening a PR. The usual CI failure is Mutation testing after a push that only ran `just check`.
 
-Run the PR gate before submitting. `just check` is fmt, clippy with `-D warnings`, and tests. CI also mutation-tests every changed Rust line; `just pr` runs that too.
+Run `just check` before opening a PR. It checks formatting, clippy with
+`-D warnings`, and workspace tests. CI also mutation-tests changed Rust lines.
+Open the PR as a draft, inspect missed mutations in the uploaded reports, and
+mark it ready when the required checks pass.
 
 ```sh
-just pr
+just check
+bash scripts/check-docs.sh  # when documentation or configuration changes
 ```
 
-Install the same cargo-mutants version as CI first (`cargo install --locked cargo-mutants --version 27.1.0`). A docs-only diff skips mutants.
+`just pr` also runs the mutation diff locally. Use it on a Linux host with enough
+cores; laptop runs can take hours. Install the same cargo-mutants version as CI
+first (`cargo install --locked cargo-mutants --version 27.1.0`). A docs-only diff
+skips mutation tests in CI. Do not run cargo-mutants through Kache itself.
 
 Clippy on macOS does not type-check `#[cfg(target_os = "linux")]` functions. Identity conversions (`u64::try_from` on a `u64`) and unused Unix-only test helpers fail on Linux CI under `-D warnings` even when `just lint` is green locally.
 
@@ -134,8 +161,8 @@ Clippy on macOS does not type-check `#[cfg(target_os = "linux")]` functions. Ide
 
 1. **Fork** the repository and create a feature branch from `main`
 2. Make your changes — keep commits focused and use [conventional commit](https://www.conventionalcommits.org/) messages (e.g., `feat:`, `fix:`, `test:`, `docs:`)
-3. Run `just pr` and ensure it passes
-4. Open a pull request against `main` (see [Branching and releases](#branching-and-releases))
+3. Run `just check` and the checks specific to the change
+4. Open a draft pull request against `main` (see [Branching and releases](#branching-and-releases)); mark it ready after required CI passes
 5. Describe what the PR does and why — link related issues if any
 
 ### PR guidelines
@@ -212,14 +239,16 @@ publish automatically.
 
 ```
 src/
-├── main.rs          CLI entry point, daemon management
+├── frontend.rs      Small kache executable, through kache-client
+├── engine.rs        kache-engine executable entry point
+├── main.rs          Application library and engine dispatch
 ├── wrapper.rs       RUSTC_WRAPPER hot path
 ├── cache_key.rs     blake3 cache key computation
-├── store.rs         SQLite-backed local cache
+├── store.rs         Application adapter for kache-store
 ├── daemon.rs        Background daemon + S3 sync
-├── remote.rs        S3 operations
+├── remote.rs        Remote cache orchestration
 ├── cli.rs           Subcommand implementations
-├── config.rs        Configuration loading
+├── config.rs        kache-config re-exports
 ├── config_tui.rs    TUI config editor
 ├── tui.rs           Live monitoring dashboard
 ├── args.rs          rustc argument parsing
@@ -228,6 +257,8 @@ src/
 ├── events.rs        Build event tracking
 ├── service.rs       launchd/systemd integration
 └── shards.rs        Content-addressed shard management
+crates/              Shared client, config, protocol, IPC, storage, and filesystem libraries
+docs/                Canonical product documentation imported by the website
 tests/               Integration tests
 scenarios/           E2E and benchmark scenarios
 test-projects/       Integration-test helper projects

@@ -47,7 +47,7 @@ Kache reads only that one file, plus the [host config](#host-config); a `.kache.
 
 Each process walks up from its own current directory. Cargo compiles packages under the workspace root from the workspace root, but compiles registry and git dependencies, and runs their build scripts, from each package's source directory under `$CARGO_HOME`, so those compiles do not see your project's `.kache.toml`. A daemon that a build starts resolves its file from the directory of the compile that started it, which can be a dependency's source directory. To apply a setting to every compile and to the daemon, put it in your user config or the host config, or point `KACHE_CONFIG` at the file.
 
-If the chosen file is not valid TOML, or a key has the wrong type, Kache ignores the whole file, and the host config with it, and runs on environment variables and defaults without a warning. Size keys (`local_max_size`, `event_log_max_size`, `prefetch_max_bytes`) take quoted strings such as `"50GiB"`.
+If the chosen file is not valid TOML, or a key has the wrong type, compiler configuration resolution falls back to environment variables and defaults for the whole file, including the host overlay. Run `kache doctor` to check the selected file; the editor and file-editing subcommands refuse invalid TOML instead of saving over it. Size keys (`local_max_size`, `event_log_max_size`, `prefetch_max_bytes`) take quoted strings such as `"50GiB"`.
 
 The editor covers common fields and updates changed keys while keeping comments and other settings. It asks before its first save to an existing file and refuses a file it cannot read or parse. The file subcommands also preserve comments and unrelated settings; `unset` can remove an unknown key.
 
@@ -63,9 +63,13 @@ region = "us-east-1"
 
 Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem remote. Kache also supports `gcs` and `oci` remotes; see [Remote settings](#remote-settings).
 
+The file subcommands above are available in `v2.0.0-rc.2`. On older versions,
+use the interactive editor or edit the selected TOML file.
+See [Release channels](/docs/getting-started/installation#release-channels).
+
 ### Unstable mode
 
-Enable all Kache experiments with one setting:
+Opt into experiments controlled by Kache's unstable mode:
 
 ```toml
 [cache]
@@ -82,7 +86,8 @@ Worktree incremental seeding is enabled independently through
 compilers. See [incremental seeds between worktrees](/docs/getting-started/mutation-testing#incremental-seeds-between-worktrees)
 for compiler behavior and donor settings.
 
-Unstable mode does not enable every optional configuration setting. Those
+Unstable mode does not enable [Blaze](/docs/getting-started/blaze), which needs
+its own opt-in on main. It does not enable every optional configuration setting. Those
 settings also cover project-specific policies such as remote access and disk
 cleanup. Experiments still check compiler support and input compatibility.
 
@@ -143,6 +148,10 @@ local_max_size = "200GiB"
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
 
 ## Optional Blaze builds
+
+**Requires main**, after `v2.0.0-rc.2`. See the
+[Blaze guide](/docs/getting-started/blaze) for routing, worktrees, and the separate
+Kache/Blaze cache and daemon state.
 
 Install [Blaze](https://github.com/indexable-inc/blaze) separately, run `kache init`
 to activate the Cargo shim, then opt in from the project:

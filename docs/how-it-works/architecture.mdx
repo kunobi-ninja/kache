@@ -3,8 +3,17 @@ title: Architecture
 description: How the compiler wrapper, local store, and daemon divide the work
 ---
 
-Kache ships a small `kache` client and a `kache-engine` executable containing the
-CLI, cache pipeline and daemon.
+Keep invoking Kache through `kache`, including from Cargo's `RUSTC_WRAPPER`.
+V2 ships two executables from the same release:
+
+| Process | Owns |
+| --- | --- |
+| `kache` client | Captures each compiler invocation; owns native compiler children, streams, and brokered artifact operations |
+| Local `kache-engine` | CLI commands, daemon startup, build-script launchers, and local cache fallback before handoff |
+| Daemon (`kache daemon run`, through the engine) | Concurrent cache pipelines, key and restore decisions, remote transfers, and maintenance |
+
+The local daemon is useful without a remote cache. The optional network planner
+service is a separate process and is not required for exact cache lookups.
 
 The client sends compiler arguments, environment, working directory and IO to
 the daemon. The daemon runs concurrent cache pipelines, each with its own inputs,
@@ -99,7 +108,7 @@ The second local check prevents duplicate work when another process fills the sa
 | `dup` | Yes | The key was new but all output blobs already existed |
 | `error` | Yes | The compiler failed; nothing was stored |
 | `skipped` | Yes | The compile ran but its result was not stored, for example because a requested output was missing, the compile was faster than `cache.min_store_compile_ms`, or another process held the key's lock |
-| `passthrough` | Yes | Kache did not cache the invocation: policy declined it, or the key, the store or a restore failed |
+| `passthrough` | Not implied | Kache did not cache the invocation: policy declined it, a compiler query ran, another wrapper handled it, or key/store/restore work failed |
 
 An entry that prefetch imported before the compile asked for it logs `local_hit`. Build timelines mark such units with the prefetch delivery and its timing.
 
@@ -125,7 +134,9 @@ Strict stores validate and flush shared blobs too, before a store or import oper
 
 ## Daemon
 
-The daemon owns delegated compilation, remote work and periodic maintenance:
+The daemon owns delegated cache pipelines, remote work and periodic maintenance.
+For an accepted invocation the client still creates compiler processes and
+performs brokered restores under its own process restrictions:
 
 - concurrent cache pipelines for delegated compiler invocations
 - exact remote checks and downloads
@@ -150,7 +161,7 @@ See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecy
 
 As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations, and caches the Clippy ones among them. On Unix, after rustc builds a build script, Kache puts a launcher in its place, so Cargo runs the script through Kache too; see [Build scripts](/docs/how-it-works/build-scripts). Rust link work driven by rustc can be cached when the artifact policy allows it (`cache.cache_executables`, on by default on Linux and macOS); an independently invoked linker is outside this path.
 
-On Unix, `kache init` also adds a shim directory to the front of `PATH` and sets `kache test-runner` as Cargo's runner for the host, both through your shell startup files. The `cargo` shim runs the real Cargo and marks its target directories in use while it runs, so cleanup leaves them alone; it caches nothing. The `rustdoc` shim, which init sets as `build.rustdoc` when that is unset, caches the modes described in [Rust documentation](/docs/getting-started/rustdoc). The test runner makes test binaries wait for the compile scheduler's slots. Apart from these and the C, C++ and CUDA compilers below, Kache wraps no other tools.
+On Unix, `kache init` also adds a shim directory to the front of `PATH` and sets `kache test-runner` as Cargo's runner for the host, both through your shell startup files. The `cargo` shim runs the real Cargo and marks its target directories in use while it runs, so cleanup leaves them alone. It can seed compatible dependency units before Cargo checks a new target. On main it can also route explicitly opted-in local builds through [Blaze](/docs/getting-started/blaze). Compiler artifact caching still happens at the wrapper boundary. The `rustdoc` shim, which init sets as `build.rustdoc` when that is unset, caches the modes described in [Rust documentation](/docs/getting-started/rustdoc). The test runner makes test binaries wait for the compile scheduler's slots.
 
 C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache cc`) or through a compiler-name shim on `PATH` (`kache init --shims`, Unix only). Supported object compilations use the same local store and remote pipeline as rustc. clang-cl debug objects stay machine-local. See [C and C++](/docs/getting-started/c-cpp).
 

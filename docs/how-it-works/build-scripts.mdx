@@ -3,8 +3,9 @@ title: Build scripts
 description: How Kache caches a build script's run, and when it does not
 ---
 
-Compiling a build script is cached like any other unit. Running it is not, and
-on a fresh target directory Cargo runs every build script again. A script that
+Compiling a build script and running it are separate operations. Caching its
+binary alone does not reuse the run: on a fresh target directory Cargo would
+still execute it. On Linux and macOS, Kache also caches eligible runs. A script that
 compiles C sources through the `cc` crate pays for that even when every object
 is a cache hit: `cc` polls its compiler children and sleeps between polls, so
 each object costs about 100 ms per parallel lane regardless of how fast the
@@ -21,7 +22,7 @@ shell would drop: Cargo spells a `links` dependency's metadata keys as the
 script printed them, so Tauri's `cargo:core:window__...` arrives as
 `DEP_TAURI_CORE:WINDOW__...`.
 
-The launcher runs a copy of Kache pinned in the profile directory under
+In v2 the launcher runs a copy of the engine pinned in the profile directory under
 `.kache-build-script-shims/`, cloned where the filesystem supports it and copied
 otherwise. Each profile has its own executable inode; installation replaces
 existing pins that still share an inode. After an upgrade, existing launchers
@@ -119,6 +120,15 @@ text, including ordinary dangling links. These rules apply to the regular
 build-script cache. Hermetic runs still refuse links that leave `OUT_DIR`
 and fall back to the regular path.
 Entries stay in the local store: `kache sync` never uploads them.
+
+On main, a configured `cache.readonly_store` is also checked after a local run
+miss. A restored run does not write to that fallback; a miss in both stores runs
+the script and records it locally. This is separate from remote artifact
+sharing. See [Read-only store](/docs/getting-started/configuration#read-only-store).
+
+Main prepares eligible cached output files concurrently before publication.
+That changes restore preparation, not the script's declared-input requirements
+or which outputs may be replayed.
 
 Runs appear in build reports (`kache stats --full`) as `build_script_run`, with
 the package name. A restored run is a `local_hit` and a recorded one a `miss`.

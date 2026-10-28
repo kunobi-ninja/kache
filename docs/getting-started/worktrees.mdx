@@ -1,0 +1,85 @@
+---
+title: Worktrees and incremental builds
+description: Share cached work while keeping Cargo and compiler state private
+---
+
+Run `kache init` once for your installation, then use ordinary Cargo commands in
+each worktree. Worktrees using the same Kache store can reuse matching outputs
+without configuring a remote. Start with the
+[quick start](/docs/getting-started/quick-start) to verify that reuse.
+
+## Keep a target directory per worktree
+
+Leave Cargo's default `target/` in each worktree, or set a different
+`CARGO_TARGET_DIR` for each concurrent build. Sharing Kache's artifact store does
+not require sharing Cargo's fingerprints or writable compiler files.
+
+A hit requires compatible source inputs, toolchain, target, features, and build
+settings. A source edit or a different profile can miss. Cargo Fresh means Cargo
+did not run the compiler; it is not a Kache hit.
+
+If you already share one target directory, `kache cargo -- build` and
+`kache cargo -- check` can separate each worktree's intermediate build directory
+on Cargo 1.91+. The supported commands and exclusions are described in
+[Concurrency limits](/docs/how-it-works/limits). Separate target directories
+remain the normal setup.
+
+## Three kinds of reuse
+
+| Mechanism | What it reuses | What happens on an edit |
+| --- | --- | --- |
+| Artifact cache | Matching compiler outputs from the local store or a remote | Changed inputs can produce a new key and a compile |
+| New-target seeding | Compatible registry/git dependency units already built in another checkout | Cargo checks the copied metadata and decides what is Fresh |
+| Managed incremental state | Private compiler state for a unit being edited | rustc rebuilds the changed parts; this path is not an artifact-cache hit |
+
+New-target seeding defaults to on through `cache.seed_new_targets`. It runs before
+Cargo checks a new target reached through the Cargo shim. See
+[New checkouts](/docs/getting-started/configuration#new-checkouts) for eligibility.
+
+Adaptive incremental mode also defaults to on. After repeated compatible builds
+of an edited unit, Kache can keep isolated incremental state instead of storing
+each intermediate edit in the artifact cache. See
+[Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds)
+for the retry window and idle timeout.
+
+With supported rustc 1.98+ layouts, `cache.seed_incremental` lets a managed
+incremental compile import a compatible finalized session from another checkout.
+Each receiver gets independent files or copy-on-write clones, never writable
+hardlinks to the donor. Compiler feature probing and bootstrap behavior are
+documented in
+[Incremental seeds between worktrees](/docs/getting-started/mutation-testing#incremental-seeds-between-worktrees).
+
+These settings have separate purposes. Disabling `seed_incremental` stops donor
+imports but keeps target-local adaptive compilation. Disabling
+`adaptive_incremental` changes the edited-unit policy. Neither setting enables
+[Blaze](/docs/getting-started/blaze).
+
+## Inspect reuse and disk use
+
+```bash
+kache stats --last-build
+kache explain
+kache monitor
+kache targets
+```
+
+In the monitor, select a build on Now, use Build for compiler events, and open
+Why for recorded miss and bypass reasons. Cache hit counts exclude incremental
+passthroughs and Cargo Fresh work.
+
+The store holds identical output bytes once. Restores try copy-on-write clones,
+then an artifact-specific hardlink policy or a byte copy. Writable metadata and
+incremental seeds keep separate inodes. A target's logical size is not the extra
+disk space it occupies. See [Deduplication](/docs/deduplication).
+
+## Preview cleanup
+
+```bash
+kache clean --stale 14d --dry-run
+```
+
+Review the selected directories and freeable-space estimates before removing
+anything. Running Cargo commands reached through Kache retain a target-use lease
+so cleanup skips active targets. Keep that protection by leaving the Cargo shim
+on PATH. For automatic policies and recorded-command unit cleanup, see
+[Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).

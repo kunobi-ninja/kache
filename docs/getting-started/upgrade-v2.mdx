@@ -1,0 +1,94 @@
+---
+title: Upgrading to v2
+description: Install the paired binaries, keep your configuration, and verify reuse
+---
+
+Keep using `cargo`, Make, CMake, or Ninja after upgrading. V2 changes how Kache
+executes and coordinates compiler work; it does not add a `kache build` command.
+
+## Choose the version
+
+These docs track v2 on `main`. The published `v2.0.0-rc.2` preview can be installed
+explicitly:
+
+```bash
+cargo install kache --locked --version 2.0.0-rc.2
+```
+
+Unversioned Cargo and stable package-manager commands select the stable channel.
+They do not opt into release candidates. See
+[Installation](/docs/getting-started/installation) for prebuilt preview packages
+and building `main`.
+
+| Workflow | Available in |
+| --- | --- |
+| Paired client/engine and daemon-backed compiler pipelines | v2 release candidates |
+| Private incremental state and compatible seeds between worktrees | v2 release candidates; seed import needs supported rustc 1.98+ |
+| Init-managed shell completions and the responsive Now build view | `v2.0.0-rc.2` |
+| Scriptable configuration, history-wide `explain --all`, volume/inode diagnostics | `v2.0.0-rc.2` |
+| Optional local Blaze routing | **main**, after `v2.0.0-rc.2`; off by default |
+
+## Upgrade the complete installation
+
+1. Finish active builds.
+2. Upgrade with the same package manager, or install both `kache` and
+   `kache-engine` from the same release archive into the same directory.
+3. Keep your existing Cargo wrapper and Kache configuration.
+4. Restart the daemon and verify the installation:
+
+```bash
+kache --version
+kache daemon restart
+kache doctor
+kache doctor --probe
+```
+
+`--probe` compiles a temporary Rust library twice and checks that the second
+compile is a local hit. It uses an isolated cache and no remote. A successful
+probe verifies the local path, not your remote's write permissions.
+
+V2 release archives contain the companion engine, including the Windows ZIP.
+Update Docker `COPY` instructions and custom installers that previously copied
+only `kache`. Package managers and `cargo install` install the pair.
+
+Existing services and compiler shims that launch `kache` remain usable when the
+pair is installed at the same paths. Run `kache init --check` to inspect setup
+changes. Run `kache init` to refresh shell completions after upgrading; a new
+terminal loads the updated scripts.
+
+Existing build-script launchers can keep using the engine copy pinned when the
+script was built. Restarting the daemon does not rebuild Cargo Fresh units. If
+an affected script still shows old behavior, rebuild that package's outputs;
+see [Build scripts](/docs/how-it-works/build-scripts). A blanket cache delete is
+not required.
+
+## Expect some cold state
+
+Your local store does not need a blanket delete. Kache can migrate its index,
+while changed cache-key recipes cause compatible work to be rebuilt under new
+keys. Managed incremental state from older layouts starts cold and is recreated
+with private files. Imported seeds never share writable inodes with a donor.
+
+Cargo can still report a package as Fresh without invoking Kache. Use the
+[two-worktree quick start](/docs/getting-started/quick-start) to test actual
+restores, then inspect:
+
+```bash
+kache stats --last-build
+kache explain
+```
+
+Older builds may show `Details missing`. Enable `[cache] explain_miss = true`
+before rebuilding to record future key differences. An upgrade cannot recover
+fields absent from the retained history.
+
+## Find the v2 workflow
+
+- [Worktrees and incremental builds](/docs/getting-started/worktrees): artifact
+  reuse, new-target seeding, private incremental state, and cleanup previews.
+- [Configuration](/docs/getting-started/configuration): file selection, host
+  settings, and scriptable edits.
+- [Monitor](/docs/monitor): select a build, inspect its events, and open Why.
+- [Blaze](/docs/getting-started/blaze): opt into a separate local compiler/cache.
+- [Architecture](/docs/how-it-works/architecture): client, engine, daemon, and
+  fallback boundaries.

@@ -14,6 +14,7 @@ Build one committed revision in two temporary worktrees. Each gets a fresh targe
 ```bash
 kache init
 kache doctor
+kache doctor --probe
 ```
 
 `kache init` configures Cargo's Rust wrapper and makes sure the background daemon is running. On Unix it also sets `HOST_CC` and `HOST_CXX` when unset, so Kache caches the C and C++ that build scripts compile, and offers Cargo and compiler shims with a `PATH` line for your zsh, bash or fish startup file, [test pacing](/docs/getting-started/configuration#test-runner), and a `build.rustdoc` setting for the `rustdoc` shim when you have none. It also offers a login service. It does not set `CC` or `CXX`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
@@ -103,7 +104,7 @@ kache init --no-shell    # leave shell startup files unchanged
 kache init --yes         # accept defaults without prompts
 ```
 
-Init shows its plan and asks once before applying it, with a separate confirmation if another Cargo wrapper is set. It backs up existing files. Open a new terminal to activate C/C++ caching and test pacing; for C/C++ you can instead run the activation command it prints. `--dry-run` (or `--check`) shows the planned changes without prompts or modifications.
+Init shows its plan and asks once before applying it, with a separate confirmation if another Cargo wrapper is set. It backs up existing files. On Unix it also installs completions for the detected Bash, Zsh, or Fish login shell. Open a new terminal to activate the Cargo/compiler shims, test pacing, and completions; for C/C++ you can instead run the activation command it prints. `--dry-run` (or `--check`) shows the planned changes without prompts or modifications.
 
 After setup, keep using ordinary Cargo commands. Give concurrent worktrees separate target directories. Tools that build in temporary copies, such as cargo-mutants, need no extra setup; see [Mutation testing](/docs/getting-started/mutation-testing).
 
@@ -111,13 +112,29 @@ For Rust documentation, follow the [rustdoc setup](/docs/getting-started/rustdoc
 
 ## Executables and incremental builds
 
-Kache caches eligible Rust executables by default on Linux and macOS: binaries, test binaries and build scripts, which Cargo compiles as executables. The default is off on Windows because executable debug information still refers to an external PDB path, so all three compile without the cache there. Override the policy with `KACHE_CACHE_EXECUTABLES` or `cache.cache_executables`.
+Kache caches eligible Rust executables by default on Linux and macOS: binaries,
+test binaries and build scripts, which Cargo compiles as executables. Windows
+keeps executable caching opt-in. Override the policy with
+`KACHE_CACHE_EXECUTABLES` or `cache.cache_executables`; compiler and artifact
+eligibility checks still apply.
 
 Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, notices a Cargo unit you are editing (a build of it, then a miss in the same target where only its sources or dependencies changed) and gives it isolated incremental state. A `git pull`, a branch switch or a rebase counts as editing too, and so does a change in a local crate the unit depends on. The mode covers every package Cargo builds incrementally, by default the workspace members and path dependencies of a debug build, including a library you edit while running `cargo build -p app`.
 
 Kache neither stores nor uploads what it compiles this way. It skips the cache for up to eight builds of the unit. After the eighth, or after 15 minutes without a build of the unit, it checks the cache first: a hit restores the cached result and drops the state, and a miss keeps compiling incrementally. Until then, switching back to a version the cache already holds compiles it incrementally instead of restoring it.
 
 A compile error keeps the state, so the fix still compiles incrementally, as it does with plain Cargo. Kache discards the state when rustc crashes or reports a problem with its incremental files, and after an interrupted build. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn the mode off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics. A CI job that keeps its target directory between runs should turn the mode off; see [CI setup](/docs/remote-cache/ci#ephemeral-and-persistent-runners).
+
+Compatible managed incremental builds can also import private state from another
+worktree with supported rustc 1.98+. This is separate from both artifact restores
+and new-target seeding. See [Worktrees](/docs/getting-started/worktrees) for how the
+three paths interact.
+
+## Optional Blaze on main
+
+Blaze routing was added after `v2.0.0-rc.2`. It is a separate opt-in for local
+default-profile commands and uses Blaze's own compiler/cache. Kache still caches
+eligible dependency work. See [Blaze](/docs/getting-started/blaze) for setup,
+profile/CI exclusions, and how it appears in reports.
 
 ## Temporarily disable caching
 

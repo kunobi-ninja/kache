@@ -1,18 +1,63 @@
 ---
 title: Compatibility
-description: Kache 1.x interfaces and upgrade behavior
+description: Kache v2 release channels, interfaces, and upgrade behavior
 ---
 
-Kache 1.x keeps documented CLI commands, options, and configuration keys compatible. Removing an interface or changing its meaning requires a major release. New commands, options, and configuration keys can appear in minor releases.
+These docs follow Kache v2 on `main`. A release candidate is a preview, not the
+stable package selected by an unversioned install. Start with
+[Installation](/docs/getting-started/installation) to choose a release, or
+[Upgrading to v2](/docs/getting-started/upgrade-v2) for an existing installation.
+Sections marked **main** describe changes made after `v2.0.0-rc.2`.
 
-For scripts, use the documented JSON output and check `schema_version`. Fields may be added within a schema version; consumers should ignore fields they do not use. Removing fields or changing their meaning requires a new schema version and a major Kache release. Human-readable output can change between releases. See the [command reference](/docs/commands/reference) for JSON schemas and exit codes.
+## CLI and configuration
 
-In 1.x, `kache stats` replaces the 0.28 `Hit rate: ... (local: ...)` line with a Builds section. Its `Sources` row shows the five outcome counts. Scripts should read `local_hits`, `prefetch_hits`, `remote_hits`, `dups` and `misses` from `kache stats --json`.
+Within stable 2.x releases, documented commands, options, and configuration keys
+follow the major-version compatibility contract. Removing an interface or
+changing its meaning requires a major release. New commands, options, and keys
+can appear in minor releases. Prerelease interfaces can still change before 2.0
+is final.
 
-The published `kache-core`, `kache-format`, `kache-fs`, `kache-shims`, and `kache-store` crates follow the same major-version compatibility rule for their public Rust APIs. Public struct fields, enum variants, and trait methods are part of those APIs.
+For scripts, use documented JSON output and check `schema_version`. Consumers
+should ignore additional fields they do not use. Removing fields or changing
+their meaning requires a new schema version and a major stable Kache release.
+Human-readable output, monitor layouts, and diagnostic wording can change.
+See [Command reference](/docs/commands/reference) for JSON schemas and exit codes.
 
-Cache contents are disposable compiler outputs. Cache-key recipes and private storage layouts can change during 1.x; an upgrade may cause misses and rebuilds. The JSON CLI contract does not make raw cache files or event logs stable interfaces.
+`config get`, `list`, `set`, `unset`, and `path`, along with `explain --all`,
+are available in `v2.0.0-rc.2`. Optional Blaze routing currently requires **main**.
 
-The [planner service and Helm chart](/docs/remote-service) remain previews. Their deployment, authentication, and HA behavior can change even when their versions track the CLI release.
+## Installation and local state
 
-Building the CLI from source requires Rust 1.95 or newer, the `rust-version` in its `Cargo.toml`. The repository pins Rust 1.99 for development and release builds. Published crates declare their own minimum Rust versions.
+V2 ships `kache` and `kache-engine`. Install matching versions together and keep
+the companion discoverable next to the client. Existing Cargo wrapper settings
+continue to name `kache`. Copying only that executable into a container or a
+custom package is no longer sufficient.
+
+Cache entries, input predictions, event logs, and compiler incremental state are
+implementation details. An upgrade can migrate an index, invalidate old keys, or
+start managed incremental state cold. They are not covered by the JSON CLI
+contract. A miss after an upgrade does not by itself mean the cache is broken.
+Historical events cannot acquire diagnostic fields they never recorded.
+
+Use one Kache release per cache/runtime instance. The
+[daemon lifecycle](/docs/daemon/lifecycle) covers replacement, same-version
+rebuilds, and older clients. Finish active builds before replacing the binaries.
+
+## Library crates and planner
+
+Published Kache libraries follow their major version for public Rust APIs;
+public struct fields, enum variants, and trait methods are part of those APIs.
+Each crate declares its own minimum Rust version. See the
+[crate boundaries](https://github.com/kunobi-ninja/kache/tree/main/crates#readme).
+
+The [planner service and Helm chart](/docs/remote-service) remain previews.
+Deployment, authentication, and HA behavior can change even when their versions
+track the CLI release. A planner is optional for local caching and exact remote
+lookups.
+
+## Building from source
+
+The CLI declares Rust 1.95 or newer in `Cargo.toml`. The repository pins Rust 1.99
+for development and release builds. This requirement concerns building Kache;
+compiler-cache eligibility also depends on the compiler, arguments, platform,
+and artifact type. See [Current support](/docs#current-support).

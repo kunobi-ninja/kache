@@ -1,0 +1,112 @@
+---
+title: Storage and cleanup
+description: Read cache and target sizes, tune recovery, and preview cleanup
+---
+
+Start with the registered cache size and a preview of the build directories:
+
+```bash
+kache stats
+kache clean --dry-run
+```
+
+The local store budget and the space occupied by Cargo targets are separate.
+Changing one does not cap the other or a remote bucket.
+
+## Read the sizes
+
+| Figure | Meaning |
+| --- | --- |
+| Logical output bytes | Sum of entry/artifact sizes before sharing |
+| Registered blob bytes | Deduplicated bytes recorded in the local store index |
+| Target size | Build output visible under a Cargo target directory |
+| Freeable target bytes | Estimate of what removing that target would release after sharing |
+| Volume free space | Space available on the filesystem, including effects outside Kache |
+
+Copy-on-write clones and hardlinks can make several paths refer to shared disk
+blocks. Deleting one path does not necessarily release those blocks. APFS
+snapshots can retain them too. See [Deduplication](/docs/deduplication) before
+using `du` or adding store and target sizes together.
+
+`kache doctor` checks the configured store and build-volume capabilities.
+RC2 also reports volume identity and inode availability when the platform can
+provide them; an unavailable observation is not a measured zero.
+
+## Set the local budget
+
+```toml title="~/.config/kache/config.toml"
+[cache]
+local_max_size = "50GiB"
+```
+
+Without an explicit limit, Kache uses 5% of the cache volume, rounded to the
+nearest GiB and bounded between 5 GiB and 100 GiB. When it cannot read the
+volume size it uses 50 GiB.
+
+GC compares the limit with eligible registered blob bytes. Blobs retained by
+targets can keep the reported cache above its budget because evicting their
+entries would not release the disk space. `kache stats` reports that split in
+`On disk`. `cache.gc_evict_shared` changes that policy; see
+[GC and shared build outputs](/docs/getting-started/configuration#gc-and-shared-build-outputs).
+
+## Free-space recovery
+
+Local builds default to recovering eligible cache entries below **10 GiB free**.
+The default floor is zero in CI. An explicit
+`cache.auto_recover_min_free_bytes` overrides that default; set it to `0` to
+disable free-space recovery.
+
+Removing target directories under disk pressure is a separate opt-in:
+
+```toml
+[cache]
+auto_recover_targets = true
+```
+
+`kache init` asks about this choice. A disk floor alone does not enable target
+removal. Automatic orphan cleanup and unused-unit cleanup have their own age
+settings. See
+[Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup)
+for their defaults and activity checks.
+
+## Inspect targets before removing them
+
+```bash
+kache clean --stale 14d --dry-run
+kache clean --orphans --dry-run
+```
+
+The daemon can discover Cargo-tagged targets in sibling worktrees and nearby
+repositories, including ones never built through Kache. Discovery is not itself
+a removal request. Previews show selected and retained targets, recent use,
+freeable estimates, and active-command blockers.
+
+The Cargo shim holds a target-use lease for the whole command, including a
+long-running `cargo run`. Cleanup can therefore retain targets until that
+command exits. Without a terminal, a removal requiring confirmation exits
+nonzero unless you explicitly select a supported noninteractive mode. A failed
+removal is reported and makes the command fail.
+
+For obsolete units inside a target you still use, recorded-command cleanup
+preserves a successful build/check command's live and Fresh artifacts:
+
+```bash
+KACHE_TARGET_LIVENESS=1 kache cargo check
+kache clean --units target --dry-run
+```
+
+Receipts describe the recorded command, including its feature/profile selection.
+Missing or changed evidence keeps files. See
+[Recorded-command cleanup](/docs/getting-started/configuration#recorded-command-cleanup).
+
+## Read-only stores and remote retention
+
+`cache.readonly_store` lets a writable job reuse an authorized local store
+mounted read-only, within the same trust domain. Restores use private inodes;
+new entries remain in the job's writable store. It is separate from a filesystem
+remote. On main, build-script run results can also restore from this fallback.
+See [Read-only store](/docs/getting-started/configuration#read-only-store).
+
+Kache does not prune remote objects when it runs local GC. Configure bucket,
+registry, or shared-folder retention separately with
+[Bounding storage](/docs/remote-cache/bounding).

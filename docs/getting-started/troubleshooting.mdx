@@ -69,6 +69,31 @@ and [build-script inputs](/docs/how-it-works/build-scripts).
 Adaptive incremental mode can also compile a unit you are editing using its
 private incremental state. See [Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds).
 
+## Miss details or old errors are missing from history
+
+`kache explain` describes recorded builds. A historical SQL/schema error in a
+skip record is evidence about that build, not a new database query failing now.
+On main, incompatible prediction metadata is migrated while compiled entries
+are kept, and known legacy prediction errors have a shorter text explanation.
+JSON retains the original error for diagnosis.
+
+`Details missing` or an unexplained cause means the retained event lacks the
+inputs needed to compare keys. Enable recording before reproducing the build:
+
+```toml
+[cache]
+explain_miss = true
+```
+
+RC2 also supports `kache config set cache.explain_miss true`. Recording applies
+to future events; it cannot reconstruct old key details or history already
+rotated away. After rebuilding, compare `kache explain --root "$PWD"` with
+`kache explain --all --root "$PWD"`: the first selects the latest build, while
+the second groups retained skips and passthroughs across build history.
+
+Use `kache doctor` to check the current configuration and store before treating
+an old report as a current failure.
+
 ## A crate fails only with Kache
 
 If one crate keeps failing with an error that goes away with
@@ -128,6 +153,9 @@ uploads as a failure. `kache sync --pull --dry-run` can inspect explicit pull
 discovery, but it needs listing permissions in addition to read access.
 
 ## The cache uses more disk than expected
+
+The [storage guide](/docs/getting-started/storage) explains the local budget,
+free-space recovery, shared blocks, target discovery, and cleanup previews.
 
 `kache stats` reports registered blob bytes and the configured store budget.
 It does not count every block occupied by target directories. Use:

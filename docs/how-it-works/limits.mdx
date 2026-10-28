@@ -1,6 +1,6 @@
 ---
 title: Limits
-description: How Kache paces concurrent compiler processes without wrapping Cargo
+description: How Kache coordinates concurrent compiler processes, worktrees, and tests
 ---
 
 ## Several Cargo builds at once
@@ -18,6 +18,15 @@ The memory estimate cannot see what else is running: builds outside Kache, an ed
 If the scheduler directory cannot be used, compilation continues without a permit. A compile that has waited 30 minutes for a peer's compile or for free slots also continues without one. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn the scheduler off.
 
 Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.
+
+## Daemon pipelines
+
+Daemon request admission and compiler scheduling are different limits.
+`cache.daemon_execution_concurrency` controls concurrent cache pipelines, using
+CPU count and, on Unix, descriptor headroom by default. It does not set the
+number of compilers allowed to run. Change it in the daemon's startup settings
+and restart the daemon. Compiler permits remain memory-weighted as described
+above.
 
 ## Several test runs at once
 

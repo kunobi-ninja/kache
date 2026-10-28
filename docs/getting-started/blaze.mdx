@@ -1,0 +1,65 @@
+---
+title: Optional Blaze builds
+description: Opt into Blaze for local default-profile Cargo commands
+---
+
+**Requires main:** this integration was added after `v2.0.0-rc.2`.
+It is off by default, including when `cache.unstable` is enabled.
+See [Installation](/docs/getting-started/installation#build-from-source) to build
+a version containing it.
+
+Install [Blaze](https://github.com/indexable-inc/blaze) separately. Kache does not
+download it or install its compiler. After `kache init` has activated the Cargo
+shim, opt in from your project:
+
+```bash
+kache config set --project cache.blaze true
+cargo build
+```
+
+Or use `KACHE_BLAZE=1 cargo build` for one command with your current config.
+Creating a `.kache.toml` selects that file instead of the user config; they do
+not merge. Check [Configuration](/docs/getting-started/configuration) before
+moving shared settings into a project file.
+
+## What the shim routes
+
+The Cargo shim checks for Blaze's `ra-jit` executable on PATH once per eligible
+Cargo command. Installing Blaze after init needs no new init. Routing supports
+Linux and Apple silicon macOS.
+
+Local default-profile `build`, `run`, `test`, and `check` commands, including
+their standard short aliases, can use Blaze. Kache leaves these commands on
+ordinary Cargo:
+
+- CI builds detected through `CI`, `GITHUB_ACTIONS`, or `GITLAB_CI`.
+- Release builds and any explicit `--profile`, including `--profile dev`.
+- Explicit `+toolchain` invocations, leading global options, and other subcommands.
+- Builds with Kache disabled, or on unsupported platforms.
+
+The decision is made in the shim, not once per crate or through a daemon RPC.
+Flags after `--` belong to the program or test and do not select Cargo's profile.
+If Blaze is missing or cannot start, the shim uses Cargo. After Blaze starts,
+its failures and signals are propagated without retrying the command.
+
+## Caches, worktrees, and daemons
+
+Blaze owns its compiler, warm worker state, and function cache. Cargo work it
+starts returns through Kache with a routing guard and the originally selected
+Cargo executable. Compatible dependency compilations can still use Kache's
+artifact cache, including across worktrees.
+
+Workspace compilations handled by Blaze are recorded as passthroughs. They are
+not Kache hits or misses. Kache preserves the workspace wrapper's arguments,
+incremental settings, and existing output files. It holds the target-cleanup
+lease for the whole Blaze command.
+
+Kache and Blaze keep separate cache and daemon state. A Kache cache hit does not
+mean Blaze restored a function, and a Blaze reuse does not count as a Kache hit.
+CI keeps the ordinary Kache/Cargo path even when the project has opted in.
+
+To turn routing off for the project:
+
+```bash
+kache config set --project cache.blaze false
+```

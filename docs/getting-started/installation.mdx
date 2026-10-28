@@ -7,11 +7,28 @@ Kache ships two executables: the `kache` client and `kache-engine`. Keep the sam
 version of both in the same directory when installing a release manually.
 
 ```bash
-cargo install kache --locked
+cargo install kache --locked --version 2.0.0-rc.2
 kache init
 ```
 
 `kache init` configures Cargo to use Kache. Your Cargo commands stay the same.
+
+## Release channels
+
+These docs track v2 on `main`. The command above pins the published v2 preview.
+The package-manager commands below without a prerelease version select the stable
+channel and do not opt into v2 release candidates.
+
+For a reproducible preview installation, request `2.0.0-rc.2` explicitly with
+Cargo, cargo-binstall, or mise. Homebrew and Windows also have separate unstable
+packages; APT has an unstable distribution. Check the
+[release list](https://github.com/kunobi-ninja/kache/releases) before selecting a
+newer version.
+
+Features marked **main** were added after `v2.0.0-rc.2`, including Blaze.
+Use [Build from source](#build-from-source)
+for those features. The [upgrade guide](/docs/getting-started/upgrade-v2) covers
+existing installs and what state can start cold.
 
 ## Recommended methods
 
@@ -19,6 +36,8 @@ kache init
   <Tab value="cargo install">
     ```bash
     cargo install kache --locked
+    # Published v2 preview:
+    cargo install kache --locked --version 2.0.0-rc.2
     ```
 
     Cargo builds Kache with your local Rust toolchain, which must be Rust 1.95 or newer.
@@ -26,6 +45,8 @@ kache init
   <Tab value="cargo-binstall">
     ```bash
     cargo binstall kache
+    # Published v2 preview:
+    cargo binstall kache --version 2.0.0-rc.2
     ```
 
     This downloads a release binary when one exists for your target. Release binaries have no Rust runtime dependency.
@@ -115,7 +136,7 @@ nix profile install github:kunobi-ninja/kache/stable
 Pin a release tag when updates must be explicit:
 
 ```bash
-nix profile install github:kunobi-ninja/kache/v1.0.0
+nix profile install github:kunobi-ninja/kache/v2.0.0-rc.2
 ```
 
 The flake also exports `overlays.default`, `nixosModules.default` and `darwinModules.default`. The module's `services.kache` options are defined in [`packaging/nix/module.nix`](https://github.com/kunobi-ninja/kache/blob/main/packaging/nix/module.nix). `enable` installs Kache, writes `settings` to `/etc/kache/config.toml` and sets `KACHE_CONFIG`. `rustcWrapper`, on by default, sets `RUSTC_WRAPPER`. `daemon.enable` runs the daemon as a systemd or launchd user service. The module does not put the shims on `PATH`; use the example below for that.
@@ -155,20 +176,16 @@ The official AUR packages also install completions for Elvish. For manual setup 
 
 ## Upgrading from 1.x
 
-Finish active builds before upgrading to 2.0. Install the matching `kache` and
-`kache-engine` executables together. Update custom install scripts and container
-images that previously copied only `kache`. Manual Windows installs now use the
-paired ZIP archive instead of a standalone EXE.
-
-Run `kache daemon restart` after upgrading so clients use the new execution
-protocol. Managed incremental state starts cold once; the next builds recreate
-it with private files that cannot modify another checkout's state.
+Follow [Upgrading to v2](/docs/getting-started/upgrade-v2). Finish active builds,
+install the matching pair, keep the existing configuration, and restart the
+daemon. Custom installers and container images must include `kache-engine`.
 
 ## Verify the install
 
 ```bash
 kache --version
 kache doctor
+kache doctor --probe
 ```
 
 If you have not run it yet, enable Kache with `kache init`. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits.
@@ -177,6 +194,14 @@ If you have not run it yet, enable Kache with `kache init`. The [quick start](/d
 
 ## Build from source
 
+To install the current main branch, including features not yet in a release:
+
+```bash
+cargo install --git https://github.com/kunobi-ninja/kache --branch main --locked kache
+```
+
+Or build from a checkout:
+
 ```bash
 git clone https://github.com/kunobi-ninja/kache
 cd kache
@@ -184,3 +209,7 @@ cargo install --path . --locked
 ```
 
 A git checkout builds with the toolchain pinned in `rust-toolchain.toml`, which rustup installs on first use.
+
+Both commands install `kache` and `kache-engine`. Build locally without installing
+with `cargo build --release --bins`; keep the two outputs together if you copy
+them from `target/release/`.

@@ -1,0 +1,82 @@
+---
+title: Windows builds
+description: Install the v2 pair and check Rust, PDB, clang-cl, and CUDA eligibility
+---
+
+Install Kache through a supported [package manager](/docs/getting-started/installation)
+or extract the Windows release ZIP. Keep `kache.exe` and `kache-engine.exe` from
+the same release in the same directory. A standalone client EXE is not a complete
+v2 installation.
+
+```powershell
+kache init
+kache doctor
+kache doctor --probe
+cargo build
+```
+
+Init configures the Cargo wrapper and can register a Task Scheduler daemon.
+Windows does not use the Unix compiler-name shim farm or Unix shell-startup
+edits. For PowerShell completions, generate the script with
+`kache completions powershell` and load it from your profile.
+
+## Rust libraries and executable outputs
+
+Eligible Rust libraries use the artifact cache. Executable caching remains
+opt-in on Windows:
+
+```toml title="~/.config/kache/config.toml"
+[cache]
+cache_executables = true
+```
+
+For one PowerShell session, set `$env:KACHE_CACHE_EXECUTABLES = "1"` before the
+build. If you use the GitHub Action, configure its `cache-executables` input
+instead of relying on the CLI default.
+
+V2 pairs a cached MSVC PE executable with the sibling PDB named by its debug
+record, checking that their identities agree. Missing/mismatched PDBs, unsupported
+debug layouts, FASTLINK dependencies, and incremental-link sidecars leave the
+compile uncached. A PE without a CodeView record needs no PDB. See
+[Windows executable keys](/docs/how-it-works/cache-key) for the exact admission
+rules.
+
+Rust links can key supported `rust-lld` toolchains, compiled resource inputs,
+and modeled runtime/default-library selections. This does not make direct
+`cl.exe` object compilation cacheable. On main, DLL caching also retains import
+libraries omitted from rustc's artifact notifications.
+
+Long Rust commands can remain cacheable: RC2 moves Kache-injected arguments into
+a response file when they would overflow the Windows command line. Unsupported
+invocations still pass through.
+
+## Daemon execution
+
+The frontend keeps native compiler processes, console access, and brokered
+restores under the client's token and job lifetime. The daemon coordinates the
+cache pipeline over an authenticated named pipe.
+
+`kache doctor` reports daemon health separately from compiler-execution
+eligibility. A refused handoff can use the local engine before Commit. After
+Commit, a lost connection fails the invocation rather than rerunning it.
+
+RC2 supports an explicit trust option for certain known process-identity token
+differences. It must be enabled in both configurations and requires a daemon
+restart. Other token checks still apply. Read
+[Process restrictions](/docs/how-it-works/architecture#process-restrictions)
+before enabling it.
+
+## C/C++, CUDA, and documentation
+
+- GCC, Clang, and eligible clang-cl object compiles can use explicit prefix
+  wrapping or build-tool launcher settings. clang-cl debug objects stay
+  machine-local. See [C/C++](/docs/getting-started/c-cpp).
+- Single-source `nvcc -c` and separate-compilation object outputs can use the
+  CUDA cache, including CMake's modeled host/compiler flags. Device and final
+  links pass through. See [CUDA](/docs/getting-started/cuda).
+- Windows `cargo doc` passes through. Unix rustdoc caching also has toolchain
+  restrictions; it is not a general v2 promise for every documentation build.
+
+On volumes without copy-on-write support, restores can copy bytes. Logical
+target sizes alone do not demonstrate shared disk blocks. See
+[Storage and cleanup](/docs/getting-started/storage).

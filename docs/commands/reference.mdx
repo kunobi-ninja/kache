@@ -17,9 +17,9 @@ The envelope is documented in [`cli.schema.json`](https://github.com/kunobi-ninj
 
 | Command | Purpose |
 | --- | --- |
-| `init` | Configure Cargo, optional C/C++ shims, test pacing, and the daemon service |
+| `init` | Configure Cargo, Unix Cargo/compiler shims, test pacing, shell completions, and the daemon service |
 | `doctor` | Diagnose setup and store integrity |
-| `config` | Open the configuration editor |
+| `config` | Edit configuration interactively or inspect/change selected file values |
 | `stats` | Hit rate, time saved and cache size; `--full` for the full build report. Alias: `status` |
 | `clean` | Free disk space: remove old target directories, or empty the cache |
 | `monitor` | Open the live dashboard |
@@ -364,6 +364,11 @@ JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `in
 
 Raw compiler events at schema 26 add `rebuilt_package`, `rebuilt_fingerprint`, `rebuilt_path` and `rebuilt_paths` when an actual successful compile produced outputs. Unknown package metadata is omitted. `rebuilt_fingerprint` is Kache's input cache key, not Cargo's on-disk freshness hash. Cache restores and Fresh Cargo artifacts do not report a rebuild. Tagged cleanup records report removed units separately from compiler `BuildEvent` records.
 
+That is the event generation which introduced these fields, not the versioned
+CLI JSON schema. Raw event logs and cache-index layouts are private interfaces;
+use the documented report/envelope schemas for scripts. See
+[Compatibility](/docs/compatibility).
+
 Every report format totals the wrapper's phases per crate: startup, key computation, lookup, scheduler wait, restore or store, and the unattributed remainder. Startup runs from process start to wrapper entry. Key computation splits out the rustc dep-info pre-pass by time and run count. Scheduler wait is the flight join plus permit acquisition. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
 
 In the trace output each crate slice carries these numbers in its `args`. It nests one `X` slice per phase on the same lane, in this order: `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice. A remote transfer that has both a start and a finish follows the crate slices as an async `b`/`e` pair with category `kache.transfer`.
@@ -408,11 +413,16 @@ Without a crate, `explain` reads the latest recorded build and says why it misse
 | own inputs changed | Its sources, compiler flags, profile or features, an environment variable it reads, its linker, or its path remapping changed |
 | differs from the build in another checkout | The first build of the crate in this tree, and its inputs differ from the same crate built in another checkout. `kache explain <crate>` names the input. A path into the checkout that Kache did not map needs `KACHE_BASE_DIR`; a C or C++ library a build script generated with the checkout's path or a timestamp in it needs prefix maps and `ZERO_AR_DATE`; a flag or file that really differs needs nothing |
 | no earlier compile | The first build of the crate in this tree, or older history was rotated away |
-| unexplained | Nothing recorded why; `[cache] explain_miss = true` records it from the next build |
+| miss details were not recorded | The retained event lacks key-comparison details; `[cache] explain_miss = true` records them from the next build. Older releases call this unexplained |
 
 The report ends with the command that explains the costliest crate, and the one that writes the build's timeline as a Perfetto trace. `--root` limits it to builds of one tree. It exits 0; the hidden `kache diff` prints the miss counts and unexplained shares of the two builds and exits 1 when either grew, for scripts that gate on that. `kache why-miss` is the same command under its earlier name.
 
 ### One crate
+
+Explanations use retained historical data. Main dates the selected build and
+distinguishes missing diagnostics from a known input change. Enabling recording
+cannot reconstruct earlier data. See
+[Historical diagnostics](/docs/getting-started/troubleshooting#miss-details-or-old-errors-are-missing-from-history).
 
 ```bash
 kache explain serde

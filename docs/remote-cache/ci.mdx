@@ -12,10 +12,22 @@ steps:
   - uses: actions/checkout@v4
   - uses: dtolnay/rust-toolchain@stable
   - uses: kunobi-ninja/kache-action@v1
+    with:
+      version: v2.0.0-rc.2
   - run: cargo build --locked
 ```
 
 See the [kache-action repository](https://github.com/kunobi-ninja/kache-action) for its current input reference and release notes.
+
+The version input pins the v2 preview; omitting it selects the stable channel.
+The action installs the matching client/engine pair. Its `cache-executables`
+input defaults to `false`, independently of the CLI's Linux/macOS default; set
+that input explicitly if the job should cache eligible Rust executable outputs.
+The action's C/C++ wrapper setup is also opt-in through `cache-c-cpp`.
+
+Custom container images must copy both `kache` and `kache-engine` from the same
+release. A Docker stage containing only the client cannot run CLI commands,
+bootstrap its daemon, or use the local-engine fallback.
 
 For S3-compatible storage:
 
@@ -142,7 +154,7 @@ Kache reads one config file: `KACHE_CONFIG` if set, else the nearest `.kache.tom
 
 `--no-service` keeps the daemon out of a login service. Without it, `init` installs one on macOS, on Windows and on Linux hosts with a systemd user session, and that daemon runs with the service's environment instead of the job's credentials.
 
-`kache daemon stop` lets the daemon work through its upload queue before it exits, so run it before the runner goes away. The daemon gives the queue 30 seconds. Uploads still queued after that stay in the store's upload queue and go out the next time a daemon starts on that store, so they are lost on a runner that discards its store. The command waits up to 35 seconds and fails if the daemon is still draining. It also fails when no daemon is running.
+`kache daemon stop` lets the daemon work through its upload queue before it exits, so run it before the runner goes away. The daemon gives the queue 30 seconds. Uploads still queued after that stay in the store's upload queue and go out the next time a daemon starts on that store, so they are lost on a runner that discards its store. The command waits up to 35 seconds and fails if the daemon is still draining. Stopping an already-stopped daemon succeeds.
 
 `kache sync --push` does not replace the daemon: inside a Cargo workspace it uploads only the workspace's own crates, without their dependencies. The daemon keeps credentials from the environment, so they can stay in `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, the runner's secret store, or the standard cloud identity chain. Use `--allow-partial` only when cache failure must not fail the job.
 

@@ -282,6 +282,7 @@ impl Platform for MacOsPlatform {
 }
 
 /// What to do at the dsymutil spawn for one macOS binary.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum DebugBundleSpawn {
     /// Packed debug info left no bundle, or this output is not Mach-O.
     /// Cache the binary and do not warn.
@@ -296,6 +297,7 @@ enum DebugBundleSpawn {
 ///
 /// `host_os` is [`std::env::consts::OS`] in production. Tests pass `"macos"`
 /// so the spawn decision runs on hosts that are not macOS.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn package_macos_debug_bundle(
     env: &InvocationEnv,
     binary: &Path,
@@ -374,6 +376,7 @@ fn package_macos_debug_bundle(
 /// that it cannot open those objects and the new bundle drops compile
 /// units. `"unpacked"` keeps the objects, so dsymutil still runs.
 /// `split-debuginfo=off` never reaches here.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn debug_bundle_spawn(
     binary: &Path,
     bundle_dir: &Path,
@@ -395,6 +398,7 @@ fn debug_bundle_spawn(
 
 /// `packed`, or no `-Csplit-debuginfo` at all. rustc's macOS default for
 /// an absent flag is packed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn split_debuginfo_already_packed(split_debuginfo: Option<&str>) -> bool {
     matches!(split_debuginfo, None | Some("packed"))
 }

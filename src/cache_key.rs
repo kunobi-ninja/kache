@@ -1707,14 +1707,22 @@ pub fn dep_info_provided() -> bool {
 /// The files of the closure [`provide_dep_info`] left for the next key,
 /// spelled as [`FileFingerprint`] records their paths.
 pub(crate) fn provided_dep_info_sources_for(
-    env: &InvocationEnv,
+    file_hasher: &FileHasher<'_>,
 ) -> Option<std::collections::HashSet<String>> {
     PROVIDED_DEP_INFO.with(|cell| {
         cell.borrow().as_ref().and_then(|(dep_info, _)| {
             dep_info
                 .source_files
                 .iter()
-                .map(|path| Some(env.resolve(path)?.to_string_lossy().into_owned()))
+                .map(|path| {
+                    Some(
+                        file_hasher
+                            .resolve_path(path)
+                            .ok()?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
                 .collect::<Option<_>>()
         })
     })

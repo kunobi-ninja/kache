@@ -19815,6 +19815,20 @@ fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
     let plain = out.join("consts.rs");
     let dotted = PathBuf::from(format!("{}/./consts.rs", out.display()));
     let collapsed = lexically_resolve_path(&plain.to_string_lossy());
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![plain.clone(), dotted.clone()],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let emitted_sources = provided_dep_info_sources_for(&hasher).unwrap();
+    PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take());
+    assert_eq!(
+        emitted_sources,
+        std::collections::HashSet::from([collapsed.clone()]),
+        "the post-compile guard must use the spelling recorded by the hasher"
+    );
     // Hash the dotted spelling first and read the fingerprint before the plain
     // spelling can overwrite the one map entry.
     let dotted_hash = hasher.hash(&dotted).unwrap();

@@ -6290,7 +6290,7 @@ fn prediction_fetch_deadline_uses_the_shorter_enabled_budget() {
 }
 
 #[tokio::test]
-async fn prediction_fetch_deadline_cancels_stalled_get_and_degrades_reads() {
+async fn prediction_fetch_deadline_cancels_stalled_get_without_degrading_reads() {
     let dir = tempfile::tempdir().unwrap();
     let mut daemon = resilience_test_daemon(dir.path(), Arc::new(StallingGetBackend));
     daemon.config.remote_restore_timeout_secs = 1;
@@ -6306,16 +6306,15 @@ async fn prediction_fetch_deadline_cancels_stalled_get_and_degrades_reads() {
     assert!(response.ok);
     assert_eq!(response.prediction, None);
     assert!(
-        daemon.remote_breaker.is_degraded(),
-        "the cancelled GET must count as a failure"
+        !daemon.remote_breaker.is_degraded(),
+        "a local prediction deadline must not count as a remote failure"
     );
     let request = fetch_request(ROW_IDENTITY);
     let next = daemon.handle_prediction_fetch(&request);
     tokio::pin!(next);
     assert!(
-        matches!(futures::poll!(&mut next), std::task::Poll::Ready(response)
-        if response.ok && response.prediction.is_none()),
-        "later requests must answer immediately"
+        futures::poll!(&mut next).is_pending(),
+        "later requests must still be admitted to the remote"
     );
 }
 
@@ -6449,7 +6448,7 @@ impl crate::remote_backend::RemoteBackend for BlockingIdentityBackend {
 
 struct FailingIdentityBackend {
     inner: Arc<dyn crate::remote_backend::RemoteBackend>,
-    kind: std::io::ErrorKind,
+    kind: Option<std::io::ErrorKind>,
     identity_keys: Mutex<Vec<String>>,
 }
 
@@ -6466,7 +6465,10 @@ impl crate::remote_backend::RemoteBackend for FailingIdentityBackend {
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         if key.contains("/_manifests/") {
             self.identity_keys.lock().unwrap().push(key.to_string());
-            return Err(std::io::Error::new(self.kind, "classified manifest failure").into());
+            if let Some(kind) = self.kind {
+                return Err(std::io::Error::new(kind, "classified manifest failure").into());
+            }
+            RemoteDeadline::from_instant(Some(Instant::now())).check("identity manifest")?;
         }
         self.inner.get(key, max_bytes).await
     }
@@ -6546,6 +6548,71 @@ impl crate::remote_backend::RemoteBackend for PutFailBackend {
 
     fn describe(&self, key: &str) -> String {
         format!("failure://test/{key}")
+    }
+}
+
+struct DeadlineUploadBackend {
+    fail_head: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for DeadlineUploadBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        if self.fail_head {
+            RemoteDeadline::from_instant(Some(Instant::now())).check("upload HEAD")?;
+        }
+        Ok(false)
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        panic!("upload must not GET");
+    }
+
+    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        RemoteDeadline::from_instant(Some(Instant::now())).check("upload PUT")
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        panic!("upload must not list");
+    }
+
+    fn describe(&self, key: &str) -> String {
+        format!("deadline://test/{key}")
+    }
+}
+
+#[tokio::test]
+async fn upload_deadlines_remain_retryable_without_degrading_remote_health() {
+    for fail_head in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(resilience_test_daemon(
+            dir.path(),
+            Arc::new(DeadlineUploadBackend { fail_head }),
+        ));
+        let key = test_cache_key("deadline-upload");
+        seed_store_entry(&daemon.config, &key, "serde", dir.path());
+        let job = persist_upload_job(
+            &daemon.config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: String::new(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+                client_version: None,
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let response = daemon.do_upload(&job).await;
+            assert!(!response.ok);
+            assert!(response.error.unwrap().starts_with("retryable:"));
+        }
+        assert!(!daemon.remote_breaker.is_degraded());
+        assert!(upload_spool_path(&daemon.config, &key).is_file());
     }
 }
 
@@ -11667,6 +11734,75 @@ async fn demand_queue_timeouts_do_not_suppress_recovery_after_permits_are_releas
 }
 
 #[tokio::test]
+async fn demand_deadlines_do_not_suppress_a_healthy_remote_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = test_remote_backend();
+    let recovery = check_request(dir.path(), "in-flight-deadline-recovery");
+    put_test_object(
+        &inner,
+        &test_pack_object_key(&recovery.key, &recovery.crate_name),
+        &build_entry_pack(&recovery.key, &recovery.crate_name),
+    )
+    .await;
+    let backend = Arc::new(DirectRestoreBackend {
+        inner,
+        gets: 0.into(),
+        started: tokio::sync::Semaphore::new(0),
+        release: Some(tokio::sync::Semaphore::new(0)),
+    });
+    let daemon = resilience_test_daemon(dir.path(), backend.clone());
+
+    for label in ["in-flight-one", "in-flight-two", "in-flight-three"] {
+        let mut request = check_request(dir.path(), label);
+        request.deadline_ms = Some(200);
+        let response = daemon.handle_remote_check(&request).await;
+        assert!(
+            response.ok,
+            "a local deadline must return a miss: {response:?}"
+        );
+        assert_eq!(response.found, Some(false));
+    }
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 3);
+    assert_eq!(daemon.negative_keys.len(), 0);
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_failed
+            .load(Ordering::Relaxed),
+        3
+    );
+    assert!(
+        !daemon.remote_breaker.is_degraded(),
+        "local deadlines are not evidence of a remote outage"
+    );
+
+    backend.release.as_ref().unwrap().add_permits(1);
+    let response = daemon.handle_remote_check(&recovery).await;
+    assert!(response.ok, "{response:?}");
+    assert_eq!(
+        response.found,
+        Some(true),
+        "a healthy remote hit must remain available after three expired demand budgets"
+    );
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_suppressed
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(
+        daemon
+            .config
+            .store_dir()
+            .join(&recovery.key)
+            .join("meta.json")
+            .is_file()
+    );
+}
+
+#[tokio::test]
 async fn demand_queue_errors_preserve_prior_remote_failures() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
@@ -11701,8 +11837,7 @@ async fn demand_queue_errors_preserve_prior_remote_failures() {
 }
 
 /// #327: a restore that exceeds `remote_restore_timeout_secs` is dropped
-/// and answered as a miss within the deadline, and the timeout feeds the
-/// breaker.
+/// and answered as a miss within the deadline, without changing remote health.
 #[tokio::test]
 async fn test_restore_deadline_returns_miss_instead_of_hanging() {
     let dir = tempfile::tempdir().unwrap();
@@ -14016,7 +14151,7 @@ async fn speculative_error_class_controls_retry_without_repeating_permanent_fail
     transient_config.remote = Some(test_remote_config());
     let transient_backend = Arc::new(FailingIdentityBackend {
         inner: test_remote_backend(),
-        kind: std::io::ErrorKind::ConnectionReset,
+        kind: Some(std::io::ErrorKind::ConnectionReset),
         identity_keys: Mutex::new(Vec::new()),
     });
     let mut transient_daemon = Daemon::new(transient_config);
@@ -14060,7 +14195,7 @@ async fn speculative_error_class_controls_retry_without_repeating_permanent_fail
     permanent_config.remote = Some(test_remote_config());
     let permanent_backend = Arc::new(FailingIdentityBackend {
         inner: test_remote_backend(),
-        kind: std::io::ErrorKind::PermissionDenied,
+        kind: Some(std::io::ErrorKind::PermissionDenied),
         identity_keys: Mutex::new(Vec::new()),
     });
     let permanent_daemon = Arc::new(Daemon::new(permanent_config));
@@ -14112,41 +14247,50 @@ async fn speculative_error_class_controls_retry_without_repeating_permanent_fail
 async fn speculative_timeout_is_not_retried_within_build_started() {
     let _lock = crate::config::config_path_lock();
     let _manifest_key = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.remote = Some(test_remote_config());
-    let backend = Arc::new(FailingIdentityBackend {
-        inner: test_remote_backend(),
-        kind: std::io::ErrorKind::TimedOut,
-        identity_keys: Mutex::new(Vec::new()),
-    });
-    let daemon = Arc::new(Daemon::new(config));
-    daemon.set_remote_backend_for_test(backend.clone());
-    let intent = kache_core::BuildIntent {
-        identity_key: Some("id/test".into()),
-        crate_names: vec!["serde".into()],
-        ..Default::default()
-    };
+    for (kind, expected) in [
+        (
+            Some(std::io::ErrorKind::TimedOut),
+            RemoteErrorClass::Timeout,
+        ),
+        (None, RemoteErrorClass::Deadline),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = Arc::new(FailingIdentityBackend {
+            inner: test_remote_backend(),
+            kind,
+            identity_keys: Mutex::new(Vec::new()),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
 
-    let outcome =
-        crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent).await;
-    assert!(matches!(
-        &outcome,
-        crate::fallback_planner::SpeculativeIdentityOutcome::NonRetryableFailures(failures)
-            if failures.len() == 1 && failures[0].1 == RemoteErrorClass::Timeout
-    ));
-    assert_eq!(backend.identity_keys.lock().unwrap().len(), 1);
+        let outcome =
+            crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent)
+                .await;
+        assert!(matches!(
+            &outcome,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NonRetryableFailures(failures)
+                if failures.len() == 1 && failures[0].1 == expected
+        ));
+        assert_eq!(backend.identity_keys.lock().unwrap().len(), 1);
 
-    let plan =
-        crate::fallback_planner::build_prefetch_plan_with_identity(&daemon, &intent, outcome)
-            .await
-            .unwrap();
-    assert!(plan.candidates.is_empty());
-    assert_eq!(
-        backend.identity_keys.lock().unwrap().len(),
-        1,
-        "a timed-out speculative GET must not start a second manifest deadline"
-    );
+        let plan =
+            crate::fallback_planner::build_prefetch_plan_with_identity(&daemon, &intent, outcome)
+                .await
+                .unwrap();
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            backend.identity_keys.lock().unwrap().len(),
+            1,
+            "a timed-out speculative GET must not start a second manifest deadline"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -14955,16 +15099,20 @@ async fn upload_retirement_reports_flush_errors_and_skips_already_missing_intent
     }
 }
 
-struct TransientThenTerminalUploadBackend {
+struct RetryableThenTerminalUploadBackend {
     heads: AtomicU64,
     first_failure: tokio::sync::Semaphore,
+    deadline: bool,
 }
 
 #[async_trait::async_trait]
-impl crate::remote_backend::RemoteBackend for TransientThenTerminalUploadBackend {
+impl crate::remote_backend::RemoteBackend for RetryableThenTerminalUploadBackend {
     async fn head(&self, _key: &str) -> Result<bool> {
         if self.heads.fetch_add(1, Ordering::Relaxed) == 0 {
             self.first_failure.add_permits(1);
+            if self.deadline {
+                RemoteDeadline::from_instant(Some(Instant::now())).check("upload HEAD")?;
+            }
             let error = std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "temporary upload refusal",
@@ -14997,11 +15145,12 @@ impl crate::remote_backend::RemoteBackend for TransientThenTerminalUploadBackend
 
 #[tokio::test]
 async fn retried_upload_keeps_its_intent_until_cancellation_or_a_terminal_outcome() {
-    for cancel in [true, false] {
+    for (deadline, cancel) in [(false, true), (false, false), (true, true), (true, false)] {
         let dir = tempfile::tempdir().unwrap();
-        let backend = Arc::new(TransientThenTerminalUploadBackend {
+        let backend = Arc::new(RetryableThenTerminalUploadBackend {
             heads: AtomicU64::new(0),
             first_failure: tokio::sync::Semaphore::new(0),
+            deadline,
         });
         let daemon = Arc::new(resilience_test_daemon(dir.path(), backend.clone()));
         let key = test_cache_key("retry-upload-retirement");

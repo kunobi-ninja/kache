@@ -97,7 +97,7 @@ pub async fn resolve_identity_candidates_speculative(
                     RemoteErrorClass::Transient => {
                         retryable_failures.push((key.clone(), class));
                     }
-                    RemoteErrorClass::Timeout => {
+                    RemoteErrorClass::Timeout | RemoteErrorClass::Deadline => {
                         return SpeculativeIdentityOutcome::NonRetryableFailures(vec![(
                             key.clone(),
                             class,

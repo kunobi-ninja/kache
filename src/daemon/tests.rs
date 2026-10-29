@@ -14859,7 +14859,9 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
         "inject mock backend"
     );
     daemon.pending_uploads.write().await.insert(key.clone());
-    let resp = run_upload_job(&daemon, &job).await;
+    let resp = tokio::time::timeout(Duration::from_secs(5), run_upload_job(&daemon, &job))
+        .await
+        .expect("a permanent upload refusal must finish without retrying");
     assert!(!resp.ok, "the remote refuses the PUT: {resp:?}");
     assert!(
         !upload_spool_path(&config, &key).exists(),

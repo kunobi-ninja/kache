@@ -457,11 +457,30 @@ pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
     {
         volume_usage_unix(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        volume_usage_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None
     }
+}
+
+/// Windows: [`capacity::volume_space`] (`GetDiskFreeSpaceExW`) on `path`,
+/// which must be a directory that exists. Without this, disk recovery, the
+/// low-disk sweep and the daemon's free-space check never ran on Windows.
+#[cfg(windows)]
+fn volume_usage_windows(path: &Path) -> Option<VolumeUsage> {
+    use std::os::windows::ffi::OsStrExt;
+    // An empty name, or one cut short by a NUL, would ask about the
+    // current directory's disk instead.
+    let mut wide = path.as_os_str().encode_wide();
+    if path.as_os_str().is_empty() || wide.any(|unit| unit == 0) {
+        return None;
+    }
+    capacity::volume_space(path)
 }
 
 #[cfg(unix)]
@@ -868,7 +887,6 @@ mod tests {
         assert_eq!(blocks.free, 16384);
     }
 
-    #[cfg(unix)]
     #[test]
     fn volume_query_requires_a_real_path() {
         let dir = TempDir::new("volume-usage");
@@ -878,13 +896,6 @@ mod tests {
         assert!(usage.free <= usage.total);
         assert!(volume_usage(&dir.path().join("missing")).is_none());
         assert!(volume_usage(Path::new("\0")).is_none());
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn unavailable_volume_usage_remains_unknown() {
-        let dir = TempDir::new("volume-usage");
-        assert!(volume_usage(dir.path()).is_none());
     }
 
     #[test]

@@ -226,6 +226,10 @@ gitignore = true
 # platform adapters explicitly. The Ubuntu mutation lane cannot compile those
 # adapters; macOS and Windows tests exercise them. The portable APFS allocation
 # classifier, extent walker and Windows identity assembly stay in scope.
+# `volume_usage_windows` is the Windows arm of `kache_fs::volume_usage`: a
+# guard against an empty or NUL-cut path in front of `capacity::volume_space`.
+# Linux does not compile it; the Windows run of
+# `volume_query_requires_a_real_path` covers the guard and the answer.
 # TempDir is fixture setup and cleanup, exposed by the testing feature for
 # consumer tests; mutating it tests the harness instead of filesystem behavior.
 # windows_identity combines a shifted u32 with an unshifted u32. Their bits do
@@ -359,6 +363,7 @@ exclude_re = [
     "crates/kache-fs/src/identity.rs:.*windows_handle_identity",
     "crates/kache-fs/src/identity.rs:.*replace \\| with \\^ in windows_identity",
     "crates/kache-fs/src/lib.rs:.*testutil::",
+    "crates/kache-fs/src/lib.rs:.*volume_usage_windows",
     "replace run_config_editor",
     "replace run_monitor",
     # `run_monitor` keeps one check of its own: refusing to start when stdout

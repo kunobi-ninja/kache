@@ -405,11 +405,11 @@ fn assert_long_engine_handoff(declined: bool) {
         frontend.as_os_str().encode_wide().count() + 4 + tail.encode_utf16().count(),
         32_750
     );
+    let decline_socket = fixture.path("runtime").join("declined.sock");
     let server = declined.then(|| {
         use kache_ipc::prelude::*;
-        let socket = fixture.path("runtime/daemon.sock");
         let listener = kache_ipc::ListenerOptions::new()
-            .name(kache_ipc::socket_name(&socket).unwrap())
+            .name(kache_ipc::socket_name(&decline_socket).unwrap())
             .nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
             .create_sync()
             .unwrap();
@@ -447,7 +447,10 @@ fn assert_long_engine_handoff(declined: bool) {
         if declined {
             // Keep the initial delegation attempt; skip cold-daemon bootstrap
             // after the controlled pre-Commit refusal. No nested-wrapper flag.
-            command.env("KACHE_DISABLED", "1");
+            command
+                .env("KACHE_DISABLED", "1")
+                // Windows hashes the literal path, including its separators.
+                .env("KACHE_SOCKET_PATH", &decline_socket);
         } else {
             command.env("KACHE_ACTIVE", "1");
         }

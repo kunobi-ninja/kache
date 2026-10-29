@@ -50,7 +50,7 @@ pub fn engine_entry(mut args: Vec<OsString>, version: &str) -> Result<EngineEntr
             })
         };
         frontend = Some(kache_shims::FrontendImage { path, identity });
-        args = args.into_iter().skip(6).collect();
+        args = crate::argv_file::expand(args.into_iter().skip(6).collect())?;
         ensure!(!args.is_empty(), "missing forwarded Kache argv");
     }
     Ok(EngineEntry {

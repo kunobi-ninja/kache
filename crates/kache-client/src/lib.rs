@@ -13,6 +13,7 @@ pub use stdio::Stdio;
 mod creation_mask;
 #[cfg(unix)]
 pub use creation_mask::creation_mask;
+mod argv_file;
 mod frontend;
 pub use frontend::run;
 

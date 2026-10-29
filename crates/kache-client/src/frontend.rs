@@ -80,7 +80,8 @@ fn forward_engine(
     args: &[OsString],
     started_at: std::time::Instant,
 ) -> Result<i32> {
-    let mut command = engine_command(executable, version, args, started_at)?;
+    let (mut command, _argv_file) =
+        forwarded_command(executable, version, args, started_at, cfg!(windows))?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -91,6 +92,23 @@ fn forward_engine(
         let status = command.status().context("starting the Kache engine")?;
         Ok(status.code().unwrap_or(1))
     }
+}
+
+fn forwarded_command(
+    executable: &std::path::Path,
+    version: &str,
+    args: &[OsString],
+    started_at: std::time::Instant,
+    windows: bool,
+) -> Result<(Command, Option<crate::argv_file::ArgvFile>)> {
+    let command = engine_command(executable, version, args, started_at)?;
+    if !windows || !crate::argv_file::command_too_long(&command) {
+        return Ok((command, None));
+    }
+    let file = crate::argv_file::ArgvFile::new(args)?;
+    let compact_args = [OsString::from(crate::argv_file::FLAG), file.path().into()];
+    let command = engine_command(executable, version, &compact_args, started_at)?;
+    Ok((command, Some(file)))
 }
 
 fn engine_command(
@@ -149,6 +167,77 @@ fn engine_only(args: &[OsString]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_windows_handoff_uses_a_file_and_preserves_the_versioned_envelope() {
+        let root = tempfile::tempdir().unwrap();
+        let frontend = root
+            .path()
+            .join(if cfg!(windows) { "kache.exe" } else { "kache" });
+        let engine = root.path().join(if cfg!(windows) {
+            "kache-engine.exe"
+        } else {
+            "kache-engine"
+        });
+        for path in [&frontend, &engine] {
+            std::fs::write(path, "image").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let frontend = frontend.canonicalize().unwrap();
+        let args = vec!["kache".into(), "rustc".into(), "x".repeat(32_750).into()];
+        let started = std::time::Instant::now();
+        for windows in [false, true] {
+            let (mut command, file) =
+                forwarded_command(&frontend, "fixture", &args, started, windows).unwrap();
+            let argv: Vec<_> = std::iter::once(command.get_program().to_owned())
+                .chain(command.get_args().map(OsString::from))
+                .collect();
+            assert_eq!(argv[1], crate::FORWARDED_ARGV_FLAG);
+            assert_eq!(argv[2], "fixture");
+            assert_eq!(
+                crate::engine_entry(argv.clone(), "fixture").unwrap().args,
+                args
+            );
+            assert!(
+                crate::engine_entry(argv, "old-version")
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("releases differ")
+            );
+            assert_eq!(file.is_some(), windows);
+            assert_eq!(crate::argv_file::command_too_long(&command), !windows);
+            if let Some(file) = file {
+                let path = file.path().to_owned();
+                std::fs::remove_file(&engine).unwrap();
+                assert!(command.status().is_err());
+                drop(file);
+                assert!(
+                    !path.exists(),
+                    "failed engine spawn must clean its argv file"
+                );
+            }
+        }
+        std::fs::write(&engine, "image").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (_, file) = forwarded_command(
+            &frontend,
+            "fixture",
+            &["kache".into(), "--help".into()],
+            started,
+            true,
+        )
+        .unwrap();
+        assert!(file.is_none(), "short invocations stay inline");
+    }
 
     #[test]
     fn commands_flags_and_cargo_go_to_the_engine_before_configuration() {

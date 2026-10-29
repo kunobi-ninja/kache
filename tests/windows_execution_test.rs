@@ -8,7 +8,9 @@ use kache_ipc::windows_process::Job;
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -364,6 +366,49 @@ fn response_file_handles_injected_remaps_that_alone_exceed_the_windows_limit() {
     assert_eq!(events[0]["result"], "miss", "{events:#?}");
     assert_eq!(events[1]["result"], "local_hit", "{events:#?}");
     assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
+}
+
+#[test]
+fn local_engine_handoff_handles_a_command_that_only_fits_before_forwarding() {
+    let fixture = Fixture::new();
+    let rustc = fixture.rustc();
+    std::fs::create_dir(fixture.path("work/out")).unwrap();
+    std::fs::write(fixture.path("work/lib.rs"), "#[cfg(not(should_arrive))] compile_error!(\"lost trailing argv\"); pub fn answer() -> u32 {42}\n").unwrap();
+    let frontend = fixture.path("install/kache.exe");
+    let prefix = format!(
+        "\"{}\" --crate-name argv_transport --crate-type=rlib --emit=link --out-dir out --cfg ",
+        rustc.display()
+    );
+    let suffix = " --cfg should_arrive lib.rs";
+    // raw_arg gives an independent exact CreateProcessW line size: quoted
+    // program + separating space + this raw tail + terminating NUL.
+    let fixed = frontend.as_os_str().encode_wide().count()
+        + 4
+        + prefix.encode_utf16().count()
+        + suffix.encode_utf16().count();
+    let padding = "p".repeat(32_750 - fixed);
+    let tail = format!("{prefix}{padding}{suffix}");
+    assert_eq!(
+        frontend.as_os_str().encode_wide().count() + 4 + tail.encode_utf16().count(),
+        32_750
+    );
+    let build = || {
+        let mut command = fixture.command(&frontend);
+        // Force the supported nested-wrapper local path, independent of the
+        // runner's token compatibility with a daemon.
+        command.env("KACHE_ACTIVE", "1").raw_arg(&tail);
+        command
+    };
+    fixture.success(&mut build());
+    assert!(fixture.path("work/out/libargv_transport.rlib").is_file());
+    std::fs::write(
+        fixture.path("work/lib.rs"),
+        "compile_error!(\"argv transport compiler diagnostic\");\n",
+    )
+    .unwrap();
+    let output = fixture.run(&mut build());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("argv transport compiler diagnostic"));
 }
 
 #[test]

@@ -1870,7 +1870,7 @@ pub(crate) struct Daemon {
     /// Upserted by CompileStarted, removed by CompileFinished, and pruned by
     /// liveness/age on both read (stats) and write (register) paths — a
     /// crashed wrapper must not leave a ghost entry forever.
-    in_flight_compiles: std::sync::Mutex<HashMap<u32, CompileStartedRequest>>,
+    in_flight_compiles: std::sync::Mutex<HashMap<u32, InFlightCompile>>,
     version: String,
     /// What this daemon actually loaded, reported in every stats response so
     /// daemon-backed CLI reads can render the daemon's view and name a
@@ -3226,7 +3226,18 @@ impl Daemon {
     pub fn handle_compile_started(&self, req: CompileStartedRequest) -> Response {
         if let Ok(mut map) = self.in_flight_compiles.lock() {
             prune_in_flight(&mut map);
-            map.insert(req.pid, req);
+            // The first-tick refresh keeps the process the first register saw.
+            let process = match map.get(&req.pid) {
+                Some(entry) if entry.compile.started_at_ms == req.started_at_ms => entry.process,
+                _ => crate::process_identity::ProcessIdentity::of(req.pid),
+            };
+            map.insert(
+                req.pid,
+                InFlightCompile {
+                    compile: req,
+                    process,
+                },
+            );
         }
         Response::ok()
     }
@@ -3266,7 +3277,7 @@ impl Daemon {
     pub fn handle_compile_finished(&self, req: &CompileFinishedRequest) -> Response {
         if let Ok(mut map) = self.in_flight_compiles.lock()
             && let Some(entry) = map.get(&req.pid)
-            && (req.started_at_ms == 0 || entry.started_at_ms == req.started_at_ms)
+            && (req.started_at_ms == 0 || entry.compile.started_at_ms == req.started_at_ms)
         {
             map.remove(&req.pid);
         }
@@ -3283,7 +3294,7 @@ impl Daemon {
         let now_ms = unix_time_ms();
         let mut entries: Vec<InFlightEntry> = map
             .values()
-            .map(|c| {
+            .map(|InFlightCompile { compile: c, .. }| {
                 let elapsed_s = now_ms.saturating_sub(c.started_at_ms) / 1000;
                 let typical_s = c.typical_ms.map(|ms| ms.div_ceil(1000));
                 InFlightEntry {
@@ -9057,40 +9068,26 @@ pub fn send_prestage(config: &Config, target_dir: &Path) {
     }
 }
 
-/// Max age before an in-flight compile entry is dropped even if a process
-/// with that PID is still alive — PID reuse must not resurrect a ghost.
+/// Max age before an in-flight compile entry is dropped even while its
+/// process runs: where the platform reports no process start, only age
+/// keeps PID reuse from resurrecting a ghost.
 const IN_FLIGHT_MAX_AGE_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// An in-flight compile and the process its PID named when it registered.
+struct InFlightCompile {
+    compile: CompileStartedRequest,
+    process: crate::process_identity::ProcessIdentity,
+}
 
 /// Drop registry entries whose process is gone or whose age is absurd. Called
 /// on both the register and snapshot paths (kunobi-ninja/kache#131) — a
 /// wrapper killed by OOM or ^C never sends CompileFinished.
-fn prune_in_flight(map: &mut HashMap<u32, CompileStartedRequest>) {
+fn prune_in_flight(map: &mut HashMap<u32, InFlightCompile>) {
     let now = unix_time_ms();
-    map.retain(|&pid, c| {
-        now.saturating_sub(c.started_at_ms) <= IN_FLIGHT_MAX_AGE_MS && pid_alive(pid)
+    map.retain(|_, entry| {
+        now.saturating_sub(entry.compile.started_at_ms) <= IN_FLIGHT_MAX_AGE_MS
+            && entry.process.is_running()
     });
-}
-
-/// Is a process with this PID alive? `kill(pid, 0)` probes without signaling:
-/// success or EPERM (alive, not ours) both mean alive; ESRCH means gone.
-///
-/// This runs inside a `retain` over every in-flight compile, so it stays a
-/// bare probe rather than [`process_is_alive`]. It refuses PIDs 0 and 1, because
-/// `kill(-1, 0)` succeeds whenever anything is signalable and would keep
-/// bogus entries alive in the map forever.
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    if pid <= 1 || i32::try_from(pid).is_err() {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// No cheap portable probe off unix — age-based pruning still applies.
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    true
 }
 
 /// Register an in-flight compile (kunobi-ninja/kache#131). Fire-and-forget

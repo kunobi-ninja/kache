@@ -59,6 +59,7 @@ mod prediction_share;
 mod prestage;
 mod probe;
 mod probe_memo;
+mod process_identity;
 mod remote;
 mod remote_backend;
 mod remote_layout;

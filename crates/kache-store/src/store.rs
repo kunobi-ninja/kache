@@ -668,6 +668,58 @@ fn remove_stale_lock_file(
     locked_stale && lock_file_is_at_path(&file, path) && fs::remove_file(path).is_ok()
 }
 
+/// Unlink up to `cap` lock files in `dir` that `is_lock_name` accepts and
+/// that are stale and unheld, by the rules of the key lock sweep
+/// ([`remove_stale_lock_file`]). For lock directories outside `store/` that
+/// grow with every distinct key, such as the scheduler's flights. A missing
+/// or unreadable directory counts as empty.
+pub fn sweep_stale_lock_files(
+    dir: &Path,
+    is_lock_name: impl Fn(&str) -> bool,
+    min_age: Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> KeyLockSweepStats {
+    sweep_lock_dir(
+        dir,
+        |name| is_lock_name(name).then_some(true),
+        min_age,
+        cap,
+        now,
+    )
+}
+
+/// Walk `dir` once. `removable` sorts each name: `None` is not a lock file,
+/// `Some(false)` is one to count but keep, `Some(true)` one to unlink when
+/// it is stale and unheld.
+fn sweep_lock_dir(
+    dir: &Path,
+    removable: impl Fn(&str) -> Option<bool>,
+    min_age: Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> KeyLockSweepStats {
+    let mut stats = KeyLockSweepStats::default();
+    let Ok(names) = fs::read_dir(dir) else {
+        return stats;
+    };
+    for name in names.flatten() {
+        let name = name.file_name();
+        let Some(removable) = name.to_str().and_then(&removable) else {
+            continue;
+        };
+        stats.seen += 1;
+        // Past the cap the walk only counts, which costs no stat.
+        if stats.removed >= cap || !removable {
+            continue;
+        }
+        if remove_stale_lock_file(&dir.join(&name), min_age, now, || {}) {
+            stats.removed += 1;
+        }
+    }
+    stats
+}
+
 fn metadata_is_stale(meta: &fs::Metadata, now: std::time::SystemTime, min_age: Duration) -> bool {
     meta.modified()
         .is_ok_and(|modified| key_lock_is_stale(modified, now, min_age))
@@ -1019,6 +1071,14 @@ pub struct HousekeepingStats {
     pub predictions_pruned: usize,
     /// File hash memo rows deleted as not written for a month (#1206).
     pub file_hashes_pruned: usize,
+    /// Scheduler flight files (compile and discovery flights) unlinked as
+    /// stale. Filled by the caller that sweeps the scheduler's directory.
+    #[serde(default)]
+    pub flights_removed: usize,
+    /// Flight files left after the pass: recent or held ones, and whatever
+    /// the per-sweep cap deferred.
+    #[serde(default)]
+    pub flights_remaining: usize,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
@@ -4366,30 +4426,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         now: std::time::SystemTime,
     ) -> Result<KeyLockSweepStats> {
         self.refuse_write("sweep key locks")?;
-        let mut stats = KeyLockSweepStats::default();
-        let Ok(names) = fs::read_dir(self.config.store_dir()) else {
-            return Ok(stats);
-        };
         let live: std::collections::HashSet<String> = self
             .db
             .prepare("SELECT cache_key FROM entries")?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        for name in names.flatten() {
-            let name = name.file_name();
-            let Some(key) = name.to_str().and_then(key_of_lock_name) else {
-                continue;
-            };
-            stats.seen += 1;
-            // Past the cap the walk only counts, which costs no stat.
-            if stats.removed >= cap || live.contains(key) {
-                continue;
-            }
-            if remove_stale_lock_file(&self.config.store_dir().join(&name), min_age, now, || {}) {
-                stats.removed += 1;
-            }
-        }
-        Ok(stats)
+        // A live entry's lock is counted and kept.
+        Ok(sweep_lock_dir(
+            &self.config.store_dir(),
+            |name| key_of_lock_name(name).map(|key| !live.contains(key)),
+            min_age,
+            cap,
+            now,
+        ))
     }
 
     /// The per-key structures nothing else bounds: stale key lock files,
@@ -4430,6 +4479,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             key_locks_remaining: locks.remaining(),
             predictions_pruned,
             file_hashes_pruned,
+            ..HousekeepingStats::default()
         }
     }
 

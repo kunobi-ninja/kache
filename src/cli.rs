@@ -4268,17 +4268,29 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
 
     // Key lock files and input predictions grow with every distinct key and
     // eviction removes neither (#1126).
-    let housekeeping = store.sweep_housekeeping();
+    let mut housekeeping = store.sweep_housekeeping();
+    // Flight files grow the same way, one per missed key (scheduler/).
+    if !store.is_read_only() {
+        let flights = crate::scheduler::sweep_stale_flights(&config.cache_dir);
+        housekeeping.flights_removed = flights.removed;
+        housekeeping.flights_remaining = flights.remaining;
+    }
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} ({} remain), {}, {}.",
+            "Housekeeping: removed {} ({} remain), {} ({} remain), {}, {}.",
             term::counted(
                 housekeeping.key_locks_removed as u64,
                 "stale key lock",
                 "stale key locks"
             ),
             housekeeping.key_locks_remaining,
+            term::counted(
+                housekeeping.flights_removed as u64,
+                "stale flight",
+                "stale flights"
+            ),
+            housekeeping.flights_remaining,
             term::counted(
                 housekeeping.predictions_pruned as u64,
                 "unused input prediction",

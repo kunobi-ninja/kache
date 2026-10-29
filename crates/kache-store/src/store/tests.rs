@@ -11741,6 +11741,68 @@ fn key_lock_sweep_with_a_zero_cap_only_counts() {
     assert!(stale.exists());
 }
 
+/// A lock directory outside `store/` is swept by the key lock rules: only
+/// accepted names, only files idle for the grace, never a held one, and at
+/// most `cap` per pass.
+#[test]
+fn lock_file_sweep_removes_only_idle_unheld_lock_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |name: &str, age: Duration| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"1").unwrap();
+        set_age(&path, age);
+        path
+    };
+    let idle = [file("lock-1", TWO_HOURS), file("lock-2", TWO_HOURS)];
+    let young = file("lock-3", Duration::from_secs(3000));
+    let other = file("notes", TWO_HOURS);
+    let held_path = file("lock-4", TWO_HOURS);
+    let held = StoreLock::try_acquire(&held_path).unwrap().unwrap();
+    set_age(&held_path, TWO_HOURS);
+    let sweep = |cap| {
+        sweep_stale_lock_files(
+            dir.path(),
+            |name| name.starts_with("lock-"),
+            KEY_LOCK_SWEEP_GRACE,
+            cap,
+            std::time::SystemTime::now(),
+        )
+    };
+
+    assert_eq!(
+        sweep(1),
+        KeyLockSweepStats {
+            seen: 4,
+            removed: 1
+        }
+    );
+    assert_eq!(idle.iter().filter(|path| path.exists()).count(), 1);
+    assert_eq!(
+        sweep(10),
+        KeyLockSweepStats {
+            seen: 3,
+            removed: 1
+        }
+    );
+    assert!(idle.iter().all(|path| !path.exists()));
+    assert!(young.exists() && other.exists() && held_path.exists());
+
+    drop(held);
+    set_age(&held_path, TWO_HOURS);
+    assert_eq!(sweep(10).removed, 1);
+    assert!(!held_path.exists());
+    assert_eq!(
+        sweep_stale_lock_files(
+            &dir.path().join("missing"),
+            |_| true,
+            KEY_LOCK_SWEEP_GRACE,
+            10,
+            std::time::SystemTime::now(),
+        ),
+        KeyLockSweepStats::default()
+    );
+}
+
 #[test]
 fn key_lock_sweep_never_touches_gc_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -11892,6 +11954,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
             key_locks_remaining: 1,
             predictions_pruned: 1,
             file_hashes_pruned: 1,
+            ..Default::default()
         }
     );
     assert!(!stale.exists());

@@ -1185,6 +1185,61 @@ fn try_collect_slots(scheduler: &Scheduler, range: Range<u32>, need: usize) -> R
     Ok(Collect::Busy(busy))
 }
 
+/// Most flight files one GC sweep unlinks from each flight directory. A
+/// build machine leaves one compile flight per missed key and one discovery
+/// flight per discovered unit, about 80k and 50k a day on a busy shared
+/// store, and GC runs a few times a day. Each removal costs an open, a lock,
+/// two stats and an unlink (tens of microseconds on Linux, a few hundred on
+/// Windows), so a full batch takes seconds in the daemon's below-normal
+/// sweep, and a backlog of a million converges in a handful of sweeps.
+pub(crate) const FLIGHT_SWEEP_CAP: usize = 100_000;
+
+/// What [`sweep_stale_flights`] did across both flight directories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FlightSweepStats {
+    pub(crate) removed: usize,
+    pub(crate) remaining: usize,
+}
+
+/// Unlink the compile and discovery flight files nobody has held for
+/// [`crate::store::KEY_LOCK_SWEEP_GRACE`]. A flight is a lock file per
+/// missed key or discovered unit, and nothing else ever removes one, so the
+/// directories grow by every distinct key the machine has compiled. Each
+/// file is taken under its lock before it goes ([`crate::store::sweep_stale_lock_files`]):
+/// a held flight stays, and a process that opened one being removed sees
+/// it replaced and opens the new file, as with key locks. Up to
+/// [`FLIGHT_SWEEP_CAP`] per directory per sweep.
+pub(crate) fn sweep_stale_flights(cache_dir: &Path) -> FlightSweepStats {
+    sweep_stale_flights_at(
+        cache_dir,
+        crate::store::KEY_LOCK_SWEEP_GRACE,
+        FLIGHT_SWEEP_CAP,
+        std::time::SystemTime::now(),
+    )
+}
+
+fn sweep_stale_flights_at(
+    cache_dir: &Path,
+    min_age: Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> FlightSweepStats {
+    let root = scheduler_root(cache_dir);
+    let mut stats = FlightSweepStats::default();
+    for dir in [root.join("flights"), root.join("discovery")] {
+        let swept = crate::store::sweep_stale_lock_files(&dir, is_flight_name, min_age, cap, now);
+        stats.removed += swept.removed;
+        stats.remaining += swept.remaining();
+    }
+    stats
+}
+
+/// A flight file's name: the 64 hex digits of a BLAKE3 digest, as
+/// [`FlightIdentity::digest`] and [`join_discovery_flight`] write it.
+fn is_flight_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub(crate) fn scheduler_root(cache_dir: &Path) -> PathBuf {
     cache_dir.join("scheduler")
 }
@@ -3504,6 +3559,66 @@ mod tests {
         // than "not found" on Unix.
         #[cfg(unix)]
         assert_eq!(slot_is_held(&slot.join("below")), None);
+    }
+
+    #[test]
+    fn gc_unlinks_flights_nobody_held_for_the_grace() {
+        let dir = temp_cache();
+        let root = scheduler_root(dir.path());
+        let digest = |n: u8| format!("{n:064x}");
+        let flight = |sub: &str, n: u8| {
+            let path = root.join(sub).join(digest(n));
+            drop(StoreLock::try_acquire(&path).unwrap().unwrap());
+            path
+        };
+        let stale = [flight("flights", 1), flight("discovery", 2)];
+        let held_path = flight("flights", 3);
+        let held = StoreLock::try_acquire(&held_path).unwrap().unwrap();
+        let recent = flight("discovery", 4);
+        // Not digests: a note, one hex digit short, 64 digits that are not hex.
+        let others = [
+            "notes".to_string(),
+            digest(5)[1..].to_string(),
+            "g".repeat(64),
+        ]
+        .map(|name| root.join("flights").join(name));
+        for other in &others {
+            fs::write(other, b"not a flight").unwrap();
+        }
+        let grace = Duration::from_secs(3600);
+        let now = std::time::SystemTime::now() + 2 * grace;
+        fs::File::options()
+            .write(true)
+            .open(&recent)
+            .unwrap()
+            .set_modified(now - grace / 2)
+            .unwrap();
+
+        let swept = sweep_stale_flights_at(dir.path(), grace, 100, now);
+        assert_eq!(
+            swept,
+            FlightSweepStats {
+                removed: 2,
+                remaining: 2
+            }
+        );
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert!(held_path.exists() && recent.exists());
+        assert!(others.iter().all(|path| path.exists()));
+
+        // The cap bounds each directory's share of one sweep: one of the
+        // three stale flights waits, beside the recent discovery flight.
+        drop(held);
+        let more = [held_path, flight("flights", 6), flight("flights", 7)];
+        let now = std::time::SystemTime::now() + 2 * grace;
+        assert_eq!(
+            sweep_stale_flights_at(dir.path(), grace, 2, now),
+            FlightSweepStats {
+                removed: 2,
+                remaining: 2
+            }
+        );
+        assert_eq!(more.iter().filter(|path| path.exists()).count(), 1);
     }
 
     #[test]

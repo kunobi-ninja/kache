@@ -1,0 +1,128 @@
+name: Adoption preflight (1763 and 1764)
+
+on:
+  push:
+    branches: [review-contribution/preflight-1763-1764]
+    paths:
+      - .github/workflows/adoption-preflight.yml
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight PR ${{ matrix.pr }}
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1763-1764'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: 1763
+            head: ba5bc48433bad1c01d00e7991aa7b17e254b7d95
+            tree: 8c41eb67fe42898bfc264c65e8fcffbb46ccd690
+          - pr: 1764
+            head: 3258ad59147c717bdb1c89aec93b177dddedc246
+            tree: aea8b1d7246a47d25258685b48d1c1f8ebc27186
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/adoption-preflight-${{ matrix.pr }}/target
+      EVIDENCE_DIR: ${{ runner.temp }}/adoption-preflight-${{ matrix.pr }}/evidence
+      EXPECTED_HEAD: ${{ matrix.head }}
+      EXPECTED_TREE: ${{ matrix.tree }}
+      ADOPTION_PR: ${{ matrix.pr }}
+    steps:
+      - name: Record helper and expected candidate identities
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'helper_ref=%s\n' "$GITHUB_REF"
+            printf 'helper_commit=%s\n' "$GITHUB_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'adoption_pr=%s\n' "$ADOPTION_PR"
+            printf 'expected_head=%s\n' "$EXPECTED_HEAD"
+            printf 'expected_tree=%s\n' "$EXPECTED_TREE"
+          } | tee "$EVIDENCE_DIR/provenance.txt"
+          test "$RUNNER_KIND" = "github-hosted"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ matrix.head }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify the checked-out candidate
+        id: verify
+        run: |
+          set -euo pipefail
+          actual_head=$(git rev-parse HEAD)
+          actual_tree=$(git rev-parse 'HEAD^{tree}')
+          {
+            printf 'tested_head=%s\n' "$actual_head"
+            printf 'tested_tree=%s\n' "$actual_tree"
+          } | tee -a "$EVIDENCE_DIR/provenance.txt"
+          test "$actual_head" = "$EXPECTED_HEAD"
+          test "$actual_tree" = "$EXPECTED_TREE"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - name: Record toolchain versions
+        id: toolchain
+        run: |
+          set -euo pipefail
+          rustc --version --verbose 2>&1 | tee "$EVIDENCE_DIR/toolchain.txt"
+          cargo --version 2>&1 | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          just --version 2>&1 | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          mise --version 2>&1 | tee -a "$EVIDENCE_DIR/toolchain.txt"
+      - name: Run just check
+        id: baseline
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation
+        id: docs
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+      - name: Record step outcomes
+        if: always()
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+          DOCS_OUTCOME: ${{ steps.docs.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            printf 'verify=%s\n' "$VERIFY_OUTCOME"
+            printf 'toolchain=%s\n' "$TOOLCHAIN_OUTCOME"
+            printf 'just_check=%s\n' "$BASELINE_OUTCOME"
+            printf 'docs=%s\n' "$DOCS_OUTCOME"
+          } | tee "$EVIDENCE_DIR/outcomes.txt"
+      - name: Upload preflight evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adoption-preflight-${{ matrix.pr }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

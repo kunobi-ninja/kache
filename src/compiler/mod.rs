@@ -2127,10 +2127,25 @@ pub(crate) mod shim {
     }
 
     fn invoked_as_compiler_for(arg0: &str, env: &super::InvocationEnv) -> bool {
+        if names_kache(arg0) {
+            return false;
+        }
         let argv = [arg0.to_owned()];
         kache_shims::compiler_launcher_driver(arg0).is_some()
             || super::rustdoc::RustdocCompiler::recognizes(&argv)
             || super::cc::CcCompiler::recognizes_for(&argv, env)
+    }
+
+    /// Whether `arg0` is kache's own frontend or engine by name: kache run as
+    /// itself, never a compiler. Without this every `kache <command>`, even
+    /// `kache --help`, ran the C-family probe on kache and left its negative
+    /// memo in the default cache folder.
+    pub(crate) fn names_kache(arg0: &str) -> bool {
+        super::command_basename(arg0)
+            .map(super::strip_windows_exe_suffix)
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("kache") || name.eq_ignore_ascii_case("kache-engine")
+            })
     }
 
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
@@ -2497,6 +2512,72 @@ mod shim_tests {
         assert!(!invoked_as_compiler("kache"));
         assert!(!invoked_as_compiler("/usr/local/bin/kache"));
         assert!(!invoked_as_compiler("gcc-ar"));
+    }
+
+    /// kache run as itself is never sent to the C-family probe: the probe
+    /// would start kache with `-E` and write a memo for every new working
+    /// directory and environment. A stand-in that answers the probe as GCC
+    /// shows the probe would run for any other unknown name.
+    #[cfg(unix)]
+    #[test]
+    fn kache_by_its_own_name_is_never_probed_as_a_compiler() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let runs = root.path().join("runs");
+        std::fs::create_dir(&bin).unwrap();
+        for name in ["kache", "kache-engine", "local-driver"] {
+            kache_fs::testutil::write_executable(
+                &bin.join(name),
+                format!(
+                    "#!/bin/sh\nprintf '{name} ' >> '{}'\nprintf '%s\\n' KACHE_PROBE_GNU\n",
+                    runs.display()
+                ),
+            );
+        }
+        let mut env = super::InvocationEnv::from_parts(
+            [("PATH", "bin")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        env.set("KACHE_CACHE_DIR", root.path().join("cache"));
+        let kache = bin.join("kache");
+        for arg0 in ["kache", "kache-engine", kache.to_str().unwrap()] {
+            let argv = [arg0.to_string(), "--help".to_string()];
+            assert!(wrapper_args_for(&argv, &env, None).is_none(), "{arg0}");
+        }
+        assert!(
+            !runs.exists(),
+            "probed {:?}",
+            std::fs::read_to_string(&runs)
+        );
+
+        let argv = ["local-driver".to_string(), "-c".to_string()];
+        assert!(wrapper_args_for(&argv, &env, None).is_some());
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "local-driver ");
+    }
+
+    #[test]
+    fn kache_is_known_by_name_with_or_without_a_path_or_exe() {
+        for arg0 in [
+            "kache",
+            "kache-engine",
+            "/usr/local/bin/kache",
+            r"C:\tools\KACHE.EXE",
+            "Kache-Engine.exe",
+        ] {
+            assert!(names_kache(arg0), "{arg0}");
+        }
+        for arg0 in [
+            "gcc",
+            "kache-cc",
+            "kache-cl",
+            "kache-clang-cl.exe",
+            "/opt/kache/bin/cc",
+            "kachex",
+        ] {
+            assert!(!names_kache(arg0), "{arg0}");
+        }
     }
 
     /// The shim must be skipped by RESOLVED IDENTITY, not by directory: that

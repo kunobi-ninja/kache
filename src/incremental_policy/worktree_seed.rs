@@ -339,9 +339,9 @@ fn same_spelling(canonical: &Path, profile: &Path) -> bool {
     if canonical == profile {
         return true;
     }
-    canonical.to_str().is_some_and(|text| {
-        Path::new(&*kache_fs::paths::strip_verbatim_prefix(text)) == profile
-    })
+    canonical
+        .to_str()
+        .is_some_and(|text| Path::new(&*kache_fs::paths::strip_verbatim_prefix(text)) == profile)
 }
 
 pub(super) fn empty_directory(path: &Path) -> bool {

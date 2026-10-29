@@ -36,8 +36,6 @@ jobs:
     env:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/adoption-preflight-${{ matrix.pr }}/target
-      EVIDENCE_DIR: ${{ runner.temp }}/adoption-preflight-${{ matrix.pr }}/evidence
       EXPECTED_HEAD: ${{ matrix.head }}
       EXPECTED_TREE: ${{ matrix.tree }}
       ADOPTION_PR: ${{ matrix.pr }}
@@ -47,6 +45,12 @@ jobs:
           RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/adoption-preflight-$ADOPTION_PR/target"
+          EVIDENCE_DIR="$RUNNER_TEMP/adoption-preflight-$ADOPTION_PR/evidence"
+          {
+            printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR"
+            printf 'EVIDENCE_DIR=%s\n' "$EVIDENCE_DIR"
+          } >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR"
           {
             printf 'repository=%s\n' "$GITHUB_REPOSITORY"

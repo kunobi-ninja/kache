@@ -14,3 +14,10 @@ fail-fast = false
 slow-timeout = { period = "120s", terminate-after = 5 }
 # List the slow tests again at the end, after the pass/fail summary.
 final-status-level = "slow"
+
+[[profile.ci.overrides]]
+platform = 'cfg(windows)'
+filter = 'test(=identity::tests::earlier_lockfiles_are_read_from_git)'
+# This Git fixture exercises a one-second lookup deadline. Reserve the test
+# pool so other tests do not consume that deadline through process contention.
+threads-required = "num-test-threads"

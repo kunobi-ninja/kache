@@ -421,6 +421,8 @@ fn walk(
 }
 
 /// Free and total bytes on the volume holding a path.
+/// Free bytes are available to the calling user. On Windows, the total also
+/// reflects any per-user quota.
 ///
 /// This is the ground truth a reclaim is ultimately graded against: predicted
 /// bytes versus the actual `statvfs` delta. Expect the two to differ — on APFS
@@ -448,6 +450,8 @@ impl VolumeUsage {
 }
 
 /// Volume usage for the filesystem holding `path`.
+/// The path must exist and, on Windows, must be a directory. Empty paths,
+/// embedded NULs, failed probes and unsupported platforms return `None`.
 pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
     #[cfg(any(test, feature = "testing"))]
     if let Some(usage) = testutil::mock_volume_usage(path) {
@@ -468,14 +472,11 @@ pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
     }
 }
 
-/// Windows: [`capacity::volume_space`] (`GetDiskFreeSpaceExW`) on `path`,
-/// which must be a directory that exists. Without this, disk recovery, the
-/// low-disk sweep and the daemon's free-space check never ran on Windows.
+/// Query an existing Windows directory with `GetDiskFreeSpaceExW`.
 #[cfg(windows)]
 fn volume_usage_windows(path: &Path) -> Option<VolumeUsage> {
     use std::os::windows::ffi::OsStrExt;
-    // An empty name, or one cut short by a NUL, would ask about the
-    // current directory's disk instead.
+    // Reject empty names and embedded NULs instead of querying an unintended path.
     let mut wide = path.as_os_str().encode_wide();
     if path.as_os_str().is_empty() || wide.any(|unit| unit == 0) {
         return None;

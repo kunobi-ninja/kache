@@ -783,7 +783,7 @@ impl VolumeView {
     }
 }
 
-/// The cache volume, `None` where its usage cannot be read (not Unix).
+/// The cache volume, `None` where its usage cannot be read.
 fn volume_view(config: &Config, daemon: Option<&daemon::EffectiveConfig>) -> Option<VolumeView> {
     let (floor, targets) = recovery_in_effect(config, daemon);
     kache_fs::volume_usage(&config.cache_dir).map(|usage| VolumeView::new(usage, floor, targets))

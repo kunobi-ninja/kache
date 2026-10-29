@@ -13,8 +13,9 @@ Filesystem measurements, file identity, and native cloning and copying. Built fo
 - `copy_writable` copies bytes with an explicit writable mode.
 - `file_identity` and `directory_identity` return the device and inode (the volume serial and file index on Windows).
 - `volume_stats` reads filesystem identity, available bytes and optional inode counts without walking directories. Unix uses `statvfs`; Windows reports bytes and a volume GUID, with inode counts unavailable. A missing identity or inode capacity stays `None`.
+- `volume_usage` reads available and total bytes for an existing path. Windows requires a directory and reports capacity available to the caller, including per-user quotas. Failed probes return `None`.
 
-Volume identities describe the current host and observation. They can be reused after an unmount, and distinct volumes can share free space through an APFS container. Do not sum their capacities as independent disks. `VolumeUsage` and `volume_usage` keep their existing interface.
+Volume identities describe the current host and observation. They can be reused after an unmount, and distinct volumes can share free space through an APFS container. Do not sum their capacities as independent disks.
 
 ## Features
 

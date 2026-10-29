@@ -3052,6 +3052,61 @@ fn now_clicks_select_visible_rows_and_the_wheel_scrolls_the_pointed_panel() {
 }
 
 #[test]
+fn monitor_labels_fixed_prediction_failures_in_now_and_why() {
+    use ratatui::backend::TestBackend;
+
+    let mut s = test_state();
+    for (version, statement) in [
+        ("2.0.0-rc.2", "SELECT schema"),
+        ("2.0.0-rc.2", "INSERT OR REPLACE"),
+        ("2.0.0-rc.3", "SELECT schema"),
+    ] {
+        let mut event = session_event("build_script_run", EventResult::Passthrough, "/w", "s1", 5);
+        event.version = version.into();
+        event.passthrough_reason = format!(
+            "refused|build-script cache bypassed: no such column: prediction_json in {statement} FROM input_predictions"
+        );
+        s.events.push(event);
+    }
+    s.refresh_sessions(chrono::Utc::now());
+    let why = why_text(&mut s, 250).join("\n");
+    let summary = why.split("Passthroughs in this build").next().unwrap();
+    assert_eq!(
+        summary.matches("fixed in Kache 2.0.0-rc.3").count(),
+        1,
+        "{summary}"
+    );
+    assert!(
+        summary.contains("incompatible prediction metadata"),
+        "{summary}"
+    );
+    assert!(!summary.contains("SELECT schema"), "{summary}");
+
+    let mut terminal = Terminal::new(TestBackend::new(250, 8)).unwrap();
+    terminal
+        .draw(|frame| draw_now_causes(frame, &mut s, frame.area()))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        screen.contains(
+            "2 passed through · prediction metadata migration failed (fixed in Kache 2.0.0-rc.3"
+        ),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("incompatible prediction metadata"),
+        "{screen}"
+    );
+    assert!(!screen.contains("SELECT schema"), "{screen}");
+}
+
+#[test]
 fn now_explains_a_passthrough_without_claiming_a_cache_hit() {
     let mut s = test_state();
     let mut event = session_event("proc_macro", EventResult::Passthrough, "/w/one", "s1", 5);

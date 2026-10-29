@@ -147,6 +147,13 @@ fn probe_access(cache_dir: &Path, index: &Path) -> Result<usize> {
 }
 
 fn recent_warning_check(marker: &Path) -> Option<Check> {
+    if !std::fs::symlink_metadata(marker)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
     let content = std::fs::read_to_string(marker).ok()?;
     let (timestamp, _) = kache_store::markers::parse_session_marker(&content)?;
     if !kache_store::markers::timestamp_is_fresh_at(
@@ -432,6 +439,20 @@ mod tests {
         assert!(recent_warning_check(&marker).is_none());
         fs::write(&marker, i64::MAX.to_string()).unwrap();
         assert!(recent_warning_check(&marker).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warning_history_rejects_symlinks_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("warning");
+        fs::write(&marker, kache_store::markers::now_epoch_secs().to_string()).unwrap();
+        let link = dir.path().join("warning-link");
+        std::os::unix::fs::symlink(&marker, &link).unwrap();
+        assert!(recent_warning_check(&link).is_none());
+        assert!(recent_warning_check(dir.path()).is_none());
+        assert!(recent_warning_check(&dir.path().join("missing")).is_none());
+        assert!(recent_warning_check(&marker).is_some());
     }
 
     #[cfg(unix)]

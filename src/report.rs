@@ -815,6 +815,8 @@ pub struct BypassDetail {
     pub crate_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_in: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
     /// Package of a build-script run. Empty for compiles.
@@ -1870,7 +1872,7 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
 
     let mut grouped = std::collections::BTreeMap::new();
     for detail in &details {
-        let fixed_in = crate::tui_sessions::passthrough_fixed_in(&detail.reason, &detail.version);
+        let fixed_in = detail.fixed_in.as_deref();
         let key = (
             detail.result.clone(),
             detail.route.clone(),
@@ -1997,6 +1999,8 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
         crate_name: e.crate_name.clone(),
         version: crate::tui_sessions::producer_version(&e.version)
             .map_or_else(String::new, |_| e.version.clone()),
+        fixed_in: crate::tui_sessions::passthrough_fixed_in(&e.passthrough_reason, &e.version)
+            .map(str::to_string),
         root: e.root.clone(),
         package: e.package.clone(),
         result: e.result.to_string(),
@@ -2014,11 +2018,10 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
 }
 
 fn bypass_detail_reason(detail: &BypassDetail) -> String {
-    let reason = crate::tui_sessions::passthrough_fixed_in(&detail.reason, &detail.version)
-        .map_or_else(
-            || detail.reason.clone(),
-            crate::tui_sessions::fixed_bug_words,
-        );
+    let reason = detail.fixed_in.as_deref().map_or_else(
+        || detail.reason.clone(),
+        crate::tui_sessions::fixed_bug_words,
+    );
     match &detail.fallback_attempt {
         Some(attempt) => format!(
             "{}; fallback `{}`: {}",

@@ -492,6 +492,7 @@
       "properties": {
         "crate_name": { "type": "string" },
         "version": { "type": "string", "description": "Kache version that recorded this invocation. Omitted when unavailable." },
+        "fixed_in": { "type": "string", "description": "Release that fixed this recognized failure in an older producer version. Omitted for current or unrecognized failures." },
         "root": { "type": "string" },
         "package": { "type": "string", "description": "Package a build-script run belongs to. Omitted when empty." },
         "result": {

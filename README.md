@@ -20,7 +20,7 @@ Built by [Kunobi][kunobi-brand].
 This README follows v2 on `main`. To install the published v2 preview:
 
 ```bash
-cargo install kache --locked --version 2.0.0-rc.4
+cargo install kache --locked --version 2.0.0-rc.3
 kache init
 kache doctor --probe
 ```
@@ -153,7 +153,7 @@ Install your Rust toolchain, then add the official action before your build:
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
   with:
-    version: v2.0.0-rc.4
+    version: v2.0.0-rc.3
 - run: cargo build --locked
 ```
 

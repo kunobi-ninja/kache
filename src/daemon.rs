@@ -3285,7 +3285,7 @@ impl Daemon {
                     key = key_short,
                     "remote backend init failed: {e:#}"
                 );
-                return if class.poisons_breaker() {
+                return if class.is_retryable() {
                     Response::err(format!("retryable: remote backend init failed: {e:#}"))
                 } else {
                     Response::err(format!("remote backend init failed: {e:#}"))
@@ -3328,7 +3328,7 @@ impl Daemon {
                     class,
                     &format!("upload exists check failed ({class:?}): {e:#}"),
                 );
-                return if class.poisons_breaker() {
+                return if class.is_retryable() {
                     Response::err(format!("retryable: upload HEAD failed: {e:#}"))
                 } else {
                     Response::err(format!("upload HEAD failed: {e:#}"))
@@ -3502,7 +3502,7 @@ impl Daemon {
                     elapsed_ms,
                     "remote upload failed: {e:#}"
                 );
-                if class.poisons_breaker() {
+                if class.is_retryable() {
                     Response::err(format!("retryable: upload failed: {e:#}"))
                 } else {
                     Response::err(format!("upload failed: {e:#}"))
@@ -3779,7 +3779,7 @@ impl Daemon {
             Ok(b) => b,
             Err(e) => {
                 let class = classify_remote_error(&e);
-                return if class.poisons_breaker() {
+                return if class.is_retryable() {
                     Response::found(false)
                 } else {
                     Response::err(format!("remote backend init failed: {e}"))
@@ -4058,19 +4058,13 @@ impl Daemon {
                     timestamp: finished_at_unix_ms / 1_000,
                 })
                 .await;
-                // Feed the breaker with the failure class (#327) so a dead or
-                // stalling remote degrades and later restores skip S3
-                // entirely. A Timeout (transport deadline or the restore
-                // deadline above) reports a plain miss: the wrapper's answer
-                // is "recompile locally" either way, and an error response
-                // would suggest the check itself malfunctioned.
+                // Transport failures can degrade remote health. Exhausting
+                // Kache's own budget leaves health unchanged. Both return a
+                // miss so the wrapper can compile locally.
                 let class = classify_remote_error(&e);
                 breaker_permit
                     .failure(class, &format!("remote download failed ({class:?}): {e:#}"));
-                if matches!(
-                    class,
-                    RemoteErrorClass::Timeout | RemoteErrorClass::Transient
-                ) {
+                if class.is_retryable() {
                     tracing::warn!(
                         "remote download of {} failed after {elapsed_ms}ms — treating as miss",
                         &req.key

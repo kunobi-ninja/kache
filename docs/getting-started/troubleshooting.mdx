@@ -142,9 +142,13 @@ caching and compilation continue. `doctor` tests the remote with this shell's
 configuration and credentials, which can differ from the daemon's. `kache stats`
 shows what the daemon uses: the remote it loaded or why it is misconfigured, and
 a warning when it read a different config file than this shell. Its Resilience
-row shows `DEGRADED` after three timeouts or transient remote errors in a row.
+row shows `DEGRADED` after three transport timeouts or transient remote errors in a row.
 Builds then compile locally and uploads wait in the queue; the daemon tries the
 remote again every 45 seconds until it answers.
+
+Reaching Kache's operation deadline, including the three-second demand lookup
+budget, returns a cache miss without changing remote health. Uploads that reach
+their deadline remain queued for retry.
 
 Follow the [remote setup guide](/docs/remote-cache/overview) for your backend,
 then check [daemon lifecycle](/docs/daemon/lifecycle) for service environment

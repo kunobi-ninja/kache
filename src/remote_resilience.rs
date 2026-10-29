@@ -39,10 +39,13 @@ pub(crate) enum RemoteErrorClass {
     /// A durable owner may retry after the current operation releases its
     /// semaphore permit.
     Transient,
-    /// The transport's own deadline elapsed (connect timeout, read-inactivity
-    /// timeout, or the daemon's operation deadline). Count it against the
-    /// breaker, but never nest a retry inside the admitted operation.
+    /// The transport's own deadline elapsed (connect or read-inactivity
+    /// timeout). Count it against the breaker, but never nest a retry inside
+    /// the admitted operation.
     Timeout,
+    /// Kache's end-to-end operation budget elapsed. This does not establish
+    /// remote health; a durable owner may retry with a fresh budget later.
+    Deadline,
     /// Credentials or remote authorization are invalid. Retrying the same
     /// request after a cooldown cannot repair this, so it must not poison the
     /// availability breaker.
@@ -64,13 +67,19 @@ impl RemoteErrorClass {
     pub(crate) fn poisons_breaker(self) -> bool {
         matches!(self, Self::Transient | Self::Timeout)
     }
+
+    /// A durable owner may retry after releasing this operation's resources.
+    /// This does not permit nested retries within an expired budget.
+    pub(crate) fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::Timeout | Self::Deadline)
+    }
 }
 
 /// Typed end-to-end deadline error. Keeping this distinct from transport
 /// errors lets every remote path classify the timeout without message parsing.
 #[derive(Debug)]
 pub(crate) struct RemoteDeadlineElapsed {
-    stage: &'static str,
+    pub(crate) stage: &'static str,
 }
 
 impl std::fmt::Display for RemoteDeadlineElapsed {
@@ -206,6 +215,10 @@ fn reqwest_payload_is_integrity(is_decode: bool, is_body: bool) -> bool {
 /// timeouts that arrive only as text (reqwest wraps hyper's connect timeout in
 /// an opaque error whose chain ends at a formatted message).
 pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
+    // Preserve the local budget marker even through a transport wrapper.
+    if error.chain().any(is_local_deadline) {
+        return RemoteErrorClass::Deadline;
+    }
     for cause in error.chain() {
         if cause
             .downcast_ref::<crate::remote_layout::EntryNotFound>()
@@ -216,7 +229,6 @@ pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
         if cause
             .downcast_ref::<tokio::time::error::Elapsed>()
             .is_some()
-            || cause.downcast_ref::<RemoteDeadlineElapsed>().is_some()
         {
             return RemoteErrorClass::Timeout;
         }
@@ -258,6 +270,16 @@ pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
         // reads and writes.
         RemoteErrorClass::Local
     }
+}
+
+fn is_local_deadline(error: &(dyn std::error::Error + 'static)) -> bool {
+    // io::Error::source skips its immediate payload, so an ordinary error
+    // chain walk cannot see a deadline held by a synchronous reader/writer.
+    error.is::<RemoteDeadlineElapsed>()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| is_local_deadline(inner))
 }
 
 fn macos_local_network_privacy_hint(
@@ -596,6 +618,11 @@ impl BreakerPermit {
     }
 
     pub(crate) fn failure(mut self, class: RemoteErrorClass, error: &str) {
+        if class == RemoteErrorClass::Deadline {
+            // No remote-health result. Drop preserves earlier failures and
+            // reopens an unfinished half-open probe for its full cooldown.
+            return;
+        }
         self.finish(Some(class), error);
     }
 
@@ -1318,6 +1345,57 @@ mod tests {
     }
 
     #[test]
+    fn local_deadline_marker_survives_transport_and_timeout_context() {
+        let error = anyhow::Error::new(
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "request timed out")
+                .set_temporary()
+                .set_source(RemoteDeadlineElapsed {
+                    stage: "extraction",
+                }),
+        )
+        .context("restore timeout");
+        assert_eq!(class_of(error), RemoteErrorClass::Deadline);
+    }
+
+    #[test]
+    fn local_deadline_marker_survives_nested_io_errors() {
+        let mut error = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            RemoteDeadlineElapsed {
+                stage: "extraction",
+            },
+        );
+        for _ in 0..3 {
+            assert!(is_local_deadline(&error));
+            error = std::io::Error::other(error);
+        }
+        assert_eq!(
+            class_of(anyhow::Error::new(error).context("reading pack")),
+            RemoteErrorClass::Deadline
+        );
+    }
+
+    #[test]
+    fn durable_retries_include_local_deadlines_but_exclude_permanent_errors() {
+        for class in [
+            RemoteErrorClass::Transient,
+            RemoteErrorClass::Timeout,
+            RemoteErrorClass::Deadline,
+        ] {
+            assert!(class.is_retryable(), "{class:?}");
+        }
+        for class in [
+            RemoteErrorClass::Miss,
+            RemoteErrorClass::Authentication,
+            RemoteErrorClass::Configuration,
+            RemoteErrorClass::Integrity,
+            RemoteErrorClass::Local,
+        ] {
+            assert!(!class.is_retryable(), "{class:?}");
+        }
+    }
+
+    #[test]
     fn classify_io_timed_out_as_timeout() {
         let error = anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -1382,6 +1460,7 @@ mod tests {
         assert!(RemoteErrorClass::Transient.poisons_breaker());
         assert!(RemoteErrorClass::Timeout.poisons_breaker());
         for class in [
+            RemoteErrorClass::Deadline,
             RemoteErrorClass::Miss,
             RemoteErrorClass::Authentication,
             RemoteErrorClass::Configuration,
@@ -1537,6 +1616,66 @@ mod tests {
         probe.success();
         assert!(!breaker.is_direction_degraded(RemoteDirection::Read));
         assert_eq!(breaker.suppressed_ops(RemoteDirection::Read), 0);
+    }
+
+    #[test]
+    fn local_deadlines_preserve_prior_remote_failures() {
+        let breaker = RemoteBreaker::with_policy(3, Duration::from_secs(60));
+        breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Transient, "first backend failure");
+        for _ in 0..3 {
+            let error = RemoteDeadline::from_instant(Some(Instant::now()))
+                .check("demand extraction")
+                .unwrap_err()
+                .context("restore timed out");
+            breaker
+                .try_acquire(RemoteOperation::DemandGet)
+                .expect("local deadlines must leave reads admitted")
+                .failure(classify_remote_error(&error), &format!("{error:#}"));
+        }
+        assert!(
+            !breaker.is_degraded(),
+            "local deadlines must not add remote failures"
+        );
+        breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Transient, "second backend failure");
+        assert!(!breaker.is_degraded());
+        breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Transient, "third backend failure");
+        assert!(
+            breaker.is_degraded(),
+            "local deadlines must not erase earlier remote failures"
+        );
+    }
+
+    #[test]
+    fn local_deadline_during_half_open_probe_preserves_failure_and_cooldown() {
+        let breaker = RemoteBreaker::with_policy(1, Duration::from_secs(60));
+        breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "backend timed out");
+        breaker.read.state.lock().unwrap().mode = BreakerMode::Open {
+            until: Instant::now(),
+        };
+        let probe = breaker.try_acquire(RemoteOperation::DemandGet).unwrap();
+        probe.failure(RemoteErrorClass::Deadline, "local budget elapsed");
+
+        let state = breaker.read.state.lock().unwrap();
+        assert_eq!(
+            state.failures, 1,
+            "a local deadline adds no backend failure"
+        );
+        match state.mode {
+            BreakerMode::Open { until } => assert!(until > Instant::now()),
+            _ => panic!("an inconclusive probe must preserve the cooldown"),
+        }
     }
 
     #[test]
@@ -1808,7 +1947,7 @@ mod tests {
             .await;
         assert_eq!(
             classify_remote_error(&result.unwrap_err()),
-            RemoteErrorClass::Timeout
+            RemoteErrorClass::Deadline
         );
     }
 

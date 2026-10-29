@@ -278,16 +278,13 @@ pub(crate) fn render(
         ));
     }
 
-    let historical_rows = analysis
-        .passthroughs
-        .iter()
-        .filter_map(|group| {
-            group
-                .fixed_in
-                .map(|fixed_in| vec![term::count(group.count as u64), fixed_bug_words(fixed_in)])
-        })
-        .collect::<Vec<_>>();
-    append_historical_bugs(&mut lines, &historical_rows);
+    append_historical_bugs(
+        &mut lines,
+        analysis
+            .passthroughs
+            .iter()
+            .filter_map(|group| group.fixed_in.map(|version| (version, group.count))),
+    );
 
     lines.push(String::new());
     let costliest = analysis
@@ -313,22 +310,34 @@ fn recorded_versions(session: &Session, events: &[BuildEvent]) -> Vec<String> {
     session
         .events
         .iter()
-        .map(|&index| match events[index].version.as_str() {
-            "" | "0.0.0" => "unknown".to_string(),
-            version => version.to_string(),
-        })
+        .map(|&index| producer_words(&events[index].version))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-fn fixed_bug_words(fixed_in: &str) -> String {
-    format!(
-        "prediction metadata migration failed (fixed in Kache {fixed_in}; predictions rebuild automatically)"
-    )
+fn producer_words(version: &str) -> String {
+    tui_sessions::producer_version(version)
+        .map_or_else(|| "unknown".to_string(), |_| version.to_string())
 }
 
-fn append_historical_bugs(lines: &mut Vec<String>, rows: &[Vec<String>]) {
+fn append_historical_bugs<'a>(
+    lines: &mut Vec<String>,
+    groups: impl IntoIterator<Item = (&'a str, usize)>,
+) {
+    let mut counts = std::collections::BTreeMap::new();
+    for (version, count) in groups {
+        *counts.entry(version).or_insert(0) += count;
+    }
+    let rows = counts
+        .into_iter()
+        .map(|(version, count)| {
+            vec![
+                term::count(count as u64),
+                tui_sessions::fixed_bug_words(version),
+            ]
+        })
+        .collect::<Vec<_>>();
     if rows.is_empty() {
         return;
     }
@@ -337,7 +346,7 @@ fn append_historical_bugs(lines: &mut Vec<String>, rows: &[Vec<String>]) {
     lines.extend(term::table(
         &["COUNT", "WHAT HAPPENED"],
         &[Align::Right, Align::Left],
-        rows,
+        &rows,
     ));
     lines.push(
         "Keep the compiled cache; these records describe failures before the fix.".to_string(),
@@ -439,8 +448,6 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
         lines.push("No skips or passthroughs recorded in this scope.".to_string());
         return lines;
     }
-    lines.push(String::new());
-    lines.push(term::heading("Reasons"));
     let reasons = body
         .reasons
         .iter()
@@ -454,21 +461,24 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
             ]
         })
         .collect::<Vec<_>>();
-    lines.extend(term::table(
-        &["COUNT", "RESULT", "ROUTE", "WHY"],
-        &[Align::Right, Align::Left, Align::Left, Align::Left],
-        &reasons,
-    ));
-    let historical =
-        body.reasons
-            .iter()
-            .filter_map(|reason| {
-                reason.fixed_in.as_deref().map(|fixed_in| {
-                    vec![term::count(reason.count as u64), fixed_bug_words(fixed_in)]
-                })
-            })
-            .collect::<Vec<_>>();
-    append_historical_bugs(&mut lines, &historical);
+    if !reasons.is_empty() {
+        lines.push(String::new());
+        lines.push(term::heading("Reasons"));
+        lines.extend(term::table(
+            &["COUNT", "RESULT", "ROUTE", "WHY"],
+            &[Align::Right, Align::Left, Align::Left, Align::Left],
+            &reasons,
+        ));
+    }
+    append_historical_bugs(
+        &mut lines,
+        body.reasons.iter().filter_map(|reason| {
+            reason
+                .fixed_in
+                .as_deref()
+                .map(|version| (version, reason.count))
+        }),
+    );
     lines.push(String::new());
     lines.push(term::heading("Every skip and passthrough, slowest first"));
     let entries = body
@@ -477,17 +487,14 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
         .map(|entry| {
             vec![
                 entry.timestamp.clone(),
-                match entry.version.as_str() {
-                    "" | "0.0.0" => "unknown".to_string(),
-                    version => version.to_string(),
-                },
+                producer_words(&entry.version),
                 entry.crate_name.clone(),
                 term::home_path(Path::new(&entry.root)),
                 entry.result.clone(),
                 term::duration_ms(entry.elapsed_ms),
                 tui_sessions::passthrough_fixed_in(&entry.reason, &entry.version).map_or_else(
                     || tui_sessions::passthrough_words(&entry.reason),
-                    fixed_bug_words,
+                    tui_sessions::fixed_bug_words,
                 ),
             ]
         })
@@ -534,6 +541,7 @@ pub(crate) struct NotCached {
     pub reason: String,
     pub count: usize,
     pub expected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fixed_in: Option<&'static str>,
 }
 
@@ -939,6 +947,123 @@ mod tests {
         assert_eq!(
             tui_sessions::passthrough_fixed_in("refused|other error", "2.0.0-rc.2"),
             None
+        );
+    }
+
+    #[test]
+    fn historical_variants_share_one_row_and_unknown_versions_are_omitted() {
+        let select = "build-script cache bypassed: no such column: prediction_json in SELECT schema FROM input_predictions";
+        let insert = "build-script cache bypassed: no such column: prediction_json in INSERT OR REPLACE INTO input_predictions";
+        let reasons = [
+            format!("refused|{select}"),
+            format!("refused: {select}"),
+            format!("refused|{insert}"),
+            format!("refused: {insert}"),
+        ];
+        let mut events = reasons
+            .iter()
+            .enumerate()
+            .map(|(index, reason)| {
+                let mut event = ev(
+                    "build_script_run",
+                    EventResult::Passthrough,
+                    "s1",
+                    index as i64,
+                    "",
+                );
+                event.version = "2.0.0-rc.2".into();
+                event.passthrough_reason = reason.clone();
+                event
+            })
+            .collect::<Vec<_>>();
+        let (_, old) = report(&events);
+        assert_eq!(old.not_cached.len(), 1);
+        assert_eq!(old.not_cached[0].count, 4);
+        let old_bypass = crate::report::build_bypass_analysis(&events, usize::MAX);
+        let old_skips = SkipsBody {
+            scope: "all history",
+            root: None,
+            passthroughs: 4,
+            skipped: 0,
+            probes: 0,
+            reasons: old_bypass.reasons,
+            entries: old_bypass.slowest,
+        };
+        let old_text = render_skips(&old_skips).join("\n");
+        assert!(!old_text.contains("Reasons"), "{old_text}");
+        let old_summary = old_text.split("Every skip").next().unwrap();
+        assert_eq!(
+            old_summary.matches("fixed in Kache").count(),
+            1,
+            "{old_summary}"
+        );
+
+        for version in ["2.0.0-rc.3", "0.0.0-dev", "invalid"] {
+            let mut event = events[0].clone();
+            event.version = version.into();
+            events.push(event);
+        }
+        let (lines, body) = report(&events);
+        assert_eq!(body.not_cached.len(), 2);
+        assert_eq!(lines.join("\n").matches("fixed in Kache").count(), 1);
+        assert_eq!(
+            body.recorded_versions,
+            ["2.0.0-rc.2", "2.0.0-rc.3", "unknown"]
+        );
+        let json = serde_json::to_value(&body).unwrap();
+        let current = json["not_cached"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group.get("fixed_in").is_none())
+            .unwrap();
+        assert_eq!(current["count"], 3);
+        let all = sessions(&events);
+        let analysis = tui_sessions::analyze_session(&events, &all[0], &all);
+        assert_eq!(analysis.passthroughs.len(), 2);
+        assert!(
+            analysis
+                .passthroughs
+                .iter()
+                .find(|group| group.fixed_in.is_some())
+                .unwrap()
+                .words()
+                .contains("fixed in Kache 2.0.0-rc.3")
+        );
+        let bypass = crate::report::build_bypass_analysis(&events, usize::MAX);
+        let unknown = bypass
+            .slowest
+            .iter()
+            .filter(|detail| detail.version.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(unknown.len(), 2);
+        for detail in unknown {
+            assert!(
+                serde_json::to_value(detail)
+                    .unwrap()
+                    .get("version")
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            bypass
+                .slowest
+                .iter()
+                .filter(|detail| reasons.contains(&detail.reason))
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn historical_summary_combines_routes_without_losing_counts() {
+        let mut lines = Vec::new();
+        append_historical_bugs(&mut lines, [("2.0.0-rc.3", 2), ("2.0.0-rc.3", 3)]);
+        let text = lines.join("\n");
+        assert_eq!(text.matches("fixed in Kache").count(), 1);
+        assert!(
+            lines.iter().any(|line| line.trim_start().starts_with("5 ")),
+            "{text}"
         );
     }
 

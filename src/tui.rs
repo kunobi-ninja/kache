@@ -1507,7 +1507,7 @@ fn draw_now_causes(frame: &mut Frame, state: &mut AppState, area: Rect) {
         }
         for group in analysis.passthroughs.iter().take(2) {
             lines.push(Line::from(clip(
-                &format!("{} passed through · {}", group.count, group.reason),
+                &format!("{} passed through · {}", group.count, group.words()),
                 inner.width as usize,
             )));
         }
@@ -3211,11 +3211,7 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
             heading,
         ));
         for group in &analysis.passthroughs {
-            let label = if group.kind.is_empty() {
-                group.reason.clone()
-            } else {
-                format!("{}: {}", group.kind, group.reason)
-            };
+            let label = group.words();
             let note = if group.probe {
                 "  (queries, not compiles)"
             } else {

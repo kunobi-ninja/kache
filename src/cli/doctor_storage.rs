@@ -147,11 +147,15 @@ fn probe_access(cache_dir: &Path, index: &Path) -> Result<usize> {
 }
 
 fn recent_warning_check(marker: &Path) -> Option<Check> {
-    if !kache_store::markers::marker_is_fresh(marker, 86_400) {
-        return None;
-    }
     let content = std::fs::read_to_string(marker).ok()?;
     let (timestamp, _) = kache_store::markers::parse_session_marker(&content)?;
+    if !kache_store::markers::timestamp_is_fresh_at(
+        timestamp,
+        86_400,
+        kache_store::markers::now_epoch_secs(),
+    ) {
+        return None;
+    }
     let timestamp = chrono::DateTime::from_timestamp(i64::try_from(timestamp).ok()?, 0)?;
     Some(Check {
         label: "Store warning history",

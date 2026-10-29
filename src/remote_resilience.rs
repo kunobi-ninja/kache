@@ -79,7 +79,7 @@ impl RemoteErrorClass {
 /// errors lets every remote path classify the timeout without message parsing.
 #[derive(Debug)]
 pub(crate) struct RemoteDeadlineElapsed {
-    stage: &'static str,
+    pub(crate) stage: &'static str,
 }
 
 impl std::fmt::Display for RemoteDeadlineElapsed {
@@ -216,10 +216,7 @@ fn reqwest_payload_is_integrity(is_decode: bool, is_body: bool) -> bool {
 /// an opaque error whose chain ends at a formatted message).
 pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
     // Preserve the local budget marker even through a transport wrapper.
-    if error
-        .chain()
-        .any(|cause| cause.is::<RemoteDeadlineElapsed>())
-    {
+    if error.chain().any(is_local_deadline) {
         return RemoteErrorClass::Deadline;
     }
     for cause in error.chain() {
@@ -273,6 +270,16 @@ pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
         // reads and writes.
         RemoteErrorClass::Local
     }
+}
+
+fn is_local_deadline(error: &(dyn std::error::Error + 'static)) -> bool {
+    // io::Error::source skips its immediate payload, so an ordinary error
+    // chain walk cannot see a deadline held by a synchronous reader/writer.
+    error.is::<RemoteDeadlineElapsed>()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| is_local_deadline(inner))
 }
 
 fn macos_local_network_privacy_hint(
@@ -1348,6 +1355,24 @@ mod tests {
         )
         .context("restore timeout");
         assert_eq!(class_of(error), RemoteErrorClass::Deadline);
+    }
+
+    #[test]
+    fn local_deadline_marker_survives_nested_io_errors() {
+        let mut error = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            RemoteDeadlineElapsed {
+                stage: "extraction",
+            },
+        );
+        for _ in 0..3 {
+            assert!(is_local_deadline(&error));
+            error = std::io::Error::other(error);
+        }
+        assert_eq!(
+            class_of(anyhow::Error::new(error).context("reading pack")),
+            RemoteErrorClass::Deadline
+        );
     }
 
     #[test]

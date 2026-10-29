@@ -583,7 +583,7 @@ fn deadline_io_check(deadline: Option<Instant>, stage: &'static str) -> std::io:
     if deadline.is_some_and(|at| Instant::now() >= at) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("remote deadline elapsed during {stage}"),
+            crate::remote_resilience::RemoteDeadlineElapsed { stage },
         ));
     }
     Ok(())
@@ -903,6 +903,7 @@ pub(crate) mod tests {
         };
         let read_error = std::io::Read::read(&mut reader, &mut [0_u8; 4]).unwrap_err();
         assert_eq!(read_error.kind(), std::io::ErrorKind::TimedOut);
+        assert_local_deadline(read_error);
 
         let mut writer = DeadlineWriter {
             inner: Vec::new(),
@@ -911,8 +912,10 @@ pub(crate) mod tests {
         };
         let write_error = std::io::Write::write_all(&mut writer, b"pack").unwrap_err();
         assert_eq!(write_error.kind(), std::io::ErrorKind::TimedOut);
+        assert_local_deadline(write_error);
         let flush_error = std::io::Write::flush(&mut writer).unwrap_err();
         assert_eq!(flush_error.kind(), std::io::ErrorKind::TimedOut);
+        assert_local_deadline(flush_error);
 
         let mut hashing_writer = HashingWriter {
             inner: Vec::new(),
@@ -921,6 +924,14 @@ pub(crate) mod tests {
         };
         let flush_error = std::io::Write::flush(&mut hashing_writer).unwrap_err();
         assert_eq!(flush_error.kind(), std::io::ErrorKind::TimedOut);
+        assert_local_deadline(flush_error);
+    }
+
+    fn assert_local_deadline(error: std::io::Error) {
+        assert_eq!(
+            crate::remote_resilience::classify_remote_error(&anyhow::Error::new(error)),
+            crate::remote_resilience::RemoteErrorClass::Deadline,
+        );
     }
 
     /// #211: building a blob path from a malformed (short) hash must not panic

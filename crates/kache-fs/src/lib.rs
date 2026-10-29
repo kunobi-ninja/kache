@@ -887,6 +887,7 @@ mod tests {
         assert_eq!(blocks.free, 16384);
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn volume_query_requires_a_real_path() {
         let dir = TempDir::new("volume-usage");
@@ -895,7 +896,17 @@ mod tests {
         assert!(usage.free > 0);
         assert!(usage.free <= usage.total);
         assert!(volume_usage(&dir.path().join("missing")).is_none());
+        assert!(volume_usage(Path::new("")).is_none());
         assert!(volume_usage(Path::new("\0")).is_none());
+        let mut truncated = dir.path().as_os_str().to_owned();
+        truncated.push("\0ignored");
+        assert!(volume_usage(Path::new(&truncated)).is_none());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn unavailable_volume_usage_remains_unknown() {
+        assert!(volume_usage(Path::new(".")).is_none());
     }
 
     #[test]

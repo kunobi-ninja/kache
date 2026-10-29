@@ -86,9 +86,10 @@ such as `/work/previous/target/debug`.
 
 ### Compiler behavior
 
-Portable private compilations use `-Zremap-cwd-prefix=/src`. Debug information
-records that virtual working directory; a debugger started elsewhere may need a
-source mapping. Relative source operands keep relative `file!()` values.
+Portable private compilations use `-Zremap-cwd-prefix=/src` on Unix and
+`-Zremap-cwd-prefix=C:\src` on Windows. Debug information records that virtual
+working directory; a debugger started elsewhere may need a source mapping.
+Relative source operands keep relative `file!()` values.
 Absolute source operands retain native path behavior and do not import a seed.
 
 Kache probes compiler support before using the flag. On stable and beta it sets

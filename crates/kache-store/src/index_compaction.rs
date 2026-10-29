@@ -119,8 +119,9 @@ fn attempt(db: &Connection) -> anyhow::Result<Attempt> {
         return Ok(Attempt::Done(IndexCompaction::NotNeeded));
     }
     let path = std::path::Path::new(db.path().context("index has no filesystem path")?);
-    let free = kache_fs::volume_usage(path)
+    let free = kache_fs::volume_stats(path)
         .context("could not check free space for index compaction")?
+        .usage
         .free;
     if !stats.fits_in(free) {
         return Ok(Attempt::Done(IndexCompaction::InsufficientSpace {
@@ -195,7 +196,7 @@ mod tests {
     };
 
     /// An index with 80 MiB of dropped legacy rows and one live table.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn sparse_index(path: &std::path::Path) -> FileHashCache<'static> {
         let db = Connection::open(path).unwrap();
         db.execute_batch(
@@ -277,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn dropped_table_is_reported_then_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");

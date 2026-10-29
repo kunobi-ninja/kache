@@ -294,6 +294,11 @@ mod tests {
         assert!(root.id.is_some());
         assert_eq!(root.id, nested.id);
         assert!(root.usage.total > 0);
+        let file = dir.path().join("index.db");
+        std::fs::write(&file, []).unwrap();
+        let stored = volume_stats(&file).unwrap();
+        assert_eq!(stored.id, root.id);
+        assert_eq!(stored.usage.total, root.usage.total);
         assert!(volume_stats(&dir.path().join("missing")).is_none());
         assert!(volume_stats(Path::new("\0")).is_none());
         let bytes = volume_space(dir.path()).unwrap();

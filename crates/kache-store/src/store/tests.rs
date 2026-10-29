@@ -11597,8 +11597,11 @@ fn key_lock_sweep_removes_a_stale_lock_whose_key_has_no_entry() {
     assert!(stale.exists());
 }
 
+/// An evicted key's lock goes with its entry when it is idle, by the
+/// sweep's rules: eviction left nearly every lock without an entry (177k of
+/// 178k on a shared store), which only the full GC's capped sweep removed.
 #[test]
-fn key_lock_sweep_removes_the_lock_of_an_evicted_key() {
+fn removing_an_entry_removes_its_idle_key_lock() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
@@ -11618,14 +11621,52 @@ fn key_lock_sweep_removes_the_lock_of_an_evicted_key() {
     assert!(lock_path.exists());
 
     store.remove_entry(&k).unwrap();
+    assert!(!lock_path.exists(), "the idle lock went with the entry");
     assert_eq!(
         sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
         KeyLockSweepStats {
-            seen: 1,
-            removed: 1
+            seen: 0,
+            removed: 0
         }
     );
-    assert!(!lock_path.exists());
+}
+
+/// A removal leaves a lock that a claimant holds or claimed within the
+/// sweep's grace: unlinking a held lock would let a second claimant in, and
+/// locking a fresh one would read as contention to its next claimant.
+#[test]
+fn removing_an_entry_keeps_a_held_or_recently_claimed_key_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let held_key = put_entry(&store, dir.path(), 1, "held", b"payload one");
+    let young_key = put_entry(&store, dir.path(), 2, "young", b"payload two");
+    let held = store.try_lock(&held_key).unwrap().expect("claim the key");
+    let held_path = config.store_dir().join(format!("{held_key}.lock"));
+    let held_identity = kache_fs::file_identity(&held_path).unwrap();
+    set_age(&held_path, TWO_HOURS);
+    drop(store.try_lock(&young_key).unwrap().expect("claim the key"));
+    let young_path = config.store_dir().join(format!("{young_key}.lock"));
+
+    // Removed from another thread, as the daemon would from another process.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let remover = Store::open(&config).unwrap();
+                remover.remove_entry(&held_key).unwrap();
+                remover.remove_entry(&young_key).unwrap();
+            })
+            .join()
+            .unwrap()
+    });
+
+    assert_eq!(kache_fs::file_identity(&held_path).unwrap(), held_identity);
+    assert!(
+        store.try_lock(&held_key).unwrap().is_none(),
+        "the holder still excludes every other claimant"
+    );
+    assert!(young_path.exists(), "a lock claimed within the grace stays");
+    drop(held);
 }
 
 #[test]

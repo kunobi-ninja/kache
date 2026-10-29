@@ -6719,6 +6719,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         cleanup_tx.commit()?;
+
+        // The key's lock file outlives its entry, and only the full GC's
+        // capped sweep removed it. Remove it here by the sweep's rules,
+        // outside the index lock: only an idle file, only while holding its
+        // lock, and only while it is still the file at the path. A claimant
+        // that opened it before the unlink finds the path changed and reopens.
+        if republished == 0 {
+            remove_stale_lock_file(
+                &entry_dir.with_extension("lock"),
+                KEY_LOCK_SWEEP_GRACE,
+                std::time::SystemTime::now(),
+                || {},
+            );
+        }
         Ok(RemovalAttempt::Done(Some(reclaim)))
     }
 

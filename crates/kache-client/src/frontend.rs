@@ -99,16 +99,31 @@ fn forwarded_command(
     version: &str,
     args: &[OsString],
     started_at: std::time::Instant,
-    windows: bool,
+    _windows: bool,
 ) -> Result<(Command, Option<crate::argv_file::ArgvFile>)> {
-    let command = engine_command(executable, version, args, started_at)?;
-    if !windows || !crate::argv_file::command_too_long(&command) {
-        return Ok((command, None));
+    let mut command = engine_command(executable, version, &[], started_at)?;
+    #[cfg(any(windows, test))]
+    if _windows && crate::argv_file::command_too_long(&command, args) {
+        let file = crate::argv_file::ArgvFile::new(args)?;
+        let mut prefix: Vec<_> = command.get_args().map(OsString::from).collect();
+        prefix[2] = startup_micros(started_at).into();
+        let mut compact = Command::new(command.get_program());
+        compact
+            .args(prefix)
+            .arg(crate::argv_file::FLAG)
+            .arg(file.path());
+        return Ok((compact, Some(file)));
     }
-    let file = crate::argv_file::ArgvFile::new(args)?;
-    let compact_args = [OsString::from(crate::argv_file::FLAG), file.path().into()];
-    let command = engine_command(executable, version, &compact_args, started_at)?;
-    Ok((command, Some(file)))
+    command.args(args);
+    Ok((command, None))
+}
+
+fn startup_micros(started_at: std::time::Instant) -> String {
+    started_at
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX))
+        .to_string()
 }
 
 fn engine_command(
@@ -123,13 +138,7 @@ fn engine_command(
     command
         .arg(crate::FORWARDED_ARGV_FLAG)
         .arg(version)
-        .arg(
-            started_at
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX))
-                .to_string(),
-        )
+        .arg(startup_micros(started_at))
         .arg(executable)
         .arg(
             kache_shims::running_identity()
@@ -202,6 +211,11 @@ mod tests {
                 crate::engine_entry(argv.clone(), "fixture").unwrap().args,
                 args
             );
+            assert_eq!(
+                crate::engine_entry(argv.clone(), "fixture").unwrap().args,
+                args,
+                "CLI command_args must be able to read the same envelope again"
+            );
             assert!(
                 crate::engine_entry(argv, "old-version")
                     .err()
@@ -210,7 +224,7 @@ mod tests {
                     .contains("releases differ")
             );
             assert_eq!(file.is_some(), windows);
-            assert_eq!(crate::argv_file::command_too_long(&command), !windows);
+            assert_eq!(crate::argv_file::command_too_long(&command, &[]), !windows);
             if let Some(file) = file {
                 let path = file.path().to_owned();
                 std::fs::remove_file(&engine).unwrap();

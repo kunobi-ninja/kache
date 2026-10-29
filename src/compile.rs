@@ -1,5 +1,6 @@
 use crate::invocation::process::{Child, CommandExt as _};
 use anyhow::{Context, Result, bail};
+use kache_protocol::command_line::{WINDOWS_COMMAND_LINE_LIMIT, windows_command_line_bound};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -43,26 +44,6 @@ impl CompileResult {
     pub fn pending_stderr(&self) -> &str {
         self.pending_stderr.as_deref().unwrap_or(&self.stderr)
     }
-}
-
-/// The longest command line `CreateProcessW` takes, in UTF-16 code units,
-/// its terminating NUL included.
-pub(crate) const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;
-
-/// An upper bound of the command line the standard library builds on Windows
-/// for a program and its arguments (`words`, program first), in UTF-16 code
-/// units with separators and the terminating NUL: every word counted as
-/// quoted, and every quote and backslash in it as escaped.
-pub(crate) fn windows_command_line_bound<'a>(
-    words: impl IntoIterator<Item = &'a std::ffi::OsStr>,
-) -> usize {
-    1 + words
-        .into_iter()
-        .map(|word| {
-            let word = word.to_string_lossy();
-            word.encode_utf16().count() + word.matches(['"', '\\']).count() + 3
-        })
-        .sum::<usize>()
 }
 
 /// Whether the compiler's own arguments go to rustc in a response file

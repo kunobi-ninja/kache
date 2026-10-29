@@ -8,6 +8,8 @@ use kache_core::timeline::{PrefetchAccounting, PrefetchOrigin};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod command_line;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrestageRequest {
     pub target_dir: String,

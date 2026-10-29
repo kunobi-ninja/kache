@@ -2,24 +2,45 @@
 use anyhow::{Context, Result, ensure};
 use kache_protocol::execution::NativeString;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(any(windows, test))]
+use std::io::Write;
+#[cfg(any(windows, test))]
 use std::path::Path;
+#[cfg(any(windows, test))]
 use std::process::Command;
 
 pub(super) const FLAG: &str = "--kache-argv-file-v1";
 const MAX_BYTES: u64 = 1 << 20;
 
-/// The frontend retains the file until the engine exits, including on spawn errors.
-/// Keep it available for later calls to `engine_entry` in the same engine process.
+/// Keep the file open while the engine runs, including repeated argv reads.
+/// Windows also deletes it if the sender is terminated without running Drop.
+#[cfg(any(windows, test))]
 pub(super) struct ArgvFile(tempfile::NamedTempFile);
+#[cfg(not(any(windows, test)))]
+pub(super) type ArgvFile = ();
 
+#[cfg(any(windows, test))]
 impl ArgvFile {
     pub(super) fn new(args: &[OsString]) -> Result<Self> {
-        let mut file = tempfile::Builder::new()
-            .prefix("kache-argv-")
-            .suffix(".json")
-            .tempfile()
-            .context("creating engine argv file")?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("kache-argv-").suffix(".json");
+        #[cfg(not(windows))]
+        let file = builder.tempfile();
+        #[cfg(windows)]
+        let file = builder.make(|path| {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+            };
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE)
+                .open(path)
+        });
+        let mut file = file.context("creating engine argv file")?;
         let native: Vec<_> = args.iter().map(|arg| NativeString::capture(arg)).collect();
         serde_json::to_writer(&mut file, &native).context("writing engine argv file")?;
         file.flush().context("flushing engine argv file")?;
@@ -31,26 +52,14 @@ impl ArgvFile {
     }
 }
 
-/// Conservative UTF-16 bound: quote every word and escape every backslash/quote.
-/// Include separators and the terminating NUL; preserve native Windows units.
-pub(super) fn command_too_long(command: &Command) -> bool {
-    let bound = std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .fold(1_usize, |total, word| {
-            let native = NativeString::capture(word);
-            let units: Vec<u16> = match native {
-                NativeString::Windows(units) => units,
-                NativeString::Unix(_) => word.to_string_lossy().encode_utf16().collect(),
-            };
-            total
-                + units.len()
-                + units
-                    .iter()
-                    .filter(|&&u| u == u16::from(b'"') || u == u16::from(b'\\'))
-                    .count()
-                + 3
-        });
-    bound > 32_767
+#[cfg(any(windows, test))]
+pub(super) fn command_too_long(command: &Command, extra: &[OsString]) -> bool {
+    use kache_protocol::command_line::{WINDOWS_COMMAND_LINE_LIMIT, windows_command_line_bound};
+    windows_command_line_bound(
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .chain(extra.iter().map(OsString::as_os_str)),
+    ) > WINDOWS_COMMAND_LINE_LIMIT
 }
 
 pub(super) fn expand(args: Vec<OsString>) -> Result<Vec<OsString>> {
@@ -79,21 +88,98 @@ pub(super) fn expand(args: Vec<OsString>) -> Result<Vec<OsString>> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn terminating_the_sender_removes_its_argv_file_without_running_drop() {
+        struct Sender(std::process::Child);
+        impl Drop for Sender {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("argv-path.json");
+        let mut sender = Sender(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "argv_file::tests::argv_file_sender_fixture",
+                ])
+                .env("KACHE_ARGV_FILE_FIXTURE", &record)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !record.exists() {
+            assert!(
+                sender.0.try_wait().unwrap().is_none(),
+                "argv sender exited before publishing its path"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "argv sender did not publish its path"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let native: NativeString =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let path = std::path::PathBuf::from(native.decode().unwrap());
+        assert_eq!(
+            expand(vec![FLAG.into(), path.clone().into_os_string()]).unwrap(),
+            [OsString::from("kache")]
+        );
+        sender.0.kill().unwrap();
+        sender.0.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "kernel must delete the argv file after a hard kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "isolated argv-file sender for the hard-kill regression"]
+    fn argv_file_sender_fixture() {
+        let Some(record) = std::env::var_os("KACHE_ARGV_FILE_FIXTURE") else {
+            return;
+        };
+        let file = ArgvFile::new(&["kache".into()]).unwrap();
+        let native = NativeString::capture(file.path().as_os_str());
+        let record = std::path::PathBuf::from(record);
+        let pending = record.with_extension("pending");
+        std::fs::write(&pending, serde_json::to_vec(&native).unwrap()).unwrap();
+        std::fs::rename(pending, record).unwrap();
+        let _ = std::io::stdin().read_exact(&mut [0]);
+        drop(file);
+    }
+
     #[test]
     fn windows_limit_counts_escaping_unicode_and_the_terminator() {
         for (length, expected) in [(32_758, false), (32_759, false), (32_760, true)] {
             assert_eq!(
-                command_too_long(Command::new("x").arg("a".repeat(length))),
+                command_too_long(Command::new("x").arg("a".repeat(length)), &[]),
                 expected
             );
         }
         let mut escaped = "a".repeat(32_756);
         escaped.push_str("\\\"");
-        assert!(command_too_long(Command::new("x").arg(escaped)));
+        assert!(command_too_long(Command::new("x").arg(escaped), &[]));
         assert!(!command_too_long(
-            Command::new("x").arg("🦀".repeat(16_379))
+            Command::new("x").arg("🦀".repeat(16_379)),
+            &[]
         ));
-        assert!(command_too_long(Command::new("x").arg("🦀".repeat(16_380))));
+        assert!(command_too_long(
+            Command::new("x").arg("🦀".repeat(16_380)),
+            &[]
+        ));
     }
 
     #[test]

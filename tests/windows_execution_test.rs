@@ -7,7 +7,7 @@ mod common;
 use kache_ipc::windows_process::Job;
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
@@ -370,6 +370,15 @@ fn response_file_handles_injected_remaps_that_alone_exceed_the_windows_limit() {
 
 #[test]
 fn local_engine_handoff_handles_a_command_that_only_fits_before_forwarding() {
+    assert_long_engine_handoff(false);
+}
+
+#[test]
+fn daemon_declined_handoff_handles_a_command_that_only_fits_before_forwarding() {
+    assert_long_engine_handoff(true);
+}
+
+fn assert_long_engine_handoff(declined: bool) {
     let fixture = Fixture::new();
     let rustc = fixture.rustc();
     std::fs::create_dir(fixture.path("work/out")).unwrap();
@@ -386,17 +395,63 @@ fn local_engine_handoff_handles_a_command_that_only_fits_before_forwarding() {
         + 4
         + prefix.encode_utf16().count()
         + suffix.encode_utf16().count();
-    let padding = "p".repeat(32_750 - fixed);
+    let padding = "p".repeat(
+        32_750_usize
+            .checked_sub(fixed)
+            .expect("fixture path too long for 32,750-unit command"),
+    );
     let tail = format!("{prefix}{padding}{suffix}");
     assert_eq!(
         frontend.as_os_str().encode_wide().count() + 4 + tail.encode_utf16().count(),
         32_750
     );
+    let server = declined.then(|| {
+        use kache_ipc::prelude::*;
+        let socket = fixture.path("runtime/daemon.sock");
+        let listener = kache_ipc::ListenerOptions::new()
+            .name(kache_ipc::socket_name(&socket).unwrap())
+            .nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
+            .create_sync()
+            .unwrap();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + LIMIT;
+            for _ in 0..2 {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok(stream) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "frontend did not contact the daemon"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accepting compiler request: {error}"),
+                    }
+                };
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                let request: kache_protocol::Request = serde_json::from_str(&line).unwrap();
+                assert!(matches!(request, kache_protocol::Request::ExecuteV1(_)));
+                let reply = kache_protocol::execution::ExecutionReply::Declined {
+                    reason: "fixture declines before Commit".into(),
+                };
+                serde_json::to_writer(&mut stream, &reply).unwrap();
+                stream.write_all(b"\n").unwrap();
+                stream.flush().unwrap();
+            }
+        })
+    });
     let build = || {
         let mut command = fixture.command(&frontend);
-        // Force the supported nested-wrapper local path, independent of the
-        // runner's token compatibility with a daemon.
-        command.env("KACHE_ACTIVE", "1").raw_arg(&tail);
+        if declined {
+            // Keep the initial delegation attempt; skip cold-daemon bootstrap
+            // after the controlled pre-Commit refusal. No nested-wrapper flag.
+            command.env("KACHE_DISABLED", "1");
+        } else {
+            command.env("KACHE_ACTIVE", "1");
+        }
+        command.raw_arg(&tail);
         command
     };
     fixture.success(&mut build());
@@ -409,6 +464,9 @@ fn local_engine_handoff_handles_a_command_that_only_fits_before_forwarding() {
     let output = fixture.run(&mut build());
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("argv transport compiler diagnostic"));
+    if let Some(server) = server {
+        server.join().expect("daemon refusal fixture failed");
+    }
 }
 
 #[test]

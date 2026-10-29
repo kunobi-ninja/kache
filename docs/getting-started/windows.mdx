@@ -46,7 +46,7 @@ and modeled runtime/default-library selections. This does not make direct
 `cl.exe` object compilation cacheable. On main, DLL caching also retains import
 libraries omitted from rustc's artifact notifications.
 
-Long Rust commands can remain cacheable: RC2 moves Kache-injected arguments into
+Long Rust commands can remain cacheable: RC.2 moves Kache-injected arguments into
 a response file when they would overflow the Windows command line. RC.4 also
 passes arguments through a temporary file when the local-engine handoff would
 exceed that limit, fixing engine startup failures with error 206. Unsupported
@@ -62,7 +62,7 @@ cache pipeline over an authenticated named pipe.
 eligibility. A refused handoff can use the local engine before Commit. After
 Commit, a lost connection fails the invocation rather than rerunning it.
 
-RC2 supports an explicit trust option for certain known process-identity token
+RC.2 supports an explicit trust option for certain known process-identity token
 differences. It must be enabled in both configurations and requires a daemon
 restart. Other token checks still apply. Read
 [Process restrictions](/docs/how-it-works/architecture#process-restrictions)

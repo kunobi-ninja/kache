@@ -10766,7 +10766,12 @@ async fn identity_manifest_candidates_protect_cheap_demands_across_planning() {
     let _lock = crate::config::config_path_lock();
     let _minimum = EnvVarForTest::remove("KACHE_MIN_COMPILE_MS");
     let _manifest_override = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
-    for timing in ["before-session", "before-plan", "after-plan"] {
+    for timing in [
+        "before-session",
+        "before-plan",
+        "after-plan",
+        "after-advisory",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
@@ -10825,11 +10830,17 @@ async fn identity_manifest_candidates_protect_cheap_demands_across_planning() {
             daemon.ensure_active_session(&request);
         }
         let planner_key = test_cache_key("planner-before-manifest");
-        if timing == "after-plan" {
+        let (initial_plan_id, initial_source) = if timing == "after-advisory" {
+            ("original-advisory-plan", "advisory")
+        } else {
+            ("", "fallback")
+        };
+        let planned_before_manifest = matches!(timing, "after-plan" | "after-advisory");
+        if planned_before_manifest {
             daemon.install_plan(
                 &request.session_id,
-                "",
-                "fallback",
+                initial_plan_id,
+                initial_source,
                 std::iter::once(planner_key.clone()),
                 request.intent.identity_key.clone(),
             );
@@ -10841,7 +10852,7 @@ async fn identity_manifest_candidates_protect_cheap_demands_across_planning() {
         if timing == "before-session" {
             daemon.ensure_active_session(&request);
         }
-        if timing != "after-plan" {
+        if !planned_before_manifest {
             daemon.install_plan(
                 &request.session_id,
                 "",
@@ -10913,12 +10924,13 @@ async fn identity_manifest_candidates_protect_cheap_demands_across_planning() {
                 &request.session_id
             }
         );
-        assert_eq!(origin.plan_id, "");
+        assert_eq!(origin.plan_id, initial_plan_id);
         assert_eq!(
             origin.source,
             match timing {
                 "before-session" => "unscoped",
                 "before-plan" => "none",
+                "after-advisory" => "advisory",
                 _ => "fallback",
             }
         );

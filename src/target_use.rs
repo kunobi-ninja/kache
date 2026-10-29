@@ -31,7 +31,7 @@ impl Drop for Lease {
 /// A running command that holds a shared lease, from its record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Holder {
-    pub(crate) pid: u32,
+    pub(crate) process: crate::process_identity::ProcessIdentity,
     /// What the command is, such as `cargo run` or a test binary's name.
     pub(crate) what: String,
     /// When it took the lease, in seconds since the epoch.
@@ -66,7 +66,9 @@ fn holder_record(cache_dir: &Path) -> PathBuf {
     cache_dir.join("target-use.holder")
 }
 
-/// One file per shared lease, named by its process and the time it was taken.
+/// One file per shared lease, named `<pid>-<nanos>-<start>`: its process,
+/// the time it was taken, and when its process started where the platform
+/// reports that. Records from before starts were kept end at `<nanos>`.
 fn holders_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("target-use.holders")
 }
@@ -77,25 +79,36 @@ fn record_holder(cache_dir: &Path, what: &str) -> Option<PathBuf> {
     let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let pid = std::process::id();
-    let record = dir.join(format!("{pid}-{}", since.as_nanos()));
+    let process = crate::process_identity::ProcessIdentity::current();
+    let taken = format!("{}-{}", process.pid(), since.as_nanos());
+    let record = dir.join(match process.start() {
+        Some(start) => format!("{taken}-{start}"),
+        None => taken,
+    });
     // A tab cannot appear in the time, so `what` keeps any characters.
     std::fs::write(&record, format!("{}\t{what}", since.as_secs())).ok()?;
     Some(record)
 }
 
 fn parse_holder(name: &str, text: &str) -> Option<Holder> {
-    let pid = name.split('-').next()?.parse().ok()?;
+    use crate::process_identity::ProcessIdentity;
+    let mut parts = name.split('-');
+    let pid = parts.next()?.parse().ok()?;
+    let _taken = parts.next()?;
+    let process = match parts.next() {
+        Some(start) => ProcessIdentity::started_at(pid, start.parse().ok()?),
+        None => ProcessIdentity::unrecorded(pid),
+    };
     let (since, what) = text.split_once('\t')?;
     Some(Holder {
-        pid,
+        process,
         what: what.trim().to_owned(),
         since: since.parse().ok()?,
     })
 }
 
-/// The commands holding shared leases now, oldest first. A record left by a
-/// process that is gone is removed.
+/// The commands holding shared leases now, oldest first. A record whose
+/// process is gone is removed, even when its number now names another.
 pub(crate) fn holders(cache_dir: &Path) -> Vec<Holder> {
     let Ok(entries) = std::fs::read_dir(holders_dir(cache_dir)) else {
         return Vec::new();
@@ -109,13 +122,13 @@ pub(crate) fn holders(cache_dir: &Path) -> Vec<Holder> {
         else {
             continue;
         };
-        if crate::daemon::process_is_alive(holder.pid) {
+        if holder.process.is_running() {
             holders.push(holder);
         } else {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-    holders.sort_by_key(|holder| (holder.since, holder.pid));
+    holders.sort_by_key(|holder| (holder.since, holder.process.pid()));
     holders
 }
 
@@ -235,7 +248,7 @@ mod tests {
         let named = holders(dir.path());
         assert_eq!(named.len(), 1);
         assert_eq!(
-            (named[0].pid, named[0].what.as_str()),
+            (named[0].process.pid(), named[0].what.as_str()),
             (std::process::id(), "cargo run")
         );
         assert_eq!(blockers(dir.path()), Some(named));
@@ -259,12 +272,56 @@ mod tests {
         assert_eq!(
             parse_holder("42-9", "17\tcargo test --all"),
             Some(Holder {
-                pid: 42,
+                process: crate::process_identity::ProcessIdentity::unrecorded(42),
                 what: "cargo test --all".to_owned(),
                 since: 17
             })
         );
         assert_eq!(parse_holder("x-9", "17\tcargo"), None);
+    }
+
+    /// Linux reuses process numbers, and answers for a thread's ID as for a
+    /// process, so a record's number can name a live stranger.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_whose_number_now_names_another_process_or_thread_is_dropped() {
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let (sent_tid, thread_id) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            sent_tid.send(unsafe { libc::gettid() } as u32).unwrap();
+            let _ = stopped.recv();
+        });
+        let tid = thread_id.recv().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let lease = shared(dir.path(), "cargo build", &mut io::sink()).unwrap();
+        let records = holders_dir(dir.path());
+        let reused = [
+            // A thread of this very process.
+            format!("{tid}-1"),
+            // A process that started after the one that wrote the record.
+            format!("{}-1-0", stranger.id()),
+            // A record from before records named a start.
+            format!("{}-2", stranger.id()),
+        ];
+        for name in &reused {
+            std::fs::write(records.join(name), "5\tcargo nextest").unwrap();
+        }
+        let named: Vec<String> = holders(dir.path()).into_iter().map(|h| h.what).collect();
+        assert_eq!(named, ["cargo build"]);
+        for name in &reused {
+            assert!(!records.join(name).exists(), "{name} kept");
+        }
+
+        drop(lease);
+        drop(stop);
+        thread.join().unwrap();
+        stranger.kill().unwrap();
+        stranger.wait().unwrap();
     }
 
     #[test]

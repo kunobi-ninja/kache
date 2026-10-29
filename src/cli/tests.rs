@@ -8058,7 +8058,7 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
     let pid = std::process::id();
     assert_eq!(waiting.len(), 1);
     assert_eq!(
-        (waiting[0].pid, waiting[0].what.as_str()),
+        (waiting[0].process.pid(), waiting[0].what.as_str()),
         (pid, "cargo build")
     );
     assert!(
@@ -8175,7 +8175,7 @@ fn only_targets_this_clean_deleted_count_as_removed() {
 fn held_reason_names_each_command_and_how_long_it_ran() {
     use crate::target_use::Holder;
     let holder = |pid, what: &str, since| Holder {
-        pid,
+        process: crate::process_identity::ProcessIdentity::unrecorded(pid),
         what: what.to_owned(),
         since,
     };

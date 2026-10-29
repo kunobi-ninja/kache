@@ -981,6 +981,34 @@ fn in_flight_registry_upserts_prunes_and_snapshots() {
     assert!(daemon.in_flight_snapshot().is_empty());
 }
 
+/// A compile whose number now names a thread or a later process is gone:
+/// Linux answers `kill(id, 0)` for a thread's ID as for a process.
+#[cfg(target_os = "linux")]
+#[test]
+fn in_flight_compile_under_a_reused_number_is_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    let (sent, received) = std::sync::mpsc::channel();
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        sent.send(unsafe { libc::gettid() } as u32).unwrap();
+        let _ = stopped.recv();
+    });
+    let tid = received.recv().unwrap();
+    daemon.handle_compile_started(CompileStartedRequest {
+        crate_name: "ghost".into(),
+        root: "/w".into(),
+        pid: tid,
+        started_at_ms: unix_time_ms(),
+        typical_ms: None,
+        client_epoch: 0,
+        client_version: None,
+    });
+    assert!(daemon.in_flight_snapshot().is_empty());
+    drop(stop);
+    thread.join().unwrap();
+}
+
 /// #131 wire shape: the new variants serialize under snake_case tags an
 /// old daemon will reject as a parse error (fire-and-forget client
 /// ignores), and StatsResponse's `in_flight` defaults for old daemons.
@@ -2321,22 +2349,6 @@ fn test_daemon_coord_state_roundtrip() {
     assert_eq!(state.build_epoch, build_epoch());
     assert_eq!(state.phase, DaemonPhase::Starting);
     assert!(daemon_state_is_recent(&state));
-}
-
-#[cfg(unix)]
-#[test]
-fn pid_alive_rejects_broadcast_pids() {
-    // This prunes the in-flight compile map. `kill(0, 0)` and `kill(-1, 0)`
-    // succeed whenever anything signalable exists, so without the guard
-    // entries recorded under a bogus PID would look alive forever.
-    assert!(super::pid_alive(std::process::id()));
-
-    assert!(!super::pid_alive(0), "0 is the caller's process group");
-    assert!(!super::pid_alive(1), "1 is init/launchd, never a compile");
-    assert!(
-        !super::pid_alive(u32::MAX),
-        "u32::MAX casts to the -1 broadcast"
-    );
 }
 
 #[test]

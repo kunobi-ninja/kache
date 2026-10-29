@@ -336,10 +336,12 @@ fn canonical_spelling(profile: &Path) -> bool {
 /// the verbatim `\\?\C:\...` spelling of a plain `C:\...` path, which names
 /// the same file; a canonical path on Unix never has that prefix.
 fn same_spelling(canonical: &Path, profile: &Path) -> bool {
-    match canonical.to_str() {
-        Some(text) => Path::new(&*kache_fs::paths::strip_verbatim_prefix(text)) == profile,
-        None => canonical == profile,
+    if canonical == profile {
+        return true;
     }
+    canonical.to_str().is_some_and(|text| {
+        Path::new(&*kache_fs::paths::strip_verbatim_prefix(text)) == profile
+    })
 }
 
 pub(super) fn empty_directory(path: &Path) -> bool {
@@ -558,6 +560,7 @@ mod tests {
             Some(text) => PathBuf::from(kache_fs::paths::strip_verbatim_prefix(text).into_owned()),
             None => canonical.clone(),
         };
+        assert!(canonical_spelling(&canonical), "{}", canonical.display());
         assert!(canonical_spelling(&plain), "{}", plain.display());
         assert!(!canonical_spelling(&plain.join("missing")));
         #[cfg(unix)]
@@ -574,11 +577,19 @@ mod tests {
         assert!(!same_spelling(Path::new("/work/a"), Path::new("/work/b")));
         assert!(same_spelling(
             Path::new(r"\\?\C:\work\a"),
+            Path::new(r"\\?\C:\work\a")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\?\C:\work\a"),
             Path::new(r"C:\work\a")
         ));
         assert!(!same_spelling(
             Path::new(r"\\?\C:\work\a"),
             Path::new(r"C:\work\b")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\?\UNC\host\share\a"),
+            Path::new(r"\\?\UNC\host\share\a")
         ));
         assert!(same_spelling(
             Path::new(r"\\?\UNC\host\share\a"),
@@ -792,7 +803,7 @@ mod tests {
     fn long_form_lint_flags_seed_like_their_short_forms() {
         let cwd = tempfile::tempdir().unwrap();
         let remap = format!("-Zremap-cwd-prefix={VIRTUAL_PREFIX}");
-        for flag in ["--warn", "--allow", "--deny", "--forbid"] {
+        for flag in ["--warn", "--allow", "--deny", "--forbid", "--force-warn"] {
             for lint in [
                 vec![format!("{flag}=unexpected_cfgs")],
                 vec![flag.to_string(), "unexpected_cfgs".to_string()],

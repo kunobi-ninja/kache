@@ -122,7 +122,7 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     command.args(&cargo_args);
     check_targets::configure(&mut command, &cargo, &config, &env);
     crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
-    run_cargo_guarded(command, &cargo, lease, &config)
+    run_cargo_and_exit(command, &cargo, lease, &config)
 }
 
 fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
@@ -224,7 +224,19 @@ fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()
     let what = cargo_command_label(command.get_args());
     let target_use = crate::target_use::shared_for(&config.cache_dir, &what, command.get_args())
         .context("protecting target directories while Cargo runs")?;
-    run_cargo_guarded(command, cargo, target_use, &config)
+    run_cargo_and_exit(command, cargo, target_use, &config)
+}
+
+/// Run Cargo under `lease`, then exit as Cargo did. Exiting runs no
+/// destructors, so the lease and its record go first.
+fn run_cargo_and_exit(
+    command: Command,
+    cargo: &Path,
+    lease: crate::target_use::Lease,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let disposition = run_cargo_guarded(command, cargo, lease, config)?;
+    std::process::exit(crate::test_runner::finish(disposition));
 }
 
 /// `cargo <subcommand>`, for a cleanup that has to wait for this command.
@@ -265,13 +277,14 @@ const MAX_CARGO_PROTOCOL_LINE: usize = 4 * 1024 * 1024;
 const INVALID_CARGO_STREAM: &[u8] = b"\0kache-invalid-cargo-stream\n";
 const CARGO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Stay alive with the lease until Cargo and everything it runs has exited.
+/// Stay alive with the lease until Cargo and everything it runs has exited,
+/// and say how Cargo ended. The lease is released on return.
 fn run_cargo_guarded(
     mut command: Command,
     cargo: &Path,
     _lease: crate::target_use::Lease,
     config: &crate::config::Config,
-) -> Result<()> {
+) -> Result<crate::test_runner::Disposition> {
     let mut capture = crate::target_liveness::Capture::prepare(&command, cargo, config);
     // Start the reader before changing Cargo's stdout mode. If the OS cannot
     // create a thread, Cargo retains its ordinary output and execution path.
@@ -319,12 +332,10 @@ fn run_cargo_guarded(
     {
         tracing::warn!(%error, "target liveness receipt not recorded");
     }
-    std::process::exit(crate::test_runner::finish(
-        crate::test_runner::exit_disposition(
-            status.code(),
-            crate::test_runner::signals::of(&status),
-        ),
-    ));
+    Ok(crate::test_runner::exit_disposition(
+        status.code(),
+        crate::test_runner::signals::of(&status),
+    ))
 }
 
 enum CargoStdoutMessage {

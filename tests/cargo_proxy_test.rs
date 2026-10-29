@@ -549,6 +549,43 @@ fn explicit_rustflags_keep_their_cargo_precedence() {
     );
 }
 
+/// The lease's record names the command only while it runs: a finished
+/// `kache cargo` leaves none behind, whatever Cargo's exit code.
+#[test]
+fn a_finished_cargo_run_leaves_no_lease_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let holders = cache.join("target-use.holders");
+    let seen = dir.path().join("seen");
+    let fake_cargo = dir.path().join("cargo");
+    kache_fs::testutil::write_executable(
+        &fake_cargo,
+        "#!/bin/sh\nls \"$KACHE_TEST_HOLDERS\" > \"$KACHE_TEST_CAPTURE\"\nexit 3\n",
+    );
+
+    let output = proxied_cargo(dir.path(), &cache, &dir.path().join("target"))
+        .args(["cargo", "build"])
+        .env("KACHE_REAL_CARGO", &fake_cargo)
+        .env("KACHE_TEST_HOLDERS", &holders)
+        .env("KACHE_TEST_CAPTURE", &seen)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let while_running = std::fs::read_to_string(&seen).unwrap();
+    assert_eq!(while_running.lines().count(), 1, "{while_running:?}");
+    let left: Vec<_> = std::fs::read_dir(&holders)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "records left behind: {left:?}");
+}
+
 #[test]
 fn non_utf8_cargo_argument_passes_through_without_cli_panic() {
     let dir = tempfile::tempdir().unwrap();

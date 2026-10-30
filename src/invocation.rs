@@ -27,14 +27,56 @@ pub(crate) fn wait_for_committed(
     key: &str,
     timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<bool> {
+    let (wait, bounded_timeout) = store_wait_budget(timeout);
+    // Supplying a bound replaces the store's None timeout. Retain that
+    // default's shortcut when the peer has already published its entry.
+    if timeout.is_none() && wait.scoped() {
+        process::check()?;
+        if store.contains(key) {
+            return Ok(true);
+        }
+    }
+    store.wait_for_committed_with(key, bounded_timeout, || Ok(process::check()?))
+}
+
+fn store_wait_budget(
+    timeout: Option<std::time::Duration>,
+) -> (crate::scheduler::BudgetWait, Option<std::time::Duration>) {
     let wait =
-        crate::scheduler::BudgetWait::start(timeout.unwrap_or(crate::scheduler::WAIT_TIMEOUT));
+        crate::scheduler::BudgetWait::start(timeout.unwrap_or(crate::store::BUILD_LOCK_TIMEOUT));
     let timeout = if wait.scoped() {
         Some(wait.timeout)
     } else {
         timeout
     };
-    store.wait_for_committed_with(key, timeout, || Ok(process::check()?))
+    (wait, timeout)
 }
 
 pub(crate) use kache_config::InvocationEnv;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn shared_budget_preserves_store_defaults_and_explicit_wait_limits() {
+        assert_eq!(store_wait_budget(None).1, None);
+        let _scope = crate::scheduler::InvocationWaitScope::enter();
+        assert_eq!(store_wait_budget(None).1, Some(Duration::from_secs(600)));
+        assert_eq!(
+            store_wait_budget(Some(Duration::from_secs(7))).1,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            store_wait_budget(Some(Duration::from_secs(900))).1,
+            Some(Duration::from_secs(900))
+        );
+        assert!(
+            store_wait_budget(Some(Duration::from_secs(3600)))
+                .1
+                .unwrap()
+                <= Duration::from_secs(1800)
+        );
+    }
+}

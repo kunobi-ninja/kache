@@ -19,12 +19,13 @@
 //! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 //!
 //! Under memory pressure (see [`pressure`]) a compile asks for the whole
-//! pool during ordinary admission. After the invocation's coordination
-//! allowance, recovery admits at most one extra compile and two extra
+//! pool during ordinary admission. After a capacity wait reaches its limit,
+//! recovery admits at most one extra compile and two extra
 //! weighted slots. Linux cgroup-v2 limits are logged for diagnostics.
 //!
-//! If the scheduler directory cannot be used, compilation continues without
-//! a permit. [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
+//! If the scheduler directory cannot be used or the shared coordination
+//! allowance is spent, compilation continues without a permit.
+//! [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
 //!
 //! Test binaries run through `kache test-runner` take slots too, but only
 //! above the compile reserve ([`reserve_for`]), so a compile always has a
@@ -483,7 +484,8 @@ impl Scheduler {
         }
     }
 
-    /// Take `weight` slots, blocking up to the wait timeout. The whole call is
+    /// Acquire ordinary or recovery capacity within the invocation allowance.
+    /// The whole call is
     /// attributed to `permit_wait_ms`: an immediately free pool costs
     /// microseconds, a saturated one costs the wait.
     fn acquire_permit(&self, weight: u32) -> Option<Permit> {
@@ -516,12 +518,28 @@ impl Scheduler {
     /// one-slot pool); a heavier compile still needs regular slots for the
     /// rest. Other waiters keep waiting for capacity, with cancellation.
     fn acquire_recovery_permit(&self, weight: u32) -> Option<Permit> {
+        let wait = BudgetWait::start(WAIT_TIMEOUT);
+        let started = std::time::Instant::now();
         loop {
             crate::invocation::process::check().ok()?;
             let seen = permit_wait::snapshot(&self.root);
             match self.try_recovery_permit(weight) {
                 Ok(Some(permit)) => return Some(permit),
-                Ok(None) => permit_wait::park(&self.root, None, seen, permit_wait::SATURATED_SLICE),
+                Ok(None) => {
+                    let remaining = wait.timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        tracing::debug!(
+                            "scheduler coordination allowance exhausted; compiling without a permit"
+                        );
+                        return None;
+                    }
+                    permit_wait::park(
+                        &self.root,
+                        None,
+                        seen,
+                        permit_wait::SATURATED_SLICE.min(remaining),
+                    );
+                }
                 Err(error) => {
                     tracing::debug!(
                         "scheduler recovery unavailable ({error:#}); compiling without a permit"
@@ -1768,6 +1786,22 @@ mod tests {
     }
 
     #[test]
+    fn recovery_preserves_the_final_deadline_when_weight_cannot_fit() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _holder = scheduler.acquire_permit(4).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        bounded_test_wait(|| {
+            assert!(scheduler.acquire_permit(4).is_none());
+            assert!(
+                crate::invocation::process::check().is_ok(),
+                "the allowance must end the wait before test cancellation"
+            );
+        });
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+    }
+
+    #[test]
     fn heavy_recovery_still_needs_regular_slots_and_returns_partial_locks() {
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 4);
@@ -1850,6 +1884,45 @@ mod tests {
     }
 
     #[test]
+    fn a_committed_entry_keeps_its_default_wait_shortcut_with_a_budget() {
+        let dir = temp_cache();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        let store = crate::store::Store::open(&config).unwrap();
+        let key = blake3::hash(b"already-committed").to_hex().to_string();
+        let artifact = dir.path().join("libready.rlib");
+        fs::write(&artifact, b"complete").unwrap();
+        store
+            .put(
+                &key,
+                "ready",
+                &["lib".into()],
+                &[],
+                "host",
+                "debug",
+                &[(artifact, "libready.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let lock = store.entry_dir(&key).with_extension("lock");
+        if lock.exists() {
+            fs::remove_file(&lock).unwrap();
+        }
+        fs::create_dir(&lock).unwrap();
+        assert!(store.contains(&key));
+        let _scope = InvocationWaitScope::enter();
+        assert!(crate::invocation::wait_for_committed(&store, &key, None).unwrap());
+        assert!(crate::invocation::wait_for_committed(&store, &key, Some(Duration::ZERO)).is_err());
+        let missing = blake3::hash(b"still-missing").to_hex().to_string();
+        fs::create_dir_all(store.entry_dir(&missing).with_extension("lock")).unwrap();
+        assert!(crate::invocation::wait_for_committed(&store, &missing, None).is_err());
+        let token = crate::invocation::process::Cancellation::default();
+        token.cancel();
+        let _cancel = crate::invocation::process::CancellationScope::enter(Some(token));
+        assert!(crate::invocation::wait_for_committed(&store, &key, None).is_err());
+    }
+
+    #[test]
     fn recovery_errors_fail_open_and_cancellation_releases_waiters() {
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 1);
@@ -1860,10 +1933,11 @@ mod tests {
         let token = crate::invocation::process::Cancellation::default();
         let (send, receive) = std::sync::mpsc::channel();
         let waiter_token = token.clone();
-        let copy = scheduler.clone();
+        let mut copy = scheduler.clone();
+        copy.wait_timeout = Duration::ZERO;
         let waiter = std::thread::spawn(move || {
             let _cancel = crate::invocation::process::CancellationScope::enter(Some(waiter_token));
-            let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+            let _scope = InvocationWaitScope::with_budget(Duration::from_secs(5));
             let permit = copy.acquire_permit(1);
             send.send(permit.is_none()).unwrap();
         });

@@ -31,8 +31,10 @@ continue checking ordinary capacity and wait for the recovery holder to finish.
 That additional wait can exceed the ordinary wait limit and remains cancellable. A
 holder exiting releases its locks, including after a crash.
 
-If the scheduler directory cannot be used, compilation continues without a
-permit. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn the
+If neither ordinary nor recovery admission can obtain capacity before the shared
+coordination allowance expires, compilation continues without a permit. The same
+fallback applies when the scheduler directory cannot be used. Set
+`KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn the
 scheduler off. Test-runner lease waits keep their own limits.
 
 Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.

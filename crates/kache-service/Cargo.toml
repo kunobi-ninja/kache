@@ -1,6 +1,6 @@
 [package]
 name = "kache-service"
-version = "2.0.0-rc.4"
+version = "2.0.0"
 edition = "2024"
 description = "Remote service shell for kache planner endpoints"
 license = "Apache-2.0"

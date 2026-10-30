@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::GetConsoleMode;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessId, OpenProcess, PROCESS_DUP_HANDLE,
+    GetCurrentProcess, GetPriorityClass, GetProcessId, OpenProcess, PROCESS_DUP_HANDLE,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
@@ -127,6 +127,13 @@ impl PeerProcess {
         };
         peer.verify_connection(stream)?;
         Ok(peer)
+    }
+
+    /// The pinned client's priority class; zero when it cannot be read.
+    pub fn priority_class(&self) -> u32 {
+        // SAFETY: the handle stays open on `self` and was opened with
+        // PROCESS_QUERY_LIMITED_INFORMATION.
+        unsafe { GetPriorityClass(self.process.as_raw_handle()) }
     }
 
     pub fn verify_connection(&self, stream: &impl PeerCredentials) -> io::Result<()> {

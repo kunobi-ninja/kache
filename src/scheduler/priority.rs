@@ -149,7 +149,9 @@ fn process_is_background(pid: u32) -> bool {
     linux_background(nice, policy)
 }
 
+// Never built by the Linux mutation lane, like the macOS reader above.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[mutants::skip]
 fn process_is_background(pid: u32) -> bool {
     let _ = pid;
     false
@@ -164,7 +166,9 @@ fn this_process_is_background() -> bool {
     windows_background(unsafe { GetPriorityClass(GetCurrentProcess()) })
 }
 
+// Never built by the Linux mutation lane, like the macOS reader above.
 #[cfg(not(any(unix, windows)))]
+#[mutants::skip]
 fn this_process_is_background() -> bool {
     false
 }

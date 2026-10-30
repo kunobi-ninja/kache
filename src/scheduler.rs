@@ -4420,7 +4420,7 @@ mod tests {
         let foreground = Requester::queued(cache, 1, 1, Priority::Foreground, 3);
         let ranks: Vec<u64> = queued(cache).iter().map(|entry| entry.rank).collect();
         assert!(
-            ranks[0] + 29_000 < ranks[1],
+            ranks[0] + 9_000 < ranks[1],
             "the foreground ticket ranks first: {ranks:?}"
         );
 

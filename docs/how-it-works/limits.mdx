@@ -17,9 +17,9 @@ The memory estimate cannot see what else is running: builds outside Kache, an ed
 
 Compiles and test binaries queue for regular slots across builds that share the
 cache directory, including worktrees and separate target directories. Requests
-are ordered by arrival, with foreground requests placed 30 seconds ahead of
+are ordered by arrival, with foreground requests placed 10 seconds ahead of
 background requests. An older background request therefore goes before foreground
-requests that arrive more than 30 seconds later. Running compiles keep their slots.
+requests that arrive more than 10 seconds later. Running compiles keep their slots.
 
 A background build has Darwin background priority (`taskpolicy -b`) or positive
 niceness on macOS, positive niceness or `SCHED_BATCH`/`SCHED_IDLE` on Linux, or the

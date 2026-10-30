@@ -45,8 +45,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::priority::Priority;
 
 /// How far ahead of a background request a foreground one arriving at the
-/// same time is placed.
-pub(super) const FOREGROUND_HEAD_START: Duration = Duration::from_secs(30);
+/// same time is placed. Well inside the 30 s an ordinary capacity wait may
+/// last (see [`super::budget`]), so a background request still in the queue
+/// comes to outrank foreground requests that arrive after it.
+pub(super) const FOREGROUND_HEAD_START: Duration = Duration::from_secs(10);
 /// How long a ticket counts after its owner last looked. A waiter looks at
 /// least every [`super::permit_wait::SATURATED_SLICE`].
 pub(super) const STALE_AFTER: Duration = Duration::from_secs(2);
@@ -642,18 +644,18 @@ mod tests {
     }
 
     #[test]
-    fn a_foreground_request_ranks_thirty_seconds_ahead() {
+    fn a_foreground_request_ranks_ten_seconds_ahead() {
         assert_eq!(rank(at(100_000), Priority::Background), 100_000);
-        assert_eq!(rank(at(100_000), Priority::Foreground), 70_000);
-        assert_eq!(rank(at(20_000), Priority::Foreground), 0, "saturates");
+        assert_eq!(rank(at(100_000), Priority::Foreground), 90_000);
+        assert_eq!(rank(at(5_000), Priority::Foreground), 0, "saturates");
         assert_eq!(
             rank(UNIX_EPOCH - Duration::from_secs(1), Priority::Background),
             0
         );
         // Waiting raises priority: a background request that has waited the
         // head start goes before a foreground one that arrives after.
-        assert!(rank(at(100_000), Priority::Background) < rank(at(130_001), Priority::Foreground));
-        assert!(rank(at(100_000), Priority::Background) > rank(at(129_999), Priority::Foreground));
+        assert!(rank(at(100_000), Priority::Background) < rank(at(110_001), Priority::Foreground));
+        assert!(rank(at(100_000), Priority::Background) > rank(at(109_999), Priority::Foreground));
     }
 
     #[test]

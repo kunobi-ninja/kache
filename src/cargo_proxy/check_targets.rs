@@ -70,11 +70,15 @@ pub(super) fn plan(
         return None;
     }
     let target = root.join("target");
-    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_symlink()) {
+    let check = target.join("check");
+    if [&target, &check]
+        .into_iter()
+        .any(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()))
+    {
         return None;
     }
     Some(Plan {
-        target: target.join("check"),
+        target: check,
         config: snapshots,
     })
 }
@@ -289,6 +293,25 @@ mod tests {
         assert!(
             get(&config, &env).is_none(),
             "an explicit target symlink keeps its layout"
+        );
+        std::fs::remove_file(project.join("target")).unwrap();
+        std::fs::create_dir(project.join("target")).unwrap();
+        assert!(get(&config, &env).is_some());
+        let destination = project.join("target/check");
+        std::fs::write(&destination, "user-owned file").unwrap();
+        assert!(
+            get(&config, &env).is_none(),
+            "an existing file cannot become a check target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "user-owned file"
+        );
+        std::fs::remove_file(&destination).unwrap();
+        std::os::unix::fs::symlink(&outside, &destination).unwrap();
+        assert!(
+            get(&config, &env).is_none(),
+            "an explicit check-target symlink keeps its layout"
         );
     }
 }

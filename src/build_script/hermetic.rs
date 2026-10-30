@@ -36,9 +36,9 @@
 //! build_script_hermetic = true` (see [`crate::config::Config::build_script_hermetic`]).
 
 use super::{
-    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, fold_dependency_inputs, input_state,
-    modified_since, package_exclusions, parse_declarations, real_command, replay, target_dir_for,
-    zero_ar_date,
+    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, fold_dependency_inputs,
+    modified_since, package_exclusions, parse_declarations, real_command, replay, run_input_state,
+    target_dir_for, zero_ar_date,
 };
 use crate::compiler_store::StoreHashExt as _;
 use crate::events::EventResult;
@@ -363,7 +363,7 @@ fn fold_declared_env(
 /// the sandbox repeats it.
 pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v2");
+    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v3");
     fold(
         &mut hasher,
         "key_version",
@@ -403,7 +403,14 @@ pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Re
         } else {
             Vec::new()
         };
-        let state = input_state(&path, &excluded, &file_hasher, &mut budget, 0)?;
+        let state = run_input_state(
+            &path,
+            &excluded,
+            &file_hasher,
+            &mut budget,
+            0,
+            prediction.default_package,
+        )?;
         fold(&mut hasher, "state", state.as_bytes());
     }
     if cfg!(target_os = "macos")

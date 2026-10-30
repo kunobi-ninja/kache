@@ -1860,7 +1860,10 @@ fn main() {
         std::fs::write(&build_rs, std::fs::read(&build_rs).unwrap()).unwrap();
     };
 
-    touch_build_rs();
+    // Losing Cargo's saved stdout reruns the script with unchanged inputs,
+    // while OUT_DIR remains a link. The sealed run must be linked again.
+    let saved_stdout = out_dir_of(&second).parent().unwrap().join("output");
+    std::fs::remove_file(saved_stdout).unwrap();
     let mark = event_count(&fx.cache);
     let output = run(&mut cargo(
         "run",
@@ -1876,6 +1879,25 @@ fn main() {
         vec!["local_hit"]
     );
     assert_eq!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
+
+    // A changed declared timestamp selects a different sealed run.
+    touch_build_rs();
+    let mark = event_count(&fx.cache);
+    let output = run(&mut cargo(
+        "run",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        &second,
+        &hermetic,
+    ));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "consistent");
+    assert_eq!(
+        results_for(&events_since(&fx.cache, mark), "build_script_run"),
+        vec!["miss"]
+    );
+    assert_ne!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
+    assert_eq!(std::fs::read(shared.join("derived.rs")).unwrap(), sealed);
 
     touch_build_rs();
     run(&mut cargo(

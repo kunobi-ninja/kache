@@ -261,6 +261,7 @@ impl Prepared {
                     .into_owned(),
                 io,
                 cancellation: Some(cancellation),
+                priority: None,
                 jobserver,
             },
         ))
@@ -403,7 +404,7 @@ pub(super) async fn handle(
     drop(channel);
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
-    let (entry, executable, args, context) =
+    let (entry, executable, args, mut context) =
         prepared.receive(descriptors, cancellation.clone(), Arc::clone(daemon))?;
     write_reply(stream, &ExecutionReply::Prepared).await?;
     let mut frame = Vec::new();
@@ -416,6 +417,9 @@ pub(super) async fn handle(
         peer_may_delegate(stream, client_pid, trusted_pipeline),
         "compiler process isolation changed before execution"
     );
+    // Read while the connection still names the client, so a reused PID
+    // cannot stand in for it. Its compiler children inherit the same.
+    context.priority = Some(crate::scheduler::Priority::of_process(client_pid));
     write_reply(stream, &ExecutionReply::Accepted).await?;
     let activity = daemon.request_clock.begin_activity();
 
@@ -623,6 +627,7 @@ mod tests {
                 started_at: Instant::now(),
                 shim_stem: "kache".into(),
                 cancellation: None,
+                priority: None,
                 jobserver: Default::default(),
             },
         )

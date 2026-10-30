@@ -357,7 +357,8 @@ pub struct PrefetchOrigin {
     #[serde(default)]
     /// Planner-issued ID when available; empty for fallback and unscoped work.
     pub plan_id: String,
-    /// `advisory`, `fallback`, or `unscoped` (startup or direct requests).
+    /// `advisory`, `fallback`, `none` while planning, or `unscoped` (startup
+    /// or direct requests).
     #[serde(default)]
     pub source: String,
     /// Zero-based order in the request list, before local-hit, in-flight,

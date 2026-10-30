@@ -48,6 +48,11 @@ available to the build.
 
 Set `cache.prefetch_enabled = false` or `KACHE_PREFETCH_ENABLED=0` to disable speculative prefetch while retaining exact remote checks and uploads.
 
+Adaptive cancellation counts every entry in the selected build manifest as
+a candidate, including cheap crates skipped for download. These candidates
+stay with the build session when its planner changes. Demands outside both the
+manifest and the selected plan can still cancel unhelpful prefetch.
+
 The daemon lists the remote's keys only when `cache.remote_key_listing` is on. It is on by default for a filesystem remote and off for S3, GCS and OCI; on S3 it needs `s3:ListBucket`. Nothing is listed while `cache.prefetch_enabled` is off. The planner uses this key index for crates that no build manifest, shard or local history covers, and the daemon refreshes it every `cache.remote_key_cache_refresh_secs` (60 by default; `0` lists once). If S3 refuses the listing for lack of `s3:ListBucket`, the daemon stops listing and logs one warning.
 
 ## When it is required

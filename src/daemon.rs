@@ -1459,6 +1459,9 @@ pub(crate) struct ActivePlan {
     /// `none` while only tracking a session, then `advisory` or `fallback`.
     pub plan_source: &'static str,
     pub candidates: HashSet<String>,
+    /// Identity-manifest eligibility, including entries skipped as cheap.
+    /// Retained when the planner replaces its candidates in this session.
+    manifest_candidates: HashSet<String>,
     /// Distinct keys demanded via RemoteCheck while this plan was active —
     /// candidate or not. The denominator of the adaptive-cancel ratio.
     pub demanded: HashSet<String>,
@@ -1494,6 +1497,7 @@ impl ActivePlan {
             plan_id,
             plan_source,
             candidates,
+            manifest_candidates: HashSet::new(),
             demanded: HashSet::new(),
             demanded_candidates: HashSet::new(),
             downloaded: HashMap::new(),
@@ -1524,20 +1528,24 @@ impl ActivePlan {
         if self.cancelled || self.plan_source == "none" {
             return false;
         }
+        if self.should_cancel() {
+            self.cancelled = true;
+            return true;
+        }
+        false
+    }
+
+    fn should_cancel(&self) -> bool {
         let downloaded_not_demanded = self
             .downloaded
             .keys()
             .filter(|k| !self.demanded.contains(*k))
             .count() as u64;
-        if should_cancel_prefetch(
+        should_cancel_prefetch(
             self.demanded.len() as u64,
             self.demanded_candidates.len() as u64,
             downloaded_not_demanded,
-        ) {
-            self.cancelled = true;
-            return true;
-        }
-        false
+        )
     }
 
     fn record_download(&mut self, key: &str, compressed_bytes: u64) {
@@ -1562,6 +1570,20 @@ impl ActivePlan {
             .iter()
             .filter_map(|k| self.downloaded.get(k))
             .sum()
+    }
+}
+
+struct ManifestPrefetchCandidates {
+    manifest_key: String,
+    keys: HashSet<String>,
+    explicitly_selected: bool,
+}
+
+impl ManifestPrefetchCandidates {
+    fn matches(&self, plan: &ActivePlan) -> bool {
+        self.explicitly_selected
+            || self.manifest_key == crate::identity::host_target_triple()
+            || plan.identity_key.as_deref() == Some(self.manifest_key.as_str())
     }
 }
 
@@ -1834,6 +1856,9 @@ pub(crate) struct Daemon {
     /// The active per-session prefetch plan (#583 P0.5). Std mutex: every
     /// critical section is a short map/set operation, never held across await.
     active_plan: Arc<std::sync::Mutex<Option<ActivePlan>>>,
+    /// Startup metadata can arrive before BuildStarted. One manifest waits
+    /// here until its matching session claims it; it never spans sessions.
+    pending_manifest_candidates: Mutex<Option<ManifestPrefetchCandidates>>,
     /// In-flight miss compiles keyed by child PID (kunobi-ninja/kache#131).
     /// Upserted by CompileStarted, removed by CompileFinished, and pruned by
     /// liveness/age on both read (stats) and write (register) paths — a
@@ -1992,6 +2017,7 @@ impl Daemon {
             ))),
             prefetch_used_keys: Arc::new(RwLock::new(HashSet::new())),
             active_plan: Arc::new(std::sync::Mutex::new(None)),
+            pending_manifest_candidates: Mutex::new(None),
             in_flight_compiles: std::sync::Mutex::new(HashMap::new()),
             version: VERSION.to_string(),
             effective_config: effective_config(&config, provenance),
@@ -3714,12 +3740,17 @@ impl Daemon {
             let fire_cancel = {
                 let mut plan = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
                 match plan.as_mut() {
-                    Some(p) => p.record_demand(&req.key),
+                    Some(p) => {
+                        let cancel = p.record_demand(&req.key);
+                        if cancel {
+                            self.prefetch_cancel.send_replace(true);
+                        }
+                        cancel
+                    }
                     None => false,
                 }
             };
             if fire_cancel {
-                let _ = self.prefetch_cancel.send(true);
                 let (demanded, hits) = {
                     let plan = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
                     plan.as_ref()
@@ -4684,6 +4715,7 @@ impl Daemon {
             && plan.session_id == origin.session_id
             && plan.plan_id == origin.plan_id
             && plan.plan_source == origin.source
+            && (self.prefetch_stopping.load(Ordering::Acquire) || *self.prefetch_cancel.borrow())
         {
             plan.cancelled = true;
         }
@@ -5356,7 +5388,6 @@ impl Daemon {
         if self.prefetch_stopping.load(Ordering::Acquire) {
             return;
         }
-        let _ = self.prefetch_cancel.send(false);
         let candidates: HashSet<String> = candidates.collect();
         let mut plan = ActivePlan::new(
             session_id.to_string(),
@@ -5373,12 +5404,16 @@ impl Daemon {
         plan.identity_key = identity_key;
         let prev = {
             let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+            self.prefetch_cancel.send_replace(false);
             if let Some(existing) = slot.as_mut()
                 && existing.session_id == session_id
             {
                 existing.plan_id = plan.plan_id;
                 existing.plan_source = plan.plan_source;
                 existing.candidates = plan.candidates;
+                existing
+                    .candidates
+                    .extend(existing.manifest_candidates.iter().cloned());
                 // Demands recorded against the previous candidate set, including
                 // the empty placeholder, count only where they match this plan.
                 existing.demanded_candidates = existing
@@ -5391,8 +5426,10 @@ impl Daemon {
                 if plan.identity_key.is_some() {
                     existing.identity_key = plan.identity_key;
                 }
+                self.claim_manifest_candidates(existing);
                 return;
             }
+            self.claim_manifest_candidates(&mut plan);
             slot.replace(plan)
         };
         if let Some(prev) = prev {
@@ -5427,14 +5464,86 @@ impl Daemon {
                     if plan.identity_key.is_some() {
                         existing.identity_key = plan.identity_key;
                     }
+                    self.claim_manifest_candidates(existing);
                     existing.last_activity_ms = unix_time_ms();
                     return;
                 }
-                _ => slot.replace(plan),
+                _ => {
+                    self.claim_manifest_candidates(&mut plan);
+                    self.prefetch_cancel.send_replace(false);
+                    slot.replace(plan)
+                }
             }
         };
         if let Some(prev) = prev {
             self.emit_plan_summary(prev, "superseded", false);
+        }
+    }
+
+    fn include_manifest_candidates(&self, plan: &mut ActivePlan, keys: HashSet<String>) {
+        plan.manifest_candidates.extend(keys);
+        plan.candidates
+            .extend(plan.manifest_candidates.iter().cloned());
+        plan.demanded_candidates = plan
+            .demanded
+            .intersection(&plan.candidates)
+            .cloned()
+            .collect();
+        plan.last_activity_ms = unix_time_ms();
+        if plan.cancelled
+            && !self.prefetch_stopping.load(Ordering::Acquire)
+            && !plan.should_cancel()
+        {
+            plan.cancelled = false;
+            self.prefetch_cancel.send_replace(false);
+        }
+    }
+
+    // Call while holding active_plan, including while installing a session,
+    // so startup metadata cannot arrive between claiming and publishing it.
+    fn claim_manifest_candidates(&self, plan: &mut ActivePlan) {
+        let mut pending = self
+            .pending_manifest_candidates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if pending
+            .as_ref()
+            .is_some_and(|manifest| manifest.matches(plan))
+        {
+            let manifest = pending.take().expect("matching pending manifest");
+            self.include_manifest_candidates(plan, manifest.keys);
+        }
+    }
+
+    fn register_manifest_candidates(
+        &self,
+        manifest_key: String,
+        keys: HashSet<String>,
+        explicit_manifest_key: Option<&str>,
+    ) -> Option<PrefetchOrigin> {
+        let explicitly_selected = explicit_manifest_key == Some(manifest_key.as_str());
+        let manifest = ManifestPrefetchCandidates {
+            manifest_key,
+            keys,
+            explicitly_selected,
+        };
+        let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(plan) = slot.as_mut()
+            && manifest.matches(plan)
+        {
+            self.include_manifest_candidates(plan, manifest.keys);
+            Some(PrefetchOrigin {
+                session_id: plan.session_id.clone(),
+                plan_id: plan.plan_id.clone(),
+                source: plan.plan_source.into(),
+                ..Default::default()
+            })
+        } else {
+            *self
+                .pending_manifest_candidates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(manifest);
+            None
         }
     }
 
@@ -7664,6 +7773,15 @@ async fn identity_manifest_prefetch_from(
     manifest_key: String,
     manifest: crate::remote::BuildManifest,
 ) -> usize {
+    let origin = daemon.register_manifest_candidates(
+        manifest_key.clone(),
+        manifest
+            .entries
+            .iter()
+            .map(|entry| entry.cache_key.clone())
+            .collect(),
+        crate::identity::explicit_manifest_key().as_deref(),
+    );
     let min_compile_ms: u64 = std::env::var("KACHE_MIN_COMPILE_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -7697,11 +7815,15 @@ async fn identity_manifest_prefetch_from(
         .map(|e| (e.cache_key.clone(), e.crate_name.clone()))
         .collect();
 
+    let candidate_sources = prefetch_keys
+        .iter()
+        .map(|(key, _)| (key.clone(), kache_core::CandidateSource::Manifest))
+        .collect();
     let req = PrefetchRequest {
         keys: prefetch_keys,
         warm_all: false,
-        origin: None,
-        candidate_sources: HashMap::new(),
+        origin,
+        candidate_sources,
     };
     let resp = daemon.handle_prefetch(&req).await;
     if !resp.ok {

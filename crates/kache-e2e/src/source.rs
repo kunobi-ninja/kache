@@ -386,9 +386,7 @@ fn copy_file_with_mtime(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::copy(from, to)?;
     #[cfg(windows)]
     if metadata.permissions().readonly() {
-        let mut writable = metadata.permissions();
-        writable.set_readonly(false);
-        std::fs::set_permissions(to, writable)?;
+        make_writable(to)?;
     }
     let result = filetime::set_file_mtime(
         to,

@@ -170,20 +170,39 @@ mod tests {
             vec!["c", "--release"],
             vec!["clippy", "--", "-Copt-level=2"],
             vec!["clippy", "--", "--help"],
+            vec!["--color=always", "check"],
         ] {
             assert_eq!(eligible(&args(&values)), Some(None), "{values:?}");
+        }
+        for flag in [
+            "--offline",
+            "--locked",
+            "--frozen",
+            "--quiet",
+            "-q",
+            "-v",
+            "-vv",
+        ] {
+            assert_eq!(eligible(&args(&[flag, "check"])), Some(None), "{flag}");
         }
         for values in [
             vec![],
             vec!["build"],
             vec!["test"],
             vec!["alias"],
+            vec!["alias", "check"],
+            vec!["build", "check"],
+            vec!["--unknown", "check"],
             vec!["check", "--target-dir", "elsewhere"],
             vec!["check", "--target-dir=elsewhere"],
+            vec!["check", "--build-dir", "elsewhere"],
             vec!["check", "--config=x=1"],
             vec!["check", "-Celsewhere"],
             vec!["clippy", "-Zunstable-options"],
             vec!["check", "--help"],
+            vec!["check", "-h"],
+            vec!["check", "--version"],
+            vec!["check", "-V"],
             vec!["--color"],
             vec!["check", "--manifest-path"],
         ] {

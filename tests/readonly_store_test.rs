@@ -64,7 +64,7 @@ fn last_event_for(cache: &Path, crate_name: &str) -> serde_json::Value {
 }
 
 #[cfg(unix)]
-fn compile_cc(work: &Path, cache: &Path, config: &Path) {
+fn compile_cc(work: &Path, cache: &Path, config: &Path) -> std::process::Output {
     let prefix_map = format!("-ffile-prefix-map={}=/readonly-probe", work.display());
     settle_writes(&[work]);
     let output = hermetic_command(kache_binary(), cache, Some(config))
@@ -84,6 +84,7 @@ fn compile_cc(work: &Path, cache: &Path, config: &Path) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    output
 }
 
 #[test]
@@ -221,9 +222,15 @@ fn failed_readonly_cc_restore_is_cached_locally_and_writable_failure_uses_passth
         let host = root.path().join("host-cache");
         let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
         let host_config = write_config(&host, None);
-        compile_cc(&work, &host, &host_config);
+        let output = compile_cc(&work, &host, &host_config);
         let seed = last_event_for(&host, "readonly_probe.c");
-        assert_eq!(seed["result"], "miss", "{seed}");
+        assert_eq!(
+            seed["result"],
+            "miss",
+            "{seed}\ncc stdout: {}\ncc stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let key = seed["cache_key"].as_str().unwrap();
         let metadata = host.join("store").join(key).join("meta.json");
         let mut meta: kache_format::EntryMeta =

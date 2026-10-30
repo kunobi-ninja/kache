@@ -97,6 +97,28 @@ Removal rechecks each directory's identity and skips one that changed since the 
 
 The daemon removes tracked targets on its own, on a quiet machine at most once an hour: a target whose workspace was deleted, once no build has used it for a day (`auto_clean_orphaned_targets`, on by default); idle ones when `auto_clean_idle_targets_days` is set; and, when `auto_recover_targets` is on, idle ones while free disk space is below the `auto_recover_min_free_bytes` floor. See [Target directory cleanup](/docs/getting-started/configuration#target-directory-cleanup).
 
+### Cached results from an old Rust compiler
+
+```bash
+kache clean --cache --rustc-version 1.99.1 --dry-run
+kache clean --cache --rustc-version 1.99.1 --yes
+```
+
+A release selects all recorded builds of that compiler, including multiple
+nightlies with the same release number. To select one build, quote its first
+`rustc -vV` line, with or without the leading `rustc`.
+
+The preview reports selected entries and their logical size. Removal keeps
+shared blobs that other entries need, and skips entries that are in use or
+awaiting upload. The removal report distinguishes store bytes removed from
+disk space reclaimed. Target directories and remote entries stay in place.
+
+Compiler identities are recorded on new Rust compilations and carried by
+remote imports. Older entries and non-Rust results without an identity are
+kept and counted separately in the preview. `--json` previews unless `--yes`
+is set. The compatibility command `kache gc --rustc-version VERSION` performs
+the same selection without a confirmation; add `--dry-run` to preview it.
+
 ### Obsolete units in live targets
 
 ```bash

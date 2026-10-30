@@ -3815,6 +3815,7 @@ fn save_manifest_config(
     };
     Config {
         blaze: false,
+        separate_check_targets: true,
         remote_error: None,
         socket_path_override: None,
         fallback: None,
@@ -6213,6 +6214,7 @@ fn diff_meta(
     crate::store::EntryMeta {
         cache_key: "k".to_string(),
         key_schema: crate::cache_key::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "c".to_string(),
         crate_types: crate_types.iter().map(|v| (*v).to_string()).collect(),
         files: Vec::new(),

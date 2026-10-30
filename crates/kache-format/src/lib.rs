@@ -22,6 +22,10 @@ pub struct EntryMeta {
     /// stores unreadable during an ordinary upgrade.
     #[serde(default)]
     pub key_schema: u32,
+    /// Compiler identity from the first line of `rustc -vV`. Older and non-Rust
+    /// entries have no identity and are kept by compiler-version cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc_version: Option<String>,
     pub crate_name: String,
     pub crate_types: Vec<String>,
     pub files: Vec<CachedFile>,
@@ -315,6 +319,7 @@ mod tests {
         let mk = |kinds: &[&str]| EntryMeta {
             cache_key: "k".into(),
             key_schema: CACHE_KEY_VERSION,
+            rustc_version: None,
             crate_name: "c".into(),
             crate_types: vec![],
             files: vec![],

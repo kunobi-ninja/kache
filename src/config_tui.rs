@@ -2149,6 +2149,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 readonly_store: None,
                 blaze: None,
+                separate_check_targets: None,
                 bypass_env: None,
                 bypass_argv: None,
                 bypass_crates: None,

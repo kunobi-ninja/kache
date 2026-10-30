@@ -1,3 +1,4 @@
+pub(crate) mod compiler_gc;
 use crate::term;
 use crate::term::human_println as println;
 use anyhow::{Context, Result};

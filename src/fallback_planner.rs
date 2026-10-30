@@ -500,6 +500,7 @@ mod tests {
     ) -> Config {
         Config {
             blaze: false,
+            separate_check_targets: true,
             readonly_store: None,
             remote_error: None,
             socket_path_override: None,

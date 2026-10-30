@@ -818,7 +818,12 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Gc {
             max_age,
             stale_schema,
+            rustc_version,
+            dry_run,
         }) => {
+            if let Some(version) = rustc_version {
+                return cli::compiler_gc::clean(&config, &version, dry_run, true, json, "gc");
+            }
             let hours = max_age
                 .as_deref()
                 .map(|value| parse_age_hours("--max-age", value))
@@ -837,8 +842,12 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             crate_name,
             stale_schema,
             units,
+            rustc_version,
             tracked: _,
         }) => {
+            if let Some(version) = rustc_version {
+                return cli::compiler_gc::clean(&config, &version, dry_run, yes, json, "clean");
+            }
             if units {
                 return cli::clean_units(&config, path, dry_run, yes, json);
             }

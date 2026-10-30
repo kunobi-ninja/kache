@@ -332,6 +332,20 @@ Compaction needs free disk of about twice the live index size, not the file size
 
 A live index above 8 GiB is never compacted automatically, because the rewrite would hold the index for too long. The daemon logs that it skipped it; run `kache doctor --repair` when no build is running.
 
+### Run checks beside builds
+
+The Cargo shim and `kache cargo` put direct `check` and `clippy` commands in
+`<workspace>/target/check`. Builds keep their normal outputs. This gives the
+commands separate Cargo locks, so a check can run while a build is compiling.
+The two directories share Kache's artifact store and scheduler, but use extra
+space for Cargo fingerprints and outputs.
+
+Set `cache.separate_check_targets = false` or
+`KACHE_SEPARATE_CHECK_TARGETS=0` to use Cargo's shared target directory.
+Explicit target or build directories, command-line configuration overrides,
+Cargo config includes and unknown aliases retain Cargo's configured layout.
+A check's first run in the separate directory may restore or compile its units.
+
 ### Target directory cleanup
 
 Builds through Kache record the target directories they use; `kache clean --dry-run` lists them. The daemon checks that list at most once an hour, when the machine is quiet, and removes:

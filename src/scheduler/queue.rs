@@ -21,7 +21,9 @@
 //!   can use. A ticket that does not fit is passed by later ones that do.
 //! - The first ticket can be passed [`pass_budget`] times. After that it
 //!   reserves the free slots it can use, so they add up until it fits. A test
-//!   reserves only test slots, so a compile a test waits on still runs.
+//!   reserves only test slots, and a waiting compile counts them as slots
+//!   tests hold (see [`super::compile_need`]): it then fits in the compile
+//!   reserve, so a compile a test waits on still runs.
 //! - A ticket is live while its owner holds the lock on `waiters/<id>`. A
 //!   cancelled waiter removes its ticket; a killed one leaves files whose lock
 //!   the kernel has released, and the next planner deletes them. The lock, not
@@ -359,8 +361,16 @@ pub(super) struct Admitted {
     pub(super) spare: Vec<u32>,
 }
 
+/// Why [`plan`] gave the request it was asked about nothing yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Waiting {
+    /// Free slots the first ticket, a test, reserves. A compile counts them
+    /// as slots tests hold.
+    pub(super) saved_for_tests: u32,
+}
+
 /// Hand `free` slots to the tickets in `queue`, which is in rank order and
-/// holds `me`, and say what `me` gets. `None` means wait.
+/// holds `me`, and say what `me` gets, or why it waits.
 ///
 /// `ready` is asked only about other tickets that would take slots or would
 /// be first, and `passes` only about the first ticket when it does not fit.
@@ -375,8 +385,9 @@ pub(super) fn plan(
     spare: bool,
     mut ready: impl FnMut(&Entry) -> bool,
     mut passes: impl FnMut(&Entry) -> u32,
-) -> Option<Admitted> {
+) -> Result<Admitted, Waiting> {
     let mut available = free.to_vec();
+    let mut saved_for_tests = 0;
     // The first ticket that counts, and whether it got its slots.
     let mut first: Option<(&Entry, bool)> = None;
     let mut mine = None;
@@ -400,17 +411,23 @@ pub(super) fn plan(
                     mine = Some(slots);
                 }
             }
-            None if is_me => return None,
+            None if is_me => return Err(Waiting { saved_for_tests }),
             None if is_first => {
                 first = Some((entry, false));
                 if passes(entry) >= budget {
+                    let before = available.len();
                     available.retain(|&index| !entry.kind.uses(index, reserve));
+                    if entry.kind == Kind::Test {
+                        saved_for_tests = (before - available.len()) as u32;
+                    }
                 }
             }
             None => {}
         }
     }
-    let slots = mine?;
+    let Some(slots) = mine else {
+        return Err(Waiting { saved_for_tests });
+    };
     let passed = match first {
         Some((entry, false)) => Some(entry.clone()),
         _ => None,
@@ -423,7 +440,7 @@ pub(super) fn plan(
     } else {
         Vec::new()
     };
-    Some(Admitted {
+    Ok(Admitted {
         slots,
         passed,
         spare,
@@ -550,7 +567,7 @@ mod tests {
     }
 
     /// Plan with every other ticket ready and never passed.
-    fn plan_all_ready(queue: &[Entry], me: &str, free: &[u32]) -> Option<Admitted> {
+    fn plan_all_ready(queue: &[Entry], me: &str, free: &[u32]) -> Result<Admitted, Waiting> {
         plan(queue, me, free, 1, 4, false, |_| true, |_| 0)
     }
 
@@ -670,7 +687,10 @@ mod tests {
         let test = entry(1, Kind::Test, 2, "me");
         let admitted = plan(&[test], "me", &[0, 1, 2], 1, 4, false, |_| true, |_| 0).unwrap();
         assert_eq!(admitted.slots, [1, 2], "a test skips the reserve");
-        assert_eq!(plan_all_ready(&[me], "me", &[1]), None);
+        assert_eq!(
+            plan_all_ready(&[me], "me", &[1]),
+            Err(Waiting { saved_for_tests: 0 })
+        );
     }
 
     #[test]
@@ -679,7 +699,10 @@ mod tests {
             entry(1, Kind::Compile, 1, "ahead"),
             entry(2, Kind::Compile, 1, "me"),
         ];
-        assert_eq!(plan_all_ready(&queue, "me", &[4]), None);
+        assert_eq!(
+            plan_all_ready(&queue, "me", &[4]),
+            Err(Waiting { saved_for_tests: 0 })
+        );
         let admitted = plan_all_ready(&queue, "me", &[4, 5]).unwrap();
         assert_eq!(admitted.slots, [5]);
         assert_eq!(admitted.passed, None, "the first ticket got its slots");
@@ -695,9 +718,13 @@ mod tests {
         let admitted = with_passes(0).unwrap();
         assert_eq!(admitted.slots, [0]);
         assert_eq!(admitted.passed, Some(queue[0].clone()));
-        assert!(with_passes(1).is_some());
-        assert_eq!(with_passes(2), None, "the budget is spent: it reserves");
-        assert_eq!(with_passes(3), None);
+        assert!(with_passes(1).is_ok());
+        assert_eq!(
+            with_passes(2),
+            Err(Waiting { saved_for_tests: 0 }),
+            "the budget is spent: it reserves, and saves nothing for tests"
+        );
+        assert_eq!(with_passes(3), Err(Waiting { saved_for_tests: 0 }));
     }
 
     #[test]
@@ -714,8 +741,37 @@ mod tests {
         ];
         assert_eq!(
             plan(&queue, "me", &[0, 2], 1, 0, false, |_| true, |_| 0),
-            None,
+            Err(Waiting { saved_for_tests: 0 }),
             "a reserving compile can use every slot"
+        );
+    }
+
+    #[test]
+    fn a_compile_learns_how_many_slots_a_waiting_test_saves() {
+        let queue = [
+            entry(1, Kind::Test, 3, "test"),
+            entry(2, Kind::Compile, 2, "me"),
+        ];
+        let with = |passes| plan(&queue, "me", &[0, 2, 3], 1, 1, false, |_| true, |_| passes);
+        assert_eq!(
+            with(1),
+            Err(Waiting { saved_for_tests: 2 }),
+            "slots 2 and 3 are saved; the reserve alone is too few"
+        );
+        assert_eq!(
+            with(0).unwrap().slots,
+            [0, 2],
+            "within its budget the test saves nothing"
+        );
+        let queue = [
+            entry(1, Kind::Test, 3, "test"),
+            entry(2, Kind::Compile, 1, "me"),
+        ];
+        let admitted = plan(&queue, "me", &[0, 2, 3], 1, 0, false, |_| true, |_| 0).unwrap();
+        assert_eq!(
+            admitted.slots,
+            [0],
+            "a light compile fits beside the saved slots"
         );
     }
 
@@ -806,7 +862,7 @@ mod tests {
                 0
             },
         );
-        assert_eq!(plan, None);
+        assert_eq!(plan, Err(Waiting { saved_for_tests: 0 }));
         assert_eq!(*asked.borrow(), 0);
     }
 

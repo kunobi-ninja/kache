@@ -4390,9 +4390,17 @@ mod tests {
         let pass_one = Requester::running(cache, 2, 1, background);
         second.finish();
         let pass_two = Requester::running(cache, 2, 1, background);
-        let waiting = queued(cache);
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(queue::passes(&scheduler_root(cache), &waiting[0]), 2);
+        {
+            let root = scheduler_root(cache);
+            // Ticket refreshes truncate and rewrite the pass count under this
+            // lock. Read it under the same lock to avoid seeing an empty file.
+            let _lock = queue::lock(&root, Duration::from_secs(5))
+                .unwrap()
+                .expect("the queue lock");
+            let waiting = queued(cache);
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(queue::passes(&root, &waiting[0]), 2);
+        }
 
         // The budget is spent: a freed slot is saved for the large request.
         pass_one.finish();

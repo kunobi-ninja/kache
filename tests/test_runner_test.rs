@@ -303,6 +303,29 @@ fn exit_codes_pass_through_scheduled_and_plain() {
         !fixture.cache().join("scheduler").exists(),
         "with the scheduler off the runner leaves no lease files"
     );
+
+    // A relative config path cannot resolve once the working directory is
+    // gone. Without a config there is no cache to lease, and the runner
+    // becomes the test.
+    let fixture = Fixture::new();
+    let gone = fixture.path().join("gone");
+    fs::create_dir(&gone).unwrap();
+    let gone_c = std::ffi::CString::new(gone.as_os_str().as_encoded_bytes()).unwrap();
+    let mut exec = fixture.runner(&fixture.probe(), "exit7");
+    exec.current_dir(&gone).env("KACHE_CONFIG", "kache.toml");
+    // SAFETY: rmdir is async-signal-safe, and the path was built beforehand.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut exec, move || {
+            if libc::rmdir(gone_c.as_ptr()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let exec = run(exec);
+    assert!(!gone.exists());
+    assert_eq!(exec.status.code(), Some(7), "{exec:?}");
 }
 
 #[test]
@@ -786,8 +809,7 @@ fn a_hardened_runner_passes_the_dyld_variables_on() {
         "the probe needs Cargo's library path to find libstd: {alone:?}"
     );
 
-    // Scheduled, unscheduled, and `cargo run`'s binary, which the runner
-    // becomes.
+    // Scheduled, unscheduled, and `cargo run`'s binary, which has no hash.
     for (program, scheduler) in [(&hashed, None), (&hashed, Some("0")), (&unhashed, None)] {
         let mut command = fixture.runner_of(&bin.join("kache"), program, "unused");
         command

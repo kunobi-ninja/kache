@@ -4,8 +4,8 @@
 //! cannot see what else is running: several agents' builds, an IDE, a
 //! browser. When memory runs short, a compile it admits anyway can push the
 //! machine into swap or the OOM killer. Under pressure, [`super::Scheduler`]
-//! therefore asks for the whole pool for a compile: it waits for the other
-//! compiles to finish, so they run one after another until pressure eases.
+//! therefore asks for the whole pool during ordinary admission. Bounded
+//! recovery admission uses the compile's base weight instead.
 //! Slots running tests hold still count against that need as before, so a
 //! test waiting on a compile cannot stall it.
 //!

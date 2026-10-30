@@ -568,8 +568,8 @@ pub struct Config {
     /// `KACHE_AUTO_RECOVER_TARGETS=1`/`=true` or `[cache]
     /// auto_recover_targets = true`; `kache init` offers it.
     pub auto_recover_targets: bool,
-    /// Under memory pressure, admit a compile only when no other compile
-    /// holds a scheduler slot. On by default. Set via
+    /// Under memory pressure, ordinary admission waits for other compiles
+    /// to release their slots. Recovery has a separate bound. On by default. Set via
     /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` or `[cache]
     /// scheduler_memory_pressure = false` to disable.
     pub scheduler_memory_pressure: bool,

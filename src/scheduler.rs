@@ -19,11 +19,13 @@
 //! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 //!
 //! Under memory pressure (see [`pressure`]) a compile asks for the whole
-//! pool, so compiles run one after another until pressure eases. Linux
-//! cgroup-v2 limits are logged for diagnostics.
+//! pool during ordinary admission. After a capacity wait reaches its limit,
+//! recovery admits at most one extra compile and two extra
+//! weighted slots. Linux cgroup-v2 limits are logged for diagnostics.
 //!
-//! If the scheduler directory cannot be used, compilation continues without
-//! a permit. [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
+//! If the scheduler directory cannot be used or the shared coordination
+//! allowance is spent, compilation continues without a permit.
+//! [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
 //!
 //! Test binaries run through `kache test-runner` take slots too, but only
 //! above the compile reserve ([`reserve_for`]), so a compile always has a
@@ -33,9 +35,11 @@
 //! is covered by the test's slots and takes none of its own; see
 //! [`lease_covers`].
 
+mod budget;
 mod permit_wait;
 pub(crate) mod pressure;
 use anyhow::Result;
+pub(crate) use budget::{BudgetWait, InvocationWaitScope};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
@@ -83,7 +87,8 @@ pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> Discove
     let path = cache_dir
         .join("scheduler/discovery")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
-    match acquire_discovery(&path, WAIT_TIMEOUT, POLL_INTERVAL) {
+    let wait = BudgetWait::start(WAIT_TIMEOUT);
+    match acquire_discovery(&path, wait.timeout, POLL_INTERVAL) {
         Ok((lock, waited)) => DiscoveryFlight { lock, waited },
         Err(error) => {
             tracing::debug!("discovery flight unavailable: {error:#}");
@@ -230,16 +235,19 @@ pub struct MissGuard {
 struct Permit {
     root: PathBuf,
     _slots: Vec<(u32, StoreLock)>,
+    _recovery: Vec<StoreLock>,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
         // Unlock before publishing, so a waiter that wakes can take the slot.
         self._slots.clear();
+        self._recovery.clear();
         permit_wait::notify(&self.root);
     }
 }
 
+#[derive(Clone)]
 struct Scheduler {
     root: PathBuf,
     pool_size: u32,
@@ -287,9 +295,9 @@ impl MissGuard {
 
 /// Consult the scheduler after a local+remote miss.
 ///
-/// Hits and passthroughs must not call this. Disabled and fail-open paths
-/// return [`BeginMiss::Compile`] with an empty guard so the caller proceeds
-/// to `claim_build` without waiting. `lease` is the inherited
+/// Hits and passthroughs must not call this. A disabled or unusable scheduler
+/// returns an empty guard. A failed flight still paces the uncoalesced compile.
+/// `lease` is the inherited
 /// [`TEST_LEASE_ENV`] marker, if any; see [`Scheduler::begin_miss`].
 pub fn begin_miss(
     cache_dir: &Path,
@@ -406,7 +414,9 @@ impl Scheduler {
                 BeginMiss::Compile(MissGuard::compiling(permit, flight, self.weights_dir()))
             }
             FlightJoin::Waited => BeginMiss::Recheck,
-            FlightJoin::FailOpen => BeginMiss::Compile(MissGuard::empty()),
+            FlightJoin::FailOpen => {
+                BeginMiss::Compile(self.keyless_compile(crate_name, is_link, lease))
+            }
         }
     }
 
@@ -437,7 +447,8 @@ impl Scheduler {
                 );
                 let waited = std::time::Instant::now();
                 let _trace_wait = crate::phase_trace::phase("flight_wait");
-                let outcome = wait_for_lock(&path, self.wait_timeout, self.poll_interval);
+                let wait = BudgetWait::start(self.wait_timeout);
+                let outcome = wait_for_lock(&path, wait.timeout, self.poll_interval);
                 crate::opcounts::record_flight_wait(waited.elapsed());
                 match outcome {
                     Ok(true) => FlightJoin::Waited,
@@ -473,21 +484,118 @@ impl Scheduler {
         }
     }
 
-    /// Take `weight` slots, blocking up to the wait timeout. The whole call is
+    /// Acquire ordinary or recovery capacity within the invocation allowance.
+    /// The whole call is
     /// attributed to `permit_wait_ms`: an immediately free pool costs
     /// microseconds, a saturated one costs the wait.
     fn acquire_permit(&self, weight: u32) -> Option<Permit> {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
-        let slots = self.wait_for_permit(0..self.pool_size, |waited| {
+        let wait = BudgetWait::capacity(self.wait_timeout);
+        let mut bounded = self.clone();
+        bounded.wait_timeout = wait.timeout;
+        let slots = bounded.wait_for_permit(0..self.pool_size, |waited| {
             let weight = pressure::weight(weight, self.pool_size, pressure::now());
             compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
         });
+        let recover = wait.scoped();
+        drop(wait);
+        let permit = match slots {
+            Some(slots) => Some(Permit {
+                root: self.root.clone(),
+                _slots: slots,
+                _recovery: Vec::new(),
+            }),
+            None if recover => self.acquire_recovery_permit(weight),
+            None => None,
+        };
         crate::opcounts::record_permit_wait(started.elapsed());
-        slots.map(|slots| Permit {
+        permit
+    }
+
+    /// After the ordinary wait allowance, one compiler can use recovery
+    /// capacity. It may overcommit at most two weighted slots (one on a
+    /// one-slot pool); a heavier compile still needs regular slots for the
+    /// rest. Other waiters keep waiting for capacity, with cancellation.
+    fn acquire_recovery_permit(&self, weight: u32) -> Option<Permit> {
+        let wait = BudgetWait::start(WAIT_TIMEOUT);
+        let started = std::time::Instant::now();
+        loop {
+            crate::invocation::process::check().ok()?;
+            let seen = permit_wait::snapshot(&self.root);
+            match self.try_recovery_permit(weight) {
+                Ok(Some(permit)) => return Some(permit),
+                Ok(None) => {
+                    let remaining = wait.timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        tracing::debug!(
+                            "scheduler coordination allowance exhausted; compiling without a permit"
+                        );
+                        return None;
+                    }
+                    permit_wait::park(
+                        &self.root,
+                        None,
+                        seen,
+                        permit_wait::SATURATED_SLICE.min(remaining),
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "scheduler recovery unavailable ({error:#}); compiling without a permit"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn try_recovery_permit(&self, weight: u32) -> Result<Option<Permit>> {
+        let need = compile_need(weight, self.pool_size, true, || tests_held(&self.root));
+        let pressured = pressure::weight(weight, self.pool_size, pressure::now());
+        let ordinary = compile_need(pressured, self.pool_size, true, || tests_held(&self.root));
+        if let Collect::Ready(slots) =
+            try_collect_slots(self, 0..self.pool_size, ordinary as usize)?
+        {
+            return Ok(Some(Permit {
+                root: self.root.clone(),
+                _slots: slots,
+                _recovery: Vec::new(),
+            }));
+        }
+        let Some(gate) = StoreLock::try_acquire(&permits_dir(&self.root).join("recovery-0"))?
+        else {
+            return Ok(None);
+        };
+        let extra = need.min(2);
+        let regular = need - extra;
+        let slots = if regular == 0 {
+            Vec::new()
+        } else {
+            match try_collect_slots(self, 0..self.pool_size, regular as usize)? {
+                Collect::Ready(slots) => slots,
+                Collect::Busy(_) => return Ok(None),
+            }
+        };
+        let mut recovery = vec![gate];
+        for index in 1..extra {
+            let Some(lock) =
+                StoreLock::try_acquire(&permits_dir(&self.root).join(format!("recovery-{index}")))?
+            else {
+                return Ok(None);
+            };
+            recovery.push(lock);
+        }
+        tracing::debug!(
+            requested_slots = need,
+            recovery_slots = extra,
+            "scheduler wait allowance exhausted; admitted one recovery compile"
+        );
+        Ok(Some(Permit {
             root: self.root.clone(),
             _slots: slots,
-        })
+            _recovery: recovery,
+        }))
     }
 
     /// Wait for `need(waited)` free slots in `range`. The need is asked again
@@ -1619,6 +1727,262 @@ mod tests {
         // when the test wants pressure.
         pressure::force(Some(false));
         Scheduler::open_with(dir, pool, Duration::from_secs(5), Duration::from_millis(10)).unwrap()
+    }
+
+    fn bounded_test_wait<T>(work: impl FnOnce() -> T) -> T {
+        let token = crate::invocation::process::Cancellation::default();
+        let _scope = crate::invocation::process::CancellationScope::enter(Some(token.clone()));
+        std::thread::scope(|threads| {
+            let (stop, receive) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                if matches!(
+                    receive.recv_timeout(Duration::from_secs(2)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    token.cancel();
+                }
+            });
+            let result = work();
+            let _ = stop.send(());
+            result
+        })
+    }
+
+    #[test]
+    fn exhausted_compiler_allowance_uses_one_counted_recovery_compile() {
+        for pool in [1, 4] {
+            let dir = temp_cache();
+            let scheduler = test_scheduler(dir.path(), pool);
+            let holder = scheduler.acquire_permit(pool).unwrap();
+            let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+            let recovered =
+                bounded_test_wait(|| scheduler.acquire_permit(2)).expect("recovery capacity");
+            let extra = if pool == 1 { 1 } else { 2 };
+            assert_eq!(recovered._recovery.len(), extra);
+            assert_eq!(permits_in_use(dir.path()), Some(pool + extra as u32));
+            assert!(scheduler.try_recovery_permit(1).unwrap().is_none());
+            drop(recovered);
+            assert_eq!(permits_in_use(dir.path()), Some(pool));
+            let next = scheduler.try_recovery_permit(1).unwrap().unwrap();
+            assert_eq!(next._recovery.len(), 1);
+            drop(next);
+            drop(holder);
+            assert_eq!(permits_in_use(dir.path()), Some(0));
+        }
+    }
+
+    #[test]
+    fn a_compiler_spends_its_remaining_allowance_before_recovery() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let _holder = scheduler.acquire_permit(1).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::from_millis(50));
+        let recovered = bounded_test_wait(|| scheduler.acquire_permit(1)).unwrap();
+        assert_eq!(recovered._recovery.len(), 1);
+        assert_eq!(
+            BudgetWait::start(Duration::from_secs(5)).timeout,
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_the_final_deadline_when_weight_cannot_fit() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _holder = scheduler.acquire_permit(4).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        bounded_test_wait(|| {
+            assert!(scheduler.acquire_permit(4).is_none());
+            assert!(
+                crate::invocation::process::check().is_ok(),
+                "the allowance must end the wait before test cancellation"
+            );
+        });
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+    }
+
+    #[test]
+    fn heavy_recovery_still_needs_regular_slots_and_returns_partial_locks() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let mut held: Vec<_> = (0..4)
+            .map(|slot| {
+                StoreLock::try_acquire(&scheduler.permit_path(slot))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(scheduler.try_recovery_permit(4).unwrap().is_none());
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+        drop(held.pop());
+        assert!(scheduler.try_recovery_permit(4).unwrap().is_none());
+        assert_eq!(permits_in_use(dir.path()), Some(3));
+        drop(held.pop());
+        let recovered = scheduler.try_recovery_permit(4).unwrap().unwrap();
+        assert_eq!(recovered._slots.len(), 2);
+        assert_eq!(recovered._recovery.len(), 2);
+        assert_eq!(permits_in_use(dir.path()), Some(6));
+        drop(recovered);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+    }
+
+    #[test]
+    fn recovery_rechecks_ordinary_capacity_and_limits_pressure_overcommit() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let ordinary = scheduler.try_recovery_permit(2).unwrap().unwrap();
+        assert_eq!(ordinary._slots.len(), 2);
+        assert!(ordinary._recovery.is_empty());
+        drop(ordinary);
+        let holder = scheduler.acquire_permit(1).unwrap();
+        let _pressured = PinnedPressure::new(true);
+        let recovered = scheduler.try_recovery_permit(1).unwrap().unwrap();
+        assert!(recovered._slots.is_empty());
+        assert_eq!(recovered._recovery.len(), 1);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(recovered);
+        drop(holder);
+    }
+
+    #[test]
+    fn spent_allowance_does_not_restart_discovery_flight_or_key_waits() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let identity = FlightIdentity::cc("queued").with_key("key");
+        let _flight = StoreLock::try_acquire(&scheduler.flight_path(&identity))
+            .unwrap()
+            .unwrap();
+        let discovery = dir
+            .path()
+            .join("scheduler/discovery")
+            .join(blake3::hash(b"discovery").to_hex().as_str());
+        let _discovery = StoreLock::try_acquire(&discovery).unwrap().unwrap();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        let store = crate::store::Store::open(&config).unwrap();
+        let _key = match store.claim_build("key").unwrap() {
+            crate::store::BuildClaim::Acquired(lock) => lock,
+            _ => panic!("fresh key must have a build lock"),
+        };
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        let discovered = bounded_test_wait(|| join_discovery_flight(dir.path(), "discovery"));
+        assert!(discovered.lock.is_none());
+        assert!(discovered.waited);
+        let miss = bounded_test_wait(|| scheduler.begin_miss(&identity, "queued", false, None));
+        let BeginMiss::Compile(guard) = miss else {
+            panic!("exhausted flight wait must allow a compile");
+        };
+        assert!(guard._flight.is_none());
+        assert!(
+            guard._permit.is_some(),
+            "uncoalesced work must still take capacity"
+        );
+        drop(guard);
+        assert!(
+            !bounded_test_wait(|| crate::invocation::wait_for_committed(&store, "key", None))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_committed_entry_keeps_its_default_wait_shortcut_with_a_budget() {
+        let dir = temp_cache();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        let store = crate::store::Store::open(&config).unwrap();
+        let key = blake3::hash(b"already-committed").to_hex().to_string();
+        let artifact = dir.path().join("libready.rlib");
+        fs::write(&artifact, b"complete").unwrap();
+        store
+            .put(
+                &key,
+                "ready",
+                &["lib".into()],
+                &[],
+                "host",
+                "debug",
+                &[(artifact, "libready.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let lock = store.entry_dir(&key).with_extension("lock");
+        if lock.exists() {
+            fs::remove_file(&lock).unwrap();
+        }
+        fs::create_dir(&lock).unwrap();
+        assert!(store.contains(&key));
+        let _scope = InvocationWaitScope::enter();
+        assert!(crate::invocation::wait_for_committed(&store, &key, None).unwrap());
+        assert!(crate::invocation::wait_for_committed(&store, &key, Some(Duration::ZERO)).is_err());
+        let missing = blake3::hash(b"still-missing").to_hex().to_string();
+        fs::create_dir_all(store.entry_dir(&missing).with_extension("lock")).unwrap();
+        assert!(crate::invocation::wait_for_committed(&store, &missing, None).is_err());
+        let token = crate::invocation::process::Cancellation::default();
+        token.cancel();
+        let _cancel = crate::invocation::process::CancellationScope::enter(Some(token));
+        assert!(crate::invocation::wait_for_committed(&store, &key, None).is_err());
+    }
+
+    #[test]
+    fn recovery_errors_fail_open_and_cancellation_releases_waiters() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let holder = scheduler.acquire_permit(1).unwrap();
+        let gate = StoreLock::try_acquire(&permits_dir(&scheduler.root).join("recovery-0"))
+            .unwrap()
+            .unwrap();
+        let token = crate::invocation::process::Cancellation::default();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter_token = token.clone();
+        let mut copy = scheduler.clone();
+        copy.wait_timeout = Duration::ZERO;
+        let waiter = std::thread::spawn(move || {
+            let _cancel = crate::invocation::process::CancellationScope::enter(Some(waiter_token));
+            let _scope = InvocationWaitScope::with_budget(Duration::from_secs(5));
+            let permit = copy.acquire_permit(1);
+            send.send(permit.is_none()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        token.cancel();
+        let cancelled = receive.recv_timeout(Duration::from_secs(2));
+        // Release the gate even on failure so a broken cancellation branch
+        // cannot leave a test thread parked for the rest of the suite.
+        drop(gate);
+        drop(holder);
+        waiter.join().unwrap();
+        assert!(cancelled.unwrap());
+
+        let holder = scheduler.acquire_permit(1).unwrap();
+        fs::remove_file(permits_dir(&scheduler.root).join("recovery-0")).unwrap();
+        fs::create_dir(permits_dir(&scheduler.root).join("recovery-0")).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        assert!(scheduler.acquire_permit(1).is_none());
+        drop(holder);
+    }
+
+    #[test]
+    fn killing_a_recovery_holder_returns_its_capacity() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let _holder = scheduler.acquire_permit(1).unwrap();
+        let mut child = spawn_fixture(dir.path(), "scheduler::tests::recovery_owner_child_fixture");
+        wait_ready(dir.path(), &mut child);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        assert!(scheduler.try_recovery_permit(1).unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(1));
+        assert!(scheduler.try_recovery_permit(1).unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for killing_a_recovery_holder_returns_its_capacity"]
+    fn recovery_owner_child_fixture() {
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").unwrap());
+        let scheduler = test_scheduler(&root, 1);
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        let _permit = scheduler.acquire_permit(1).unwrap();
+        fs::write(root.join("lock-ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     fn spawn_fixture(dir: &Path, test_name: &str) -> std::process::Child {

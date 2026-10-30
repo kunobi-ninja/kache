@@ -244,6 +244,42 @@ fn last_event(cache_dir: &Path) -> LastEvent {
     last_event_with(cache_dir, &[])
 }
 
+#[test]
+fn compile_first_publishes_without_a_second_compiler_admission() {
+    build_kache();
+    let (_work, cache, out, src) = fixture();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    run_kache_rustc_as_cargo(cache.path(), out.path(), &src, true);
+    let cold = last_event(cache.path());
+    assert_eq!(cold.result, "miss");
+    assert_eq!(cold.compiler_runs, 1);
+    let scheduler = cache.path().join("scheduler");
+    assert!(
+        std::fs::read_dir(scheduler.join("permits"))
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        std::fs::read_dir(scheduler.join("flights"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a finished compile must not join a keyed compiler flight or take another permit"
+    );
+
+    std::fs::remove_dir_all(&scheduler).unwrap();
+    run_kache_rustc_as_cargo(cache.path(), out.path(), &src, true);
+    let warm = last_event(cache.path());
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.cache_key, cold.cache_key);
+    assert_eq!(warm.compiler_runs, 0);
+    assert!(
+        !scheduler.exists(),
+        "a prediction-backed cache hit must bypass admission"
+    );
+}
+
 /// [`last_event`], with `env` set for the report as it was for the build.
 fn last_event_with(cache_dir: &Path, env: &[(&str, std::ffi::OsString)]) -> LastEvent {
     let output = std::process::Command::new(kache_binary())

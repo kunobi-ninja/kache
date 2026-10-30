@@ -1320,7 +1320,8 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// megabytes.
 pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
-const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Default maximum wait for another process to publish a key it is building.
+pub const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a waiter sleeps before its next `try_lock`: 1 ms, doubling up to

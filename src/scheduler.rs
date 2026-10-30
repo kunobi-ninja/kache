@@ -504,9 +504,11 @@ impl Scheduler {
         let wait = BudgetWait::capacity(self.wait_timeout);
         let mut bounded = self.clone();
         bounded.wait_timeout = wait.timeout;
-        let need = |waited| {
+        let need = |waited, saved_for_tests: u32| {
             let weight = pressure::weight(weight, self.pool_size, pressure::now());
-            compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
+            compile_need(weight, self.pool_size, waited, || {
+                tests_held(&self.root).saturating_add(saved_for_tests)
+            })
         };
         let slots = bounded.wait_for_permit(queue::Kind::Compile, need, false);
         let recover = wait.scoped();
@@ -609,10 +611,12 @@ impl Scheduler {
         }))
     }
 
-    /// Wait for `need(waited)` free slots of `kind`, in [`queue`] order. The
-    /// need is asked again on every scan, with `waited` false on the first: a
-    /// compile's need shrinks while tests hold slots. With `spare`, the
-    /// request also takes the free test slots no waiter wants.
+    /// Wait for `need(waited, saved_for_tests)` free slots of `kind`, in
+    /// [`queue`] order. The need is asked again on every scan, with `waited`
+    /// false on the first, and with the free slots the last scan found the
+    /// queue saving for a waiting test: a compile's need shrinks while tests
+    /// hold slots or have slots saved for them. With `spare`, the request also
+    /// takes the free test slots no waiter wants.
     ///
     /// A scan that locked nothing another process is holding retries on
     /// [`POLL_INTERVAL`]. A scan that found held slots arms a release watch
@@ -621,7 +625,7 @@ impl Scheduler {
     fn wait_for_permit(
         &self,
         kind: queue::Kind,
-        need: impl Fn(bool) -> u32,
+        need: impl Fn(bool, u32) -> u32,
         spare: bool,
     ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
@@ -629,6 +633,7 @@ impl Scheduler {
             kind,
             spare,
             rank: queue::rank(SystemTime::now(), priority::current()),
+            saved_for_tests: std::cell::Cell::new(0),
         };
         // Dropped on every return, cancellation included: the request
         // leaves the queue.
@@ -637,7 +642,7 @@ impl Scheduler {
         loop {
             crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
-            let asking = need(waited).max(1);
+            let asking = need(waited, request.saved_for_tests.get()).max(1);
             match self.collect_permits(&request, asking, &mut ticket, start) {
                 WaitStep::Ready(slots) => return Some(slots),
                 WaitStep::Stop => return None,
@@ -685,7 +690,7 @@ impl Scheduler {
             tracing::debug!("no test slots above the compile reserve; running without a lease");
             return None;
         }
-        let slots = self.wait_for_permit(queue::Kind::Test, |_| need, elastic)?;
+        let slots = self.wait_for_permit(queue::Kind::Test, |_, _| need, elastic)?;
         // One marker per slot, so a compile can count the slots tests hold.
         let markers = slots
             .iter()
@@ -748,7 +753,8 @@ pub(crate) fn test_need(want: u32, pool: u32) -> u32 {
 /// and never less than the reserve. A test may be waiting on this very
 /// compile, and tests never take reserve slots, so this is what keeps both
 /// moving. Only a heavy compile that has waited calls `tests_held`, which
-/// counts the slots tests hold.
+/// counts the slots tests hold, and the free slots the [`queue`] saves for a
+/// waiting test: those are no more a compile's than held ones.
 pub(crate) fn compile_need(
     weight: u32,
     pool: u32,
@@ -923,6 +929,8 @@ struct Request {
     kind: queue::Kind,
     spare: bool,
     rank: u64,
+    /// What the last scan found the queue saving for a waiting test.
+    saved_for_tests: std::cell::Cell<u32>,
 }
 
 impl Scheduler {
@@ -972,6 +980,7 @@ impl Scheduler {
         need: u32,
         ticket: &mut Option<queue::Ticket>,
     ) -> Result<Collect> {
+        request.saved_for_tests.set(0);
         let wait = queue::LOCK_WAIT.min(self.wait_timeout);
         match queue::lock(&self.root, wait) {
             Ok(Some(_queue)) => match self.admit_in_order(request, need, ticket) {
@@ -1072,8 +1081,12 @@ impl Scheduler {
             |entry| queue::ready(&self.root, entry, now),
             |entry| queue::passes(&self.root, entry),
         );
-        let Some(admitted) = plan else {
-            return Ok(Collect::Busy(busy));
+        let admitted = match plan {
+            Ok(admitted) => admitted,
+            Err(waiting) => {
+                request.saved_for_tests.set(waiting.saved_for_tests);
+                return Ok(Collect::Busy(busy));
+            }
         };
         if let Some(passed) = &admitted.passed
             && let Err(error) = queue::record_pass(&self.root, passed)
@@ -1872,7 +1885,7 @@ mod tests {
                         ),
                         _ => assert!(
                             scheduler
-                                .wait_for_permit(queue::Kind::Compile, |_| 1, false)
+                                .wait_for_permit(queue::Kind::Compile, |_, _| 1, false)
                                 .is_none()
                         ),
                     }
@@ -3068,7 +3081,7 @@ mod tests {
         reset_permit_scans();
         assert!(
             scheduler
-                .wait_for_permit(queue::Kind::Compile, |_| 2, false)
+                .wait_for_permit(queue::Kind::Compile, |_, _| 2, false)
                 .is_none()
         );
         // Observe the requested sleep: runner contention can delay a wakeup
@@ -3096,7 +3109,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(
             scheduler
-                .wait_for_permit(queue::Kind::Compile, |_| 1, false)
+                .wait_for_permit(queue::Kind::Compile, |_, _| 1, false)
                 .is_none()
         );
         assert!(
@@ -4474,6 +4487,36 @@ mod tests {
         assert!(
             scheduler.acquire_test_lease(TestWant::Fixed(1)).is_none(),
             "slot 3 is saved for the waiting test"
+        );
+    }
+
+    #[test]
+    fn a_heavy_compile_counts_slots_saved_for_a_test_as_held_by_tests() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        // Pool 4: slot 0 is the compile reserve, slots 1..4 are test slots.
+        let scheduler = test_scheduler(cache, 4);
+        // A running test the compile below may be blocking, through a nested
+        // build or a shared flight.
+        let running = scheduler.acquire_test_lease(TestWant::Fixed(1)).unwrap();
+        assert_eq!(running.marker_path(), tests_dir(&scheduler.root).join("1"));
+        // A test that waits for three slots and has been passed out of budget
+        // saves slots 2 and 3.
+        let waiting = hold_ticket(cache, 0, queue::Kind::Test, 3, SystemTime::now());
+        for _ in 0..queue::pass_budget(4) {
+            queue::record_pass(&scheduler.root, waiting.entry()).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let permit = scheduler
+            .acquire_permit(3)
+            .expect("a heavy compile must fit in what tests leave: the reserve");
+        let slots: Vec<u32> = permit._slots.iter().map(|(index, _)| *index).collect();
+        assert_eq!(slots, [0]);
+        // Well before the waiting ticket goes stale and stops saving slots.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
         );
     }
 

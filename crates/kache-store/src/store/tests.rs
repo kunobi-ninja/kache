@@ -7989,6 +7989,43 @@ fn entry_meta_key_schema_defaults_to_unknown_for_legacy_json() {
 }
 
 #[test]
+fn a_verified_download_stays_unregistered_until_the_import_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let key = "a".repeat(64);
+    let entry = write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+
+    let verified = Store::verify_downloaded_entry(&store.entry_dir(&key), &key).unwrap();
+
+    assert_eq!(verified, entry.meta);
+    assert!(!store.contains(&key));
+    store.finish_restored_import(&key, Ok(verified)).unwrap();
+    assert!(store.contains(&key));
+}
+
+#[test]
+fn a_failed_download_check_is_cleaned_up_by_the_finishing_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let key = "b".repeat(64);
+    write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+    let entry_dir = store.entry_dir(&key);
+    let artifact = entry_dir.join("lib.rlib");
+    let mut tampered = fs::read(&artifact).unwrap();
+    tampered[0] ^= 0xff;
+    fs::write(&artifact, tampered).unwrap();
+
+    let verified = Store::verify_downloaded_entry(&entry_dir, &key);
+    let error = verified.as_ref().unwrap_err().to_string();
+    assert!(error.contains("content hash mismatch"), "{error}");
+    assert!(entry_dir.exists(), "the check itself removes nothing");
+
+    assert!(store.finish_restored_import(&key, verified).is_err());
+    assert!(!entry_dir.exists());
+    assert!(!store.contains(&key));
+}
+
+#[test]
 fn test_store_import_downloaded_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

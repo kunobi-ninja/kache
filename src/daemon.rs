@@ -3971,9 +3971,10 @@ impl Daemon {
                         .insert(req.key.clone(), Some(cn.as_str()))
                         .await;
                 }
+                let verified = Store::verify_downloaded_entry(&entry_dir, &req.key);
                 let (import_result, import_lock_wait_ms, import_ms) = self
                     .with_import_store_timed(&cache_dir, |store| {
-                        store.import_restored_entry(&req.key)
+                        store.finish_restored_import(&req.key, verified)
                     });
                 let import_ok = match import_result {
                     Ok(()) => true,
@@ -5224,8 +5225,11 @@ impl Daemon {
                                     .insert(key.clone(), Some(crate_name.as_str()))
                                     .await;
                             }
-                            let (import_result, import_lock_wait_ms, import_ms) =
-                                d.with_store_timed(|store| store.import_restored_entry(&key));
+                            let verified = Store::verify_downloaded_entry(&entry_dir, &key);
+                            let (import_result, import_lock_wait_ms, import_ms) = d
+                                .with_store_timed(|store| {
+                                    store.finish_restored_import(&key, verified)
+                                });
                             let import_ok = match import_result {
                                 Ok(()) => true,
                                 Err(e) => {

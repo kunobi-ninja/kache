@@ -3105,7 +3105,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// committed entries pending for retry rather than certifying their bytes.
     pub fn import_downloaded_entry(&self, cache_key: &str) -> Result<()> {
         self.refuse_write("import an entry")?;
-        let entry_dir = self.entry_dir(cache_key);
+        let meta = Self::verify_downloaded_entry(&self.entry_dir(cache_key), cache_key)?;
+        self.register_downloaded_entry(cache_key, meta)
+    }
+
+    /// Check a downloaded entry against its metadata, hashing every artifact.
+    /// This reads whole files and touches no index, so a caller that serializes
+    /// access to the store runs it first, outside that lock.
+    pub fn verify_downloaded_entry(entry_dir: &Path, cache_key: &str) -> Result<EntryMeta> {
         let meta_path = entry_dir.join("meta.json");
         let content = fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
         let meta: EntryMeta =
@@ -3175,6 +3182,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
+        Ok(meta)
+    }
+
+    /// Install a verified entry's blobs and commit its rows.
+    fn register_downloaded_entry(&self, cache_key: &str, meta: EntryMeta) -> Result<()> {
+        let entry_dir = self.entry_dir(cache_key);
         let total_size: u64 = meta.files.iter().map(|f| f.size).sum();
 
         let content_hash = compute_content_hash(&meta.files);
@@ -3233,8 +3246,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// serialized with Store publishers and preserves any committed generation
     /// that won the race.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
+        let verified = Self::verify_downloaded_entry(&self.entry_dir(cache_key), cache_key);
+        self.finish_restored_import(cache_key, verified)
+    }
+
+    /// [`Self::import_restored_entry`] after [`Self::verify_downloaded_entry`]
+    /// ran elsewhere: register the entry, or clean up after a failed check.
+    pub fn finish_restored_import(
+        &self,
+        cache_key: &str,
+        verified: Result<EntryMeta>,
+    ) -> Result<()> {
         self.refuse_write("import an entry")?;
-        match self.import_downloaded_entry(cache_key) {
+        match verified.and_then(|meta| self.register_downloaded_entry(cache_key, meta)) {
             Ok(()) => Ok(()),
             Err(import_error) => match self.discard_uncommitted_restored_entry(cache_key) {
                 Ok(()) => Err(import_error),

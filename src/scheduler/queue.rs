@@ -194,9 +194,14 @@ fn new_id() -> String {
         // process with the same name makes creation fail and the request
         // takes slots out of order.
         let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        bytes = (u64::from(std::process::id()) << 32 | next).to_le_bytes();
+        bytes = fallback_id(std::process::id(), next).to_le_bytes();
     }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A ticket id without randomness: the process id above its own counter.
+fn fallback_id(pid: u32, next: u64) -> u64 {
+    u64::from(pid) << 32 | next
 }
 
 fn millis(time: SystemTime) -> u64 {
@@ -611,6 +616,18 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_eq!(first.id.len(), 16);
         assert_eq!(Entry::parse(&first.name()), Some(first));
+    }
+
+    #[test]
+    fn a_fallback_id_keeps_the_process_and_its_counter_apart() {
+        assert_eq!(fallback_id(1, 0), 0x1_0000_0000);
+        assert_eq!(fallback_id(1, 2), 0x1_0000_0002);
+        assert_eq!(fallback_id(0xffff_ffff, 7), 0xffff_ffff_0000_0007);
+        assert_eq!(
+            fallback_id(1, 0x1_0000_0001),
+            0x1_0000_0001,
+            "a counter past 32 bits keeps its bits"
+        );
     }
 
     #[test]

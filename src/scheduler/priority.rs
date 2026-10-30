@@ -43,8 +43,10 @@ impl Priority {
         Self::from_background(process_is_background(pid))
     }
 
-    /// The priority a Windows priority class stands for.
+    /// The priority a Windows priority class stands for. Never built by the
+    /// Linux mutation lane; `windows_background` holds the decision.
     #[cfg(windows)]
+    #[mutants::skip]
     pub(crate) fn of_windows_class(class: u32) -> Self {
         Self::from_background(windows_background(class))
     }
@@ -91,7 +93,7 @@ pub(crate) fn current() -> Priority {
 pub(crate) fn macos_background(flags: u32, nice: i32) -> bool {
     const PROC_FLAG_DARWINBG: u32 = 0x8000;
     const PROC_FLAG_EXT_DARWINBG: u32 = 0x10000;
-    flags & (PROC_FLAG_DARWINBG | PROC_FLAG_EXT_DARWINBG) != 0 || nice > 0
+    flags & PROC_FLAG_DARWINBG != 0 || flags & PROC_FLAG_EXT_DARWINBG != 0 || nice > 0
 }
 
 /// Whether Linux runs a process as background: lowered with nice, or under
@@ -116,7 +118,10 @@ fn this_process_is_background() -> bool {
     process_is_background(std::process::id())
 }
 
+// The mutation lane runs on Linux and never builds this; the macOS tests
+// below exercise it.
 #[cfg(target_os = "macos")]
+#[mutants::skip]
 fn process_is_background(pid: u32) -> bool {
     let Ok(pid) = libc::c_int::try_from(pid) else {
         return false;
@@ -150,7 +155,9 @@ fn process_is_background(pid: u32) -> bool {
     false
 }
 
+// Never built by the Linux mutation lane, like the macOS reader above.
 #[cfg(windows)]
+#[mutants::skip]
 fn this_process_is_background() -> bool {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
     // SAFETY: the pseudo handle of this process needs no closing.
@@ -225,8 +232,9 @@ mod tests {
             .arg("5")
             .spawn()
             .unwrap();
+        let own = nice_of(std::process::id());
         let mut niced = std::process::Command::new("nice")
-            .args(["-n", "10", "sleep", "5"])
+            .args(["-n", &nice_ten_from(own), "sleep", "5"])
             .spawn()
             .unwrap();
         // `nice` execs `sleep` in place; wait until the new image runs niced.
@@ -240,15 +248,33 @@ mod tests {
             Priority::of_process(calm.id()),
             Priority::of_process(niced.id()),
         );
+        let child = nice_of(niced.id());
         let _ = calm.kill();
         let _ = niced.kill();
         let _ = calm.wait();
         let _ = niced.wait();
-        // The suite itself may run niced, and children inherit it.
-        if Priority::of_this_process() == Priority::Foreground {
-            assert_eq!(observed.0, Priority::Foreground);
-        }
-        assert_eq!(observed.1, Priority::Background);
+        // An unniced child inherits the suite's own priority.
+        assert_eq!(observed.0, Priority::of_this_process());
+        assert_eq!(
+            observed.1,
+            Priority::Background,
+            "suite nice {own}, child nice {child}"
+        );
+    }
+
+    /// The nice value of `pid` as `getpriority` reports it.
+    #[cfg(unix)]
+    fn nice_of(pid: u32) -> i32 {
+        // SAFETY: only reads the scheduling state of `pid`.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) }
+    }
+
+    /// The `nice` increment that starts a child at nice 10 from `own`. The
+    /// suite may itself start below zero, where a fixed increment can leave
+    /// the child at or under zero.
+    #[cfg(unix)]
+    fn nice_ten_from(own: i32) -> String {
+        (10 - own).max(1).to_string()
     }
 
     #[cfg(unix)]
@@ -257,7 +283,8 @@ mod tests {
     fn niced_process_fixture() {
         let out = std::env::var_os("KACHE_TEST_PRIORITY_OUT").expect("fixture output");
         let observed = (Priority::of_this_process(), current());
-        std::fs::write(out, format!("{observed:?}")).unwrap();
+        let nice = nice_of(std::process::id());
+        std::fs::write(out, format!("{observed:?} at nice {nice}")).unwrap();
     }
 
     #[cfg(unix)]
@@ -265,8 +292,9 @@ mod tests {
     fn this_process_reads_its_own_nice() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("priority");
+        let own = nice_of(std::process::id());
         let status = std::process::Command::new("nice")
-            .args(["-n", "5"])
+            .args(["-n", &nice_ten_from(own)])
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -278,9 +306,10 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        assert_eq!(
-            std::fs::read_to_string(out).unwrap(),
-            "(Background, Background)"
+        let observed = std::fs::read_to_string(out).unwrap();
+        assert!(
+            observed.starts_with("(Background, Background) "),
+            "suite nice {own}: {observed}"
         );
     }
 

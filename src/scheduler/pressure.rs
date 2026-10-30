@@ -78,8 +78,13 @@ impl Drop for InvocationPressureScope {
     }
 }
 
-/// What one reading says about memory.
+/// What one reading says about memory. Systems without a reading only ever
+/// produce [`Level::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) enum Level {
     Calm,
     Warning,

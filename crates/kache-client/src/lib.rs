@@ -14,6 +14,10 @@ mod creation_mask;
 #[cfg(unix)]
 pub use creation_mask::creation_mask;
 mod argv_file;
+#[cfg(any(test, target_os = "macos"))]
+mod dyld_env;
+#[cfg(target_os = "macos")]
+pub use dyld_env::restore_dyld_env;
 mod frontend;
 pub use frontend::run;
 

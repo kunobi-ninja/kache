@@ -146,6 +146,8 @@ fn engine_command(
                 .unwrap_or_else(|| "-".to_owned()),
         )
         .args(args);
+    #[cfg(target_os = "macos")]
+    crate::restore_dyld_env(&mut command);
     Ok(command)
 }
 

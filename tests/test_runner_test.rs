@@ -111,8 +111,13 @@ impl Fixture {
     /// `kache test-runner <program> <args>` in its own process group, with
     /// every variable the runner reads cleared.
     fn runner(&self, program: &Path, mode: &str) -> Command {
+        self.runner_of(Path::new(kache_binary()), program, mode)
+    }
+
+    /// [`Self::runner`] with another `kache`.
+    fn runner_of(&self, kache: &Path, program: &Path, mode: &str) -> Command {
         let mut command = hermetic_command(
-            kache_binary(),
+            kache,
             &self.cache(),
             Some(&self.path().join("missing-kache.toml")),
         );
@@ -720,4 +725,83 @@ fn nested_runners_and_compiles_do_not_deadlock() {
             .any(|event| event["crate_name"] == "nested" && event["result"] == "miss"),
         "the nested compile must take the scheduled miss path: {events:#?}"
     );
+}
+
+/// Cargo points `DYLD_FALLBACK_LIBRARY_PATH` at the Rust dylibs for `cargo
+/// run` and `cargo test`. The released `kache` and `kache-engine` run with
+/// the hardened runtime, and dyld removes every `DYLD_*` variable from their
+/// environment, so a binary linked against libstd as a dylib (Bevy's
+/// `dynamic_linking`) could not start under the runner (#1737). The copies
+/// here are signed the same way, without a certificate.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_hardened_runner_passes_the_dyld_variables_on() {
+    let fixture = Fixture::new();
+    let bin = fixture.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    for name in ["kache", "kache-engine"] {
+        fs::copy(
+            Path::new(kache_binary()).with_file_name(name),
+            bin.join(name),
+        )
+        .unwrap();
+    }
+    let signed = Command::new("codesign")
+        .args(["--force", "--sign", "-", "--options", "runtime"])
+        .arg(bin.join("kache"))
+        .arg(bin.join("kache-engine"))
+        .output()
+        .unwrap();
+    assert!(signed.status.success(), "{signed:?}");
+
+    let libdir = Command::new("rustc")
+        .args(["--print", "target-libdir"])
+        .output()
+        .unwrap();
+    let libdir = String::from_utf8(libdir.stdout).unwrap();
+    let source = fixture.path().join("dylinked.rs");
+    fs::write(
+        &source,
+        r#"fn main() { println!("{}", std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default()); }"#,
+    )
+    .unwrap();
+    let hashed = fixture.path().join("dylinked-0123456789abcdef");
+    let built = Command::new("rustc")
+        .args(["-C", "prefer-dynamic", "-o"])
+        .arg(&hashed)
+        .arg(&source)
+        .env_remove("RUSTC_WRAPPER")
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{built:?}");
+    let unhashed = fixture.path().join("dylinked");
+    fs::copy(&hashed, &unhashed).unwrap();
+    let alone = Command::new(&hashed)
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .env_remove("DYLD_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    assert!(
+        !alone.status.success(),
+        "the probe needs Cargo's library path to find libstd: {alone:?}"
+    );
+
+    // Scheduled, unscheduled, and `cargo run`'s binary, which the runner
+    // becomes.
+    for (program, scheduler) in [(&hashed, None), (&hashed, Some("0")), (&unhashed, None)] {
+        let mut command = fixture.runner_of(&bin.join("kache"), program, "unused");
+        command
+            .env("DYLD_FALLBACK_LIBRARY_PATH", libdir.trim_end())
+            .env("DYLD_LIBRARY_PATH", "/kache-1737");
+        if let Some(scheduler) = scheduler {
+            command.env("KACHE_SCHEDULER", scheduler);
+        }
+        let output = run(command);
+        assert!(
+            output.status.success(),
+            "{} with KACHE_SCHEDULER={scheduler:?}: {output:?}",
+            program.display()
+        );
+        assert_eq!(output.stdout, b"/kache-1737\n");
+    }
 }

@@ -4669,15 +4669,19 @@ fn run_parsed_rustc(
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then
     // claim the key and re-check under the build lock.
-    let (miss_guard, scheduled_hit) = admit_scheduler_miss(
-        config,
-        &store,
-        &cache_key,
-        FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
-        crate_name,
-        args.invokes_linker(),
-        cache_entry_has_files,
-    );
+    let (miss_guard, scheduled_hit) = if precompiled.is_none() {
+        admit_scheduler_miss(
+            config,
+            &store,
+            &cache_key,
+            FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
+            crate_name,
+            args.invokes_linker(),
+            cache_entry_has_files,
+        )
+    } else {
+        (MissGuard::empty(), None)
+    };
     let (lock, committed) = if let Some(meta) = scheduled_hit {
         (None, Some(meta))
     } else {

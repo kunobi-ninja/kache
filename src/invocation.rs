@@ -27,6 +27,13 @@ pub(crate) fn wait_for_committed(
     key: &str,
     timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<bool> {
+    let wait =
+        crate::scheduler::BudgetWait::start(timeout.unwrap_or(crate::scheduler::WAIT_TIMEOUT));
+    let timeout = if wait.scoped() {
+        Some(wait.timeout)
+    } else {
+        timeout
+    };
     store.wait_for_committed_with(key, timeout, || Ok(process::check()?))
 }
 

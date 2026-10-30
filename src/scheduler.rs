@@ -694,12 +694,10 @@ impl Scheduler {
                         WaitStep::Stop => return None,
                         WaitStep::Busy(_) => {
                             let remaining = self.wait_timeout.saturating_sub(start.elapsed());
-                            permit_wait::park(
-                                &self.root,
-                                armed,
-                                seen,
-                                permit_wait::SATURATED_SLICE.min(remaining),
-                            );
+                            let nap = permit_wait::SATURATED_SLICE.min(remaining);
+                            #[cfg(test)]
+                            PERMIT_POLL_MAX.with(|max| max.set(max.get().max(nap)));
+                            permit_wait::park(&self.root, armed, seen, nap);
                         }
                     }
                 }
@@ -3260,16 +3258,16 @@ mod tests {
         let _held = StoreLock::try_acquire(&scheduler.permit_path(0))
             .unwrap()
             .unwrap();
-        let started = std::time::Instant::now();
+        reset_permit_scans();
         assert!(
             scheduler
                 .wait_for_permit(queue::Kind::Compile, |_, _| 1, false)
                 .is_none()
         );
+        // Check the requested sleep; a loaded runner may wake us much later.
         assert!(
-            started.elapsed() < Duration::from_millis(190),
-            "stopped after {:?}; the wait slept a full slice past the timeout",
-            started.elapsed()
+            PERMIT_POLL_MAX.with(|max| max.get()) <= Duration::from_millis(80),
+            "the requested sleep must fit the remaining wait allowance"
         );
     }
 

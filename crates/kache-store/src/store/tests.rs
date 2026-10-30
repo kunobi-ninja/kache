@@ -9616,6 +9616,10 @@ fn publish_racing_an_unlink_never_errors() {
     let hash = crate::file_hash::hash_file(&source).unwrap();
     let blob = store.blob_path(&hash);
 
+    // Publication already takes SQLite's writer lock. Serialize the publishers
+    // here so this fixture tests rename/unlink races without exhausting the
+    // database's busy timeout. The remover keeps running without this lock.
+    let publish_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let remover = {
         let blob = blob.clone();
@@ -9633,9 +9637,11 @@ fn publish_racing_an_unlink_never_errors() {
             let store = Store::open(&config).unwrap();
             let source = source.clone();
             let hash = hash.clone();
+            let publish_lock = std::sync::Arc::clone(&publish_lock);
             std::thread::spawn(move || {
                 for _ in 0..ROUNDS {
                     let (staged, ingest) = store.stage_blob_from_source(&source, false).unwrap();
+                    let _publish = publish_lock.lock().unwrap();
                     store
                         .publish_staged_blob(&staged, ingest, &hash, content.len() as u64)
                         .unwrap();

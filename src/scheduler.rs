@@ -23,6 +23,13 @@
 //! recovery admits at most one extra compile and two extra
 //! weighted slots. Linux cgroup-v2 limits are logged for diagnostics.
 //!
+//! Waiters take free slots in [`queue`] order: by arrival, foreground builds
+//! ahead of background ones (see [`priority`]), and a large request is passed
+//! by smaller ones only a bounded number of times. The slot locks stay the
+//! authority for capacity; the queue only orders who may lock them next.
+//! Recovery admission, after an ordinary wait reaches its limit, does not
+//! queue.
+//!
 //! If the scheduler directory cannot be used or the shared coordination
 //! allowance is spent, compilation continues without a permit.
 //! [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
@@ -38,13 +45,16 @@
 mod budget;
 mod permit_wait;
 pub(crate) mod pressure;
+mod priority;
+mod queue;
 use anyhow::Result;
 pub(crate) use budget::{BudgetWait, InvocationWaitScope};
+pub(crate) use priority::{InvocationPriorityScope, Priority};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::store::StoreLock;
 
@@ -494,10 +504,11 @@ impl Scheduler {
         let wait = BudgetWait::capacity(self.wait_timeout);
         let mut bounded = self.clone();
         bounded.wait_timeout = wait.timeout;
-        let slots = bounded.wait_for_permit(0..self.pool_size, |waited| {
+        let need = |waited| {
             let weight = pressure::weight(weight, self.pool_size, pressure::now());
             compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
-        });
+        };
+        let slots = bounded.wait_for_permit(queue::Kind::Compile, need, false);
         let recover = wait.scoped();
         drop(wait);
         let permit = match slots {
@@ -598,9 +609,10 @@ impl Scheduler {
         }))
     }
 
-    /// Wait for `need(waited)` free slots in `range`. The need is asked again
-    /// on every scan, with `waited` false on the first: a compile's need
-    /// shrinks while tests hold slots.
+    /// Wait for `need(waited)` free slots of `kind`, in [`queue`] order. The
+    /// need is asked again on every scan, with `waited` false on the first: a
+    /// compile's need shrinks while tests hold slots. With `spare`, the
+    /// request also takes the free test slots no waiter wants.
     ///
     /// A scan that locked nothing another process is holding retries on
     /// [`POLL_INTERVAL`]. A scan that found held slots arms a release watch
@@ -608,22 +620,31 @@ impl Scheduler {
     /// sleeps in [`permit_wait`].
     fn wait_for_permit(
         &self,
-        range: Range<u32>,
+        kind: queue::Kind,
         need: impl Fn(bool) -> u32,
+        spare: bool,
     ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
+        let request = Request {
+            kind,
+            spare,
+            rank: queue::rank(SystemTime::now(), priority::current()),
+        };
+        // Dropped on every return, cancellation included: the request
+        // leaves the queue.
+        let mut ticket = None;
         let mut waited = false;
         loop {
             crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
-            let asking = need(waited).max(1) as usize;
-            match self.collect_permits(range.clone(), asking, start) {
+            let asking = need(waited).max(1);
+            match self.collect_permits(&request, asking, &mut ticket, start) {
                 WaitStep::Ready(slots) => return Some(slots),
                 WaitStep::Stop => return None,
                 WaitStep::Busy(busy) if !busy.is_empty() => {
                     let armed = permit_wait::arm(&self.root, &busy);
                     let seen = permit_wait::snapshot(&self.root);
-                    match self.collect_permits(range.clone(), asking, start) {
+                    match self.collect_permits(&request, asking, &mut ticket, start) {
                         WaitStep::Ready(slots) => return Some(slots),
                         WaitStep::Stop => return None,
                         WaitStep::Busy(_) => {
@@ -664,11 +685,7 @@ impl Scheduler {
             tracing::debug!("no test slots above the compile reserve; running without a lease");
             return None;
         }
-        let range = reserve_for(self.pool_size)..self.pool_size;
-        let mut slots = self.wait_for_permit(range.clone(), |_| need)?;
-        if elastic {
-            slots.extend(self.take_free_slots(range));
-        }
+        let slots = self.wait_for_permit(queue::Kind::Test, |_| need, elastic)?;
         // One marker per slot, so a compile can count the slots tests hold.
         let markers = slots
             .iter()
@@ -901,15 +918,23 @@ enum WaitStep {
     Stop,
 }
 
+/// What one permit request asks the [`queue`] for.
+struct Request {
+    kind: queue::Kind,
+    spare: bool,
+    rank: u64,
+}
+
 impl Scheduler {
     fn collect_permits(
         &self,
-        range: Range<u32>,
-        need: usize,
+        request: &Request,
+        need: u32,
+        ticket: &mut Option<queue::Ticket>,
         start: std::time::Instant,
     ) -> WaitStep {
         note_permit_scan();
-        match try_collect_slots(self, range, need) {
+        match self.admit(request, need, ticket) {
             Ok(Collect::Ready(slots)) => WaitStep::Ready(slots),
             Ok(Collect::Busy(busy)) => {
                 if start.elapsed() >= self.wait_timeout {
@@ -926,6 +951,142 @@ impl Scheduler {
                 WaitStep::Stop
             }
         }
+    }
+}
+
+impl Scheduler {
+    /// The slots a request of `kind` can take.
+    fn range(&self, kind: queue::Kind) -> Range<u32> {
+        match kind {
+            queue::Kind::Compile => 0..self.pool_size,
+            queue::Kind::Test => reserve_for(self.pool_size)..self.pool_size,
+        }
+    }
+
+    /// Take `need` slots if the queue gives them to this request now, and
+    /// queue it when it does not. Should the queue be unusable, or its lock
+    /// stay held for [`queue::LOCK_WAIT`], take free slots out of order.
+    fn admit(
+        &self,
+        request: &Request,
+        need: u32,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Result<Collect> {
+        let wait = queue::LOCK_WAIT.min(self.wait_timeout);
+        match queue::lock(&self.root, wait) {
+            Ok(Some(_queue)) => match self.admit_in_order(request, need, ticket) {
+                Ok(collect) => return Ok(collect),
+                Err(error) => {
+                    tracing::debug!("permit queue unusable ({error:#}); taking slots out of order")
+                }
+            },
+            Ok(None) => tracing::debug!("permit queue stayed locked; taking slots out of order"),
+            Err(error) => {
+                crate::invocation::process::check()?;
+                tracing::debug!("permit queue lock failed ({error:#}); taking slots out of order")
+            }
+        }
+        self.collect_unordered(request, need)
+    }
+
+    /// Admit under `queue.lock`. With no other ticket queued, this is the
+    /// first-come scan of [`Scheduler::collect_unordered`].
+    fn admit_in_order(
+        &self,
+        request: &Request,
+        need: u32,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Result<Collect> {
+        let now = SystemTime::now();
+        let me = match ticket {
+            Some(ticket) => {
+                ticket.refresh(need, now)?;
+                ticket.entry().clone()
+            }
+            None => queue::Entry::new(request.rank, request.kind, need),
+        };
+        let queued = queue::list(&self.root)?;
+        let collect = if queued.iter().all(|entry| entry.id == me.id) {
+            self.collect_unordered(request, need)?
+        } else {
+            self.collect_planned(request, &me, queued, now)?
+        };
+        match collect {
+            Collect::Ready(slots) => {
+                if let Some(ticket) = ticket.take() {
+                    ticket.admitted();
+                }
+                Ok(Collect::Ready(slots))
+            }
+            Collect::Busy(busy) => {
+                if ticket.is_none() {
+                    *ticket = Some(queue::Ticket::create(&self.root, me, now)?);
+                }
+                Ok(Collect::Busy(busy))
+            }
+        }
+    }
+
+    /// Take the first `need` free slots of the request's range, and with
+    /// `spare` every other free one.
+    fn collect_unordered(&self, request: &Request, need: u32) -> Result<Collect> {
+        let range = self.range(request.kind);
+        Ok(
+            match try_collect_slots(self, range.clone(), need as usize)? {
+                Collect::Ready(mut slots) if request.spare => {
+                    slots.extend(self.take_free_slots(range));
+                    Collect::Ready(slots)
+                }
+                collect => collect,
+            },
+        )
+    }
+
+    /// Lock every free slot of the pool, let [`queue::plan`] decide which are
+    /// this request's, and release the rest.
+    fn collect_planned(
+        &self,
+        request: &Request,
+        me: &queue::Entry,
+        queued: Vec<queue::Entry>,
+        now: SystemTime,
+    ) -> Result<Collect> {
+        // The whole pool, whatever the request's kind: a compile ahead of a
+        // test takes reserve slots first.
+        let mut free = Vec::new();
+        let mut busy = Vec::new();
+        for index in 0..self.pool_size {
+            match StoreLock::try_acquire(&self.permit_path(index))? {
+                Some(lock) => free.push((index, lock)),
+                None => busy.push(index),
+            }
+        }
+        let indexes: Vec<u32> = free.iter().map(|(index, _)| *index).collect();
+        let plan = queue::plan(
+            &queue::with_entry(queued, me),
+            &me.id,
+            &indexes,
+            reserve_for(self.pool_size),
+            queue::pass_budget(self.pool_size),
+            request.spare,
+            |entry| queue::ready(&self.root, entry, now),
+            |entry| queue::passes(&self.root, entry),
+        );
+        let Some(admitted) = plan else {
+            return Ok(Collect::Busy(busy));
+        };
+        if let Some(passed) = &admitted.passed
+            && let Err(error) = queue::record_pass(&self.root, passed)
+        {
+            tracing::debug!("could not count a pass of the first waiter: {error:#}");
+        }
+        Ok(Collect::Ready(
+            free.into_iter()
+                .filter(|(index, _)| {
+                    admitted.slots.contains(index) || admitted.spare.contains(index)
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -1709,7 +1870,11 @@ mod tests {
                             wait_for_lock(&path, Duration::from_secs(5), Duration::from_millis(5))
                                 .is_err()
                         ),
-                        _ => assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none()),
+                        _ => assert!(
+                            scheduler
+                                .wait_for_permit(queue::Kind::Compile, |_| 1, false)
+                                .is_none()
+                        ),
                     }
                 });
                 std::thread::sleep(Duration::from_millis(30));
@@ -2901,7 +3066,11 @@ mod tests {
         )
         .unwrap();
         reset_permit_scans();
-        assert!(scheduler.wait_for_permit(0..1, |_| 2).is_none());
+        assert!(
+            scheduler
+                .wait_for_permit(queue::Kind::Compile, |_| 2, false)
+                .is_none()
+        );
         // Observe the requested sleep: runner contention can delay a wakeup
         // regardless of the interval the scheduler selected.
         assert_eq!(
@@ -2925,7 +3094,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let started = std::time::Instant::now();
-        assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none());
+        assert!(
+            scheduler
+                .wait_for_permit(queue::Kind::Compile, |_| 1, false)
+                .is_none()
+        );
         assert!(
             started.elapsed() < Duration::from_millis(190),
             "stopped after {:?}; the wait slept a full slice past the timeout",
@@ -3949,5 +4122,374 @@ mod tests {
         )
         .expect("a test run must persist a peak RSS sample");
         assert!(rss > 1024, "got {rss}");
+    }
+
+    /// The tickets queued under `cache`, in rank order.
+    fn queued(cache: &Path) -> Vec<queue::Entry> {
+        queue::list(&scheduler_root(cache)).unwrap()
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// One build's compile, waiting for `weight` slots of a pool of `pool` on
+    /// its own thread. It holds its permit until [`Requester::finish`].
+    struct Requester {
+        admitted: std::sync::mpsc::Receiver<()>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: std::thread::JoinHandle<bool>,
+    }
+
+    impl Requester {
+        fn spawn(cache: &Path, pool: u32, weight: u32, priority: Priority) -> Self {
+            let (admit, admitted) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let cache = cache.to_path_buf();
+            let thread = std::thread::spawn(move || {
+                let _priority = InvocationPriorityScope::enter(Some(priority));
+                let scheduler = test_scheduler(&cache, pool);
+                let Some(permit) = scheduler.acquire_permit(weight) else {
+                    return false;
+                };
+                admit.send(()).unwrap();
+                let _ = released.recv();
+                drop(permit);
+                true
+            });
+            Self {
+                admitted,
+                release: Some(release),
+                thread,
+            }
+        }
+
+        /// Spawn, then wait until the request is admitted.
+        fn running(cache: &Path, pool: u32, weight: u32, priority: Priority) -> Self {
+            let requester = Self::spawn(cache, pool, weight, priority);
+            requester.admitted(Duration::from_secs(5));
+            requester
+        }
+
+        /// Spawn, then wait until the queue holds `queued` tickets.
+        fn queued(cache: &Path, pool: u32, weight: u32, priority: Priority, queued: usize) -> Self {
+            let requester = Self::spawn(cache, pool, weight, priority);
+            wait_until("the request to queue", || {
+                super::tests::queued(cache).len() == queued
+            });
+            requester
+        }
+
+        fn admitted(&self, within: Duration) {
+            self.admitted
+                .recv_timeout(within)
+                .expect("the request was not admitted");
+        }
+
+        fn still_waiting(&self) -> bool {
+            matches!(
+                self.admitted.recv_timeout(Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+        }
+
+        /// Release the permit and wait for the thread to drop it.
+        fn finish(mut self) {
+            drop(self.release.take());
+            assert!(
+                self.thread.join().unwrap(),
+                "the request was never admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_of_small_requests_cannot_overtake_a_large_one_forever() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let background = Priority::Background;
+        let first = Requester::running(cache, 2, 1, background);
+        let second = Requester::running(cache, 2, 1, background);
+        let large = Requester::queued(cache, 2, 2, background, 1);
+
+        // While the large request does not fit, smaller ones pass it, once
+        // per slot of the pool.
+        first.finish();
+        let pass_one = Requester::running(cache, 2, 1, background);
+        second.finish();
+        let pass_two = Requester::running(cache, 2, 1, background);
+        let waiting = queued(cache);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(queue::passes(&scheduler_root(cache), &waiting[0]), 2);
+
+        // The budget is spent: a freed slot is saved for the large request.
+        pass_one.finish();
+        let late = Requester::queued(cache, 2, 1, background, 2);
+        assert!(late.still_waiting(), "a third small request passed");
+        assert!(large.still_waiting(), "one free slot is not enough");
+        pass_two.finish();
+        large.admitted(Duration::from_secs(5));
+        assert!(late.still_waiting(), "the large request runs alone");
+        large.finish();
+        late.admitted(Duration::from_secs(5));
+        late.finish();
+        assert!(queued(cache).is_empty());
+    }
+
+    #[test]
+    fn a_foreground_request_goes_before_earlier_background_ones() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let holder = Requester::running(cache, 1, 1, Priority::Background);
+        let background = Requester::queued(cache, 1, 1, Priority::Background, 1);
+        let later_background = Requester::queued(cache, 1, 1, Priority::Background, 2);
+        let foreground = Requester::queued(cache, 1, 1, Priority::Foreground, 3);
+        let ranks: Vec<u64> = queued(cache).iter().map(|entry| entry.rank).collect();
+        assert!(
+            ranks[0] + 9_000 < ranks[1],
+            "the foreground ticket ranks first: {ranks:?}"
+        );
+
+        holder.finish();
+        foreground.admitted(Duration::from_secs(5));
+        assert!(background.still_waiting());
+        foreground.finish();
+        // Background requests still run, in the order they came.
+        background.admitted(Duration::from_secs(5));
+        assert!(later_background.still_waiting());
+        background.finish();
+        later_background.admitted(Duration::from_secs(5));
+        later_background.finish();
+    }
+
+    #[test]
+    fn a_cancelled_waiter_leaves_the_queue() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let holder = Requester::running(cache, 1, 1, Priority::Foreground);
+        let token = crate::invocation::process::Cancellation::default();
+        let waiter = {
+            let cache = cache.to_path_buf();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let _scope = crate::invocation::process::CancellationScope::enter(Some(token));
+                test_scheduler(&cache, 1).acquire_permit(1).is_some()
+            })
+        };
+        wait_until("the waiter to queue", || queued(cache).len() == 1);
+        let behind = Requester::queued(cache, 1, 1, Priority::Background, 2);
+        token.cancel();
+        assert!(
+            !waiter.join().unwrap(),
+            "a cancelled waiter takes no permit"
+        );
+        assert_eq!(queued(cache).len(), 1, "only the request behind is left");
+        assert_eq!(
+            fs::read_dir(scheduler_root(cache).join("waiters"))
+                .unwrap()
+                .count(),
+            1
+        );
+        holder.finish();
+        behind.admitted(Duration::from_secs(5));
+        behind.finish();
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for a_killed_waiter_loses_its_place"]
+    fn queued_waiter_child_fixture() {
+        let cache = PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").unwrap());
+        let _ = test_scheduler(&cache, 1).acquire_permit(1);
+    }
+
+    #[test]
+    fn a_killed_waiter_loses_its_place() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = test_scheduler(cache, 1);
+        let holder = scheduler.acquire_permit(1).unwrap();
+        let mut child = spawn_fixture(cache, "scheduler::tests::queued_waiter_child_fixture");
+        wait_until("the child to queue", || queued(cache).len() == 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(queued(cache).len(), 1, "a killed waiter cannot clean up");
+
+        drop(holder);
+        let started = std::time::Instant::now();
+        let permit = scheduler.acquire_permit(1);
+        assert!(permit.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the dead ticket held the queue for {:?}",
+            started.elapsed()
+        );
+        assert!(queued(cache).is_empty(), "the next planner deleted it");
+        assert_eq!(
+            fs::read_dir(scheduler_root(cache).join("waiters"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    /// A ticket held by this thread, as a waiter that last looked at `seen`.
+    fn hold_ticket(
+        cache: &Path,
+        rank: u64,
+        kind: queue::Kind,
+        need: u32,
+        seen: SystemTime,
+    ) -> queue::Ticket {
+        queue::Ticket::create(
+            &scheduler_root(cache),
+            queue::Entry::new(rank, kind, need),
+            seen,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_waiter_that_has_not_looked_for_a_while_is_skipped() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 1);
+        let fresh = hold_ticket(cache, 0, queue::Kind::Compile, 1, SystemTime::now());
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "a live ticket ahead takes the free slot first"
+        );
+        drop(fresh);
+        let _starved = hold_ticket(
+            cache,
+            0,
+            queue::Kind::Compile,
+            1,
+            SystemTime::now() - Duration::from_secs(3),
+        );
+        assert!(scheduler.acquire_permit(1).is_some());
+        assert_eq!(queued(cache).len(), 1, "it keeps its place for later");
+    }
+
+    #[test]
+    fn slots_held_without_a_ticket_still_count() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 2);
+        // What a wrapper from before the queue holds: the slot lock alone.
+        let older = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        let _ahead = hold_ticket(cache, 0, queue::Kind::Compile, 1, SystemTime::now());
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "slot 1 is the ticket's, slot 0 the older wrapper's"
+        );
+        drop(older);
+        let permit = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(permit._slots[0].0, 1, "slot 0 is left for the ticket ahead");
+    }
+
+    #[test]
+    fn a_held_queue_lock_falls_back_to_first_come() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 1);
+        let _queue = StoreLock::try_acquire(&queue::lock_path(&scheduler.root))
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(scheduler.acquire_permit(1).is_some());
+        assert!(started.elapsed() >= BUDGET, "it waited for the queue first");
+        assert!(queued(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unusable_queue_falls_back_to_first_come() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 1);
+        fs::write(queue::queue_dir(&scheduler.root), b"not a directory").unwrap();
+        let busy = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        assert!(scheduler.acquire_permit(1).is_none());
+        drop(busy);
+        assert!(scheduler.acquire_permit(1).is_some());
+    }
+
+    #[test]
+    fn cancellation_while_the_queue_is_locked_takes_no_slot() {
+        let dir = temp_cache();
+        let cache = dir.path().to_path_buf();
+        let _queue = StoreLock::try_acquire(&queue::lock_path(&scheduler_root(&cache)))
+            .unwrap()
+            .unwrap();
+        let token = crate::invocation::process::Cancellation::default();
+        let waiter = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let _scope = crate::invocation::process::CancellationScope::enter(Some(token));
+                test_scheduler(&cache, 1).acquire_permit(1).is_some()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        token.cancel();
+        assert!(!waiter.join().unwrap());
+    }
+
+    #[test]
+    fn an_elastic_lease_leaves_the_slots_queued_tests_need() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 8);
+        let now = SystemTime::now();
+        let _ahead = hold_ticket(cache, 0, queue::Kind::Test, 2, now);
+        let _behind = hold_ticket(cache, u64::MAX / 2, queue::Kind::Test, 1, now);
+        let lease = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
+        // Slots 2 and 3 for the ticket ahead, 4 for the lease, 5 for the one
+        // behind; 6 and 7 are spare.
+        let slots: Vec<u32> = lease._slots.iter().map(|(index, _)| *index).collect();
+        assert_eq!(slots, [4, 6, 7]);
+    }
+
+    #[test]
+    fn a_compile_runs_beside_a_test_that_saves_test_slots() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 4);
+        let _lease = scheduler.acquire_test_lease(TestWant::Fixed(2)).unwrap();
+        let waiting = hold_ticket(cache, 0, queue::Kind::Test, 3, SystemTime::now());
+        for _ in 0..queue::pass_budget(4) {
+            queue::record_pass(&scheduler.root, waiting.entry()).unwrap();
+        }
+        let permit = scheduler
+            .acquire_permit(1)
+            .expect("the reserve stays a compile's");
+        assert_eq!(permit._slots[0].0, 0);
+        assert!(
+            scheduler.acquire_test_lease(TestWant::Fixed(1)).is_none(),
+            "slot 3 is saved for the waiting test"
+        );
+    }
+
+    #[test]
+    fn a_pool_of_one_admits_queued_requests_in_turn() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let holder = Requester::running(cache, 1, 1, Priority::Foreground);
+        let waiters: Vec<_> = (1..=3)
+            .map(|queued| Requester::queued(cache, 1, 1, Priority::Foreground, queued))
+            .collect();
+        holder.finish();
+        for waiter in waiters {
+            waiter.admitted(Duration::from_secs(5));
+            waiter.finish();
+        }
+        assert!(queued(cache).is_empty());
     }
 }

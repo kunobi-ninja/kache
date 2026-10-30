@@ -17,6 +17,9 @@ pub(crate) struct InvocationContext {
     pub(crate) shim_stem: String,
     pub(crate) io: io::InvocationIo,
     pub(crate) cancellation: Option<process::Cancellation>,
+    /// The priority of the build behind a request another process sent;
+    /// `None` reads this process. See [`crate::scheduler::Priority`].
+    pub(crate) priority: Option<crate::scheduler::Priority>,
     #[cfg(unix)]
     pub(crate) jobserver: kache_ipc::jobserver::Descriptors,
 }

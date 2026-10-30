@@ -1429,6 +1429,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_synchronous: Default::default(),
         auto_clean_orphaned_targets: false,
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,

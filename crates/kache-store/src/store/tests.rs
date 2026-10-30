@@ -1,6 +1,56 @@
 mod compiler_gc_tests;
 mod cost_backfill_tests;
 
+fn connection_synchronous(db: &Connection) -> i64 {
+    db.query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn index_connections_take_the_configured_synchronous_mode() {
+    const SQLITE_OFF: i64 = 0;
+    const SQLITE_NORMAL: i64 = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+
+    let (off, _) = open_index_db_reporting_recovery(&path, IndexSynchronous::Off).unwrap();
+    assert_eq!(connection_synchronous(&off), SQLITE_OFF);
+    let (normal, _) = open_index_db_reporting_recovery(&path, IndexSynchronous::Normal).unwrap();
+    assert_eq!(connection_synchronous(&normal), SQLITE_NORMAL);
+    assert_eq!(
+        connection_synchronous(&off),
+        SQLITE_OFF,
+        "the mode belongs to the connection, not the file"
+    );
+    assert_eq!(
+        connection_synchronous(&open_index_db(&path).unwrap()),
+        SQLITE_NORMAL
+    );
+}
+
+#[test]
+fn store_open_applies_the_configured_synchronous_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        index_synchronous: IndexSynchronous::Off,
+        ..test_config(dir.path())
+    };
+    let store = Store::open(config).unwrap();
+    assert_eq!(connection_synchronous(store.file_hash_cache().db()), 0);
+}
+
+#[test]
+fn a_recovered_index_keeps_the_configured_synchronous_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    fs::write(&path, b"this is not a sqlite database; it is garbage bytes").unwrap();
+
+    let (db, recovered) = open_index_db_reporting_recovery(&path, IndexSynchronous::Off).unwrap();
+
+    assert!(recovered);
+    assert_eq!(connection_synchronous(&db), 0);
+}
+
 #[test]
 fn incompatible_predictions_are_relearned_without_removing_compiled_entries() {
     for generation in [11, INDEX_SCHEMA_GENERATION] {
@@ -3250,6 +3300,7 @@ fn test_config(dir: &Path) -> Config {
         gc_evict_shared: false,
         upload_spool_max_jobs: 65_536,
         deferred_durability: false,
+        index_synchronous: IndexSynchronous::default(),
     }
 }
 
@@ -4034,7 +4085,7 @@ fn is_corruption_error_flags_a_non_sqlite_file() {
     let dir = tempfile::tempdir().unwrap();
     let garbage = dir.path().join("garbage.db");
     fs::write(&garbage, b"definitely not a sqlite database").unwrap();
-    let err = try_open_index_db(&garbage).unwrap_err();
+    let err = try_open_index_db(&garbage, IndexSynchronous::default()).unwrap_err();
     assert!(
         is_corruption_error(&err),
         "a non-sqlite file must classify as corruption: {err}"
@@ -4043,7 +4094,7 @@ fn is_corruption_error_flags_a_non_sqlite_file() {
     // A transient open failure (missing parent → CannotOpen) is NOT
     // corruption and must not be self-healed.
     let missing = dir.path().join("missing").join("index.db");
-    let err = try_open_index_db(&missing).unwrap_err();
+    let err = try_open_index_db(&missing, IndexSynchronous::default()).unwrap_err();
     assert!(!is_corruption_error(&err));
 }
 
@@ -4389,12 +4440,13 @@ fn recover_corrupt_index_reuses_a_peer_healed_db_without_requarantine() {
     // A corruption-shaped error to pass in (as the original open would have).
     let garbage = dir.path().join("garbage.db");
     fs::write(&garbage, b"not a sqlite database").unwrap();
-    let err = try_open_index_db(&garbage).unwrap_err();
+    let err = try_open_index_db(&garbage, IndexSynchronous::default()).unwrap_err();
 
     // The peer's freshly-healed, valid empty index now lives at db_path.
-    drop(try_open_index_db(&db_path).unwrap());
+    drop(try_open_index_db(&db_path, IndexSynchronous::default()).unwrap());
 
-    let (db, recovered) = recover_corrupt_index(&db_path, &err).unwrap();
+    let (db, recovered) =
+        recover_corrupt_index(&db_path, IndexSynchronous::default(), &err).unwrap();
     let count: i64 = db
         .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
         .unwrap();

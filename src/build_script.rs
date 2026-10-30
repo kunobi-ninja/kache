@@ -60,7 +60,9 @@ mod rooted_links;
 use rooted_links::RootedSymlink;
 
 use declarations::parse_declarations;
-use inputs::{TREE_MEMO_DIR, input_state, input_state_as};
+#[cfg(test)]
+use inputs::input_state;
+use inputs::{TREE_MEMO_DIR, input_state_as, run_input_state};
 #[cfg(all(test, unix))]
 use inputs::{tree_digest_memo, tree_stamp};
 
@@ -89,8 +91,9 @@ const PREDICTION_SCHEMA: u32 = 2;
 const PREDICTION_PREFIX: &str = "build-script:";
 /// A v2 key could replay a search path in a sibling Cargo build unit without
 /// restoring its library. Version 3 refuses those runs unless a dependency
-/// handed down the path and keys the dependency contents.
-const ACTION_KIND: &[u8] = b"kache-build-script-action-v3";
+/// handed down the path and keys the dependency contents. Version 4 keys
+/// modification times of declared inputs too.
+const ACTION_KIND: &[u8] = b"kache-build-script-action-v4";
 /// Marks a script binary that writes into its inputs on every run.
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -1570,7 +1573,14 @@ impl Run {
             } else {
                 Vec::new()
             };
-            let state = input_state(&path, &excluded, &file_hasher, &mut budget, 0)?;
+            let state = run_input_state(
+                &path,
+                &excluded,
+                &file_hasher,
+                &mut budget,
+                0,
+                prediction.default_package,
+            )?;
             fold(&mut hasher, "state", state.as_bytes());
         }
         // It changes the archives the script writes, so it is keyed where it
@@ -1688,6 +1698,9 @@ impl Run {
             let target = artifact.target().to_path_buf();
             artifact.publish_replacing()?;
             set_executable(&target, executable)?;
+            // APFS clones retain the blob's old time. Native consumers must
+            // see a restored header as newly written.
+            kache_store::link::touch_mtime_write_clock(&target)?;
             if size >= kache_store::file_hash::MIN_PERSISTED_HASH_BYTES as u64
                 && let Ok(fingerprint) = kache_store::file_hash::FileFingerprint::from_path(&target)
             {
@@ -2320,7 +2333,13 @@ fn modified_since(path: &Path, excluded: &[PathBuf], since: std::time::SystemTim
 }
 
 fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf> {
-    let mut excluded = vec![package.join(".git"), package.join("target")];
+    // Cargo's extraction markers are not source inputs (cargo package --list).
+    let mut excluded = vec![
+        package.join(".git"),
+        package.join("target"),
+        package.join(".cargo-ok"),
+        package.join(".cargo-checksum.json"),
+    ];
     for (root, placeholder) in &environment.mappings {
         if *placeholder == TARGET_DIR_PLACEHOLDER && root.starts_with(package) {
             excluded.push(root.clone());
@@ -2577,6 +2596,8 @@ mod tests {
             vec![
                 PathBuf::from("/src/pkg/.git"),
                 PathBuf::from("/src/pkg/target"),
+                PathBuf::from("/src/pkg/.cargo-ok"),
+                PathBuf::from("/src/pkg/.cargo-checksum.json"),
                 PathBuf::from("/src/pkg/target/debug"),
             ],
             "only target roots under the package are excluded, never the manifest root"
@@ -4189,6 +4210,11 @@ mod tests {
             let package = dir.as_path().join(package);
             std::fs::create_dir_all(&package).unwrap();
             std::fs::write(package.join("input.h"), "same input").unwrap();
+            filetime::set_file_mtime(
+                package.join("input.h"),
+                filetime::FileTime::from_unix_time(1_700_000_000, 0),
+            )
+            .unwrap();
             Run {
                 store: Store::open(&config).unwrap(),
                 config: config.clone(),
@@ -4327,6 +4353,8 @@ mod tests {
         // and what sits behind a `DEP_*` path.
         let input = dir.path().join("input.txt");
         std::fs::write(&input, b"one").unwrap();
+        let input_mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&input).unwrap());
         let mut declared = prediction.clone();
         declared.env = vec!["KACHE_TEST_HERMETIC_VAR".into()];
         declared.inputs = vec![input.to_string_lossy().into_owned()];
@@ -4342,6 +4370,7 @@ mod tests {
         std::fs::write(&input, b"two").unwrap();
         assert_ne!(declared_key(), base, "a declared input's content");
         std::fs::write(&input, b"one").unwrap();
+        filetime::set_file_mtime(&input, input_mtime).unwrap();
         assert_eq!(declared_key(), base);
         let dep = dir.path().join("dep-out");
         std::fs::create_dir(&dep).unwrap();
@@ -4422,6 +4451,11 @@ mod tests {
                 checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
             std::fs::create_dir_all(&environment.manifest_dir).unwrap();
             std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            filetime::set_file_mtime(
+                environment.manifest_dir.join("build.rs"),
+                filetime::FileTime::from_unix_time(1_700_000_000, 0),
+            )
+            .unwrap();
             Run {
                 store: Store::open(&config).unwrap(),
                 config: config.clone(),
@@ -4573,6 +4607,11 @@ mod tests {
                 checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
             std::fs::create_dir_all(&environment.manifest_dir).unwrap();
             std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            filetime::set_file_mtime(
+                environment.manifest_dir.join("build.rs"),
+                filetime::FileTime::from_unix_time(1_700_000_000, 0),
+            )
+            .unwrap();
             Run {
                 store: Store::open(&config).unwrap(),
                 config: config.clone(),
@@ -4602,9 +4641,35 @@ mod tests {
             .get(&b.action_key(&prediction).unwrap())
             .unwrap()
             .unwrap();
+        let archive_blob = b.store.blob_path(
+            &meta
+                .files
+                .iter()
+                .find(|file| file.name == "out/lib/libz.a")
+                .unwrap()
+                .hash,
+        );
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        #[cfg(windows)]
+        let blob_permissions = std::fs::metadata(&archive_blob).unwrap().permissions();
+        #[cfg(windows)]
+        kache_fs::set_writable_permissions(&archive_blob, false).unwrap();
+        filetime::set_file_mtime(&archive_blob, old).unwrap();
+        #[cfg(windows)]
+        std::fs::set_permissions(&archive_blob, blob_permissions).unwrap();
         b.restore(&meta).unwrap();
         let restored = b.environment.out_dir.join("lib/libz.a");
         assert_eq!(std::fs::read(&restored).unwrap(), archive);
+        assert!(
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&restored).unwrap())
+                > old
+        );
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(
+                &std::fs::metadata(&archive_blob).unwrap()
+            ),
+            old
+        );
 
         let hasher = b.store.file_hasher();
         assert_eq!(
@@ -4677,6 +4742,11 @@ mod tests {
             );
             std::fs::create_dir_all(environment.manifest_dir.join("src")).unwrap();
             std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            filetime::set_file_mtime(
+                environment.manifest_dir.join("build.rs"),
+                filetime::FileTime::from_unix_time(1_700_000_000, 0),
+            )
+            .unwrap();
             std::fs::write(environment.manifest_dir.join("src/main.rs"), "source").unwrap();
             let header = dir
                 .as_path()
@@ -5064,6 +5134,11 @@ mod tests {
                 checkout_environment(&dir.as_path().join(target), &dir.as_path().join("cargo"));
             std::fs::create_dir_all(&environment.manifest_dir).unwrap();
             std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            filetime::set_file_mtime(
+                environment.manifest_dir.join("build.rs"),
+                filetime::FileTime::from_unix_time(1_700_000_000, 0),
+            )
+            .unwrap();
             Run {
                 store: Store::open(&config).unwrap(),
                 config: config.clone(),

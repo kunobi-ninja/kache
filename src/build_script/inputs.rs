@@ -1,5 +1,6 @@
 //! The state of a declared build-script input: a file's content, a
 //! directory's listing, a symlink's target and referent, or its absence.
+//! Run-cache keys also include modification times; compiler keys do not.
 //! Large directories are digested once per stamp of their entries' metadata.
 //!
 //! The run cache walks a tree leaving out only the paths it names, and
@@ -32,10 +33,23 @@ impl std::fmt::Display for TooManyInputs {
 
 impl std::error::Error for TooManyInputs {}
 
+/// Metadata included in a run key. Cargo's implicit package input is a file
+/// list, so creating an excluded build directory must not change its key.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum InputTimes {
+    #[default]
+    ContentOnly,
+    Files,
+    FilesAndDirectories,
+}
+
 /// How a digest walks a tree: what it leaves out, what it makes of an entry
-/// it cannot digest, and where it memoises. The default is the run cache's.
+/// it cannot digest, and where it memoises. The default keys contents only.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Walk<'a> {
+    /// Build-script runs can observe modification times. Rust compilation
+    /// inputs keep their content-only policy.
+    pub(crate) input_times: InputTimes,
     /// Paths left out wherever they appear.
     pub(crate) excluded: &'a [PathBuf],
     /// Also leave out VCS metadata and directories holding Cargo's
@@ -95,9 +109,8 @@ fn is_dir(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| kind.is_dir())
 }
 
-/// A digest of what is at `path`: content for a file, the recursive listing
-/// for a directory, the target and referent for a symlink, a marker for
-/// nothing. Cargo's own freshness compares the same things.
+/// Content-only input state, including normalized dependency text.
+#[cfg(test)]
 pub(super) fn input_state(
     path: &Path,
     excluded: &[PathBuf],
@@ -108,12 +121,8 @@ pub(super) fn input_state(
     input_state_as(path, excluded, file_hasher, budget, symlink_depth, None)
 }
 
-/// [`input_state`], reading text files that spell one of `text`'s roots with
-/// the roots as placeholders. A `links` dependency's `OUT_DIR` sits under
-/// the same target directory as the dependent's, and a pkg-config file in it
-/// names that directory: read raw, every checkout would key the dependent
-/// differently. What the dependent writes from such a file is caught by its
-/// own outputs' roots.
+/// Read dependency text with the environment's roots as placeholders, so
+/// pkg-config files naming OUT_DIR can match in another target directory.
 pub(super) fn input_state_as(
     path: &Path,
     excluded: &[PathBuf],
@@ -126,19 +135,51 @@ pub(super) fn input_state_as(
         excluded,
         ..Walk::default()
     };
-    let within = &mut Within::default();
+    input_state_with_walk(path, &walk, file_hasher, budget, symlink_depth, text)
+}
+
+/// Declared inputs also carry observable modification times. The implicit
+/// package dependency follows Cargo's file list and omits directory times.
+pub(super) fn run_input_state(
+    path: &Path,
+    excluded: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    symlink_depth: usize,
+    default_package: bool,
+) -> Result<String> {
+    let walk = Walk {
+        excluded,
+        input_times: if default_package {
+            InputTimes::Files
+        } else {
+            InputTimes::FilesAndDirectories
+        },
+        ..Walk::default()
+    };
+    input_state_with_walk(path, &walk, file_hasher, budget, symlink_depth, None)
+}
+
+fn input_state_with_walk(
+    path: &Path,
+    walk: &Walk<'_>,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    symlink_depth: usize,
+    text: Option<&Environment>,
+) -> Result<String> {
     walked_state(
         path,
-        &walk,
+        walk,
         file_hasher,
         budget,
         symlink_depth,
         text,
-        within,
+        &mut Within::default(),
     )
 }
 
-/// [`input_state`] under `walk`, for a path at the top of a walk.
+/// Digest a declared input under `walk`, starting at its root.
 pub(crate) fn state_in(
     path: &Path,
     walk: &Walk<'_>,
@@ -179,7 +220,7 @@ fn read_denied(error: &anyhow::Error) -> bool {
     })
 }
 
-/// [`input_state_as`] under `walk`. Each entry costs one from `budget`.
+/// Input state under `walk`. Each entry costs one from `budget`.
 fn walked_state(
     path: &Path,
     walk: &Walk<'_>,
@@ -235,7 +276,12 @@ fn walked_state(
                 within,
             )?
         };
-        return Ok(format!("symlink:{}:{referent}", target.to_string_lossy()));
+        return with_input_mtime(
+            path,
+            &metadata,
+            walk,
+            format!("symlink:{}:{referent}", target.to_string_lossy()),
+        );
     }
     if metadata.is_file() {
         if let Some(environment) = text
@@ -243,10 +289,15 @@ fn walked_state(
                 .as_deref()
                 .and_then(|contents| environment.rewrite_text(contents))
         {
-            return Ok(format!("text:{}", blake3::hash(&normalized).to_hex()));
+            return with_input_mtime(
+                path,
+                &metadata,
+                walk,
+                format!("text:{}", blake3::hash(&normalized).to_hex()),
+            );
         }
         return match file_hasher.hash(path) {
-            Ok(hash) => Ok(format!("file:{hash}")),
+            Ok(hash) => with_input_mtime(path, &metadata, walk, format!("file:{hash}")),
             Err(error) if walk.unreachable_entries && read_denied(&error) => {
                 Ok("unreadable".to_string())
             }
@@ -277,9 +328,9 @@ fn walked_state(
                 .push((path.to_path_buf(), stamp.digest.clone()));
         }
         if let Some(stamp) = &stamp
-            && let Some(digest) = tree_digest_memo_in(path, walk.memo, text, &stamp.digest)
+            && let Some(digest) = tree_digest_memo_in(path, walk, text, &stamp.digest)
         {
-            return Ok(digest);
+            return with_input_mtime(path, &metadata, walk, digest);
         }
         // Only the top of the walk reports its stamp.
         let below = Walk {
@@ -302,9 +353,9 @@ fn walked_state(
         if let Some(stamp) = &stamp
             && memoisable(path, walk, stamp, stamp_budget, started)
         {
-            record_tree_digest_memo(path, walk.memo, text, &stamp.digest, &digest);
+            record_tree_digest_memo(path, walk, text, &stamp.digest, &digest);
         }
-        return Ok(digest);
+        return with_input_mtime(path, &metadata, walk, digest);
     }
     if walk.other_entries {
         return Ok("other".to_string());
@@ -313,6 +364,37 @@ fn walked_state(
         "declared build-script input is neither a file nor a directory: {}",
         path.display()
     )
+}
+
+/// Keep distinct results for equal bytes with different observable times.
+/// Recheck after hashing so a timestamp changed during the read cannot select
+/// an entry for the earlier time.
+fn with_input_mtime(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    walk: &Walk<'_>,
+    state: String,
+) -> Result<String> {
+    let include_time = match walk.input_times {
+        InputTimes::ContentOnly => false,
+        InputTimes::Files => !metadata.is_dir(),
+        InputTimes::FilesAndDirectories => !metadata.is_dir() || !walk.skip_rust_and_packages,
+    };
+    if !include_time {
+        return Ok(state);
+    }
+    let before = filetime::FileTime::from_last_modification_time(metadata);
+    let after = filetime::FileTime::from_last_modification_time(&std::fs::symlink_metadata(path)?);
+    anyhow::ensure!(
+        before == after,
+        "build-script input modification time changed while hashing: {}",
+        path.display()
+    );
+    Ok(format!(
+        "mtime:{}:{}:{state}",
+        before.unix_seconds(),
+        before.nanoseconds()
+    ))
 }
 
 /// Whether the digest of the tree at `path`, read after `stamp` was taken
@@ -479,9 +561,14 @@ fn read_text(path: &Path) -> Result<Option<Vec<u8>>> {
 /// memoised apart from the raw one and per set of roots. A walk with its own
 /// rules memoises apart from the run cache, which must never read a digest
 /// those rules produced.
-fn tree_memo_path(path: &Path, memo: Option<(&Path, &str)>, text: Option<&Environment>) -> PathBuf {
+fn tree_memo_path(path: &Path, walk: &Walk<'_>, text: Option<&Environment>) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(path.as_os_str().as_encoded_bytes());
+    match walk.input_times {
+        InputTimes::ContentOnly => {}
+        InputTimes::Files => fold(&mut hasher, "input_times", b"files-v1"),
+        InputTimes::FilesAndDirectories => fold(&mut hasher, "input_times", b"all-v1"),
+    }
     if let Some(environment) = text {
         for (root, placeholder) in environment.roots() {
             fold(
@@ -491,11 +578,11 @@ fn tree_memo_path(path: &Path, memo: Option<(&Path, &str)>, text: Option<&Enviro
             );
         }
     }
-    if let Some((_, namespace)) = memo {
+    if let Some((_, namespace)) = walk.memo {
         fold(&mut hasher, "namespace", namespace.as_bytes());
     }
     let name = hasher.finalize().to_hex();
-    match memo {
+    match walk.memo {
         Some((cache_dir, _)) => cache_dir.join("probes"),
         None => TREE_MEMO_DIR
             .get()
@@ -511,32 +598,244 @@ pub(super) fn tree_digest_memo(
     text: Option<&Environment>,
     stamp: &str,
 ) -> Option<String> {
-    tree_digest_memo_in(path, None, text, stamp)
+    tree_digest_memo_in(path, &Walk::default(), text, stamp)
 }
 
 fn tree_digest_memo_in(
     path: &Path,
-    memo: Option<(&Path, &str)>,
+    walk: &Walk<'_>,
     text: Option<&Environment>,
     stamp: &str,
 ) -> Option<String> {
-    memoised_digest(&tree_memo_path(path, memo, text), stamp)
+    memoised_digest(&tree_memo_path(path, walk, text), stamp)
         .filter(|digest| digest.starts_with("dir:"))
 }
 
 fn record_tree_digest_memo(
     path: &Path,
-    memo: Option<(&Path, &str)>,
+    walk: &Walk<'_>,
     text: Option<&Environment>,
     stamp: &str,
     digest: &str,
 ) {
-    record_digest(&tree_memo_path(path, memo, text), stamp, digest);
+    record_digest(&tree_memo_path(path, walk, text), stamp, digest);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_keys_track_seconds_and_nanoseconds_without_changing_content_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("input");
+        write(&file, "unchanged bytes");
+        let hasher = crate::cache_key::FileHasher::new();
+        let stamp = |seconds, nanos| {
+            filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(seconds, nanos))
+                .unwrap();
+        };
+        let content = || input_state(&file, &[], &hasher, &mut 10, 0).unwrap();
+        let run = || run_input_state(&file, &[], &hasher, &mut 10, 0, false).unwrap();
+        stamp(1_700_000_000, 100);
+        let original = run();
+        let content_key = content();
+        stamp(1_700_000_001, 100);
+        assert_ne!(run(), original);
+        assert_eq!(content(), content_key);
+        stamp(1_700_000_000, 200);
+        assert_ne!(run(), original);
+        stamp(1_700_000_000, 100);
+        assert_eq!(run(), original);
+    }
+
+    #[test]
+    fn timestamped_tree_memos_do_not_read_content_only_digests() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        let cache = temp.path().join("cache");
+        write(&root.join("input"), "same");
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(root.join("input"), old).unwrap();
+        filetime::set_file_mtime(&root, old).unwrap();
+        let content = Walk {
+            memo: Some((&cache, "shared")),
+            ..Walk::default()
+        };
+        let timestamped = Walk {
+            input_times: InputTimes::FilesAndDirectories,
+            ..content
+        };
+        let uncached = Walk {
+            memo: Some((&cache, "fresh")),
+            ..timestamped
+        };
+        let hasher = crate::cache_key::FileHasher::new();
+        let digest = |walk| state_in(&root, walk, &hasher, &mut 10).unwrap();
+        let original_content = digest(&content);
+        let stamp = tree_stamp_in(&root, &content, 10).unwrap();
+        assert_eq!(
+            tree_digest_memo_in(&root, &content, None, &stamp.digest),
+            Some(original_content.clone()),
+            "the legacy content memo must exist before testing isolation"
+        );
+        assert_eq!(digest(&timestamped), digest(&uncached));
+        assert_eq!(digest(&content), original_content);
+        let before = digest(&timestamped);
+        filetime::set_file_mtime(
+            root.join("input"),
+            filetime::FileTime::from_unix_time(1_700_000_001, 0),
+        )
+        .unwrap();
+        assert_ne!(digest(&timestamped), before);
+        assert_eq!(digest(&content), original_content);
+        let before = digest(&timestamped);
+        filetime::set_file_mtime(&root, filetime::FileTime::from_unix_time(1_700_000_002, 0))
+            .unwrap();
+        assert_ne!(digest(&timestamped), before);
+    }
+
+    #[test]
+    fn implicit_package_times_ignore_directories_and_excluded_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("package");
+        let input = package.join("input");
+        write(&input, "same");
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let newer = filetime::FileTime::from_unix_time(1_700_000_001, 0);
+        filetime::set_file_mtime(&input, old).unwrap();
+        filetime::set_file_mtime(&package, old).unwrap();
+        let excluded = [package.join("target"), package.join(".git")];
+        let hasher = crate::cache_key::FileHasher::new();
+        let implicit = || run_input_state(&package, &excluded, &hasher, &mut 20, 0, true).unwrap();
+        let explicit = || run_input_state(&package, &[], &hasher, &mut 20, 0, false).unwrap();
+        let before = implicit();
+        let explicit_before = explicit();
+        filetime::set_file_mtime(&package, newer).unwrap();
+        assert_eq!(implicit(), before);
+        assert_ne!(explicit(), explicit_before);
+        write(&excluded[0].join("artifact"), "ignored");
+        write(&excluded[1].join("index"), "ignored");
+        assert_eq!(implicit(), before);
+        std::fs::remove_dir_all(&excluded[0]).unwrap();
+        assert_eq!(implicit(), before);
+        filetime::set_file_mtime(&input, newer).unwrap();
+        assert_ne!(implicit(), before);
+    }
+
+    #[test]
+    fn filtered_timestamp_walks_ignore_rust_only_and_empty_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        write(&root.join("config"), "same");
+        let hasher = crate::cache_key::FileHasher::new();
+        let walk = Walk {
+            input_times: InputTimes::FilesAndDirectories,
+            skip_rust_and_packages: true,
+            ..Walk::default()
+        };
+        let key = || state_in(&root, &walk, &hasher, &mut 20).unwrap();
+        let before = key();
+        write(&root.join("tests/test.rs"), "ignored");
+        std::fs::create_dir(root.join("empty")).unwrap();
+        assert_eq!(key(), before);
+        filetime::set_file_mtime(
+            root.join("config"),
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        assert_ne!(key(), before);
+    }
+
+    #[test]
+    fn run_tree_memos_answer_without_reading_and_keep_each_time_policy_apart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        let cache = temp.path().join("cache");
+        write(&root.join("input"), "same");
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(root.join("input"), old).unwrap();
+        filetime::set_file_mtime(&root, old).unwrap();
+        let hasher = crate::cache_key::FileHasher::new();
+        let mut fresh = crate::cache_key::FileHasher::new();
+        fresh.arm_too_new_guard(1, 0);
+        for (input_times, control_namespace) in [
+            (InputTimes::ContentOnly, "content-control"),
+            (InputTimes::Files, "file-control"),
+            (InputTimes::FilesAndDirectories, "all-control"),
+        ] {
+            let walk = Walk {
+                input_times,
+                memo: Some((&cache, "test")),
+                ..Walk::default()
+            };
+            let before = state_in(&root, &walk, &hasher, &mut 20).unwrap();
+            let control = Walk {
+                memo: Some((&cache, control_namespace)),
+                ..walk
+            };
+            assert_eq!(
+                before,
+                state_in(&root, &control, &hasher, &mut 20).unwrap(),
+                "each time policy has its own memo"
+            );
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = reads.clone();
+            crate::cache_key::set_before_read(Some(Box::new(move |_| {
+                counted.set(counted.get() + 1)
+            })));
+            let cached = state_in(&root, &walk, &fresh, &mut 20);
+            crate::cache_key::set_before_read(None);
+            assert_eq!(cached.unwrap(), before);
+            assert_eq!(reads.get(), 0, "a settled run tree must use its memo");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_keys_track_both_symlinks_and_their_referents() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("input");
+        let link = temp.path().join("link");
+        write(&file, "same");
+        std::os::unix::fs::symlink("input", &link).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let newer = filetime::FileTime::from_unix_time(1_700_000_001, 0);
+        filetime::set_file_mtime(&file, old).unwrap();
+        filetime::set_symlink_file_times(&link, old, old).unwrap();
+        let hasher = crate::cache_key::FileHasher::new();
+        let key = || run_input_state(&link, &[], &hasher, &mut 10, 0, false).unwrap();
+        let before = key();
+        filetime::set_file_mtime(&file, newer).unwrap();
+        assert_ne!(key(), before);
+        filetime::set_file_mtime(&file, old).unwrap();
+        assert_eq!(key(), before);
+        filetime::set_symlink_file_times(&link, old, newer).unwrap();
+        assert_ne!(key(), before);
+    }
+
+    #[test]
+    fn a_timestamp_change_during_hashing_refuses_the_run_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("input");
+        write(&file, "same bytes");
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_700_000_000, 0))
+            .unwrap();
+        let mut hasher = crate::cache_key::FileHasher::new();
+        hasher.arm_too_new_guard(1, 0);
+        crate::cache_key::set_before_read(Some(Box::new(|path| {
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_700_000_001, 0))
+                .unwrap();
+        })));
+        let result = run_input_state(&file, &[], &hasher, &mut 10, 0, false);
+        crate::cache_key::set_before_read(None);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("modification time changed")
+        );
+    }
 
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -680,12 +979,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
         let root = dir.path().join("tree");
-        let named = |namespace| tree_memo_path(&root, Some((&cache, namespace)), None);
+        let named = |namespace| {
+            tree_memo_path(
+                &root,
+                &Walk {
+                    memo: Some((&cache, namespace)),
+                    ..Walk::default()
+                },
+                None,
+            )
+        };
         assert_eq!(named("a").parent(), Some(cache.join("probes").as_path()));
         assert_ne!(named("a"), named("b"));
         assert_ne!(
             named("a").file_name(),
-            tree_memo_path(&root, None, None).file_name()
+            tree_memo_path(&root, &Walk::default(), None).file_name()
         );
 
         write(&root.join("a.txt"), "a");
@@ -699,7 +1007,7 @@ mod tests {
         let digest = state_in(&root, &walk, &hasher, &mut 10).unwrap();
         let stamp = tree_stamp_in(&root, &walk, 10).unwrap();
         assert_eq!(
-            tree_digest_memo_in(&root, walk.memo, None, &stamp.digest),
+            tree_digest_memo_in(&root, &walk, None, &stamp.digest),
             Some(digest),
             "a settled tree is memoised in its namespace"
         );
@@ -724,8 +1032,7 @@ mod tests {
         let mut hasher = crate::cache_key::FileHasher::new();
         // Armed, the hasher reads each file through the hook.
         hasher.arm_too_new_guard(1, 0);
-        let memoised =
-            |stamp: &TreeStamp| tree_digest_memo_in(&root, walk.memo, None, &stamp.digest);
+        let memoised = |stamp: &TreeStamp| tree_digest_memo_in(&root, &walk, None, &stamp.digest);
         let read = |hook: crate::cache_key::BeforeRead| {
             crate::cache_key::set_before_read(Some(hook));
             let digest = state_in(&root, &walk, &hasher, &mut 10);

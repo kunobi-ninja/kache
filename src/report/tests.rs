@@ -634,6 +634,7 @@ fn write_test_events(dir: &std::path::Path) -> Config {
 
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2021,6 +2022,7 @@ fn test_missing_transfer_data() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2128,6 +2130,7 @@ fn test_suggestion_high_miss_share() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2234,6 +2237,7 @@ fn test_suggestion_high_hit_overhead() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2341,6 +2345,7 @@ fn test_suggestion_network_download_failures_and_fanout() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2453,6 +2458,7 @@ fn test_suggestion_network_latency_thresholds() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2968,6 +2974,7 @@ fn test_empty_report() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3456,6 +3463,7 @@ fn report_counts_each_download_transfer_format() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,

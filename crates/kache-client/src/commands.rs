@@ -32,6 +32,14 @@ enum Commands {
         #[arg(long, conflicts_with = "stale_schema")]
         max_age: Option<String>,
 
+        /// Remove cached Rust compilations from this release or exact compiler build
+        #[arg(long, conflicts_with_all = ["max_age", "stale_schema"])]
+        rustc_version: Option<String>,
+
+        /// Preview compiler-version cleanup without removing entries
+        #[arg(long, requires = "rustc_version")]
+        dry_run: bool,
+
         /// Remove entries from old or unrecorded cache-key schemas
         #[arg(long)]
         stale_schema: bool,
@@ -93,6 +101,10 @@ enum Commands {
         /// With --cache, remove entries from old or unrecorded cache-key schemas
         #[arg(long, hide = true, requires = "cache", conflicts_with = "stale")]
         stale_schema: bool,
+
+        /// With --cache: remove this Rust release or exact compiler build
+        #[arg(long, requires = "cache", conflicts_with_all = ["stale", "stale_schema", "all", "units", "orphans", "crate_name"])]
+        rustc_version: Option<String>,
 
         /// Accepted for older scripts: tracked targets are the default now
         #[arg(long, hide = true)]

@@ -5143,7 +5143,14 @@ fn run_parsed_rustc(
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let put = store.put_with_compile_time(
+    let identity_compiler = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
+    let rustc_version =
+        crate::cache_key::rustc_version_text_for(identity_compiler, args.invocation_env());
+    let rustc_identity = rustc_version
+        .as_deref()
+        .and_then(|version| version.lines().next())
+        .and_then(|line| line.strip_prefix("rustc "));
+    let put = store.put_rustc_with_compile_time(
         &cache_key,
         crate_name,
         &args.crate_types,
@@ -5154,6 +5161,7 @@ fn run_parsed_rustc(
         &result.stdout,
         &result.stderr,
         compile_time_ms,
+        rustc_identity,
     );
     // A stored entry grew the store: throttled size check and a detached
     // background GC if over budget (kunobi-ninja/kache#497). A put refused for

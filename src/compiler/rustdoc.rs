@@ -3246,6 +3246,7 @@ mod tests {
         let empty = crate::store::EntryMeta {
             cache_key: "ab".repeat(32),
             key_schema: 0,
+            rustc_version: None,
             crate_name: "demo".to_string(),
             crate_types: Vec::new(),
             files: Vec::new(),

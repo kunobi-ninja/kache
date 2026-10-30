@@ -2871,6 +2871,7 @@ fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta 
     crate::store::EntryMeta {
         cache_key: "k".to_string(),
         key_schema: crate::cache_key::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "c".to_string(),
         crate_types: vec![],
         files: vec![],
@@ -3044,6 +3045,7 @@ fn entry_meta(
     crate::store::EntryMeta {
         cache_key: cache_key.to_string(),
         key_schema: crate::cache_key::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "foo".to_string(),
         crate_types: vec!["lib".to_string()],
         files,
@@ -3557,6 +3559,7 @@ fn cc_cache_entry_requires_depinfo_when_invocation_requests_it() {
         crate::store::EntryMeta {
             cache_key: "key".to_string(),
             key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            rustc_version: None,
             crate_name: "foo.c".to_string(),
             crate_types: vec![],
             files: names

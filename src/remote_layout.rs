@@ -986,6 +986,7 @@ pub(crate) mod tests {
             let meta = EntryMeta {
                 cache_key: blake3::hash(b"property-v3-entry").to_hex().to_string(),
                 key_schema: crate::cache_key::CACHE_KEY_VERSION,
+                rustc_version: None,
                 crate_name: "property_crate".to_string(),
                 crate_types: vec!["lib".to_string()],
                 files,
@@ -1040,6 +1041,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             blaze: false,
+            separate_check_targets: true,
             readonly_store: None,
             fallback: None,
             key_salt: None,
@@ -1160,6 +1162,7 @@ pub(crate) mod tests {
         let restore_cache_dir = tmp.path().join("restore-cache");
         let restore_config = Config {
             blaze: false,
+            separate_check_targets: true,
             readonly_store: None,
             fallback: None,
             key_salt: None,
@@ -1363,6 +1366,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             blaze: false,
+            separate_check_targets: true,
             readonly_store: None,
             fallback: None,
             key_salt: None,
@@ -1540,6 +1544,7 @@ pub(crate) mod tests {
     fn min_config(cache_dir: std::path::PathBuf) -> Config {
         Config {
             blaze: false,
+            separate_check_targets: true,
             readonly_store: None,
             fallback: None,
             key_salt: None,

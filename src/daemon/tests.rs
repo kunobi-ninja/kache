@@ -1404,6 +1404,7 @@ async fn test_send_request_with_timeout_bounds_unresponsive_daemon() {
 pub(super) fn test_config(dir: &Path) -> Config {
     Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,

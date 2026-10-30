@@ -1,3 +1,4 @@
+mod compiler_gc_tests;
 mod cost_backfill_tests;
 
 #[test]
@@ -5564,6 +5565,7 @@ fn import_test_entry(store: &Store, key: &str, bytes: usize) {
     let meta = EntryMeta {
         cache_key: key.to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: format!("{key}_crate"),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -6308,6 +6310,7 @@ fn claim_build_evicts_empty_committed_entry() {
     let meta = EntryMeta {
         cache_key: cache_key.to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "empty".to_string(),
         crate_types: vec!["rlib".to_string()],
         files: vec![],
@@ -7133,6 +7136,7 @@ fn extract_download(store: &Store, key: &str, outputs: &[(&str, &[u8])]) -> Entr
     let meta = EntryMeta {
         cache_key: key.to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "c1".to_string(),
         crate_types: vec!["lib".to_string()],
         files,
@@ -8003,6 +8007,7 @@ fn test_store_import_downloaded_entry() {
     let meta = EntryMeta {
         cache_key: "downloaded_key".to_string(),
         key_schema: prior_schema,
+        rustc_version: None,
         crate_name: "downloaded_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -8049,6 +8054,7 @@ fn test_store_import_downloaded_entry_missing_file() {
     let meta = EntryMeta {
         cache_key: "incomplete_key".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "incomplete_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -8091,6 +8097,7 @@ fn failed_restore_cleanup_preserves_a_concurrent_committed_generation() {
     let meta_json = serde_json::to_string_pretty(&EntryMeta {
         cache_key: key.clone(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "published".into(),
         crate_types: vec!["lib".into()],
         files: Vec::new(),
@@ -8288,6 +8295,7 @@ fn test_import_downloaded_entry_creates_blobs() {
     let meta = EntryMeta {
         cache_key: "dl_key".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "dl_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -8646,6 +8654,7 @@ fn test_store_import_rejects_size_mismatch() {
     let meta = EntryMeta {
         cache_key: "mismatch_key".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "mismatch_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -8697,6 +8706,7 @@ fn import_with_poisoned_meta(
     let meta = EntryMeta {
         cache_key: key.to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "c".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![file],
@@ -10720,6 +10730,7 @@ fn test_get_lazily_migrates_legacy_entry() {
     let meta = EntryMeta {
         cache_key: "old_key".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "old_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -10779,6 +10790,7 @@ fn get_preserves_a_retryable_legacy_entry_when_migration_fails() {
     let meta = EntryMeta {
         cache_key: "old_bad_key".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "old_bad_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -10852,6 +10864,7 @@ fn test_migrate_to_blobs_bulk() {
         let meta = EntryMeta {
             cache_key: key.to_string(),
             key_schema: kache_format::CACHE_KEY_VERSION,
+            rustc_version: None,
             crate_name: "shared_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -12084,6 +12097,7 @@ fn test_migration_of_legacy_entry() {
     let meta = EntryMeta {
         cache_key: "legacy_key".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "legacy_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![
@@ -12297,6 +12311,7 @@ fn migrate_entry_to_blobs_bumps_refcount_when_insert_loses_race() {
     let meta = EntryMeta {
         cache_key: "legacy_race".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "legacy_crate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -12593,6 +12608,7 @@ fn wasm_link_output_satisfies_the_emit_coverage_gate() {
     let meta = EntryMeta {
         cache_key: "k".into(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "rococo_runtime".into(),
         crate_types: vec!["cdylib".into()],
         files,
@@ -12667,6 +12683,7 @@ fn test_import_downloaded_entry_stores_content_hash() {
     let meta = EntryMeta {
         cache_key: "dl_ch_test".to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "dlcrate".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {
@@ -12722,6 +12739,7 @@ fn verified_batch_import_is_atomic_and_registers_every_entry() {
         let meta = EntryMeta {
             cache_key: key.clone(),
             key_schema: kache_format::CACHE_KEY_VERSION,
+            rustc_version: None,
             crate_name: format!("crate{index}"),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -12815,6 +12833,7 @@ fn write_verified_fixture(
     let meta = EntryMeta {
         cache_key: meta_key.to_string(),
         key_schema: kache_format::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "fixture".to_string(),
         crate_types: vec!["lib".to_string()],
         files: vec![CachedFile {

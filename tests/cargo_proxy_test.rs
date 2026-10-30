@@ -1374,3 +1374,225 @@ fn receipt_cleanup_preserves_units_in_unobserved_profiles() {
         before
     );
 }
+
+/// Both front ends must move checks' outputs AND Cargo's lock, while explicit
+/// caller layouts and the opt-out retain their original environment.
+#[test]
+fn checks_use_a_separate_target_through_the_shim_and_explicit_proxy() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("project");
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(KACHE_BIN, &cache);
+    let shims = root.join("shims");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    std::fs::create_dir_all(&shims).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let cargo = root.join("real-cargo");
+    std::fs::write(&cargo, "#!/bin/sh\ncase \"$*\" in *locate-project*) echo \"$PROJECT/Cargo.toml\"; exit 0;; *--version*) echo 'cargo 1.99.1'; exit 0;; esac\nprintf 'target=%s\\nbuild=%s\\n' \"${CARGO_TARGET_DIR-unset}\" \"${CARGO_BUILD_BUILD_DIR-unset}\"\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim = shims.join("cargo");
+    std::os::unix::fs::symlink(KACHE_BIN, &shim).unwrap();
+    for front in [&shim, Path::new(KACHE_BIN)] {
+        for (subcommand, setting, expected) in [
+            ("check", "1", "check"),
+            ("clippy", "1", "check"),
+            ("check", "0", "unset"),
+            ("build", "1", "unset"),
+        ] {
+            let mut command = hermetic_command(front, &cache, Some(&cache.join("config.toml")));
+            command
+                .current_dir(&project)
+                .env("HOME", &home)
+                .env("CARGO_HOME", home.join(".cargo"))
+                .env("PROJECT", &project)
+                .env("KACHE_REAL_CARGO", &cargo)
+                .env("KACHE_SEPARATE_CHECK_TARGETS", setting)
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR");
+            if front == Path::new(KACHE_BIN) {
+                command.arg("cargo");
+            }
+            let output = command.arg(subcommand).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let target = if expected == "check" {
+                project.join("target/check").display().to_string()
+            } else {
+                expected.to_string()
+            };
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.contains(&format!("target={target}\n")),
+                "{front:?} {subcommand}: {stdout}"
+            );
+            assert!(
+                stdout.contains(&format!("build={target}\n")),
+                "{front:?} {subcommand}: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compiler() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let project = root.join("project");
+    let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(KACHE_BIN, &cache);
+    let target = project.join("target");
+    std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"compiler_gc_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+    let held = std::fs::File::create(target.join("debug/.cargo-lock")).unwrap();
+    held.lock().unwrap();
+    let mut command = proxied_cargo(&home, &cache, &target);
+    command
+        .current_dir(&project)
+        .args(["cargo", "check", "--offline"])
+        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_SEPARATE_CHECK_TARGETS", "1")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "check waited on the build lock: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target.join("check/debug/.fingerprint").is_dir());
+    held.unlock().unwrap();
+    let version = Command::new("rustc").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let release = version.split_whitespace().nth(1).unwrap();
+    let preview = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
+        .args(["clean", "--cache", "--rustc-version", release, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["preview"], true, "{preview}");
+    assert!(
+        preview["selected"]["entries"].as_u64().unwrap() > 0,
+        "{preview}"
+    );
+    assert!(
+        preview["selected"]["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().starts_with(release)),
+        "{preview}"
+    );
+    let clippy = proxied_cargo(&home, &cache, &target)
+        .current_dir(&project)
+        .args(["cargo", "clippy", "--offline"])
+        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_SEPARATE_CHECK_TARGETS", "1")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        clippy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clippy.stderr)
+    );
+    let run = |args: &[&str]| {
+        hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let after_clippy = run(&["clean", "--cache", "--rustc-version", release, "--json"]);
+    assert!(after_clippy.status.success());
+    let after_clippy: Value = serde_json::from_slice(&after_clippy.stdout).unwrap();
+    assert!(
+        after_clippy["selected"]["entries"].as_u64().unwrap()
+            > preview["selected"]["entries"].as_u64().unwrap(),
+        "Clippy must be recorded under its underlying Rust compiler: {after_clippy}"
+    );
+    let legacy = run(&["gc", "--rustc-version", release, "--dry-run", "--json"]);
+    assert!(
+        legacy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(legacy["preview"], true);
+    assert_eq!(legacy["command"], "gc");
+    let human = run(&["clean", "--cache", "--rustc-version", release, "--dry-run"]);
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("selected"));
+    let unconfirmed = run(&["clean", "--cache", "--rustc-version", release]);
+    assert!(
+        !unconfirmed.status.success(),
+        "non-terminal cleanup requires confirmation"
+    );
+    let removed = run(&[
+        "clean",
+        "--cache",
+        "--rustc-version",
+        release,
+        "--yes",
+        "--json",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["preview"], false);
+    assert!(removed["eviction"].is_object(), "{removed}");
+    let absent = run(&[
+        "clean",
+        "--cache",
+        "--rustc-version",
+        "1.0.0",
+        "--json",
+        "--yes",
+    ]);
+    assert!(absent.status.success());
+    let absent: Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert_eq!(absent["selected"]["entries"], 0);
+    assert!(absent.get("eviction").is_none());
+}

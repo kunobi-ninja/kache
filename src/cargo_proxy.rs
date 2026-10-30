@@ -6,6 +6,8 @@
 //! repair Cargo's unit identities, so `kache cargo -- ...` removes only that
 //! duplicate source before Cargo computes them.
 
+mod check_targets;
+
 use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
@@ -118,6 +120,7 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     }
     let mut command = Command::new(&cargo);
     command.args(&cargo_args);
+    check_targets::configure(&mut command, &cargo, &config, &env);
     crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
     run_cargo_guarded(command, &cargo, lease, &config)
 }
@@ -125,6 +128,9 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
 fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     let cargo = real_cargo_program(false)?;
+    let env = crate::invocation::InvocationEnv::capture();
+    let config = crate::config::Config::load_for(&env)?;
+    let check_target = check_targets::plan(&cwd, &cargo_args, &cargo, &config, &env);
 
     // Cargo owns freshness before RUSTC_WRAPPER runs. Sharing its intermediate
     // fingerprint directory across worktrees can therefore declare the wrong
@@ -176,7 +182,7 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
     // changed after inspection, leave Cargo's layout untouched rather than
     // override a newly configured build-dir policy with stale information.
     let mut isolate_build_dir = false;
-    if let Some(plan) = build_dir_plan {
+    if let Some(plan) = build_dir_plan.filter(|_| check_target.is_none()) {
         if build_dir_plan_is_current(&plan) {
             isolate_build_dir = true;
         } else {
@@ -198,6 +204,9 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
         command.env("CARGO_ENCODED_RUSTFLAGS", flags);
     }
 
+    if let Some(plan) = check_target {
+        check_targets::apply(&mut command, plan);
+    }
     crate::target_seed::configure_cargo_seed(
         &mut command,
         &cargo_args,

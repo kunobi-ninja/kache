@@ -230,65 +230,89 @@ mod tests {
         assert_eq!(current(), own);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_niced_child_reads_as_background() {
-        let mut calm = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .unwrap();
-        let mut niced = std::process::Command::new("nice")
-            .args(["-n", "10", "sleep", "5"])
-            .spawn()
-            .unwrap();
-        // `nice` execs `sleep` in place; wait until the new image runs niced.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while Priority::of_process(niced.id()) != Priority::Background
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let observed = (
-            Priority::of_process(calm.id()),
-            Priority::of_process(niced.id()),
-        );
-        let _ = calm.kill();
-        let _ = niced.kill();
-        let _ = calm.wait();
-        let _ = niced.wait();
-        // The suite itself may run niced, and children inherit it.
-        if Priority::of_this_process() == Priority::Foreground {
-            assert_eq!(observed.0, Priority::Foreground);
-        }
-        assert_eq!(observed.1, Priority::Background);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "subprocess fixture for this_process_reads_its_own_nice"]
-    fn niced_process_fixture() {
-        let out = std::env::var_os("KACHE_TEST_PRIORITY_OUT").expect("fixture output");
-        let observed = (Priority::of_this_process(), current());
-        std::fs::write(out, format!("{observed:?}")).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn this_process_reads_its_own_nice() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("priority");
-        let status = std::process::Command::new("nice")
-            .args(["-n", "5"])
-            .arg(std::env::current_exe().unwrap())
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn niced_fixture_command(out: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "scheduler::priority::tests::niced_process_fixture",
                 "--ignored",
                 "--quiet",
             ])
-            .env("KACHE_TEST_PRIORITY_OUT", &out)
-            .status()
+            .env("KACHE_TEST_PRIORITY_OUT", out)
+            .env_remove("KACHE_TEST_PRIORITY_HOLD");
+        command
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_niced_child_reads_as_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("priority");
+        let mut niced = niced_fixture_command(&out)
+            .env("KACHE_TEST_PRIORITY_HOLD", "1")
+            .spawn()
             .unwrap();
+        // The fixture publishes only after setting and checking its priority.
+        // Keep it alive until the parent has queried that same process.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !out.exists() && std::time::Instant::now() < deadline {
+            if niced.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let ready = out.exists();
+        let observed = Priority::of_process(niced.id());
+        let _ = niced.kill();
+        let _ = niced.wait();
+        assert!(ready, "the child did not establish background priority");
+        assert_eq!(observed, Priority::Background);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    #[ignore = "subprocess fixture for this_process_reads_its_own_nice"]
+    fn niced_process_fixture() {
+        let out = std::env::var_os("KACHE_TEST_PRIORITY_OUT").expect("fixture output");
+        // `nice -n` adds to the inherited value: a raised-priority runner can
+        // remain foreground after +5 or +10. Only this child changes priority.
+        // SAFETY: these calls read and lower the current process's priority.
+        // On Linux niceness belongs to a thread. Use the process's main
+        // thread, which both the parent and `of_this_process` query.
+        let pid = std::process::id();
+        let before = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+        let changed = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 20) };
+        assert_eq!(
+            changed,
+            0,
+            "setting background nice from {before}: {}",
+            std::io::Error::last_os_error()
+        );
+        let actual = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+        assert!(
+            actual > 0,
+            "fixture nice must be positive; before={before}, after={actual}"
+        );
+        let observed = (Priority::of_this_process(), current());
+        assert_eq!(
+            observed,
+            (Priority::Background, Priority::Background),
+            "nice before={before}, after={actual}"
+        );
+        std::fs::write(out, format!("{observed:?}")).unwrap();
+        if std::env::var_os("KACHE_TEST_PRIORITY_HOLD").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn this_process_reads_its_own_nice() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("priority");
+        let status = niced_fixture_command(&out).status().unwrap();
         assert!(status.success());
         assert_eq!(
             std::fs::read_to_string(out).unwrap(),

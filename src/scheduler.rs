@@ -502,12 +502,18 @@ impl Scheduler {
         let wait = BudgetWait::capacity(self.wait_timeout);
         let mut bounded = self.clone();
         bounded.wait_timeout = wait.timeout;
-        let slots = bounded.wait_for_permit(queue::Kind::Compile, |waited, saved_for_tests| {
-            let weight = pressure::weight(weight, self.pool_size, pressure::now());
-            compile_need(weight, self.pool_size, waited, || {
-                tests_held(&self.root).saturating_add(saved_for_tests)
-            })
-        }, false);
+        let request = Request::new(queue::Kind::Compile, false);
+        let mut ticket = None;
+        let slots = bounded.wait_for_request(
+            &request,
+            |waited, saved_for_tests| {
+                let weight = pressure::weight(weight, self.pool_size, pressure::now());
+                compile_need(weight, self.pool_size, waited, || {
+                    tests_held(&self.root).saturating_add(saved_for_tests)
+                })
+            },
+            &mut ticket,
+        );
         let recover = wait.scoped();
         drop(wait);
         let permit = match slots {
@@ -516,7 +522,7 @@ impl Scheduler {
                 _slots: slots,
                 _recovery: Vec::new(),
             }),
-            None if recover => self.acquire_recovery_permit(weight),
+            None if recover => self.acquire_recovery_permit(weight, &request, &mut ticket),
             None => None,
         };
         crate::opcounts::record_permit_wait(started.elapsed());
@@ -527,13 +533,19 @@ impl Scheduler {
     /// capacity. It may overcommit at most two weighted slots (one on a
     /// one-slot pool); a heavier compile still needs regular slots for the
     /// rest. Other waiters keep waiting for capacity, with cancellation.
-    fn acquire_recovery_permit(&self, weight: u32) -> Option<Permit> {
+    fn acquire_recovery_permit(
+        &self,
+        weight: u32,
+        request: &Request,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Option<Permit> {
         let wait = BudgetWait::start(WAIT_TIMEOUT);
         let started = std::time::Instant::now();
         loop {
             crate::invocation::process::check().ok()?;
             let seen = permit_wait::snapshot(&self.root);
-            match self.try_recovery_permit(weight) {
+            let remaining = wait.timeout.saturating_sub(started.elapsed());
+            match self.try_recovery_request(weight, request, ticket, remaining) {
                 Ok(Some(permit)) => return Some(permit),
                 Ok(None) => {
                     let remaining = wait.timeout.saturating_sub(started.elapsed());
@@ -560,13 +572,29 @@ impl Scheduler {
         }
     }
 
+    #[cfg(test)]
     fn try_recovery_permit(&self, weight: u32) -> Result<Option<Permit>> {
-        let need = compile_need(weight, self.pool_size, true, || tests_held(&self.root));
+        self.try_recovery_request(
+            weight,
+            &Request::new(queue::Kind::Compile, false),
+            &mut None,
+            self.wait_timeout,
+        )
+    }
+
+    fn try_recovery_request(
+        &self,
+        weight: u32,
+        request: &Request,
+        ticket: &mut Option<queue::Ticket>,
+        allowance: Duration,
+    ) -> Result<Option<Permit>> {
+        let started = std::time::Instant::now();
         let pressured = pressure::weight(weight, self.pool_size, pressure::now());
-        let ordinary = compile_need(pressured, self.pool_size, true, || tests_held(&self.root));
-        if let Collect::Ready(slots) =
-            try_collect_slots(self, 0..self.pool_size, ordinary as usize)?
-        {
+        let ordinary = compile_need(pressured, self.pool_size, true, || {
+            tests_held(&self.root).saturating_add(request.saved_for_tests.get())
+        });
+        if let Collect::Ready(slots) = self.admit(request, ordinary, ticket, allowance)? {
             return Ok(Some(Permit {
                 root: self.root.clone(),
                 _slots: slots,
@@ -577,12 +605,20 @@ impl Scheduler {
         else {
             return Ok(None);
         };
+        let need = compile_need(weight, self.pool_size, true, || {
+            tests_held(&self.root).saturating_add(request.saved_for_tests.get())
+        });
         let extra = need.min(2);
         let regular = need - extra;
         let slots = if regular == 0 {
             Vec::new()
         } else {
-            match try_collect_slots(self, 0..self.pool_size, regular as usize)? {
+            match self.admit(
+                request,
+                regular,
+                ticket,
+                allowance.saturating_sub(started.elapsed()),
+            )? {
                 Collect::Ready(slots) => slots,
                 Collect::Busy(_) => return Ok(None),
             }
@@ -595,6 +631,9 @@ impl Scheduler {
                 return Ok(None);
             };
             recovery.push(lock);
+        }
+        if let Some(ticket) = ticket.take() {
+            ticket.admitted();
         }
         tracing::debug!(
             requested_slots = need,
@@ -625,28 +664,32 @@ impl Scheduler {
         need: impl Fn(bool, u32) -> u32,
         spare: bool,
     ) -> Option<Vec<(u32, StoreLock)>> {
-        let start = std::time::Instant::now();
-        let request = Request {
-            kind,
-            spare,
-            rank: queue::rank(SystemTime::now(), priority::current()),
-            saved_for_tests: std::cell::Cell::new(0),
-        };
+        let request = Request::new(kind, spare);
         // Dropped on every return, cancellation included: the request
         // leaves the queue.
         let mut ticket = None;
+        self.wait_for_request(&request, need, &mut ticket)
+    }
+
+    fn wait_for_request(
+        &self,
+        request: &Request,
+        need: impl Fn(bool, u32) -> u32,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Option<Vec<(u32, StoreLock)>> {
+        let start = std::time::Instant::now();
         let mut waited = false;
         loop {
             crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
             let asking = need(waited, request.saved_for_tests.get()).max(1);
-            match self.collect_permits(&request, asking, &mut ticket, start) {
+            match self.collect_permits(request, asking, ticket, start) {
                 WaitStep::Ready(slots) => return Some(slots),
                 WaitStep::Stop => return None,
                 WaitStep::Busy(busy) if !busy.is_empty() => {
                     let armed = permit_wait::arm(&self.root, &busy);
                     let seen = permit_wait::snapshot(&self.root);
-                    match self.collect_permits(&request, asking, &mut ticket, start) {
+                    match self.collect_permits(request, asking, ticket, start) {
                         WaitStep::Ready(slots) => return Some(slots),
                         WaitStep::Stop => return None,
                         WaitStep::Busy(_) => {
@@ -930,6 +973,17 @@ struct Request {
     saved_for_tests: std::cell::Cell<u32>,
 }
 
+impl Request {
+    fn new(kind: queue::Kind, spare: bool) -> Self {
+        Self {
+            kind,
+            spare,
+            rank: queue::rank(SystemTime::now(), priority::current()),
+            saved_for_tests: std::cell::Cell::new(0),
+        }
+    }
+}
+
 impl Scheduler {
     fn collect_permits(
         &self,
@@ -939,7 +993,8 @@ impl Scheduler {
         start: std::time::Instant,
     ) -> WaitStep {
         note_permit_scan();
-        match self.admit(request, need, ticket) {
+        let remaining = self.wait_timeout.saturating_sub(start.elapsed());
+        match self.admit(request, need, ticket, remaining) {
             Ok(Collect::Ready(slots)) => WaitStep::Ready(slots),
             Ok(Collect::Busy(busy)) => {
                 if start.elapsed() >= self.wait_timeout {
@@ -976,9 +1031,10 @@ impl Scheduler {
         request: &Request,
         need: u32,
         ticket: &mut Option<queue::Ticket>,
+        allowance: Duration,
     ) -> Result<Collect> {
         request.saved_for_tests.set(0);
-        let wait = queue::LOCK_WAIT.min(self.wait_timeout);
+        let wait = queue::LOCK_WAIT.min(allowance);
         match queue::lock(&self.root, wait) {
             Ok(Some(_queue)) => match self.admit_in_order(request, need, ticket) {
                 Ok(collect) => return Ok(collect),
@@ -2017,6 +2073,107 @@ mod tests {
         assert_eq!(permits_in_use(dir.path()), Some(2));
         drop(recovered);
         drop(holder);
+    }
+
+    #[test]
+    fn recovery_leaves_reserved_regular_slots_for_the_earlier_waiter() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _held: Vec<_> = (2..4)
+            .map(|index| {
+                StoreLock::try_acquire(&scheduler.permit_path(index))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let ahead = hold_ticket(dir.path(), 0, queue::Kind::Compile, 3, SystemTime::now());
+        for _ in 0..4 {
+            queue::record_pass(&scheduler.root, ahead.entry()).unwrap();
+        }
+        assert!(scheduler.try_recovery_permit(4).unwrap().is_none());
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(ahead);
+        let permit = scheduler.try_recovery_permit(4).unwrap().unwrap();
+        assert_eq!(permit._slots.len(), 2);
+        assert_eq!(permit._recovery.len(), 2);
+    }
+
+    #[test]
+    fn recovery_keeps_the_ordinary_tickets_rank_and_passes() {
+        let dir = temp_cache();
+        let mut scheduler = test_scheduler(dir.path(), 4);
+        let _holder = scheduler.acquire_permit(4).unwrap();
+        scheduler.wait_timeout = Duration::ZERO;
+        let request = Request {
+            rank: 17,
+            kind: queue::Kind::Compile,
+            spare: false,
+            saved_for_tests: std::cell::Cell::new(0),
+        };
+        let mut ticket = None;
+        assert!(
+            scheduler
+                .wait_for_request(&request, |_, _| 4, &mut ticket)
+                .is_none()
+        );
+        let original = ticket.as_ref().unwrap().entry().clone();
+        queue::record_pass(&scheduler.root, &original).unwrap();
+        assert!(
+            scheduler
+                .try_recovery_request(4, &request, &mut ticket, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        let remaining = ticket.as_ref().unwrap().entry();
+        assert_eq!(remaining.id, original.id);
+        assert_eq!(remaining.rank, 17);
+        assert_eq!(remaining.need, 2);
+        assert_eq!(queue::passes(&scheduler.root, remaining), 1);
+        drop(ticket);
+        assert!(queued(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn recovery_rechecks_capacity_with_the_slots_saved_for_tests() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _running = scheduler.acquire_test_lease(TestWant::Fixed(1)).unwrap();
+        let waiting = hold_ticket(dir.path(), 0, queue::Kind::Test, 3, SystemTime::now());
+        for _ in 0..4 {
+            queue::record_pass(&scheduler.root, waiting.entry()).unwrap();
+        }
+        let gate = StoreLock::try_acquire(&permits_dir(&scheduler.root).join("recovery-0"))
+            .unwrap()
+            .unwrap();
+        let request = Request::new(queue::Kind::Compile, false);
+        let mut ticket = None;
+        assert!(
+            scheduler
+                .try_recovery_request(3, &request, &mut ticket, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(request.saved_for_tests.get(), 2);
+        drop(gate);
+        let permit = scheduler
+            .try_recovery_request(3, &request, &mut ticket, Duration::ZERO)
+            .unwrap()
+            .expect("the compile reserve is ordinary capacity");
+        assert!(permit._recovery.is_empty());
+        assert_eq!(
+            permit
+                ._slots
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(ticket.is_none());
+        assert_eq!(
+            queued(dir.path()).len(),
+            1,
+            "the waiting test keeps its ticket"
+        );
     }
 
     #[test]

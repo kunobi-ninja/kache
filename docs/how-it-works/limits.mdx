@@ -15,7 +15,25 @@ The permit pool size is `std::thread::available_parallelism()`, with a floor of 
 
 The memory estimate cannot see what else is running: builds outside Kache, an editor, a browser. So the scheduler also checks whether the machine is short of memory. Under memory pressure ordinary admission asks for the whole pool, waiting for other compiles to finish. Recovery admission is bounded separately below. Slots held by running tests still count against the ordinary request, so a test waiting on a compile cannot stall it. On macOS, pressure is the kernel's pressure level at warning or critical. On Linux it is memory PSI, some task stalled on memory for at least 10% of the last ten seconds, read from the process's cgroup when it has its own `memory.pressure` and from the host otherwise. Other systems report no pressure. Set `cache.scheduler_memory_pressure = false` or `KACHE_SCHEDULER_MEMORY_PRESSURE=0` to turn the check off.
 
-Compiles and test binaries that wait for slots queue for them, across every build that shares the cache directory: worktrees, separate target directories, and test runs. Requests are served in the order they arrived, except that a request from a foreground build is placed 30 seconds ahead of one from a background build. A request keeps its place while later ones arrive, so a background request that has waited 30 seconds goes before any foreground request that comes after it. A background build is one running at Darwin background priority (`taskpolicy -b`) on macOS, a positive nice value, `SCHED_BATCH` or `SCHED_IDLE` on Linux, or the idle or below-normal priority class on Windows. A request the daemon executes takes the priority of the build that sent it. A compile that is already running keeps its slots whatever its priority. When the first request in line needs more slots than are free, smaller requests behind it can use the free slots, but only as many times as the pool has slots. After that the free slots are saved for the first request until it fits. A test saves only test slots, and a compile counts the slots saved for a test like slots running tests hold, so a heavy compile can still run in the reserve. A request that is cancelled or killed loses its place at once. A waiter that has not been able to run for two seconds, such as a background process the OS has starved of CPU, is skipped until it runs again.
+Compiles and test binaries queue for regular slots across builds that share the
+cache directory, including worktrees and separate target directories. Requests
+are ordered by arrival, with foreground requests placed 30 seconds ahead of
+background requests. An older background request therefore goes before foreground
+requests that arrive more than 30 seconds later. Running compiles keep their slots.
+
+A background build has Darwin background priority (`taskpolicy -b`) or positive
+niceness on macOS, positive niceness or `SCHED_BATCH`/`SCHED_IDLE` on Linux, or the
+idle or below-normal priority class on Windows. Daemon requests use the calling
+build's priority.
+
+When the first request needs more slots than are free, smaller requests can pass
+it once per pool slot. It then reserves free slots until enough are available.
+Tests reserve only test slots. Heavy compiles count slots reserved for waiting
+tests alongside slots running tests hold, so they fit in the compile reserve. Cancelled
+waiters remove their tickets; the next planner removes tickets left by killed
+processes. A waiter that has not run for two seconds is skipped until it runs
+again. If the queue is unusable or its lock remains held for one second, requests
+try free slots without queue ordering.
 
 Kache releases before this queue take free slots without queuing. Their running compiles still count against the pool, but while releases are mixed on one machine an older wrapper can take slots a queued request was saving up.
 
@@ -34,6 +52,9 @@ it does not inflate the request to the whole pool under pressure. Other waiters
 continue checking ordinary capacity and wait for the recovery holder to finish.
 That additional wait can exceed the ordinary wait limit and remains cancellable. A
 holder exiting releases its locks, including after a crash.
+
+Recovery keeps the request's queue position when it needs regular slots. Its
+extra slots have a separate single-compiler gate and do not follow queue order.
 
 If neither ordinary nor recovery admission can obtain capacity before the shared
 coordination allowance expires, compilation continues without a permit. The same

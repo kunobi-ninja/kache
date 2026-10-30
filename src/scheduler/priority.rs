@@ -32,7 +32,18 @@ impl Priority {
 
     /// The priority of this process.
     pub(crate) fn of_this_process() -> Self {
-        Self::from_background(this_process_is_background())
+        #[cfg(unix)]
+        {
+            Self::of_process(std::process::id())
+        }
+        #[cfg(windows)]
+        {
+            Self::from_background(this_process_is_background())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::Foreground
+        }
     }
 
     /// The priority of the process `pid`. The caller must know `pid` still
@@ -44,7 +55,7 @@ impl Priority {
     }
 
     /// The priority a Windows priority class stands for.
-    #[cfg(windows)]
+    #[cfg(any(test, windows))]
     pub(crate) fn of_windows_class(class: u32) -> Self {
         Self::from_background(windows_background(class))
     }
@@ -89,9 +100,8 @@ pub(crate) fn current() -> Priority {
 /// lowered with nice.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_background(flags: u32, nice: i32) -> bool {
-    const PROC_FLAG_DARWINBG: u32 = 0x8000;
-    const PROC_FLAG_EXT_DARWINBG: u32 = 0x10000;
-    flags & (PROC_FLAG_DARWINBG | PROC_FLAG_EXT_DARWINBG) != 0 || nice > 0
+    const DARWIN_BACKGROUND_FLAGS: u32 = 0x0001_8000;
+    flags & DARWIN_BACKGROUND_FLAGS != 0 || nice > 0
 }
 
 /// Whether Linux runs a process as background: lowered with nice, or under
@@ -111,23 +121,25 @@ pub(crate) fn windows_background(class: u32) -> bool {
     class == IDLE_PRIORITY_CLASS || class == BELOW_NORMAL_PRIORITY_CLASS
 }
 
-#[cfg(unix)]
-fn this_process_is_background() -> bool {
-    process_is_background(std::process::id())
-}
-
 #[cfg(target_os = "macos")]
+// Linux mutation shards cannot execute this macOS syscall adapter. The
+// classifier is exercised on every host; macOS CI also tests real processes.
+#[mutants::skip]
 fn process_is_background(pid: u32) -> bool {
     let Ok(pid) = libc::c_int::try_from(pid) else {
         return false;
     };
+    // Niceness remains readable when the wider process-info query is denied.
+    // SAFETY: getpriority only reads the scheduling state of this process.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as u32) };
     // SAFETY: `proc_bsdinfo` is a C struct of integers and arrays; zero is a
     // valid value, and the kernel writes at most `size` bytes into it.
     let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let written =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    written == size && macos_background(info.pbi_flags, info.pbi_nice)
+    let flags = if written == size { info.pbi_flags } else { 0 };
+    macos_background(flags, nice)
 }
 
 #[cfg(target_os = "linux")]
@@ -145,21 +157,18 @@ fn process_is_background(pid: u32) -> bool {
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[mutants::skip] // Not compiled by the supported-platform CI matrix.
 fn process_is_background(pid: u32) -> bool {
     let _ = pid;
     false
 }
 
 #[cfg(windows)]
+#[mutants::skip] // Windows API adapter; its class decoder is tested on every host.
 fn this_process_is_background() -> bool {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
     // SAFETY: the pseudo handle of this process needs no closing.
     windows_background(unsafe { GetPriorityClass(GetCurrentProcess()) })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn this_process_is_background() -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -198,6 +207,9 @@ mod tests {
         assert!(!windows_background(0x20), "normal");
         assert!(!windows_background(0x8000), "above normal");
         assert!(!windows_background(0), "unreadable");
+        assert_eq!(Priority::of_windows_class(0x40), Priority::Background);
+        assert_eq!(Priority::of_windows_class(0x4000), Priority::Background);
+        assert_eq!(Priority::of_windows_class(0x20), Priority::Foreground);
     }
 
     #[test]

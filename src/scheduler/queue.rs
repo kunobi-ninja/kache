@@ -192,9 +192,13 @@ fn new_id() -> String {
         // process with the same name makes creation fail and the request
         // takes slots out of order.
         let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        bytes = (u64::from(std::process::id()) << 32 | next).to_le_bytes();
+        return fallback_id(std::process::id(), next);
     }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn fallback_id(pid: u32, sequence: u64) -> String {
+    format!("p{pid:x}n{sequence:016x}")
 }
 
 fn millis(time: SystemTime) -> u64 {
@@ -300,7 +304,11 @@ pub(super) fn ready(root: &Path, entry: &Entry, now: SystemTime) -> bool {
 /// `Some(false)` when nothing holds the lock at `path` or the file is gone;
 /// `None` when it cannot be probed.
 fn owner_alive(path: &Path) -> Option<bool> {
-    let file = match fs::File::open(path) {
+    probe_owner(fs::File::open(path))
+}
+
+fn probe_owner(opened: std::io::Result<fs::File>) -> Option<bool> {
+    let file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
         Err(_) => return None,
@@ -609,6 +617,28 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_eq!(first.id.len(), 16);
         assert_eq!(Entry::parse(&first.name()), Some(first));
+    }
+
+    #[test]
+    fn fallback_ids_keep_the_process_and_sequence_distinct() {
+        let first = fallback_id(17, 3);
+        assert!(valid_id(&first));
+        assert_ne!(first, fallback_id(18, 3));
+        assert_ne!(first, fallback_id(17, 4));
+        assert_ne!(fallback_id(1, 0x100), fallback_id(0x11, 0));
+    }
+
+    #[test]
+    fn an_unreadable_owner_is_not_a_dead_owner() {
+        assert_eq!(
+            probe_owner(Err(std::io::ErrorKind::NotFound.into())),
+            Some(false)
+        );
+        assert_eq!(
+            probe_owner(Err(std::io::ErrorKind::PermissionDenied.into())),
+            None
+        );
+        assert_eq!(probe_owner(Err(std::io::ErrorKind::Other.into())), None);
     }
 
     #[test]

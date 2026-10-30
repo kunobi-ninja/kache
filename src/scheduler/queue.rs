@@ -203,7 +203,7 @@ fn fallback_id(pid: u32, sequence: u64) -> String {
     format!("p{pid:x}n{sequence:016x}")
 }
 
-fn millis(time: SystemTime) -> u64 {
+pub(super) fn millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH).map_or(0, |since| {
         u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
     })

@@ -70,18 +70,6 @@ where
     }
 }
 
-/// Whether a known byte-valued file setting permits zero.
-pub fn size_key(key: &str) -> Option<bool> {
-    match key {
-        "cache.local_max_size"
-        | "cache.event_log_max_size"
-        | "cache.prefetch_max_bytes"
-        | "cache.auto_recover_min_free_bytes" => Some(true),
-        "cache.restore_max_size" => Some(false),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

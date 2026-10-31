@@ -221,6 +221,18 @@ fn edit(path: &Path, key: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether a known byte-valued file setting permits zero.
+fn size_key(key: &str) -> Option<bool> {
+    match key {
+        "cache.local_max_size"
+        | "cache.event_log_max_size"
+        | "cache.prefetch_max_bytes"
+        | "cache.auto_recover_min_free_bytes" => Some(true),
+        "cache.restore_max_size" => Some(false),
+        _ => None,
+    }
+}
+
 fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str>) -> Result<()> {
     if raw.is_some() && keys[0] == "workspace" {
         bail!("edit workspace declarations directly in TOML");
@@ -229,7 +241,7 @@ fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str
         raw.parse::<toml_edit::Value>()
             .unwrap_or_else(|_| toml_edit::Value::from(raw))
     });
-    if let Some(allow_zero) = kache_config::size::size_key(&keys.join("."))
+    if let Some(allow_zero) = size_key(&keys.join("."))
         && let Some(value) = replacement.as_ref()
     {
         let bytes = match value {

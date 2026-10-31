@@ -3309,19 +3309,41 @@ mod tests {
         let root = dir.path().to_path_buf();
         let waiter =
             std::thread::spawn(move || test_scheduler(&root, 1).acquire_permit(1).is_some());
-        // Inside the wait, and early enough that a 200 ms slice is still running
-        // when the permit is dropped.
+        #[cfg(target_os = "linux")]
+        wait_until("the permit waiter to queue", || {
+            queued(dir.path()).len() == 1
+        });
+        // macOS observes the kernel unlock event rather than a wake counter.
+        #[cfg(not(target_os = "linux"))]
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             !waiter.is_finished(),
             "the waiter must still be blocked on the held slot"
         );
+        #[cfg(target_os = "linux")]
+        {
+            // Keep admission from removing the waiter's ticket and publishing
+            // its own wake, so only dropping this permit can move the counter.
+            let _queue = queue::lock(&holder.root, Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let seen = permit_wait::snapshot(&holder.root);
+            drop(permit);
+            assert_ne!(
+                permit_wait::snapshot(&holder.root),
+                seen,
+                "dropping the permit must publish a wake"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
         let started = std::time::Instant::now();
+        #[cfg(not(target_os = "linux"))]
         drop(permit);
         assert!(
             waiter.join().unwrap(),
             "the waiter must take the slot after it is released"
         );
+        #[cfg(not(target_os = "linux"))]
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "woke after {:?}; releasing a permit has to interrupt the wait",
@@ -4518,6 +4540,12 @@ mod tests {
         let first = Requester::running(cache, 2, 1, background);
         let second = Requester::running(cache, 2, 1, background);
         let large = Requester::queued(cache, 2, 2, background, 1);
+        // Equal millisecond ranks are ordered by random ticket ID. Ensure the
+        // later requests actually rank after the large one.
+        let large_rank = queued(cache)[0].rank;
+        wait_until("a later request rank", || {
+            queue::rank(SystemTime::now(), background) > large_rank
+        });
 
         // While the large request does not fit, smaller ones pass it, once
         // per slot of the pool.
@@ -4525,9 +4553,15 @@ mod tests {
         let pass_one = Requester::running(cache, 2, 1, background);
         second.finish();
         let pass_two = Requester::running(cache, 2, 1, background);
-        let waiting = queued(cache);
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(queue::passes(&scheduler_root(cache), &waiting[0]), 2);
+        {
+            let root = scheduler_root(cache);
+            // Refresh truncates and rewrites ticket state under this lock.
+            // Read the pass count under the same lock to avoid a partial read.
+            let _queue = queue::lock(&root, Duration::from_secs(5)).unwrap().unwrap();
+            let waiting = queued(cache);
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(queue::passes(&root, &waiting[0]), 2);
+        }
 
         // The budget is spent: a freed slot is saved for the large request.
         pass_one.finish();

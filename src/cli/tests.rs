@@ -3845,6 +3845,7 @@ fn save_manifest_config(
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -5191,6 +5192,7 @@ fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
         socket_path: config.socket_path().display().to_string(),
         started_at_ms: 1_700_000_000_000,
         auto_recover_min_free_bytes: None,
+        restore_max_size: None,
         auto_recover_targets: None,
     }
 }
@@ -5286,6 +5288,18 @@ fn config_mismatch_warnings_name_both_sides_per_field() {
     // Full agreement is silent.
     let eff = effective_config_like(&config);
     assert!(config_mismatch_warnings(&config, &same, &eff).is_empty());
+
+    let mut restore_limit = eff.clone();
+    restore_limit.restore_max_size = Some(config.restore_max_size);
+    assert!(config_mismatch_warnings(&config, &same, &restore_limit).is_empty());
+    restore_limit.restore_max_size = Some(12_884_901_888);
+    let warnings = config_mismatch_warnings(&config, &same, &restore_limit);
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("restore_max_size=12.0 GiB"),
+        "{warnings:?}"
+    );
+    assert!(warnings[0].contains("says 8.0 GiB"), "{warnings:?}");
 
     // LIST cadence is irrelevant when neither side has a remote. A
     // stale/default cadence alone must not produce a mismatch warning.
@@ -9954,6 +9968,32 @@ fn init_offers_recovery_with_the_floor_its_file_and_environment_set() {
     assert!(!defaults.file_decides_targets);
     assert_eq!(RecoverySettings::of("", &none, true).floor, 0, "CI default");
 
+    let unit_file = "[cache]\nauto_recover_min_free_bytes = \"100GiB\"\n";
+    assert_eq!(
+        RecoverySettings::of(unit_file, &none, false).floor,
+        107_374_182_400
+    );
+    let unit_env =
+        |key: &str| (key == "KACHE_AUTO_RECOVER_MIN_FREE_BYTES").then(|| "20GB".to_owned());
+    assert_eq!(
+        RecoverySettings::of(unit_file, &unit_env, false).floor,
+        20_000_000_000
+    );
+    for value in ["invalid", "16EiB", "-1GB"] {
+        let env =
+            |key: &str| (key == "KACHE_AUTO_RECOVER_MIN_FREE_BYTES").then(|| value.to_owned());
+        assert_eq!(
+            RecoverySettings::of(unit_file, &env, false).floor,
+            107_374_182_400
+        );
+    }
+    for raw in ["-1", "true", "\"invalid\"", "\"16EiB\""] {
+        let text = format!("[cache]\nauto_recover_min_free_bytes = {raw}\n");
+        assert_eq!(
+            RecoverySettings::of(&text, &none, false).floor,
+            crate::config::DEFAULT_RECOVERY_FLOOR
+        );
+    }
     let file = "[cache]\nauto_recover_min_free_bytes = 107374182400\n";
     assert_eq!(RecoverySettings::of(file, &none, false).floor, 100 << 30);
     let env = |name: &str| match name {

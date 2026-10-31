@@ -47,7 +47,17 @@ Kache reads only that one file, plus the [host config](#host-config); a `.kache.
 
 Each process walks up from its own current directory. Cargo compiles packages under the workspace root from the workspace root, but compiles registry and git dependencies, and runs their build scripts, from each package's source directory under `$CARGO_HOME`, so those compiles do not see your project's `.kache.toml`. A daemon that a build starts resolves its file from the directory of the compile that started it, which can be a dependency's source directory. To apply a setting to every compile and to the daemon, put it in your user config or the host config, or point `KACHE_CONFIG` at the file.
 
-If the chosen file is not valid TOML, or a key has the wrong type, compiler configuration resolution falls back to environment variables and defaults for the whole file, including the host overlay. Run `kache doctor` to check the selected file; the editor and file-editing subcommands refuse invalid TOML instead of saving over it. Size keys (`local_max_size`, `event_log_max_size`, `prefetch_max_bytes`) take quoted strings such as `"50GiB"`.
+If the chosen file is not valid TOML, or a key has the wrong type, compiler configuration resolution falls back to environment variables and defaults for the whole file, including the host overlay. Run `kache doctor` to check the selected file; the editor and file-editing subcommands refuse invalid TOML instead of saving over it. Byte-size settings (`local_max_size`, `restore_max_size`, `event_log_max_size`, `prefetch_max_bytes`, `auto_recover_min_free_bytes`) accept integer bytes or quoted unit strings. `GB` means 1,000,000,000 bytes; `GiB` means 1,073,741,824. Units are case-insensitive; fractional values such as `"1.5GiB"` also work.
+
+The same units work in environment variables and `kache config set`:
+
+```bash
+kache config set cache.local_max_size 50GiB
+kache config set cache.auto_recover_min_free_bytes 20GB
+kache config set cache.restore_max_size 12GiB
+```
+
+`config set` preserves the unit string and rejects invalid sizes and overflow before changing the file. Counts and durations take numbers in the units named by their settings.
 
 The editor covers common fields and updates changed keys while keeping comments and other settings. It asks before its first save to an existing file and refuses a file it cannot read or parse. The file subcommands also preserve comments and unrelated settings; `unset` can remove an unknown key.
 
@@ -128,7 +138,8 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_SHARE_TARGET_FILES` | `cache.auto_share_target_files` | `true` | Let the daemon replace target files that are full copies of stored blobs with clones of those blobs. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
-| `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | `10737418240` (10 GiB); `0` in CI | Below this many free bytes, builds evict eligible cache entries; `0` disables recovery. See [Target directory cleanup](#target-directory-cleanup). |
+| `KACHE_RESTORE_MAX_SIZE` | `cache.restore_max_size` | `8GiB` | Positive per-entry limit for compressed remote downloads, extracted remote files and unpacked debug bundles. Oversized entries fall back to compilation. Restart the daemon after changing it. |
+| `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | `10GiB`; `0` in CI | Below this many free bytes, builds evict eligible cache entries; `0` disables recovery. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
@@ -361,13 +372,13 @@ The daemon also asks Git about the repositories of the targets it tracks, and ab
 
 When `cache.auto_clean_idle_targets_days` is set or `cache.auto_recover_targets` is on, the daemon watches discovered targets so those rules can judge them. No build through Kache has used one, so each hourly check marks the access times of its units' fingerprints, the same way [unused build units](#unused-build-units) are found, and the target counts as idle from then until a build reads or writes one; Cargo reads them even when it compiles nothing. Until the daemon has watched it, or on a filesystem that does not record reads or is not local, a discovered target has unknown idle time and is never removed. Discovered targets go whole: the daemon does not prune their units, does not apply the deleted-workspace rule to them, and never uses them to seed another checkout.
 
-Free-space recovery keeps 10 GiB free by default by evicting cache entries. In CI, where a runner's disk lasts one job and the CI cache keeps entries for later jobs, it is off unless you set a floor. Set `cache.auto_recover_min_free_bytes` or `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` to the number of bytes to keep free, or to `0` to turn recovery off.
+Free-space recovery keeps 10 GiB free by default by evicting cache entries. In CI, where a runner's disk lasts one job and the CI cache keeps entries for later jobs, it is off unless you set a floor. Set `cache.auto_recover_min_free_bytes` or `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` to a size such as `"20GiB"` or an integer byte count, or to `0` to turn recovery off.
 
 Recovery removes target directories only when you also turn on `cache.auto_recover_targets`, because those are build outputs in your worktrees, some of which no build through Kache has used. `kache init` asks whether to turn it on.
 
 ```toml
 [cache]
-auto_recover_min_free_bytes = 21474836480 # keep 20 GiB free
+auto_recover_min_free_bytes = "20GiB"
 auto_recover_targets = true               # remove idle targets too
 ```
 

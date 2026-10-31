@@ -55,7 +55,7 @@ Kache rejects a relative path, or one inside `<prefix>/v3/`, when it loads the c
 
 Filesystem prefixes cannot contain `:`, and no path segment may end in a dot or a space. Windows strips those characters, so the same share would name different files from different machines.
 
-The [v3 download limits](/docs/remote-cache/s3-setup#object-layout-and-policy) also apply to shared folders: 8 GiB compressed and 8 GiB extracted per entry. Compiler invocations recompile when a remote entry exceeds either limit.
+The [v3 download limits](/docs/remote-cache/s3-setup#object-layout-and-policy) also apply to shared folders: 8 GiB compressed and 8 GiB extracted per entry by default. Set `cache.restore_max_size` / `KACHE_RESTORE_MAX_SIZE` to change both limits and restart the daemon. Compiler invocations recompile when a remote entry exceeds either limit.
 
 ## Reclaim remote space
 

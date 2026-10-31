@@ -1067,6 +1067,16 @@ pub struct RemovalReclaim {
     pub disk_bytes_reclaimed: u64,
 }
 
+/// What a removal read at `meta.json` before taking the write lock. Under the
+/// lock the removal goes ahead only while the file still reads the same, so a
+/// republication in between rolls it back (#670).
+enum MetaAtRemoval {
+    /// The bytes read, parseable or not.
+    Content(String),
+    /// Settled missing while the entry's row was present.
+    Absent,
+}
+
 /// One pass of `remove_entry_guarded_with_hooks`: either a settled outcome,
 /// or the instruction to run again because a republication replaced the
 /// generation this pass was waiting on.
@@ -5458,7 +5468,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             std::collections::HashMap::new()
         };
         let bytes_held: u64 = held.values().sum();
-        let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(bytes_held), target));
+        let left_out = self.config.held_bytes_budget.left_out(bytes_held);
+        let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(left_out), target));
         let shadow = stop_at.map(|(current, target)| {
             use crate::eviction::EvictionPolicy as _;
             let candidate = crate::eviction::ValueDensityPolicy;
@@ -6247,6 +6258,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
     }
 
+    /// Each blob reference `cache_key`'s `entry_blobs` mapping records, one
+    /// hash per reference, as `meta.files` would list them. Empty for an
+    /// entry never mapped (a legacy entry not yet backfilled).
+    fn mapped_blob_references(&self, cache_key: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT hash, refs FROM entry_blobs WHERE cache_key = ?1")?;
+        let rows = stmt
+            .query_map(params![cache_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .flat_map(|(hash, refs)| std::iter::repeat_n(hash, refs.max(0) as usize))
+            .collect())
+    }
+
     fn remove_entry_attempt(
         &self,
         cache_key: &str,
@@ -6257,24 +6286,41 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
 
-        // Load the blob hashes this entry references. If `meta.json` exists but
-        // can't be read or parsed, we CANNOT know which blobs to decrement —
-        // deleting the entry row anyway permanently orphans those refcounts (the
-        // blobs keep their DB row and evade size-based eviction forever). Refuse
-        // the removal so a corrupt entry never silently leaks (#276); callers
-        // (GC / purge / `doctor --repair`) log and move on, and the entry stays
-        // accounted-for until a fresh `put` (INSERT OR REPLACE) overwrites it.
-        let meta_content: String;
+        // Load the blob hashes this entry references. If `meta.json` can't be
+        // parsed (a crash can leave it zero-filled) or is settled missing, the
+        // index's `entry_blobs` mapping still names every reference the entry
+        // holds, and the removal releases those. Without a mapping we CANNOT know
+        // which blobs to decrement — deleting the entry row anyway permanently
+        // orphans those refcounts (the blobs keep their DB row and evade
+        // size-based eviction forever). Refuse the removal so a corrupt entry
+        // never silently leaks (#276); callers (GC / purge / `doctor
+        // --repair`) log and move on, and the entry stays accounted-for until
+        // a fresh `put` (INSERT OR REPLACE) overwrites it.
+        let meta_content: MetaAtRemoval;
         let hashes: Vec<String> = match fs::read_to_string(&meta_path) {
             Ok(content) => {
-                let meta: EntryMeta = serde_json::from_str(&content).with_context(|| {
-                    format!(
-                        "entry {cache_key}: meta.json unparseable — refusing removal so blob \
-                         refcounts are not leaked (#276)"
-                    )
-                })?;
-                meta_content = content;
-                meta.files.iter().map(|f| f.hash.clone()).collect()
+                let hashes = match serde_json::from_str::<EntryMeta>(&content) {
+                    Ok(meta) => meta.files.iter().map(|f| f.hash.clone()).collect(),
+                    Err(parse_error) => {
+                        let mapped = self.mapped_blob_references(cache_key)?;
+                        if mapped.is_empty() {
+                            return Err(parse_error).with_context(|| {
+                                format!(
+                                    "entry {cache_key}: meta.json unparseable — refusing \
+                                     removal so blob refcounts are not leaked (#276)"
+                                )
+                            });
+                        }
+                        tracing::warn!(
+                            "entry {cache_key}: meta.json unparseable ({parse_error}); \
+                             releasing the {} blob references its index mapping names",
+                            mapped.len()
+                        );
+                        mapped
+                    }
+                };
+                meta_content = MetaAtRemoval::Content(content);
+                hashes
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
@@ -6342,13 +6388,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     // cannot spin on its own.
                     return Ok(RemovalAttempt::Republished);
                 }
-                // Settled: a row with no meta.json. Its blob list is unknown
-                // and deleting the row would leak the refcounts — refuse, so
-                // a corrupt entry never silently leaks (#276).
-                anyhow::bail!(
-                    "entry {cache_key}: meta.json missing but DB row present — refusing \
-                     removal so blob refcounts are not leaked (#276)"
+                // Settled: a row with no meta.json. Its mapping names its
+                // references; without one its blob list is unknown and
+                // deleting the row would leak the refcounts — refuse, so a
+                // corrupt entry never silently leaks (#276).
+                let mapped = self.mapped_blob_references(cache_key)?;
+                if mapped.is_empty() {
+                    anyhow::bail!(
+                        "entry {cache_key}: meta.json missing but DB row present — refusing \
+                         removal so blob refcounts are not leaked (#276)"
+                    );
+                }
+                tracing::warn!(
+                    "entry {cache_key}: meta.json missing; releasing the {} blob references \
+                     its index mapping names",
+                    mapped.len()
                 );
+                meta_content = MetaAtRemoval::Absent;
+                mapped
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6459,7 +6516,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // meta.json that vanished or went corrupt in the window takes the
         // same rollback; the NEXT removal attempt reports it properly
         // through the #276 guards above.
-        let still_ours = matches!(fs::read_to_string(&meta_path), Ok(now) if now == meta_content);
+        let still_ours = match (fs::read_to_string(&meta_path), &meta_content) {
+            (Ok(now), MetaAtRemoval::Content(read)) => now == *read,
+            (Err(e), MetaAtRemoval::Absent) => e.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        };
         if !still_ours {
             return Ok(RemovalAttempt::Done(None));
         }

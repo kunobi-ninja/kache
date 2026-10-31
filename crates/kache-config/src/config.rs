@@ -258,6 +258,12 @@ pub struct Config {
     /// reclamation. Set via `KACHE_GC_EVICT_SHARED=1`/`=true` or
     /// `[cache] gc_evict_shared = true`.
     pub gc_evict_shared: bool,
+    /// Whether bytes a build output still holds count toward `max_size`.
+    /// Left out by default (kunobi-ninja/kache#1206). Counted, a size sweep
+    /// still keeps those entries but evicts others until the whole store is
+    /// under its target. Set via `KACHE_COUNT_HELD_IN_MAX_SIZE=1`/`=true` or
+    /// `[cache] count_held_in_max_size = true`.
+    pub held_bytes_budget: kache_core::store_config::HeldBytesBudget,
     /// Daemon idle timeout in seconds (default 0 = no timeout).
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
@@ -970,6 +976,8 @@ pub struct CacheFileConfig {
     pub build_script_hermetic: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
     pub gc_evict_shared: Option<bool>,
+    /// Held bytes count toward `max_size`. See [`Config::held_bytes_budget`].
+    pub count_held_in_max_size: Option<bool>,
     /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
     pub storage_layout_advice: Option<bool>,
     /// In-flight heartbeat cadence. See [`Config::heartbeat_secs`].
@@ -1408,6 +1416,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
     "KACHE_GC_EVICT_SHARED",
+    "KACHE_COUNT_HELD_IN_MAX_SIZE",
     "KACHE_PREFETCH_MAX_KEYS",
     "KACHE_PREFETCH_MAX_BYTES",
     "KACHE_PREFETCH_DEADLINE_SECS",
@@ -1464,6 +1473,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_MIN_STORE_COMPILE_MS", "cache.min_store_compile_ms"),
     ("KACHE_GC_MAX_AGE_HOURS", "cache.gc_max_age_hours"),
     ("KACHE_GC_EVICT_SHARED", "cache.gc_evict_shared"),
+    (
+        "KACHE_COUNT_HELD_IN_MAX_SIZE",
+        "cache.count_held_in_max_size",
+    ),
     (
         "KACHE_DAEMON_IDLE_TIMEOUT",
         "cache.daemon_idle_timeout_secs",
@@ -2232,6 +2245,7 @@ impl Config {
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled_for(invocation, &file_config);
+        let held_bytes_budget = Self::held_bytes_budget_for(invocation, &file_config);
         let storage_layout_advice =
             Self::storage_layout_advice_enabled_for(invocation, &file_config);
         let mut volume_stores = Self::load_volume_stores(&file_config, explicit_max_size);
@@ -2369,6 +2383,7 @@ impl Config {
             seed_new_targets,
             build_script_hermetic,
             gc_evict_shared,
+            held_bytes_budget,
             storage_layout_advice,
             volume_stores,
             heartbeat_secs,
@@ -3377,6 +3392,26 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.gc_evict_shared)
             .unwrap_or(false)
+    }
+
+    /// Whether held bytes count toward `max_size`: env wins, then
+    /// `[cache] count_held_in_max_size`, else left out.
+    fn held_bytes_budget_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> kache_core::store_config::HeldBytesBudget {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        let counted =
+            match env_or_ignored_for(invocation, "KACHE_COUNT_HELD_IN_MAX_SIZE", ignore_env) {
+                Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+                Err(_) => file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.count_held_in_max_size)
+                    .unwrap_or(false),
+            };
+        kache_core::store_config::HeldBytesBudget::from_count_held_in_max_size(counted)
     }
 
     /// Storage-layout advisories (kunobi-ninja/kache#551): on by default so
@@ -5084,6 +5119,7 @@ impl From<&Config> for kache_core::store_config::Config {
             cache_dir: config.cache_dir.clone(),
             max_size: config.max_size,
             gc_evict_shared: config.gc_evict_shared,
+            held_bytes_budget: config.held_bytes_budget,
             upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
             deferred_durability: config.deferred_durability,
         }

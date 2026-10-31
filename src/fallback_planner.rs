@@ -537,6 +537,7 @@ mod tests {
             seed_new_targets: false,
             build_script_hermetic: false,
             gc_evict_shared: false,
+            held_bytes_budget: Default::default(),
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,

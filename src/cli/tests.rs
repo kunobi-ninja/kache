@@ -3852,6 +3852,7 @@ fn save_manifest_config(
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
+        held_bytes_budget: Default::default(),
         storage_layout_advice: true,
         heartbeat_secs: 30,
         explain_miss: false,
@@ -4583,6 +4584,15 @@ fn purge_skips_corrupt_filtered_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().join("cache"), None);
     put_entry(&config, "badpurgekey", "bad", dir.path());
+    // Without its blob mapping the corrupt entry's references are unknown,
+    // so its removal is refused.
+    crate::store::open_index_db(&config.index_db_path())
+        .unwrap()
+        .execute(
+            "DELETE FROM entry_blobs WHERE cache_key = 'badpurgekey'",
+            [],
+        )
+        .unwrap();
     std::fs::write(
         config.store_dir().join("badpurgekey").join("meta.json"),
         b"{ not valid json",

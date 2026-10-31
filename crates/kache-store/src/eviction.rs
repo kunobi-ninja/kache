@@ -37,6 +37,8 @@ pub fn eviction_target(max_size: u64) -> u64 {
     ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
 }
 
+pub use kache_core::store_config::HeldBytesBudget;
+
 /// The high edge of GC's hysteresis band: the size a sweep *fires* at.
 ///
 /// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids

@@ -2,6 +2,7 @@ use crate::store::StoreHashExt;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use chrono::Utc;
+use kache_store::eviction::HeldBytesBudget;
 pub(crate) use kache_store::markers::*;
 use std::path::{Component, Path, PathBuf};
 
@@ -412,18 +413,19 @@ fn read_auto_gc_backoff(cache_dir: &Path) -> Option<AutoGcBackoff> {
 }
 
 /// The record after a sweep that left the store at `size_after`, `held` of
-/// it held by target directories. Back under the trigger once the held bytes
-/// are left out, there is no backoff, and a record remains only to carry
-/// `held`. Otherwise the interval doubles, starting from the check interval,
-/// up to [`AUTO_GC_MAX_BACKOFF`].
+/// it held by target directories. Back under the trigger once `budget` has
+/// left out what it leaves out of `held`, there is no backoff, and a record
+/// remains only to carry `held`. Otherwise the interval doubles, starting
+/// from the check interval, up to [`AUTO_GC_MAX_BACKOFF`].
 fn next_auto_gc_backoff(
     previous: Option<AutoGcBackoff>,
     now: u64,
     size_after: u64,
     held: u64,
     max_size: u64,
+    budget: HeldBytesBudget,
 ) -> Option<AutoGcBackoff> {
-    if size_after.saturating_sub(held) <= auto_gc_threshold(max_size) {
+    if size_after.saturating_sub(budget.left_out(held)) <= auto_gc_threshold(max_size) {
         return (held > 0).then_some(AutoGcBackoff {
             since: now,
             interval_secs: 0,
@@ -471,11 +473,19 @@ pub(crate) fn auto_gc_sweep_due(config: &Config, total: u64) -> bool {
         unix_now_secs(),
         total,
         config.max_size,
+        config.held_bytes_budget,
     )
 }
 
-fn auto_gc_due_at(backoff: Option<AutoGcBackoff>, now: u64, total: u64, max_size: u64) -> bool {
-    total.saturating_sub(recent_held_bytes(backoff, now)) > auto_gc_threshold(max_size)
+fn auto_gc_due_at(
+    backoff: Option<AutoGcBackoff>,
+    now: u64,
+    total: u64,
+    max_size: u64,
+    budget: HeldBytesBudget,
+) -> bool {
+    total.saturating_sub(budget.left_out(recent_held_bytes(backoff, now)))
+        > auto_gc_threshold(max_size)
         && !auto_gc_backoff_holds(backoff, now, total, max_size)
 }
 
@@ -490,6 +500,7 @@ pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64, held: u64
         size_after,
         held,
         config.max_size,
+        config.held_bytes_budget,
     );
     let Some(next) = next else {
         let _ = std::fs::remove_file(&path);

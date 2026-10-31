@@ -2185,6 +2185,7 @@ mod tests {
                 seed_new_targets: None,
                 build_script_hermetic: None,
                 gc_evict_shared: Some(true),
+                count_held_in_max_size: None,
                 storage_layout_advice: None,
                 heartbeat_secs: None,
                 explain_miss: None,

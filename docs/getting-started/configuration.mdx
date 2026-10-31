@@ -124,6 +124,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
+| `KACHE_COUNT_HELD_IN_MAX_SIZE` | `cache.count_held_in_max_size` | `false` | Count bytes build outputs still hold toward `local_max_size`, evicting other entries to make up for them |
 | `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon heal the blob index and compact `index.db` when the machine is quiet. See [Daemon index maintenance](#daemon-index-maintenance). |
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_SHARE_TARGET_FILES` | `cache.auto_share_target_files` | `true` | Let the daemon replace target files that are full copies of stored blobs with clones of those blobs. See [Target directory cleanup](#target-directory-cleanup). |
@@ -264,6 +265,15 @@ gc_evict_shared = true
 ```
 
 The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this option, GC can drop an entry even though target files still hold all its blocks. The registered store size falls, but disk usage does not. A later build must compile or download that entry again. Explicit `purge` and repair operations remain unconditional regardless of this setting.
+
+If `local_max_size` should bound everything the store holds, held bytes included, count them toward it:
+
+```toml title="~/.config/kache/config.toml"
+[cache]
+count_held_in_max_size = true
+```
+
+The equivalent environment setting is `KACHE_COUNT_HELD_IN_MAX_SIZE=1`. A size sweep still keeps the entries a build output holds, since removing them frees no disk. It evicts other entries, in the usual order, until the whole store is under the target, and the automatic trigger compares the whole store with 110% of `local_max_size`. Each eviction frees disk. When held bytes alone exceed the target, every other entry the sweep may remove goes, and the store stays over budget until those build outputs are removed.
 
 ### Volume shards
 

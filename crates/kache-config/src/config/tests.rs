@@ -547,6 +547,29 @@ fn gc_evict_shared_is_opt_in_and_obeys_env_precedence() {
 }
 
 #[test]
+fn count_held_in_max_size_is_opt_in_and_obeys_env_precedence() {
+    use kache_core::store_config::HeldBytesBudget;
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_COUNT_HELD_IN_MAX_SIZE");
+    let budget = || Config::load().unwrap().held_bytes_budget;
+
+    assert_eq!(budget(), HeldBytesBudget::LeftOut);
+    std::fs::write(&config_path, "[cache]\ncount_held_in_max_size = true\n").unwrap();
+    assert_eq!(budget(), HeldBytesBudget::Counted);
+    assert_eq!(
+        kache_core::store_config::Config::from(&Config::load().unwrap()).held_bytes_budget,
+        HeldBytesBudget::Counted,
+        "the store sweeps with the same budget"
+    );
+
+    let _override = NamedEnvGuard::set("KACHE_COUNT_HELD_IN_MAX_SIZE", "0");
+    assert_eq!(budget(), HeldBytesBudget::LeftOut);
+}
+
+#[test]
 fn index_auto_compact_is_on_by_default_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -2836,6 +2859,7 @@ fn test_file_config_roundtrip() {
             seed_new_targets: None,
             build_script_hermetic: None,
             gc_evict_shared: None,
+            count_held_in_max_size: None,
             storage_layout_advice: None,
             heartbeat_secs: None,
             explain_miss: None,
@@ -3496,6 +3520,7 @@ fn test_config_store_dir() {
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
+        held_bytes_budget: Default::default(),
         storage_layout_advice: true,
         heartbeat_secs: 30,
         explain_miss: false,
@@ -3584,6 +3609,7 @@ fn test_config_index_db_path() {
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
+        held_bytes_budget: Default::default(),
         storage_layout_advice: true,
         heartbeat_secs: 30,
         explain_miss: false,
@@ -3668,6 +3694,7 @@ fn test_config_event_log_path() {
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
+        held_bytes_budget: Default::default(),
         storage_layout_advice: true,
         heartbeat_secs: 30,
         explain_miss: false,
@@ -3771,6 +3798,7 @@ fn test_config_socket_path() {
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
+        held_bytes_budget: Default::default(),
         storage_layout_advice: true,
         heartbeat_secs: 30,
         explain_miss: false,
@@ -4510,6 +4538,7 @@ fn test_save_and_load_file_config() {
             seed_new_targets: None,
             build_script_hermetic: None,
             gc_evict_shared: None,
+            count_held_in_max_size: None,
             storage_layout_advice: None,
             heartbeat_secs: None,
             explain_miss: None,

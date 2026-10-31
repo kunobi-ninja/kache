@@ -124,6 +124,7 @@ mod tests {
             cache_dir: temp.path().join("cache"),
             max_size: 1 << 20,
             gc_evict_shared: false,
+            held_bytes_budget: Default::default(),
             upload_spool_max_jobs: 128,
             deferred_durability: false,
         })

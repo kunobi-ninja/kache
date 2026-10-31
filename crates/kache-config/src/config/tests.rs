@@ -579,6 +579,58 @@ fn index_auto_compact_is_on_by_default_and_obeys_env_precedence() {
 }
 
 #[test]
+fn index_synchronous_defaults_to_normal_and_obeys_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_INDEX_SYNCHRONOUS");
+    let loaded = || Config::load().unwrap().index_synchronous;
+
+    assert_eq!(loaded(), IndexSynchronous::Normal);
+
+    std::fs::write(&config_path, "[cache]\nindex_synchronous = \"off\"\n").unwrap();
+    assert_eq!(loaded(), IndexSynchronous::Off);
+
+    // A blank or unknown variable leaves the file's value in charge.
+    for ignored in ["", "  ", "full"] {
+        let _override = NamedEnvGuard::set("KACHE_INDEX_SYNCHRONOUS", ignored);
+        assert_eq!(loaded(), IndexSynchronous::Off, "{ignored:?}");
+    }
+
+    let _override = NamedEnvGuard::set("KACHE_INDEX_SYNCHRONOUS", "normal");
+    assert_eq!(loaded(), IndexSynchronous::Normal);
+    drop(_override);
+
+    std::fs::write(&config_path, "[cache]\nindex_synchronous = \"fast\"\n").unwrap();
+    assert_eq!(loaded(), IndexSynchronous::Normal);
+
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nindex_synchronous = \"normal\"\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set("KACHE_INDEX_SYNCHRONOUS", "off");
+    assert_eq!(loaded(), IndexSynchronous::Normal);
+}
+
+#[test]
+fn store_config_carries_the_index_synchronous_mode() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _override = NamedEnvGuard::set("KACHE_INDEX_SYNCHRONOUS", "off");
+
+    let config = Config::load().unwrap();
+
+    assert_eq!(
+        kache_core::store_config::Config::from(&config).index_synchronous,
+        IndexSynchronous::Off
+    );
+}
+
+#[test]
 fn target_cleanup_defaults_and_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -2826,6 +2878,7 @@ fn test_file_config_roundtrip() {
             daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
+            index_synchronous: None,
             auto_clean_orphaned_targets: None,
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
@@ -3486,6 +3539,7 @@ fn test_config_store_dir() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_synchronous: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -3574,6 +3628,7 @@ fn test_config_index_db_path() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_synchronous: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -3658,6 +3713,7 @@ fn test_config_event_log_path() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_synchronous: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -3761,6 +3817,7 @@ fn test_config_socket_path() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_synchronous: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -4500,6 +4557,7 @@ fn test_save_and_load_file_config() {
             daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
+            index_synchronous: None,
             auto_clean_orphaned_targets: None,
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,

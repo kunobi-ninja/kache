@@ -4518,6 +4518,12 @@ mod tests {
         let first = Requester::running(cache, 2, 1, background);
         let second = Requester::running(cache, 2, 1, background);
         let large = Requester::queued(cache, 2, 2, background, 1);
+        // Equal millisecond ranks are ordered by random ticket ID. Ensure the
+        // later requests actually rank after the large one.
+        let large_rank = queued(cache)[0].rank;
+        wait_until("a later request rank", || {
+            queue::rank(SystemTime::now(), background) > large_rank
+        });
 
         // While the large request does not fit, smaller ones pass it, once
         // per slot of the pool.
@@ -4525,9 +4531,15 @@ mod tests {
         let pass_one = Requester::running(cache, 2, 1, background);
         second.finish();
         let pass_two = Requester::running(cache, 2, 1, background);
-        let waiting = queued(cache);
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(queue::passes(&scheduler_root(cache), &waiting[0]), 2);
+        {
+            let root = scheduler_root(cache);
+            // Refresh truncates and rewrites ticket state under this lock.
+            // Read the pass count under the same lock to avoid a partial read.
+            let _queue = queue::lock(&root, Duration::from_secs(5)).unwrap().unwrap();
+            let waiting = queued(cache);
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(queue::passes(&root, &waiting[0]), 2);
+        }
 
         // The budget is spent: a freed slot is saved for the large request.
         pass_one.finish();

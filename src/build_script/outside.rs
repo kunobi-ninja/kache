@@ -204,6 +204,7 @@ pub(super) fn restore(
         let path = artifact.target().to_path_buf();
         artifact.publish_replacing()?;
         set_executable(&path, executable)?;
+        link::touch_mtime_write_clock(&path)?;
     }
     for (blob, path, executable) in texts {
         std::fs::write(&path, environment.denormalize(&std::fs::read(&blob)?))?;

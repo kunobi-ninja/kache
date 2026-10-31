@@ -80,6 +80,71 @@ fn lock_polls_back_off_from_a_millisecond_to_the_interval() {
     assert_eq!(naps, vec![1, 2, 4, 8, 16, 32, 64, 100, 100, 100]);
 }
 
+#[test]
+fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
+    for upgrade in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
+        store
+            .db
+            .execute_batch(
+                "WITH RECURSIVE rows(n) AS (
+                     SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 1000
+                 )
+                 INSERT INTO entries(cache_key, crate_name, committed, durable)
+                 SELECT printf('durable-%d', n), 'crate', 1, 1 FROM rows;
+                 INSERT INTO entries(cache_key, crate_name, committed, durable)
+                 VALUES ('uncommitted', 'crate', 0, 0);",
+            )
+            .unwrap();
+        if upgrade {
+            store
+                .db
+                .execute_batch("DROP INDEX IF EXISTS idx_entries_durability_pending")
+                .unwrap();
+            store.db.pragma_update(None, "user_version", 13).unwrap();
+        }
+        drop(store);
+        let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        assert_eq!(store.flush_durability(10).unwrap(), 0);
+        for sql in [
+            "SELECT count(*) FROM entries WHERE committed = 1 AND durable = 0",
+            "SELECT cache_key FROM entries WHERE committed = 1 AND durable = 0
+             ORDER BY created_at LIMIT 10",
+        ] {
+            let mut stmt = store
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = stmt
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("idx_entries_durability_pending")),
+                "upgrade={upgrade}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+            let mut stmt = store.db.prepare(sql).unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while rows.next().unwrap().is_some() {}
+            drop(rows);
+            assert_eq!(
+                stmt.get_status(rusqlite::StatementStatus::FullscanStep),
+                0,
+                "upgrade={upgrade}: {sql}"
+            );
+        }
+    }
+}
+
 /// Opening an index runs its DDL once: the second open finds the schema
 /// generation current and skips every statement (each would otherwise
 /// take the write lock), while an index from before the stamp still
@@ -113,7 +178,8 @@ fn index_ddl_runs_once_per_schema_generation() {
     // C memo tables; the generation bump is what makes it migrate.
     db.pragma_update(None, "user_version", 1_i64).unwrap();
     db.execute_batch(
-        "ALTER TABLE entries DROP COLUMN durable;
+        "DROP INDEX idx_entries_durability_pending;
+             ALTER TABLE entries DROP COLUMN durable;
              DROP TABLE cc_mapped_hashes;
              DROP TABLE cc_asm_scans;",
     )

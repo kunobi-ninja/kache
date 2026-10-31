@@ -1967,6 +1967,14 @@ fn json_init_previews_without_writes_and_applies_without_prompts() {
         e.home.join(".cargo").join("config.toml").to_str().unwrap()
     );
     assert!(body["daemon_running"].is_null());
+    assert!(
+        !body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["component"] == "login_service")
+    );
+    let service_installed = body["service_installed"].clone();
     assert!(!e.home.join(".cargo/config.toml").exists());
     assert!(!e.cache.join("daemon.sock").exists());
     let applied = e.cmd().args(args).arg("--yes").output().unwrap();
@@ -1982,9 +1990,14 @@ fn json_init_previews_without_writes_and_applies_without_prompts() {
         !steps.iter().any(|step| step["component"] == "backup"),
         "{steps:?}"
     );
+    assert!(
+        !steps
+            .iter()
+            .any(|step| step["component"] == "login_service")
+    );
     assert_eq!(body["cargo_configured"], true);
     assert_eq!(body["daemon_running"], true);
-    assert_eq!(body["service_installed"], false);
+    assert_eq!(body["service_installed"], service_installed);
     assert!(e.home.join(".cargo/config.toml").exists());
     assert!(!e.home.join(".bashrc").exists());
     assert!(!String::from_utf8_lossy(&applied.stderr).contains("[Y/n]"));

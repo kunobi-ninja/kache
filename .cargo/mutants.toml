@@ -289,6 +289,11 @@ exclude_re = [
     # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
     "src/invocation/unix_broker.rs:.*can_track_client",
     "src/fallback.rs:.*compiler_peer_may_delegate",
+    # The sysctl that reads the process's start-up environment, and the
+    # wrapper that sets what it finds, are cfg(target_os = "macos"). The
+    # `dyld_vars` parser stays in scope; Test (macOS) runs the wrappers.
+    "crates/kache-client/src/dyld_env.rs:.*restore_dyld_env",
+    "crates/kache-client/src/dyld_env.rs:.*own_procargs",
     # touch uses two disjoint kernel flags. XOR and OR produce the same mask;
     # symlink and FIFO tests exercise the meaningful removal of either flag.
     "crates/kache-ipc/src/execution/workspace.rs:.*replace \\| with \\^ in touch$",

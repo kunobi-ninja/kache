@@ -605,7 +605,7 @@ Forgets the stored planner session and asks the identity provider to revoke it.
 runner = ["kache", "test-runner"]
 ```
 
-Cargo runs each test binary as `kache test-runner <binary> <args>`. A test binary waits for slots in the scheduler's pool, then runs with its arguments, stdin, exit code and signals unchanged. Binaries without Cargo's hash suffix (`cargo run` targets, doctests), `--list` and `--bench` runs start at once, as does everything when the scheduler is off. Cargo is the caller, so the command is not listed in `kache --help`. See [Test runner](/docs/getting-started/configuration#test-runner).
+Cargo runs each test binary as `kache test-runner <binary> <args>`. A test binary waits for slots in the scheduler's pool, then runs with its arguments, stdin, exit code and signals unchanged. On macOS it also gets the `DYLD_*` variables Cargo passed, such as the `DYLD_FALLBACK_LIBRARY_PATH` that lets a binary linked against Rust dylibs (Bevy's `dynamic_linking`) find the standard library. macOS hides these variables from the signed `kache` binaries, so the runner reads them from the environment the process started with. Binaries without Cargo's hash suffix (`cargo run` targets, doctests), `--list` and `--bench` runs start at once, as does everything when the scheduler is off. Cargo is the caller, so the command is not listed in `kache --help`. See [Test runner](/docs/getting-started/configuration#test-runner).
 
 ## `kache completions`
 

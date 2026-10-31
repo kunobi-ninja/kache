@@ -3309,19 +3309,41 @@ mod tests {
         let root = dir.path().to_path_buf();
         let waiter =
             std::thread::spawn(move || test_scheduler(&root, 1).acquire_permit(1).is_some());
-        // Inside the wait, and early enough that a 200 ms slice is still running
-        // when the permit is dropped.
+        #[cfg(target_os = "linux")]
+        wait_until("the permit waiter to queue", || {
+            queued(dir.path()).len() == 1
+        });
+        // macOS observes the kernel unlock event rather than a wake counter.
+        #[cfg(not(target_os = "linux"))]
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             !waiter.is_finished(),
             "the waiter must still be blocked on the held slot"
         );
+        #[cfg(target_os = "linux")]
+        {
+            // Keep admission from removing the waiter's ticket and publishing
+            // its own wake, so only dropping this permit can move the counter.
+            let _queue = queue::lock(&holder.root, Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let seen = permit_wait::snapshot(&holder.root);
+            drop(permit);
+            assert_ne!(
+                permit_wait::snapshot(&holder.root),
+                seen,
+                "dropping the permit must publish a wake"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
         let started = std::time::Instant::now();
+        #[cfg(not(target_os = "linux"))]
         drop(permit);
         assert!(
             waiter.join().unwrap(),
             "the waiter must take the slot after it is released"
         );
+        #[cfg(not(target_os = "linux"))]
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "woke after {:?}; releasing a permit has to interrupt the wait",

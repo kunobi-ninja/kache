@@ -91,7 +91,7 @@ fn compiler_identity_migrates_without_discarding_legacy_entries() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        crate::store::INDEX_SCHEMA_GENERATION
     );
     assert_eq!(
         db.query_row(

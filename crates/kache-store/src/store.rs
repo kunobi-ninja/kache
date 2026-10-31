@@ -1719,6 +1719,11 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     // Whether the entry's blobs and metadata were fsynced (deferred
     // durability). Rows from before the column were always flushed on put.
     let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN durable INTEGER NOT NULL DEFAULT 1");
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_entries_durability_pending
+         ON entries(created_at, cache_key)
+         WHERE committed = 1 AND durable = 0;",
+    )?;
     // What a miss on this entry would cost to rebuild (kunobi-ninja/kache#594).
     // Recorded in every entry's meta.json since long before this column, so
     // pre-existing rows are backfilled by `backfill_compile_times` rather than
@@ -1885,7 +1890,8 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 /// 12: replace incompatible `record_json` prediction memos with the current
 ///    payload schema. Compiled cache entries are retained.
 /// 13: `entries.rustc_version`, for explicit compiler-version cleanup.
-const INDEX_SCHEMA_GENERATION: i64 = 13;
+/// 14: partial index for pending durability counts and ordered flush batches.
+const INDEX_SCHEMA_GENERATION: i64 = 14;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's

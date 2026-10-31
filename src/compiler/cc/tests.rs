@@ -2975,6 +2975,10 @@ fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let object = dir.path().join("input.o");
     fs::write(&object, b"same object bytes").unwrap();
+    let compiler_program = crate::compiler::resolve_program_on_path("rustc")
+        .expect("rustc must be available to run the tests")
+        .to_string_lossy()
+        .into_owned();
     let compiler = CcCompiler::for_invocation(Vec::new(), &env).with_cache_cc_links(true);
     let file_hasher = crate::cache_key::FileHasher::new_for(&env);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
@@ -2992,7 +2996,7 @@ fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
     // under NFC. The linker embeds their distinct raw SONAME bytes.
     let key = |soname: &str| {
         let argv = vec![
-            "cc".to_string(),
+            compiler_program.clone(),
             "-shared".to_string(),
             object.to_string_lossy().into_owned(),
             format!("-Wl,-soname,{soname}"),
@@ -3015,9 +3019,13 @@ fn cache_key_for_link_changes_when_an_object_changes() {
     let out = dir.path().join("prog");
     fs::write(&a, b"obj-a-v1").unwrap();
     fs::write(&b, b"obj-b").unwrap();
+    let compiler_program = crate::compiler::resolve_program_on_path("rustc")
+        .expect("rustc must be available to run the tests")
+        .to_string_lossy()
+        .into_owned();
     let compiler = CcCompiler::new().with_cache_cc_links(true);
     let argv = s(&[
-        "cc",
+        &compiler_program,
         a.to_str().unwrap(),
         b.to_str().unwrap(),
         "-o",

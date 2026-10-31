@@ -1007,6 +1007,7 @@ fn effective_config(
         socket_path: config.socket_path().display().to_string(),
         started_at_ms: unix_time_ms(),
         auto_recover_min_free_bytes: Some(config.auto_recover_min_free_bytes),
+        restore_max_size: Some(config.restore_max_size),
         auto_recover_targets: Some(config.auto_recover_targets),
     }
 }
@@ -4546,6 +4547,7 @@ impl Daemon {
                     entry.payload,
                     &entry_dir,
                     None,
+                    self.config.restore_max_size,
                 ) {
                     Ok(extracted) => verified.push((extracted, guard, pack_index, entry_index)),
                     Err(error) => {

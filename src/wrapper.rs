@@ -2293,7 +2293,7 @@ fn run_cc_with_store(
         } else {
             let restore_start = std::time::Instant::now();
             let trace_restore = crate::phase_trace::phase("restore");
-            let restored = restore_cc_hit(hit_store, parsed, meta);
+            let restored = restore_cc_hit(config.restore_max_size, hit_store, parsed, meta);
             drop(trace_restore);
             if let Err(e) = &restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
@@ -2426,7 +2426,7 @@ fn run_cc_with_store(
         cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(parsed, meta))
     }) {
         let restore_start = std::time::Instant::now();
-        let restored = restore_cc_hit(store, parsed, meta);
+        let restored = restore_cc_hit(config.restore_max_size, store, parsed, meta);
         if let Err(e) = restored {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
                 return Err(e);
@@ -3170,6 +3170,7 @@ fn prepare_cc_cached_artifact(
 }
 
 fn apply_cc_post_publish_actions(
+    restore_max_size: u64,
     published: &[(PathBuf, ArtifactKind)],
     env: &crate::invocation::InvocationEnv,
 ) -> Result<()> {
@@ -3183,9 +3184,11 @@ fn apply_cc_post_publish_actions(
             if action.is_content_transform() {
                 continue;
             }
-            action.apply(path, &*host).with_context(|| {
-                format!("cc restore: applying {action:?} to {}", path.display())
-            })?;
+            action
+                .apply(path, &*host, restore_max_size)
+                .with_context(|| {
+                    format!("cc restore: applying {action:?} to {}", path.display())
+                })?;
         }
     }
     Ok(())
@@ -3194,11 +3197,12 @@ fn apply_cc_post_publish_actions(
 /// All finalization happens after publication, so any failure must stop the
 /// caller from invoking the compiler over the restored outputs.
 fn finalize_cc_restore(
+    restore_max_size: u64,
     published: &[(PathBuf, ArtifactKind)],
     parsed: &crate::compiler::cc::CcArgs,
 ) -> Result<()> {
     let finish = || -> Result<()> {
-        apply_cc_post_publish_actions(published, &parsed.invocation_env)?;
+        apply_cc_post_publish_actions(restore_max_size, published, &parsed.invocation_env)?;
         #[cfg(unix)]
         if parsed.mode == crate::compiler::cc::CompileMode::Link
             && let Some(output) = parsed.object_output_path()
@@ -3293,6 +3297,7 @@ fn restore_cc_stdout_from_cache(
 
 /// Decode and validate diagnostic locations before publishing any hit output.
 fn restore_cc_hit(
+    restore_max_size: u64,
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     mut meta: EntryMeta,
@@ -3307,7 +3312,7 @@ fn restore_cc_hit(
     {
         meta.stderr = stderr;
     }
-    restore_cc_from_cache(store, parsed, &meta)?;
+    restore_cc_from_cache(restore_max_size, store, parsed, &meta)?;
     Ok(meta)
 }
 
@@ -3318,6 +3323,7 @@ fn restore_cc_hit(
 /// after publication starts, the caller receives `PartialCcRestore` and must
 /// not run the compiler over the partially restored output set.
 fn restore_cc_from_cache(
+    restore_max_size: u64,
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
@@ -3417,7 +3423,7 @@ fn restore_cc_from_cache(
         published_kinds.push((target, kind));
     }
     publish_prepared_cc_artifacts(prepared)?;
-    finalize_cc_restore(&published_kinds, parsed)
+    finalize_cc_restore(restore_max_size, &published_kinds, parsed)
 }
 
 /// After a local miss, ask the daemon for an exact remote entry.
@@ -3449,7 +3455,7 @@ fn cc_try_remote_hit(
         return Ok(None);
     };
     let restore_start = std::time::Instant::now();
-    let restored = restore_cc_hit(store, parsed, meta);
+    let restored = restore_cc_hit(config.restore_max_size, store, parsed, meta);
     if let Err(e) = restored {
         if e.downcast_ref::<PartialCcRestore>().is_some() {
             return Err(e);
@@ -5972,6 +5978,7 @@ enum RestoredBytes {
 ///      recompile** — never a false hit. ENOENT is called out below so the
 ///      degradation reads as the benign race it is rather than corruption.
 fn materialize_cached_artifact(
+    restore_max_size: u64,
     store: &Store,
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
@@ -6144,7 +6151,7 @@ fn materialize_cached_artifact(
             continue;
         }
         let loadability = action
-            .apply(target_path, platform)
+            .apply(target_path, platform, restore_max_size)
             .with_context(|| format!("{context}: applying {action:?}"))?;
         if loadability == crate::compiler::Loadability::Verified {
             verified_now = true;
@@ -8053,6 +8060,7 @@ fn restore_from_cache_with_memo_store(
             continue;
         }
         let restored = materialize_cached_artifact(
+            config.restore_max_size,
             store,
             cached_file,
             &target_path,

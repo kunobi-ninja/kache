@@ -290,6 +290,9 @@ pub struct EffectiveConfig {
     /// predate the field.
     #[serde(default)]
     pub auto_recover_min_free_bytes: Option<u64>,
+    /// Per-entry restore budget. Absent from older daemons.
+    #[serde(default)]
+    pub restore_max_size: Option<u64>,
     /// Whether the daemon's recovery also removes idle targets. `None` from
     /// daemons that predate the field.
     #[serde(default)]

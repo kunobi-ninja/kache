@@ -1692,6 +1692,7 @@ mod tests {
         ])
         .await;
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Gcs(GcsRemoteConfig {
                 bucket: "builds".to_string(),
@@ -2028,6 +2029,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let atomic_write_dir = root.path().join(".staging");
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
@@ -2082,6 +2084,7 @@ mod tests {
     async fn filesystem_concurrent_same_key_puts_never_tear() {
         let root = tempfile::tempdir().unwrap();
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
@@ -2148,6 +2151,7 @@ mod tests {
     async fn filesystem_backend_rejects_parent_traversal() {
         let root = tempfile::tempdir().unwrap();
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
@@ -2718,6 +2722,7 @@ mod tests {
     async fn filesystem_backend_declines_a_conditional_replace() {
         let root = tempfile::tempdir().unwrap();
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
@@ -2998,6 +3003,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, root.path().join("artifacts/v3/key")).unwrap();
 
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
@@ -3068,6 +3074,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("artifacts")).unwrap();
 
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
@@ -3095,6 +3102,7 @@ mod tests {
     async fn filesystem_keys_reject_windows_hostile_shapes() {
         let root = tempfile::tempdir().unwrap();
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".to_string(),
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),

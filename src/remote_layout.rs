@@ -17,15 +17,6 @@ const V3_PACKS: &str = "packs";
 const V3_PREDICTIONS: &str = "predictions";
 const V3_MANIFEST_VERSION: u32 = 3;
 
-/// Cap on total bytes written while extracting one downloaded entry pack.
-/// Generous for real artifact packs (a large crate's rlib + rmeta + debug
-/// info), but lethal to a decompression bomb that expands a few KB into
-/// terabytes. Paired with [`MAX_ZSTD_WINDOW_LOG`] on the decoder (#212).
-const MAX_EXTRACTED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
-
-/// Cap compressed bytes downloaded to the temporary file before extraction.
-const MAX_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
-
 /// Max zstd window-log accepted on decode (2^27 = 128 MiB). Bounds the
 /// decoder's allocation regardless of what the frame header claims (#212).
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
@@ -178,7 +169,7 @@ impl<'a> RemoteLayout<'a> {
                     observer.started(&object_key);
                 }
                 self.backend
-                    .get_into(&object_key, Some(MAX_COMPRESSED_BYTES), &mut spool)
+                    .get_into(&object_key, Some(self.remote.restore_max_size), &mut spool)
                     .await
             })
             .await
@@ -222,6 +213,7 @@ impl<'a> RemoteLayout<'a> {
                 crate_name,
                 meta_digest: None,
             }),
+            self.remote.restore_max_size,
         )?;
         let extract_ms = extract_start.elapsed().as_millis() as u64;
 
@@ -421,6 +413,7 @@ pub(crate) fn extract_verified_prefetch_entry(
     payload: &[u8],
     entry_dir: &Path,
     deadline: Option<Instant>,
+    max_bytes: u64,
 ) -> Result<VerifiedPackEntry> {
     if !crate::cache_key::is_valid_cache_key(cache_key)
         || !crate::cache_key::is_valid_crate_name(crate_name)
@@ -447,6 +440,7 @@ pub(crate) fn extract_verified_prefetch_entry(
             crate_name,
             meta_digest: Some(meta_digest),
         }),
+        max_bytes,
     )?;
     Ok(VerifiedPackEntry {
         restored: VerifiedRestoredEntry {
@@ -637,7 +631,14 @@ fn is_rooted_path(path: &Path) -> bool {
 
 #[cfg(test)]
 fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u64> {
-    Ok(extract_entry_pack_until(reader, dest_dir, None, None)?.original_bytes)
+    Ok(extract_entry_pack_until(
+        reader,
+        dest_dir,
+        None,
+        None,
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+    )?
+    .original_bytes)
 }
 
 struct ExtractedEntry {
@@ -650,6 +651,7 @@ fn extract_entry_pack_until<R: std::io::Read>(
     dest_dir: &Path,
     deadline: Option<Instant>,
     expected: Option<ExpectedEntryBinding<'_>>,
+    max_bytes: u64,
 ) -> Result<ExtractedEntry> {
     deadline_io_check(deadline, "extraction setup")?;
     let parent = dest_dir.parent().unwrap_or(Path::new("/tmp"));
@@ -670,9 +672,9 @@ fn extract_entry_pack_until<R: std::io::Read>(
         // `entry.size()` bytes, so the running declared total upper-bounds what
         // we will ever write to disk — reject before writing anything (#212).
         total_bytes = total_bytes.saturating_add(entry.size());
-        if total_bytes > MAX_EXTRACTED_BYTES {
+        if total_bytes > max_bytes {
             bail!(
-                "entry pack exceeds the {MAX_EXTRACTED_BYTES}-byte extraction cap \
+                "entry pack exceeds the {max_bytes}-byte extraction cap \
                  (possible decompression bomb)"
             );
         }
@@ -1069,6 +1071,7 @@ pub(crate) mod tests {
             auto_share_target_files: false,
             auto_clean_idle_targets_days: 0,
             auto_recover_min_free_bytes: 0,
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
@@ -1190,6 +1193,7 @@ pub(crate) mod tests {
             auto_share_target_files: false,
             auto_clean_idle_targets_days: 0,
             auto_recover_min_free_bytes: 0,
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
@@ -1258,6 +1262,77 @@ pub(crate) mod tests {
         assert!(!restore_entry_dir.join("libfoo.rlib").exists());
     }
 
+    #[tokio::test]
+    async fn remote_download_and_extraction_use_configured_restore_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = min_config(tmp.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"size-budget").to_hex().to_string();
+        let source = tmp.path().join("source.rlib");
+        std::fs::write(&source, vec![b'x'; 4096]).unwrap();
+        store
+            .put(
+                &key,
+                "serde",
+                &["lib".to_owned()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(source, "libserde.rlib".to_owned())],
+                "",
+                "",
+            )
+            .unwrap();
+        let dir = store.entry_dir(&key);
+        let meta: EntryMeta =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        let packed = create_entry_pack_zstd(&dir, &store.blobs_dir(), &meta, 3).unwrap();
+        let compressed_bytes = packed.len() as u64;
+        let mut archive = tar::Archive::new(zstd::stream::Decoder::new(&packed[..]).unwrap());
+        let extracted_bytes: u64 = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().size())
+            .sum();
+        assert!(compressed_bytes < extracted_bytes);
+        let backend = memory_backend();
+        let mut remote = test_remote();
+        backend
+            .put(&v3_pack_key(&remote.prefix, &key, "serde"), packed, None)
+            .await
+            .unwrap();
+        for (cap, stage) in [
+            (compressed_bytes - 1, "download"),
+            (compressed_bytes, "extraction"),
+            (extracted_bytes - 1, "extraction"),
+            (extracted_bytes, "success"),
+        ] {
+            remote.restore_max_size = cap;
+            let restored = tmp.path().join(format!("remote-cap-{cap}"));
+            let result = RemoteLayout::new(&backend, &remote)
+                .download_entry_until(&key, "serde", &restored, tmp.path(), None)
+                .await;
+            if stage == "success" {
+                result.unwrap();
+                assert_eq!(
+                    std::fs::read(restored.join("libserde.rlib")).unwrap(),
+                    vec![b'x'; 4096]
+                );
+            } else {
+                let error = format!("{:#}", result.err().unwrap());
+                assert!(
+                    error.contains(if stage == "download" {
+                        "downloading v3 pack"
+                    } else {
+                        "extraction cap"
+                    }),
+                    "{error}"
+                );
+                assert!(!restored.exists());
+            }
+        }
+    }
+
     #[test]
     fn packed_prefetch_checks_each_outer_and_inner_binding_independently() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1290,6 +1365,35 @@ pub(crate) mod tests {
             .to_string();
         let packed = create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap();
 
+        let mut archive = tar::Archive::new(zstd::stream::Decoder::new(&packed[..]).unwrap());
+        let extracted_bytes: u64 = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().size())
+            .sum();
+        for cap in [extracted_bytes - 1, extracted_bytes] {
+            let restored = tmp.path().join(format!("prefetch-cap-{cap}"));
+            let result = extract_verified_prefetch_entry(
+                &key,
+                "serde",
+                &meta_digest,
+                &packed,
+                &restored,
+                None,
+                cap,
+            );
+            if cap < extracted_bytes {
+                assert!(format!("{:#}", result.err().unwrap()).contains("extraction cap"));
+                assert!(!restored.exists());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    std::fs::read(restored.join("libserde.rlib")).unwrap(),
+                    b"packed binding artifact"
+                );
+            }
+        }
+
         for (cache_key, crate_name, expected_error) in [
             ("invalid", "serde", "invalid packed-prefetch entry binding"),
             (
@@ -1314,6 +1418,7 @@ pub(crate) mod tests {
                 &packed,
                 &restored,
                 None,
+                crate::config::DEFAULT_RESTORE_MAX_SIZE,
             )
             .err()
             .expect("a mismatched binding must be rejected");
@@ -1325,10 +1430,17 @@ pub(crate) mod tests {
         }
 
         let restored = tmp.path().join("restored-invalid-meta-digest");
-        let err =
-            extract_verified_prefetch_entry(&key, "serde", "invalid", &packed, &restored, None)
-                .err()
-                .expect("a malformed metadata digest must be rejected at the outer binding gate");
+        let err = extract_verified_prefetch_entry(
+            &key,
+            "serde",
+            "invalid",
+            &packed,
+            &restored,
+            None,
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        )
+        .err()
+        .expect("a malformed metadata digest must be rejected at the outer binding gate");
         assert!(
             err.to_string()
                 .contains("invalid packed-prefetch entry binding")
@@ -1338,10 +1450,17 @@ pub(crate) mod tests {
         let wrong_digest = blake3::hash(b"other metadata").to_hex().to_string();
         assert_ne!(wrong_digest, meta_digest);
         let restored = tmp.path().join("restored-wrong-meta-digest");
-        let error =
-            extract_verified_prefetch_entry(&key, "serde", &wrong_digest, &packed, &restored, None)
-                .err()
-                .expect("a valid-format mismatched metadata digest must be rejected");
+        let error = extract_verified_prefetch_entry(
+            &key,
+            "serde",
+            &wrong_digest,
+            &packed,
+            &restored,
+            None,
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        )
+        .err()
+        .expect("a valid-format mismatched metadata digest must be rejected");
         assert_eq!(
             error.to_string(),
             format!(
@@ -1351,9 +1470,16 @@ pub(crate) mod tests {
         assert!(!restored.exists());
 
         let restored = tmp.path().join("restored-matching-binding");
-        let verified =
-            extract_verified_prefetch_entry(&key, "serde", &meta_digest, &packed, &restored, None)
-                .unwrap();
+        let verified = extract_verified_prefetch_entry(
+            &key,
+            "serde",
+            &meta_digest,
+            &packed,
+            &restored,
+            None,
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        )
+        .unwrap();
         assert_eq!(verified.restored.meta, meta);
         assert_eq!(
             std::fs::read(restored.join("libserde.rlib")).unwrap(),
@@ -1394,6 +1520,7 @@ pub(crate) mod tests {
             auto_share_target_files: false,
             auto_clean_idle_targets_days: 0,
             auto_recover_min_free_bytes: 0,
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
@@ -1572,6 +1699,7 @@ pub(crate) mod tests {
             auto_share_target_files: false,
             auto_clean_idle_targets_days: 0,
             auto_recover_min_free_bytes: 0,
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
@@ -2262,6 +2390,7 @@ pub(crate) mod tests {
         );
 
         let remote = RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: String::new(),
             backend: crate::config::RemoteBackendConfig::S3(crate::config::S3RemoteConfig {
                 bucket: "bucket".to_string(),

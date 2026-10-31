@@ -812,6 +812,7 @@ fn min_store_compile_is_opt_in_and_obeys_env_precedence() {
 #[test]
 fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
     let filesystem = RemoteConfig {
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
             root: PathBuf::from("/cache"),
@@ -819,6 +820,7 @@ fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
         }),
     };
     let s3 = RemoteConfig {
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: RemoteBackendConfig::S3(S3RemoteConfig {
             bucket: "bucket".to_string(),
@@ -1733,7 +1735,7 @@ fn a_malformed_host_file_is_ignored_and_reported() {
     let _lock = config_path_lock();
     for host_content in [
         "[cache\nthis is not toml",
-        "[cache]\nlocal_max_size = 5\n", // valid TOML, wrong type
+        "[cache]\nlocal_max_size = true\n", // valid TOML, wrong type
     ] {
         let dir = tempfile::tempdir().unwrap();
         let (host, chosen) = write_host_and_chosen(
@@ -2830,6 +2832,7 @@ fn test_file_config_roundtrip() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
+            restore_max_size: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
@@ -3490,6 +3493,7 @@ fn test_config_store_dir() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3578,6 +3582,7 @@ fn test_config_index_db_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3662,6 +3667,7 @@ fn test_config_event_log_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3765,6 +3771,7 @@ fn test_config_socket_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -4504,6 +4511,7 @@ fn test_save_and_load_file_config() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
+            restore_max_size: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,

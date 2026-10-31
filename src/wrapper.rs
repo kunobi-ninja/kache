@@ -2314,7 +2314,7 @@ fn run_cc_with_store(
                         restore_failure_reason(e),
                     );
                 }
-                lookup_rejection = format!("read-only restore failed: {e:#}");
+                lookup_rejection = format!("read-only {}", restore_failure_reason(e));
             }
             if let Ok(meta) = restored {
                 let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -8692,8 +8692,10 @@ fn uncacheable_reason(error: &anyhow::Error) -> String {
 }
 
 /// Keep the root cause when a failed restore is recorded for report/explain.
+/// The chain can quote a tar entry name from a remote archive, so it gets the
+/// same guards as a store error before it is persisted.
 fn restore_failure_reason(error: &anyhow::Error) -> String {
-    format!("restore failed: {error:#}")
+    format!("restore failed: {}", store_error_for_event(error))
 }
 
 /// What a passthrough reason quotes of rustc's own output. A failed pre-pass
@@ -9268,7 +9270,8 @@ pub(crate) fn log_event(config: &Config, inputs: EventInputs<'_>) {
     write_event(config, &event);
 }
 
-/// Render a failed `Store::put` for the event log and the report.
+/// Render a failed `Store::put`, or a failed restore through
+/// `restore_failure_reason`, for the event log and the report.
 ///
 /// `{:#}` keeps anyhow's whole context chain — the outer context alone
 /// ("creating blob shard directory") never names the cause. Two guards, because
@@ -9280,8 +9283,9 @@ pub(crate) fn log_event(config: &Config, inputs: EventInputs<'_>) {
 ///   event line in the log.
 ///
 /// Hardening for shape, not secrecy: it does not redact. The reason is derived
-/// from filesystem and SQLite errors, so it can carry absolute paths, and a
-/// report shared outside the machine carries them too.
+/// from filesystem, SQLite and archive errors, so it can carry absolute paths
+/// and entry names from a remote archive, and a report shared outside the
+/// machine carries them too.
 pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
     const MAX_CHARS: usize = 2048;
 

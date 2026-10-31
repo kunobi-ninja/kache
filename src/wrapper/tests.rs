@@ -1949,6 +1949,38 @@ fn only_an_uncacheable_reason_quotes_rustc_output() {
 }
 
 #[test]
+fn restore_events_keep_the_debug_bundle_limit_cause() {
+    use crate::compiler::{PostRestoreAction, platform::tests::CountingPlatform};
+
+    let dir = tempfile::tempdir().unwrap();
+    let tar_path = dir.path().join("oversized.dsym.tar");
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path("Contents/Resources/DWARF/oversized")
+        .unwrap();
+    header.set_mode(0o644);
+    header.set_size(8_589_934_593);
+    header.set_cksum();
+    std::fs::write(&tar_path, header.as_bytes()).unwrap();
+    let error = PostRestoreAction::UnpackDebugBundle
+        .apply(&tar_path, &CountingPlatform::new())
+        .unwrap_err()
+        .context("rustc restore: applying UnpackDebugBundle");
+
+    let config = test_config(dir.path().join("cache"));
+    log_event(
+        &config,
+        EventInputs::new("root", "oversized", EventResult::Skipped, 0)
+            .skip_reason(restore_failure_reason(&error)),
+    );
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(
+        events.last().unwrap().skip_reason,
+        "restore failed: rustc restore: applying UnpackDebugBundle: debug bundle exceeds the 8589934592-byte extraction cap"
+    );
+}
+
+#[test]
 fn a_prestage_candidate_is_a_stored_file_of_at_least_the_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let file = |name: &str, len: u64| {

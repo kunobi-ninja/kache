@@ -1429,7 +1429,7 @@ pub(crate) fn run_nvcc_for(
             let restore_start = std::time::Instant::now();
             if let Err(e) = restore_nvcc_from_cache(hit_store, &parsed, &meta) {
                 tracing::warn!(
-                    "restoring nvcc cache hit for {crate_name} failed: {e} — recompiling"
+                    "restoring nvcc cache hit for {crate_name} failed: {e:#} — recompiling"
                 );
                 return nvcc_passthrough_with_event(
                     config,
@@ -1437,7 +1437,7 @@ pub(crate) fn run_nvcc_for(
                     &crate_name,
                     &event_root,
                     start,
-                    format!("restore failed: {e}"),
+                    restore_failure_reason(&e),
                 );
             }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -1507,7 +1507,7 @@ pub(crate) fn run_nvcc_for(
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_nvcc_from_cache(&store, &parsed, &meta) {
             tracing::warn!(
-                "restoring nvcc coalesced hit for {crate_name} failed: {e} — recompiling"
+                "restoring nvcc coalesced hit for {crate_name} failed: {e:#} — recompiling"
             );
             return nvcc_passthrough_with_event(
                 config,
@@ -1515,7 +1515,7 @@ pub(crate) fn run_nvcc_for(
                 &crate_name,
                 &event_root,
                 start,
-                format!("restore failed: {e}"),
+                restore_failure_reason(&e),
             );
         }
         let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -1916,7 +1916,7 @@ fn nvcc_try_remote_hit(
     let restore_start = std::time::Instant::now();
     if let Err(e) = restore_nvcc_from_cache(store, parsed, &meta) {
         tracing::warn!(
-            "restoring nvcc remote cache hit for {crate_name} failed: {e} — recompiling"
+            "restoring nvcc remote cache hit for {crate_name} failed: {e:#} — recompiling"
         );
         return Ok(Some(nvcc_passthrough_with_event(
             config,
@@ -1924,7 +1924,7 @@ fn nvcc_try_remote_hit(
             crate_name,
             event_root,
             start,
-            format!("restore failed: {e}"),
+            restore_failure_reason(&e),
         )?));
     }
     let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -2300,7 +2300,7 @@ fn run_cc_with_store(
                     return restored.map(|_| 0);
                 }
                 tracing::warn!(
-                    "restoring cc cache hit for {} failed: {} — recompiling",
+                    "restoring cc cache hit for {} failed: {:#} — recompiling",
                     crate_name,
                     e
                 );
@@ -2311,10 +2311,10 @@ fn run_cc_with_store(
                         crate_name,
                         event_root,
                         start,
-                        format!("restore failed: {e}"),
+                        restore_failure_reason(e),
                     );
                 }
-                lookup_rejection = format!("read-only restore failed: {e}");
+                lookup_rejection = format!("read-only restore failed: {e:#}");
             }
             if let Ok(meta) = restored {
                 let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -2432,7 +2432,7 @@ fn run_cc_with_store(
                 return Err(e);
             }
             tracing::warn!(
-                "restoring cc coalesced hit for {} failed: {} — recompiling",
+                "restoring cc coalesced hit for {} failed: {:#} — recompiling",
                 crate_name,
                 e
             );
@@ -2442,7 +2442,7 @@ fn run_cc_with_store(
                 crate_name,
                 event_root,
                 start,
-                format!("restore failed: {e}"),
+                restore_failure_reason(&e),
             );
         }
         let meta = restored?;
@@ -3455,7 +3455,7 @@ fn cc_try_remote_hit(
             return Err(e);
         }
         tracing::warn!(
-            "restoring cc remote cache hit for {} failed: {} — recompiling",
+            "restoring cc remote cache hit for {} failed: {:#} — recompiling",
             crate_name,
             e
         );
@@ -3465,7 +3465,7 @@ fn cc_try_remote_hit(
             crate_name,
             event_root,
             start,
-            format!("restore failed: {e}"),
+            restore_failure_reason(&e),
         )?));
     }
     let meta = restored?;
@@ -4501,7 +4501,7 @@ fn run_parsed_rustc(
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "restoring local cache hit for {} failed: {} — recompiling",
+                            "restoring local cache hit for {} failed: {:#} — recompiling",
                             crate_name,
                             e
                         );
@@ -4512,7 +4512,7 @@ fn run_parsed_rustc(
                                 crate_name,
                                 &event_root,
                                 start,
-                                format!("restore failed: {e}"),
+                                restore_failure_reason(&e),
                                 key_record,
                             );
                         }
@@ -4541,7 +4541,7 @@ fn run_parsed_rustc(
         ) {
             if let Err(e) = restored {
                 tracing::warn!(
-                    "restoring cache hit for {} failed: {} — recompiling",
+                    "restoring cache hit for {} failed: {:#} — recompiling",
                     crate_name,
                     e
                 );
@@ -4551,7 +4551,7 @@ fn run_parsed_rustc(
                     crate_name,
                     &event_root,
                     start,
-                    format!("restore failed: {e}"),
+                    restore_failure_reason(&e),
                     key_record,
                 );
             }
@@ -4723,7 +4723,7 @@ fn run_parsed_rustc(
             &key_record,
         ) {
             tracing::warn!(
-                "restoring cache hit for {} failed: {} — recompiling",
+                "restoring cache hit for {} failed: {:#} — recompiling",
                 crate_name,
                 e
             );
@@ -4733,7 +4733,7 @@ fn run_parsed_rustc(
                 crate_name,
                 &event_root,
                 start,
-                format!("restore failed: {e}"),
+                restore_failure_reason(&e),
                 key_record,
             );
         }
@@ -8689,6 +8689,11 @@ const UNCACHEABLE_REASON: &str = "uncacheable|";
 /// (kunobi-ninja/kache#431).
 fn uncacheable_reason(error: &anyhow::Error) -> String {
     format!("{UNCACHEABLE_REASON}{error:#}")
+}
+
+/// Keep the root cause when a failed restore is recorded for report/explain.
+fn restore_failure_reason(error: &anyhow::Error) -> String {
+    format!("restore failed: {error:#}")
 }
 
 /// What a passthrough reason quotes of rustc's own output. A failed pre-pass

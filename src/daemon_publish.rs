@@ -1504,6 +1504,7 @@ mod tests {
         let mut config = crate::test_support::test_config(dir.join("cache"));
         config.auto_gc = false;
         config.remote = Some(crate::config::RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".into(),
             backend: crate::config::RemoteBackendConfig::Filesystem(
                 crate::config::FilesystemRemoteConfig {

@@ -1963,7 +1963,11 @@ fn restore_events_keep_the_debug_bundle_limit_cause() {
     header.set_cksum();
     std::fs::write(&tar_path, header.as_bytes()).unwrap();
     let error = PostRestoreAction::UnpackDebugBundle
-        .apply(&tar_path, &CountingPlatform::new())
+        .apply(
+            &tar_path,
+            &CountingPlatform::new(),
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        )
         .unwrap_err()
         .context("rustc restore: applying UnpackDebugBundle");
 
@@ -2329,6 +2333,7 @@ fn rows_are_asked_of_the_remote_only_with_predictions_and_a_remote() {
     config.input_predictions = true;
     assert!(!fetches_remote_predictions(&config));
     config.remote = Some(crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: crate::config::RemoteBackendConfig::Filesystem(
             crate::config::FilesystemRemoteConfig {
@@ -3045,15 +3050,37 @@ fn cc_hit_validates_both_diagnostic_streams_before_restoring_outputs() {
         } else {
             invalid.stderr = malformed;
         }
-        assert!(restore_cc_hit(&store, &parsed, invalid).is_err());
+        assert!(
+            restore_cc_hit(
+                crate::config::DEFAULT_RESTORE_MAX_SIZE,
+                &store,
+                &parsed,
+                invalid
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&output).unwrap(), b"original output");
     }
     let mut missing_roots = parsed.clone();
     missing_roots.depinfo_roots.clear();
-    assert!(restore_cc_hit(&store, &missing_roots, meta.clone()).is_err());
+    assert!(
+        restore_cc_hit(
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+            &store,
+            &missing_roots,
+            meta.clone()
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(&output).unwrap(), b"original output");
 
-    let restored = restore_cc_hit(&store, &parsed, meta).unwrap();
+    let restored = restore_cc_hit(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        meta,
+    )
+    .unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
     replay_cached_diagnostics(&restored, &mut out, &mut err);
@@ -3796,7 +3823,13 @@ fn restore_cc_from_cache_skips_unrequested_depinfo_and_unknown_artifacts() {
         &[],
     );
 
-    restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap();
 }
 
 /// Degenerate cc invocations with no object path fail before blob access,
@@ -3819,7 +3852,13 @@ fn restore_cc_from_cache_writes_the_preprocessed_output() {
         .unwrap();
     let meta = entry_meta("cc-preprocess-key", vec![cached_file("unit.i", hash)], &[]);
 
-    restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(&output).unwrap(),
         b"# 1 \"unit.c\"\nint expanded;\n",
@@ -3856,7 +3895,13 @@ fn restore_cc_from_cache_writes_the_preprocessed_output() {
     let mismatched = CcCompiler::new()
         .parse(&s(&["cc", "-E", "unit.c", "-o", &other_str]))
         .unwrap();
-    restore_cc_from_cache(&store, &mismatched, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &mismatched,
+        &meta,
+    )
+    .unwrap();
     assert!(
         !other.exists(),
         "an entry for a different name must leave nothing behind"
@@ -3998,7 +4043,13 @@ fn restore_cc_from_cache_writes_the_link_binary_and_sidecar() {
         &[],
     );
 
-    restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(&output).unwrap(),
         b"ELF",
@@ -4019,7 +4070,13 @@ fn restore_cc_from_cache_writes_the_link_binary_and_sidecar() {
     let compile = CcCompiler::new()
         .parse(&s(&["cc", "-c", "unit.c", "-o", &object_str]))
         .unwrap();
-    restore_cc_from_cache(&store, &compile, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &compile,
+        &meta,
+    )
+    .unwrap();
     assert!(
         !object.exists(),
         "an executable blob must not restore onto a compile -o path"
@@ -4051,6 +4108,7 @@ fn restore_cc_from_cache_signs_an_exe_and_a_dylib() {
         .parse(&s(&["cc", "a.o", "-o", &exe_str]))
         .unwrap();
     restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &parsed,
         &entry_meta("cc-exe-key", vec![cached_file("app.exe", exe_hash)], &[]),
@@ -4064,6 +4122,7 @@ fn restore_cc_from_cache_signs_an_exe_and_a_dylib() {
         .parse(&s(&["cc", "a.o", "-o", &dylib_str]))
         .unwrap();
     restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &parsed,
         &entry_meta("cc-so-key", vec![cached_file("libfoo.so", so_hash)], &[]),
@@ -4108,6 +4167,7 @@ fn prepare_cc_store_files_tars_a_dsym_directory_and_restore_unpacks_it() {
         .parse(&s(&["cc", "a.o", "-o", &output_str]))
         .unwrap();
     restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &parsed,
         &entry_meta(
@@ -4163,9 +4223,14 @@ fn restore_cc_from_cache_requires_object_output_for_object_blob() {
         &[],
     );
 
-    let err = restore_cc_from_cache(&store, &parsed, &meta)
-        .unwrap_err()
-        .to_string();
+    let err = restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap_err()
+    .to_string();
 
     assert!(
         err.contains("cannot determine object output path"),
@@ -4196,7 +4261,13 @@ fn restore_cc_object_is_writable_private_and_keeps_blob_immutable() {
         .unwrap();
     let meta = entry_meta("cc-private-key", vec![cached_file("foo.o", hash)], &[]);
 
-    restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap();
 
     let output_meta = std::fs::metadata(&output).unwrap();
     let blob_meta = std::fs::metadata(store.blob_path(hash)).unwrap();
@@ -4226,6 +4297,7 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     let source_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
 
     apply_cc_post_publish_actions(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &[
             (object.clone(), ArtifactKind::Object),
             (depinfo.clone(), ArtifactKind::DepInfo),
@@ -4240,6 +4312,7 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     assert_eq!(std::fs::read(&depinfo).unwrap(), b"unit.o: unit.c\n");
     assert!(
         apply_cc_post_publish_actions(
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
             &[(dir.path().join("missing.o"), ArtifactKind::Object)],
             &crate::invocation::InvocationEnv::capture()
         )
@@ -4262,13 +4335,19 @@ fn cc_link_finalization_errors_prevent_compiler_fallback() {
     ]))
     .unwrap();
     // A publication race may remove the linker output before final chmod.
-    let error = finalize_cc_restore(&[], &parsed).unwrap_err();
+    let error =
+        finalize_cc_restore(crate::config::DEFAULT_RESTORE_MAX_SIZE, &[], &parsed).unwrap_err();
     assert!(error.downcast_ref::<PartialCcRestore>().is_some());
     assert!(format!("{error:#}").contains("cc restore: stat"));
 
     std::fs::write(&output, b"executable").unwrap();
     std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
-    finalize_cc_restore(&[(output.clone(), ArtifactKind::Executable)], &parsed).unwrap();
+    finalize_cc_restore(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &[(output.clone(), ArtifactKind::Executable)],
+        &parsed,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
         0o755
@@ -4284,12 +4363,18 @@ fn cc_link_finalization_errors_prevent_compiler_fallback() {
     ]))
     .unwrap();
     std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
-    finalize_cc_restore(&[(output.clone(), ArtifactKind::Object)], &compile).unwrap();
+    finalize_cc_restore(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &[(output.clone(), ArtifactKind::Object)],
+        &compile,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
         0o600
     );
     let error = finalize_cc_restore(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &[(dir.path().join("missing.o"), ArtifactKind::Object)],
         &compile,
     )
@@ -4326,7 +4411,13 @@ fn cc_restore_stamps_new_and_replaced_outputs_without_redating_blobs() {
             ]))
             .unwrap();
         assert_eq!(cc_cache_entry_rejection_reason(&parsed, &meta), None);
-        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        restore_cc_from_cache(
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+            &store,
+            &parsed,
+            &meta,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"cached object");
         assert!(std::fs::metadata(&output).unwrap().modified().unwrap() >= source_mtime);
         assert_eq!(
@@ -4417,7 +4508,13 @@ fn cc_generated_source_depinfo_rebases_headers_outside_the_build_directory() {
         .unwrap();
         parsed.depinfo_roots = vec![(consumer.clone(), sentinel.to_string(), 5)];
         assert_eq!(cc_cache_entry_rejection_reason(&parsed, &meta), None);
-        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        restore_cc_from_cache(
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
+            &store,
+            &parsed,
+            &meta,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&restored_object).unwrap(), b"wasm object");
         let restored = std::fs::read_to_string(&restored_depfile).unwrap();
         let expected_header = consumer
@@ -4452,7 +4549,13 @@ fn restore_cc_from_cache_replaces_existing_plain_object() {
         .unwrap();
     let meta = entry_meta("cc-replace-key", vec![cached_file("foo.o", hash)], &[]);
 
-    restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+    restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap();
 
     assert_eq!(std::fs::read(&output).unwrap(), b"cached object");
     assert_eq!(
@@ -4490,7 +4593,13 @@ fn concurrent_cc_restores_root_objects_and_link_outputs_in_each_client_directory
                 );
                 let parsed = crate::compiler::cc::CcArgs::parse_for(&args, &env).unwrap();
                 let meta = entry_meta("cc-client-path", vec![cached_file(cached, &hash)], &[]);
-                restore_cc_from_cache(&Store::open(&config).unwrap(), &parsed, &meta).unwrap();
+                restore_cc_from_cache(
+                    crate::config::DEFAULT_RESTORE_MAX_SIZE,
+                    &Store::open(&config).unwrap(),
+                    &parsed,
+                    &meta,
+                )
+                .unwrap();
                 let output = root.join("out").join(cached);
                 assert_eq!(std::fs::read(&output).unwrap(), bytes);
                 #[cfg(unix)]
@@ -4624,9 +4733,14 @@ fn restore_cc_from_cache_refuses_symlinked_object_output() {
     let parsed = CcCompiler::new().parse(&args).unwrap();
     let meta = entry_meta("cc-symlink-key", vec![cached_file("foo.o", hash)], &[]);
 
-    let err = restore_cc_from_cache(&store, &parsed, &meta)
-        .unwrap_err()
-        .to_string();
+    let err = restore_cc_from_cache(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &parsed,
+        &meta,
+    )
+    .unwrap_err()
+    .to_string();
 
     assert!(err.contains("requires compiler passthrough"), "{err}");
     assert!(
@@ -4656,6 +4770,7 @@ fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
     let platform = platform::current();
 
     let err = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -4699,6 +4814,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
     let platform = platform::current();
 
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -4768,6 +4884,7 @@ fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
     let platform = platform::current();
 
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -4809,6 +4926,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
     let platform = platform::current();
 
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -4948,6 +5066,7 @@ fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
     cached.executable = true;
     let target = dir.path().join("target/debug/deps/libfoo_macros-1.so");
     let restored = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5051,6 +5170,7 @@ fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
     let platform = platform::current();
 
     let restored = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5088,6 +5208,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
     let platform = platform::current();
 
     let restored = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5123,6 +5244,7 @@ fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
     let platform = CountingPlatform::new();
 
     let restored = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5164,6 +5286,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
     let platform = platform::current();
 
     let RestoredBytes::ExactBlobCopy(fingerprint) = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5242,6 +5365,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
     let target = dir.path().join("target").join("libmac.so");
 
     let restored = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5278,6 +5402,7 @@ fn restore_loadable(
 ) -> RestoredBytes {
     let anchor = target.parent().unwrap();
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         store,
         &cached_file("libmac.so", hash),
         target,
@@ -5600,6 +5725,7 @@ fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
     let platform = platform::current();
 
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -5694,6 +5820,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
     let target = deps.join("hello-bin.dsym.tar");
     let platform = platform::current();
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached,
         &target,
@@ -11925,6 +12052,7 @@ fn a_read_only_store_restores_by_copy() {
     let restore = |store: &Store, target: &Path| {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         materialize_cached_artifact(
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
             store,
             &cached,
             target,
@@ -12003,6 +12131,7 @@ fn readonly_metadata_restores_honor_private_creation_permissions() {
     let cached = cached_file("libfoo.rmeta", &hash);
     let platform = platform::current();
     materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &readonly,
         &cached,
         &target,
@@ -12073,6 +12202,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
         cached.executable = executable;
         let target = dir.path().join(name);
         let result = materialize_cached_artifact(
+            crate::config::DEFAULT_RESTORE_MAX_SIZE,
             &readonly,
             &cached,
             &target,
@@ -13275,5 +13405,78 @@ fn wasm_bin_outputs_keep_module_admission_and_restore_behavior() {
         let restore_args = parse(&consumer);
         restore_from_cache(&config, &compiler, &store, &restore_args, &meta, None).unwrap();
         assert_eq!(&std::fs::read(consumer.join("app.wasm")).unwrap(), wasm);
+    }
+}
+
+#[test]
+fn restore_paths_honor_configured_debug_bundle_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let config = test_config(root.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let payload = [b'x'; 64];
+    let mut header = tar::Header::new_gnu();
+    header.set_size(64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    let mut tar = tar::Builder::new(Vec::new());
+    tar.append_data(&mut header, "Contents/DWARF/test", &payload[..])
+        .unwrap();
+    let bytes = tar.into_inner().unwrap();
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    create_blob(&store, &hash, &bytes);
+    let cached = cached_file("test.dsym.tar", &hash);
+    let target = root.path().join("test.dsym.tar");
+    let host = platform::current();
+    for cap in [63, 64] {
+        let result = materialize_cached_artifact(
+            cap,
+            &store,
+            &cached,
+            &target,
+            ArtifactKind::DebugBundle,
+            None,
+            root.path(),
+            root.path(),
+            None,
+            &[],
+            &*host,
+            "test restore",
+            None,
+        );
+        if cap == 63 {
+            assert!(format!("{:#}", result.unwrap_err()).contains("63-byte extraction cap"));
+            assert!(!root.path().join("test.dSYM").exists());
+        } else {
+            result.unwrap();
+            assert_eq!(
+                std::fs::read(root.path().join("test.dSYM/Contents/DWARF/test")).unwrap(),
+                payload
+            );
+        }
+    }
+    let cc_target = root.path().join("cc.dsym.tar");
+    let invocation = crate::invocation::InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.path().to_owned()),
+        None,
+        root.path().join("tmp"),
+    );
+    for cap in [63, 64] {
+        std::fs::write(&cc_target, &bytes).unwrap();
+        let result = apply_cc_post_publish_actions(
+            cap,
+            &[(cc_target.clone(), ArtifactKind::DebugBundle)],
+            &invocation,
+        );
+        if cap == 63 {
+            assert!(format!("{:#}", result.unwrap_err()).contains("63-byte extraction cap"));
+            assert!(!root.path().join("cc.dSYM").exists());
+        } else {
+            result.unwrap();
+            assert_eq!(
+                std::fs::read(root.path().join("cc.dSYM/Contents/DWARF/test")).unwrap(),
+                payload
+            );
+        }
     }
 }

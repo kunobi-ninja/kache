@@ -1770,6 +1770,15 @@ pub(crate) fn config_mismatch_warnings(
              installed service takes the setting from its own environment and config"
         ));
     }
+    if let Some(limit) = eff.restore_max_size
+        && limit != config.restore_max_size
+    {
+        warnings.push(format!(
+            "warning: {daemon_side} has restore_max_size={}; {client_side} says {} — {remedy}",
+            bytesize::ByteSize(limit),
+            bytesize::ByteSize(config.restore_max_size)
+        ));
+    }
     if let Some(floor) = eff.auto_recover_min_free_bytes
         && floor != config.auto_recover_min_free_bytes
     {
@@ -11015,12 +11024,11 @@ impl RecoverySettings {
         let ignore_env = file("ignore_env").and_then(|value| value.as_bool()) == Some(true);
         let env = |name: &str| if ignore_env { None } else { env(name) };
         let floor = env("KACHE_AUTO_RECOVER_MIN_FREE_BYTES")
-            .and_then(|value| value.parse().ok())
-            .or_else(|| {
-                file("auto_recover_min_free_bytes")?
-                    .as_integer()?
-                    .try_into()
-                    .ok()
+            .and_then(|value| crate::config::parse_size(&value))
+            .or_else(|| match file("auto_recover_min_free_bytes")? {
+                toml::Value::Integer(bytes) => bytes.try_into().ok(),
+                toml::Value::String(size) => crate::config::parse_size(&size),
+                _ => None,
             })
             .unwrap_or_else(|| crate::config::default_recovery_floor(in_ci));
         Self {

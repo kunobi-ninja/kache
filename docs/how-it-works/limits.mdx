@@ -83,3 +83,19 @@ above.
 ## Several test runs at once
 
 Test binaries can wait for the same pool. Set `kache test-runner` as Cargo's target runner and each test binary takes slots until it exits. A quarter of the pool, at least one slot, stays reserved for compiles. Builds started inside a running test use that test's slots. See [Test runner](/docs/getting-started/configuration#test-runner) to turn it on.
+
+## Restoring large cache entries
+
+`cache.restore_max_size` / `KACHE_RESTORE_MAX_SIZE` limits each compressed remote
+entry download and its extracted file contents, and each unpacked debug bundle.
+The default is `8GiB`. The limit must be positive; an entry that exceeds it falls
+back to compilation. It does not reserve memory or set a combined budget for
+concurrent restores.
+
+```bash
+kache config set cache.restore_max_size 12GiB
+kache daemon restart
+```
+
+Remote decoders also limit the zstd window to 128 MiB. Raising the restore-size
+limit does not raise that memory bound or disable archive path and link checks.

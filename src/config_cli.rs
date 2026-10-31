@@ -221,6 +221,18 @@ fn edit(path: &Path, key: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether a known byte-valued file setting permits zero.
+fn size_key(key: &str) -> Option<bool> {
+    match key {
+        "cache.local_max_size"
+        | "cache.event_log_max_size"
+        | "cache.prefetch_max_bytes"
+        | "cache.auto_recover_min_free_bytes" => Some(true),
+        "cache.restore_max_size" => Some(false),
+        _ => None,
+    }
+}
+
 fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str>) -> Result<()> {
     if raw.is_some() && keys[0] == "workspace" {
         bail!("edit workspace declarations directly in TOML");
@@ -229,6 +241,19 @@ fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str
         raw.parse::<toml_edit::Value>()
             .unwrap_or_else(|_| toml_edit::Value::from(raw))
     });
+    if let Some(allow_zero) = size_key(&keys.join("."))
+        && let Some(value) = replacement.as_ref()
+    {
+        let bytes = match value {
+            toml_edit::Value::Integer(n) => u64::try_from(*n.value()).ok(),
+            toml_edit::Value::String(s) => crate::config::parse_size(s.value()),
+            _ => None,
+        }
+        .context("expected byte count or size such as 10GiB or 500MB")?;
+        if bytes == 0 && !allow_zero {
+            bail!("{} must be greater than zero", keys.join("."));
+        }
+    }
     if replacement
         .as_ref()
         .is_some_and(toml_edit::Value::is_inline_table)
@@ -269,6 +294,59 @@ fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_edits_accept_units_and_integer_bytes_without_changing_other_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(&path, "# Keep this comment\n[cache]\nlocal_only = true\n").unwrap();
+        for key in [
+            "local_max_size",
+            "event_log_max_size",
+            "prefetch_max_bytes",
+            "auto_recover_min_free_bytes",
+            "restore_max_size",
+        ] {
+            let dotted = format!("cache.{key}");
+            for raw in ["1.5 GiB", "500MB", "4096"] {
+                edit(&path, &dotted, Some(raw)).unwrap();
+                let text = fs::read_to_string(&path).unwrap();
+                let values: toml::Value = toml::from_str(&text).unwrap();
+                if raw == "4096" {
+                    assert_eq!(values["cache"][key].as_integer(), Some(4096));
+                } else {
+                    assert_eq!(values["cache"][key].as_str(), Some(raw));
+                }
+                assert!(text.contains("# Keep this comment"));
+                assert_eq!(values["cache"]["local_only"].as_bool(), Some(true));
+            }
+            let original = fs::read_to_string(&path).unwrap();
+            for raw in [
+                "-1",
+                "-1GB",
+                "16EiB",
+                "18446744073709551616B",
+                "2frogs",
+                "true",
+                "1.5",
+                "[]",
+            ] {
+                assert!(edit(&path, &dotted, Some(raw)).is_err(), "{dotted}={raw}");
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            }
+            if key == "restore_max_size" {
+                assert!(edit(&path, &dotted, Some("0B")).is_err());
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            } else {
+                edit(&path, &dotted, Some("0B")).unwrap();
+            }
+        }
+        for key in ["cache.prefetch_max_keys", "cache.prefetch_deadline_secs"] {
+            let original = fs::read_to_string(&path).unwrap();
+            assert!(edit(&path, key, Some("1GiB")).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+    }
 
     #[test]
     fn edits_preserve_comments_unknown_keys_and_value_types() {

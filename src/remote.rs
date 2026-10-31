@@ -1209,6 +1209,7 @@ mod tests {
         let endpoint = std::env::var("KACHE_E2E_S3_ENDPOINT").ok()?;
         let bucket = std::env::var(bucket_var).ok()?;
         let remote = crate::config::RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "e2e".to_string(),
             backend: crate::config::RemoteBackendConfig::S3(crate::config::S3RemoteConfig {
                 bucket,

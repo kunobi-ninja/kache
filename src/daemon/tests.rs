@@ -1040,6 +1040,7 @@ fn compile_started_wire_tags_and_stats_default() {
             socket_path: "/c/daemon.sock".into(),
             started_at_ms: 1,
             auto_recover_min_free_bytes: None,
+            restore_max_size: None,
             auto_recover_targets: None,
         }),
     })
@@ -1432,6 +1433,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -1637,6 +1639,7 @@ fn only_a_refused_listing_stops_the_refresher() {
     assert!(!listing_was_refused(&flaky, s3.as_ref()));
     let root = tempfile::tempdir().unwrap();
     let filesystem = crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: crate::config::RemoteBackendConfig::Filesystem(
             crate::config::FilesystemRemoteConfig {
@@ -1879,6 +1882,7 @@ async fn server_main_binds_socket_and_handles_shutdown() {
     config.daemon_idle_timeout_secs = 0;
     config.prefetch_enabled = false;
     config.remote = Some(crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".into(),
         backend: crate::config::RemoteBackendConfig::Filesystem(
             crate::config::FilesystemRemoteConfig {
@@ -11644,6 +11648,7 @@ async fn enabled_manifest_warming_spawns_and_releases_its_barrier() {
     let mut config = test_config(dir.path());
     config.prefetch_enabled = true;
     config.remote = Some(crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".into(),
         backend: crate::config::RemoteBackendConfig::Filesystem(
             crate::config::FilesystemRemoteConfig {
@@ -15901,6 +15906,7 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
     let consumer = tempfile::tempdir().unwrap();
     let mut config = test_config(consumer.path());
     let remote = crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "amh/v1".into(),
         backend: crate::config::RemoteBackendConfig::Gcs(crate::config::GcsRemoteConfig {
             bucket: "consumer-fixture".into(),

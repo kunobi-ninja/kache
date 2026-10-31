@@ -3,6 +3,7 @@
 pub mod config;
 pub mod invocation;
 pub mod policy;
+pub mod size;
 pub use config::Config;
 pub use invocation::InvocationEnv;
 

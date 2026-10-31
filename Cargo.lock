@@ -2498,6 +2498,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "filetime",
  "indexmap 2.14.2",
  "kache-fs",
  "serde",

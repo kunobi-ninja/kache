@@ -354,9 +354,10 @@ fn make_writable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Recursively copy `src` into `dst` with plain byte copies, preserving
-/// symlinks instead of flattening them.
+/// Recursively copy `src` into `dst`, preserving symlinks and modification
+/// times. Relocation changes paths while keeping observable inputs equal.
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let modified = filetime::FileTime::from_last_modification_time(&std::fs::metadata(src)?);
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -365,13 +366,37 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             copy_symlink(&from, &to)?;
+            let metadata = std::fs::symlink_metadata(&from)?;
+            filetime::set_symlink_file_times(
+                &to,
+                filetime::FileTime::from_last_access_time(&metadata),
+                filetime::FileTime::from_last_modification_time(&metadata),
+            )?;
         } else if file_type.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {
-            std::fs::copy(&from, &to)?;
+            copy_file_with_mtime(&from, &to)?;
         }
     }
-    Ok(())
+    filetime::set_file_mtime(dst, modified)
+}
+
+fn copy_file_with_mtime(from: &Path, to: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(from)?;
+    std::fs::copy(from, to)?;
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        make_writable(to)?;
+    }
+    let result = filetime::set_file_mtime(
+        to,
+        filetime::FileTime::from_last_modification_time(&metadata),
+    );
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        std::fs::set_permissions(to, metadata.permissions())?;
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -489,6 +514,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn relocation_preserves_file_and_directory_modification_times() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("empty")).unwrap();
+        std::fs::write(source.join("input"), "same").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 123_456_700);
+        for name in ["input", "empty", ""] {
+            filetime::set_file_mtime(source.join(name), old).unwrap();
+        }
+        let destination = temp.path().join("destination");
+        copy_dir_recursive(&source, &destination).unwrap();
+        for name in ["input", "empty", ""] {
+            assert_eq!(
+                std::fs::metadata(destination.join(name))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                std::fs::metadata(source.join(name))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_keeps_a_read_only_files_time_and_permissions() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let file = source.join("input");
+        std::fs::write(&file, "same").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_600_000_000, 0))
+            .unwrap();
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        let destination = temp.path().join("destination");
+        copy_dir_recursive(&source, &destination).unwrap();
+        let copied = std::fs::metadata(destination.join("input")).unwrap();
+        assert!(copied.permissions().readonly());
+        assert_eq!(
+            copied.modified().unwrap(),
+            std::fs::metadata(&file).unwrap().modified().unwrap()
+        );
+        remove_tree(temp.path()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn copy_dir_recursive_preserves_symlinks() {
@@ -498,8 +573,16 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("real.txt"), b"real").unwrap();
         std::os::unix::fs::symlink("real.txt", src.join("link.txt")).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 123_456_700);
+        filetime::set_symlink_file_times(src.join("link.txt"), old, old).unwrap();
 
         copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(
+                &std::fs::symlink_metadata(dst.join("link.txt")).unwrap()
+            ),
+            old
+        );
 
         let copied = dst.join("link.txt");
         assert!(

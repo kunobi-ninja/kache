@@ -140,7 +140,11 @@ fn remote_completion_child() {
     if mode == "failure" {
         assert_eq!(exit, Some(7));
         assert_eq!(event.result, EventResult::Passthrough);
-        assert!(event.passthrough_reason.contains("restore failed"));
+        let reason = &event.passthrough_reason;
+        assert!(reason.starts_with("restore failed: "), "{reason}");
+        // The cause under the outer `cc restore: staging` context reaches the
+        // event (kunobi-ninja/kache#1786).
+        assert!(reason.contains("(os error 2)"), "{reason}");
         assert!(!output.exists());
     } else {
         assert_eq!(exit, Some(0));

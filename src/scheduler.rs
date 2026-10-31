@@ -18,9 +18,10 @@
 //! wrappers record the child's peak RSS by crate name; later invocations of
 //! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 //!
-//! Under memory pressure (see [`pressure`]) a compile asks for the whole
-//! pool during ordinary admission. After a capacity wait reaches its limit,
-//! recovery admits at most one extra compile and two extra
+//! Under memory pressure (see [`pressure`]) ordinary admission keeps the
+//! slots compiles hold within a shared ceiling that falls while pressure
+//! lasts and grows back once it has cleared. After a capacity wait reaches
+//! its limit, recovery admits at most one extra compile and two extra
 //! weighted slots. Linux cgroup-v2 limits are logged for diagnostics.
 //!
 //! Waiters take free slots in [`queue`] order: by arrival, foreground builds
@@ -506,22 +507,13 @@ impl Scheduler {
         let mut ticket = None;
         let slots = bounded.wait_for_request(
             &request,
-            |waited, saved_for_tests| {
-                let weight = pressure::weight(weight, self.pool_size, pressure::now());
-                compile_need(weight, self.pool_size, waited, || {
-                    tests_held(&self.root).saturating_add(saved_for_tests)
-                })
-            },
+            |waited, saved_for_tests| self.ordinary_need(weight, waited, saved_for_tests),
             &mut ticket,
         );
         let recover = wait.scoped();
         drop(wait);
         let permit = match slots {
-            Some(slots) => Some(Permit {
-                root: self.root.clone(),
-                _slots: slots,
-                _recovery: Vec::new(),
-            }),
+            Some(slots) => Some(self.keep(slots, weight)),
             None if recover => self.acquire_recovery_permit(weight, &request, &mut ticket),
             None => None,
         };
@@ -590,16 +582,9 @@ impl Scheduler {
         allowance: Duration,
     ) -> Result<Option<Permit>> {
         let started = std::time::Instant::now();
-        let pressured = pressure::weight(weight, self.pool_size, pressure::now());
-        let ordinary = compile_need(pressured, self.pool_size, true, || {
-            tests_held(&self.root).saturating_add(request.saved_for_tests.get())
-        });
+        let ordinary = self.ordinary_need(weight, true, request.saved_for_tests.get());
         if let Collect::Ready(slots) = self.admit(request, ordinary, ticket, allowance)? {
-            return Ok(Some(Permit {
-                root: self.root.clone(),
-                _slots: slots,
-                _recovery: Vec::new(),
-            }));
+            return Ok(Some(self.keep(slots, weight)));
         }
         let Some(gate) = StoreLock::try_acquire(&permits_dir(&self.root).join("recovery-0"))?
         else {
@@ -645,6 +630,35 @@ impl Scheduler {
             _slots: slots,
             _recovery: recovery,
         }))
+    }
+
+    /// Free slots an ordinary compile of `weight` waits for: its weight and
+    /// the slots above the memory pressure ceiling (see [`pressure::ask`]),
+    /// capped by [`compile_need`] at what tests leave.
+    fn ordinary_need(&self, weight: u32, waited: bool, saved_for_tests: u32) -> u32 {
+        let ceiling = pressure::ceiling(&self.root, self.pool_size);
+        compile_need(
+            pressure::ask(weight, self.pool_size, ceiling),
+            self.pool_size,
+            waited,
+            || tests_held(&self.root).saturating_add(saved_for_tests),
+        )
+    }
+
+    /// A permit holding the lowest `weight` of `slots`. The rest were the
+    /// free slots the pressure ceiling asks for, which are released at once.
+    fn keep(&self, mut slots: Vec<(u32, StoreLock)>, weight: u32) -> Permit {
+        let keep = weight.max(1) as usize;
+        if slots.len() > keep {
+            slots.truncate(keep);
+            // A test may be waiting for exactly these slots.
+            permit_wait::notify(&self.root);
+        }
+        Permit {
+            root: self.root.clone(),
+            _slots: slots,
+            _recovery: Vec::new(),
+        }
     }
 
     /// Wait for `need(waited, saved_for_tests)` free slots of `kind`, in
@@ -1872,6 +1886,7 @@ pub(crate) fn parse_memory_events(text: &str) -> Option<MemoryEvents> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pressure::Level;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
@@ -1898,8 +1913,8 @@ mod tests {
     struct PinnedPressure;
 
     impl PinnedPressure {
-        fn new(pressured: bool) -> Self {
-            pressure::force(Some(pressured));
+        fn new(level: Level) -> Self {
+            pressure::force(Some(level));
             Self
         }
     }
@@ -1954,7 +1969,7 @@ mod tests {
         // Slot-count fixtures must not depend on the host's memory pressure.
         // This replaces a pin the caller already set. Pin again afterwards
         // when the test wants pressure.
-        pressure::force(Some(false));
+        pressure::force(Some(Level::Calm));
         Scheduler::open_with(dir, pool, Duration::from_secs(5), Duration::from_millis(10)).unwrap()
     }
 
@@ -1979,9 +1994,15 @@ mod tests {
 
     #[test]
     fn exhausted_compiler_allowance_uses_one_counted_recovery_compile() {
-        for pool in [1, 4] {
+        for (pool, level) in [
+            (1, Level::Calm),
+            (4, Level::Calm),
+            (1, Level::Critical),
+            (4, Level::Critical),
+        ] {
             let dir = temp_cache();
             let scheduler = test_scheduler(dir.path(), pool);
+            let _pin = PinnedPressure::new(level);
             let holder = scheduler.acquire_permit(pool).unwrap();
             let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
             let recovered =
@@ -2064,7 +2085,13 @@ mod tests {
         assert!(ordinary._recovery.is_empty());
         drop(ordinary);
         let holder = scheduler.acquire_permit(1).unwrap();
-        let _pressured = PinnedPressure::new(true);
+        let _warning = PinnedPressure::new(Level::Warning);
+        let within = scheduler.try_recovery_permit(1).unwrap().unwrap();
+        assert_eq!(within._slots.len(), 1, "the halved ceiling has room for it");
+        assert!(within._recovery.is_empty());
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(within);
+        let _critical = PinnedPressure::new(Level::Critical);
         let recovered = scheduler.try_recovery_permit(1).unwrap().unwrap();
         assert!(recovered._slots.is_empty());
         assert_eq!(recovered._recovery.len(), 1);
@@ -3340,7 +3367,7 @@ mod tests {
 
     #[test]
     fn permits_in_use_counts_held_slots() {
-        let _calm = PinnedPressure::new(false);
+        let _calm = PinnedPressure::new(Level::Calm);
         let dir = temp_cache();
         assert_eq!(
             permits_in_use(dir.path()),
@@ -3379,17 +3406,17 @@ mod tests {
 
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 4);
-        let _pressured = PinnedPressure::new(true);
+        let _pressured = PinnedPressure::new(Level::Critical);
         let one = scheduler.acquire_permit(1).unwrap();
         assert_eq!(
             permits_in_use(dir.path()),
-            Some(4),
-            "under pressure an ask of one locks the whole pool"
+            Some(1),
+            "under pressure a compile still locks only its weight"
         );
         drop(one);
         assert_eq!(permits_in_use(dir.path()), Some(0));
         let two = scheduler.acquire_permit(2).unwrap();
-        assert_eq!(permits_in_use(dir.path()), Some(4));
+        assert_eq!(permits_in_use(dir.path()), Some(2));
         drop(two);
         assert_eq!(permits_in_use(dir.path()), Some(0));
     }
@@ -3661,7 +3688,7 @@ mod tests {
     fn budget_scheduler(dir: &Path, pool: u32) -> Scheduler {
         // Replaces a pin the caller already set. Pin again afterwards when
         // the test wants pressure.
-        pressure::force(Some(false));
+        pressure::force(Some(Level::Calm));
         Scheduler::open_with(dir, pool, BUDGET, Duration::from_millis(5)).unwrap()
     }
 
@@ -3684,37 +3711,142 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_admits_a_compile_only_when_no_other_holds_a_slot() {
-        pressure::force(Some(false));
+    fn critical_pressure_runs_one_compile_and_grows_back_only_after_settling() {
         let dir = temp_cache();
-        let scheduler = Scheduler::open_with(
-            dir.path(),
-            4,
-            Duration::from_millis(150),
-            Duration::from_millis(5),
-        )
-        .unwrap();
-        let _pin = PinnedPressure::new(false);
+        let scheduler = budget_scheduler(dir.path(), 4);
+        let calm = PinnedPressure::new(Level::Calm);
         let held = scheduler.acquire_permit(1).unwrap();
-        assert_eq!(
-            held._slots.len(),
-            1,
-            "a calm compile takes the one slot it asked for"
-        );
-        pressure::force(Some(true));
+        let other = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(calm);
+        let critical = PinnedPressure::new(Level::Critical);
         assert!(
             scheduler.acquire_permit(1).is_none(),
-            "under pressure a compile waits for the other to finish"
+            "under critical pressure a compile waits for the others to finish"
         );
-        drop(held);
+        drop((held, other));
         let alone = scheduler.acquire_permit(1).unwrap();
-        assert_eq!(alone._slots.len(), 4, "it takes the whole pool");
-        drop(alone);
-        pressure::force(Some(false));
-        let first = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(alone._slots.len(), 1, "it keeps only its weight");
+        assert!(scheduler.acquire_permit(1).is_none(), "one at a time");
+        drop(critical);
+
+        let _calm = PinnedPressure::new(Level::Calm);
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "calm readings must last a settling period before the ceiling grows"
+        );
+        // A run of calm readings that began a settling period ago.
+        let now = queue::millis(SystemTime::now());
+        fs::write(
+            scheduler.root.join("pressure"),
+            format!("1 {} {}", now - 20_000, now - 10_000),
+        )
+        .unwrap();
         let second = scheduler.acquire_permit(1).unwrap();
-        assert_eq!(first._slots.len() + second._slots.len(), 2);
-        drop(_pin);
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(2),
+            "a quarter of the pool more"
+        );
+        assert!(scheduler.acquire_permit(1).is_none());
+        drop((alone, second));
+    }
+
+    #[test]
+    fn a_falling_ceiling_keeps_running_compiles_and_admits_within_it() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 8);
+        let mut running: Vec<_> = (0..6)
+            .map(|_| scheduler.acquire_permit(1).unwrap())
+            .collect();
+        let _warning = PinnedPressure::new(Level::Warning);
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "the halved ceiling of 4 is below the 6 slots held"
+        );
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(6),
+            "running compiles keep their slots"
+        );
+        running.truncate(3);
+        let admitted = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(admitted._slots.len(), 1);
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+        assert!(scheduler.acquire_permit(1).is_none(), "the ceiling is full");
+        running.clear();
+        drop(admitted);
+
+        let heavy = scheduler.acquire_permit(6).unwrap();
+        assert_eq!(
+            heavy._slots.len(),
+            6,
+            "a compile heavier than the ceiling runs alone with its weight"
+        );
+        assert!(scheduler.acquire_permit(1).is_none());
+    }
+
+    #[test]
+    fn a_one_slot_pool_runs_one_compile_at_any_pressure() {
+        for level in [Level::Calm, Level::Warning, Level::Critical, Level::Unknown] {
+            let dir = temp_cache();
+            let scheduler = budget_scheduler(dir.path(), 1);
+            let _pin = PinnedPressure::new(level);
+            let only = scheduler.acquire_permit(1).unwrap();
+            assert_eq!(only._slots.len(), 1, "{level:?}");
+            assert!(scheduler.acquire_permit(1).is_none(), "{level:?}");
+            drop(only);
+            assert!(scheduler.acquire_permit(2).is_some(), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn a_compile_under_pressure_still_fits_beside_running_tests() {
+        for level in [Level::Warning, Level::Critical] {
+            let dir = temp_cache();
+            let scheduler = test_scheduler(dir.path(), 4);
+            let _tests = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
+            let _pin = PinnedPressure::new(level);
+            let permit = scheduler
+                .acquire_permit(1)
+                .expect("a test may be waiting on this compile");
+            let slots: Vec<u32> = permit._slots.iter().map(|(slot, _)| *slot).collect();
+            assert_eq!(slots, [0], "{level:?}: the compile reserve");
+            assert_eq!(permits_in_use(dir.path()), Some(4));
+        }
+    }
+
+    #[test]
+    fn a_weightless_compile_still_keeps_one_slot() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let permit = scheduler.acquire_permit(0).unwrap();
+        assert_eq!(permit._slots.len(), 1);
+        assert_eq!(permits_in_use(dir.path()), Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn releasing_the_slots_above_the_ceiling_wakes_waiters() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let seen = super::permit_wait::snapshot(&scheduler.root);
+        let calm = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(
+            super::permit_wait::snapshot(&scheduler.root),
+            seen,
+            "nothing was released"
+        );
+        drop(calm);
+        let seen = super::permit_wait::snapshot(&scheduler.root);
+        let _critical = PinnedPressure::new(Level::Critical);
+        let alone = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(alone._slots.len(), 1);
+        assert_eq!(
+            super::permit_wait::snapshot(&scheduler.root),
+            seen.wrapping_add(1),
+            "the three free slots it locked were released"
+        );
     }
 
     #[test]
@@ -3843,7 +3975,7 @@ mod tests {
     fn exited_test_lease_owner_restores_admission() {
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 4);
-        let _calm = PinnedPressure::new(false);
+        let _calm = PinnedPressure::new(Level::Calm);
         let mut child = spawn_fixture(
             dir.path(),
             "scheduler::tests::test_lease_owner_child_fixture",
@@ -4069,17 +4201,14 @@ mod tests {
 
     #[test]
     fn heavy_compiles_take_their_full_weight_without_tests() {
-        // Calm: the ask is the count. Pressured: the same ask locks the pool.
-        for (pressured, held) in [(false, 3), (true, 4)] {
+        // Pressure asks for the slots above the ceiling to be free too, but
+        // the compile keeps only its weight.
+        for level in [Level::Calm, Level::Critical] {
             let dir = temp_cache();
             let scheduler = budget_scheduler(dir.path(), 4);
-            let _pin = PinnedPressure::new(pressured);
+            let _pin = PinnedPressure::new(level);
             let _permit = scheduler.acquire_permit(3).unwrap();
-            assert_eq!(
-                permits_in_use(dir.path()),
-                Some(held),
-                "pressured={pressured}"
-            );
+            assert_eq!(permits_in_use(dir.path()), Some(3), "{level:?}");
             assert!(
                 !tests_dir(&scheduler.root).exists(),
                 "compiles alone leave no test state"
@@ -4090,11 +4219,11 @@ mod tests {
     #[test]
     fn covered_misses_skip_the_permit_but_join_the_flight() {
         // A covered miss stays at zero slots either way. An uncovered miss
-        // takes its weight when calm and the whole pool under pressure.
-        for (pressured, uncovered) in [(false, 1), (true, 2)] {
+        // takes its weight, under pressure too.
+        for level in [Level::Calm, Level::Critical] {
             let dir = temp_cache();
             let scheduler = budget_scheduler(dir.path(), 2);
-            let _pin = PinnedPressure::new(pressured);
+            let _pin = PinnedPressure::new(level);
             fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
             let marker = tests_dir(&scheduler.root).join("1");
             let _marker_lock = StoreLock::try_acquire(&marker).unwrap().unwrap();
@@ -4107,7 +4236,7 @@ mod tests {
             };
             assert!(covered._flight.is_some(), "a covered miss joins the flight");
             assert!(covered._permit.is_none(), "a covered miss takes no permit");
-            assert_eq!(permits_in_use(dir.path()), Some(0), "pressured={pressured}");
+            assert_eq!(permits_in_use(dir.path()), Some(0), "{level:?}");
             drop(covered);
 
             let BeginMiss::Compile(uncovered_miss) =
@@ -4120,11 +4249,7 @@ mod tests {
                 uncovered_miss._permit.is_some(),
                 "an uncovered miss takes a permit"
             );
-            assert_eq!(
-                permits_in_use(dir.path()),
-                Some(uncovered),
-                "pressured={pressured}"
-            );
+            assert_eq!(permits_in_use(dir.path()), Some(1), "{level:?}");
         }
     }
 
@@ -4132,19 +4257,15 @@ mod tests {
     /// unless the scheduler is off or a test lease covers it.
     #[test]
     fn a_keyless_compile_takes_a_permit_and_no_flight() {
-        for (pressured, held) in [(false, 1), (true, 2)] {
+        for level in [Level::Calm, Level::Critical] {
             let dir = temp_cache();
             let scheduler = budget_scheduler(dir.path(), 2);
-            let _pin = PinnedPressure::new(pressured);
+            let _pin = PinnedPressure::new(level);
 
             let guard = scheduler.keyless_compile("c_unit", false, None);
             assert!(guard._permit.is_some(), "a keyless compile takes a permit");
             assert!(guard._flight.is_none(), "its discovery flight dedupes it");
-            assert_eq!(
-                permits_in_use(dir.path()),
-                Some(held),
-                "pressured={pressured}"
-            );
+            assert_eq!(permits_in_use(dir.path()), Some(1), "{level:?}");
             drop(guard);
             assert_eq!(permits_in_use(dir.path()), Some(0));
 
@@ -4156,22 +4277,24 @@ mod tests {
                 covered._permit.is_none(),
                 "a covered compile takes no permit"
             );
-            assert_eq!(permits_in_use(dir.path()), Some(0), "pressured={pressured}");
+            assert_eq!(permits_in_use(dir.path()), Some(0), "{level:?}");
         }
 
         let dir = temp_cache();
         let disabled = begin_keyless_compile(dir.path(), false, "c_unit", false, None);
         assert!(disabled.is_empty());
         {
-            let _calm = PinnedPressure::new(false);
+            let _calm = PinnedPressure::new(Level::Calm);
             let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
             assert!(!enabled.is_empty());
             assert_eq!(permits_in_use(dir.path()), Some(UNMEASURED_COMPILE_WEIGHT));
         }
-        let _pressured = PinnedPressure::new(true);
+        let _pressured = PinnedPressure::new(Level::Critical);
         let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
         assert!(!enabled.is_empty());
-        assert_eq!(permits_in_use(dir.path()), Some(default_pool_size()));
+        assert_eq!(permits_in_use(dir.path()), Some(UNMEASURED_COMPILE_WEIGHT));
+        let ceiling = fs::read_to_string(scheduler_root(dir.path()).join("pressure")).unwrap();
+        assert!(ceiling.starts_with("1 "), "stored ceiling: {ceiling:?}");
     }
 
     #[test]
@@ -4315,12 +4438,24 @@ mod tests {
 
     impl Requester {
         fn spawn(cache: &Path, pool: u32, weight: u32, priority: Priority) -> Self {
+            Self::spawn_at(cache, pool, weight, priority, Level::Calm)
+        }
+
+        /// [`Requester::spawn`], reading memory pressure as `level`.
+        fn spawn_at(
+            cache: &Path,
+            pool: u32,
+            weight: u32,
+            priority: Priority,
+            level: Level,
+        ) -> Self {
             let (admit, admitted) = std::sync::mpsc::channel();
             let (release, released) = std::sync::mpsc::channel::<()>();
             let cache = cache.to_path_buf();
             let thread = std::thread::spawn(move || {
                 let _priority = InvocationPriorityScope::enter(Some(priority));
                 let scheduler = test_scheduler(&cache, pool);
+                pressure::force(Some(level));
                 let Some(permit) = scheduler.acquire_permit(weight) else {
                     return false;
                 };
@@ -4405,6 +4540,35 @@ mod tests {
         large.finish();
         late.admitted(Duration::from_secs(5));
         late.finish();
+        assert!(queued(cache).is_empty());
+    }
+
+    #[test]
+    fn queued_compiles_wait_for_room_under_the_shared_ceiling() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let background = Priority::Background;
+        let holder = Requester::running(cache, 4, 2, background);
+        let pressured = Requester::spawn_at(cache, 4, 1, background, Level::Warning);
+        wait_until("the pressured request to queue", || {
+            queued(cache).len() == 1
+        });
+        assert_eq!(
+            queued(cache)[0].need,
+            3,
+            "its slot and the two above the ceiling"
+        );
+        let calm = Requester::queued(cache, 4, 1, background, 2);
+        assert!(
+            calm.still_waiting(),
+            "a calm reading does not raise the shared ceiling at once"
+        );
+        holder.finish();
+        pressured.admitted(Duration::from_secs(5));
+        calm.admitted(Duration::from_secs(5));
+        assert_eq!(permits_in_use(cache), Some(2), "each keeps one slot");
+        pressured.finish();
+        calm.finish();
         assert!(queued(cache).is_empty());
     }
 

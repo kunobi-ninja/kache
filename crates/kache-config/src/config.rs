@@ -1,7 +1,7 @@
 use crate::invocation::InvocationEnv;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
-use kache_core::store_config::IndexSynchronous;
+use kache_core::store_config::IndexMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -502,10 +502,10 @@ pub struct Config {
     /// `[cache] deferred_durability = false` flushes every entry inside the
     /// compile or download that stored it.
     pub deferred_durability: bool,
-    /// Whether commits to `index.db` wait for the disk. `normal` by default;
-    /// `KACHE_INDEX_SYNCHRONOUS=off` or `[cache] index_synchronous = "off"`
-    /// never fsyncs the index, for runners whose disk does not outlive the job.
-    pub index_synchronous: IndexSynchronous,
+    /// Local index policy: `auto` (default), `conservative`, or `off`.
+    /// Auto currently resolves to conservative (WAL + NORMAL). Off disables
+    /// index fsync and must be selected explicitly for disposable storage.
+    pub index_mode: IndexMode,
     /// Hand a finished cc compile's store put to the daemon so the wrapper
     /// returns as soon as the object is written (see `daemon_publish`). On
     /// by default; `KACHE_DAEMON_PUBLISH=0` or `[cache] daemon_publish =
@@ -957,8 +957,8 @@ pub struct CacheFileConfig {
     pub out_dir_alias_root: Option<String>,
     /// Deferred store flush toggle. See [`Config::deferred_durability`].
     pub deferred_durability: Option<bool>,
-    /// Index fsync mode. See [`Config::index_synchronous`].
-    pub index_synchronous: Option<String>,
+    /// Local index policy. See [`Config::index_mode`].
+    pub index_mode: Option<String>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
     pub daemon_publish: Option<bool>,
     pub trust_daemon_execution: Option<bool>,
@@ -1409,7 +1409,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_OUT_DIR_ALIAS",
     "KACHE_OUT_DIR_ALIAS_ROOT",
     "KACHE_DEFERRED_DURABILITY",
-    "KACHE_INDEX_SYNCHRONOUS",
+    "KACHE_INDEX_MODE",
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
@@ -1519,7 +1519,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_OUT_DIR_ALIAS", "cache.out_dir_alias"),
     ("KACHE_OUT_DIR_ALIAS_ROOT", "cache.out_dir_alias_root"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
-    ("KACHE_INDEX_SYNCHRONOUS", "cache.index_synchronous"),
+    ("KACHE_INDEX_MODE", "cache.index_mode"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     (
         "KACHE_TRUST_DAEMON_EXECUTION",
@@ -2246,7 +2246,7 @@ impl Config {
             );
         }
         let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
-        let index_synchronous = Self::index_synchronous_for(invocation, &file_config);
+        let index_mode = Self::index_mode_for(invocation, &file_config);
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
         let trust_daemon_execution = Self::trust_daemon_execution_for(invocation, &file_config);
         let daemon_execution_concurrency =
@@ -2396,7 +2396,7 @@ impl Config {
             out_dir_alias,
             out_dir_alias_root,
             deferred_durability,
-            index_synchronous,
+            index_mode,
             daemon_publish,
             trust_daemon_execution,
             daemon_execution_concurrency,
@@ -3155,23 +3155,20 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// `KACHE_INDEX_SYNCHRONOUS` (env wins), else `[cache] index_synchronous`,
-    /// else `normal`. See [`Config::index_synchronous`].
-    fn index_synchronous_for(
-        invocation: &InvocationEnv,
-        file_config: &Result<FileConfig>,
-    ) -> IndexSynchronous {
+    /// `KACHE_INDEX_MODE` (env wins), else `[cache] index_mode`,
+    /// else `auto`. See [`Config::index_mode`].
+    fn index_mode_for(invocation: &InvocationEnv, file_config: &Result<FileConfig>) -> IndexMode {
         let ignore_env = Self::ignore_env_enabled(file_config);
-        env_or_ignored_for(invocation, "KACHE_INDEX_SYNCHRONOUS", ignore_env)
+        env_or_ignored_for(invocation, "KACHE_INDEX_MODE", ignore_env)
             .ok()
-            .and_then(|value| parse_index_synchronous(&value, "KACHE_INDEX_SYNCHRONOUS"))
+            .and_then(|value| parse_index_mode(&value, "KACHE_INDEX_MODE"))
             .or_else(|| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.index_synchronous.as_deref())
-                    .and_then(|value| parse_index_synchronous(value, "cache.index_synchronous"))
+                    .and_then(|c| c.index_mode.as_deref())
+                    .and_then(|value| parse_index_mode(value, "cache.index_mode"))
             })
             .unwrap_or_default()
     }
@@ -5072,13 +5069,13 @@ pub fn disk_share_note(total: u64) -> String {
     )
 }
 
-/// Parse an index fsync mode, warning when it is set but unknown.
-fn parse_index_synchronous(value: &str, source: &str) -> Option<IndexSynchronous> {
-    let parsed = IndexSynchronous::parse(value);
+/// Parse an index policy, warning when it is set but unknown.
+fn parse_index_mode(value: &str, source: &str) -> Option<IndexMode> {
+    let parsed = IndexMode::parse(value);
     if parsed.is_none() {
         tracing::warn!(
-            "ignoring unknown index fsync mode {value:?} from {source}: expected `normal` or \
-             `off`; falling back to the next configured source or the default"
+            "ignoring unknown index mode {value:?} from {source}: expected `auto`, \
+             `conservative`, or `off`; falling back to the next configured source or the default"
         );
     }
     parsed
@@ -5176,7 +5173,7 @@ impl From<&Config> for kache_core::store_config::Config {
             gc_evict_shared: config.gc_evict_shared,
             upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
             deferred_durability: config.deferred_durability,
-            index_synchronous: config.index_synchronous,
+            index_mode: config.index_mode,
         }
     }
 }

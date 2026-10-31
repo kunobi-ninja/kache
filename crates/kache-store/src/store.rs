@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::config::{Config, IndexSynchronous};
+use crate::config::{Config, IndexMode};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StorePutResult {
@@ -1678,9 +1678,9 @@ fn is_retryable_sqlite_open_error(err: &SqlError) -> bool {
     }
 }
 
-fn initialize_db(db: &Connection, synchronous: IndexSynchronous) -> rusqlite::Result<()> {
+fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     db.pragma_update(None, "journal_mode", "WAL")?;
-    db.pragma_update(None, "synchronous", synchronous.pragma_value())?;
+    db.pragma_update(None, "synchronous", mode.resolve().pragma_value())?;
     // Let concurrent writers retry for up to 5 s instead of failing immediately
     // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
     db.pragma_update(None, "busy_timeout", "5000")?;
@@ -1986,7 +1986,7 @@ fn record_entry_blobs(
 }
 
 pub fn open_index_db(db_path: &Path) -> Result<Connection> {
-    open_index_db_reporting_recovery(db_path, IndexSynchronous::default()).map(|(db, _)| db)
+    open_index_db_reporting_recovery(db_path, IndexMode::default()).map(|(db, _)| db)
 }
 
 /// Like [`open_index_db`], but also reports whether the index had to be
@@ -1998,16 +1998,16 @@ pub fn open_index_db(db_path: &Path) -> Result<Connection> {
 /// only need a connection use the wrapper above.
 pub fn open_index_db_reporting_recovery(
     db_path: &Path,
-    synchronous: IndexSynchronous,
+    mode: IndexMode,
 ) -> Result<(Connection, bool)> {
-    match try_open_index_db(db_path, synchronous) {
+    match try_open_index_db(db_path, mode) {
         Ok(db) => Ok((db, false)),
         // The index is a derived, rebuildable cache — the blobs plus each
         // entry's meta.json are the source of truth — so a corrupt index must
         // not brick every command (the #412 report: macOS + Linux writing one
         // WAL index on a shared home dir left it SQLITE_CORRUPT, and every
         // command then hard-failed). Recover under a lock (#415).
-        Err(err) if is_corruption_error(&err) => recover_corrupt_index(db_path, synchronous, &err),
+        Err(err) if is_corruption_error(&err) => recover_corrupt_index(db_path, mode, &err),
         Err(err) => Err(err.into()),
     }
 }
@@ -2028,7 +2028,7 @@ pub fn open_index_db_reporting_recovery(
 /// and report `false`, because that peer owns the rebuild.
 fn recover_corrupt_index(
     db_path: &Path,
-    synchronous: IndexSynchronous,
+    mode: IndexMode,
     err: &SqlError,
 ) -> Result<(Connection, bool)> {
     // OS file lock, released automatically when the handle drops / the process
@@ -2037,7 +2037,7 @@ fn recover_corrupt_index(
     let _lock = acquire_index_recovery_lock(db_path);
 
     // Re-check under the lock: a peer may have healed it while we waited.
-    match try_open_index_db(db_path, synchronous) {
+    match try_open_index_db(db_path, mode) {
         Ok(db) => return Ok((db, false)),
         Err(e) if is_corruption_error(&e) => {} // still corrupt: we heal it
         Err(e) => return Err(e.into()),
@@ -2051,7 +2051,7 @@ fn recover_corrupt_index(
         "index database is corrupt ({err}); quarantined it and recreated an empty index. \
          Rebuilding the entry rows from the store; run `kache doctor` to inspect."
     );
-    let db = try_open_index_db(db_path, synchronous)
+    let db = try_open_index_db(db_path, mode)
         .map_err(anyhow::Error::from)
         .with_context(|| {
             format!(
@@ -2080,15 +2080,12 @@ fn acquire_index_recovery_lock(db_path: &Path) -> Option<fs::File> {
 /// Open the index DB, retrying only *transient* open failures. Returns the raw
 /// [`SqlError`] so [`open_index_db`] can distinguish corruption (which it
 /// self-heals) from a genuine failure.
-fn try_open_index_db(
-    db_path: &Path,
-    synchronous: IndexSynchronous,
-) -> std::result::Result<Connection, SqlError> {
+fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Connection, SqlError> {
     let mut last_error: Option<SqlError> = None;
 
     for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
         match Connection::open(db_path).and_then(|db| {
-            initialize_db(&db, synchronous)?;
+            initialize_db(&db, mode)?;
             Ok(db)
         }) {
             Ok(db) => return Ok(db),
@@ -2288,7 +2285,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .with_context(|| format!("creating store directory {}", store_dir.display()))?;
 
         let db_path = config.index_db_path();
-        let (db, recovered) = open_index_db_reporting_recovery(&db_path, config.index_synchronous)
+        let (db, recovered) = open_index_db_reporting_recovery(&db_path, config.index_mode)
             .with_context(|| format!("opening index database {}", db_path.display()))?;
 
         let store = Self {

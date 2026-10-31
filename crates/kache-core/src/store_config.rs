@@ -1,31 +1,61 @@
 use std::path::PathBuf;
 
-/// How long a commit to `index.db` waits for the disk. Each connection sets it
-/// when it opens the index.
+/// Performance policy for the local SQLite index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum IndexSynchronous {
-    /// SQLite's `NORMAL`: fsync at WAL checkpoints, so a power loss cannot
-    /// corrupt the index.
+pub enum IndexMode {
+    /// Follow Kache's recommended policy. Currently resolves to conservative.
     #[default]
-    Normal,
-    /// SQLite's `OFF`: never fsync. A killed process loses nothing, but a power
-    /// loss or kernel crash can corrupt the index, which then rebuilds from
-    /// the store. For runners whose disk does not outlive the job.
+    Auto,
+    /// Keep the established WAL + NORMAL policy.
+    Conservative,
+    /// Disable index fsync for storage discarded with the job.
     Off,
 }
 
-impl IndexSynchronous {
+/// A concrete index policy after resolving the automatic mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedIndexMode {
+    Conservative,
+    Off,
+}
+
+impl IndexMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "normal" => Some(Self::Normal),
+            "auto" => Some(Self::Auto),
+            "conservative" => Some(Self::Conservative),
             "off" => Some(Self::Off),
             _ => None,
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Conservative => "conservative",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn resolve(self) -> ResolvedIndexMode {
+        match self {
+            Self::Auto | Self::Conservative => ResolvedIndexMode::Conservative,
+            Self::Off => ResolvedIndexMode::Off,
+        }
+    }
+}
+
+impl ResolvedIndexMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::Off => "off",
+        }
+    }
+
     pub fn pragma_value(self) -> &'static str {
         match self {
-            Self::Normal => "NORMAL",
+            Self::Conservative => "NORMAL",
             Self::Off => "OFF",
         }
     }
@@ -41,7 +71,7 @@ pub struct Config {
     /// Store new entries without an fsync on the build path and flush them
     /// later; a hit on an entry still pending verifies its bytes first.
     pub deferred_durability: bool,
-    pub index_synchronous: IndexSynchronous,
+    pub index_mode: IndexMode,
 }
 
 impl From<&Config> for Config {
@@ -69,23 +99,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn index_synchronous_parses_each_mode_and_rejects_the_rest() {
-        assert_eq!(
-            IndexSynchronous::parse("normal"),
-            Some(IndexSynchronous::Normal)
-        );
-        assert_eq!(
-            IndexSynchronous::parse(" OFF "),
-            Some(IndexSynchronous::Off)
-        );
-        assert_eq!(IndexSynchronous::parse("full"), None);
-        assert_eq!(IndexSynchronous::default(), IndexSynchronous::Normal);
+    fn index_mode_parses_each_mode_and_rejects_the_rest() {
+        for (value, expected) in [
+            ("auto", IndexMode::Auto),
+            (" AUTO ", IndexMode::Auto),
+            ("conservative", IndexMode::Conservative),
+            (" Conservative ", IndexMode::Conservative),
+            ("off", IndexMode::Off),
+            (" OFF ", IndexMode::Off),
+        ] {
+            assert_eq!(IndexMode::parse(value), Some(expected), "{value:?}");
+        }
+        for value in ["", "  ", "normal", "full", "fast", "0"] {
+            assert_eq!(IndexMode::parse(value), None, "{value:?}");
+        }
+        assert_eq!(IndexMode::default(), IndexMode::Auto);
     }
 
     #[test]
-    fn index_synchronous_names_the_sqlite_pragma_value() {
-        assert_eq!(IndexSynchronous::Normal.pragma_value(), "NORMAL");
-        assert_eq!(IndexSynchronous::Off.pragma_value(), "OFF");
+    fn index_modes_resolve_to_the_expected_sqlite_policy() {
+        for (mode, configured, effective, pragma) in [
+            (IndexMode::Auto, "auto", "conservative", "NORMAL"),
+            (
+                IndexMode::Conservative,
+                "conservative",
+                "conservative",
+                "NORMAL",
+            ),
+            (IndexMode::Off, "off", "off", "OFF"),
+        ] {
+            assert_eq!(mode.as_str(), configured);
+            assert_eq!(mode.resolve().as_str(), effective);
+            assert_eq!(mode.resolve().pragma_value(), pragma);
+        }
+        assert_eq!(IndexMode::Auto.resolve(), ResolvedIndexMode::Conservative);
+        assert_eq!(
+            IndexMode::Conservative.resolve(),
+            ResolvedIndexMode::Conservative
+        );
+        assert_eq!(IndexMode::Off.resolve(), ResolvedIndexMode::Off);
     }
 
     #[test]
@@ -103,7 +155,7 @@ mod tests {
             gc_evict_shared: false,
             upload_spool_max_jobs: 2,
             deferred_durability: false,
-            index_synchronous: IndexSynchronous::default(),
+            index_mode: IndexMode::default(),
         };
         let second = Config {
             cache_dir: PathBuf::from("second/cache"),

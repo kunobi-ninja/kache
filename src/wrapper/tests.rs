@@ -2007,6 +2007,7 @@ fn restore_failure_reasons_flatten_archive_text() {
     std::fs::create_dir_all(&deps).unwrap();
 
     let error = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
         &store,
         &cached_file("foo.dsym.tar", &hash),
         &deps.join("foo.dsym.tar"),

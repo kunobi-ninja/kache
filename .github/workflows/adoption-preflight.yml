@@ -25,8 +25,8 @@ jobs:
       matrix:
         include:
           - pr: 1784
-            head: d8a8c79fe50d0151d412ed7d02dd835b99e39ea6
-            tree: 6911c1972eb5b9a4976a7be166d3d63983a63559
+            head: 010dbaebab4e90b53eab030fa4d1977e7a06c827
+            tree: e75a06416f6e68a4f69d32fa02e9975c5d28034f
     defaults:
       run:
         shell: bash

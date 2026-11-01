@@ -406,7 +406,17 @@
         "compiler_runs",
         "preprocessor_runs",
         "probe_runs",
-        "dep_info_runs"
+        "dep_info_runs",
+        "startup_ms",
+        "key_ms",
+        "dep_info_ms",
+        "lookup_ms",
+        "wait_ms",
+        "flight_wait_ms",
+        "permit_wait_ms",
+        "restore_ms",
+        "store_ms",
+        "unattributed_ms"
       ],
       "properties": {
         "crate_name": { "type": "string" },
@@ -444,7 +454,17 @@
         "probe_runs": { "type": "integer", "minimum": 0 },
         "dep_info_runs": { "type": "integer", "minimum": 0 },
         "prediction_mismatches": { "type": "integer", "minimum": 0 },
-        "store_error": { "type": "string" }
+        "store_error": { "type": "string" },
+        "startup_ms": { "type": "integer", "minimum": 0, "description": "Process start to wrapper entry. Zero for events written before schema 17." },
+        "key_ms": { "type": "integer", "minimum": 0 },
+        "dep_info_ms": { "type": "integer", "minimum": 0, "description": "Rustc dep-info pre-pass time, inside key_ms. Zero for events written before schema 17." },
+        "lookup_ms": { "type": "integer", "minimum": 0 },
+        "wait_ms": { "type": "integer", "minimum": 0, "description": "flight_wait_ms + permit_wait_ms. Zero for events written before schema 17." },
+        "flight_wait_ms": { "type": "integer", "minimum": 0, "description": "Zero for events written before schema 17." },
+        "permit_wait_ms": { "type": "integer", "minimum": 0, "description": "Zero for events written before schema 17." },
+        "restore_ms": { "type": "integer", "minimum": 0 },
+        "store_ms": { "type": "integer", "minimum": 0 },
+        "unattributed_ms": { "type": "integer", "minimum": 0, "description": "overhead_ms minus every measured phase, clamped at zero." }
       }
     },
     "BypassReason": {

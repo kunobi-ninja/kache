@@ -1002,6 +1002,30 @@ pub struct CrateDetail {
     pub store_handed_off: bool,
     #[serde(default)]
     pub daemon_store_ms: u64,
+    /// Wrapper phases (ms), the same numbers the trace format carries in
+    /// each crate slice's args. `dep_info_ms` is inside `key_ms`; `wait_ms` is
+    /// flight plus permit; `unattributed_ms` is the overhead no phase
+    /// accounts for.
+    #[serde(default)]
+    pub startup_ms: u64,
+    #[serde(default)]
+    pub key_ms: u64,
+    #[serde(default)]
+    pub dep_info_ms: u64,
+    #[serde(default)]
+    pub lookup_ms: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default)]
+    pub flight_wait_ms: u64,
+    #[serde(default)]
+    pub permit_wait_ms: u64,
+    #[serde(default)]
+    pub restore_ms: u64,
+    #[serde(default)]
+    pub store_ms: u64,
+    #[serde(default)]
+    pub unattributed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1823,6 +1847,16 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         store_error: e.store_error.clone(),
         store_handed_off: e.store_handed_off,
         daemon_store_ms: e.daemon_store_ms,
+        startup_ms: e.startup_ms,
+        key_ms: e.key_ms,
+        dep_info_ms: e.dep_info_ms,
+        lookup_ms: e.lookup_ms,
+        wait_ms: e.wait_ms(),
+        flight_wait_ms: e.flight_wait_ms,
+        permit_wait_ms: e.permit_wait_ms,
+        restore_ms: e.restore_ms,
+        store_ms: e.store_ms,
+        unattributed_ms: e.unattributed_ms(),
     }
 }
 

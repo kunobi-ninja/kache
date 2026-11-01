@@ -525,6 +525,11 @@ pub struct Config {
     /// false` keeps every put in the wrapper. Without a reachable daemon the
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
+    /// Prepare cold MSVC runtime hashes in the daemon while native units compile.
+    /// The first units may run without caching. Disable with
+    /// `KACHE_NATIVE_RUNTIME_WARMUP=0` or `[cache] native_runtime_warmup = false`
+    /// to wait for the hashes before compiling.
+    pub native_runtime_warmup: bool,
     /// Permit a trusted daemon's pipeline to access the workspace under its
     /// own restrictions. Native children and restores still run in the client.
     /// Disabled unless `KACHE_TRUST_DAEMON_EXECUTION=1` or
@@ -974,6 +979,8 @@ pub struct CacheFileConfig {
     pub index_mode: Option<String>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
     pub daemon_publish: Option<bool>,
+    /// Background MSVC runtime hashing. See [`Config::native_runtime_warmup`].
+    pub native_runtime_warmup: Option<bool>,
     pub trust_daemon_execution: Option<bool>,
     /// See [`Config::daemon_execution_concurrency`].
     pub daemon_execution_concurrency: Option<usize>,
@@ -1420,6 +1427,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
+    "KACHE_NATIVE_RUNTIME_WARMUP",
     "KACHE_TRUST_DAEMON_EXECUTION",
     "KACHE_DAEMON_EXECUTION_CONCURRENCY",
     "KACHE_OUT_DIR_ALIAS",
@@ -1538,6 +1546,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_INDEX_MODE", "cache.index_mode"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
+    ("KACHE_NATIVE_RUNTIME_WARMUP", "cache.native_runtime_warmup"),
     (
         "KACHE_TRUST_DAEMON_EXECUTION",
         "cache.trust_daemon_execution",
@@ -2297,6 +2306,8 @@ impl Config {
         let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
         let index_mode = Self::index_mode_for(invocation, &file_config);
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
+        let native_runtime_warmup =
+            Self::native_runtime_warmup_enabled_for(invocation, &file_config);
         let trust_daemon_execution = Self::trust_daemon_execution_for(invocation, &file_config);
         let daemon_execution_concurrency =
             Self::daemon_execution_concurrency_for(invocation, &file_config)?;
@@ -2447,6 +2458,7 @@ impl Config {
             deferred_durability,
             index_mode,
             daemon_publish,
+            native_runtime_warmup,
             trust_daemon_execution,
             daemon_execution_concurrency,
             project_rules,
@@ -3120,6 +3132,25 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.daemon_publish)
+            .unwrap_or(true)
+    }
+
+    fn native_runtime_warmup_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
+        if let Ok(value) = env_or_ignored_for(
+            invocation,
+            "KACHE_NATIVE_RUNTIME_WARMUP",
+            Self::ignore_env_enabled(file_config),
+        ) {
+            return !(value == "0" || value.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|config| config.cache.as_ref())
+            .and_then(|cache| cache.native_runtime_warmup)
             .unwrap_or(true)
     }
 

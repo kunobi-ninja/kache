@@ -24,22 +24,27 @@ pub(super) fn probe(
     client_trust: bool,
     daemon: &Daemon,
 ) -> kache_protocol::execution::ExecutionStatus {
-    let eligible = version == daemon.version
-        && PeerProcess::for_connection(stream, client_pid).is_ok_and(|peer| {
-            peer.permits_delegation(client_trust && daemon.config.trust_daemon_execution)
-                .unwrap_or(false)
-        });
+    let problem = if version != daemon.version {
+        Some("client and daemon releases differ".to_owned())
+    } else {
+        match PeerProcess::for_connection(stream, client_pid).and_then(|peer| {
+            peer.delegation_problem(client_trust && daemon.config.trust_daemon_execution)
+        }) {
+            Ok(problem) => problem.map(str::to_owned),
+            Err(error) => Some(format!(
+                "cannot verify Windows process security context: {error}"
+            )),
+        }
+    };
     kache_protocol::execution::ExecutionStatus {
         protocol_version: EXECUTION_VERSION,
-        eligible,
+        eligible: problem.is_none(),
         client_trust_enabled: client_trust,
         daemon_trust_enabled: daemon.config.trust_daemon_execution,
-        detail: if eligible {
-            "client process and restore broker"
-        } else {
-            "local engine: release or process security context is incompatible"
-        }
-        .into(),
+        detail: problem.map_or_else(
+            || "client process and restore broker".to_owned(),
+            |reason| format!("local engine: {reason}"),
+        ),
     }
 }
 

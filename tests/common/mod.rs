@@ -168,6 +168,9 @@ pub fn hermetic_command(
     command
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_RUNTIME_DIR", cache_dir)
+        // Cache-contract fixtures require the first native compile to store.
+        // The dedicated Windows warmup probe exercises background admission.
+        .env("KACHE_NATIVE_RUNTIME_WARMUP", "0")
         .env_remove("KACHE_SOCKET_PATH")
         .env_remove("KACHE_EVENT_ROOT")
         .env_remove("KACHE_ACTIVE")

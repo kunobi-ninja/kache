@@ -82,13 +82,13 @@ impl PeerSecurity {
                 "compiler endpoint process exited",
             ));
         }
-        if !crate::windows_security::matches_daemon(
+        if let Some(problem) = crate::windows_security::delegation_problem(
             self.process.as_handle(),
             self.trusted_pipeline,
         )? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "compiler endpoint security context differs",
+                format!("compiler endpoint security context differs: {problem}"),
             ));
         }
         Ok(())

@@ -2171,6 +2171,7 @@ mod tests {
                 deferred_durability: None,
                 daemon_publish: None,
                 trust_daemon_execution: None,
+                native_runtime_warmup: Some(false),
                 daemon_execution_concurrency: None,
                 auto_gc: None,
                 index_auto_compact: None,
@@ -2273,6 +2274,7 @@ mod tests {
         assert_eq!(cache.min_store_compile_ms, Some(750));
         assert_eq!(cache.gc_max_age_hours, Some(72));
         assert_eq!(cache.scheduler, Some(false));
+        assert_eq!(cache.native_runtime_warmup, Some(false));
         assert_eq!(cache.gc_evict_shared, Some(true));
         assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
         // The editor has no planner fields, but a save must preserve the

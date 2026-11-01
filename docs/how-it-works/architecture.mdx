@@ -142,6 +142,7 @@ performs brokered restores under its own process restrictions:
 - exact remote checks and downloads
 - storing finished C/C++ compiles that wrappers hand over (`cache.daemon_publish`)
 - background uploads and durable upload replay
+- background MSVC runtime hashing, with one worker and a bounded queue
 - speculative prefetch, and fetching and publishing input records on the remote
 - seeding a new checkout's target directory with registry units another checkout built (`cache.seed_new_targets`)
 - copying large executables beside their destinations while the rest of a build runs

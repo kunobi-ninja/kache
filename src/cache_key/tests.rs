@@ -1457,14 +1457,16 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
         root.clone(),
     );
     for library in ["libcmt.lib", "libvcruntime.lib"] {
-        std::fs::write(fallback.join(library), b"legacy unrequested runtime").unwrap();
+        std::fs::write(fallback.join(library), vec![b'r'; 70_000]).unwrap();
     }
-    let original = crate::native_archive::closed_coff_archive_for_tests(b"\xc3");
+    let original = crate::native_archive::closed_coff_archive_for_tests(&vec![b'c'; 70_000]);
     let changed = crate::native_archive::closed_coff_archive_for_tests(b"\x90\xc3");
     let selected_path = priority.join("ucrt.lib");
     std::fs::write(&selected_path, &original).unwrap();
     std::fs::write(fallback.join("ucrt.lib"), &changed).unwrap();
-    let file_hasher = FileHasher::new_for(&invocation);
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let file_hasher = FileHasher::from_cache_for(FileHashCache::Borrowed(&db), &invocation);
     let fold = |extra: &[&str]| -> Result<(String, String)> {
         let mut argv = vec![
             "rustc".into(),
@@ -1484,18 +1486,15 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
             |linker, architecture, _, search_dirs| {
                 // Only tool banners are fixtures. This is the production
                 // request forwarding, runtime selection/read and hash path.
-                let identity =
-                    crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
-                        linker,
-                        architecture,
-                        &[],
-                        &search_dirs.rustc,
-                        &search_dirs.linker,
-                        &args.link_libs,
-                        &search_dirs.default_libraries,
-                        |path| file_hasher.hash_static_lib(path),
-                        &invocation,
-                    )?;
+                let identity = probe_native_windows_msvc_identity_for(
+                    linker,
+                    architecture,
+                    &[],
+                    search_dirs,
+                    &args,
+                    &file_hasher,
+                    &invocation,
+                )?;
                 selected_digest = identity.libraries.get("ucrt.lib").cloned();
                 Ok(identity)
             },
@@ -1508,6 +1507,13 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
     };
     let request = ["-Clink-arg=/DEFAULTLIB:ucrt.lib"];
     let without_request = fold(&[]).unwrap();
+    let cold = file_hasher.stats();
+    assert_eq!(cold.cache_misses, 3);
+    assert_eq!(cold.bytes_hashed, 140_000 + original.len() as u64);
+    file_hasher.flush_memo_as_if_settled();
+    assert_eq!(fold(&[]).unwrap(), without_request);
+    assert_eq!(file_hasher.stats().cache_hits, 3);
+    assert_eq!(file_hasher.stats().bytes_hashed, cold.bytes_hashed);
     let requested = fold(&request).unwrap();
     assert_eq!(requested.1, blake3::hash(&original).to_hex().to_string());
     assert_eq!(
@@ -1847,6 +1853,648 @@ fn windows_resources_stream_all_bytes_without_trusting_a_whole_file_memo() {
     assert_eq!(file_hasher.stats().cache_hits, 0);
     assert_eq!(file_hasher.stats().bytes_hashed, bytes.len() as u64);
     assert!(file_hasher.pending_memo.borrow().is_empty());
+}
+
+#[test]
+fn uncached_header_hash_reads_bytes_instead_of_supplied_memos() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let path = root.join("header.h");
+    let bytes = vec![b'h'; 65_537];
+    std::fs::write(&path, &bytes).unwrap();
+    let invocation = InvocationEnv::from_parts(
+        Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+        Some(root.clone()),
+        None,
+        root,
+    );
+    let hasher = FileHasher::new_for(&invocation);
+    let observed = ObservedFingerprint::from_path(&path).unwrap();
+    let stale = "0".repeat(64);
+    hasher.prefetched.borrow_mut().insert(
+        observed.fingerprint.clone(),
+        PrefetchedHash {
+            hash: stale.clone(),
+            cache_hit: true,
+            bytes_hashed: 0,
+        },
+    );
+    let supplied = HashMap::from([(observed.fingerprint.path.clone(), stale)]);
+    let expected = blake3::hash(&bytes).to_hex().to_string();
+    assert_eq!(
+        hasher.header_hash(&path, &observed, &supplied).unwrap(),
+        expected
+    );
+    hasher.prefetched.borrow_mut().clear();
+    assert_eq!(
+        hasher.header_hash(&path, &observed, &supplied).unwrap(),
+        expected
+    );
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert!(hasher.pending_memo.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() {
+    use kache_ipc::prelude::*;
+    use kache_protocol::{HashFileRequest, HashFileResult, Request, Response};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let large = root.join("large.rlib");
+    let small = root.join("small.rs");
+    let bytes = vec![b'l'; 65_537];
+    std::fs::write(&large, &bytes).unwrap();
+    std::fs::write(&small, b"small").unwrap();
+    let fingerprint = FileFingerprint::from_path(&large).unwrap();
+    let expected_request = HashFileRequest {
+        path: fingerprint.path.clone(),
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        ctime_ns: fingerprint.ctime_ns,
+        inode: fingerprint.inode,
+    };
+    let expected = blake3::hash(&bytes).to_hex().to_string();
+    let reply = Response::ok_hash_results(vec![HashFileResult {
+        path: fingerprint.path,
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        ctime_ns: fingerprint.ctime_ns,
+        inode: fingerprint.inode,
+        hash: Some(expected.clone()),
+        cache_hit: true,
+        bytes_hashed: 0,
+        error: None,
+    }]);
+    let socket = root.join("hash.sock");
+    let listener = kache_ipc::ListenerOptions::new()
+        .name(kache_ipc::socket_name(&socket).unwrap())
+        .create_tokio()
+        .unwrap();
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let stream = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let Request::HashFiles(request) = serde_json::from_str(&line).unwrap() else {
+                panic!("expected a file-hash prefetch request");
+            };
+            assert_eq!(request.files, vec![expected_request]);
+            let response = format!("{}\n", serde_json::to_string(&reply).unwrap());
+            (&stream).write_all(response.as_bytes()).await.unwrap();
+            (&stream).flush().await.unwrap();
+        })
+        .await
+        .expect("file-hash prefetch did not complete its request");
+    });
+    let invocation = InvocationEnv::from_parts(
+        Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let client = tokio::task::spawn_blocking(move || {
+        let hasher = FileHasher::persistent(&root.join("index.db"))
+            .with_invocation_env(&invocation)
+            .with_daemon(socket);
+        hasher.prefetch(&[small.as_path(), large.as_path()]);
+        let prefetched = hasher.prefetched.borrow().len();
+        let hash = hasher.hash(&large).unwrap();
+        (hash, prefetched, hasher.stats())
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(client.0, expected);
+    assert_eq!(client.1, 1);
+    assert_eq!(client.2.cache_hits, 1);
+    assert_eq!(client.2.cache_misses, 0);
+    assert_eq!(client.2.bytes_hashed, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
+    use kache_ipc::prelude::*;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = kache_ipc::ListenerOptions::new()
+        .name(kache_ipc::socket_name(&socket).unwrap())
+        .nonblocking(interprocess::local_socket::ListenerNonblockingMode::Both)
+        .create_sync()
+        .unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db)).with_daemon(socket);
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let observed = ObservedFingerprint::from_path(&path).unwrap();
+        assert_eq!(observed.fingerprint.inode, 0);
+        hasher.prefetch(&[path.as_path()]);
+        assert!(
+            listener
+                .accept()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let stale = "0".repeat(64);
+        hasher.prefetched.borrow_mut().insert(
+            observed.fingerprint.clone(),
+            PrefetchedHash {
+                hash: stale.clone(),
+                cache_hit: true,
+                bytes_hashed: 0,
+            },
+        );
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(hasher.hash(&path).unwrap(), expected);
+        assert_eq!(
+            hasher
+                .header_hash(
+                    &path,
+                    &observed,
+                    &HashMap::from([(observed.fingerprint.path.clone(), stale.clone()),])
+                )
+                .unwrap(),
+            expected,
+        );
+        let input = CcPreprocessMemoInput {
+            name: "runtime.lib".into(),
+            fingerprint: observed.fingerprint,
+            content: stale,
+            mapped: String::new(),
+            observed_ns: i64::MAX,
+        };
+        assert!(!input.stamp_settled());
+        assert!(
+            hasher
+                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .is_none()
+        );
+        assert!(hasher.hash_static_lib(&path).is_ok());
+        assert_eq!(hasher.stats().cache_hits, 0);
+        assert_eq!(hasher.stats().bytes_hashed, 280_000);
+        assert!(hasher.pending_memo.borrow().is_empty());
+        hasher.flush_memo_as_if_settled();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM file_hashes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    });
+}
+
+fn runtime_warmup_reply(
+    request: crate::daemon::HashFileRequest,
+    hash: Option<String>,
+) -> crate::daemon::HashFileResult {
+    crate::daemon::HashFileResult {
+        path: request.path,
+        size: request.size,
+        mtime_ns: request.mtime_ns,
+        ctime_ns: request.ctime_ns,
+        inode: request.inode,
+        cache_hit: hash.is_some(),
+        hash,
+        bytes_hashed: 0,
+        error: None,
+    }
+}
+
+#[test]
+fn native_runtime_warmup_public_adapter_prepares_ready_memo_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let fingerprint = FileFingerprint::from_path(&path).unwrap();
+    let digest = blake3::hash(&bytes).to_hex().to_string();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("unused.sock"))
+        .with_native_runtime_warmup(true);
+    hasher
+        .native_runtime_warmup_observed_at
+        .set(Some(wall_clock_ns() + 5_000_000_000));
+    hasher
+        .cache
+        .as_ref()
+        .unwrap()
+        .put(&fingerprint, &digest)
+        .unwrap();
+    hasher
+        .prepare_windows_runtime_hashes(&[path.as_path()])
+        .unwrap();
+    let prefetched = hasher.prefetched.borrow();
+    assert_eq!(prefetched.len(), 1);
+    assert_eq!(prefetched[&fingerprint].hash, digest);
+    assert!(prefetched[&fingerprint].cache_hit);
+    assert_eq!(prefetched[&fingerprint].bytes_hashed, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_runtime_warmup_weak_large_files_keep_the_fresh_scalar_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+            .with_daemon(dir.path().join("unused.sock"))
+            .with_native_runtime_warmup(true);
+        hasher
+            .prepare_windows_runtime_hashes_with(
+                &[path.as_path()],
+                wall_clock_ns() + 5_000_000_000,
+                |_, _| panic!("weak identity cannot queue a memo hash"),
+            )
+            .unwrap();
+        assert_eq!(
+            hasher.hash(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(hasher.stats().cache_hits, 0);
+        assert_eq!(hasher.stats().bytes_hashed, 70_000);
+    });
+}
+
+#[test]
+fn native_runtime_warmup_batches_large_misses_without_reading_any_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.lib");
+    let second = dir.path().join("second.lib");
+    let small = dir.path().join("small.lib");
+    std::fs::write(&first, vec![b'a'; 70_000]).unwrap();
+    std::fs::write(&second, vec![b'b'; 80_000]).unwrap();
+    std::fs::write(&small, b"small").unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("daemon.sock"))
+        .with_native_runtime_warmup(true);
+    set_before_read(Some(Box::new(|_| {
+        panic!("warmup must not read runtime bytes")
+    })));
+    let result = hasher.prepare_windows_runtime_hashes_with(
+        &[
+            small.as_path(),
+            first.as_path(),
+            second.as_path(),
+            first.as_path(),
+        ],
+        wall_clock_ns() + 5_000_000_000,
+        |socket, mut requests| {
+            assert_eq!(socket, dir.path().join("daemon.sock"));
+            requests.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut expected = vec![first.display().to_string(), second.display().to_string()];
+            expected.sort();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for request in &requests {
+                let stamp = FileFingerprint::from_path(Path::new(&request.path)).unwrap();
+                assert_eq!(
+                    (
+                        request.size,
+                        request.mtime_ns,
+                        request.ctime_ns,
+                        request.inode
+                    ),
+                    (stamp.size, stamp.mtime_ns, stamp.ctime_ns, stamp.inode)
+                );
+            }
+            Ok(requests
+                .into_iter()
+                .map(|request| runtime_warmup_reply(request, None))
+                .collect())
+        },
+    );
+    set_before_read(None);
+    assert!(
+        result
+            .unwrap_err()
+            .downcast_ref::<NativeRuntimeHashesWarming>()
+            .is_some()
+    );
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+    assert_eq!(hasher.stats().cache_misses, 0);
+    assert!(hasher.prefetched.borrow().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_runtime_warmup_keeps_non_utf8_paths_on_the_fresh_read_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"runtime-\xff.lib".to_vec()));
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("daemon.sock"))
+        .with_native_runtime_warmup(true);
+    hasher
+        .prepare_windows_runtime_hashes_with(
+            &[path.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, _| panic!("a lossy path cannot be queued for daemon hashing"),
+        )
+        .unwrap();
+    assert!(hasher.prefetched.borrow().is_empty());
+    assert_eq!(
+        hasher.hash(&path).unwrap(),
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    assert_eq!(hasher.stats().bytes_hashed, 70_000);
+}
+
+#[test]
+fn native_runtime_warmup_reuses_memo_and_ready_replies_before_small_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo.lib");
+    let ready = dir.path().join("ready.lib");
+    let small = dir.path().join("small.lib");
+    let memo_bytes = vec![b'm'; 70_000];
+    let ready_bytes = vec![b'r'; 65_536];
+    std::fs::write(&memo, &memo_bytes).unwrap();
+    std::fs::write(&ready, &ready_bytes).unwrap();
+    std::fs::write(&small, b"small").unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("daemon.sock"))
+        .with_native_runtime_warmup(true);
+    let memo_hash = blake3::hash(&memo_bytes).to_hex().to_string();
+    let ready_hash = blake3::hash(&ready_bytes).to_hex().to_string();
+    hasher
+        .cache
+        .as_ref()
+        .unwrap()
+        .put(&FileFingerprint::from_path(&memo).unwrap(), &memo_hash)
+        .unwrap();
+    hasher
+        .prepare_windows_runtime_hashes_with(
+            &[memo.as_path(), ready.as_path(), small.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, mut requests| {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].path, ready.display().to_string());
+                Ok(vec![runtime_warmup_reply(
+                    requests.remove(0),
+                    Some(ready_hash.clone()),
+                )])
+            },
+        )
+        .unwrap();
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+    set_before_read(Some(Box::new(|_| {
+        panic!("ready runtime hashes must avoid reads")
+    })));
+    let memo_result = hasher.hash(&memo);
+    let ready_result = hasher.hash(&ready);
+    hasher
+        .prepare_windows_runtime_hashes_with(
+            &[memo.as_path(), ready.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, _| panic!("all hashes are already ready"),
+        )
+        .unwrap();
+    set_before_read(None);
+    assert_eq!(memo_result.unwrap(), memo_hash);
+    assert_eq!(ready_result.unwrap(), ready_hash);
+    assert_eq!(hasher.stats().cache_hits, 2);
+    assert_eq!(hasher.stats().cache_misses, 0);
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+    assert_eq!(
+        hasher.hash(&small).unwrap(),
+        blake3::hash(b"small").to_hex().to_string()
+    );
+    assert_eq!(hasher.stats().bytes_hashed, 5);
+}
+
+#[test]
+fn native_runtime_warmup_rejects_stale_unknown_or_invalid_ready_results() {
+    for mode in [
+        "path",
+        "size",
+        "mtime",
+        "ctime",
+        "inode",
+        "cache-hit",
+        "bytes",
+        "digest",
+        "duplicate",
+        "changed",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lib");
+        let bytes = vec![b'r'; 70_000];
+        std::fs::write(&path, &bytes).unwrap();
+        let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+            .with_daemon(dir.path().join("daemon.sock"))
+            .with_native_runtime_warmup(true);
+        let result = hasher.prepare_windows_runtime_hashes_with(
+            &[path.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, mut requests| {
+                let mut reply = runtime_warmup_reply(
+                    requests.remove(0),
+                    Some(blake3::hash(&bytes).to_hex().to_string()),
+                );
+                match mode {
+                    "path" => reply.path.push_str(".unknown"),
+                    "size" => reply.size += 1,
+                    "mtime" => reply.mtime_ns += 1,
+                    "ctime" => reply.ctime_ns += 1,
+                    "inode" => reply.inode += 1,
+                    "cache-hit" => reply.cache_hit = false,
+                    "bytes" => reply.bytes_hashed = 1,
+                    "digest" => reply.hash = Some("invalid".into()),
+                    "duplicate" => return Ok(vec![reply.clone(), reply]),
+                    "changed" => std::fs::write(&path, vec![b'n'; 70_001]).unwrap(),
+                    _ => unreachable!(),
+                }
+                Ok(vec![reply])
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<NativeRuntimeHashesWarming>()
+                .is_some(),
+            "{mode}"
+        );
+        assert!(hasher.prefetched.borrow().is_empty(), "{mode}");
+        assert_eq!(hasher.stats().bytes_hashed, 0, "{mode}");
+    }
+}
+
+#[test]
+fn native_runtime_warmup_admission_requires_strong_settled_fingerprints() {
+    let file = FileFingerprint {
+        path: "runtime.lib".into(),
+        size: 70_000,
+        mtime_ns: 1_234_567_007,
+        ctime_ns: 1_234_567_007,
+        inode: 5,
+    };
+    assert!(native_runtime_fingerprints_can_warm(
+        std::slice::from_ref(&file),
+        3_234_567_007
+    ));
+    assert!(!native_runtime_fingerprints_can_warm(
+        std::slice::from_ref(&file),
+        3_234_567_006
+    ));
+    let mut weak = file.clone();
+    weak.inode = 0;
+    assert!(!native_runtime_fingerprints_can_warm(
+        &[file.clone(), weak],
+        5_000_000_007
+    ));
+    let mut future = file.clone();
+    future.mtime_ns = 6_000_000_007;
+    assert!(!native_runtime_fingerprints_can_warm(
+        &[file, future],
+        5_000_000_007
+    ));
+}
+
+#[test]
+fn native_runtime_warmup_does_not_promote_invalid_prefetched_metadata() {
+    for mode in ["cache-hit", "bytes", "digest", "memo-digest"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lib");
+        std::fs::write(&path, vec![b'r'; 70_000]).unwrap();
+        let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+            .with_daemon(dir.path().join("daemon.sock"))
+            .with_native_runtime_warmup(true);
+        let fingerprint = FileFingerprint::from_path(&path).unwrap();
+        let mut prefetched = PrefetchedHash {
+            hash: "a".repeat(64),
+            cache_hit: true,
+            bytes_hashed: 0,
+        };
+        match mode {
+            "cache-hit" => prefetched.cache_hit = false,
+            "bytes" => prefetched.bytes_hashed = 1,
+            "digest" => prefetched.hash = "invalid".into(),
+            "memo-digest" => hasher
+                .cache
+                .as_ref()
+                .unwrap()
+                .put(&fingerprint, "invalid")
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        if mode != "memo-digest" {
+            hasher
+                .prefetched
+                .borrow_mut()
+                .insert(fingerprint, prefetched);
+        }
+        let result = hasher.prepare_windows_runtime_hashes_with(
+            &[path.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, requests| {
+                assert_eq!(requests.len(), 1, "{mode}");
+                Ok(requests
+                    .into_iter()
+                    .map(|request| runtime_warmup_reply(request, None))
+                    .collect())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<NativeRuntimeHashesWarming>()
+                .is_some(),
+            "{mode}"
+        );
+        assert_eq!(hasher.stats().bytes_hashed, 0);
+    }
+}
+
+#[test]
+fn native_runtime_warmup_disabled_unavailable_or_refused_keeps_blocking_hashes() {
+    for mode in [
+        "default",
+        "disabled",
+        "no-cache",
+        "no-daemon",
+        "old-daemon",
+        "file-error",
+        "memo-error",
+        "unsettled",
+        "small-only",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lib");
+        let bytes = vec![b'r'; if mode == "small-only" { 65_535 } else { 70_000 }];
+        std::fs::write(&path, &bytes).unwrap();
+        let mut hasher = if mode == "no-cache" {
+            FileHasher::new()
+        } else {
+            FileHasher::persistent(&dir.path().join("index.db"))
+        };
+        if mode != "no-daemon" {
+            hasher = hasher.with_daemon(dir.path().join("daemon.sock"));
+        }
+        if mode != "default" {
+            hasher = hasher.with_native_runtime_warmup(mode != "disabled");
+        }
+        if mode == "memo-error" {
+            hasher
+                .cache
+                .as_ref()
+                .unwrap()
+                .db()
+                .execute_batch("DROP TABLE file_hashes")
+                .unwrap();
+        }
+        let now = if mode == "unsettled" {
+            0
+        } else {
+            wall_clock_ns() + 5_000_000_000
+        };
+        let calls = std::cell::Cell::new(0);
+        hasher
+            .prepare_windows_runtime_hashes_with(&[path.as_path()], now, |_, mut requests| {
+                calls.set(calls.get() + 1);
+                if mode == "old-daemon" {
+                    anyhow::bail!("unsupported request");
+                }
+                assert_eq!(mode, "file-error");
+                let mut reply = runtime_warmup_reply(requests.remove(0), None);
+                reply.error = Some("unreadable".into());
+                Ok(vec![reply])
+            })
+            .unwrap();
+        assert_eq!(
+            calls.get(),
+            usize::from(matches!(mode, "old-daemon" | "file-error")),
+            "{mode}"
+        );
+        assert_eq!(
+            hasher.hash(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        let expected = if mode == "no-cache" {
+            (0, 0)
+        } else {
+            (1, bytes.len() as u64)
+        };
+        assert_eq!(
+            (hasher.stats().cache_misses, hasher.stats().bytes_hashed),
+            expected,
+            "{mode}"
+        );
+    }
 }
 
 #[test]
@@ -14320,7 +14968,11 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
                 &no_mapping,
             )
             .unwrap();
-        inputs[0].observed_ns += observed_later_ns;
+        let changed_ns = inputs[0]
+            .fingerprint
+            .mtime_ns
+            .max(inputs[0].fingerprint.ctime_ns);
+        inputs[0].observed_ns = changed_ns + observed_later_ns;
         hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
         let recorded = hasher
             .cache
@@ -14341,7 +14993,10 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
     };
 
     let (fresh, stored) = record("fresh.h", 0);
-    assert!(!fresh.stamp_settled(), "the file was just written");
+    assert!(
+        !fresh.stamp_settled(),
+        "observed before the settle interval"
+    );
     assert_ne!(stored, fresh.fingerprint, "the stamp is not recorded");
     assert_eq!(reads_on_lookup("fresh.h"), 1, "the content is compared");
 
@@ -15871,7 +16526,10 @@ fn a_weak_guard_identity_cannot_reuse_a_row_from_before_replacement() {
         .push((observed.clone(), old_hash.clone()));
     hasher.flush_memo_as_if_settled();
     let rows = hasher.memoised_hashes(std::iter::once(&observed.fingerprint));
-    assert_eq!(rows.get(&observed.fingerprint.path), Some(&old_hash));
+    assert_eq!(
+        rows.get(&observed.fingerprint.path),
+        if cfg!(windows) { None } else { Some(&old_hash) }
+    );
     let memoised = HashMap::from([(observed.fingerprint.clone(), old_hash.clone())]);
     std::fs::remove_file(&path).unwrap();
     write_file(&path, "after!");

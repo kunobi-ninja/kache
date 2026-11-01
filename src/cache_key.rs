@@ -4088,15 +4088,13 @@ fn compute_key_into(
         cfg!(target_os = "windows"),
         file_hasher,
         |linker, architecture, host, search_dirs| {
-            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+            probe_native_windows_msvc_identity_for(
                 linker,
                 architecture,
                 &rustc_tool_dirs_for(args, host, invocation)?,
-                &search_dirs.rustc,
-                &search_dirs.linker,
-                &args.link_libs,
-                &search_dirs.default_libraries,
-                |path| file_hasher.hash_static_lib(path),
+                search_dirs,
+                args,
+                file_hasher,
                 invocation,
             )
         },
@@ -7471,6 +7469,9 @@ pub struct FileHasher<'db> {
     pub(crate) invocation_env: InvocationEnv,
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
+    native_runtime_warmup: bool,
+    #[cfg(test)]
+    native_runtime_warmup_observed_at: Cell<Option<i64>>,
     use_input_predictions: bool,
     prediction_flight_dir: Option<PathBuf>,
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
@@ -7548,6 +7549,24 @@ struct PrefetchedHash {
     bytes_hashed: u64,
 }
 
+/// The daemon accepted native runtime reads; this compile can run uncached.
+#[derive(Debug)]
+pub(crate) struct NativeRuntimeHashesWarming;
+
+impl std::fmt::Display for NativeRuntimeHashesWarming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native runtime warmup")
+    }
+}
+
+impl std::error::Error for NativeRuntimeHashesWarming {}
+
+fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: i64) -> bool {
+    files
+        .iter()
+        .all(|file| file.inode != 0 && stamp_is_settled(file, observed_at))
+}
+
 #[derive(Clone)]
 struct RecentHash {
     hash: String,
@@ -7610,6 +7629,9 @@ impl FileHasher<'static> {
             invocation_env: env.clone(),
             cache: None,
             daemon_socket: None,
+            native_runtime_warmup: false,
+            #[cfg(test)]
+            native_runtime_warmup_observed_at: Cell::new(None),
             use_input_predictions: false,
             prediction_flight_dir: None,
             discovery_flight: RefCell::new(None),
@@ -7632,6 +7654,9 @@ impl FileHasher<'static> {
                 invocation_env: InvocationEnv::capture(),
                 cache: Some(cache),
                 daemon_socket: None,
+                native_runtime_warmup: false,
+                #[cfg(test)]
+                native_runtime_warmup_observed_at: Cell::new(None),
                 use_input_predictions: false,
                 prediction_flight_dir: None,
                 discovery_flight: RefCell::new(None),
@@ -7718,6 +7743,9 @@ impl<'db> FileHasher<'db> {
             invocation_env: env.clone(),
             cache: Some(cache),
             daemon_socket: None,
+            native_runtime_warmup: false,
+            #[cfg(test)]
+            native_runtime_warmup_observed_at: Cell::new(None),
             use_input_predictions: false,
             prediction_flight_dir: None,
             discovery_flight: RefCell::new(None),
@@ -7735,6 +7763,11 @@ impl<'db> FileHasher<'db> {
 
     pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
         self.daemon_socket = Some(socket_path);
+        self
+    }
+
+    pub(crate) fn with_native_runtime_warmup(mut self, enabled: bool) -> Self {
+        self.native_runtime_warmup = enabled;
         self
     }
 
@@ -7860,7 +7893,7 @@ impl<'db> FileHasher<'db> {
     /// checkout with future mtimes) where the wall-clock guard misfires.
     ///
     /// Fails closed: an empty set, a missing or changed file, or an input
-    /// without an inode (non-Unix, where replace-by-rename is invisible)
+    /// without an inode or Windows file index
     /// never excuses a tripped guard.
     pub fn guarded_inputs_unchanged_since_hash(inputs: &[ObservedFingerprint]) -> bool {
         if inputs.is_empty() {
@@ -7882,8 +7915,8 @@ impl<'db> FileHasher<'db> {
     /// The change time does not count: linking a dependency's output
     /// elsewhere, as store ingest and Cargo's uplift do while its dependents
     /// compile, moves it and leaves the bytes alone. So a rewrite that keeps
-    /// the size and write time is missed, and on Windows, where fingerprints
-    /// carry no inode, so is a replacement with the same size and write time.
+    /// the size and write time is missed. Replacement also needs an inode or
+    /// Windows file index; a weak filesystem observation cannot prove it.
     pub fn guarded_inputs_moved_since_hash(inputs: &[ObservedFingerprint]) -> bool {
         inputs.iter().any(|input| {
             let expected = &input.fingerprint;
@@ -8212,7 +8245,9 @@ impl<'db> FileHasher<'db> {
             // Cheapest first: identical metadata needs no read, identical raw
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
-            if current.fingerprint == expected.fingerprint {
+            if current.fingerprint == expected.fingerprint
+                && file_hash_memo_eligible(current.fingerprint.inode, cfg!(windows))
+            {
                 // Unhashed, so registered here with the bytes its stamp
                 // proves: the recheck after a compile has to cover it like
                 // any input the key hashed.
@@ -8559,6 +8594,7 @@ impl<'db> FileHasher<'db> {
                 continue;
             };
             if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+                || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
                 || self.prefetched.borrow().contains_key(&fingerprint)
             {
                 continue;
@@ -8601,6 +8637,142 @@ impl<'db> FileHasher<'db> {
             }
             Err(e) => tracing::debug!("daemon file hash prefetch failed: {e}"),
         }
+    }
+
+    pub(crate) fn prepare_windows_runtime_hashes(&self, paths: &[&Path]) -> Result<()> {
+        let observed_at = wall_clock_ns();
+        #[cfg(test)]
+        let observed_at = self
+            .native_runtime_warmup_observed_at
+            .get()
+            .unwrap_or(observed_at);
+        self.prepare_windows_runtime_hashes_with(paths, observed_at, |socket, files| {
+            crate::daemon::send_hash_files_warmup_request(socket, files)
+        })
+    }
+
+    fn prepare_windows_runtime_hashes_with<Send>(
+        &self,
+        paths: &[&Path],
+        observed_at: i64,
+        send: Send,
+    ) -> Result<()>
+    where
+        Send: FnOnce(
+            &Path,
+            Vec<crate::daemon::HashFileRequest>,
+        ) -> Result<Vec<crate::daemon::HashFileResult>>,
+    {
+        if !self.native_runtime_warmup {
+            return Ok(());
+        }
+        let (Some(cache), Some(socket)) = (&self.cache, &self.daemon_socket) else {
+            return Ok(());
+        };
+        let mut files = Vec::new();
+        for path in paths {
+            let resolved = self.resolve_path(path)?;
+            // The memo and daemon protocol use UTF-8 path keys. Keep the
+            // existing fresh-read path when the actual filename cannot roundtrip.
+            if resolved.to_str().is_none() {
+                return Ok(());
+            }
+            let fingerprint = FileFingerprint::from_path(&resolved)?;
+            // Small runtimes stay fresh and blocking, after large hashes are
+            // ready. They must not disable preparation of the large cohort.
+            if fingerprint.size >= MIN_PERSISTED_HASH_BYTES && !files.contains(&fingerprint) {
+                files.push(fingerprint);
+            }
+        }
+        if files.is_empty() || !native_runtime_fingerprints_can_warm(&files, observed_at) {
+            return Ok(());
+        }
+        let stamps: Vec<_> = files.iter().collect();
+        let memoized = match cache.get_many(&stamps) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                tracing::debug!(%error, "native runtime hash memo unavailable; hashing synchronously");
+                return Ok(());
+            }
+        };
+        let mut ready = HashMap::new();
+        let mut missing = std::collections::HashSet::new();
+        let mut requests = Vec::new();
+        for file in files {
+            if let Some(hash) = memoized
+                .get(&file.path)
+                .filter(|hash| is_valid_cache_key(hash))
+            {
+                ready.insert(file, hash.clone());
+            } else if let Some(hash) = self.prefetched.borrow().get(&file).filter(|hash| {
+                hash.cache_hit && hash.bytes_hashed == 0 && is_valid_cache_key(&hash.hash)
+            }) {
+                ready.insert(file, hash.hash.clone());
+            } else {
+                requests.push(crate::daemon::HashFileRequest {
+                    path: file.path.clone(),
+                    size: file.size,
+                    mtime_ns: file.mtime_ns,
+                    ctime_ns: file.ctime_ns,
+                    inode: file.inode,
+                });
+                missing.insert(file);
+            }
+        }
+        if !missing.is_empty() {
+            let results = match send(socket, requests) {
+                Ok(results) => results,
+                Err(error) => {
+                    tracing::debug!(%error, "native runtime warmup unavailable; hashing synchronously");
+                    return Ok(());
+                }
+            };
+            let mut seen = std::collections::HashSet::new();
+            for result in results {
+                let file = FileFingerprint {
+                    path: result.path,
+                    size: result.size,
+                    mtime_ns: result.mtime_ns,
+                    ctime_ns: result.ctime_ns,
+                    inode: result.inode,
+                };
+                if !missing.contains(&file) {
+                    continue;
+                }
+                if !seen.insert(file.clone()) {
+                    ready.remove(&file);
+                    continue;
+                }
+                if result.error.is_some() {
+                    tracing::debug!(error = ?result.error, "native runtime warmup refused a file; hashing synchronously");
+                    return Ok(());
+                }
+                if let Some(hash) = result.hash.filter(|hash| is_valid_cache_key(hash))
+                    && result.cache_hit
+                    && result.bytes_hashed == 0
+                    && FileFingerprint::from_path(Path::new(&file.path))
+                        .is_ok_and(|current| current == file)
+                {
+                    ready.insert(file, hash);
+                }
+            }
+        }
+        let pending = missing.iter().any(|file| !ready.contains_key(file));
+        let mut prefetched = self.prefetched.borrow_mut();
+        for (file, hash) in ready {
+            prefetched.insert(
+                file,
+                PrefetchedHash {
+                    hash,
+                    cache_hit: true,
+                    bytes_hashed: 0,
+                },
+            );
+        }
+        if pending {
+            return Err(NativeRuntimeHashesWarming.into());
+        }
+        Ok(())
     }
 
     /// Hash a file's contents, using the persistent cache when available.
@@ -8812,7 +8984,9 @@ impl<'db> FileHasher<'db> {
             self.note_too_new(fingerprint);
         }
 
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+        {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
             let (observed, _) = self.restat_after_read(path, observed, keyed);
@@ -9046,7 +9220,9 @@ impl<'db> FileHasher<'db> {
         // Small libs skip the persistent cache (same policy as `hash`); the
         // archive read is cheap and not worth a row.
         let size = fingerprint.size;
-        if size < MIN_PERSISTED_HASH_BYTES {
+        if size < MIN_PERSISTED_HASH_BYTES
+            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+        {
             let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
             self.record_miss(size);
             return Ok(hash);
@@ -9126,7 +9302,9 @@ impl<'db> FileHasher<'db> {
     ) -> Result<String> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
-        if self.cache.is_none() {
+        if self.cache.is_none()
+            || !file_hash_memo_eligible(observed.fingerprint.inode, cfg!(windows))
+        {
             return self.hash(path);
         }
         let fingerprint = &observed.fingerprint;
@@ -10768,6 +10946,31 @@ struct WindowsNativeLinkSearchDirs {
     /// (see `windows_link_argument_input_files`), in argument order.
     files: Vec<PathBuf>,
     default_libraries: Vec<crate::native_link_key::WindowsDefaultLibrary>,
+}
+
+fn probe_native_windows_msvc_identity_for(
+    linker: Option<&Path>,
+    architecture: &str,
+    rustc_tool_dirs: &[PathBuf],
+    search_dirs: &WindowsNativeLinkSearchDirs,
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    invocation: &InvocationEnv,
+) -> Result<crate::native_link_key::WindowsMsvcIdentity> {
+    let prepare = |paths: &[&Path]| file_hasher.prepare_windows_runtime_hashes(paths);
+    crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+        linker,
+        architecture,
+        rustc_tool_dirs,
+        &search_dirs.rustc,
+        &search_dirs.linker,
+        &args.link_libs,
+        &search_dirs.default_libraries,
+        |path| file_hasher.hash_static_lib(path),
+        |path| file_hasher.hash(path),
+        invocation,
+        Some(&prepare),
+    )
 }
 
 fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {

@@ -1949,6 +1949,76 @@ fn only_an_uncacheable_reason_quotes_rustc_output() {
 }
 
 #[test]
+fn native_runtime_warmup_reason_survives_error_contexts() {
+    assert_eq!(
+        crate::cache_key::NativeRuntimeHashesWarming.to_string(),
+        "native runtime warmup"
+    );
+    let error = anyhow::Error::new(crate::cache_key::NativeRuntimeHashesWarming)
+        .context("preparing selected runtime libraries")
+        .context("determining native Windows MSVC link identity");
+    let reason = uncacheable_reason(&error);
+    assert_eq!(reason, "native runtime warmup");
+    assert_eq!(rustc_output_in(&reason), "");
+    assert!(
+        error
+            .downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+            .is_some()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_runtime_warmup_passthrough_runs_the_compiler_and_keeps_its_exit_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let compiler = dir.path().join("rustc");
+    let marker = dir.path().join("compiler-ran");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        "#!/bin/sh\nprintf ran > \"$KACHE_TEST_RUNTIME_MARKER\"\nexit 37\n",
+    );
+    let invocation = crate::invocation::InvocationEnv::from_parts(
+        [("KACHE_TEST_RUNTIME_MARKER", marker.as_os_str().to_owned())],
+        Some(dir.path().to_path_buf()),
+        None,
+        dir.path().to_path_buf(),
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            compiler.display().to_string(),
+            "--crate-name".into(),
+            "warmup".into(),
+            "input.rs".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.scheduler = true;
+    let reason = uncacheable_reason(&anyhow::Error::new(
+        crate::cache_key::NativeRuntimeHashesWarming,
+    ));
+    let status = passthrough_with_event(
+        &config,
+        &args,
+        "warmup",
+        "root",
+        std::time::Instant::now(),
+        reason,
+        KeyEventRecord::default(),
+    )
+    .unwrap();
+    assert_eq!(status, 37);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"ran");
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].result, EventResult::Passthrough);
+    assert_eq!(events[0].passthrough_reason, "native runtime warmup");
+    assert_eq!(events[0].exit_code, Some(37));
+    assert!(config.cache_dir.join("scheduler").is_dir());
+}
+
+#[test]
 fn restore_events_keep_the_debug_bundle_limit_cause() {
     use crate::compiler::{PostRestoreAction, platform::tests::CountingPlatform};
 

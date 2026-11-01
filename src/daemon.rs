@@ -34,7 +34,7 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, RwLock};
@@ -1879,6 +1879,7 @@ pub(crate) struct Daemon {
     transfer_counters: TransferCounters,
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
+    file_hash_warmup: Arc<FileHashWarmup>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
@@ -1925,6 +1926,342 @@ struct FileHashCacheKey {
     mtime_ns: i64,
     ctime_ns: i64,
     inode: i64,
+}
+
+const HASH_WARMUP_REQUEST_LIMIT: usize = 64;
+const HASH_WARMUP_PENDING_LIMIT: usize = 128;
+const HASH_WARMUP_TIMEOUT: Duration = Duration::from_millis(100);
+
+impl From<&HashFileRequest> for FileHashCacheKey {
+    fn from(file: &HashFileRequest) -> Self {
+        Self {
+            path: file.path.clone(),
+            size: file.size,
+            mtime_ns: file.mtime_ns,
+            ctime_ns: file.ctime_ns,
+            inode: file.inode,
+        }
+    }
+}
+
+impl FileHashCacheKey {
+    fn fingerprint(&self) -> crate::cache_key::FileFingerprint {
+        crate::cache_key::FileFingerprint {
+            path: self.path.clone(),
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            inode: self.inode,
+        }
+    }
+
+    fn result(&self, hash: Option<String>) -> HashFileResult {
+        HashFileResult {
+            path: self.path.clone(),
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            inode: self.inode,
+            cache_hit: hash.is_some(),
+            hash,
+            bytes_hashed: 0,
+            error: None,
+        }
+    }
+}
+
+fn hash_warmup_keys(files: &[HashFileRequest]) -> Result<Vec<FileHashCacheKey>> {
+    anyhow::ensure!(
+        files.len() <= HASH_WARMUP_REQUEST_LIMIT,
+        "file hash warmup exceeds 64 files"
+    );
+    files
+        .iter()
+        .map(|file| {
+            anyhow::ensure!(
+                Path::new(&file.path).is_absolute()
+                    && file.size > 0
+                    && file.inode != 0
+                    && file.mtime_ns >= 0
+                    && file.ctime_ns > 0,
+                "file hash warmup requires a strong absolute fingerprint"
+            );
+            Ok(FileHashCacheKey::from(file))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct FileHashWarmupState {
+    queue: std::collections::VecDeque<FileHashCacheKey>,
+    pending: HashSet<FileHashCacheKey>,
+    failed: HashSet<FileHashCacheKey>,
+    active: Option<FileHashCacheKey>,
+    running: bool,
+    stopping: bool,
+}
+
+#[derive(Default)]
+struct FileHashWarmup {
+    state: Mutex<FileHashWarmupState>,
+    changed: Condvar,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct FileHashWarmupWorker {
+    warmup: Arc<FileHashWarmup>,
+    failed: bool,
+}
+
+impl Drop for FileHashWarmupWorker {
+    fn drop(&mut self) {
+        self.warmup.reset_worker(self.failed);
+    }
+}
+
+impl FileHashWarmup {
+    fn respond(
+        self: &Arc<Self>,
+        files: &[HashFileRequest],
+        cache: &Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
+        operation: impl FnMut(&FileHashCacheKey) -> Result<Option<String>> + Send + 'static,
+    ) -> Result<Vec<HashFileResult>> {
+        let keys = hash_warmup_keys(files)?;
+        let (results, start) = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(!state.stopping, "file hash warmup is stopping");
+            let mut failed = false;
+            for key in &keys {
+                failed = state.failed.remove(key) || failed;
+            }
+            anyhow::ensure!(
+                !failed,
+                "file hash warmup failed; retry with blocking hashing"
+            );
+            let cache = cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("file hash memory cache poisoned"))?;
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys {
+                let ready = cache
+                    .get(&key)
+                    .filter(|hash| crate::cache_key::is_valid_cache_key(hash))
+                    .cloned();
+                if ready.is_none()
+                    && state.pending.len() < HASH_WARMUP_PENDING_LIMIT
+                    && state.pending.insert(key.clone())
+                {
+                    state.queue.push_back(key.clone());
+                }
+                results.push(key.result(ready));
+            }
+            let start = !state.running && !state.queue.is_empty();
+            if start {
+                state.running = true;
+            }
+            (results, start)
+        };
+        if start {
+            self.start_worker(Arc::clone(cache), operation)?;
+        }
+        self.changed.notify_all();
+        Ok(results)
+    }
+
+    fn start_worker(
+        self: &Arc<Self>,
+        cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
+        operation: impl FnMut(&FileHashCacheKey) -> Result<Option<String>> + Send + 'static,
+    ) -> Result<()> {
+        let mut handle = self.worker.lock().unwrap_or_else(|p| p.into_inner());
+        let stopping = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stopping;
+        if stopping {
+            self.reset_worker(false);
+            anyhow::bail!("file hash warmup is stopping");
+        }
+        let warmup = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("kache-hash-warmup".into())
+            .spawn(move || {
+                let mut guard = FileHashWarmupWorker {
+                    warmup: Arc::clone(&warmup),
+                    failed: true,
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    warmup.run_worker(&cache, operation)
+                }));
+                match outcome {
+                    Ok(Ok(())) => guard.failed = false,
+                    Ok(Err(error)) => tracing::debug!("file hash warmup failed: {error:#}"),
+                    Err(_) => tracing::warn!("file hash warmup worker panicked"),
+                }
+            }) {
+            Ok(worker) => {
+                *handle = Some(worker);
+                Ok(())
+            }
+            Err(error) => {
+                self.reset_worker(false);
+                Err(error.into())
+            }
+        }
+    }
+
+    fn run_worker(
+        &self,
+        cache: &Mutex<HashMap<FileHashCacheKey, String>>,
+        mut operation: impl FnMut(&FileHashCacheKey) -> Result<Option<String>>,
+    ) -> Result<()> {
+        loop {
+            let key = {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                while state.queue.is_empty() && !state.stopping {
+                    state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner());
+                }
+                if state.stopping {
+                    return Ok(());
+                }
+                let key = state.queue.pop_front().expect("warmup queue is nonempty");
+                state.active = Some(key.clone());
+                key
+            };
+            // No queue/cache lock or connection handler owns this read.
+            if let Some(hash) = operation(&key)? {
+                let mut cache = cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("file hash memory cache poisoned"))?;
+                if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(key.clone(), hash);
+            }
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.pending.remove(&key);
+            state.active = None;
+            self.changed.notify_all();
+        }
+    }
+
+    fn reset_worker(&self, failed: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if failed
+            && !state.stopping
+            && let Some(key) = state.active.clone()
+        {
+            if state.failed.len() >= HASH_WARMUP_PENDING_LIMIT
+                && let Some(evicted) = state.failed.iter().next().cloned()
+            {
+                state.failed.remove(&evicted);
+            }
+            state.failed.insert(key);
+        }
+        state.queue.clear();
+        state.pending.clear();
+        state.active = None;
+        state.running = false;
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.stopping = true;
+        state.queue.clear();
+        state.pending.clear();
+        state.failed.clear();
+        if let Some(active) = state.active.clone() {
+            state.pending.insert(active);
+        }
+        self.changed.notify_all();
+    }
+}
+
+fn prepare_hash_warmup_with(
+    key: &FileHashCacheKey,
+    observe: impl Fn(&Path) -> Result<crate::cache_key::ObservedFingerprint>,
+    lookup: impl FnOnce(&Path) -> Result<crate::cache_key::FileHashLookup>,
+    read: impl FnOnce(&Path) -> Result<String>,
+    record: impl FnOnce(&crate::cache_key::FileFingerprint, &str) -> Result<()>,
+) -> Result<Option<String>> {
+    let path = Path::new(&key.path);
+    let before = observe(path)?;
+    if before.fingerprint != key.fingerprint() || before.fingerprint.inode == 0 || !before.settled()
+    {
+        return Ok(None);
+    }
+    let (hash, needs_record) = match lookup(path)? {
+        crate::cache_key::FileHashLookup::Hit(hash) => (hash, false),
+        crate::cache_key::FileHashLookup::NeedsHash(fingerprint)
+            if fingerprint == before.fingerprint =>
+        {
+            (read(path)?, true)
+        }
+        crate::cache_key::FileHashLookup::NeedsHash(_) => return Ok(None),
+        crate::cache_key::FileHashLookup::Uncacheable => (read(path)?, false),
+    };
+    anyhow::ensure!(
+        crate::cache_key::is_valid_cache_key(&hash),
+        "invalid file hash warmup digest"
+    );
+    let after = observe(path)?;
+    if after.fingerprint != before.fingerprint || !after.settled() {
+        return Ok(None);
+    }
+    if needs_record {
+        record(&before.fingerprint, &hash)?;
+    }
+    Ok(Some(hash))
+}
+
+fn prepare_hash_warmup(
+    config: &Config,
+    store: &mut Option<Store>,
+    key: &FileHashCacheKey,
+    env: &crate::invocation::InvocationEnv,
+) -> Result<Option<String>> {
+    let _invocation = crate::phase_trace::start_for("native-runtime-warmup", &[], env);
+    let _trace = crate::phase_trace::phase("native_msvc_runtime_warmup");
+    if store.is_none() {
+        *store = Some(Store::open(config)?);
+    }
+    let store = store.as_ref().expect("warmup store initialized");
+    prepare_hash_warmup_with(
+        key,
+        crate::cache_key::ObservedFingerprint::from_path,
+        |path| Ok(store.file_hash_lookup(path)),
+        crate::cache_key::hash_file,
+        |fingerprint, hash| {
+            store.file_hash_record(fingerprint, hash);
+            Ok(())
+        },
+    )
+}
+
+fn remember_ready_file_hash(
+    cache: &Mutex<HashMap<FileHashCacheKey, String>>,
+    key: &FileHashCacheKey,
+    hash: &str,
+    settled: bool,
+    observe: impl FnOnce(&Path) -> Result<crate::cache_key::FileFingerprint>,
+) {
+    if settled
+        && observe(Path::new(&key.path)).is_ok_and(|current| current == key.fingerprint())
+        && let Ok(mut cache) = cache.lock()
+    {
+        if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key.clone(), hash.to_owned());
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.file_hash_warmup.stop();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2031,6 +2368,7 @@ impl Daemon {
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
+            file_hash_warmup: Arc::new(FileHashWarmup::default()),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
@@ -2729,6 +3067,7 @@ impl Daemon {
             | Request::ExecutionStatus { .. }
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
+            | Request::HashFilesWarmup(_)
             | Request::Prefetch(_)
             | Request::PublishCc(_)
             | Request::PredictionFetch(_)
@@ -2966,6 +3305,20 @@ impl Daemon {
         self.handle_hash_files_at(req, crate::cache_key::wall_clock_ns)
     }
 
+    fn handle_hash_files_warmup(&self, req: &HashFilesRequest) -> Response {
+        let config = self.config.clone();
+        let env = crate::invocation::InvocationEnv::capture();
+        let mut store = None;
+        match self
+            .file_hash_warmup
+            .respond(&req.files, &self.file_hash_cache, move |key| {
+                prepare_hash_warmup(&config, &mut store, key, &env)
+            }) {
+            Ok(results) => Response::ok_hash_results(results),
+            Err(error) => Response::err(format!("file hash warmup rejected: {error:#}")),
+        }
+    }
+
     /// [`Self::handle_hash_files`] with the wall clock supplied.
     fn handle_hash_files_at(&self, req: &HashFilesRequest, clock: impl Fn() -> i64) -> Response {
         let mut results = Vec::with_capacity(req.files.len());
@@ -2980,6 +3333,7 @@ impl Daemon {
             };
 
             if let Ok(cache) = self.file_hash_cache.lock()
+                && crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
                 && let Some(hash) = cache.get(&key).cloned()
             {
                 results.push(HashFileResult {
@@ -2999,12 +3353,12 @@ impl Daemon {
             // Read before the stats below, so it is no later than the moment
             // either of them saw the stamp.
             let observed_ns = clock();
-            match std::fs::metadata(&file.path) {
-                Ok(metadata)
-                    if i64::try_from(metadata.len()).unwrap_or(i64::MAX) == file.size
-                        && crate::cache_key::metadata_mtime_ns(&metadata) == file.mtime_ns
-                        && crate::cache_key::metadata_ctime_ns(&metadata) == file.ctime_ns
-                        && crate::cache_key::metadata_inode(&metadata) == file.inode => {}
+            match crate::cache_key::FileFingerprint::from_path(Path::new(&file.path)) {
+                Ok(fingerprint)
+                    if fingerprint.size == file.size
+                        && fingerprint.mtime_ns == file.mtime_ns
+                        && fingerprint.ctime_ns == file.ctime_ns
+                        && fingerprint.inode == file.inode => {}
                 Ok(_) => {
                     results.push(HashFileResult {
                         path: file.path.clone(),
@@ -3038,16 +3392,17 @@ impl Daemon {
             // A stamp that had changed within the settle window when it was
             // observed can be kept by a second write in the same tick, so
             // its hash goes back to this caller and is remembered nowhere.
-            let settled = crate::cache_key::stamp_is_settled(
-                &crate::cache_key::FileFingerprint {
-                    path: file.path.clone(),
-                    size: file.size,
-                    mtime_ns: file.mtime_ns,
-                    ctime_ns: file.ctime_ns,
-                    inode: file.inode,
-                },
-                observed_ns,
-            );
+            let settled = crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
+                && crate::cache_key::stamp_is_settled(
+                    &crate::cache_key::FileFingerprint {
+                        path: file.path.clone(),
+                        size: file.size,
+                        mtime_ns: file.mtime_ns,
+                        ctime_ns: file.ctime_ns,
+                        inode: file.inode,
+                    },
+                    observed_ns,
+                );
 
             // #281: hold the store mutex only for the cheap cache lookup and
             // record; run the blake3 read of the whole file OUTSIDE the lock so
@@ -3078,12 +3433,13 @@ impl Daemon {
 
             match computed {
                 Ok((hash, cache_hit, bytes_hashed)) => {
-                    if settled && let Ok(mut cache) = self.file_hash_cache.lock() {
-                        if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
-                            cache.clear();
-                        }
-                        cache.insert(key, hash.clone());
-                    }
+                    remember_ready_file_hash(
+                        &self.file_hash_cache,
+                        &key,
+                        &hash,
+                        settled,
+                        crate::cache_key::FileFingerprint::from_path,
+                    );
 
                     results.push(HashFileResult {
                         path: file.path.clone(),
@@ -7390,6 +7746,7 @@ async fn accept_loop(
     // the runtime and starts draining uploads.
     lifecycle.start_drain();
     daemon.stop_prefetch_admission();
+    daemon.file_hash_warmup.stop();
     let drain_deadline = tokio::time::Instant::now() + handler_drain_timeout;
     let _ = lifecycle.drain_until(drain_deadline).await;
     if drain_connection_handlers(
@@ -8074,6 +8431,7 @@ async fn handle_connection_started_at(
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_hash_files(&req)).await
             }
+            Ok(Request::HashFilesWarmup(req)) => daemon.handle_hash_files_warmup(&req),
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
@@ -8082,6 +8440,7 @@ async fn handle_connection_started_at(
             Ok(Request::PredictionFetch(req)) => daemon.handle_prediction_fetch(&req).await,
             Ok(Request::PredictionPublish(req)) => daemon.handle_prediction_publish(req),
             Ok(Request::Shutdown) => {
+                daemon.file_hash_warmup.stop();
                 lifecycle.start_drain();
                 // Wake the accept loop so it breaks now rather than on the next
                 // periodic tick (issue #288).
@@ -8518,13 +8877,62 @@ pub fn send_hash_files_request(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    if !socket_path.exists() {
-        anyhow::bail!("daemon socket does not exist: {}", socket_path.display());
-    }
-
     let req = Request::HashFiles(HashFilesRequest { files });
     let resp_str = send_request_with_timeout(socket_path, &req, std::time::Duration::from_secs(3))?;
     hash_files_results_from_response_line(&resp_str)
+}
+
+/// Queue cold fingerprints without waiting for disk reads. Old or unavailable
+/// daemons return an error so the caller can retain blocking hashing.
+pub fn send_hash_files_warmup_request(
+    socket_path: &Path,
+    files: Vec<HashFileRequest>,
+) -> Result<Vec<HashFileResult>> {
+    let keys = hash_warmup_keys(&files)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let request = Request::HashFilesWarmup(HashFilesRequest { files });
+    let response = send_request_with_timeout(socket_path, &request, HASH_WARMUP_TIMEOUT)?;
+    hash_warmup_results_from_response(&response, &keys)
+}
+
+fn hash_warmup_results_from_response(
+    response: &str,
+    keys: &[FileHashCacheKey],
+) -> Result<Vec<HashFileResult>> {
+    let response: Response = serde_json::from_str(response)?;
+    anyhow::ensure!(
+        response.ok && response.error.is_none(),
+        "daemon rejected file hash warmup: {}",
+        response.error.unwrap_or_default()
+    );
+    let results = response
+        .hash_results
+        .context("daemon did not return file hash warmup results")?;
+    anyhow::ensure!(
+        results.len() == keys.len(),
+        "file hash warmup response length differs"
+    );
+    for (result, key) in results.iter().zip(keys) {
+        let matched = result.path == key.path
+            && result.size == key.size
+            && result.mtime_ns == key.mtime_ns
+            && result.ctime_ns == key.ctime_ns
+            && result.inode == key.inode;
+        anyhow::ensure!(
+            matched && result.error.is_none() && result.bytes_hashed == 0,
+            "file hash warmup response does not match its fingerprint"
+        );
+        match &result.hash {
+            Some(hash) => anyhow::ensure!(
+                result.cache_hit && crate::cache_key::is_valid_cache_key(hash),
+                "invalid ready warmup hash"
+            ),
+            None => anyhow::ensure!(!result.cache_hit, "pending warmup hash claimed a hit"),
+        }
+    }
+    Ok(results)
 }
 
 fn hash_files_results_from_response_line(resp_str: &str) -> Result<Vec<HashFileResult>> {

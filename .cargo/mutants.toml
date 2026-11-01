@@ -283,9 +283,16 @@ exclude_globs = [
 # `notice::deliver`, which picks terminal, stderr or log, stays in scope and
 # is tested with in-memory writers, refused writes and no terminal.
 exclude_re = [
-    # Only this thin syscall adapter is Windows-only; the delegation policy
-    # is compiled and mutation-tested on Linux.
-    "crates/kache-ipc/src/windows_security.rs:.*matches_daemon",
+    # These Windows-only wrappers query process security. The pure
+    # delegation_problem_for policy stays compiled and mutation-tested on Linux.
+    "crates/kache-ipc/src/windows_security\\.rs:.*\\b(matches_daemon|delegation_problem)\\b",
+    # Only the Windows handle/volume/basic-info reader is excluded. The
+    # windows_fingerprint_from_parts decoder and memo eligibility policy have
+    # portable tests for all identity, size and timestamp decisions.
+    "crates/kache-store/src/file_hash\\.rs:.*\\bwindows_fingerprint\\b",
+    # This thread-local failure fixture and its restoration Drop exist only
+    # on Windows; they contain no production fingerprint or admission logic.
+    "crates/kache-store/src/file_hash\\.rs:.*\\bwith_weak_windows_fingerprints_for_tests(?:::<impl Drop for Restore>::drop)?(?: ->| with|$)",
     # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
     "src/invocation/unix_broker.rs:.*can_track_client",
     "src/fallback.rs:.*compiler_peer_may_delegate",

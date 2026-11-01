@@ -138,7 +138,7 @@ mutants-service *ARGS:
 # describe the current working tree.
 [group('dev')]
 mutants-diff DIFF *ARGS:
-  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --exclude 'crates/kache-proofs/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --exclude 'crates/kache-proofs/**' --baseline run --timeout 450 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
 
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once

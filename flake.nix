@@ -139,6 +139,7 @@
       # so dogfooding kache on kache keeps working inside the shell.
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
+          KACHE_TEST_SLEEP = lib.getExe' pkgs.coreutils "sleep";
           packages = [
             pkgs.kache-rust-toolchain
             pkgs.just

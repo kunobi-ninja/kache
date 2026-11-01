@@ -8728,6 +8728,50 @@ fn remove_targets_refuses_a_directory_replaced_after_scan() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn clean_skips_a_directly_started_program_but_removes_an_idle_sibling() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let busy = root.path().join("busy");
+    let idle = root.path().join("idle");
+    std::fs::create_dir(&idle).unwrap();
+    let child = crate::target_processes::tests::RunningProgram::start(&busy);
+    let to_remove: Vec<_> = [&busy, &idle]
+        .into_iter()
+        .map(|path| RemovalTarget {
+            path: path.clone(),
+            scanned_identity: directory_identity(path),
+            estimated_reclaimable: 100,
+            apparent_gap: 0,
+        })
+        .collect();
+    assert_eq!(
+        removal_notes(cache.path(), &[&busy, &idle]),
+        [format!("Not now: 1 target {TARGET_IN_USE}.")]
+    );
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+    assert_eq!(
+        remove_targets(
+            &to_remove,
+            root.path(),
+            cache.path(),
+            true,
+            &mut skipped,
+            &mut Vec::new(),
+            &mut failed
+        ),
+        (1, 100, 0)
+    );
+    assert!(failed.is_empty());
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].reason, TARGET_IN_USE);
+    assert!(busy.join("running-program").exists());
+    assert!(!idle.exists());
+    drop(child);
+}
+
 #[test]
 fn clean_handle_key_cancel_and_confirm() {
     use crossterm::event::KeyCode;

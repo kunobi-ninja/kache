@@ -234,6 +234,7 @@ pub(crate) fn unit_window(days: u64) -> Option<Duration> {
 /// the sweep stays.
 pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     let store = Store::open(config)?;
+    let programs = crate::target_processes::ActivePrograms::default();
     let window = unit_window(config.auto_clean_unused_units_days);
     let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
@@ -245,6 +246,9 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
             forget(&store, &tracked.path, tracked.identity);
+            continue;
+        }
+        if programs.uses(&tracked.path) {
             continue;
         }
         if tracked.discovered {
@@ -317,8 +321,8 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
             unused.insert(tracked.path, since);
         }
     }
-    let used = prune_under_pressure(config, &store, at, &mut swept)?;
-    recover_under_pressure(config, &store, now, &unused, &used, &mut swept)?;
+    let used = prune_under_pressure(config, &store, at, &mut swept, &programs)?;
+    recover_under_pressure(config, &store, now, &unused, &used, &mut swept, &programs)?;
     Ok(swept)
 }
 
@@ -364,6 +368,9 @@ pub(crate) struct Plan {
 /// What [`sweep`] would do to `tracked` at `now`, from the same checks,
 /// without changing anything.
 pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Plan {
+    if crate::target_processes::ActivePrograms::default().uses(&tracked.path) {
+        return Plan::default();
+    }
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(now);
     let now = i64::try_from(now).unwrap_or(i64::MAX);
     let Some(idle) = idle_secs(config, tracked, now) else {
@@ -496,12 +503,17 @@ fn prune_under_pressure(
     store: &Store,
     at: SystemTime,
     swept: &mut Swept,
+    programs: &crate::target_processes::ActivePrograms,
 ) -> anyhow::Result<std::collections::HashSet<PathBuf>> {
     let mut used = std::collections::HashSet::new();
     for tracked in store.tracked_target_roots(0)? {
         // A discovered target goes whole: pruning would re-arm it and reset
         // the watch that decides whether it may go.
-        if tracked.discovered || !under_pressure(config, &tracked) || !intact(&tracked) {
+        if tracked.discovered
+            || !under_pressure(config, &tracked)
+            || !intact(&tracked)
+            || programs.uses(&tracked.path)
+        {
             continue;
         }
         let Some(before) = kache_fs::volume_usage(&tracked.path) else {
@@ -656,6 +668,7 @@ fn recover_under_pressure(
     unused: &std::collections::HashMap<PathBuf, Option<SystemTime>>,
     used: &std::collections::HashSet<PathBuf>,
     swept: &mut Swept,
+    programs: &crate::target_processes::ActivePrograms,
 ) -> anyhow::Result<()> {
     if !recovers_free_space(config) {
         return Ok(());
@@ -664,7 +677,10 @@ fn recover_under_pressure(
     let mut candidates = Vec::new();
     for tracked in store.tracked_target_roots(0)? {
         let since = unused.get(&tracked.path).copied().flatten();
-        if used.contains(&tracked.path) || !pressure_eligible_with(config, &tracked, now, since) {
+        if used.contains(&tracked.path)
+            || !pressure_eligible_with(config, &tracked, now, since)
+            || programs.uses(&tracked.path)
+        {
             continue;
         }
         let reclaimable = crate::cli::target_reclaimable_bytes(&tracked.path);
@@ -818,7 +834,10 @@ fn remove_after_rename(
     let unchanged = crate::machine::directory_identity(&aside) == Some(expected)
         && std::fs::symlink_metadata(&aside).is_ok_and(|meta| meta.file_type().is_dir())
         && !looks_like_a_source_root(&aside);
-    if !unchanged || crate::cli::target_in_use(&aside) {
+    if !unchanged
+        || crate::cli::target_in_use(&aside)
+        || crate::target_processes::ActivePrograms::default().uses(&aside)
+    {
         if std::fs::symlink_metadata(target).is_err() {
             std::fs::rename(&aside, target)?;
         }
@@ -908,6 +927,57 @@ mod tests {
         .unwrap();
         store.remember_target_root(&target, &workspace).unwrap();
         (workspace, target)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_program_started_directly_keeps_an_idle_target_and_its_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let config = config(cache.path(), false, 1);
+        let store = Store::open(&config).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "project");
+        age_target(&store, &target, 2 * 86_400);
+        let child = crate::target_processes::tests::RunningProgram::start(&target);
+        let now = unix_now_secs();
+        let tracked = root_of(&store, &target);
+        assert_eq!(plan(&config, &tracked, now), Plan::default());
+        assert_eq!(sweep(&config, now).unwrap(), Swept::default());
+        assert!(target.exists());
+        drop(child);
+        assert_eq!(plan(&config, &tracked, now).remove, Some(Reason::Idle));
+        assert_eq!(
+            sweep(&config, now).unwrap().removed,
+            vec![(target.clone(), Reason::Idle)]
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_program_started_during_the_rename_keeps_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let mut child = None;
+        let removed = remove_after_rename(
+            &target,
+            identity,
+            0,
+            cache.path(),
+            || false,
+            |aside| child = Some(crate::target_processes::tests::RunningProgram::start(aside)),
+            |_| panic!("must not delete a running program's target"),
+        )
+        .unwrap();
+        assert!(!removed);
+        assert!(
+            target.join("running-program").exists(),
+            "the rename must be rolled back"
+        );
+        drop(child);
     }
 
     /// Move `target` out of `workspace` and delete the workspace, the way a
@@ -1048,6 +1118,32 @@ mod tests {
             let tracked = store.tracked_target_roots(0).unwrap().remove(0);
             let window = Duration::from_secs(10);
             let at = std::time::UNIX_EPOCH + Duration::from_secs(110);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                policy.auto_recover_targets = true;
+                policy.auto_recover_min_free_bytes =
+                    kache_fs::volume_usage(&target).unwrap().total - 1;
+                assert!(under_pressure(&policy, &tracked));
+                let child = crate::target_processes::tests::RunningProgram::start(&target);
+                let mut swept = Swept::default();
+                assert!(
+                    prune_under_pressure(
+                        &policy,
+                        &store,
+                        at + Duration::from_secs(DAY_SECS),
+                        &mut swept,
+                        &crate::target_processes::ActivePrograms::default(),
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                assert!(swept.pruned.is_empty());
+                assert!(
+                    graph.exists(),
+                    "a running target keeps its incremental state under pressure"
+                );
+                drop(child);
+            }
             let preview = preview_units(&policy, &tracked, window, at);
             assert_eq!(preview.units, 1, "receipts={receipts}");
             assert_eq!(preview.bytes, 7, "receipts={receipts}");
@@ -1142,6 +1238,57 @@ mod tests {
             .into_iter()
             .find(|tracked| tracked.path == path)
             .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pressure_recovery_does_not_rename_a_running_target() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), false, 0);
+        policy.auto_recover_targets = true;
+        let store = Store::open(&policy).unwrap();
+        let (workspace, target) = tracked_target(&store, root.path(), "busy");
+        policy.auto_recover_min_free_bytes = kache_fs::volume_usage(&target).unwrap().total - 1;
+        age_target(&store, &target, 2 * 86_400);
+        let child = crate::target_processes::tests::RunningProgram::start(&target);
+        let before = filetime::FileTime::from_unix_time(10, 0);
+        filetime::set_file_mtime(&workspace, before).unwrap();
+        let now = unix_now_secs() as i64;
+        assert!(pressure_eligible(&policy, &root_of(&store, &target), now));
+        assert!(crate::cli::target_reclaimable_bytes(&target) > 0);
+        let mut swept = Swept::default();
+        recover_under_pressure(
+            &policy,
+            &store,
+            now,
+            &Default::default(),
+            &Default::default(),
+            &mut swept,
+            &crate::target_processes::ActivePrograms::default(),
+        )
+        .unwrap();
+        assert_eq!(swept, Swept::default());
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(
+                &std::fs::metadata(&workspace).unwrap()
+            ),
+            before,
+            "a running program must keep access through the original target path"
+        );
+        drop(child);
+        recover_under_pressure(
+            &policy,
+            &store,
+            now,
+            &Default::default(),
+            &Default::default(),
+            &mut swept,
+            &crate::target_processes::ActivePrograms::default(),
+        )
+        .unwrap();
+        assert_eq!(swept.removed, vec![(target.clone(), Reason::Pressure)]);
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]

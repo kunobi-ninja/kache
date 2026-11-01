@@ -939,7 +939,9 @@ pub(crate) fn preview_window(
             };
         }
     };
-    if crate::cli::target_in_use(target) {
+    if crate::cli::target_in_use(target)
+        || crate::target_processes::ActivePrograms::default().uses(target)
+    {
         return Plan {
             status: "busy".into(),
             command: receipt.command,
@@ -981,6 +983,9 @@ pub(crate) fn prune(
     window: Option<Duration>,
     now: SystemTime,
 ) -> Result<Pruned> {
+    if crate::target_processes::ActivePrograms::default().uses(target) {
+        return Ok(Pruned::default());
+    }
     let Some(_reservation) = crate::target_use::try_exclusive(&config.cache_dir)? else {
         return Ok(Pruned::default());
     };
@@ -1180,6 +1185,22 @@ fn rollback(staged: &[(PathBuf, PathBuf)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_running_program_prevents_pruning_before_a_receipt_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let workspace = dir.path().join("workspace");
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let child = crate::target_processes::tests::RunningProgram::start(&target);
+        assert_eq!(
+            prune(&config, &target, &workspace, None, SystemTime::now()).unwrap(),
+            Pruned::default()
+        );
+        drop(child);
+        assert!(prune(&config, &target, &workspace, None, SystemTime::now()).is_err());
+    }
 
     fn unit(live: bool, known: bool, seconds: u64) -> ObservedUnit {
         ObservedUnit {

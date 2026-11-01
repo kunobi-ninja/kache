@@ -1984,6 +1984,52 @@ fn restore_events_keep_the_debug_bundle_limit_cause() {
     );
 }
 
+/// A restore failure can quote a tar entry name from a remote archive. Its
+/// newline becomes a space, so the persisted reason cannot break the row
+/// `kache report` prints it in.
+#[test]
+fn restore_failure_reasons_flatten_archive_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Symlink);
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_link(&mut header, "dwarf\nforged row", "/etc/passwd")
+        .unwrap();
+    let bundle = builder.into_inner().unwrap();
+    let hash = blake3::hash(&bundle).to_hex().to_string();
+    create_blob(&store, &hash, &bundle);
+    let deps = dir.path().join("target").join("debug").join("deps");
+    std::fs::create_dir_all(&deps).unwrap();
+
+    let error = materialize_cached_artifact(
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+        &store,
+        &cached_file("foo.dsym.tar", &hash),
+        &deps.join("foo.dsym.tar"),
+        ArtifactKind::DebugBundle,
+        None,
+        dir.path(),
+        dir.path(),
+        None,
+        &[],
+        &*platform::current(),
+        "rustc restore",
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        restore_failure_reason(&error),
+        "restore failed: rustc restore: applying UnpackDebugBundle: \
+         debug bundle entry is a link (rejected): dwarf forged row"
+    );
+}
+
 #[test]
 fn a_prestage_candidate_is_a_stored_file_of_at_least_the_threshold() {
     let dir = tempfile::tempdir().unwrap();

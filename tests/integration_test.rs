@@ -3231,6 +3231,7 @@ local_only = true
 local_max_size = "10GiB"
 auto_gc = false
 cache_executables = true
+native_runtime_warmup = false
 "#;
     let config_path = isolated_config_path(cache_dir.path());
     std::fs::write(&config_path, config_content).unwrap();
@@ -3310,6 +3311,7 @@ local_max_size = "{gc_budget}B"
 auto_gc = true
 gc_evict_shared = true
 cache_executables = true
+native_runtime_warmup = false
 "#
     );
     std::fs::write(&config_path, config_content).unwrap();

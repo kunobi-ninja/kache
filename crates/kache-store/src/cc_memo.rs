@@ -1,6 +1,6 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
-use crate::file_hash::{FileFingerprint, FileHashCache, stamp_is_settled};
+use crate::file_hash::{FileFingerprint, FileHashCache, file_hash_memo_eligible, stamp_is_settled};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,7 +28,8 @@ impl CcPreprocessMemoInput {
     /// write moves it (see [`stamp_is_settled`]). Only such a stamp may stand
     /// in for the content on a later lookup.
     pub fn stamp_settled(&self) -> bool {
-        stamp_is_settled(&self.fingerprint, self.observed_ns)
+        file_hash_memo_eligible(self.fingerprint.inode, cfg!(windows))
+            && stamp_is_settled(&self.fingerprint, self.observed_ns)
     }
 }
 

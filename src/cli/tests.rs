@@ -3837,6 +3837,7 @@ fn save_manifest_config(
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        native_runtime_warmup: true,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,

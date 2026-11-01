@@ -3923,7 +3923,7 @@ fn run_parsed_rustc(
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
-    extra_inputs_guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    extra_inputs_guard_inputs: crate::cache_key::GuardedInputs,
     build_script_inputs: Option<&BuildScriptInputs>,
     mut precompiled: Option<Precompiled>,
 ) -> Result<i32> {
@@ -4306,7 +4306,17 @@ fn run_parsed_rustc(
                 let _ = lease.finish(CompileOutcome::Abnormal);
             }
             // `{:#}` walks the cause chain; see `uncacheable_reason`.
-            tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
+            if e.downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+                .is_some()
+            {
+                tracing::debug!(
+                    "native runtime hashes are warming for {}: {:#}",
+                    crate_name,
+                    e
+                );
+            } else {
+                tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
+            }
             return passthrough_with_event(
                 config,
                 args,
@@ -4829,11 +4839,10 @@ fn run_parsed_rustc(
         && extra_inputs_changed_during_compile(config, args, extra_inputs, invocation_start_ns);
     let sources_changed = emitted_sources_changed_during_compile(&written_sources, &guard_inputs);
     let key_inputs_changed = config.modified_input_guard && {
-        let hashed: Vec<_> = guard_inputs
-            .iter()
-            .chain(hashed_after_compile.iter().flatten())
-            .cloned()
-            .collect();
+        let mut hashed = guard_inputs.clone();
+        if let Some(after_compile) = &hashed_after_compile {
+            hashed.extend(after_compile.clone());
+        }
         key_inputs_changed_during_compile(key_too_new, &hashed)
     };
     if should_skip_cache_store_for_input_race(
@@ -6406,11 +6415,11 @@ struct ComputedKey {
     /// Fingerprints taken before the compile while the too-new guard was
     /// armed: the extra-inputs resolve, and the key's own when the key came
     /// first. Carried past the compile for clock-independent verification.
-    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    guard_inputs: crate::cache_key::GuardedInputs,
     /// `Some` for a key derived from the dep-info a compile emitted: the
     /// fingerprints its inputs had when hashed, after rustc read them. They
     /// say nothing about what the compile saw.
-    hashed_after_compile: Option<Vec<crate::cache_key::ObservedFingerprint>>,
+    hashed_after_compile: Option<crate::cache_key::GuardedInputs>,
     /// The emitted dep-info's files that `hashed_after_compile` shows written
     /// since the invocation began (see [`sources_written_since`]).
     written_sources: Vec<crate::cache_key::FileFingerprint>,
@@ -6494,7 +6503,7 @@ fn adaptive_compile_before_key(
     ctx: &CompileFirst<'_>,
     mut lease: Lease,
     tree_guard: Option<crate::cache_key::TreeGuard>,
-    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    guard_inputs: crate::cache_key::GuardedInputs,
     mut key_record: KeyEventRecord,
     mut key_ms: u64,
     mut key_hash_stats: FileHashStats,
@@ -6692,7 +6701,7 @@ fn compile_before_key(
     ctx: &CompileFirst<'_>,
     stop_on_hit: bool,
     tree_guard: Option<crate::cache_key::TreeGuard>,
-    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    guard_inputs: crate::cache_key::GuardedInputs,
     key_record: KeyEventRecord,
     key_ms: u64,
     key_hash_stats: FileHashStats,
@@ -7098,13 +7107,13 @@ fn sources_written_since(
 /// the stamp, so a match would prove nothing.
 fn emitted_sources_changed_during_compile(
     written: &[crate::cache_key::FileFingerprint],
-    before: &[crate::cache_key::ObservedFingerprint],
+    before: &crate::cache_key::GuardedInputs,
 ) -> bool {
     written.iter().any(|input| {
         !before.iter().any(|earlier| {
             earlier.fingerprint.path == input.path
                 && earlier.settled()
-                && FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(earlier))
+                && FileHasher::guarded_inputs_unchanged_since_hash(&before.for_file(earlier))
         })
     })
 }
@@ -7129,7 +7138,7 @@ fn emitted_sources_changed_during_compile(
 /// hash and the compiler's read, keeps the fingerprint and is excused.
 fn key_inputs_changed_during_compile(
     key_too_new: bool,
-    guard_inputs: &[crate::cache_key::ObservedFingerprint],
+    guard_inputs: &crate::cache_key::GuardedInputs,
 ) -> bool {
     FileHasher::guarded_inputs_moved_since_hash(guard_inputs)
         || (key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs))
@@ -7230,7 +7239,7 @@ struct ExtraInputsKey<'a> {
     hash_stats: FileHashStats,
     too_new: bool,
     key_ms: u64,
-    guard_inputs: Vec<crate::cache_key::ObservedFingerprint>,
+    guard_inputs: crate::cache_key::GuardedInputs,
 }
 
 /// Compute the rustc cache key. With `store` present the hasher is backed by
@@ -7278,6 +7287,7 @@ fn compute_rustc_cache_key(
         None => crate::cache_key::FileHasher::new_for(args.invocation_env())
             .with_daemon(config.socket_path()),
     }
+    .with_native_runtime_warmup(config.native_runtime_warmup)
     .with_input_predictions(config.input_predictions)
     .with_prediction_flights(flight_dir)
     .with_own_dirs(written_while_building(config, store, args.invocation_env()));
@@ -8696,6 +8706,12 @@ const UNCACHEABLE_REASON: &str = "uncacheable|";
 /// failed for src/lib.rs" and dropped rustc's own reason underneath it
 /// (kunobi-ninja/kache#431).
 fn uncacheable_reason(error: &anyhow::Error) -> String {
+    if error
+        .downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+        .is_some()
+    {
+        return "native runtime warmup".to_owned();
+    }
     format!("{UNCACHEABLE_REASON}{error:#}")
 }
 
@@ -8754,11 +8770,24 @@ fn passthrough_with_event<R: Into<String>>(
         return Ok(exit_code);
     }
     let reason = reason.into();
+    let permit = (reason == "native runtime warmup").then(|| {
+        scheduler::begin_keyless_compile(
+            &config.cache_dir,
+            config.scheduler,
+            crate_name,
+            args.invokes_linker(),
+            config.test_lease.as_deref(),
+        )
+    });
     let output = passthrough(
         args,
         config.fallback.as_deref(),
         config.preserve_incremental,
     )?;
+    if let Some(permit) = &permit {
+        permit.record_compile_rss(crate_name);
+    }
+    drop(permit);
     let elapsed = start.elapsed().as_millis() as u64;
     after_rustc_exit(output.exit_code, rustc_output_in(&reason), &args.externs);
     log_event(

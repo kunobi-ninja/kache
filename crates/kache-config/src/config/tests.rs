@@ -2932,6 +2932,56 @@ fn daemon_execution_concurrency_respects_environment_file_and_automatic_mode() {
 }
 
 #[test]
+fn native_runtime_warmup_defaults_on_and_respects_file_env_and_ignore_env() {
+    let file = |text| Ok(toml::from_str::<FileConfig>(text).unwrap());
+    let invocation = |value: Option<&str>| {
+        InvocationEnv::from_parts(
+            value
+                .into_iter()
+                .map(|value| ("KACHE_NATIVE_RUNTIME_WARMUP", value)),
+            None,
+            None,
+            std::env::temp_dir(),
+        )
+    };
+    for (text, expected) in [
+        ("", true),
+        ("[cache]\nnative_runtime_warmup = false", false),
+        ("[cache]\nnative_runtime_warmup = true", true),
+    ] {
+        assert_eq!(
+            Config::native_runtime_warmup_enabled_for(&invocation(None), &file(text)),
+            expected
+        );
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+            ("true", true),
+        ] {
+            assert_eq!(
+                Config::native_runtime_warmup_enabled_for(&invocation(Some(value)), &file(text)),
+                expected,
+                "{text:?} {value:?}"
+            );
+        }
+    }
+    assert!(Config::native_runtime_warmup_enabled_for(
+        &invocation(Some("0")),
+        &file("[cache]\nignore_env = true")
+    ));
+    assert!(!Config::native_runtime_warmup_enabled_for(
+        &invocation(Some("1")),
+        &file("[cache]\nignore_env = true\nnative_runtime_warmup = false")
+    ));
+    assert!(Config::native_runtime_warmup_enabled_for(
+        &invocation(None),
+        &Err(anyhow::anyhow!("no config file"))
+    ));
+}
+
+#[test]
 fn trusted_daemon_execution_requires_an_explicit_setting() {
     let file = |text| Ok(toml::from_str::<FileConfig>(text).unwrap());
     let invocation = |value: Option<&str>| {
@@ -3057,6 +3107,7 @@ fn test_file_config_roundtrip() {
             deferred_durability: None,
             daemon_publish: None,
             trust_daemon_execution: None,
+            native_runtime_warmup: None,
             daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
@@ -3719,6 +3770,7 @@ fn test_config_store_dir() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        native_runtime_warmup: true,
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -3810,6 +3862,7 @@ fn test_config_index_db_path() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        native_runtime_warmup: true,
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -3897,6 +3950,7 @@ fn test_config_event_log_path() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        native_runtime_warmup: true,
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -4003,6 +4057,7 @@ fn test_config_socket_path() {
         deferred_durability: false,
         daemon_publish: false,
         trust_daemon_execution: false,
+        native_runtime_warmup: true,
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -4746,6 +4801,7 @@ fn test_save_and_load_file_config() {
             deferred_durability: None,
             daemon_publish: None,
             trust_daemon_execution: None,
+            native_runtime_warmup: None,
             daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,

@@ -324,7 +324,7 @@ fn observe_oracle_compile(
         std::fs::write(
             &config_path,
             format!(
-                "[cache]\nlocal_only = true\nignore_env = true\ncache_executables = true\nlocal_store = {}\nruntime_dir = {}\n",
+                "[cache]\nlocal_only = true\nignore_env = true\ncache_executables = true\nnative_runtime_warmup = false\nlocal_store = {}\nruntime_dir = {}\n",
                 toml_path(cache_dir),
                 toml_path(cache_dir)
             ),

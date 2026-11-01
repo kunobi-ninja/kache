@@ -1,5 +1,6 @@
 use super::*;
 use crate::args::RustcArgs;
+use crate::native_link_key::WindowsLinkInput;
 use crate::test_support::process_state_test_lock;
 
 const GNU_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
@@ -1254,6 +1255,12 @@ fn windows_defaultlib_requests_are_not_rustc_libraries() {
 
 #[test]
 fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() {
+    assert_eq!(
+        crate::native_link_key::WindowsDefaultLibrary::parse("-defaultlib:UCRT")
+            .unwrap()
+            .canonical_name(),
+        "ucrt.lib"
+    );
     let dir = tempfile::tempdir().unwrap();
     let invocation = client_invocation(dir.path(), &[]);
     let file_hasher = FileHasher::new_for(&invocation);
@@ -1277,6 +1284,7 @@ fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() 
                     ucrt: "10".into(),
                     architecture: "x64".into(),
                     wrapper: None,
+                    manifest_tool: None,
                     libraries: BTreeMap::from([
                         ("ucrt.lib".into(), "ucrt-digest".into()),
                         ("msvcrt.lib".into(), "msvcrt-digest".into()),
@@ -1293,6 +1301,16 @@ fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() 
         key(&["-Clink-args=-defaultlib:UCRT"]).unwrap(),
         requested,
         "both carriers use canonical runtime names"
+    );
+    assert_eq!(
+        key(&["-Clink-arg=/DEFAULTLIB:ucrt.lib", "-Clink-args=/DEBUG"]).unwrap(),
+        key(&["-Clink-args=-defaultlib:UCRT", "-Clink-args=/DEBUG"]).unwrap(),
+        "canonical runtime names survive mixed options"
+    );
+    assert_ne!(
+        key(&["-Clink-arg=/DEFAULTLIB:ucrt.lib", "-Clink-args=/DEBUG"]).unwrap(),
+        key(&["-Clink-args=/DEBUG", "-Clink-arg=/DEFAULTLIB:ucrt.lib"]).unwrap(),
+        "mixed option order remains keyed"
     );
     assert_ne!(
         key(&["-Clink-args=/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt"]).unwrap(),
@@ -1457,14 +1475,16 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
         root.clone(),
     );
     for library in ["libcmt.lib", "libvcruntime.lib"] {
-        std::fs::write(fallback.join(library), b"legacy unrequested runtime").unwrap();
+        std::fs::write(fallback.join(library), vec![b'r'; 70_000]).unwrap();
     }
-    let original = crate::native_archive::closed_coff_archive_for_tests(b"\xc3");
+    let original = crate::native_archive::closed_coff_archive_for_tests(&vec![b'c'; 70_000]);
     let changed = crate::native_archive::closed_coff_archive_for_tests(b"\x90\xc3");
     let selected_path = priority.join("ucrt.lib");
     std::fs::write(&selected_path, &original).unwrap();
     std::fs::write(fallback.join("ucrt.lib"), &changed).unwrap();
-    let file_hasher = FileHasher::new_for(&invocation);
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let file_hasher = FileHasher::from_cache_for(FileHashCache::Borrowed(&db), &invocation);
     let fold = |extra: &[&str]| -> Result<(String, String)> {
         let mut argv = vec![
             "rustc".into(),
@@ -1484,18 +1504,15 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
             |linker, architecture, _, search_dirs| {
                 // Only tool banners are fixtures. This is the production
                 // request forwarding, runtime selection/read and hash path.
-                let identity =
-                    crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
-                        linker,
-                        architecture,
-                        &[],
-                        &search_dirs.rustc,
-                        &search_dirs.linker,
-                        &args.link_libs,
-                        &search_dirs.default_libraries,
-                        |path| file_hasher.hash_static_lib(path),
-                        &invocation,
-                    )?;
+                let identity = probe_native_windows_msvc_identity_for(
+                    linker,
+                    architecture,
+                    &[],
+                    search_dirs,
+                    &args,
+                    &file_hasher,
+                    &invocation,
+                )?;
                 selected_digest = identity.libraries.get("ucrt.lib").cloned();
                 Ok(identity)
             },
@@ -1508,6 +1525,13 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
     };
     let request = ["-Clink-arg=/DEFAULTLIB:ucrt.lib"];
     let without_request = fold(&[]).unwrap();
+    let cold = file_hasher.stats();
+    assert_eq!(cold.cache_misses, 3);
+    assert_eq!(cold.bytes_hashed, 140_000 + original.len() as u64);
+    file_hasher.flush_memo_as_if_settled();
+    assert_eq!(fold(&[]).unwrap(), without_request);
+    assert_eq!(file_hasher.stats().cache_hits, 3);
+    assert_eq!(file_hasher.stats().bytes_hashed, cold.bytes_hashed);
     let requested = fold(&request).unwrap();
     assert_eq!(requested.1, blake3::hash(&original).to_hex().to_string());
     assert_eq!(
@@ -1598,9 +1622,11 @@ fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
         "rustc".into(),
         "--crate-type=bin".into(),
         r"-Clink-arg=C:\w\target\debug\build\app-1\out\resource.res".into(),
+        r"-Clink-args=/MANIFESTINPUT:C:\w\first.xml".into(),
         "-Clink-arg=/MANIFEST:EMBED".into(),
         "-Clink-arg=/WX".into(),
         r"-Clink-args=/DEBUG C:\w\extra.res".into(),
+        r"-Clink-arg=-manifestinput:C:\w\last.xml".into(),
         r"-Clink-arg=/LIBPATH:C:\shadow".into(),
     ])
     .unwrap();
@@ -1611,8 +1637,12 @@ fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
             linker: vec![PathBuf::from(r"C:\shadow")],
             default_libraries: vec![],
             files: vec![
-                PathBuf::from(r"C:\w\target\debug\build\app-1\out\resource.res"),
-                PathBuf::from(r"C:\w\extra.res"),
+                WindowsLinkInput::Resource(PathBuf::from(
+                    r"C:\w\target\debug\build\app-1\out\resource.res"
+                )),
+                WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\first.xml")),
+                WindowsLinkInput::Resource(PathBuf::from(r"C:\w\extra.res")),
+                WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\last.xml")),
             ],
         }
     );
@@ -1628,8 +1658,6 @@ fn windows_resources_do_not_hide_mixed_search_paths_or_unsupported_files() {
         r"C:\w\a.res /DEF:C:\w\exports.def",
         r"C:\w\a.res C:\w\extra.obj",
         r"C:\w\a.res C:\w\opaque.dat",
-        r"C:\w\a.res /MANIFESTINPUT:C:\w\app.xml",
-        r"/MANIFESTINPUT:C:\w\Manifest.xml",
         r"C:\w\opaque.dat",
     ] {
         let args = RustcArgs::parse(&[
@@ -1708,7 +1736,7 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
                     search_dirs.files,
                     files
                         .iter()
-                        .map(|path| path.to_path_buf())
+                        .map(|path| WindowsLinkInput::Resource(path.to_path_buf()))
                         .collect::<Vec<_>>()
                 );
                 Ok(crate::native_link_key::WindowsMsvcIdentity {
@@ -1719,6 +1747,7 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
                     ucrt: "10".into(),
                     architecture: architecture.into(),
                     wrapper: None,
+                    manifest_tool: None,
                     libraries: BTreeMap::new(),
                 })
             },
@@ -1761,7 +1790,7 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
     );
     for argument in [
         "C:/extra.obj",
-        "/MANIFESTINPUT:C:/app.xml",
+        "/MANIFESTINPUT:app.xml",
         "/LIBPATH:C:/other C:/extra.res",
     ] {
         assert!(key(&files, Some(argument)).is_err(), "{argument}");
@@ -1794,7 +1823,7 @@ fn windows_resource_hash_rejects_truncated_headers_and_renamed_containers() {
     let identity = || {
         windows_link_identity_with_argument_files(
             "linker=LINK 14".into(),
-            std::slice::from_ref(&path),
+            &[WindowsLinkInput::Resource(path.clone())],
             &file_hasher,
         )
     };
@@ -1850,6 +1879,648 @@ fn windows_resources_stream_all_bytes_without_trusting_a_whole_file_memo() {
 }
 
 #[test]
+fn uncached_header_hash_reads_bytes_instead_of_supplied_memos() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let path = root.join("header.h");
+    let bytes = vec![b'h'; 65_537];
+    std::fs::write(&path, &bytes).unwrap();
+    let invocation = InvocationEnv::from_parts(
+        Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+        Some(root.clone()),
+        None,
+        root,
+    );
+    let hasher = FileHasher::new_for(&invocation);
+    let observed = ObservedFingerprint::from_path(&path).unwrap();
+    let stale = "0".repeat(64);
+    hasher.prefetched.borrow_mut().insert(
+        observed.fingerprint.clone(),
+        PrefetchedHash {
+            hash: stale.clone(),
+            cache_hit: true,
+            bytes_hashed: 0,
+        },
+    );
+    let supplied = HashMap::from([(observed.fingerprint.path.clone(), stale)]);
+    let expected = blake3::hash(&bytes).to_hex().to_string();
+    assert_eq!(
+        hasher.header_hash(&path, &observed, &supplied).unwrap(),
+        expected
+    );
+    hasher.prefetched.borrow_mut().clear();
+    assert_eq!(
+        hasher.header_hash(&path, &observed, &supplied).unwrap(),
+        expected
+    );
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert!(hasher.pending_memo.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() {
+    use kache_ipc::prelude::*;
+    use kache_protocol::{HashFileRequest, HashFileResult, Request, Response};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let large = root.join("large.rlib");
+    let small = root.join("small.rs");
+    let bytes = vec![b'l'; 65_537];
+    std::fs::write(&large, &bytes).unwrap();
+    std::fs::write(&small, b"small").unwrap();
+    let fingerprint = FileFingerprint::from_path(&large).unwrap();
+    let expected_request = HashFileRequest {
+        path: fingerprint.path.clone(),
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        ctime_ns: fingerprint.ctime_ns,
+        inode: fingerprint.inode,
+    };
+    let expected = blake3::hash(&bytes).to_hex().to_string();
+    let reply = Response::ok_hash_results(vec![HashFileResult {
+        path: fingerprint.path,
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        ctime_ns: fingerprint.ctime_ns,
+        inode: fingerprint.inode,
+        hash: Some(expected.clone()),
+        cache_hit: true,
+        bytes_hashed: 0,
+        error: None,
+    }]);
+    let socket = root.join("hash.sock");
+    let listener = kache_ipc::ListenerOptions::new()
+        .name(kache_ipc::socket_name(&socket).unwrap())
+        .create_tokio()
+        .unwrap();
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let stream = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let Request::HashFiles(request) = serde_json::from_str(&line).unwrap() else {
+                panic!("expected a file-hash prefetch request");
+            };
+            assert_eq!(request.files, vec![expected_request]);
+            let response = format!("{}\n", serde_json::to_string(&reply).unwrap());
+            (&stream).write_all(response.as_bytes()).await.unwrap();
+            (&stream).flush().await.unwrap();
+        })
+        .await
+        .expect("file-hash prefetch did not complete its request");
+    });
+    let invocation = InvocationEnv::from_parts(
+        Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let client = tokio::task::spawn_blocking(move || {
+        let hasher = FileHasher::persistent(&root.join("index.db"))
+            .with_invocation_env(&invocation)
+            .with_daemon(socket);
+        hasher.prefetch(&[small.as_path(), large.as_path()]);
+        let prefetched = hasher.prefetched.borrow().len();
+        let hash = hasher.hash(&large).unwrap();
+        (hash, prefetched, hasher.stats())
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(client.0, expected);
+    assert_eq!(client.1, 1);
+    assert_eq!(client.2.cache_hits, 1);
+    assert_eq!(client.2.cache_misses, 0);
+    assert_eq!(client.2.bytes_hashed, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
+    use kache_ipc::prelude::*;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = kache_ipc::ListenerOptions::new()
+        .name(kache_ipc::socket_name(&socket).unwrap())
+        .nonblocking(interprocess::local_socket::ListenerNonblockingMode::Both)
+        .create_sync()
+        .unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db)).with_daemon(socket);
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let observed = ObservedFingerprint::from_path(&path).unwrap();
+        assert_eq!(observed.fingerprint.inode, 0);
+        hasher.prefetch(&[path.as_path()]);
+        assert!(
+            listener
+                .accept()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let stale = "0".repeat(64);
+        hasher.prefetched.borrow_mut().insert(
+            observed.fingerprint.clone(),
+            PrefetchedHash {
+                hash: stale.clone(),
+                cache_hit: true,
+                bytes_hashed: 0,
+            },
+        );
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(hasher.hash(&path).unwrap(), expected);
+        assert_eq!(
+            hasher
+                .header_hash(
+                    &path,
+                    &observed,
+                    &HashMap::from([(observed.fingerprint.path.clone(), stale.clone()),])
+                )
+                .unwrap(),
+            expected,
+        );
+        let input = CcPreprocessMemoInput {
+            name: "runtime.lib".into(),
+            fingerprint: observed.fingerprint,
+            content: stale,
+            mapped: String::new(),
+            observed_ns: i64::MAX,
+        };
+        assert!(!input.stamp_settled());
+        assert!(
+            hasher
+                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .is_none()
+        );
+        assert!(hasher.hash_static_lib(&path).is_ok());
+        assert_eq!(hasher.stats().cache_hits, 0);
+        assert_eq!(hasher.stats().bytes_hashed, 280_000);
+        assert!(hasher.pending_memo.borrow().is_empty());
+        hasher.flush_memo_as_if_settled();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM file_hashes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    });
+}
+
+fn runtime_warmup_reply(
+    request: crate::daemon::HashFileRequest,
+    hash: Option<String>,
+) -> crate::daemon::HashFileResult {
+    crate::daemon::HashFileResult {
+        path: request.path,
+        size: request.size,
+        mtime_ns: request.mtime_ns,
+        ctime_ns: request.ctime_ns,
+        inode: request.inode,
+        cache_hit: hash.is_some(),
+        hash,
+        bytes_hashed: 0,
+        error: None,
+    }
+}
+
+#[test]
+fn native_runtime_warmup_public_adapter_prepares_ready_memo_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let fingerprint = FileFingerprint::from_path(&path).unwrap();
+    let digest = blake3::hash(&bytes).to_hex().to_string();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("unused.sock"))
+        .with_native_runtime_warmup(true);
+    hasher
+        .native_runtime_warmup_observed_at
+        .set(Some(wall_clock_ns() + 5_000_000_000));
+    hasher
+        .cache
+        .as_ref()
+        .unwrap()
+        .put(&fingerprint, &digest)
+        .unwrap();
+    hasher
+        .prepare_windows_runtime_hashes(&[path.as_path()])
+        .unwrap();
+    let prefetched = hasher.prefetched.borrow();
+    assert_eq!(prefetched.len(), 1);
+    assert_eq!(prefetched[&fingerprint].hash, digest);
+    assert!(prefetched[&fingerprint].cache_hit);
+    assert_eq!(prefetched[&fingerprint].bytes_hashed, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_runtime_warmup_weak_large_files_keep_the_fresh_scalar_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+            .with_daemon(dir.path().join("unused.sock"))
+            .with_native_runtime_warmup(true);
+        hasher
+            .prepare_windows_runtime_hashes_with(
+                &[path.as_path()],
+                wall_clock_ns() + 5_000_000_000,
+                |_, _| panic!("weak identity cannot queue a memo hash"),
+            )
+            .unwrap();
+        assert_eq!(
+            hasher.hash(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(hasher.stats().cache_hits, 0);
+        assert_eq!(hasher.stats().bytes_hashed, 70_000);
+    });
+}
+
+#[test]
+fn native_runtime_warmup_batches_large_misses_without_reading_any_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.lib");
+    let second = dir.path().join("second.lib");
+    let small = dir.path().join("small.lib");
+    std::fs::write(&first, vec![b'a'; 70_000]).unwrap();
+    std::fs::write(&second, vec![b'b'; 80_000]).unwrap();
+    std::fs::write(&small, b"small").unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("daemon.sock"))
+        .with_native_runtime_warmup(true);
+    set_before_read(Some(Box::new(|_| {
+        panic!("warmup must not read runtime bytes")
+    })));
+    let result = hasher.prepare_windows_runtime_hashes_with(
+        &[
+            small.as_path(),
+            first.as_path(),
+            second.as_path(),
+            first.as_path(),
+        ],
+        wall_clock_ns() + 5_000_000_000,
+        |socket, mut requests| {
+            assert_eq!(socket, dir.path().join("daemon.sock"));
+            requests.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut expected = vec![first.display().to_string(), second.display().to_string()];
+            expected.sort();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for request in &requests {
+                let stamp = FileFingerprint::from_path(Path::new(&request.path)).unwrap();
+                assert_eq!(
+                    (
+                        request.size,
+                        request.mtime_ns,
+                        request.ctime_ns,
+                        request.inode
+                    ),
+                    (stamp.size, stamp.mtime_ns, stamp.ctime_ns, stamp.inode)
+                );
+            }
+            Ok(requests
+                .into_iter()
+                .map(|request| runtime_warmup_reply(request, None))
+                .collect())
+        },
+    );
+    set_before_read(None);
+    assert!(
+        result
+            .unwrap_err()
+            .downcast_ref::<NativeRuntimeHashesWarming>()
+            .is_some()
+    );
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+    assert_eq!(hasher.stats().cache_misses, 0);
+    assert!(hasher.prefetched.borrow().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_runtime_warmup_keeps_non_utf8_paths_on_the_fresh_read_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"runtime-\xff.lib".to_vec()));
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("daemon.sock"))
+        .with_native_runtime_warmup(true);
+    hasher
+        .prepare_windows_runtime_hashes_with(
+            &[path.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, _| panic!("a lossy path cannot be queued for daemon hashing"),
+        )
+        .unwrap();
+    assert!(hasher.prefetched.borrow().is_empty());
+    assert_eq!(
+        hasher.hash(&path).unwrap(),
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    assert_eq!(hasher.stats().bytes_hashed, 70_000);
+}
+
+#[test]
+fn native_runtime_warmup_reuses_memo_and_ready_replies_before_small_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo.lib");
+    let ready = dir.path().join("ready.lib");
+    let small = dir.path().join("small.lib");
+    let memo_bytes = vec![b'm'; 70_000];
+    let ready_bytes = vec![b'r'; 65_536];
+    std::fs::write(&memo, &memo_bytes).unwrap();
+    std::fs::write(&ready, &ready_bytes).unwrap();
+    std::fs::write(&small, b"small").unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+        .with_daemon(dir.path().join("daemon.sock"))
+        .with_native_runtime_warmup(true);
+    let memo_hash = blake3::hash(&memo_bytes).to_hex().to_string();
+    let ready_hash = blake3::hash(&ready_bytes).to_hex().to_string();
+    hasher
+        .cache
+        .as_ref()
+        .unwrap()
+        .put(&FileFingerprint::from_path(&memo).unwrap(), &memo_hash)
+        .unwrap();
+    hasher
+        .prepare_windows_runtime_hashes_with(
+            &[memo.as_path(), ready.as_path(), small.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, mut requests| {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].path, ready.display().to_string());
+                Ok(vec![runtime_warmup_reply(
+                    requests.remove(0),
+                    Some(ready_hash.clone()),
+                )])
+            },
+        )
+        .unwrap();
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+    set_before_read(Some(Box::new(|_| {
+        panic!("ready runtime hashes must avoid reads")
+    })));
+    let memo_result = hasher.hash(&memo);
+    let ready_result = hasher.hash(&ready);
+    hasher
+        .prepare_windows_runtime_hashes_with(
+            &[memo.as_path(), ready.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, _| panic!("all hashes are already ready"),
+        )
+        .unwrap();
+    set_before_read(None);
+    assert_eq!(memo_result.unwrap(), memo_hash);
+    assert_eq!(ready_result.unwrap(), ready_hash);
+    assert_eq!(hasher.stats().cache_hits, 2);
+    assert_eq!(hasher.stats().cache_misses, 0);
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+    assert_eq!(
+        hasher.hash(&small).unwrap(),
+        blake3::hash(b"small").to_hex().to_string()
+    );
+    assert_eq!(hasher.stats().bytes_hashed, 5);
+}
+
+#[test]
+fn native_runtime_warmup_rejects_stale_unknown_or_invalid_ready_results() {
+    for mode in [
+        "path",
+        "size",
+        "mtime",
+        "ctime",
+        "inode",
+        "cache-hit",
+        "bytes",
+        "digest",
+        "duplicate",
+        "changed",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lib");
+        let bytes = vec![b'r'; 70_000];
+        std::fs::write(&path, &bytes).unwrap();
+        let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+            .with_daemon(dir.path().join("daemon.sock"))
+            .with_native_runtime_warmup(true);
+        let result = hasher.prepare_windows_runtime_hashes_with(
+            &[path.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, mut requests| {
+                let mut reply = runtime_warmup_reply(
+                    requests.remove(0),
+                    Some(blake3::hash(&bytes).to_hex().to_string()),
+                );
+                match mode {
+                    "path" => reply.path.push_str(".unknown"),
+                    "size" => reply.size += 1,
+                    "mtime" => reply.mtime_ns += 1,
+                    "ctime" => reply.ctime_ns += 1,
+                    "inode" => reply.inode += 1,
+                    "cache-hit" => reply.cache_hit = false,
+                    "bytes" => reply.bytes_hashed = 1,
+                    "digest" => reply.hash = Some("invalid".into()),
+                    "duplicate" => return Ok(vec![reply.clone(), reply]),
+                    "changed" => std::fs::write(&path, vec![b'n'; 70_001]).unwrap(),
+                    _ => unreachable!(),
+                }
+                Ok(vec![reply])
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<NativeRuntimeHashesWarming>()
+                .is_some(),
+            "{mode}"
+        );
+        assert!(hasher.prefetched.borrow().is_empty(), "{mode}");
+        assert_eq!(hasher.stats().bytes_hashed, 0, "{mode}");
+    }
+}
+
+#[test]
+fn native_runtime_warmup_admission_requires_strong_settled_fingerprints() {
+    let file = FileFingerprint {
+        path: "runtime.lib".into(),
+        size: 70_000,
+        mtime_ns: 1_234_567_007,
+        ctime_ns: 1_234_567_007,
+        inode: 5,
+    };
+    assert!(native_runtime_fingerprints_can_warm(
+        std::slice::from_ref(&file),
+        3_234_567_007
+    ));
+    assert!(!native_runtime_fingerprints_can_warm(
+        std::slice::from_ref(&file),
+        3_234_567_006
+    ));
+    let mut weak = file.clone();
+    weak.inode = 0;
+    assert!(!native_runtime_fingerprints_can_warm(
+        &[file.clone(), weak],
+        5_000_000_007
+    ));
+    let mut future = file.clone();
+    future.mtime_ns = 6_000_000_007;
+    assert!(!native_runtime_fingerprints_can_warm(
+        &[file, future],
+        5_000_000_007
+    ));
+}
+
+#[test]
+fn native_runtime_warmup_does_not_promote_invalid_prefetched_metadata() {
+    for mode in ["cache-hit", "bytes", "digest", "memo-digest"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lib");
+        std::fs::write(&path, vec![b'r'; 70_000]).unwrap();
+        let hasher = FileHasher::persistent(&dir.path().join("index.db"))
+            .with_daemon(dir.path().join("daemon.sock"))
+            .with_native_runtime_warmup(true);
+        let fingerprint = FileFingerprint::from_path(&path).unwrap();
+        let mut prefetched = PrefetchedHash {
+            hash: "a".repeat(64),
+            cache_hit: true,
+            bytes_hashed: 0,
+        };
+        match mode {
+            "cache-hit" => prefetched.cache_hit = false,
+            "bytes" => prefetched.bytes_hashed = 1,
+            "digest" => prefetched.hash = "invalid".into(),
+            "memo-digest" => hasher
+                .cache
+                .as_ref()
+                .unwrap()
+                .put(&fingerprint, "invalid")
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        if mode != "memo-digest" {
+            hasher
+                .prefetched
+                .borrow_mut()
+                .insert(fingerprint, prefetched);
+        }
+        let result = hasher.prepare_windows_runtime_hashes_with(
+            &[path.as_path()],
+            wall_clock_ns() + 5_000_000_000,
+            |_, requests| {
+                assert_eq!(requests.len(), 1, "{mode}");
+                Ok(requests
+                    .into_iter()
+                    .map(|request| runtime_warmup_reply(request, None))
+                    .collect())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<NativeRuntimeHashesWarming>()
+                .is_some(),
+            "{mode}"
+        );
+        assert_eq!(hasher.stats().bytes_hashed, 0);
+    }
+}
+
+#[test]
+fn native_runtime_warmup_disabled_unavailable_or_refused_keeps_blocking_hashes() {
+    for mode in [
+        "default",
+        "disabled",
+        "no-cache",
+        "no-daemon",
+        "old-daemon",
+        "file-error",
+        "memo-error",
+        "unsettled",
+        "small-only",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lib");
+        let bytes = vec![b'r'; if mode == "small-only" { 65_535 } else { 70_000 }];
+        std::fs::write(&path, &bytes).unwrap();
+        let mut hasher = if mode == "no-cache" {
+            FileHasher::new()
+        } else {
+            FileHasher::persistent(&dir.path().join("index.db"))
+        };
+        if mode != "no-daemon" {
+            hasher = hasher.with_daemon(dir.path().join("daemon.sock"));
+        }
+        if mode != "default" {
+            hasher = hasher.with_native_runtime_warmup(mode != "disabled");
+        }
+        if mode == "memo-error" {
+            hasher
+                .cache
+                .as_ref()
+                .unwrap()
+                .db()
+                .execute_batch("DROP TABLE file_hashes")
+                .unwrap();
+        }
+        let now = if mode == "unsettled" {
+            0
+        } else {
+            wall_clock_ns() + 5_000_000_000
+        };
+        let calls = std::cell::Cell::new(0);
+        hasher
+            .prepare_windows_runtime_hashes_with(&[path.as_path()], now, |_, mut requests| {
+                calls.set(calls.get() + 1);
+                if mode == "old-daemon" {
+                    anyhow::bail!("unsupported request");
+                }
+                assert_eq!(mode, "file-error");
+                let mut reply = runtime_warmup_reply(requests.remove(0), None);
+                reply.error = Some("unreadable".into());
+                Ok(vec![reply])
+            })
+            .unwrap();
+        assert_eq!(
+            calls.get(),
+            usize::from(matches!(mode, "old-daemon" | "file-error")),
+            "{mode}"
+        );
+        assert_eq!(
+            hasher.hash(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        let expected = if mode == "no-cache" {
+            (0, 0)
+        } else {
+            (1, bytes.len() as u64)
+        };
+        assert_eq!(
+            (hasher.stats().cache_misses, hasher.stats().bytes_hashed),
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
 fn windows_resource_validation_reads_after_the_guarded_stat() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resource.res");
@@ -1887,6 +2558,568 @@ fn windows_resource_validation_reads_after_the_guarded_stat() {
         guarded
             .iter()
             .any(|input| input.fingerprint.size == original.len() as i64)
+    );
+}
+
+fn windows_test_manifest(description: &str) -> Vec<u8> {
+    format!(r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><description>{description}</description></assembly>"#).into_bytes()
+}
+
+#[test]
+fn windows_manifest_bytes_order_and_removal_reach_the_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.xml");
+    let second = dir.path().join("second.xml");
+    let resource = dir.path().join("resource.res");
+    std::fs::write(&first, windows_test_manifest("first")).unwrap();
+    std::fs::write(&second, windows_test_manifest("second")).unwrap();
+    std::fs::write(&resource, windows_test_resource(b"resource")).unwrap();
+    let file_hasher = FileHasher::new();
+    let identity = |files: &[WindowsLinkInput]| {
+        windows_link_identity_with_argument_files("LINK".into(), files, &file_hasher)
+    };
+    let inputs = || {
+        vec![
+            WindowsLinkInput::Manifest(first.clone()),
+            WindowsLinkInput::Resource(resource.clone()),
+            WindowsLinkInput::Manifest(second.clone()),
+        ]
+    };
+    let original = identity(&inputs()).unwrap();
+    assert_eq!(identity(&inputs()).unwrap(), original);
+    assert!(original.contains("link_arg_input.v2=0=manifest="));
+    assert!(original.contains("link_arg_input.v2=1=resource="));
+    assert!(original.contains("link_arg_input.v2=2=manifest="));
+    std::fs::write(&first, windows_test_manifest("edited first")).unwrap();
+    assert_ne!(identity(&inputs()).unwrap(), original);
+    std::fs::write(&first, windows_test_manifest("first")).unwrap();
+    std::fs::write(&second, windows_test_manifest("edited second")).unwrap();
+    assert_ne!(identity(&inputs()).unwrap(), original);
+    std::fs::write(&second, windows_test_manifest("second")).unwrap();
+    assert_eq!(identity(&inputs()).unwrap(), original);
+    let mut reversed = inputs();
+    reversed.reverse();
+    assert_ne!(identity(&reversed).unwrap(), original);
+    assert!(
+        identity(&[WindowsLinkInput::Resource(first.clone())]).is_err(),
+        "XML renamed to .res is not a compiled resource"
+    );
+    assert!(
+        identity(&[WindowsLinkInput::Manifest(resource.clone())]).is_err(),
+        "a resource is not manifest XML"
+    );
+    std::fs::remove_file(&first).unwrap();
+    assert!(identity(&inputs()).is_err());
+    std::fs::create_dir(&first).unwrap();
+    assert!(identity(&inputs()).is_err());
+}
+
+#[test]
+fn windows_manifest_tool_requirement_depends_on_input_kinds() {
+    let resource = || WindowsLinkInput::Resource(PathBuf::from("resource.xml"));
+    let manifest = || WindowsLinkInput::Manifest(PathBuf::from("manifest.res"));
+    for (files, expected) in [
+        (vec![], false),
+        (vec![resource()], false),
+        (vec![resource(), resource()], false),
+        (vec![manifest()], true),
+        (vec![manifest(), resource()], true),
+        (vec![resource(), manifest()], true),
+        (vec![resource(), manifest(), resource()], true),
+    ] {
+        assert_eq!(
+            windows_link_inputs_need_manifest_tool(&files),
+            expected,
+            "{files:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_link_options_preserve_order_across_carrier_names() {
+    let fold = |options: &[&str]| {
+        let mut argv = vec!["rustc".into(), "--crate-type=bin".into()];
+        argv.extend(options.iter().map(|option| (*option).into()));
+        let args = RustcArgs::parse(&argv).unwrap();
+        windows_fold_key(&args, WINDOWS_RUSTC_VERSION, "LINK").unwrap()
+    };
+    let embed_then_no = ["-Clink-arg=/MANIFEST:EMBED", "-Clink-args=/MANIFEST:NO"];
+    let no_then_embed = ["-Clink-args=/MANIFEST:NO", "-Clink-arg=/MANIFEST:EMBED"];
+    assert_ne!(fold(&embed_then_no), fold(&no_then_embed));
+    assert_eq!(fold(&embed_then_no), fold(&embed_then_no));
+    assert_ne!(fold(&["-Clink-arg=/DEBUG"]), fold(&["-Clink-args=/DEBUG"]));
+    assert_ne!(fold(&["-Clink-arg=/DEBUG"]), fold(&["-Clink-arg=/WX"]));
+    assert_ne!(
+        fold(&["-Clink-arg=/DEBUG", "-Clink-arg=/WX"]),
+        fold(&["-Clink-args=/DEBUG /WX"])
+    );
+}
+
+#[test]
+fn windows_manifest_admission_and_hash_ignore_misleading_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.manifest");
+    let bytes = windows_test_manifest("original &amp; &#65;");
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let stamp = FileFingerprint::from_path(&path).unwrap();
+    FileHashCache::Borrowed(&db)
+        .put(&stamp, &"0".repeat(64))
+        .unwrap();
+    let file_hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    for _ in 0..2 {
+        assert_eq!(
+            file_hasher.hash_windows_manifest(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+    }
+    assert_eq!(file_hasher.stats().cache_hits, 0);
+    assert_eq!(file_hasher.stats().bytes_hashed, 2 * bytes.len() as u64);
+    assert!(file_hasher.pending_memo.borrow().is_empty());
+    let invalid = windows_test_manifest("&external;");
+    std::fs::write(&path, &invalid).unwrap();
+    let stamp = FileFingerprint::from_path(&path).unwrap();
+    FileHashCache::Borrowed(&db)
+        .put(&stamp, blake3::hash(&bytes).to_hex().as_ref())
+        .unwrap();
+    assert!(
+        file_hasher.hash_windows_manifest(&path).is_err(),
+        "no memo can substitute for validating current XML bytes"
+    );
+}
+
+#[test]
+fn windows_manifest_hash_preserves_encoding_bytes_and_bounds_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.manifest");
+    let plain = windows_test_manifest("Unicode π");
+    let text = std::str::from_utf8(&plain).unwrap();
+    let file_hasher = FileHasher::new();
+    let mut expected_hashes = std::collections::BTreeSet::new();
+    for bytes in [
+        plain.clone(),
+        [b"\xef\xbb\xbf".as_slice(), plain.as_slice()].concat(),
+        [
+            b"\xff\xfe".as_slice(),
+            text.encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        ]
+        .concat(),
+        [
+            b"\xfe\xff".as_slice(),
+            text.encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        ]
+        .concat(),
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+        let digest = file_hasher.hash_windows_manifest(&path).unwrap();
+        assert_eq!(digest, blake3::hash(&bytes).to_hex().to_string());
+        expected_hashes.insert(digest);
+    }
+    assert_eq!(
+        expected_hashes.len(),
+        4,
+        "encoding changes retain distinct byte identities"
+    );
+    let mut oversized = plain;
+    oversized.resize(1_048_577, b' ');
+    std::fs::write(&path, oversized).unwrap();
+    assert!(file_hasher.hash_windows_manifest(&path).is_err());
+}
+
+#[test]
+fn windows_manifest_validation_hashes_the_guarded_read_and_tracks_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.manifest");
+    let original = windows_test_manifest("original");
+    std::fs::write(&path, &original).unwrap();
+    let mut file_hasher = FileHasher::new();
+    file_hasher.arm_too_new_guard(1, 0);
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, windows_test_manifest("&external;")).unwrap();
+    })));
+    let result = file_hasher.hash_windows_manifest(&path);
+    set_before_read(None);
+    assert!(result.is_err());
+    std::fs::write(&path, &original).unwrap();
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, windows_test_manifest("changed and longer")).unwrap();
+    })));
+    let result = file_hasher.hash_windows_manifest(&path);
+    set_before_read(None);
+    assert_eq!(
+        result.unwrap(),
+        hash_file(&path).unwrap(),
+        "hash exactly the validated bytes"
+    );
+    assert!(file_hasher.too_new());
+    assert!(file_hasher.inputs_changed_since_keyed());
+    let guarded = file_hasher.take_guarded_inputs();
+    assert!(guarded.len() >= 2);
+    assert!(
+        guarded
+            .iter()
+            .any(|input| input.fingerprint.size == original.len() as i64)
+    );
+}
+
+#[test]
+fn windows_manifest_tools_stream_original_bytes_without_any_memo_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mt.exe");
+    let bytes = b"original merger bytes".repeat(5000);
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let fingerprint = FileFingerprint::from_path(&path).unwrap();
+    FileHashCache::Borrowed(&db)
+        .put(&fingerprint, &"0".repeat(64))
+        .unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    for _ in 0..2 {
+        assert_eq!(
+            hasher.hash_windows_manifest_tool(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+    }
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert_eq!(hasher.stats().cache_misses, 2);
+    assert_eq!(hasher.stats().bytes_hashed, 2 * bytes.len() as u64);
+    assert!(hasher.pending_memo.borrow().is_empty());
+    assert_eq!(
+        hasher.recent_hashes.borrow()[&path].hash,
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(hasher.hash_windows_manifest_tool(&path).is_err());
+    std::fs::create_dir(&path).unwrap();
+    assert!(hasher.hash_windows_manifest_tool(&path).is_err());
+}
+
+#[test]
+fn windows_manifest_tool_read_changes_keep_both_input_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mt.exe");
+    std::fs::write(&path, b"old merger").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, b"a replaced merger with different bytes").unwrap();
+    })));
+    let digest = hasher.hash_windows_manifest_tool(&path);
+    set_before_read(None);
+    assert_eq!(digest.unwrap(), hash_file(&path).unwrap());
+    assert!(hasher.too_new());
+    assert!(hasher.inputs_changed_since_keyed());
+    let guarded = hasher.take_guarded_inputs();
+    assert!(guarded.iter().any(|input| input.fingerprint.size == 10));
+    assert!(guarded.iter().any(|input| input.fingerprint.size == 38));
+}
+
+#[test]
+fn windows_manifest_tool_lookup_guards_earlier_absences_and_directory_replacements() {
+    for change in [
+        "earlier-file",
+        "missing-directory",
+        "replace-directory",
+        "shadow",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let early = dir.path().join("early");
+        let late = dir.path().join("late");
+        let missing = dir.path().join("not-created/nested");
+        let shadow = dir.path().join("shadow");
+        for directory in [&early, &late, &shadow] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(late.join("mt.exe"), b"original merger").unwrap();
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        let selected = crate::native_link_key::select_windows_manifest_tool(
+            &[missing.clone(), early.clone(), late.clone()],
+            std::slice::from_ref(&shadow),
+            |directory| hasher.observe_windows_tool_directory(directory),
+            |path| hasher.record_absent_tool_candidate(path),
+        )
+        .unwrap();
+        assert_eq!(selected, late.join("mt.exe"));
+        hasher.hash_windows_manifest_tool(&selected).unwrap();
+        assert!(
+            !hasher.inputs_changed_since_keyed(),
+            "initial inputs: {change}"
+        );
+        let guarded = GuardedInputs {
+            files: hasher.guard_inputs.borrow().clone(),
+            absent_paths: hasher.guard_absent_paths.borrow().clone(),
+            tool_directories: hasher.guard_tool_directories.borrow().clone(),
+        };
+        assert!(
+            guarded
+                .iter()
+                .any(|input| Path::new(&input.fingerprint.path) == dir.path()),
+            "nearest existing ancestor guards the absent directory"
+        );
+        assert!(
+            guarded
+                .iter()
+                .any(|input| Path::new(&input.fingerprint.path) == selected)
+        );
+        match change {
+            "earlier-file" => {
+                std::fs::write(early.join("mt.exe"), b"earlier merger").unwrap();
+            }
+            "missing-directory" => {
+                std::fs::create_dir_all(&missing).unwrap();
+                std::fs::write(missing.join("mt.exe"), b"new directory merger").unwrap();
+            }
+            "replace-directory" => {
+                std::fs::rename(&early, dir.path().join("old-early")).unwrap();
+                std::fs::create_dir(&early).unwrap();
+            }
+            "shadow" => {
+                std::fs::write(shadow.join("mt.exe"), b"shadow merger").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            hasher.inputs_changed_since_keyed(),
+            "changed lookup: {change}"
+        );
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&guarded));
+        let next = crate::native_link_key::select_windows_manifest_tool(
+            &[missing.clone(), early.clone(), late.clone()],
+            std::slice::from_ref(&shadow),
+            |directory| FileHasher::new().observe_windows_tool_directory(directory),
+            |_| Ok(()),
+        );
+        match change {
+            "earlier-file" => assert_eq!(next.unwrap(), early.join("mt.exe")),
+            "missing-directory" => assert_eq!(next.unwrap(), missing.join("mt.exe")),
+            "shadow" => assert!(next.is_err()),
+            "replace-directory" => assert_eq!(next.unwrap(), selected),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn windows_manifest_tool_disappearing_after_directory_observation_retains_absence() {
+    for missing_kind in ["shadow", "path"] {
+        let dir = tempfile::tempdir().unwrap();
+        let early = dir.path().join("early");
+        let late = dir.path().join("late");
+        let stable = dir.path().join("stable.rs");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        std::fs::write(&stable, b"stable file evidence").unwrap();
+        let candidate = early.join("mt.exe");
+        std::fs::write(&candidate, b"earlier original merger").unwrap();
+        std::fs::write(late.join("mt.exe"), b"later selected merger").unwrap();
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        let search = if missing_kind == "path" {
+            vec![early.clone(), late.clone()]
+        } else {
+            vec![late.clone()]
+        };
+        let shadows = if missing_kind == "shadow" {
+            vec![early.clone()]
+        } else {
+            vec![]
+        };
+        let selected = crate::native_link_key::select_windows_manifest_tool(
+            &search,
+            &shadows,
+            |directory| {
+                hasher.observe_windows_tool_directory(directory)?;
+                if directory == early.as_path() {
+                    assert!(std::fs::symlink_metadata(&candidate).unwrap().is_file());
+                    std::fs::remove_file(&candidate).unwrap();
+                }
+                Ok(())
+            },
+            |path| hasher.record_absent_tool_candidate(path),
+        )
+        .unwrap();
+        assert_eq!(selected, late.join("mt.exe"));
+        let mut guarded = hasher.take_guarded_inputs();
+        assert_eq!(
+            guarded.absent_paths,
+            std::slice::from_ref(&candidate),
+            "{missing_kind}"
+        );
+        // Hold supplied file observations stable to isolate negative evidence.
+        let observed = ObservedFingerprint::from_path(&stable).unwrap();
+        guarded.files = vec![observed.clone()];
+        assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+        assert_eq!(
+            FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            observed.fingerprint.inode != 0
+        );
+        let directory_time =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&early).unwrap());
+        std::fs::write(&candidate, b"reappeared earlier merger").unwrap();
+        filetime::set_file_mtime(&early, directory_time).unwrap();
+        assert!(
+            FileHasher::guarded_inputs_moved_since_hash(&guarded),
+            "{missing_kind}"
+        );
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            "{missing_kind}"
+        );
+    }
+}
+
+#[test]
+fn windows_manifest_tool_file_only_drain_preserves_negative_candidate_veto() {
+    let dir = tempfile::tempdir().unwrap();
+    let early = dir.path().join("early");
+    let late = dir.path().join("late");
+    let stable = dir.path().join("stable.rs");
+    std::fs::create_dir(&early).unwrap();
+    std::fs::create_dir(&late).unwrap();
+    std::fs::write(&stable, b"stable file evidence").unwrap();
+    std::fs::write(late.join("mt.exe"), b"selected merger").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    hasher.hash(&stable).unwrap();
+    crate::native_link_key::select_windows_manifest_tool(
+        &[early.clone(), late],
+        &[],
+        |directory| hasher.observe_windows_tool_directory(directory),
+        |path| hasher.record_absent_tool_candidate(path),
+    )
+    .unwrap();
+    let files = hasher.take_guarded_file_observations();
+    assert!(
+        files
+            .iter()
+            .any(|input| Path::new(&input.fingerprint.path) == stable.as_path())
+    );
+    assert!(hasher.guard_inputs.borrow().is_empty());
+    assert!(!hasher.inputs_changed_since_keyed());
+    std::fs::write(early.join("mt.exe"), b"new earlier merger").unwrap();
+    assert!(hasher.inputs_changed_since_keyed());
+    let remaining = hasher.take_guarded_inputs();
+    assert!(remaining.files.is_empty());
+    assert!(
+        !remaining.is_empty(),
+        "negative evidence survives file-only serialization"
+    );
+    assert!(FileHasher::guarded_inputs_moved_since_hash(&remaining));
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&remaining));
+    assert!(hasher.take_guarded_inputs().is_empty());
+}
+
+#[test]
+fn windows_manifest_tool_directory_guards_do_not_claim_unsettled_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    hasher.observe_windows_tool_directory(dir.path()).unwrap();
+    assert!(hasher.too_new());
+    assert!(hasher.inputs_changed_since_keyed());
+    assert_eq!(
+        hasher.stats().cache_misses,
+        0,
+        "directory observations are not file hashes"
+    );
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    assert!(hasher.observe_windows_tool_directory(&file).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_manifest_tool_directory_guards_refuse_dangling_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("linked-tools");
+    let target = dir.path().join("absent-tools");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    assert!(hasher.observe_windows_tool_directory(&link).is_err());
+    assert!(
+        hasher
+            .observe_windows_tool_directory(&link.join("nested"))
+            .is_err()
+    );
+    std::fs::create_dir(&target).unwrap();
+    hasher.observe_windows_tool_directory(&link).unwrap();
+    assert!(!hasher.inputs_changed_since_keyed());
+    let replacement = dir.path().join("other-tools");
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&replacement, &link).unwrap();
+    assert!(hasher.inputs_changed_since_keyed());
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_manifest_tool_search_permission_errors_fail_closed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let early = dir.path().join("early");
+    let late = dir.path().join("late");
+    std::fs::create_dir(&early).unwrap();
+    std::fs::create_dir(&late).unwrap();
+    std::fs::write(late.join("mt.exe"), b"later merger").unwrap();
+    std::fs::set_permissions(&early, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let metadata = std::fs::metadata(early.join("mt.exe"));
+    let hasher = FileHasher::new();
+    let result = crate::native_link_key::select_windows_manifest_tool(
+        &[early.clone(), late],
+        &[],
+        |directory| hasher.observe_windows_tool_directory(directory),
+        |path| hasher.record_absent_tool_candidate(path),
+    );
+    std::fs::set_permissions(&early, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if metadata.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) {
+        assert!(
+            result.is_err(),
+            "an unreadable earlier candidate cannot select the later tool"
+        );
+    }
+}
+
+#[test]
+fn missing_tool_directory_requires_both_observations_to_report_not_found() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotADirectory,
+        ErrorKind::Other,
+    ] {
+        assert!(
+            confirm_missing_tool_directory(Error::from(kind), || {
+                panic!("a failed directory observation must stop before probing the link")
+            })
+            .is_err()
+        );
+        assert!(
+            confirm_missing_tool_directory(Error::from(ErrorKind::NotFound), || {
+                Err(Error::from(kind))
+            })
+            .is_err()
+        );
+    }
+    confirm_missing_tool_directory(Error::from(ErrorKind::NotFound), || {
+        Err(Error::from(ErrorKind::NotFound))
+    })
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        confirm_missing_tool_directory(Error::from(ErrorKind::NotFound), || {
+            std::fs::metadata(root.path())
+        })
+        .is_err()
     );
 }
 
@@ -14320,7 +15553,11 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
                 &no_mapping,
             )
             .unwrap();
-        inputs[0].observed_ns += observed_later_ns;
+        let changed_ns = inputs[0]
+            .fingerprint
+            .mtime_ns
+            .max(inputs[0].fingerprint.ctime_ns);
+        inputs[0].observed_ns = changed_ns + observed_later_ns;
         hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
         let recorded = hasher
             .cache
@@ -14341,7 +15578,10 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
     };
 
     let (fresh, stored) = record("fresh.h", 0);
-    assert!(!fresh.stamp_settled(), "the file was just written");
+    assert!(
+        !fresh.stamp_settled(),
+        "observed before the settle interval"
+    );
     assert_ne!(stored, fresh.fingerprint, "the stamp is not recorded");
     assert_eq!(reads_on_lookup("fresh.h"), 1, "the content is compared");
 
@@ -14715,9 +15955,233 @@ fn guarded_inputs_record_only_while_armed() {
 #[test]
 fn guarded_inputs_empty_set_never_excuses() {
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(&[]),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&GuardedInputs::default()),
         "a vacuous check must not waive a tripped guard"
     );
+}
+
+#[test]
+fn guarded_tool_directory_identity_survives_transfer_and_file_only_drains() {
+    for change in ["replace", "remove", "file"] {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("tools");
+        let stable = dir.path().join("stable.rs");
+        std::fs::create_dir(&tools).unwrap();
+        std::fs::write(&stable, b"stable source").unwrap();
+        let observed = ObservedFingerprint::from_path(&stable).unwrap();
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        hasher.hash(&stable).unwrap();
+        hasher.observe_windows_tool_directory(&tools).unwrap();
+        assert!(!hasher.inputs_changed_since_keyed());
+        let files = hasher.take_guarded_file_observations();
+        assert!(
+            files
+                .iter()
+                .any(|file| file.fingerprint == observed.fingerprint)
+        );
+        let lookup = hasher.take_guarded_inputs();
+        assert!(lookup.files.is_empty());
+        assert!(lookup.absent_paths.is_empty());
+        assert_eq!(lookup.tool_directories.len(), 1);
+        assert!(
+            !lookup.is_empty(),
+            "directory identities survive the file-only drain"
+        );
+        assert!(!FileHasher::guarded_inputs_moved_since_hash(&lookup));
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&lookup));
+        assert!(hasher.take_guarded_inputs().is_empty());
+
+        let mut guarded: GuardedInputs = vec![observed.clone()].into();
+        guarded.extend(lookup);
+        let one_file = guarded.for_file(&observed);
+        assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+        assert_eq!(
+            FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            observed.fingerprint.inode != 0
+        );
+        let directory_time =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&tools).unwrap());
+        std::fs::rename(&tools, dir.path().join("old-tools")).unwrap();
+        match change {
+            "replace" => {
+                std::fs::create_dir(&tools).unwrap();
+                filetime::set_file_mtime(&tools, directory_time).unwrap();
+                assert_ne!(
+                    kache_fs::directory_identity(&tools).unwrap(),
+                    guarded.tool_directories[0].1
+                );
+            }
+            "file" => std::fs::write(&tools, b"not a directory").unwrap(),
+            "remove" => {}
+            _ => unreachable!(),
+        }
+        assert!(
+            FileHasher::guarded_inputs_moved_since_hash(&guarded),
+            "{change}"
+        );
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            "{change}"
+        );
+        assert!(FileHasher::guarded_inputs_moved_since_hash(&one_file));
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&one_file));
+        // Keep file evidence identical; only the directory identity can veto.
+        *hasher.guard_inputs.borrow_mut() = guarded.files.clone();
+        *hasher.guard_tool_directories.borrow_mut() = guarded.tool_directories.clone();
+        assert!(hasher.inputs_changed_since_keyed(), "{change}");
+    }
+}
+
+#[test]
+fn guarded_absences_survive_transfer_and_merge_without_directory_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let stable = dir.path().join("stable.rs");
+    let tools = dir.path().join("tools");
+    std::fs::write(&stable, b"stable input").unwrap();
+    std::fs::create_dir(&tools).unwrap();
+    let absent = tools.join("mt.exe");
+    let observed = ObservedFingerprint::from_path(&stable).unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    hasher.observe_windows_tool_directory(&tools).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&absent)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+    hasher.record_absent_tool_candidate(&absent).unwrap();
+    // Supply stable file evidence only: the absence check must not depend
+    // on the parent directory's time, size or identity changing.
+    *hasher.guard_inputs.borrow_mut() = vec![observed.clone()];
+    assert!(!hasher.inputs_changed_since_keyed());
+    let mut guarded = GuardedInputs::default();
+    guarded.extend(hasher.take_guarded_inputs());
+    assert!(
+        hasher.take_guarded_inputs().is_empty(),
+        "both evidence sets are drained"
+    );
+    assert_eq!(guarded.len(), 1);
+    assert!(!guarded.is_empty());
+    assert_eq!(guarded.absent_paths, std::slice::from_ref(&absent));
+    let one_file = guarded.for_file(&observed);
+    assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert_eq!(
+        FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        observed.fingerprint.inode != 0
+    );
+    let directory_time =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&tools).unwrap());
+    std::fs::write(&absent, b"new earlier merger").unwrap();
+    filetime::set_file_mtime(&tools, directory_time).unwrap();
+    assert_eq!(
+        FileFingerprint::from_path(&stable).unwrap(),
+        observed.fingerprint
+    );
+    assert!(
+        FileHasher::guarded_inputs_moved_since_hash(&guarded),
+        "postcompile proof rejects the new candidate"
+    );
+    assert!(
+        !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        "postrestore proof rejects the new candidate"
+    );
+    assert!(FileHasher::guarded_inputs_moved_since_hash(&one_file));
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&one_file));
+    // Keep the local guard's supplied file evidence identical too.
+    *hasher.guard_inputs.borrow_mut() = guarded.files.clone();
+    *hasher.guard_absent_paths.borrow_mut() = guarded.absent_paths.clone();
+    assert!(hasher.inputs_changed_since_keyed());
+    std::fs::remove_file(&absent).unwrap();
+    assert!(!hasher.inputs_changed_since_keyed());
+    assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert_eq!(
+        FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        observed.fingerprint.inode != 0
+    );
+}
+
+#[test]
+fn guarded_absence_only_is_nonempty_but_cannot_excuse_a_file_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("mt.exe");
+    let file = dir.path().join("stable.rs");
+    std::fs::write(&file, b"stable").unwrap();
+    let files_only: GuardedInputs = vec![ObservedFingerprint::from_path(&file).unwrap()].into();
+    assert!(!files_only.is_empty());
+    let mut guarded = GuardedInputs::default();
+    assert!(guarded.is_empty());
+    guarded.extend(GuardedInputs {
+        files: Vec::new(),
+        absent_paths: vec![absent.clone()],
+        ..GuardedInputs::default()
+    });
+    assert!(!guarded.is_empty());
+    assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert!(
+        !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        "file evidence is still required"
+    );
+    std::fs::write(&absent, b"present").unwrap();
+    assert!(FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&guarded));
+}
+
+#[cfg(unix)]
+#[test]
+fn guarded_absences_reject_dangling_symlinks_and_lookup_errors() {
+    for mode in ["dangling", "loop", "permission"] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let stable = dir.path().join("stable.rs");
+        std::fs::write(&stable, b"stable input").unwrap();
+        let tools = dir.path().join("tools");
+        let absent = if mode == "dangling" {
+            dir.path().join("mt.exe")
+        } else {
+            tools.join("mt.exe")
+        };
+        if mode == "permission" {
+            std::fs::create_dir(&tools).unwrap();
+        }
+        let observed = ObservedFingerprint::from_path(&stable).unwrap();
+        let guarded = GuardedInputs {
+            files: vec![observed.clone()],
+            absent_paths: vec![absent.clone()],
+            ..GuardedInputs::default()
+        };
+        assert!(FileHasher::guarded_inputs_unchanged_since_hash(&guarded));
+        match mode {
+            "dangling" => std::os::unix::fs::symlink("missing-target", &absent).unwrap(),
+            "loop" => std::os::unix::fs::symlink("tools", &tools).unwrap(),
+            "permission" => {
+                std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o0)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let actual = std::fs::symlink_metadata(&absent);
+        let moved = FileHasher::guarded_inputs_moved_since_hash(&guarded);
+        let unchanged = FileHasher::guarded_inputs_unchanged_since_hash(&guarded);
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        *hasher.guard_inputs.borrow_mut() = guarded.files.clone();
+        *hasher.guard_absent_paths.borrow_mut() = guarded.absent_paths.clone();
+        let local_changed = hasher.inputs_changed_since_keyed();
+        if mode == "permission" {
+            std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if mode == "permission"
+            && actual.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue; // A privileged process may traverse a mode-000 directory.
+        }
+        assert!(moved, "{mode}");
+        assert!(!unchanged, "{mode}");
+        assert!(local_changed, "{mode}");
+        assert_eq!(
+            FileFingerprint::from_path(&stable).unwrap(),
+            observed.fingerprint
+        );
+    }
 }
 
 #[test]
@@ -14729,13 +16193,13 @@ fn guarded_inputs_reject_changed_or_missing_files() {
 
     std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&vec![recorded.clone()].into()),
         "rewritten bytes must fail verification even when the wall clock cannot tell"
     );
 
     std::fs::remove_file(&file).unwrap();
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&vec![recorded.clone()].into()),
         "a file that vanished mid-build must fail verification"
     );
 }
@@ -14748,7 +16212,7 @@ fn guarded_inputs_reject_weak_identity() {
     let mut recorded = ObservedFingerprint::from_path(&file).unwrap();
     recorded.fingerprint.inode = 0;
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&vec![recorded.clone()].into()),
         "without an inode a replace-by-rename is invisible, so verification must fail closed"
     );
 }
@@ -14843,7 +16307,7 @@ fn a_file_removed_after_its_read_counts_as_too_new() {
     assert!(hasher.too_new());
     assert_eq!(reported, before);
     assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
-        std::slice::from_ref(&reported)
+        &vec![reported.clone()].into()
     ));
 }
 
@@ -14909,7 +16373,7 @@ fn guarded_inputs_keep_when_they_were_observed() {
         let before = wall_clock_ns();
         hasher.hash(&file).unwrap();
         let after = wall_clock_ns();
-        let [input] = hasher.take_guarded_inputs().try_into().unwrap();
+        let [input] = hasher.take_guarded_inputs().files.try_into().unwrap();
         assert!((before..=after).contains(&input.observed_ns), "{input:?}");
         assert_eq!(
             input.fingerprint,
@@ -15871,7 +17335,10 @@ fn a_weak_guard_identity_cannot_reuse_a_row_from_before_replacement() {
         .push((observed.clone(), old_hash.clone()));
     hasher.flush_memo_as_if_settled();
     let rows = hasher.memoised_hashes(std::iter::once(&observed.fingerprint));
-    assert_eq!(rows.get(&observed.fingerprint.path), Some(&old_hash));
+    assert_eq!(
+        rows.get(&observed.fingerprint.path),
+        if cfg!(windows) { None } else { Some(&old_hash) }
+    );
     let memoised = HashMap::from([(observed.fingerprint.clone(), old_hash.clone())]);
     std::fs::remove_file(&path).unwrap();
     write_file(&path, "after!");

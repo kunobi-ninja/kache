@@ -72,6 +72,7 @@ mod scheduler;
 mod service;
 mod shards;
 mod since;
+mod windows_manifest;
 // Both callers (`clean`'s classifier and `compute_link_stats`) are `cfg(unix)`,
 // because `nlink` is the signal they combine with. Windows ReFS block-cloning
 // has no read-side query to implement this against — `FSCTL_DUPLICATE_EXTENTS`

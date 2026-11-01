@@ -40,6 +40,9 @@ pub enum Request {
     Health,
     BatchRemoteCheck(BatchRemoteCheckRequest),
     HashFiles(HashFilesRequest),
+    /// Return ready file hashes and queue cold fingerprints without reading
+    /// their contents on the connection handler. Older daemons reject it.
+    HashFilesWarmup(HashFilesRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),

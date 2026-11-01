@@ -311,6 +311,11 @@ and work in child processes or other threads. Trace writing adds overhead, so
 compare performance on untraced runs. The benchmark marks traced runs
 as diagnostic and rejects missing or truncated traces.
 
+On Windows, a daemon started with the same trace directory also records native
+runtime hash preparation on its worker thread. Those files have a `worker-thread`
+scope; wrapper files retain `wrapper-thread`. Existing daemons keep their startup
+environment.
+
 `kache stats --format perfetto` remains the compact event-based view: its
 phase offsets are reconstructed from millisecond totals. The opt-in files
 above record actual interval placement and retain sub-millisecond work.

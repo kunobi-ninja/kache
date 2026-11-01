@@ -4088,15 +4088,13 @@ fn compute_key_into(
         cfg!(target_os = "windows"),
         file_hasher,
         |linker, architecture, host, search_dirs| {
-            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+            probe_native_windows_msvc_identity_for(
                 linker,
                 architecture,
                 &rustc_tool_dirs_for(args, host, invocation)?,
-                &search_dirs.rustc,
-                &search_dirs.linker,
-                &args.link_libs,
-                &search_dirs.default_libraries,
-                |path| file_hasher.hash_static_lib(path),
+                search_dirs,
+                args,
+                file_hasher,
                 invocation,
             )
         },
@@ -7461,6 +7459,81 @@ fn prediction_identity_in_env(
     hasher.finalize().to_hex().to_string()
 }
 
+/// File observations and tool lookup evidence carried across a compile or restore.
+#[derive(Debug, Clone, Default)]
+pub struct GuardedInputs {
+    files: Vec<ObservedFingerprint>,
+    absent_paths: Vec<PathBuf>,
+    tool_directories: Vec<(PathBuf, kache_fs::InodeId)>,
+}
+
+impl std::ops::Deref for GuardedInputs {
+    type Target = [ObservedFingerprint];
+
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
+}
+
+impl From<Vec<ObservedFingerprint>> for GuardedInputs {
+    fn from(files: Vec<ObservedFingerprint>) -> Self {
+        Self {
+            files,
+            absent_paths: Vec::new(),
+            tool_directories: Vec::new(),
+        }
+    }
+}
+
+impl GuardedInputs {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.absent_paths.is_empty() && self.tool_directories.is_empty()
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.files.extend(other.files);
+        self.absent_paths.extend(other.absent_paths);
+        self.tool_directories.extend(other.tool_directories);
+    }
+
+    /// A source-specific proof still depends on all tool lookup evidence.
+    pub(crate) fn for_file(&self, file: &ObservedFingerprint) -> Self {
+        Self {
+            files: vec![file.clone()],
+            absent_paths: self.absent_paths.clone(),
+            tool_directories: self.tool_directories.clone(),
+        }
+    }
+}
+
+fn paths_still_absent(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn tool_directories_unchanged(directories: &[(PathBuf, kache_fs::InodeId)]) -> bool {
+    directories
+        .iter()
+        .all(|(path, expected)| kache_fs::file_identity(path).is_ok_and(|id| id == *expected))
+}
+
+fn confirm_missing_tool_directory(
+    error: std::io::Error,
+    inspect_link: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> Result<()> {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(error.into());
+    }
+    match inspect_link() {
+        Ok(_) => anyhow::bail!("manifest tool search path is not absent"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Thin abstraction over file hashing.
 ///
 /// When backed by the persistent index DB, hashes are memoized by
@@ -7471,6 +7544,9 @@ pub struct FileHasher<'db> {
     pub(crate) invocation_env: InvocationEnv,
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
+    native_runtime_warmup: bool,
+    #[cfg(test)]
+    native_runtime_warmup_observed_at: Cell<Option<i64>>,
     use_input_predictions: bool,
     prediction_flight_dir: Option<PathBuf>,
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
@@ -7486,6 +7562,11 @@ pub struct FileHasher<'db> {
     /// [`FileHasher::inputs_changed_since_keyed`] and
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
     guard_inputs: RefCell<Vec<ObservedFingerprint>>,
+    /// Missing tool candidates are rechecked explicitly; directory stamps
+    /// cannot prove that an earlier mt.exe stayed absent.
+    guard_absent_paths: RefCell<Vec<PathBuf>>,
+    /// Kernel identities detect directory replacement even when timestamps match.
+    guard_tool_directories: RefCell<Vec<(PathBuf, kache_fs::InodeId)>>,
     /// Memo rows for files hashed in this process, written in one transaction
     /// by [`FileHasher::flush_memo`] (and on drop). One autocommit write per
     /// file made every hit in a six-job cold cell wait for the index's write
@@ -7546,6 +7627,24 @@ struct PrefetchedHash {
     hash: String,
     cache_hit: bool,
     bytes_hashed: u64,
+}
+
+/// The daemon accepted native runtime reads; this compile can run uncached.
+#[derive(Debug)]
+pub(crate) struct NativeRuntimeHashesWarming;
+
+impl std::fmt::Display for NativeRuntimeHashesWarming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native runtime warmup")
+    }
+}
+
+impl std::error::Error for NativeRuntimeHashesWarming {}
+
+fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: i64) -> bool {
+    files
+        .iter()
+        .all(|file| file.inode != 0 && stamp_is_settled(file, observed_at))
 }
 
 #[derive(Clone)]
@@ -7610,6 +7709,9 @@ impl FileHasher<'static> {
             invocation_env: env.clone(),
             cache: None,
             daemon_socket: None,
+            native_runtime_warmup: false,
+            #[cfg(test)]
+            native_runtime_warmup_observed_at: Cell::new(None),
             use_input_predictions: false,
             prediction_flight_dir: None,
             discovery_flight: RefCell::new(None),
@@ -7619,6 +7721,8 @@ impl FileHasher<'static> {
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
+            guard_absent_paths: RefCell::new(Vec::new()),
+            guard_tool_directories: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
             tree_walks: RefCell::new(Vec::new()),
             own_dirs: Vec::new(),
@@ -7632,6 +7736,9 @@ impl FileHasher<'static> {
                 invocation_env: InvocationEnv::capture(),
                 cache: Some(cache),
                 daemon_socket: None,
+                native_runtime_warmup: false,
+                #[cfg(test)]
+                native_runtime_warmup_observed_at: Cell::new(None),
                 use_input_predictions: false,
                 prediction_flight_dir: None,
                 discovery_flight: RefCell::new(None),
@@ -7641,6 +7748,8 @@ impl FileHasher<'static> {
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
                 guard_inputs: RefCell::new(Vec::new()),
+                guard_absent_paths: RefCell::new(Vec::new()),
+                guard_tool_directories: RefCell::new(Vec::new()),
                 pending_memo: RefCell::new(Vec::new()),
                 tree_walks: RefCell::new(Vec::new()),
                 own_dirs: Vec::new(),
@@ -7718,6 +7827,9 @@ impl<'db> FileHasher<'db> {
             invocation_env: env.clone(),
             cache: Some(cache),
             daemon_socket: None,
+            native_runtime_warmup: false,
+            #[cfg(test)]
+            native_runtime_warmup_observed_at: Cell::new(None),
             use_input_predictions: false,
             prediction_flight_dir: None,
             discovery_flight: RefCell::new(None),
@@ -7727,6 +7839,8 @@ impl<'db> FileHasher<'db> {
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
+            guard_absent_paths: RefCell::new(Vec::new()),
+            guard_tool_directories: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
             tree_walks: RefCell::new(Vec::new()),
             own_dirs: Vec::new(),
@@ -7735,6 +7849,11 @@ impl<'db> FileHasher<'db> {
 
     pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
         self.daemon_socket = Some(socket_path);
+        self
+    }
+
+    pub(crate) fn with_native_runtime_warmup(mut self, enabled: bool) -> Self {
+        self.native_runtime_warmup = enabled;
         self
     }
 
@@ -7848,7 +7967,16 @@ impl<'db> FileHasher<'db> {
     /// Drain the fingerprints hashed while the guard was armed. The wrapper
     /// carries them past the compile and hands them to
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`].
-    pub fn take_guarded_inputs(&self) -> Vec<ObservedFingerprint> {
+    pub fn take_guarded_inputs(&self) -> GuardedInputs {
+        GuardedInputs {
+            files: self.take_guarded_file_observations(),
+            absent_paths: std::mem::take(&mut *self.guard_absent_paths.borrow_mut()),
+            tool_directories: std::mem::take(&mut *self.guard_tool_directories.borrow_mut()),
+        }
+    }
+
+    /// Serializable file snapshots do not consume tool lookup evidence.
+    pub(crate) fn take_guarded_file_observations(&self) -> Vec<ObservedFingerprint> {
         std::mem::take(&mut *self.guard_inputs.borrow_mut())
     }
 
@@ -7860,10 +7988,13 @@ impl<'db> FileHasher<'db> {
     /// checkout with future mtimes) where the wall-clock guard misfires.
     ///
     /// Fails closed: an empty set, a missing or changed file, or an input
-    /// without an inode (non-Unix, where replace-by-rename is invisible)
+    /// without an inode or Windows file index
     /// never excuses a tripped guard.
-    pub fn guarded_inputs_unchanged_since_hash(inputs: &[ObservedFingerprint]) -> bool {
-        if inputs.is_empty() {
+    pub fn guarded_inputs_unchanged_since_hash(inputs: &GuardedInputs) -> bool {
+        if inputs.files.is_empty()
+            || !paths_still_absent(&inputs.absent_paths)
+            || !tool_directories_unchanged(&inputs.tool_directories)
+        {
             return false;
         }
         inputs.iter().all(|input| {
@@ -7881,18 +8012,20 @@ impl<'db> FileHasher<'db> {
     ///
     /// The change time does not count: linking a dependency's output
     /// elsewhere, as store ingest and Cargo's uplift do while its dependents
-    /// compile, moves it and leaves the bytes alone. So a rewrite that keeps
-    /// the size and write time is missed, and on Windows, where fingerprints
-    /// carry no inode, so is a replacement with the same size and write time.
-    pub fn guarded_inputs_moved_since_hash(inputs: &[ObservedFingerprint]) -> bool {
-        inputs.iter().any(|input| {
-            let expected = &input.fingerprint;
-            FileFingerprint::from_path(Path::new(&expected.path)).map_or(true, |current| {
-                current.size != expected.size
-                    || current.mtime_ns != expected.mtime_ns
-                    || current.inode != expected.inode
+    /// compile, moves it and leaves the bytes alone. A rewrite that keeps
+    /// the size and write time is missed. Replacement also needs an inode or
+    /// Windows file index; a weak filesystem observation cannot prove it.
+    pub fn guarded_inputs_moved_since_hash(inputs: &GuardedInputs) -> bool {
+        !paths_still_absent(&inputs.absent_paths)
+            || !tool_directories_unchanged(&inputs.tool_directories)
+            || inputs.iter().any(|input| {
+                let expected = &input.fingerprint;
+                FileFingerprint::from_path(Path::new(&expected.path)).map_or(true, |current| {
+                    current.size != expected.size
+                        || current.mtime_ns != expected.mtime_ns
+                        || current.inode != expected.inode
+                })
             })
-        })
     }
 
     /// Whether a compile that ran after this key may have read other bytes
@@ -7908,7 +8041,10 @@ impl<'db> FileHasher<'db> {
     /// as well, since a second write in the same timestamp tick keeps the
     /// stamp; only such fresh files pay a read.
     pub(crate) fn inputs_changed_since_keyed(&self) -> bool {
-        if self.too_new.saw_write_since_start.get() {
+        if self.too_new.saw_write_since_start.get()
+            || !paths_still_absent(&self.guard_absent_paths.borrow())
+            || !tool_directories_unchanged(&self.guard_tool_directories.borrow())
+        {
             return true;
         }
         let start_ns = self.too_new.invocation_start_ns;
@@ -8212,7 +8348,9 @@ impl<'db> FileHasher<'db> {
             // Cheapest first: identical metadata needs no read, identical raw
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
-            if current.fingerprint == expected.fingerprint {
+            if current.fingerprint == expected.fingerprint
+                && file_hash_memo_eligible(current.fingerprint.inode, cfg!(windows))
+            {
                 // Unhashed, so registered here with the bytes its stamp
                 // proves: the recheck after a compile has to cover it like
                 // any input the key hashed.
@@ -8559,6 +8697,7 @@ impl<'db> FileHasher<'db> {
                 continue;
             };
             if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+                || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
                 || self.prefetched.borrow().contains_key(&fingerprint)
             {
                 continue;
@@ -8601,6 +8740,142 @@ impl<'db> FileHasher<'db> {
             }
             Err(e) => tracing::debug!("daemon file hash prefetch failed: {e}"),
         }
+    }
+
+    pub(crate) fn prepare_windows_runtime_hashes(&self, paths: &[&Path]) -> Result<()> {
+        let observed_at = wall_clock_ns();
+        #[cfg(test)]
+        let observed_at = self
+            .native_runtime_warmup_observed_at
+            .get()
+            .unwrap_or(observed_at);
+        self.prepare_windows_runtime_hashes_with(paths, observed_at, |socket, files| {
+            crate::daemon::send_hash_files_warmup_request(socket, files)
+        })
+    }
+
+    fn prepare_windows_runtime_hashes_with<Send>(
+        &self,
+        paths: &[&Path],
+        observed_at: i64,
+        send: Send,
+    ) -> Result<()>
+    where
+        Send: FnOnce(
+            &Path,
+            Vec<crate::daemon::HashFileRequest>,
+        ) -> Result<Vec<crate::daemon::HashFileResult>>,
+    {
+        if !self.native_runtime_warmup {
+            return Ok(());
+        }
+        let (Some(cache), Some(socket)) = (&self.cache, &self.daemon_socket) else {
+            return Ok(());
+        };
+        let mut files = Vec::new();
+        for path in paths {
+            let resolved = self.resolve_path(path)?;
+            // The memo and daemon protocol use UTF-8 path keys. Keep the
+            // existing fresh-read path when the actual filename cannot roundtrip.
+            if resolved.to_str().is_none() {
+                return Ok(());
+            }
+            let fingerprint = FileFingerprint::from_path(&resolved)?;
+            // Small runtimes stay fresh and blocking, after large hashes are
+            // ready. They must not disable preparation of the large cohort.
+            if fingerprint.size >= MIN_PERSISTED_HASH_BYTES && !files.contains(&fingerprint) {
+                files.push(fingerprint);
+            }
+        }
+        if files.is_empty() || !native_runtime_fingerprints_can_warm(&files, observed_at) {
+            return Ok(());
+        }
+        let stamps: Vec<_> = files.iter().collect();
+        let memoized = match cache.get_many(&stamps) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                tracing::debug!(%error, "native runtime hash memo unavailable; hashing synchronously");
+                return Ok(());
+            }
+        };
+        let mut ready = HashMap::new();
+        let mut missing = std::collections::HashSet::new();
+        let mut requests = Vec::new();
+        for file in files {
+            if let Some(hash) = memoized
+                .get(&file.path)
+                .filter(|hash| is_valid_cache_key(hash))
+            {
+                ready.insert(file, hash.clone());
+            } else if let Some(hash) = self.prefetched.borrow().get(&file).filter(|hash| {
+                hash.cache_hit && hash.bytes_hashed == 0 && is_valid_cache_key(&hash.hash)
+            }) {
+                ready.insert(file, hash.hash.clone());
+            } else {
+                requests.push(crate::daemon::HashFileRequest {
+                    path: file.path.clone(),
+                    size: file.size,
+                    mtime_ns: file.mtime_ns,
+                    ctime_ns: file.ctime_ns,
+                    inode: file.inode,
+                });
+                missing.insert(file);
+            }
+        }
+        if !missing.is_empty() {
+            let results = match send(socket, requests) {
+                Ok(results) => results,
+                Err(error) => {
+                    tracing::debug!(%error, "native runtime warmup unavailable; hashing synchronously");
+                    return Ok(());
+                }
+            };
+            let mut seen = std::collections::HashSet::new();
+            for result in results {
+                let file = FileFingerprint {
+                    path: result.path,
+                    size: result.size,
+                    mtime_ns: result.mtime_ns,
+                    ctime_ns: result.ctime_ns,
+                    inode: result.inode,
+                };
+                if !missing.contains(&file) {
+                    continue;
+                }
+                if !seen.insert(file.clone()) {
+                    ready.remove(&file);
+                    continue;
+                }
+                if result.error.is_some() {
+                    tracing::debug!(error = ?result.error, "native runtime warmup refused a file; hashing synchronously");
+                    return Ok(());
+                }
+                if let Some(hash) = result.hash.filter(|hash| is_valid_cache_key(hash))
+                    && result.cache_hit
+                    && result.bytes_hashed == 0
+                    && FileFingerprint::from_path(Path::new(&file.path))
+                        .is_ok_and(|current| current == file)
+                {
+                    ready.insert(file, hash);
+                }
+            }
+        }
+        let pending = missing.iter().any(|file| !ready.contains_key(file));
+        let mut prefetched = self.prefetched.borrow_mut();
+        for (file, hash) in ready {
+            prefetched.insert(
+                file,
+                PrefetchedHash {
+                    hash,
+                    cache_hit: true,
+                    bytes_hashed: 0,
+                },
+            );
+        }
+        if pending {
+            return Err(NativeRuntimeHashesWarming.into());
+        }
+        Ok(())
     }
 
     /// Hash a file's contents, using the persistent cache when available.
@@ -8669,6 +8944,120 @@ impl<'db> FileHasher<'db> {
             },
         );
         Ok(hash)
+    }
+
+    /// Validate a closed manifest profile and hash the original bytes from
+    /// one bounded read. A whole-file memo cannot establish XML admission.
+    fn hash_windows_manifest(&self, path: &Path) -> Result<String> {
+        use std::io::Read as _;
+
+        let _trace = crate::phase_trace::phase("input_hash");
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
+        let before = ObservedFingerprint::from_path(path)?;
+        self.note_too_new(&before.fingerprint);
+        #[cfg(test)]
+        before_file_read(path);
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(crate::windows_manifest::MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .context("reading the manifest")?;
+        crate::windows_manifest::validate(&bytes)?;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        self.record_miss(bytes.len() as i64);
+        let (observed, _) = self.restat_after_read(path, before, true);
+        self.guard_input(&observed);
+        self.recent_hashes.borrow_mut().insert(
+            resolved,
+            RecentHash {
+                hash: hash.clone(),
+                fingerprint: Some(observed.fingerprint),
+                header_scan: None,
+            },
+        );
+        Ok(hash)
+    }
+
+    /// A tool's memoized digest does not prove which merger the link will
+    /// execute. Stream its original bytes and retain both read observations.
+    fn hash_windows_manifest_tool(&self, path: &Path) -> Result<String> {
+        let _trace = crate::phase_trace::phase("input_hash");
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
+        let before = ObservedFingerprint::from_path(path)?;
+        self.note_too_new(&before.fingerprint);
+        #[cfg(test)]
+        before_file_read(path);
+        let file = std::fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            anyhow::bail!("manifest merger is not a regular file");
+        }
+        let mut digest = blake3::Hasher::new();
+        digest.update_reader(file)?;
+        let hash = digest.finalize().to_hex().to_string();
+        self.record_miss_count();
+        self.record_miss_bytes(digest.count());
+        let (observed, _) = self.restat_after_read(path, before, true);
+        self.guard_input(&observed);
+        self.recent_hashes.borrow_mut().insert(
+            resolved,
+            RecentHash {
+                hash: hash.clone(),
+                fingerprint: Some(observed.fingerprint),
+                header_scan: None,
+            },
+        );
+        Ok(hash)
+    }
+
+    /// Called for the selector's exact NotFound observation, without a second
+    /// candidate stat that could see a different directory entry.
+    fn record_absent_tool_candidate(&self, path: &Path) -> Result<()> {
+        let resolved = self.resolve_path(path)?;
+        self.guard_absent_paths.borrow_mut().push(resolved);
+        Ok(())
+    }
+
+    /// Directory identity supplements the selector's explicit absences.
+    fn observe_windows_tool_directory(&self, directory: &Path) -> Result<()> {
+        let resolved = self.resolve_path(directory)?;
+        let mut directory = resolved.as_path();
+        loop {
+            match std::fs::metadata(directory) {
+                Ok(metadata) if metadata.is_dir() => {
+                    let identity = kache_fs::file_identity(directory)
+                        .context("identifying manifest tool search directory")?;
+                    anyhow::ensure!(
+                        identity.ino != 0,
+                        "manifest tool directory identity is unavailable"
+                    );
+                    let observed = ObservedFingerprint::from_path(directory)?;
+                    self.note_too_new(&observed.fingerprint);
+                    self.guard_input(&observed);
+                    self.guard_tool_directories
+                        .borrow_mut()
+                        .push((directory.to_path_buf(), identity));
+                    return Ok(());
+                }
+                Ok(_) => anyhow::bail!(
+                    "manifest tool search path {} is not a directory",
+                    directory.display()
+                ),
+                Err(error) => {
+                    confirm_missing_tool_directory(error, || std::fs::symlink_metadata(directory))
+                        .with_context(|| {
+                            format!(
+                                "observing manifest tool search directory {}",
+                                directory.display()
+                            )
+                        })?;
+                    directory = directory
+                        .parent()
+                        .context("manifest tool search directory has no existing ancestor")?;
+                }
+            }
+        }
     }
 
     /// Hash a file that is not a key input, such as one a tree guard reads,
@@ -8812,7 +9201,9 @@ impl<'db> FileHasher<'db> {
             self.note_too_new(fingerprint);
         }
 
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+        {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
             let (observed, _) = self.restat_after_read(path, observed, keyed);
@@ -9046,7 +9437,9 @@ impl<'db> FileHasher<'db> {
         // Small libs skip the persistent cache (same policy as `hash`); the
         // archive read is cheap and not worth a row.
         let size = fingerprint.size;
-        if size < MIN_PERSISTED_HASH_BYTES {
+        if size < MIN_PERSISTED_HASH_BYTES
+            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+        {
             let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
             self.record_miss(size);
             return Ok(hash);
@@ -9126,7 +9519,9 @@ impl<'db> FileHasher<'db> {
     ) -> Result<String> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
-        if self.cache.is_none() {
+        if self.cache.is_none()
+            || !file_hash_memo_eligible(observed.fingerprint.inode, cfg!(windows))
+        {
             return self.hash(path);
         }
         let fingerprint = &observed.fingerprint;
@@ -10766,8 +11161,52 @@ struct WindowsNativeLinkSearchDirs {
     linker: Vec<PathBuf>,
     /// Files `-C link-arg` hands LINK by absolute path, which the key hashes
     /// (see `windows_link_argument_input_files`), in argument order.
-    files: Vec<PathBuf>,
+    files: Vec<crate::native_link_key::WindowsLinkInput>,
     default_libraries: Vec<crate::native_link_key::WindowsDefaultLibrary>,
+}
+
+fn windows_link_inputs_need_manifest_tool(
+    files: &[crate::native_link_key::WindowsLinkInput],
+) -> bool {
+    files
+        .iter()
+        .any(|file| matches!(file, crate::native_link_key::WindowsLinkInput::Manifest(_)))
+}
+
+fn probe_native_windows_msvc_identity_for(
+    linker: Option<&Path>,
+    architecture: &str,
+    rustc_tool_dirs: &[PathBuf],
+    search_dirs: &WindowsNativeLinkSearchDirs,
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    invocation: &InvocationEnv,
+) -> Result<crate::native_link_key::WindowsMsvcIdentity> {
+    let prepare = |paths: &[&Path]| file_hasher.prepare_windows_runtime_hashes(paths);
+    let hash_tool = |path: &Path| file_hasher.hash_windows_manifest_tool(path);
+    let observe_directory = |path: &Path| file_hasher.observe_windows_tool_directory(path);
+    let record_absence = |path: &Path| file_hasher.record_absent_tool_candidate(path);
+    let manifest = windows_link_inputs_need_manifest_tool(&search_dirs.files).then_some(
+        crate::native_link_key::WindowsManifestProbe {
+            hash_tool: &hash_tool,
+            observe_directory: &observe_directory,
+            record_absence: &record_absence,
+        },
+    );
+    crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+        linker,
+        architecture,
+        rustc_tool_dirs,
+        &search_dirs.rustc,
+        &search_dirs.linker,
+        &args.link_libs,
+        &search_dirs.default_libraries,
+        |path| file_hasher.hash_static_lib(path),
+        |path| file_hasher.hash(path),
+        invocation,
+        manifest,
+        Some(&prepare),
+    )
 }
 
 fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {
@@ -10804,7 +11243,7 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
         let Some(inputs) = crate::native_link_key::windows_link_argument_input_files(key, value)
         else {
             anyhow::bail!(
-                "Windows linker input files other than absolute compiled resources, and unmodeled file-carrying LINK options, are not cacheable"
+                "Windows linker inputs require absolute compiled resources or supported /MANIFESTINPUT files; unmodeled file-carrying LINK options are not cacheable"
             );
         };
         let crate::native_link_key::WindowsLinkArgumentInputs {
@@ -10822,24 +11261,57 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
     })
 }
 
-/// Add compiled-resource digests to the MSVC identity in argument order.
+/// Add typed resource/manifest digests to the MSVC identity in argument order.
 /// Missing inputs or unsupported formats make the link uncacheable.
 fn windows_link_identity_with_argument_files(
     mut identity: String,
-    files: &[PathBuf],
+    files: &[crate::native_link_key::WindowsLinkInput],
     file_hasher: &FileHasher<'_>,
 ) -> Result<String> {
-    for (index, file) in files.iter().enumerate() {
+    for (index, input) in files.iter().enumerate() {
+        let file = input.path();
         let resolved = file_hasher.resolve_path(file)?;
         if !resolved.is_file() {
             anyhow::bail!("linker input {} is not a regular file", file.display());
         }
-        let digest = file_hasher
-            .hash_windows_resource(file)
-            .with_context(|| format!("hashing linker input {}", file.display()))?;
-        identity.push_str(&format!("\nlink_arg_input.v1={index}={digest}"));
+        let (kind, digest) = match input {
+            crate::native_link_key::WindowsLinkInput::Resource(_) => {
+                ("resource", file_hasher.hash_windows_resource(file))
+            }
+            crate::native_link_key::WindowsLinkInput::Manifest(_) => {
+                ("manifest", file_hasher.hash_windows_manifest(file))
+            }
+        };
+        let digest = digest.with_context(|| format!("hashing linker input {}", file.display()))?;
+        identity.push_str(&format!("\nlink_arg_input.v2={index}={kind}={digest}"));
     }
     Ok(identity)
+}
+
+/// Generic codegen hashing sorts by option name. LINK options can override
+/// earlier options across link-arg/link-args carriers, so retain that order too.
+fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs) {
+    for (index, (carrier, value)) in args
+        .codegen_opts
+        .iter()
+        .filter(|(key, _)| matches!(key.as_str(), "link-arg" | "link-args"))
+        .enumerate()
+    {
+        let default_library = value
+            .as_deref()
+            .and_then(crate::native_link_key::WindowsDefaultLibrary::parse);
+        let (carrier, value) = match default_library {
+            Some(library) => ("defaultlib", library.canonical_name()),
+            None => (carrier.as_str(), value.as_deref().unwrap_or("")),
+        };
+        fold_field(
+            hasher,
+            b"windows_link_arg_index.v1:",
+            &(index as u64).to_le_bytes(),
+        );
+        fold_field(hasher, b"windows_link_arg_carrier.v1:", carrier.as_bytes());
+        fold_field(hasher, b"windows_link_arg_value.v1:", value.as_bytes());
+    }
 }
 
 fn windows_libpath_argument(value: &str) -> Result<Option<String>> {
@@ -10951,6 +11423,7 @@ where
                 ucrt: "10".into(),
                 architecture: architecture.into(),
                 wrapper: None,
+                manifest_tool: None,
                 libraries: BTreeMap::new(),
             })
         },
@@ -11027,6 +11500,7 @@ where
         .encode();
     let identity =
         windows_link_identity_with_argument_files(identity, &search_dirs.files, file_hasher)?;
+    fold_windows_link_argument_order(hasher, args);
     fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());
     tracing::trace!(
         "[key:{}] host_windows_msvc={}",

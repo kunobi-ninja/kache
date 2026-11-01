@@ -21,9 +21,10 @@
 //! `-C link-arg` that hands LINK a file the identity does not hash. That last
 //! group is checked by [`windows_link_argument_input_files`]. Absolute `.res`
 //! inputs with the standard binary resource header are hashed from their
-//! validated bytes. Objects, archives, explicit manifest inputs and other
-//! file-carrying options stay refused; their further inputs or side outputs
-//! are not modeled.
+//! validated bytes. Absolute `/MANIFESTINPUT` files are validated as a closed
+//! application-metadata XML subset and hashed from those same bytes. Objects,
+//! archives and other file-carrying options stay refused; their further inputs
+//! or side outputs are not modeled.
 //!
 //! `NODEFAULTLIB` excludes libraries rather than introducing file inputs.
 //! `DEFAULTLIB` is admitted only for the modeled CRT/vcruntime/UCRT names,
@@ -42,7 +43,10 @@ use std::process::Command;
 
 use crate::invocation::InvocationEnv;
 use crate::probe_memo::{self, Material};
+#[cfg(test)]
 use kache_store::file_hash::hash_file;
+
+pub(crate) type WindowsRuntimePreparation<'a> = &'a dyn Fn(&[&Path]) -> Result<()>;
 
 /// What the driver is asked to place, and which of it a key cannot do without.
 ///
@@ -844,7 +848,8 @@ pub(crate) fn encode_crt_objects(objects: &BTreeMap<String, String>) -> String {
 /// paths select the tools and libraries on this machine; absolute paths would
 /// make a cache key differ for every Visual Studio installation. Library
 /// contents are retained as hashes because a version directory can be
-/// replaced in place by a servicing update.
+/// replaced in place by a servicing update. Explicit manifest inputs also
+/// pin the selected external merger's path and original file bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowsMsvcIdentity {
     pub(crate) linker: String,
@@ -858,6 +863,9 @@ pub(crate) struct WindowsMsvcIdentity {
     /// `cargo-host-linker.bat` via `MOZ_CARGO_WRAP_*`). Empty when rustc
     /// invoked `link.exe` / `lld-link.exe` directly.
     pub(crate) wrapper: Option<(String, Vec<String>)>,
+    /// Only explicit manifest inputs need the external merger's selected
+    /// path and original bytes. Ordinary link identities retain their format.
+    pub(crate) manifest_tool: Option<(PathBuf, String)>,
 }
 
 impl WindowsMsvcIdentity {
@@ -897,6 +905,16 @@ impl WindowsMsvcIdentity {
             for flag in extra {
                 fields.push(format!("wrapper_flag={flag}"));
             }
+        }
+        if let Some((path, digest)) = &self.manifest_tool {
+            let path = hex::encode(path.as_os_str().as_encoded_bytes());
+            fields.push(format!(
+                "manifest_tool.v1={}:{}={}:{}",
+                path.len(),
+                path,
+                digest.len(),
+                digest
+            ));
         }
         fields.extend(
             self.libraries
@@ -1086,6 +1104,7 @@ impl WindowsProbeEnvironment {
         architecture: &str,
         env: &InvocationEnv,
     ) -> Result<()> {
+        let _trace = crate::phase_trace::phase("native_msvc_discovery");
         self.validate_discovery_probe()?;
         // find-msvc-tools' architecture fallback spawns cl.exe with inherited
         // process state. Supply the result of our own isolated banner probe.
@@ -1306,6 +1325,9 @@ fn windows_link_token_is_file_option(token: &str) -> bool {
         || named("NATVIS")
         || named("SOURCELINK")
         || named("MANIFESTINPUT")
+        // This option can enable a side-by-side manifest output. Until the
+        // effective EMBED context is modeled, no spelling is admitted.
+        || named("MANIFESTDEPENDENCY")
         || named("ASSEMBLYMODULE")
         || named("ASSEMBLYRESOURCE")
         || named("ASSEMBLYLINKRESOURCE")
@@ -1327,18 +1349,32 @@ fn manifest_value_writes_no_side_file(value: Option<&str>) -> bool {
 }
 
 /// Holds modeled inputs in Windows linker argument order.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WindowsLinkInput {
+    Resource(PathBuf),
+    Manifest(PathBuf),
+}
+
+impl WindowsLinkInput {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Resource(path) | Self::Manifest(path) => path,
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowsLinkArgumentInputs {
-    pub files: Vec<PathBuf>,
+    pub files: Vec<WindowsLinkInput>,
     pub default_libraries: Vec<WindowsDefaultLibrary>,
 }
 
 /// Parses modeled inputs carried by one link-arg or link-args value.
 ///
-/// Absolute compiled-resource files carried by one link-arg or
-/// whitespace-split link-args value. Their binary format is checked by the
-/// hasher. Objects and archives can name further inputs; XML manifests need
-/// a separate proof of the merger's external-file behavior. Both stay refused.
+/// Absolute compiled resources and `/MANIFESTINPUT` files carried by one
+/// link-arg or whitespace-split link-args value. Their formats are checked by
+/// the hasher. The manifest parser excludes elements that can name more files.
+/// Objects and archives can name further inputs and stay refused.
 ///
 /// A bare token is a possible input even without a recognized extension.
 /// Embedded quotes, relative paths and C-driver spellings stay outside this
@@ -1368,11 +1404,20 @@ pub(crate) fn windows_link_argument_input_files(
     Some(inputs)
 }
 
-fn windows_link_argument_input_file(argument: &str) -> Option<PathBuf> {
-    (windows_absolute_path(argument)
-        && ends_with_ignore_ascii_case(argument, ".res")
-        && !argument.contains('"'))
-    .then(|| PathBuf::from(argument))
+fn windows_link_argument_input_file(argument: &str) -> Option<WindowsLinkInput> {
+    if argument.contains('"') {
+        return None;
+    }
+    if let Some((_, path)) = argument
+        .strip_prefix(['/', '-'])
+        .and_then(|option| option.split_once(':'))
+        .filter(|(option, _)| option.eq_ignore_ascii_case("MANIFESTINPUT"))
+    {
+        return windows_absolute_path(path)
+            .then(|| WindowsLinkInput::Manifest(PathBuf::from(path)));
+    }
+    (windows_absolute_path(argument) && ends_with_ignore_ascii_case(argument, ".res"))
+        .then(|| WindowsLinkInput::Resource(PathBuf::from(argument)))
 }
 
 /// A Windows path that does not depend on a working directory or a current
@@ -1600,6 +1645,135 @@ fn directory_lookup<'a>(
     })
 }
 
+/// Observe each directory before testing it, including absent directories.
+/// The observer must guard its nearest existing ancestor when it is absent.
+/// Record only the precise NotFound observations used by this selection.
+pub(crate) fn select_windows_manifest_tool<Observe, RecordAbsence>(
+    search_dirs: &[PathBuf],
+    shadow_dirs: &[PathBuf],
+    observe: Observe,
+    record_absence: RecordAbsence,
+) -> Result<PathBuf>
+where
+    Observe: Fn(&Path) -> Result<()>,
+    RecordAbsence: Fn(&Path) -> Result<()>,
+{
+    for directory in shadow_dirs {
+        observe(directory)?;
+        let candidate = directory.join("mt.exe");
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => bail!(
+                "manifest merger shadow {} is not modeled",
+                candidate.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                record_absence(&candidate)?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspecting manifest merger shadow {}", candidate.display())
+                });
+            }
+        }
+    }
+    for directory in search_dirs {
+        observe(directory)?;
+        let candidate = directory.join("mt.exe");
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(candidate),
+            Ok(_) => bail!(
+                "manifest merger {} is not a regular file",
+                candidate.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                record_absence(&candidate)?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspecting manifest merger {}", candidate.display())
+                });
+            }
+        }
+    }
+    bail!("mt.exe was not found in the effective native linker PATH")
+}
+
+/// Hashing and negative-lookup guards belong to the invocation's FileHasher.
+pub(crate) struct WindowsManifestProbe<'a> {
+    pub hash_tool: &'a dyn Fn(&Path) -> Result<String>,
+    pub observe_directory: &'a dyn Fn(&Path) -> Result<()>,
+    pub record_absence: &'a dyn Fn(&Path) -> Result<()>,
+}
+
+#[cfg(windows)]
+fn windows_manifest_system_directories() -> Result<Vec<PathBuf>> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemDirectoryW, GetWindowsDirectoryW,
+    };
+
+    fn query_windows_manifest_directory(
+        get: unsafe extern "system" fn(*mut u16, u32) -> u32,
+    ) -> Result<PathBuf> {
+        let mut buffer = vec![0u16; 32_768];
+        // These APIs return the required size if the buffer is too short.
+        // SAFETY: both callers provide a Windows directory query; the buffer
+        // is writable for the advertised number of UTF-16 code units.
+        let len = unsafe { get(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if len == 0 || len >= buffer.len() {
+            bail!("cannot identify the Windows manifest-merger search directories");
+        }
+        Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
+    }
+    let system = query_windows_manifest_directory(GetSystemDirectoryW)?;
+    let windows = query_windows_manifest_directory(GetWindowsDirectoryW)?;
+    Ok(vec![system, windows.join("System"), windows])
+}
+
+#[cfg(not(windows))]
+fn windows_manifest_system_directories() -> Result<Vec<PathBuf>> {
+    bail!("native Windows manifest-merger discovery requires Windows")
+}
+
+fn key_windows_manifest_tool(
+    identity: &mut WindowsMsvcIdentity,
+    linker: &Path,
+    environment: &WindowsProbeEnvironment,
+    system_dirs: &[PathBuf],
+    probe: WindowsManifestProbe<'_>,
+) -> Result<()> {
+    if identity.wrapper.is_some() {
+        bail!("linker wrappers are not modeled for manifest inputs");
+    }
+    let mut shadows = vec![
+        linker
+            .parent()
+            .context("selected linker has no parent directory")?
+            .to_path_buf(),
+        environment
+            .cwd
+            .clone()
+            .context("manifest input requires the invocation working directory")?,
+    ];
+    shadows.extend_from_slice(system_dirs);
+    let search_dirs = environment
+        .rustc_tool_dirs
+        .iter()
+        .chain(&environment.path)
+        .cloned()
+        .collect::<Vec<_>>();
+    let path = select_windows_manifest_tool(
+        &search_dirs,
+        &shadows,
+        probe.observe_directory,
+        probe.record_absence,
+    )?;
+    let digest = (probe.hash_tool)(&path)
+        .with_context(|| format!("hashing manifest merger {}", path.display()))?;
+    identity.manifest_tool = Some((path, digest));
+    Ok(())
+}
+
 fn is_path_like(path: &Path) -> bool {
     path.to_string_lossy()
         .chars()
@@ -1793,8 +1967,13 @@ fn run_windows_tool_in_for(
     environment: &[(OsString, OsString)],
     env: &InvocationEnv,
 ) -> Result<String> {
+    let _trace = crate::phase_trace::phase("native_msvc_banner");
+    let digest = || {
+        let _trace = crate::phase_trace::phase("native_msvc_banner_hash");
+        probe_memo::file_digest(path)
+    };
     let before = (memo_dir.is_some() && memoises_banner(tool))
-        .then(|| probe_memo::file_digest(path))
+        .then(digest)
         .flatten();
     let memo = memo_dir
         .zip(before.as_deref())
@@ -1806,9 +1985,12 @@ fn run_windows_tool_in_for(
     {
         return Ok(banner);
     }
-    let output = windows_tool_command_for(tool, path, environment, env)?
-        .invocation_output()
-        .with_context(|| format!("running {} at {}", tool.name(), path.display()))?;
+    let output = {
+        let _trace = crate::phase_trace::phase("native_msvc_banner_run");
+        windows_tool_command_for(tool, path, environment, env)?
+            .invocation_output()
+            .with_context(|| format!("running {} at {}", tool.name(), path.display()))?
+    };
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1816,7 +1998,7 @@ fn run_windows_tool_in_for(
     );
     let banner = validate_tool_banner(tool, &text)?;
     if let Some((memo_path, key)) = &memo
-        && probe_memo::file_digest(path) == before
+        && digest() == before
     {
         probe_memo::write_verified(memo_path, key, &text);
     }
@@ -2319,6 +2501,10 @@ const UCRT: &[&str] = &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"];
 pub(crate) struct WindowsDefaultLibrary(&'static str);
 
 impl WindowsDefaultLibrary {
+    pub(crate) fn canonical_name(self) -> &'static str {
+        self.0
+    }
+
     /// Parses a single LINK default-library option for an already modeled runtime.
     pub(crate) fn parse(argument: &str) -> Option<Self> {
         let (option, name) = argument.strip_prefix(['/', '-'])?.split_once(':')?;
@@ -2337,6 +2523,7 @@ impl WindowsDefaultLibrary {
     }
 }
 
+#[cfg(test)]
 fn hash_windows_runtime_libraries(
     environment: &WindowsProbeEnvironment,
     architecture: &str,
@@ -2344,6 +2531,30 @@ fn hash_windows_runtime_libraries(
     ucrt_version: &str,
     additional_dirs: &[PathBuf],
 ) -> Result<BTreeMap<String, String>> {
+    hash_windows_runtime_libraries_with_hash(
+        environment,
+        architecture,
+        sdk_version,
+        ucrt_version,
+        additional_dirs,
+        hash_file,
+        None,
+    )
+}
+
+fn hash_windows_runtime_libraries_with_hash<HashRuntime>(
+    environment: &WindowsProbeEnvironment,
+    architecture: &str,
+    sdk_version: &str,
+    ucrt_version: &str,
+    additional_dirs: &[PathBuf],
+    hash_runtime: HashRuntime,
+    prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
+) -> Result<BTreeMap<String, String>>
+where
+    HashRuntime: Fn(&Path) -> Result<String>,
+{
+    let _trace = crate::phase_trace::phase("native_msvc_runtime");
     let directories = windows_library_dirs(
         environment,
         architecture,
@@ -2360,27 +2571,42 @@ fn hash_windows_runtime_libraries(
     // copy further along is never read, so it does not enter the key. A
     // host with two toolsets, such as Firefox's mozbuild toolchain on LIB
     // beside the machine's Visual Studio, has several copies that differ.
-    let mut libraries = BTreeMap::new();
+    let mut selected = Vec::new();
     for name in MSVC_RUNTIME.iter().chain(VCRUNTIME).chain(UCRT) {
-        let found = first_windows_library(&directories, &[(*name).to_string()])?;
-        if let Some(path) = found {
+        if let Some(path) = first_windows_library(&directories, &[(*name).to_string()])? {
             let requested = environment
                 .requested_default_libraries
                 .contains(&WindowsDefaultLibrary(name));
-            let digest = hash_windows_runtime_library(&path, requested)
-                .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
-            libraries.insert((*name).to_string(), digest);
+            selected.push((*name, path, requested));
         }
     }
-    let has_crt = ["libcmt.lib", "libcmtd.lib", "msvcrt.lib", "msvcrtd.lib"]
-        .iter()
-        .any(|name| libraries.contains_key(*name))
-        && VCRUNTIME.iter().any(|name| libraries.contains_key(*name));
+    let has = |name: &&str| selected.iter().any(|(selected, _, _)| selected == name);
+    let has_crt = MSVC_RUNTIME.iter().any(has) && VCRUNTIME.iter().any(has);
     if !has_crt {
         bail!("selected MSVC runtime is incomplete (CRT and vcruntime are required)");
     }
-    if !UCRT.iter().any(|name| libraries.contains_key(*name)) {
+    if !UCRT.iter().any(has) {
         bail!("no selected UCRT library was found in LIB");
+    }
+    if let Some(prepare) = prepare_runtime {
+        let ordinary: Vec<_> = selected
+            .iter()
+            .filter(|(_, _, requested)| !*requested)
+            .map(|(_, path, _)| path.as_path())
+            .collect();
+        prepare(&ordinary)?;
+    }
+    let mut libraries = BTreeMap::new();
+    for (name, path, requested) in selected {
+        // DEFAULTLIB retains a fresh format proof from the same read as its
+        // digest. Only ordinary runtime files can use prepared memo hashes.
+        let digest = if requested {
+            hash_windows_default_library(&path)
+        } else {
+            hash_runtime(&path)
+        }
+        .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
+        libraries.insert(name.to_string(), digest);
     }
     Ok(libraries)
 }
@@ -2389,10 +2615,7 @@ fn hash_windows_runtime_libraries(
 // runtime hashes retain the existing streaming path and its digest format.
 const MAX_WINDOWS_DEFAULTLIB_BYTES: usize = 64 << 20;
 
-fn hash_windows_runtime_library(path: &Path, requested: bool) -> Result<String> {
-    if !requested {
-        return hash_file(path);
-    }
+fn hash_windows_default_library(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening explicit DEFAULTLIB {}", path.display()))?;
@@ -2439,11 +2662,14 @@ where
         link_libraries,
         &[],
         hash_library,
+        hash_file,
         &InvocationEnv::capture(),
+        None,
+        None,
     )
 }
 
-pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
+pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary, HashRuntime>(
     linker: Option<&Path>,
     target_architecture: &str,
     rustc_tool_dirs: &[PathBuf],
@@ -2452,11 +2678,16 @@ pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
     link_libraries: &[String],
     requested_default_libraries: &[WindowsDefaultLibrary],
     hash_library: HashLibrary,
+    hash_runtime: HashRuntime,
     env: &InvocationEnv,
+    manifest: Option<WindowsManifestProbe<'_>>,
+    prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
 ) -> Result<WindowsMsvcIdentity>
 where
     HashLibrary: Fn(&Path) -> Result<String>,
+    HashRuntime: Fn(&Path) -> Result<String>,
 {
+    let _trace = crate::phase_trace::phase("native_msvc");
     let resolve_paths = |paths: &[PathBuf]| {
         paths
             .iter()
@@ -2476,15 +2707,32 @@ where
     environment.requested_default_libraries = requested_default_libraries.to_vec();
     environment.augment_from_installed_msvc(target_architecture, env)?;
     environment.root_invocation_paths(env)?;
-    let mut identity = probe_windows_msvc_identity_with(
+    let mut selected_linker = None;
+    let mut identity = probe_windows_msvc_identity_with_runtime_hash(
         linker,
         target_architecture,
         &linker_library_dirs,
         &environment,
         |tool, path| {
+            if matches!(tool, WindowsTool::Link | WindowsTool::LldLink) {
+                selected_linker = Some(path.to_path_buf());
+            }
             run_windows_tool_for(tool, path, environment.command_environment(tool, path), env)
         },
+        hash_runtime,
+        prepare_runtime,
     )?;
+    if let Some(probe) = manifest {
+        key_windows_manifest_tool(
+            &mut identity,
+            selected_linker
+                .as_deref()
+                .context("selected manifest linker is unavailable")?,
+            &environment,
+            &windows_manifest_system_directories()?,
+            probe,
+        )?;
+    }
     let directories = windows_library_dirs(
         &environment,
         &identity.architecture,
@@ -2504,15 +2752,40 @@ where
 /// Test seam for [`probe_windows_msvc_identity_with_library_dirs`]. The callback supplies tool
 /// output, so all selection, banner validation, version and library rules can
 /// run on macOS/Linux without executing Windows binaries.
+#[cfg(test)]
 pub(crate) fn probe_windows_msvc_identity_with<F>(
     linker: Option<&Path>,
     target_architecture: &str,
     additional_library_dirs: &[PathBuf],
     environment: &WindowsProbeEnvironment,
-    mut tool_output: F,
+    tool_output: F,
 ) -> Result<WindowsMsvcIdentity>
 where
     F: FnMut(WindowsTool, &Path) -> Result<String>,
+{
+    probe_windows_msvc_identity_with_runtime_hash(
+        linker,
+        target_architecture,
+        additional_library_dirs,
+        environment,
+        tool_output,
+        hash_file,
+        None,
+    )
+}
+
+pub(crate) fn probe_windows_msvc_identity_with_runtime_hash<F, HashRuntime>(
+    linker: Option<&Path>,
+    target_architecture: &str,
+    additional_library_dirs: &[PathBuf],
+    environment: &WindowsProbeEnvironment,
+    mut tool_output: F,
+    hash_runtime: HashRuntime,
+    prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
+) -> Result<WindowsMsvcIdentity>
+where
+    F: FnMut(WindowsTool, &Path) -> Result<String>,
+    HashRuntime: Fn(&Path) -> Result<String>,
 {
     for variable in ["LINK", "_LINK_"] {
         if environment.var(variable).is_some() {
@@ -2597,12 +2870,14 @@ where
         "Include",
         "UCRT",
     )?;
-    let libraries = hash_windows_runtime_libraries(
+    let libraries = hash_windows_runtime_libraries_with_hash(
         environment,
         &architecture,
         &sdk,
         &ucrt,
         additional_library_dirs,
+        hash_runtime,
+        prepare_runtime,
     )?;
     Ok(WindowsMsvcIdentity {
         linker: linker_banner,
@@ -2613,6 +2888,7 @@ where
         architecture,
         libraries,
         wrapper,
+        manifest_tool: None,
     })
 }
 
@@ -3152,7 +3428,10 @@ esac
                 &[],
                 &[],
                 hash_file,
+                hash_file,
                 env,
+                None,
+                None,
             )
             .unwrap();
             let cwd = env.cwd().unwrap();
@@ -3251,6 +3530,208 @@ esac
     }
 
     #[test]
+    fn windows_runtime_hash_memos_preserve_keys_and_revalidate_edits() {
+        use crate::cache_key::{FileHasher, wall_clock_ns};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let environment = windows_environment(root, "x64");
+        for (name, byte) in [
+            ("libcmt.lib", b'c'),
+            ("libvcruntime.lib", b'v'),
+            ("ucrt.lib", b'u'),
+        ] {
+            std::fs::write(root.join(name), vec![byte; 70_000]).unwrap();
+        }
+        let index = root.join("index.db");
+        let run = |hasher: &FileHasher<'_>| {
+            probe_windows_msvc_identity_with_runtime_hash(
+                None,
+                "x64",
+                &[],
+                &environment,
+                |tool, _| {
+                    Ok(match tool {
+                        WindowsTool::Link => LINK_BANNER.to_owned(),
+                        WindowsTool::Cl => compiler_banner("x64"),
+                        WindowsTool::LldLink => panic!("fixture selected LINK"),
+                    })
+                },
+                |path| hasher.hash(path),
+                None,
+            )
+            .unwrap()
+        };
+        let cold = FileHasher::persistent(&index);
+        let first = run(&cold);
+        assert_eq!(cold.stats().cache_misses, 3);
+        assert_eq!(cold.stats().bytes_hashed, 210_000);
+        for (name, digest) in &first.libraries {
+            assert_eq!(*digest, hash_file(&root.join(name)).unwrap());
+        }
+        cold.flush_memo_as_if_settled();
+        drop(cold);
+
+        let mut warm = FileHasher::persistent(&index);
+        warm.arm_too_new_guard(wall_clock_ns().saturating_add(10_000_000_000), 0);
+        assert_eq!(run(&warm).encode(), first.encode());
+        assert_eq!(warm.stats().cache_hits, 3);
+        assert_eq!(warm.stats().bytes_hashed, 0);
+        assert!(!warm.inputs_changed_since_keyed());
+        let path = root.join("ucrt.lib");
+        let before = kache_store::file_hash::FileFingerprint::from_path(&path).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kache_store::file_hash::stamp_clock_ns() <= before.ctime_ns.saturating_add(20_000_000)
+        {
+            assert!(std::time::Instant::now() < deadline, "stamp clock stalled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::write(&path, vec![b'n'; 70_000]).unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        assert!(warm.inputs_changed_since_keyed());
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
+            &warm.take_guarded_inputs()
+        ));
+
+        let changed = FileHasher::persistent(&index);
+        let second = run(&changed);
+        assert_ne!(second.encode(), first.encode());
+        assert_eq!(
+            second.libraries["ucrt.lib"],
+            blake3::hash(&vec![b'n'; 70_000]).to_hex().to_string()
+        );
+        assert_eq!(changed.stats().cache_hits, 2);
+        assert_eq!(changed.stats().cache_misses, 1);
+        assert_eq!(changed.stats().bytes_hashed, 70_000);
+    }
+
+    #[test]
+    fn windows_runtime_prepare_batches_selected_ordinary_files_before_hashing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut environment = windows_environment(root.path(), "x64");
+        environment.requested_default_libraries = vec![WindowsDefaultLibrary("ucrt.lib")];
+        let closed = crate::native_archive::closed_coff_archive_for_tests(b"explicit default");
+        std::fs::write(root.path().join("ucrt.lib"), &closed).unwrap();
+        let prepared = std::cell::Cell::new(false);
+        let calls = std::cell::Cell::new(0);
+        let prepare = |paths: &[&Path]| {
+            calls.set(calls.get() + 1);
+            assert_eq!(
+                paths,
+                [
+                    root.path().join("libcmt.lib").as_path(),
+                    root.path().join("libvcruntime.lib").as_path()
+                ]
+            );
+            prepared.set(true);
+            Ok(())
+        };
+        let reads = std::cell::Cell::new(0);
+        let libraries = hash_windows_runtime_libraries_with_hash(
+            &environment,
+            "x64",
+            "10",
+            "10",
+            &[],
+            |path| {
+                assert!(prepared.get());
+                reads.set(reads.get() + 1);
+                hash_file(path)
+            },
+            Some(&prepare),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            libraries["ucrt.lib"],
+            blake3::hash(&closed).to_hex().to_string()
+        );
+        std::fs::write(root.path().join("ucrt.lib"), b"invalid explicit archive").unwrap();
+        let pending = |paths: &[&Path]| {
+            assert_eq!(paths.len(), 2);
+            Err(crate::cache_key::NativeRuntimeHashesWarming.into())
+        };
+        let error = hash_windows_runtime_libraries_with_hash(
+            &environment,
+            "x64",
+            "10",
+            "10",
+            &[],
+            |_| panic!("no scalar read while pending"),
+            Some(&pending),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+                .is_some(),
+            "DEFAULTLIB validation must wait too"
+        );
+    }
+
+    #[test]
+    fn windows_runtime_family_requirements_are_checked_before_prepare_or_reads() {
+        for missing in ["libvcruntime.lib", "ucrt.lib"] {
+            let root = tempfile::tempdir().unwrap();
+            let environment = windows_environment(root.path(), "x64");
+            std::fs::remove_file(root.path().join(missing)).unwrap();
+            let prepare = |_: &[&Path]| -> Result<()> { panic!("incomplete family cannot warm") };
+            assert!(
+                hash_windows_runtime_libraries_with_hash(
+                    &environment,
+                    "x64",
+                    "10",
+                    "10",
+                    &[],
+                    |_| panic!("incomplete family cannot hash"),
+                    Some(&prepare)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_hashes_work_without_strong_filesystem_identity() {
+        use crate::cache_key::FileHasher;
+        let directory = tempfile::tempdir().unwrap();
+        let environment = windows_environment(directory.path(), "x64");
+        for name in ["libcmt.lib", "libvcruntime.lib", "ucrt.lib"] {
+            std::fs::write(directory.path().join(name), vec![b'r'; 70_000]).unwrap();
+        }
+        let index = directory.path().join("index.db");
+        kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+            let run = || {
+                let hasher = FileHasher::persistent(&index);
+                let libraries = hash_windows_runtime_libraries_with_hash(
+                    &environment,
+                    "x64",
+                    "10",
+                    "10",
+                    &[],
+                    |path| hasher.hash(path),
+                    None,
+                )
+                .unwrap();
+                hasher.flush_memo_as_if_settled();
+                assert_eq!(hasher.stats().cache_hits, 0);
+                assert_eq!(hasher.stats().cache_misses, 3);
+                assert_eq!(hasher.stats().bytes_hashed, 210_000);
+                libraries
+            };
+            let first = run();
+            assert_eq!(run(), first);
+            assert_eq!(
+                first["ucrt.lib"],
+                blake3::hash(&vec![b'r'; 70_000]).to_hex().to_string()
+            );
+        });
+    }
+
+    #[test]
     fn windows_environment_names_are_case_insensitive() {
         let mut environment = WindowsProbeEnvironment {
             variables: BTreeMap::from([
@@ -3284,6 +3765,242 @@ esac
         assert_eq!(
             environment.path,
             [PathBuf::from("one"), PathBuf::from("two")]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn manifest_system_directory_queries_cannot_use_another_hosts_paths() {
+        assert!(windows_manifest_system_directories().is_err());
+    }
+
+    #[test]
+    fn manifest_tool_selection_observes_shadows_and_only_the_searched_path_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs: Vec<_> = ["shadow", "rustc", "earlier", "sdk", "later"]
+            .iter()
+            .map(|name| root.path().join(name))
+            .collect();
+        for directory in &dirs {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let selected = dirs[3].join("mt.exe");
+        std::fs::write(&selected, b"merger").unwrap();
+        let observed = std::cell::RefCell::new(Vec::new());
+        let absent = std::cell::RefCell::new(Vec::new());
+        let result = select_windows_manifest_tool(
+            &dirs[1..],
+            &dirs[..1],
+            |directory| {
+                observed.borrow_mut().push(directory.to_path_buf());
+                Ok(())
+            },
+            |path| {
+                absent.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, selected);
+        assert_eq!(*observed.borrow(), dirs[..4]);
+        assert_eq!(
+            *absent.borrow(),
+            dirs[..3]
+                .iter()
+                .map(|dir| dir.join("mt.exe"))
+                .collect::<Vec<_>>()
+        );
+        let earlier = dirs[1].join("mt.exe");
+        std::fs::write(&earlier, b"rustc-prefix merger").unwrap();
+        assert_eq!(
+            select_windows_manifest_tool(&dirs[1..], &dirs[..1], |_| Ok(()), |_| Ok(())).unwrap(),
+            earlier
+        );
+        std::fs::write(dirs[0].join("mt.exe"), b"shadow").unwrap();
+        assert!(
+            select_windows_manifest_tool(&dirs[1..], &dirs[..1], |_| Ok(()), |_| Ok(())).is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_tool_selection_refuses_nonfiles_missing_tools_and_observation_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let early = root.path().join("early");
+        let late = root.path().join("late");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[missing.clone(), early.clone()],
+                &[],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        std::fs::write(late.join("mt.exe"), b"late").unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[early.clone(), late.clone()],
+                &[],
+                |_| Ok(()),
+                |_| bail!("cannot retain absence evidence"),
+            )
+            .is_err()
+        );
+        assert!(
+            select_windows_manifest_tool(
+                std::slice::from_ref(&late),
+                &[],
+                |_| bail!("unreadable directory"),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        std::fs::create_dir(early.join("mt.exe")).unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[early.clone(), late.clone()],
+                &[],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            select_windows_manifest_tool(
+                std::slice::from_ref(&late),
+                &[early],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        std::fs::write(&missing, b"not a directory").unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[missing, late],
+                &[],
+                |directory| {
+                    if std::fs::metadata(directory)?.is_dir() {
+                        Ok(())
+                    } else {
+                        bail!("not a directory")
+                    }
+                },
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_tool_symlinks_do_not_fall_through() {
+        let root = tempfile::tempdir().unwrap();
+        let early = root.path().join("early");
+        let late = root.path().join("late");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        std::os::unix::fs::symlink("mt.exe", early.join("mt.exe")).unwrap();
+        std::fs::write(late.join("mt.exe"), b"late").unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[early.clone(), late.clone()],
+                &[],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(select_windows_manifest_tool(&[late], &[early], |_| Ok(()), |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn manifest_merger_identity_keys_selected_path_and_bytes_and_refuses_wrappers() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = windows_environment(root.path(), "x64");
+        let mut base =
+            probe_windows_msvc_identity_with(None, "x64", &[], &environment, |tool, _| {
+                Ok(match tool {
+                    WindowsTool::Link => LINK_BANNER.into(),
+                    WindowsTool::Cl => compiler_banner("x64"),
+                    WindowsTool::LldLink => unreachable!(),
+                })
+            })
+            .unwrap();
+        let ordinary = base.encode();
+        assert!(!ordinary.contains("manifest_tool"));
+        let rustc = root.path().join("rustc-tools");
+        let sdk = root.path().join("sdk");
+        std::fs::create_dir(&rustc).unwrap();
+        std::fs::create_dir(&sdk).unwrap();
+        let tool = sdk.join("mt.exe");
+        std::fs::write(&tool, b"merger v1").unwrap();
+        let mut environment = environment;
+        environment.rustc_tool_dirs = vec![rustc.clone()];
+        environment.path = vec![sdk.clone()];
+        assert!(
+            key_windows_manifest_tool(
+                &mut base.clone(),
+                &root.path().join("link.exe"),
+                &environment,
+                &[],
+                WindowsManifestProbe {
+                    hash_tool: &|_| bail!("unreadable merger bytes"),
+                    observe_directory: &|_| Ok(()),
+                    record_absence: &|_| Ok(()),
+                },
+            )
+            .is_err()
+        );
+        let key = || {
+            let mut identity = base.clone();
+            key_windows_manifest_tool(
+                &mut identity,
+                &root.path().join("link.exe"),
+                &environment,
+                &[],
+                WindowsManifestProbe {
+                    hash_tool: &hash_file,
+                    observe_directory: &|_| Ok(()),
+                    record_absence: &|_| Ok(()),
+                },
+            )?;
+            Ok::<_, anyhow::Error>(identity.encode())
+        };
+        let first = key().unwrap();
+        assert_ne!(ordinary, first);
+        assert!(first.contains(&blake3::hash(b"merger v1").to_hex().to_string()));
+        assert_eq!(key().unwrap(), first);
+        std::fs::write(&tool, b"merger v2").unwrap();
+        assert_ne!(key().unwrap(), first);
+        std::fs::write(&tool, b"merger v1").unwrap();
+        assert_eq!(key().unwrap(), first);
+        std::fs::write(rustc.join("mt.exe"), b"merger v1").unwrap();
+        assert_ne!(
+            key().unwrap(),
+            first,
+            "the selected path is part of the key even for equal bytes"
+        );
+        std::fs::remove_file(rustc.join("mt.exe")).unwrap();
+        std::fs::remove_file(&tool).unwrap();
+        assert!(key().is_err());
+        base.wrapper = Some(("wrapper digest".into(), vec![]));
+        assert!(
+            key_windows_manifest_tool(
+                &mut base,
+                &root.path().join("link.exe"),
+                &environment,
+                &[],
+                WindowsManifestProbe {
+                    hash_tool: &|_| panic!("no wrapper tool hash"),
+                    observe_directory: &|_| panic!("no wrapper search"),
+                    record_absence: &|_| panic!("no wrapper absence")
+                }
+            )
+            .is_err()
         );
     }
 
@@ -4540,6 +5257,29 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn manifest_merger_shadow_lookup_errors_are_not_recorded_as_absences() {
+        let root = tempfile::tempdir().unwrap();
+        let shadow = root.path().join("not-a-directory");
+        let tools = root.path().join("tools");
+        std::fs::write(&shadow, b"file").unwrap();
+        std::fs::create_dir(&tools).unwrap();
+        std::fs::write(tools.join("mt.exe"), b"later merger").unwrap();
+        let absences = std::cell::RefCell::new(Vec::new());
+        let result = select_windows_manifest_tool(
+            &[tools],
+            &[shadow],
+            |_| Ok(()),
+            |path| {
+                absences.borrow_mut().push(path.to_owned());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(absences.borrow().is_empty());
+    }
+
     #[test]
     fn windows_runtime_libraries_reject_non_file_candidates_before_fallback() {
         let root = tempfile::tempdir().unwrap();
@@ -4637,7 +5377,7 @@ esac
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(67_108_865).unwrap(); // One byte above the independent 64 MiB limit.
         drop(file);
-        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        let error = hash_windows_default_library(&path).unwrap_err();
         assert!(error.to_string().contains("at most 64 MiB"), "{error:#}");
         std::fs::OpenOptions::new()
             .write(true)
@@ -4645,12 +5385,12 @@ esac
             .unwrap()
             .set_len(67_108_864)
             .unwrap();
-        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        let error = hash_windows_default_library(&path).unwrap_err();
         assert!(
             error.to_string().contains("supported closed COFF archive"),
             "an exactly 64 MiB regular file reaches format validation: {error:#}"
         );
-        assert!(hash_windows_runtime_library(root.path(), true).is_err());
+        assert!(hash_windows_default_library(root.path()).is_err());
     }
 
     #[test]
@@ -5700,7 +6440,10 @@ esac
             assert_eq!(
                 windows_link_argument_input_files(key, value),
                 Some(WindowsLinkArgumentInputs {
-                    files: expected.into_iter().map(PathBuf::from).collect(),
+                    files: expected
+                        .into_iter()
+                        .map(|path| WindowsLinkInput::Resource(PathBuf::from(path)))
+                        .collect(),
                     default_libraries: Vec::new(),
                 }),
                 "{key}={value}"
@@ -5717,6 +6460,10 @@ esac
             ("link-arg", r"C:app.res"),
             ("link-arg", r"\w\app.res"),
             ("link-arg", "/MANIFESTINPUT:extra.manifest"),
+            ("link-arg", r"/MANIFESTINPUT:C:app.xml"),
+            ("link-arg", r"/MANIFESTINPUT:\app.xml"),
+            ("link-arg", "/MANIFESTINPUT:"),
+            ("link-arg", r"-Wl,/MANIFESTINPUT:C:\w\app.xml"),
             // Embedded quotes need parsing beyond this accepted subset.
             ("link-arg", r#""C:\out dir\app.res""#),
             ("link-arg", r#"/MANIFESTINPUT:"C:\w\Manifest.xml""#),
@@ -5729,9 +6476,6 @@ esac
             ("link-arg", r"C:\w\opaque.dat"),
             ("link-arg", r"C:\w\extensionless"),
             ("link-args", r"C:\w\a.res C:\w\opaque.dat"),
-            ("link-args", r"C:\w\a.res /MANIFESTINPUT:C:\w\app.xml"),
-            ("link-arg", r"/MANIFESTINPUT:C:\w\Manifest.xml"),
-            ("link-arg", r"-manifestinput:C:\w\app.res"),
             // Objects/archives can name further inputs through directives or
             // thin members. Renamed containers are also checked by the hasher.
             ("link-arg", r"C:\w\extra.obj"),
@@ -5755,6 +6499,75 @@ esac
                 windows_link_argument_input_files(key, value),
                 None,
                 "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_manifest_inputs_keep_their_kind_and_total_argument_order() {
+        for option in ["/MANIFESTINPUT:", "-manifestinput:", "/MaNiFeStInPuT:"] {
+            for path in [
+                r"C:\w\app.xml",
+                "C:/w/app",
+                r"\\server\share\app.xml",
+                r"C:\out dir\app.res",
+            ] {
+                assert_eq!(
+                    windows_link_argument_input_files("link-arg", &format!("{option}{path}")),
+                    Some(WindowsLinkArgumentInputs {
+                        files: vec![WindowsLinkInput::Manifest(PathBuf::from(path))],
+                        default_libraries: vec![],
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            windows_link_argument_input_files(
+                "link-args",
+                r"/MANIFESTINPUT:C:\w\first.xml C:\w\app.res /DEBUG -manifestinput:C:\w\last.xml"
+            ),
+            Some(WindowsLinkArgumentInputs {
+                files: vec![
+                    WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\first.xml")),
+                    WindowsLinkInput::Resource(PathBuf::from(r"C:\w\app.res")),
+                    WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\last.xml")),
+                ],
+                default_libraries: vec![],
+            })
+        );
+        assert!(
+            windows_link_argument_input_files("link-args", r"/MANIFESTINPUT:C:\out dir\app.xml")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn windows_manifest_dependency_options_stay_refused() {
+        for argument in [
+            "/MANIFESTDEPENDENCY:type='win32'",
+            "-manifestdependency:type='win32'",
+            "/MaNiFeStDePeNdEnCy=type='win32'",
+            "-MANIFESTDEPENDENCY=dependency",
+            "/MANIFESTDEPENDENCY",
+            "-manifestdependency",
+        ] {
+            assert!(
+                windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+            for carrier in ["link-arg", "link-args"] {
+                assert!(
+                    windows_link_argument_input_files(carrier, argument).is_none(),
+                    "{carrier}={argument}"
+                );
+            }
+            assert!(
+                windows_link_argument_input_files(
+                    "link-args",
+                    &format!("/MANIFEST:EMBED {argument}")
+                )
+                .is_none(),
+                "EMBED context remains unmodeled: {argument}"
             );
         }
     }

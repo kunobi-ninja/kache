@@ -34,6 +34,12 @@ pub struct CompilerHandles {
 }
 
 impl PeerProcess {
+    /// Why execution must remain in the client, without exposing token contents.
+    pub fn delegation_problem(&self, trusted_pipeline: bool) -> io::Result<Option<&'static str>> {
+        self.require_alive()?;
+        crate::windows_security::delegation_problem(self.process.as_handle(), trusted_pipeline)
+    }
+
     pub fn permits_delegation(&self, trusted_pipeline: bool) -> io::Result<bool> {
         self.require_alive()?;
         crate::windows_security::matches_daemon(self.process.as_handle(), trusted_pipeline)

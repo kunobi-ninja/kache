@@ -1994,7 +1994,10 @@ pub(crate) fn ran_compiler_uncached(event: &BuildEvent) -> bool {
 /// reason kache declined to store it.
 pub(crate) fn uncached_compile_words(event: &BuildEvent) -> String {
     if matches!(event.result, EventResult::Skipped) {
-        format!("compiled, not stored: {}", event.skip_reason)
+        format!(
+            "compiled, not stored: {}",
+            uncached_reason_words(&event.skip_reason)
+        )
     } else {
         crate::tui_sessions::passthrough_words(&event.passthrough_reason)
     }
@@ -2002,7 +2005,7 @@ pub(crate) fn uncached_compile_words(event: &BuildEvent) -> String {
 
 /// A passthrough the adaptive incremental policy chose for a crate under edit.
 pub(crate) fn is_edit_rebuild(reason: &str) -> bool {
-    uncached_reason_label(reason).is_some()
+    matches!(reason.trim(), "adaptive seed" | "adaptive active")
 }
 
 /// Plain words for the passthrough reasons a reader would not recognize, the
@@ -2010,6 +2013,9 @@ pub(crate) fn is_edit_rebuild(reason: &str) -> bool {
 /// what happened.
 pub(crate) fn uncached_reason_label(reason: &str) -> Option<&'static str> {
     match reason.trim() {
+        "native runtime warmup" => {
+            Some("the daemon is preparing MSVC runtime hashes; this compile ran without caching")
+        }
         "adaptive seed" => {
             Some("edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)")
         }

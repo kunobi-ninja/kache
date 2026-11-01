@@ -20,6 +20,7 @@ and daemon entry points.
 - Upload newly stored entries in the background.
 - Replay durable upload intents after a restart.
 - Prefetch likely entries at the start of a build session.
+- Prepare cold MSVC runtime hashes while native compiles run without caching.
 - Refresh the remote key index used by fallback planning.
 - Run garbage collection at startup and every six hours, including `[cache.volumes]` shards. When the store is over its size limit, also sweep after an upload or when a wrapper reports it.
 - Flush entries that were stored without an fsync, every two seconds.

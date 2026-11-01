@@ -1006,6 +1006,9 @@ fn run_step(
         .arg(cmd)
         .current_dir(cwd)
         .env("KACHE_CACHE_DIR", cache_dir)
+        // Cache correctness fixtures require cold to populate warm's entries.
+        // Dedicated native warmup controls cover compilation while hashes prepare.
+        .env("KACHE_NATIVE_RUNTIME_WARMUP", "0")
         .envs(&fixture.env);
     // Capture every cache-key field to a per-phase file so a convergence
     // failure can be diagnosed offline (see `report_key_divergence`). cargo

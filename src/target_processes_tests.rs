@@ -56,7 +56,17 @@ impl RunningProgram {
         // Coreutils can dispatch by executable name in multicall builds.
         let executable = target.join("sleep");
         let sleep = option_env!("KACHE_TEST_SLEEP").unwrap_or("/bin/sleep");
-        std::fs::copy(sleep, &executable).unwrap();
+        // A child writes the executable so another test thread cannot fork
+        // with its writable descriptor and make the next exec fail (ETXTBSY).
+        let copied = std::process::Command::new(Path::new(sleep).with_file_name("cp"))
+            .arg(sleep)
+            .arg(&executable)
+            .status()
+            .expect("start the packaged executable copier");
+        assert!(
+            copied.success(),
+            "copying the process fixture failed: {copied}"
+        );
         let program = Self(
             std::process::Command::new(&executable)
                 .arg("60")

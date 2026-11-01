@@ -42,6 +42,7 @@ compile uncached. A PE without a CodeView record needs no PDB. See
 rules.
 
 Rust links can key supported `rust-lld` toolchains, compiled resource inputs,
+supported application manifests passed with `/MANIFESTINPUT` and `/MANIFEST:EMBED`,
 and modeled runtime/default-library selections. This does not make direct
 `cl.exe` object compilation cacheable. On main, DLL caching also retains import
 libraries omitted from rustc's artifact notifications.
@@ -67,6 +68,57 @@ differences. It must be enabled in both configurations and requires a daemon
 restart. Other token checks still apply. Read
 [Process restrictions](/docs/how-it-works/architecture#process-restrictions)
 before enabling it.
+
+The execution diagnostic distinguishes process-identity token differences from
+incompatible access-token contexts and failed security queries. The trust option
+only permits the first case. Keep the full diagnostic when reporting a refused
+handoff; changing trust does not fix incompatible tokens.
+
+The logical `daemon.sock` path has no socket file on Windows. The daemon uses
+a named pipe derived from that path, including for file-hash requests. Check
+`kache daemon` to test reachability.
+
+## Slow native-link keys
+
+Rust proc-macros also link native code. Their keys inspect the selected MSVC
+tools and CRT libraries even when executable caching is disabled.
+
+On a cold cache, the daemon prepares large runtime hashes in the background.
+Initial native units compile without caching while this work runs. Once the
+hashes are ready, later units use the normal cache path. `kache explain` labels
+those initial compiles as runtime warmup.
+
+To wait for the hashes and cache from the first native compile:
+
+```powershell
+kache config set cache.native_runtime_warmup false
+```
+
+Ordinary runtime-library hashes reuse file-hash memos when NTFS supplies a file
+index and change time. A replaced library or an edit that restores its old
+modification time invalidates that memo. Other filesystems, or failed identity
+queries, keep caching artifacts but read runtime bytes on each key. Explicit
+`/DEFAULTLIB` requests still validate and hash the selected archive together.
+An unavailable or older daemon uses the synchronous path too.
+
+Record the slow build with phase tracing:
+
+```powershell
+$env:KACHE_PHASE_TRACE_DIR = Join-Path $env:TEMP 'kache-phases'
+cargo build
+```
+
+The trace separates `native_msvc_discovery`, `native_msvc_banner_hash`,
+`native_msvc_banner_run`, and `native_msvc_runtime`. Ordinary runtime reads also
+contribute to file-hash byte counts; banner reads have their own spans. These
+intervals are needed to locate a cold-key delay. A small hash-byte count alone
+does not identify its cause. See [phase tracing](/docs/benchmarks) for scope and
+measurement overhead.
+
+Daemon preparation has separate `native_msvc_runtime_warmup` spans. Its file
+reads run outside the compiler's key calculation. Start the daemon with the
+same `KACHE_PHASE_TRACE_DIR` to capture those spans; a running daemon keeps its
+startup environment.
 
 ## C/C++, CUDA, and documentation
 

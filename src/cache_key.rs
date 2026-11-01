@@ -4088,15 +4088,13 @@ fn compute_key_into(
         cfg!(target_os = "windows"),
         file_hasher,
         |linker, architecture, host, search_dirs| {
-            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+            probe_native_windows_msvc_identity_for(
                 linker,
                 architecture,
                 &rustc_tool_dirs_for(args, host, invocation)?,
-                &search_dirs.rustc,
-                &search_dirs.linker,
-                &args.link_libs,
-                &search_dirs.default_libraries,
-                |path| file_hasher.hash_static_lib(path),
+                search_dirs,
+                args,
+                file_hasher,
                 invocation,
             )
         },
@@ -7860,7 +7858,7 @@ impl<'db> FileHasher<'db> {
     /// checkout with future mtimes) where the wall-clock guard misfires.
     ///
     /// Fails closed: an empty set, a missing or changed file, or an input
-    /// without an inode (non-Unix, where replace-by-rename is invisible)
+    /// without an inode or Windows file index
     /// never excuses a tripped guard.
     pub fn guarded_inputs_unchanged_since_hash(inputs: &[ObservedFingerprint]) -> bool {
         if inputs.is_empty() {
@@ -7882,8 +7880,8 @@ impl<'db> FileHasher<'db> {
     /// The change time does not count: linking a dependency's output
     /// elsewhere, as store ingest and Cargo's uplift do while its dependents
     /// compile, moves it and leaves the bytes alone. So a rewrite that keeps
-    /// the size and write time is missed, and on Windows, where fingerprints
-    /// carry no inode, so is a replacement with the same size and write time.
+    /// the size and write time is missed. Replacement also needs an inode or
+    /// Windows file index; a weak filesystem observation cannot prove it.
     pub fn guarded_inputs_moved_since_hash(inputs: &[ObservedFingerprint]) -> bool {
         inputs.iter().any(|input| {
             let expected = &input.fingerprint;
@@ -8212,7 +8210,9 @@ impl<'db> FileHasher<'db> {
             // Cheapest first: identical metadata needs no read, identical raw
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
-            if current.fingerprint == expected.fingerprint {
+            if current.fingerprint == expected.fingerprint
+                && file_hash_memo_eligible(current.fingerprint.inode, cfg!(windows))
+            {
                 // Unhashed, so registered here with the bytes its stamp
                 // proves: the recheck after a compile has to cover it like
                 // any input the key hashed.
@@ -8559,6 +8559,7 @@ impl<'db> FileHasher<'db> {
                 continue;
             };
             if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+                || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
                 || self.prefetched.borrow().contains_key(&fingerprint)
             {
                 continue;
@@ -8812,7 +8813,9 @@ impl<'db> FileHasher<'db> {
             self.note_too_new(fingerprint);
         }
 
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+        {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
             let (observed, _) = self.restat_after_read(path, observed, keyed);
@@ -9046,7 +9049,9 @@ impl<'db> FileHasher<'db> {
         // Small libs skip the persistent cache (same policy as `hash`); the
         // archive read is cheap and not worth a row.
         let size = fingerprint.size;
-        if size < MIN_PERSISTED_HASH_BYTES {
+        if size < MIN_PERSISTED_HASH_BYTES
+            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+        {
             let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
             self.record_miss(size);
             return Ok(hash);
@@ -9126,7 +9131,9 @@ impl<'db> FileHasher<'db> {
     ) -> Result<String> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
-        if self.cache.is_none() {
+        if self.cache.is_none()
+            || !file_hash_memo_eligible(observed.fingerprint.inode, cfg!(windows))
+        {
             return self.hash(path);
         }
         let fingerprint = &observed.fingerprint;
@@ -10768,6 +10775,29 @@ struct WindowsNativeLinkSearchDirs {
     /// (see `windows_link_argument_input_files`), in argument order.
     files: Vec<PathBuf>,
     default_libraries: Vec<crate::native_link_key::WindowsDefaultLibrary>,
+}
+
+fn probe_native_windows_msvc_identity_for(
+    linker: Option<&Path>,
+    architecture: &str,
+    rustc_tool_dirs: &[PathBuf],
+    search_dirs: &WindowsNativeLinkSearchDirs,
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    invocation: &InvocationEnv,
+) -> Result<crate::native_link_key::WindowsMsvcIdentity> {
+    crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+        linker,
+        architecture,
+        rustc_tool_dirs,
+        &search_dirs.rustc,
+        &search_dirs.linker,
+        &args.link_libs,
+        &search_dirs.default_libraries,
+        |path| file_hasher.hash_static_lib(path),
+        |path| file_hasher.hash(path),
+        invocation,
+    )
 }
 
 fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {

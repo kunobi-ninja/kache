@@ -2974,6 +2974,7 @@ impl Daemon {
             };
 
             if let Ok(cache) = self.file_hash_cache.lock()
+                && crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
                 && let Some(hash) = cache.get(&key).cloned()
             {
                 results.push(HashFileResult {
@@ -2993,12 +2994,12 @@ impl Daemon {
             // Read before the stats below, so it is no later than the moment
             // either of them saw the stamp.
             let observed_ns = clock();
-            match std::fs::metadata(&file.path) {
-                Ok(metadata)
-                    if i64::try_from(metadata.len()).unwrap_or(i64::MAX) == file.size
-                        && crate::cache_key::metadata_mtime_ns(&metadata) == file.mtime_ns
-                        && crate::cache_key::metadata_ctime_ns(&metadata) == file.ctime_ns
-                        && crate::cache_key::metadata_inode(&metadata) == file.inode => {}
+            match crate::cache_key::FileFingerprint::from_path(Path::new(&file.path)) {
+                Ok(fingerprint)
+                    if fingerprint.size == file.size
+                        && fingerprint.mtime_ns == file.mtime_ns
+                        && fingerprint.ctime_ns == file.ctime_ns
+                        && fingerprint.inode == file.inode => {}
                 Ok(_) => {
                     results.push(HashFileResult {
                         path: file.path.clone(),
@@ -3032,16 +3033,17 @@ impl Daemon {
             // A stamp that had changed within the settle window when it was
             // observed can be kept by a second write in the same tick, so
             // its hash goes back to this caller and is remembered nowhere.
-            let settled = crate::cache_key::stamp_is_settled(
-                &crate::cache_key::FileFingerprint {
-                    path: file.path.clone(),
-                    size: file.size,
-                    mtime_ns: file.mtime_ns,
-                    ctime_ns: file.ctime_ns,
-                    inode: file.inode,
-                },
-                observed_ns,
-            );
+            let settled = crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
+                && crate::cache_key::stamp_is_settled(
+                    &crate::cache_key::FileFingerprint {
+                        path: file.path.clone(),
+                        size: file.size,
+                        mtime_ns: file.mtime_ns,
+                        ctime_ns: file.ctime_ns,
+                        inode: file.inode,
+                    },
+                    observed_ns,
+                );
 
             // #281: hold the store mutex only for the cheap cache lookup and
             // record; run the blake3 read of the whole file OUTSIDE the lock so
@@ -8505,10 +8507,6 @@ pub fn send_hash_files_request(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    if !socket_path.exists() {
-        anyhow::bail!("daemon socket does not exist: {}", socket_path.display());
-    }
-
     let req = Request::HashFiles(HashFilesRequest { files });
     let resp_str = send_request_with_timeout(socket_path, &req, std::time::Duration::from_secs(3))?;
     hash_files_results_from_response_line(&resp_str)

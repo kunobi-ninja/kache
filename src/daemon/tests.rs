@@ -4884,20 +4884,69 @@ fn test_daemon_reuses_store_handle() {
 /// A request for `file` as it is on disk, and the clock at which its stamp
 /// settles: [`crate::cache_key::HASH_SETTLE_NS`] after its last change.
 fn hash_files_request(file: &Path) -> (HashFilesRequest, i64) {
-    let metadata = std::fs::metadata(file).unwrap();
-    let mtime_ns = crate::cache_key::metadata_mtime_ns(&metadata);
-    let ctime_ns = crate::cache_key::metadata_ctime_ns(&metadata);
+    let fingerprint = crate::cache_key::FileFingerprint::from_path(file).unwrap();
+    let mtime_ns = fingerprint.mtime_ns;
+    let ctime_ns = fingerprint.ctime_ns;
     let req = HashFilesRequest {
         files: vec![HashFileRequest {
             path: file.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap(),
+            size: fingerprint.size,
             mtime_ns,
             ctime_ns,
-            inode: crate::cache_key::metadata_inode(&metadata),
+            inode: fingerprint.inode,
         }],
     };
     let settles_at = mtime_ns.max(ctime_ns) + crate::cache_key::HASH_SETTLE_NS;
     (req, settles_at)
+}
+
+#[cfg(windows)]
+#[test]
+fn weak_windows_hash_requests_never_use_or_fill_daemon_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config);
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let (request, settles_at) = hash_files_request(&path);
+        let file = &request.files[0];
+        assert_eq!(file.inode, 0);
+        daemon.file_hash_cache.lock().unwrap().insert(
+            FileHashCacheKey {
+                path: file.path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                ctime_ns: file.ctime_ns,
+                inode: file.inode,
+            },
+            "legacy stale hash".into(),
+        );
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        for pass in 0..2 {
+            let response = daemon.handle_hash_files_at(&request, || settles_at);
+            let results = response.hash_results.unwrap();
+            assert_eq!(results[0].hash.as_deref(), Some(expected.as_str()));
+            assert!(!results[0].cache_hit);
+            assert_eq!(results[0].bytes_hashed, 70_000);
+            assert_eq!(results[0].error, None);
+            if pass == 0 {
+                assert!(
+                    daemon
+                        .file_hash_cache
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|hash| hash == "legacy stale hash")
+                );
+            } else {
+                assert!(daemon.file_hash_cache.lock().unwrap().is_empty());
+            }
+            daemon.file_hash_cache.lock().unwrap().clear();
+        }
+        assert!(daemon.file_hash_cache.lock().unwrap().is_empty());
+    });
 }
 
 #[test]
@@ -5007,16 +5056,9 @@ fn handle_hash_files_rejects_changed_metadata_before_hashing() {
 
     let file = dir.path().join("input.bin");
     std::fs::write(&file, b"stable bytes").unwrap();
-    let metadata = std::fs::metadata(&file).unwrap();
-    let resp = daemon.handle_hash_files(&HashFilesRequest {
-        files: vec![HashFileRequest {
-            path: file.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap() + 1,
-            mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
-            ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
-            inode: crate::cache_key::metadata_inode(&metadata),
-        }],
-    });
+    let mut request = hash_files_request(&file).0;
+    request.files[0].size += 1;
+    let resp = daemon.handle_hash_files(&request);
 
     assert!(resp.ok);
     let result = &resp.hash_results.as_ref().unwrap()[0];
@@ -5036,16 +5078,7 @@ fn handle_hash_files_reports_hash_io_error() {
 
     let input_dir = dir.path().join("not-a-file");
     std::fs::create_dir(&input_dir).unwrap();
-    let metadata = std::fs::metadata(&input_dir).unwrap();
-    let resp = daemon.handle_hash_files(&HashFilesRequest {
-        files: vec![HashFileRequest {
-            path: input_dir.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap(),
-            mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
-            ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
-            inode: crate::cache_key::metadata_inode(&metadata),
-        }],
-    });
+    let resp = daemon.handle_hash_files(&hash_files_request(&input_dir).0);
 
     assert!(resp.ok);
     let result = &resp.hash_results.as_ref().unwrap()[0];
@@ -5388,14 +5421,7 @@ async fn test_socket_hash_files_roundtrip_hashes_a_real_file() {
     // handler proceeds to actually hash it.
     let file_path = dir.path().join("input.bin");
     std::fs::write(&file_path, b"hash me please").unwrap();
-    let meta = std::fs::metadata(&file_path).unwrap();
-    let req = HashFileRequest {
-        path: file_path.to_string_lossy().into_owned(),
-        size: meta.len() as i64,
-        mtime_ns: crate::cache_key::metadata_mtime_ns(&meta),
-        ctime_ns: crate::cache_key::metadata_ctime_ns(&meta),
-        inode: crate::cache_key::metadata_inode(&meta),
-    };
+    let req = hash_files_request(&file_path).0.files.remove(0);
     let expected = blake3::hash(b"hash me please").to_hex().to_string();
 
     let daemon = Arc::new(Daemon::new(config));
@@ -5457,7 +5483,9 @@ fn send_hash_files_request_empty_is_ok_without_socket() {
 
 #[test]
 fn send_hash_files_request_missing_socket_errors() {
-    // A non-empty request against a missing socket bails before connecting.
+    // A missing endpoint is reported by the transport, including named pipes.
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("absent.sock");
     let req = HashFileRequest {
         path: "/some/file".into(),
         size: 1,
@@ -5465,12 +5493,9 @@ fn send_hash_files_request_missing_socket_errors() {
         ctime_ns: 0,
         inode: 0,
     };
-    let err = send_hash_files_request(Path::new("/nonexistent/socket.sock"), vec![req])
-        .expect_err("missing socket -> error");
-    assert!(
-        err.to_string().contains("socket does not exist"),
-        "got: {err}"
-    );
+    let err =
+        send_hash_files_request(&socket_path, vec![req]).expect_err("missing socket -> error");
+    assert!(err.is::<DaemonConnectionFailure>(), "got: {err:#}");
 }
 
 #[test]
@@ -5503,10 +5528,6 @@ fn hash_files_response_parser_handles_results_error_and_malformed() {
     assert!(err.to_string().contains("key must be a string"));
 }
 
-// Unix-only: send_hash_files_request guards on `socket_path.exists()`, which
-// is false for a Windows named pipe (no filesystem `.sock` entry), so the
-// round-trip can't run there. The client logic is covered here on Linux/macOS.
-#[cfg(unix)]
 #[tokio::test]
 async fn send_hash_files_request_client_roundtrip() {
     // CLIENT side: send_hash_files_request connects to a live in-process
@@ -5518,17 +5539,15 @@ async fn send_hash_files_request_client_roundtrip() {
 
     let file_path = dir.path().join("input.bin");
     std::fs::write(&file_path, b"hash me please").unwrap();
-    let meta = std::fs::metadata(&file_path).unwrap();
-    let req = HashFileRequest {
-        path: file_path.to_string_lossy().into_owned(),
-        size: meta.len() as i64,
-        mtime_ns: crate::cache_key::metadata_mtime_ns(&meta),
-        ctime_ns: crate::cache_key::metadata_ctime_ns(&meta),
-        inode: crate::cache_key::metadata_inode(&meta),
-    };
+    let req = hash_files_request(&file_path).0.files.remove(0);
     let expected = blake3::hash(b"hash me please").to_hex().to_string();
 
     let listener = bind_listener(&socket_path);
+    #[cfg(windows)]
+    assert!(
+        !socket_path.exists(),
+        "a live named pipe has no socket file at its logical daemon path"
+    );
     let daemon = Arc::new(Daemon::new(config.clone()));
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept");
@@ -5544,6 +5563,7 @@ async fn send_hash_files_request_client_roundtrip() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].hash.as_deref(), Some(expected.as_str()));
+    assert_eq!(results[0].error, None);
 }
 
 #[tokio::test]

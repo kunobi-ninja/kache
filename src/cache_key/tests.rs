@@ -1457,14 +1457,16 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
         root.clone(),
     );
     for library in ["libcmt.lib", "libvcruntime.lib"] {
-        std::fs::write(fallback.join(library), b"legacy unrequested runtime").unwrap();
+        std::fs::write(fallback.join(library), vec![b'r'; 70_000]).unwrap();
     }
-    let original = crate::native_archive::closed_coff_archive_for_tests(b"\xc3");
+    let original = crate::native_archive::closed_coff_archive_for_tests(&vec![b'c'; 70_000]);
     let changed = crate::native_archive::closed_coff_archive_for_tests(b"\x90\xc3");
     let selected_path = priority.join("ucrt.lib");
     std::fs::write(&selected_path, &original).unwrap();
     std::fs::write(fallback.join("ucrt.lib"), &changed).unwrap();
-    let file_hasher = FileHasher::new_for(&invocation);
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let file_hasher = FileHasher::from_cache_for(FileHashCache::Borrowed(&db), &invocation);
     let fold = |extra: &[&str]| -> Result<(String, String)> {
         let mut argv = vec![
             "rustc".into(),
@@ -1484,18 +1486,15 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
             |linker, architecture, _, search_dirs| {
                 // Only tool banners are fixtures. This is the production
                 // request forwarding, runtime selection/read and hash path.
-                let identity =
-                    crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
-                        linker,
-                        architecture,
-                        &[],
-                        &search_dirs.rustc,
-                        &search_dirs.linker,
-                        &args.link_libs,
-                        &search_dirs.default_libraries,
-                        |path| file_hasher.hash_static_lib(path),
-                        &invocation,
-                    )?;
+                let identity = probe_native_windows_msvc_identity_for(
+                    linker,
+                    architecture,
+                    &[],
+                    search_dirs,
+                    &args,
+                    &file_hasher,
+                    &invocation,
+                )?;
                 selected_digest = identity.libraries.get("ucrt.lib").cloned();
                 Ok(identity)
             },
@@ -1508,6 +1507,13 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
     };
     let request = ["-Clink-arg=/DEFAULTLIB:ucrt.lib"];
     let without_request = fold(&[]).unwrap();
+    let cold = file_hasher.stats();
+    assert_eq!(cold.cache_misses, 3);
+    assert_eq!(cold.bytes_hashed, 140_000 + original.len() as u64);
+    file_hasher.flush_memo_as_if_settled();
+    assert_eq!(fold(&[]).unwrap(), without_request);
+    assert_eq!(file_hasher.stats().cache_hits, 3);
+    assert_eq!(file_hasher.stats().bytes_hashed, cold.bytes_hashed);
     let requested = fold(&request).unwrap();
     assert_eq!(requested.1, blake3::hash(&original).to_hex().to_string());
     assert_eq!(
@@ -1847,6 +1853,80 @@ fn windows_resources_stream_all_bytes_without_trusting_a_whole_file_memo() {
     assert_eq!(file_hasher.stats().cache_hits, 0);
     assert_eq!(file_hasher.stats().bytes_hashed, bytes.len() as u64);
     assert!(file_hasher.pending_memo.borrow().is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
+    use kache_ipc::prelude::*;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = kache_ipc::ListenerOptions::new()
+        .name(kache_ipc::socket_name(&socket).unwrap())
+        .nonblocking(interprocess::local_socket::ListenerNonblockingMode::Both)
+        .create_sync()
+        .unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db)).with_daemon(socket);
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let observed = ObservedFingerprint::from_path(&path).unwrap();
+        assert_eq!(observed.fingerprint.inode, 0);
+        hasher.prefetch(&[path.as_path()]);
+        assert!(
+            listener
+                .accept()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let stale = "0".repeat(64);
+        hasher.prefetched.borrow_mut().insert(
+            observed.fingerprint.clone(),
+            PrefetchedHash {
+                hash: stale.clone(),
+                cache_hit: true,
+                bytes_hashed: 0,
+            },
+        );
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(hasher.hash(&path).unwrap(), expected);
+        assert_eq!(
+            hasher
+                .header_hash(
+                    &path,
+                    &observed,
+                    &HashMap::from([(observed.fingerprint.path.clone(), stale.clone()),])
+                )
+                .unwrap(),
+            expected,
+        );
+        let input = CcPreprocessMemoInput {
+            name: "runtime.lib".into(),
+            fingerprint: observed.fingerprint,
+            content: stale,
+            mapped: String::new(),
+            observed_ns: i64::MAX,
+        };
+        assert!(!input.stamp_settled());
+        assert!(
+            hasher
+                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .is_none()
+        );
+        assert!(hasher.hash_static_lib(&path).is_ok());
+        assert_eq!(hasher.stats().cache_hits, 0);
+        assert_eq!(hasher.stats().bytes_hashed, 280_000);
+        assert!(hasher.pending_memo.borrow().is_empty());
+        hasher.flush_memo_as_if_settled();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM file_hashes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    });
 }
 
 #[test]
@@ -14320,7 +14400,11 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
                 &no_mapping,
             )
             .unwrap();
-        inputs[0].observed_ns += observed_later_ns;
+        let changed_ns = inputs[0]
+            .fingerprint
+            .mtime_ns
+            .max(inputs[0].fingerprint.ctime_ns);
+        inputs[0].observed_ns = changed_ns + observed_later_ns;
         hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
         let recorded = hasher
             .cache
@@ -14341,7 +14425,10 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
     };
 
     let (fresh, stored) = record("fresh.h", 0);
-    assert!(!fresh.stamp_settled(), "the file was just written");
+    assert!(
+        !fresh.stamp_settled(),
+        "observed before the settle interval"
+    );
     assert_ne!(stored, fresh.fingerprint, "the stamp is not recorded");
     assert_eq!(reads_on_lookup("fresh.h"), 1, "the content is compared");
 
@@ -15871,7 +15958,10 @@ fn a_weak_guard_identity_cannot_reuse_a_row_from_before_replacement() {
         .push((observed.clone(), old_hash.clone()));
     hasher.flush_memo_as_if_settled();
     let rows = hasher.memoised_hashes(std::iter::once(&observed.fingerprint));
-    assert_eq!(rows.get(&observed.fingerprint.path), Some(&old_hash));
+    assert_eq!(
+        rows.get(&observed.fingerprint.path),
+        if cfg!(windows) { None } else { Some(&old_hash) }
+    );
     let memoised = HashMap::from([(observed.fingerprint.clone(), old_hash.clone())]);
     std::fs::remove_file(&path).unwrap();
     write_file(&path, "after!");

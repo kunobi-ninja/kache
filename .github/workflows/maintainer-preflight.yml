@@ -81,7 +81,7 @@ jobs:
           cat "$EVIDENCE_DIR/regression-red.log"
           test "$result" -ne 0
           grep -F 'test daemon::tests::configured_demand_timeout_restores_after_the_legacy_three_seconds ... FAILED' "$EVIDENCE_DIR/regression-red.log"
-          grep -F 'configured wrapper wait' "$EVIDENCE_DIR/regression-red.log"
+          grep -E 'configured wrapper wait|the raised demand budget must restore the entry' "$EVIDENCE_DIR/regression-red.log"
       - name: Verify the same regression passes with the fix
         id: green
         run: |

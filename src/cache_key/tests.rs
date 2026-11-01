@@ -83,6 +83,50 @@ fn apple_library_keys_follow_every_deployment_target_variable() {
     }
 }
 
+#[test]
+fn apple_deployment_targets_are_keyed_for_named_custom_targets() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = root.join("lib.rs");
+    std::fs::write(&source, "pub fn value() {}\n").unwrap();
+    let invocation = client_invocation(
+        &root,
+        &[
+            ("OUT_DIR", None),
+            ("RUST_TARGET_PATH", Some(root.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--target=custom_ios".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let key = |value: Option<&str>| {
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        let env = KeyEnv::from_parts(
+            value.map(|value| ("IPHONEOS_DEPLOYMENT_TARGET", value)),
+            Some(root.clone()),
+        );
+        compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &env).unwrap()
+    };
+    assert_ne!(key(Some("26.0")), key(Some("18.0")));
+    assert_ne!(key(None), key(Some("18.0")));
+    assert_eq!(key(Some("18.0")), key(Some("18.0")));
+}
+
 fn client_invocation(cwd: &Path, overrides: &[(&str, Option<&std::ffi::OsStr>)]) -> InvocationEnv {
     let captured = InvocationEnv::capture();
     let vars = captured

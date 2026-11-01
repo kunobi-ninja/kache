@@ -3351,7 +3351,6 @@ fn compute_key_into(
         .target
         .as_deref()
         .or_else(|| rustc_host_triple(&rustc_version));
-    fold_apple_deployment_targets(&mut hasher, compiler_target, custom_target_file, env);
 
     // Pre-audit clients can store an EXE-only entry under the old key. Keep
     // those entries out of every local/remote lookup and committed-peer
@@ -3363,6 +3362,7 @@ fn compute_key_into(
                 || target.ends_with(".json")
                 || invocation.var_os("RUST_TARGET_PATH").is_some()
         });
+    fold_apple_deployment_targets(&mut hasher, compiler_target, custom_target, env);
     if executable_pdb_admission(args, &rustc_version, custom_target) {
         hasher.set_group("pe_pdb_admission");
         fold_field(&mut hasher, b"executable_pdb_pairing.v1:", b"verified");

@@ -1086,6 +1086,7 @@ impl WindowsProbeEnvironment {
         architecture: &str,
         env: &InvocationEnv,
     ) -> Result<()> {
+        let _trace = crate::phase_trace::phase("native_msvc_discovery");
         self.validate_discovery_probe()?;
         // find-msvc-tools' architecture fallback spawns cl.exe with inherited
         // process state. Supply the result of our own isolated banner probe.
@@ -1793,8 +1794,13 @@ fn run_windows_tool_in_for(
     environment: &[(OsString, OsString)],
     env: &InvocationEnv,
 ) -> Result<String> {
+    let _trace = crate::phase_trace::phase("native_msvc_banner");
+    let digest = || {
+        let _trace = crate::phase_trace::phase("native_msvc_banner_hash");
+        probe_memo::file_digest(path)
+    };
     let before = (memo_dir.is_some() && memoises_banner(tool))
-        .then(|| probe_memo::file_digest(path))
+        .then(digest)
         .flatten();
     let memo = memo_dir
         .zip(before.as_deref())
@@ -1806,9 +1812,12 @@ fn run_windows_tool_in_for(
     {
         return Ok(banner);
     }
-    let output = windows_tool_command_for(tool, path, environment, env)?
-        .invocation_output()
-        .with_context(|| format!("running {} at {}", tool.name(), path.display()))?;
+    let output = {
+        let _trace = crate::phase_trace::phase("native_msvc_banner_run");
+        windows_tool_command_for(tool, path, environment, env)?
+            .invocation_output()
+            .with_context(|| format!("running {} at {}", tool.name(), path.display()))?
+    };
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1816,7 +1825,7 @@ fn run_windows_tool_in_for(
     );
     let banner = validate_tool_banner(tool, &text)?;
     if let Some((memo_path, key)) = &memo
-        && probe_memo::file_digest(path) == before
+        && digest() == before
     {
         probe_memo::write_verified(memo_path, key, &text);
     }
@@ -2344,6 +2353,7 @@ fn hash_windows_runtime_libraries(
     ucrt_version: &str,
     additional_dirs: &[PathBuf],
 ) -> Result<BTreeMap<String, String>> {
+    let _trace = crate::phase_trace::phase("native_msvc_runtime");
     let directories = windows_library_dirs(
         environment,
         architecture,
@@ -2367,8 +2377,11 @@ fn hash_windows_runtime_libraries(
             let requested = environment
                 .requested_default_libraries
                 .contains(&WindowsDefaultLibrary(name));
-            let digest = hash_windows_runtime_library(&path, requested)
-                .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
+            let digest = {
+                let _trace = crate::phase_trace::phase(name);
+                hash_windows_runtime_library(&path, requested)
+                    .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?
+            };
             libraries.insert((*name).to_string(), digest);
         }
     }

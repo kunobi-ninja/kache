@@ -11,7 +11,7 @@ permissions:
 jobs:
   preflight:
     name: Windows prerequisites (Linux)
-    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1792-windows'
+    if: false # Exact candidate Linux just check passed in run 41316505873
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -160,6 +160,7 @@ jobs:
           if ((git rev-parse 'HEAD^{tree}') -ne $env:EXPECTED_TREE) { throw 'Wrong tree' }
           "tested_head=$env:EXPECTED_HEAD`ntested_tree=$env:EXPECTED_TREE" | Add-Content (Join-Path $env:EVIDENCE_DIR 'provenance.txt')
       - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+        if: matrix.runner != 'windows-11-arm'
       - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
         with:
           version: 2026.6.9
@@ -220,13 +221,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Baseline checkout failed' }
           Push-Location $baseline
           try {
-            cargo build --locked -p kache --release --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-baseline.log')
+            cargo build --locked -p kache --release --bins --target-dir (Join-Path $env:RUNNER_TEMP 'windows-1792-baseline-target') 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-baseline.log')
             if ($LASTEXITCODE -ne 0) { throw 'Baseline build failed' }
           } finally { Pop-Location }
           $bin = Join-Path $env:RUNNER_TEMP 'baseline-bin'
           [IO.Directory]::CreateDirectory($bin) | Out-Null
-          Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release/kache.exe') $bin
-          Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release/kache-engine.exe') $bin
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'windows-1792-baseline-target/release/kache.exe') $bin
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'windows-1792-baseline-target/release/kache-engine.exe') $bin
           ./scripts/adoption/windows-native-key-probe.ps1 -Kache (Join-Path $bin 'kache.exe') -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'baseline')
       - name: Build and measure candidate binaries
         run: |

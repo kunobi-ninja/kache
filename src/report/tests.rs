@@ -653,6 +653,7 @@ fn write_test_events(dir: &std::path::Path) -> Config {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -2140,6 +2141,7 @@ fn test_missing_transfer_data() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -2251,6 +2253,7 @@ fn test_suggestion_high_miss_share() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -2361,6 +2364,7 @@ fn test_suggestion_high_hit_overhead() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -2472,6 +2476,7 @@ fn test_suggestion_network_download_failures_and_fanout() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -2588,6 +2593,7 @@ fn test_suggestion_network_latency_thresholds() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -3107,6 +3113,7 @@ fn test_empty_report() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -3599,6 +3606,7 @@ fn report_counts_each_download_transfer_format() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        native_runtime_warmup: true,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -4897,6 +4905,22 @@ fn adaptive_reasons_have_plain_words() {
         "edit rebuild: rustc rebuilt a crate still being edited incrementally (adaptive active)"
     );
     assert_eq!(uncached_reason_words("linker"), "linker");
+}
+
+#[test]
+fn native_runtime_warmup_has_plain_words_without_counting_as_an_edit() {
+    assert_eq!(
+        uncached_reason_words("native runtime warmup"),
+        "the daemon is preparing MSVC runtime hashes; this compile ran without caching"
+    );
+    assert!(!is_edit_rebuild("native runtime warmup"));
+    assert!(!is_edit_rebuild(" native runtime warmup "));
+    let mut skipped = BuildEvent::new_for_test("native", EventResult::Skipped);
+    skipped.skip_reason = "native runtime warmup".into();
+    assert_eq!(
+        uncached_compile_words(&skipped),
+        "compiled, not stored: the daemon is preparing MSVC runtime hashes; this compile ran without caching"
+    );
 }
 
 #[test]

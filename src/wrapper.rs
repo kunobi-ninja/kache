@@ -4306,7 +4306,17 @@ fn run_parsed_rustc(
                 let _ = lease.finish(CompileOutcome::Abnormal);
             }
             // `{:#}` walks the cause chain; see `uncacheable_reason`.
-            tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
+            if e.downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+                .is_some()
+            {
+                tracing::debug!(
+                    "native runtime hashes are warming for {}: {:#}",
+                    crate_name,
+                    e
+                );
+            } else {
+                tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
+            }
             return passthrough_with_event(
                 config,
                 args,
@@ -7278,6 +7288,7 @@ fn compute_rustc_cache_key(
         None => crate::cache_key::FileHasher::new_for(args.invocation_env())
             .with_daemon(config.socket_path()),
     }
+    .with_native_runtime_warmup(config.native_runtime_warmup)
     .with_input_predictions(config.input_predictions)
     .with_prediction_flights(flight_dir)
     .with_own_dirs(written_while_building(config, store, args.invocation_env()));
@@ -8696,6 +8707,12 @@ const UNCACHEABLE_REASON: &str = "uncacheable|";
 /// failed for src/lib.rs" and dropped rustc's own reason underneath it
 /// (kunobi-ninja/kache#431).
 fn uncacheable_reason(error: &anyhow::Error) -> String {
+    if error
+        .downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+        .is_some()
+    {
+        return "native runtime warmup".to_owned();
+    }
     format!("{UNCACHEABLE_REASON}{error:#}")
 }
 
@@ -8754,11 +8771,24 @@ fn passthrough_with_event<R: Into<String>>(
         return Ok(exit_code);
     }
     let reason = reason.into();
+    let permit = (reason == "native runtime warmup").then(|| {
+        scheduler::begin_keyless_compile(
+            &config.cache_dir,
+            config.scheduler,
+            crate_name,
+            args.invokes_linker(),
+            config.test_lease.as_deref(),
+        )
+    });
     let output = passthrough(
         args,
         config.fallback.as_deref(),
         config.preserve_incremental,
     )?;
+    if let Some(permit) = &permit {
+        permit.record_compile_rss(crate_name);
+    }
+    drop(permit);
     let elapsed = start.elapsed().as_millis() as u64;
     after_rustc_exit(output.exit_code, rustc_output_in(&reason), &args.externs);
     log_event(

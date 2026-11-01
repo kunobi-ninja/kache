@@ -1492,6 +1492,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         remote_error: None,
         disabled: false,
         cache_executables: false,
+        native_runtime_warmup: true,
         cache_cc_links: false,
         trust_codegen_backends: false,
         target_liveness: false,
@@ -4919,20 +4920,69 @@ fn test_daemon_reuses_store_handle() {
 /// A request for `file` as it is on disk, and the clock at which its stamp
 /// settles: [`crate::cache_key::HASH_SETTLE_NS`] after its last change.
 fn hash_files_request(file: &Path) -> (HashFilesRequest, i64) {
-    let metadata = std::fs::metadata(file).unwrap();
-    let mtime_ns = crate::cache_key::metadata_mtime_ns(&metadata);
-    let ctime_ns = crate::cache_key::metadata_ctime_ns(&metadata);
+    let fingerprint = crate::cache_key::FileFingerprint::from_path(file).unwrap();
+    let mtime_ns = fingerprint.mtime_ns;
+    let ctime_ns = fingerprint.ctime_ns;
     let req = HashFilesRequest {
         files: vec![HashFileRequest {
             path: file.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap(),
+            size: fingerprint.size,
             mtime_ns,
             ctime_ns,
-            inode: crate::cache_key::metadata_inode(&metadata),
+            inode: fingerprint.inode,
         }],
     };
     let settles_at = mtime_ns.max(ctime_ns) + crate::cache_key::HASH_SETTLE_NS;
     (req, settles_at)
+}
+
+#[cfg(windows)]
+#[test]
+fn weak_windows_hash_requests_never_use_or_fill_daemon_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config);
+    let path = dir.path().join("runtime.lib");
+    let bytes = vec![b'r'; 70_000];
+    std::fs::write(&path, &bytes).unwrap();
+    kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+        let (request, settles_at) = hash_files_request(&path);
+        let file = &request.files[0];
+        assert_eq!(file.inode, 0);
+        daemon.file_hash_cache.lock().unwrap().insert(
+            FileHashCacheKey {
+                path: file.path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                ctime_ns: file.ctime_ns,
+                inode: file.inode,
+            },
+            "legacy stale hash".into(),
+        );
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        for pass in 0..2 {
+            let response = daemon.handle_hash_files_at(&request, || settles_at);
+            let results = response.hash_results.unwrap();
+            assert_eq!(results[0].hash.as_deref(), Some(expected.as_str()));
+            assert!(!results[0].cache_hit);
+            assert_eq!(results[0].bytes_hashed, 70_000);
+            assert_eq!(results[0].error, None);
+            if pass == 0 {
+                assert!(
+                    daemon
+                        .file_hash_cache
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|hash| hash == "legacy stale hash")
+                );
+            } else {
+                assert!(daemon.file_hash_cache.lock().unwrap().is_empty());
+            }
+            daemon.file_hash_cache.lock().unwrap().clear();
+        }
+        assert!(daemon.file_hash_cache.lock().unwrap().is_empty());
+    });
 }
 
 #[test]
@@ -5042,16 +5092,9 @@ fn handle_hash_files_rejects_changed_metadata_before_hashing() {
 
     let file = dir.path().join("input.bin");
     std::fs::write(&file, b"stable bytes").unwrap();
-    let metadata = std::fs::metadata(&file).unwrap();
-    let resp = daemon.handle_hash_files(&HashFilesRequest {
-        files: vec![HashFileRequest {
-            path: file.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap() + 1,
-            mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
-            ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
-            inode: crate::cache_key::metadata_inode(&metadata),
-        }],
-    });
+    let mut request = hash_files_request(&file).0;
+    request.files[0].size += 1;
+    let resp = daemon.handle_hash_files(&request);
 
     assert!(resp.ok);
     let result = &resp.hash_results.as_ref().unwrap()[0];
@@ -5071,16 +5114,7 @@ fn handle_hash_files_reports_hash_io_error() {
 
     let input_dir = dir.path().join("not-a-file");
     std::fs::create_dir(&input_dir).unwrap();
-    let metadata = std::fs::metadata(&input_dir).unwrap();
-    let resp = daemon.handle_hash_files(&HashFilesRequest {
-        files: vec![HashFileRequest {
-            path: input_dir.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap(),
-            mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
-            ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
-            inode: crate::cache_key::metadata_inode(&metadata),
-        }],
-    });
+    let resp = daemon.handle_hash_files(&hash_files_request(&input_dir).0);
 
     assert!(resp.ok);
     let result = &resp.hash_results.as_ref().unwrap()[0];
@@ -5423,14 +5457,7 @@ async fn test_socket_hash_files_roundtrip_hashes_a_real_file() {
     // handler proceeds to actually hash it.
     let file_path = dir.path().join("input.bin");
     std::fs::write(&file_path, b"hash me please").unwrap();
-    let meta = std::fs::metadata(&file_path).unwrap();
-    let req = HashFileRequest {
-        path: file_path.to_string_lossy().into_owned(),
-        size: meta.len() as i64,
-        mtime_ns: crate::cache_key::metadata_mtime_ns(&meta),
-        ctime_ns: crate::cache_key::metadata_ctime_ns(&meta),
-        inode: crate::cache_key::metadata_inode(&meta),
-    };
+    let req = hash_files_request(&file_path).0.files.remove(0);
     let expected = blake3::hash(b"hash me please").to_hex().to_string();
 
     let daemon = Arc::new(Daemon::new(config));
@@ -5492,7 +5519,9 @@ fn send_hash_files_request_empty_is_ok_without_socket() {
 
 #[test]
 fn send_hash_files_request_missing_socket_errors() {
-    // A non-empty request against a missing socket bails before connecting.
+    // A missing endpoint is reported by the transport, including named pipes.
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("absent.sock");
     let req = HashFileRequest {
         path: "/some/file".into(),
         size: 1,
@@ -5500,12 +5529,9 @@ fn send_hash_files_request_missing_socket_errors() {
         ctime_ns: 0,
         inode: 0,
     };
-    let err = send_hash_files_request(Path::new("/nonexistent/socket.sock"), vec![req])
-        .expect_err("missing socket -> error");
-    assert!(
-        err.to_string().contains("socket does not exist"),
-        "got: {err}"
-    );
+    let err =
+        send_hash_files_request(&socket_path, vec![req]).expect_err("missing socket -> error");
+    assert!(err.is::<DaemonConnectionFailure>(), "got: {err:#}");
 }
 
 #[test]
@@ -5538,10 +5564,6 @@ fn hash_files_response_parser_handles_results_error_and_malformed() {
     assert!(err.to_string().contains("key must be a string"));
 }
 
-// Unix-only: send_hash_files_request guards on `socket_path.exists()`, which
-// is false for a Windows named pipe (no filesystem `.sock` entry), so the
-// round-trip can't run there. The client logic is covered here on Linux/macOS.
-#[cfg(unix)]
 #[tokio::test]
 async fn send_hash_files_request_client_roundtrip() {
     // CLIENT side: send_hash_files_request connects to a live in-process
@@ -5553,21 +5575,23 @@ async fn send_hash_files_request_client_roundtrip() {
 
     let file_path = dir.path().join("input.bin");
     std::fs::write(&file_path, b"hash me please").unwrap();
-    let meta = std::fs::metadata(&file_path).unwrap();
-    let req = HashFileRequest {
-        path: file_path.to_string_lossy().into_owned(),
-        size: meta.len() as i64,
-        mtime_ns: crate::cache_key::metadata_mtime_ns(&meta),
-        ctime_ns: crate::cache_key::metadata_ctime_ns(&meta),
-        inode: crate::cache_key::metadata_inode(&meta),
-    };
+    let req = hash_files_request(&file_path).0.files.remove(0);
     let expected = blake3::hash(b"hash me please").to_hex().to_string();
 
     let listener = bind_listener(&socket_path);
+    #[cfg(windows)]
+    assert!(
+        !socket_path.exists(),
+        "a live named pipe has no socket file at its logical daemon path"
+    );
     let daemon = Arc::new(Daemon::new(config.clone()));
     let server = tokio::spawn(async move {
-        let stream = listener.accept().await.expect("accept");
-        let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let stream = listener.accept().await.expect("accept");
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
+        })
+        .await
+        .expect("hash-files client did not complete its request");
     });
 
     let sp = socket_path.clone();
@@ -5579,6 +5603,7 @@ async fn send_hash_files_request_client_roundtrip() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].hash.as_deref(), Some(expected.as_str()));
+    assert_eq!(results[0].error, None);
 }
 
 #[tokio::test]
@@ -16587,4 +16612,942 @@ fn a_buffered_fire_and_forget_request_is_bounded_through_flush() {
         "a peer that never reads cannot finish a flush"
     );
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+mod hash_warmup_tests {
+    use super::*;
+    use crate::cache_key::{FileFingerprint, FileHashLookup, HASH_SETTLE_NS, ObservedFingerprint};
+    use std::sync::atomic::AtomicUsize;
+
+    fn file(root: &Path, name: &str) -> HashFileRequest {
+        HashFileRequest {
+            path: root.join(name).to_string_lossy().into_owned(),
+            size: 65_537,
+            mtime_ns: 1,
+            ctime_ns: 2,
+            inode: 3,
+        }
+    }
+
+    fn observation(key: &FileHashCacheKey) -> ObservedFingerprint {
+        ObservedFingerprint {
+            fingerprint: key.fingerprint(),
+            observed_ns: HASH_SETTLE_NS + 2,
+        }
+    }
+
+    fn wait_state(daemon: &Daemon, predicate: impl Fn(&FileHashWarmupState) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = daemon.file_hash_warmup.state.lock().unwrap();
+        while !predicate(&state) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "warmup worker did not reach its expected state"
+            );
+            state = daemon
+                .file_hash_warmup
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap()
+                .0;
+        }
+    }
+
+    fn stop(daemon: &Daemon) {
+        daemon.file_hash_warmup.stop();
+        wait_state(daemon, |state| !state.running);
+        if let Some(worker) = daemon.file_hash_warmup.worker.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn warmup_ack_and_health_do_not_wait_for_reads_and_duplicates_share_one_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(root.path()));
+        let request = file(root.path(), "first");
+        let digest = test_cache_key("first");
+        let (started, reads) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let operations = count.clone();
+        let hash = digest.clone();
+        let first = daemon
+            .file_hash_warmup
+            .respond(
+                std::slice::from_ref(&request),
+                &daemon.file_hash_cache,
+                move |_| {
+                    let index = operations.fetch_add(1, Ordering::SeqCst);
+                    started.send(std::thread::current().id()).unwrap();
+                    if index == 0 {
+                        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    Ok(Some(hash.clone()))
+                },
+            )
+            .unwrap();
+        assert_eq!(first, vec![FileHashCacheKey::from(&request).result(None)]);
+        let worker = reads.recv_timeout(Duration::from_secs(5)).unwrap();
+        let duplicate = daemon
+            .file_hash_warmup
+            .respond(
+                &[request.clone(), request.clone()],
+                &daemon.file_hash_cache,
+                |_| panic!("a duplicate must not start another worker"),
+            )
+            .unwrap();
+        assert!(
+            duplicate
+                .iter()
+                .all(|result| result.hash.is_none() && result.error.is_none())
+        );
+        assert!(daemon.handle_request_sync(&Request::Health).ok);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            daemon.file_hash_warmup.state.lock().unwrap().pending.len(),
+            1
+        );
+        release.send(()).unwrap();
+        wait_state(&daemon, |state| state.pending.is_empty());
+        assert!(
+            daemon
+                .file_hash_warmup
+                .state
+                .lock()
+                .unwrap()
+                .failed
+                .is_empty()
+        );
+        assert!(
+            daemon
+                .file_hash_warmup
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .is_none()
+        );
+        let ready = daemon
+            .file_hash_warmup
+            .respond(
+                std::slice::from_ref(&request),
+                &daemon.file_hash_cache,
+                |_| panic!("ready memory does not need another operation"),
+            )
+            .unwrap();
+        assert_eq!(
+            ready,
+            vec![FileHashCacheKey::from(&request).result(Some(digest))]
+        );
+        let second = file(root.path(), "second");
+        daemon
+            .file_hash_warmup
+            .respond(&[second], &daemon.file_hash_cache, |_| {
+                panic!("the existing worker owns subsequent requests")
+            })
+            .unwrap();
+        assert_eq!(reads.recv_timeout(Duration::from_secs(5)).unwrap(), worker);
+        wait_state(&daemon, |state| state.pending.is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(daemon.file_hash_cache.lock().unwrap().len(), 2);
+        stop(&daemon);
+    }
+
+    #[test]
+    fn warmup_bounds_include_active_work_and_shutdown_discards_queued_items() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(root.path()));
+        let (started, read) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let operations = count.clone();
+        let batch = |begin| {
+            (begin..begin + 64)
+                .map(|n| file(root.path(), &format!("input-{n}")))
+                .collect::<Vec<_>>()
+        };
+        let first = batch(0);
+        daemon
+            .file_hash_warmup
+            .respond(&first, &daemon.file_hash_cache, move |_| {
+                operations.fetch_add(1, Ordering::SeqCst);
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(Some(test_cache_key("ready")))
+            })
+            .unwrap();
+        read.recv_timeout(Duration::from_secs(5)).unwrap();
+        daemon
+            .file_hash_warmup
+            .respond(&batch(64), &daemon.file_hash_cache, |_| unreachable!())
+            .unwrap();
+        let saturated = daemon
+            .file_hash_warmup
+            .respond(&batch(128), &daemon.file_hash_cache, |_| unreachable!())
+            .unwrap();
+        assert_eq!(saturated.len(), 64);
+        assert!(
+            saturated
+                .iter()
+                .all(|result| result.hash.is_none() && result.error.is_none())
+        );
+        {
+            let state = daemon.file_hash_warmup.state.lock().unwrap();
+            assert_eq!(state.pending.len(), 128);
+            assert_eq!(state.queue.len(), 127);
+        }
+        let too_many = (0..65)
+            .map(|n| file(root.path(), &format!("oversized-{n}")))
+            .collect::<Vec<_>>();
+        assert!(
+            daemon
+                .file_hash_warmup
+                .respond(&too_many, &daemon.file_hash_cache, |_| unreachable!())
+                .is_err()
+        );
+        daemon.file_hash_warmup.stop();
+        {
+            let state = daemon.file_hash_warmup.state.lock().unwrap();
+            assert!(state.queue.is_empty());
+            assert_eq!(state.pending.len(), 1);
+        }
+        assert!(
+            daemon
+                .file_hash_warmup
+                .respond(&first, &daemon.file_hash_cache, |_| unreachable!())
+                .is_err()
+        );
+        release.send(()).unwrap();
+        stop(&daemon);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(
+            daemon
+                .file_hash_warmup
+                .state
+                .lock()
+                .unwrap()
+                .failed
+                .is_empty()
+        );
+        assert!(
+            daemon
+                .file_hash_warmup
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn warmup_worker_errors_and_panics_clear_state_and_allow_retry() {
+        for panics in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let daemon = Daemon::new(test_config(root.path()));
+            let request = file(root.path(), "retry");
+            let (started, reading) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            daemon
+                .file_hash_warmup
+                .respond(
+                    &[request.clone(), file(root.path(), "queued")],
+                    &daemon.file_hash_cache,
+                    move |_| {
+                        started.send(()).unwrap();
+                        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if panics {
+                            panic!("injected worker failure");
+                        }
+                        anyhow::bail!("injected read error")
+                    },
+                )
+                .unwrap();
+            reading.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(daemon.file_hash_warmup.state.lock().unwrap().queue.len(), 1);
+            release.send(()).unwrap();
+            wait_state(&daemon, |state| !state.running);
+            assert!(
+                daemon
+                    .file_hash_warmup
+                    .state
+                    .lock()
+                    .unwrap()
+                    .active
+                    .is_none()
+            );
+            assert!(
+                daemon
+                    .file_hash_warmup
+                    .state
+                    .lock()
+                    .unwrap()
+                    .queue
+                    .is_empty()
+            );
+            assert!(
+                daemon
+                    .file_hash_warmup
+                    .state
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .is_empty()
+            );
+            assert!(
+                daemon
+                    .file_hash_warmup
+                    .respond(
+                        std::slice::from_ref(&request),
+                        &daemon.file_hash_cache,
+                        |_| panic!("one-shot failure must return before retrying work")
+                    )
+                    .is_err()
+            );
+            assert!(
+                daemon
+                    .file_hash_warmup
+                    .state
+                    .lock()
+                    .unwrap()
+                    .failed
+                    .is_empty()
+            );
+            let digest = test_cache_key("recovered");
+            let hash = digest.clone();
+            daemon
+                .file_hash_warmup
+                .respond(
+                    std::slice::from_ref(&request),
+                    &daemon.file_hash_cache,
+                    move |_| Ok(Some(hash.clone())),
+                )
+                .unwrap();
+            wait_state(&daemon, |state| state.pending.is_empty());
+            assert_eq!(
+                daemon
+                    .file_hash_cache
+                    .lock()
+                    .unwrap()
+                    .get(&FileHashCacheKey::from(&request)),
+                Some(&digest)
+            );
+            stop(&daemon);
+        }
+    }
+
+    #[test]
+    fn warmup_failed_evidence_is_bounded_consumed_once_and_cleared_on_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(root.path()));
+        for n in 0..129 {
+            daemon.file_hash_warmup.state.lock().unwrap().active = Some(FileHashCacheKey::from(
+                &file(root.path(), &format!("failed-{n}")),
+            ));
+            daemon.file_hash_warmup.reset_worker(true);
+        }
+        let latest = file(root.path(), "failed-128");
+        {
+            let state = daemon.file_hash_warmup.state.lock().unwrap();
+            assert_eq!(state.failed.len(), 128);
+            assert!(state.failed.contains(&FileHashCacheKey::from(&latest)));
+        }
+        assert!(
+            daemon
+                .file_hash_warmup
+                .respond(
+                    std::slice::from_ref(&latest),
+                    &daemon.file_hash_cache,
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            daemon.file_hash_warmup.state.lock().unwrap().failed.len(),
+            127
+        );
+        let active = FileHashCacheKey::from(&file(root.path(), "normal-stop"));
+        daemon.file_hash_warmup.state.lock().unwrap().active = Some(active.clone());
+        daemon.file_hash_warmup.reset_worker(false);
+        assert!(
+            !daemon
+                .file_hash_warmup
+                .state
+                .lock()
+                .unwrap()
+                .failed
+                .contains(&active)
+        );
+        daemon.file_hash_warmup.stop();
+        daemon.file_hash_warmup.state.lock().unwrap().active = Some(active);
+        daemon.file_hash_warmup.reset_worker(true);
+        assert!(
+            daemon
+                .file_hash_warmup
+                .state
+                .lock()
+                .unwrap()
+                .failed
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn warmup_ready_results_match_every_fingerprint_field_and_memory_stays_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(root.path()));
+        let request = file(root.path(), "ready");
+        let key = FileHashCacheKey::from(&request);
+        let hash = test_cache_key("ready");
+        daemon
+            .file_hash_cache
+            .lock()
+            .unwrap()
+            .insert(key.clone(), hash.clone());
+        let mut changed = Vec::new();
+        for field in 0..5 {
+            let mut file = request.clone();
+            match field {
+                0 => file.path.push('x'),
+                1 => file.size += 1,
+                2 => file.mtime_ns += 1,
+                3 => file.ctime_ns += 1,
+                _ => file.inode += 1,
+            }
+            changed.push(file);
+        }
+        let response = daemon
+            .file_hash_warmup
+            .respond(&changed, &daemon.file_hash_cache, |_| Ok(None))
+            .unwrap();
+        assert!(response.iter().all(|result| result.hash.is_none()));
+        wait_state(&daemon, |state| state.pending.is_empty());
+        daemon
+            .file_hash_cache
+            .lock()
+            .unwrap()
+            .insert(key, "invalid".into());
+        let invalid = daemon
+            .file_hash_warmup
+            .respond(
+                std::slice::from_ref(&request),
+                &daemon.file_hash_cache,
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(invalid[0].hash, None);
+        wait_state(&daemon, |state| state.pending.is_empty());
+        stop(&daemon);
+        // A new daemon gives this capacity control an accepting queue.
+        let daemon = Daemon::new(test_config(root.path()));
+        {
+            let mut cache = daemon.file_hash_cache.lock().unwrap();
+            for n in 0..4096 {
+                cache.insert(
+                    FileHashCacheKey::from(&file(root.path(), &format!("cached-{n}"))),
+                    hash.clone(),
+                );
+            }
+        }
+        let value = hash.clone();
+        daemon
+            .file_hash_warmup
+            .respond(&[request], &daemon.file_hash_cache, move |_| {
+                Ok(Some(value.clone()))
+            })
+            .unwrap();
+        wait_state(&daemon, |state| state.pending.is_empty());
+        assert_eq!(daemon.file_hash_cache.lock().unwrap().len(), 1);
+        stop(&daemon);
+    }
+
+    #[test]
+    fn warmup_rejects_weak_invalid_and_async_only_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(root.path()));
+        let valid = file(root.path(), "valid");
+        for field in 0..5 {
+            let mut invalid = valid.clone();
+            match field {
+                0 => invalid.path = "relative".into(),
+                1 => invalid.size = 0,
+                2 => invalid.inode = 0,
+                3 => invalid.mtime_ns = -1,
+                _ => invalid.ctime_ns = 0,
+            }
+            assert!(hash_warmup_keys(&[invalid]).is_err());
+        }
+        let mut epoch = valid.clone();
+        epoch.mtime_ns = 0;
+        assert!(hash_warmup_keys(&[epoch]).is_ok());
+        assert!(
+            daemon
+                .handle_hash_files_warmup(&HashFilesRequest {
+                    files: vec![file(root.path(), "bad")]
+                })
+                .ok
+        );
+        let response = daemon.handle_request_sync(&Request::HashFilesWarmup(HashFilesRequest {
+            files: vec![valid],
+        }));
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("async"));
+        assert_eq!(HASH_WARMUP_TIMEOUT, Duration::from_millis(100));
+        assert!(
+            send_hash_files_warmup_request(
+                &root.path().join("absent.sock"),
+                vec![file(root.path(), "absent")]
+            )
+            .is_err()
+        );
+        assert!(
+            send_hash_files_warmup_request(&root.path().join("absent.sock"), Vec::new())
+                .unwrap()
+                .is_empty()
+        );
+        stop(&daemon);
+    }
+
+    #[test]
+    fn dropping_the_daemon_stops_its_idle_warmup_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(root.path()));
+        daemon
+            .file_hash_warmup
+            .respond(
+                &[file(root.path(), "input")],
+                &daemon.file_hash_cache,
+                |_| Ok(Some(test_cache_key("ready"))),
+            )
+            .unwrap();
+        wait_state(&daemon, |state| state.pending.is_empty());
+        let warmup = daemon.file_hash_warmup.clone();
+        drop(daemon);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = warmup.state.lock().unwrap();
+        assert!(state.stopping);
+        while state.running {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "idle warmup worker did not stop");
+            state = warmup.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        assert!(state.queue.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(state.active.is_none());
+        drop(state);
+        warmup
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn warmup_response_requires_complete_matching_ready_or_pending_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let request = file(root.path(), "ready");
+        let key = FileHashCacheKey::from(&request);
+        let keys = [key.clone()];
+        let digest = test_cache_key("ready");
+        for result in [key.result(None), key.result(Some(digest.clone()))] {
+            let json =
+                serde_json::to_string(&Response::ok_hash_results(vec![result.clone()])).unwrap();
+            assert_eq!(
+                hash_warmup_results_from_response(&json, &keys).unwrap(),
+                vec![result]
+            );
+        }
+        for (ok, error) in [(true, Some("legacy error".to_owned())), (false, None)] {
+            let mut response = Response::ok_hash_results(vec![key.result(Some(digest.clone()))]);
+            response.ok = ok;
+            response.error = error;
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(hash_warmup_results_from_response(&json, &keys).is_err());
+        }
+        for response in [
+            "{}",
+            "{bad",
+            "{\"ok\":true}",
+            "{\"ok\":false,\"error\":\"unknown variant hash_files_warmup\"}",
+            "{\"ok\":true,\"hash_results\":[]}",
+        ] {
+            assert!(
+                hash_warmup_results_from_response(response, &keys).is_err(),
+                "{response}"
+            );
+        }
+        for field in 0..11 {
+            let mut invalid = key.result(Some(digest.clone()));
+            match field {
+                0 => invalid.path.push('x'),
+                1 => invalid.size += 1,
+                2 => invalid.mtime_ns += 1,
+                3 => invalid.ctime_ns += 1,
+                4 => invalid.inode += 1,
+                5 => invalid.error = Some("error".into()),
+                6 => invalid.bytes_hashed = 1,
+                7 => invalid.cache_hit = false,
+                8 => invalid.hash = Some("invalid".into()),
+                9 => invalid.hash = None,
+                _ => {
+                    invalid.hash = None;
+                    invalid.bytes_hashed = 1;
+                    invalid.cache_hit = false;
+                }
+            }
+            let json = serde_json::to_string(&Response::ok_hash_results(vec![invalid])).unwrap();
+            assert!(
+                hash_warmup_results_from_response(&json, &keys).is_err(),
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn warmup_preparation_records_its_own_worker_trace_even_on_read_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let traces = root.path().join("traces");
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("KACHE_PHASE_TRACE_DIR", traces.as_os_str())],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        let key = FileHashCacheKey::from(&file(root.path(), "missing-runtime.lib"));
+        let config = test_config(root.path());
+        let result =
+            std::thread::spawn(move || prepare_hash_warmup(&config, &mut None, &key, &env))
+                .join()
+                .unwrap();
+        assert!(result.is_err());
+        let entries: Vec<_> = std::fs::read_dir(traces)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let trace: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&entries[0]).unwrap()).unwrap();
+        assert_eq!(trace["kache_trace"]["scope"], "worker-thread");
+        let events = trace["traceEvents"].as_array().unwrap();
+        assert_eq!(events[0]["name"], "native-runtime-warmup");
+        assert!(events.iter().any(|event| {
+            event["name"] == "native_msvc_runtime_warmup"
+                && event["cat"] == "native-runtime-warmup"
+                && event["tid"] == events[0]["tid"]
+        }));
+    }
+
+    #[test]
+    fn warmup_preparation_revalidates_content_before_recording_or_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        let key = FileHashCacheKey::from(&file(root.path(), "input"));
+        let before = observation(&key);
+        let digest = test_cache_key("read bytes");
+        let records = std::cell::RefCell::new(Vec::new());
+        let value = prepare_hash_warmup_with(
+            &key,
+            |_| Ok(before.clone()),
+            |_| Ok(FileHashLookup::NeedsHash(key.fingerprint())),
+            |_| Ok(digest.clone()),
+            |fingerprint, hash| {
+                records
+                    .borrow_mut()
+                    .push((fingerprint.clone(), hash.to_owned()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(value, Some(digest.clone()));
+        assert_eq!(*records.borrow(), vec![(key.fingerprint(), digest.clone())]);
+        assert_eq!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| Ok(FileHashLookup::Hit(digest.clone())),
+                |_| panic!("a settled memo needs no read"),
+                |_, _| panic!("a memo hit needs no record")
+            )
+            .unwrap(),
+            Some(digest.clone())
+        );
+        assert_eq!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| Ok(FileHashLookup::Uncacheable),
+                |_| Ok(digest.clone()),
+                |_, _| panic!("uncacheable lookups cannot write a memo")
+            )
+            .unwrap(),
+            Some(digest)
+        );
+        for field in 0..7 {
+            let calls = std::cell::Cell::new(0);
+            let mut after = before.clone();
+            match field {
+                0 => after.fingerprint.path.push('x'),
+                1 => after.fingerprint.size += 1,
+                2 => after.fingerprint.mtime_ns += 1,
+                3 => after.fingerprint.ctime_ns += 1,
+                4 => after.fingerprint.inode += 1,
+                5 => after.observed_ns -= 1,
+                _ => after.fingerprint.inode = 0,
+            }
+            assert_eq!(
+                prepare_hash_warmup_with(
+                    &key,
+                    |_| {
+                        let index = calls.get();
+                        calls.set(index + 1);
+                        Ok(if index == 0 {
+                            before.clone()
+                        } else {
+                            after.clone()
+                        })
+                    },
+                    |_| Ok(FileHashLookup::NeedsHash(key.fingerprint())),
+                    |_| Ok(test_cache_key("bytes")),
+                    |_, _| panic!("changed evidence must not publish a memo")
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn warmup_preparation_refuses_unsettled_weak_changed_and_failed_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let key = FileHashCacheKey::from(&file(root.path(), "input"));
+        let before = observation(&key);
+        for mode in 0..3 {
+            let mut expected = key.clone();
+            let mut observed = before.clone();
+            match mode {
+                0 => observed.fingerprint.size += 1,
+                1 => {
+                    expected.inode = 0;
+                    observed.fingerprint.inode = 0;
+                }
+                _ => observed.observed_ns -= 1,
+            }
+            assert_eq!(
+                prepare_hash_warmup_with(
+                    &expected,
+                    |_| Ok(observed.clone()),
+                    |_| panic!("ineligible evidence must not reach the store"),
+                    |_| unreachable!(),
+                    |_, _| unreachable!()
+                )
+                .unwrap(),
+                None
+            );
+        }
+        let mut changed = key.fingerprint();
+        changed.size += 1;
+        assert_eq!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| Ok(FileHashLookup::NeedsHash(changed)),
+                |_| panic!("a changed lookup cannot be read"),
+                |_, _| unreachable!()
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| anyhow::bail!("stat error"),
+                |_| unreachable!(),
+                |_| unreachable!(),
+                |_, _| unreachable!()
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| anyhow::bail!("lookup error"),
+                |_| unreachable!(),
+                |_, _| unreachable!()
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| Ok(FileHashLookup::NeedsHash(key.fingerprint())),
+                |_| anyhow::bail!("read error"),
+                |_, _| unreachable!()
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| Ok(FileHashLookup::Hit("invalid".into())),
+                |_| unreachable!(),
+                |_, _| unreachable!()
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_hash_warmup_with(
+                &key,
+                |_| Ok(before.clone()),
+                |_| Ok(FileHashLookup::NeedsHash(key.fingerprint())),
+                |_| Ok(test_cache_key("bytes")),
+                |_, _| anyhow::bail!("record error")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blocking_hash_publisher_does_not_remember_inputs_changed_after_read() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("input");
+        std::fs::write(&path, b"before").unwrap();
+        let (request, _) = hash_files_request(&path);
+        let key = FileHashCacheKey::from(&request.files[0]);
+        let digest = crate::cache_key::hash_file(&path).unwrap();
+        let cache = Mutex::new(HashMap::new());
+        remember_ready_file_hash(&cache, &key, &digest, true, |path| {
+            std::fs::write(path, b"changed after the read")?;
+            FileFingerprint::from_path(path)
+        });
+        assert!(cache.lock().unwrap().is_empty());
+        remember_ready_file_hash(&cache, &key, &digest, false, |_| {
+            panic!("unsettled data cannot be published")
+        });
+        remember_ready_file_hash(&cache, &key, &digest, true, |_| {
+            anyhow::bail!("stat failed")
+        });
+        assert!(cache.lock().unwrap().is_empty());
+        for field in 0..5 {
+            let mut changed = key.fingerprint();
+            match field {
+                0 => changed.path.push('x'),
+                1 => changed.size += 1,
+                2 => changed.mtime_ns += 1,
+                3 => changed.ctime_ns += 1,
+                _ => changed.inode += 1,
+            }
+            remember_ready_file_hash(&cache, &key, &digest, true, |_| Ok(changed));
+            assert!(cache.lock().unwrap().is_empty());
+        }
+        remember_ready_file_hash(&cache, &key, &digest, true, |_| Ok(key.fingerprint()));
+        assert_eq!(cache.lock().unwrap().get(&key), Some(&digest));
+        {
+            let mut cache = cache.lock().unwrap();
+            cache.clear();
+            for n in 0..4096 {
+                cache.insert(
+                    FileHashCacheKey::from(&file(root.path(), &format!("cached-{n}"))),
+                    digest.clone(),
+                );
+            }
+        }
+        remember_ready_file_hash(&cache, &key, &digest, true, |_| Ok(key.fingerprint()));
+        assert_eq!(cache.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn warmup_async_dispatch_returns_ready_memory_without_a_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let socket = config.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let daemon = Arc::new(Daemon::new(config));
+        let request = file(root.path(), "ready");
+        let key = FileHashCacheKey::from(&request);
+        let digest = test_cache_key("ready");
+        daemon
+            .file_hash_cache
+            .lock()
+            .unwrap()
+            .insert(key.clone(), digest.clone());
+        let response = one_shot_request(
+            &daemon,
+            &socket,
+            &Request::HashFilesWarmup(HashFilesRequest {
+                files: vec![request],
+            }),
+        )
+        .await;
+        assert!(response.ok);
+        assert_eq!(
+            response.hash_results.unwrap(),
+            vec![key.result(Some(digest))]
+        );
+        assert!(!daemon.file_hash_warmup.state.lock().unwrap().running);
+    }
+
+    #[test]
+    fn real_warmup_reuses_its_store_and_persistent_hashes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = [
+            root.path().join("first.lib"),
+            root.path().join("second.lib"),
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, vec![index as u8; 65_537]).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        for path in &paths {
+            loop {
+                let observed = ObservedFingerprint::from_path(path).unwrap();
+                if observed.settled() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixture inputs did not settle");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            requests.push(hash_files_request(path).0.files.remove(0));
+        }
+        let daemon = Daemon::new(test_config(root.path()));
+        for request in &requests {
+            let response = daemon.handle_hash_files_warmup(&HashFilesRequest {
+                files: vec![request.clone()],
+            });
+            assert_eq!(response.hash_results.unwrap()[0].hash, None);
+            wait_state(&daemon, |state| state.pending.is_empty());
+            let expected = crate::cache_key::hash_file(Path::new(&request.path)).unwrap();
+            let ready = daemon.handle_hash_files_warmup(&HashFilesRequest {
+                files: vec![request.clone()],
+            });
+            assert_eq!(
+                ready.hash_results.unwrap(),
+                vec![FileHashCacheKey::from(request).result(Some(expected.clone()))]
+            );
+            daemon.with_store(|store| {
+                assert!(matches!(store.file_hash_lookup(Path::new(&request.path)), FileHashLookup::Hit(hash) if hash == expected));
+                Ok(())
+            }).unwrap();
+        }
+        daemon.file_hash_cache.lock().unwrap().clear();
+        daemon.handle_hash_files_warmup(&HashFilesRequest {
+            files: vec![requests[0].clone()],
+        });
+        wait_state(&daemon, |state| state.pending.is_empty());
+        assert!(
+            daemon
+                .file_hash_cache
+                .lock()
+                .unwrap()
+                .contains_key(&FileHashCacheKey::from(&requests[0]))
+        );
+        stop(&daemon);
+    }
 }

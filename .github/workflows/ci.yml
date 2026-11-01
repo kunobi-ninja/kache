@@ -470,9 +470,9 @@ jobs:
           test -s tmp/mutants/pr.diff
           # Shard 0 checks the unmutated baseline for the whole matrix.
           # The proof-only crate is compiled and exercised by the Kani job.
-          # --timeout also bounds the baseline. Its full suite reached the
-          # final integration binary at 300 s in run 39962317701. Give shard
-          # zero 450 s; keep the other workers' 300 s bound.
+          # A surviving mutant runs the same full suite as the baseline.
+          # The baseline took 322 s in run 41331392122; use its 450 s bound
+          # on every shard so survivors are reported instead of timing out.
           ./scripts/with-test-resources.sh cargo mutants \
             --workspace \
             --all-features \
@@ -485,7 +485,7 @@ jobs:
             --in-place \
             --baseline "${{ matrix.index == 0 && 'run' || 'skip' }}" \
             --caught \
-            --timeout '${{ matrix.index == 0 && 450 || 300 }}' \
+            --timeout 450 \
             --build-timeout 600 \
             --annotations github \
             --output 'tmp/mutants/diff-${{ matrix.display }}'
@@ -758,9 +758,9 @@ jobs:
           shared-key: cuda
           cache-bin: false
           cache-on-failure: false
-      # Pinned CUDA 12.8: mature, version-agnostic for the adapter, and new
-      # enough to cover every flag shape it models. `cuda-toolkit` (not the
-      # `cuda` metapackage) so no kernel driver is installed.
+      # The adapter tests need CUDA 12.8 compilers and runtime headers.
+      # Installing those components avoids unused visual tools and libraries
+      # that exhausted the hosted runner's disk with the full toolkit.
       - name: Install CUDA toolkit
         run: |
           set -euo pipefail
@@ -770,7 +770,9 @@ jobs:
           wget "https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cuda-toolkit-12-8
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            cuda-compiler-12-8 cuda-cudart-dev-12-8
+          sudo apt-get clean
           # GITHUB_PATH only takes effect in later steps: export for the
           # verification below as well.
           export PATH="/usr/local/cuda-12.8/bin:$PATH"

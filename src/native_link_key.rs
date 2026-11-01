@@ -42,7 +42,10 @@ use std::process::Command;
 
 use crate::invocation::InvocationEnv;
 use crate::probe_memo::{self, Material};
+#[cfg(test)]
 use kache_store::file_hash::hash_file;
+
+pub(crate) type WindowsRuntimePreparation<'a> = &'a dyn Fn(&[&Path]) -> Result<()>;
 
 /// What the driver is asked to place, and which of it a key cannot do without.
 ///
@@ -1086,6 +1089,7 @@ impl WindowsProbeEnvironment {
         architecture: &str,
         env: &InvocationEnv,
     ) -> Result<()> {
+        let _trace = crate::phase_trace::phase("native_msvc_discovery");
         self.validate_discovery_probe()?;
         // find-msvc-tools' architecture fallback spawns cl.exe with inherited
         // process state. Supply the result of our own isolated banner probe.
@@ -1793,8 +1797,13 @@ fn run_windows_tool_in_for(
     environment: &[(OsString, OsString)],
     env: &InvocationEnv,
 ) -> Result<String> {
+    let _trace = crate::phase_trace::phase("native_msvc_banner");
+    let digest = || {
+        let _trace = crate::phase_trace::phase("native_msvc_banner_hash");
+        probe_memo::file_digest(path)
+    };
     let before = (memo_dir.is_some() && memoises_banner(tool))
-        .then(|| probe_memo::file_digest(path))
+        .then(digest)
         .flatten();
     let memo = memo_dir
         .zip(before.as_deref())
@@ -1806,9 +1815,12 @@ fn run_windows_tool_in_for(
     {
         return Ok(banner);
     }
-    let output = windows_tool_command_for(tool, path, environment, env)?
-        .invocation_output()
-        .with_context(|| format!("running {} at {}", tool.name(), path.display()))?;
+    let output = {
+        let _trace = crate::phase_trace::phase("native_msvc_banner_run");
+        windows_tool_command_for(tool, path, environment, env)?
+            .invocation_output()
+            .with_context(|| format!("running {} at {}", tool.name(), path.display()))?
+    };
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1816,7 +1828,7 @@ fn run_windows_tool_in_for(
     );
     let banner = validate_tool_banner(tool, &text)?;
     if let Some((memo_path, key)) = &memo
-        && probe_memo::file_digest(path) == before
+        && digest() == before
     {
         probe_memo::write_verified(memo_path, key, &text);
     }
@@ -2337,6 +2349,7 @@ impl WindowsDefaultLibrary {
     }
 }
 
+#[cfg(test)]
 fn hash_windows_runtime_libraries(
     environment: &WindowsProbeEnvironment,
     architecture: &str,
@@ -2344,6 +2357,30 @@ fn hash_windows_runtime_libraries(
     ucrt_version: &str,
     additional_dirs: &[PathBuf],
 ) -> Result<BTreeMap<String, String>> {
+    hash_windows_runtime_libraries_with_hash(
+        environment,
+        architecture,
+        sdk_version,
+        ucrt_version,
+        additional_dirs,
+        hash_file,
+        None,
+    )
+}
+
+fn hash_windows_runtime_libraries_with_hash<HashRuntime>(
+    environment: &WindowsProbeEnvironment,
+    architecture: &str,
+    sdk_version: &str,
+    ucrt_version: &str,
+    additional_dirs: &[PathBuf],
+    hash_runtime: HashRuntime,
+    prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
+) -> Result<BTreeMap<String, String>>
+where
+    HashRuntime: Fn(&Path) -> Result<String>,
+{
+    let _trace = crate::phase_trace::phase("native_msvc_runtime");
     let directories = windows_library_dirs(
         environment,
         architecture,
@@ -2360,27 +2397,42 @@ fn hash_windows_runtime_libraries(
     // copy further along is never read, so it does not enter the key. A
     // host with two toolsets, such as Firefox's mozbuild toolchain on LIB
     // beside the machine's Visual Studio, has several copies that differ.
-    let mut libraries = BTreeMap::new();
+    let mut selected = Vec::new();
     for name in MSVC_RUNTIME.iter().chain(VCRUNTIME).chain(UCRT) {
-        let found = first_windows_library(&directories, &[(*name).to_string()])?;
-        if let Some(path) = found {
+        if let Some(path) = first_windows_library(&directories, &[(*name).to_string()])? {
             let requested = environment
                 .requested_default_libraries
                 .contains(&WindowsDefaultLibrary(name));
-            let digest = hash_windows_runtime_library(&path, requested)
-                .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
-            libraries.insert((*name).to_string(), digest);
+            selected.push((*name, path, requested));
         }
     }
-    let has_crt = ["libcmt.lib", "libcmtd.lib", "msvcrt.lib", "msvcrtd.lib"]
-        .iter()
-        .any(|name| libraries.contains_key(*name))
-        && VCRUNTIME.iter().any(|name| libraries.contains_key(*name));
+    let has = |name: &&str| selected.iter().any(|(selected, _, _)| selected == name);
+    let has_crt = MSVC_RUNTIME.iter().any(has) && VCRUNTIME.iter().any(has);
     if !has_crt {
         bail!("selected MSVC runtime is incomplete (CRT and vcruntime are required)");
     }
-    if !UCRT.iter().any(|name| libraries.contains_key(*name)) {
+    if !UCRT.iter().any(has) {
         bail!("no selected UCRT library was found in LIB");
+    }
+    if let Some(prepare) = prepare_runtime {
+        let ordinary: Vec<_> = selected
+            .iter()
+            .filter(|(_, _, requested)| !*requested)
+            .map(|(_, path, _)| path.as_path())
+            .collect();
+        prepare(&ordinary)?;
+    }
+    let mut libraries = BTreeMap::new();
+    for (name, path, requested) in selected {
+        // DEFAULTLIB retains a fresh format proof from the same read as its
+        // digest. Only ordinary runtime files can use prepared memo hashes.
+        let digest = if requested {
+            hash_windows_default_library(&path)
+        } else {
+            hash_runtime(&path)
+        }
+        .with_context(|| format!("hashing MSVC runtime library {}", path.display()))?;
+        libraries.insert(name.to_string(), digest);
     }
     Ok(libraries)
 }
@@ -2389,10 +2441,7 @@ fn hash_windows_runtime_libraries(
 // runtime hashes retain the existing streaming path and its digest format.
 const MAX_WINDOWS_DEFAULTLIB_BYTES: usize = 64 << 20;
 
-fn hash_windows_runtime_library(path: &Path, requested: bool) -> Result<String> {
-    if !requested {
-        return hash_file(path);
-    }
+fn hash_windows_default_library(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening explicit DEFAULTLIB {}", path.display()))?;
@@ -2439,11 +2488,13 @@ where
         link_libraries,
         &[],
         hash_library,
+        hash_file,
         &InvocationEnv::capture(),
+        None,
     )
 }
 
-pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
+pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary, HashRuntime>(
     linker: Option<&Path>,
     target_architecture: &str,
     rustc_tool_dirs: &[PathBuf],
@@ -2452,11 +2503,15 @@ pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary>(
     link_libraries: &[String],
     requested_default_libraries: &[WindowsDefaultLibrary],
     hash_library: HashLibrary,
+    hash_runtime: HashRuntime,
     env: &InvocationEnv,
+    prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
 ) -> Result<WindowsMsvcIdentity>
 where
     HashLibrary: Fn(&Path) -> Result<String>,
+    HashRuntime: Fn(&Path) -> Result<String>,
 {
+    let _trace = crate::phase_trace::phase("native_msvc");
     let resolve_paths = |paths: &[PathBuf]| {
         paths
             .iter()
@@ -2476,7 +2531,7 @@ where
     environment.requested_default_libraries = requested_default_libraries.to_vec();
     environment.augment_from_installed_msvc(target_architecture, env)?;
     environment.root_invocation_paths(env)?;
-    let mut identity = probe_windows_msvc_identity_with(
+    let mut identity = probe_windows_msvc_identity_with_runtime_hash(
         linker,
         target_architecture,
         &linker_library_dirs,
@@ -2484,6 +2539,8 @@ where
         |tool, path| {
             run_windows_tool_for(tool, path, environment.command_environment(tool, path), env)
         },
+        hash_runtime,
+        prepare_runtime,
     )?;
     let directories = windows_library_dirs(
         &environment,
@@ -2504,15 +2561,40 @@ where
 /// Test seam for [`probe_windows_msvc_identity_with_library_dirs`]. The callback supplies tool
 /// output, so all selection, banner validation, version and library rules can
 /// run on macOS/Linux without executing Windows binaries.
+#[cfg(test)]
 pub(crate) fn probe_windows_msvc_identity_with<F>(
     linker: Option<&Path>,
     target_architecture: &str,
     additional_library_dirs: &[PathBuf],
     environment: &WindowsProbeEnvironment,
-    mut tool_output: F,
+    tool_output: F,
 ) -> Result<WindowsMsvcIdentity>
 where
     F: FnMut(WindowsTool, &Path) -> Result<String>,
+{
+    probe_windows_msvc_identity_with_runtime_hash(
+        linker,
+        target_architecture,
+        additional_library_dirs,
+        environment,
+        tool_output,
+        hash_file,
+        None,
+    )
+}
+
+pub(crate) fn probe_windows_msvc_identity_with_runtime_hash<F, HashRuntime>(
+    linker: Option<&Path>,
+    target_architecture: &str,
+    additional_library_dirs: &[PathBuf],
+    environment: &WindowsProbeEnvironment,
+    mut tool_output: F,
+    hash_runtime: HashRuntime,
+    prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
+) -> Result<WindowsMsvcIdentity>
+where
+    F: FnMut(WindowsTool, &Path) -> Result<String>,
+    HashRuntime: Fn(&Path) -> Result<String>,
 {
     for variable in ["LINK", "_LINK_"] {
         if environment.var(variable).is_some() {
@@ -2597,12 +2679,14 @@ where
         "Include",
         "UCRT",
     )?;
-    let libraries = hash_windows_runtime_libraries(
+    let libraries = hash_windows_runtime_libraries_with_hash(
         environment,
         &architecture,
         &sdk,
         &ucrt,
         additional_library_dirs,
+        hash_runtime,
+        prepare_runtime,
     )?;
     Ok(WindowsMsvcIdentity {
         linker: linker_banner,
@@ -3152,7 +3236,9 @@ esac
                 &[],
                 &[],
                 hash_file,
+                hash_file,
                 env,
+                None,
             )
             .unwrap();
             let cwd = env.cwd().unwrap();
@@ -3248,6 +3334,208 @@ esac
             cwd: Some(directory.to_path_buf()),
             ..WindowsProbeEnvironment::default()
         }
+    }
+
+    #[test]
+    fn windows_runtime_hash_memos_preserve_keys_and_revalidate_edits() {
+        use crate::cache_key::{FileHasher, wall_clock_ns};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let environment = windows_environment(root, "x64");
+        for (name, byte) in [
+            ("libcmt.lib", b'c'),
+            ("libvcruntime.lib", b'v'),
+            ("ucrt.lib", b'u'),
+        ] {
+            std::fs::write(root.join(name), vec![byte; 70_000]).unwrap();
+        }
+        let index = root.join("index.db");
+        let run = |hasher: &FileHasher<'_>| {
+            probe_windows_msvc_identity_with_runtime_hash(
+                None,
+                "x64",
+                &[],
+                &environment,
+                |tool, _| {
+                    Ok(match tool {
+                        WindowsTool::Link => LINK_BANNER.to_owned(),
+                        WindowsTool::Cl => compiler_banner("x64"),
+                        WindowsTool::LldLink => panic!("fixture selected LINK"),
+                    })
+                },
+                |path| hasher.hash(path),
+                None,
+            )
+            .unwrap()
+        };
+        let cold = FileHasher::persistent(&index);
+        let first = run(&cold);
+        assert_eq!(cold.stats().cache_misses, 3);
+        assert_eq!(cold.stats().bytes_hashed, 210_000);
+        for (name, digest) in &first.libraries {
+            assert_eq!(*digest, hash_file(&root.join(name)).unwrap());
+        }
+        cold.flush_memo_as_if_settled();
+        drop(cold);
+
+        let mut warm = FileHasher::persistent(&index);
+        warm.arm_too_new_guard(wall_clock_ns().saturating_add(10_000_000_000), 0);
+        assert_eq!(run(&warm).encode(), first.encode());
+        assert_eq!(warm.stats().cache_hits, 3);
+        assert_eq!(warm.stats().bytes_hashed, 0);
+        assert!(!warm.inputs_changed_since_keyed());
+        let path = root.join("ucrt.lib");
+        let before = kache_store::file_hash::FileFingerprint::from_path(&path).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kache_store::file_hash::stamp_clock_ns() <= before.ctime_ns.saturating_add(20_000_000)
+        {
+            assert!(std::time::Instant::now() < deadline, "stamp clock stalled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::write(&path, vec![b'n'; 70_000]).unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        assert!(warm.inputs_changed_since_keyed());
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
+            &warm.take_guarded_inputs()
+        ));
+
+        let changed = FileHasher::persistent(&index);
+        let second = run(&changed);
+        assert_ne!(second.encode(), first.encode());
+        assert_eq!(
+            second.libraries["ucrt.lib"],
+            blake3::hash(&vec![b'n'; 70_000]).to_hex().to_string()
+        );
+        assert_eq!(changed.stats().cache_hits, 2);
+        assert_eq!(changed.stats().cache_misses, 1);
+        assert_eq!(changed.stats().bytes_hashed, 70_000);
+    }
+
+    #[test]
+    fn windows_runtime_prepare_batches_selected_ordinary_files_before_hashing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut environment = windows_environment(root.path(), "x64");
+        environment.requested_default_libraries = vec![WindowsDefaultLibrary("ucrt.lib")];
+        let closed = crate::native_archive::closed_coff_archive_for_tests(b"explicit default");
+        std::fs::write(root.path().join("ucrt.lib"), &closed).unwrap();
+        let prepared = std::cell::Cell::new(false);
+        let calls = std::cell::Cell::new(0);
+        let prepare = |paths: &[&Path]| {
+            calls.set(calls.get() + 1);
+            assert_eq!(
+                paths,
+                [
+                    root.path().join("libcmt.lib").as_path(),
+                    root.path().join("libvcruntime.lib").as_path()
+                ]
+            );
+            prepared.set(true);
+            Ok(())
+        };
+        let reads = std::cell::Cell::new(0);
+        let libraries = hash_windows_runtime_libraries_with_hash(
+            &environment,
+            "x64",
+            "10",
+            "10",
+            &[],
+            |path| {
+                assert!(prepared.get());
+                reads.set(reads.get() + 1);
+                hash_file(path)
+            },
+            Some(&prepare),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            libraries["ucrt.lib"],
+            blake3::hash(&closed).to_hex().to_string()
+        );
+        std::fs::write(root.path().join("ucrt.lib"), b"invalid explicit archive").unwrap();
+        let pending = |paths: &[&Path]| {
+            assert_eq!(paths.len(), 2);
+            Err(crate::cache_key::NativeRuntimeHashesWarming.into())
+        };
+        let error = hash_windows_runtime_libraries_with_hash(
+            &environment,
+            "x64",
+            "10",
+            "10",
+            &[],
+            |_| panic!("no scalar read while pending"),
+            Some(&pending),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::cache_key::NativeRuntimeHashesWarming>()
+                .is_some(),
+            "DEFAULTLIB validation must wait too"
+        );
+    }
+
+    #[test]
+    fn windows_runtime_family_requirements_are_checked_before_prepare_or_reads() {
+        for missing in ["libvcruntime.lib", "ucrt.lib"] {
+            let root = tempfile::tempdir().unwrap();
+            let environment = windows_environment(root.path(), "x64");
+            std::fs::remove_file(root.path().join(missing)).unwrap();
+            let prepare = |_: &[&Path]| -> Result<()> { panic!("incomplete family cannot warm") };
+            assert!(
+                hash_windows_runtime_libraries_with_hash(
+                    &environment,
+                    "x64",
+                    "10",
+                    "10",
+                    &[],
+                    |_| panic!("incomplete family cannot hash"),
+                    Some(&prepare)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_hashes_work_without_strong_filesystem_identity() {
+        use crate::cache_key::FileHasher;
+        let directory = tempfile::tempdir().unwrap();
+        let environment = windows_environment(directory.path(), "x64");
+        for name in ["libcmt.lib", "libvcruntime.lib", "ucrt.lib"] {
+            std::fs::write(directory.path().join(name), vec![b'r'; 70_000]).unwrap();
+        }
+        let index = directory.path().join("index.db");
+        kache_store::file_hash::with_weak_windows_fingerprints_for_tests(|| {
+            let run = || {
+                let hasher = FileHasher::persistent(&index);
+                let libraries = hash_windows_runtime_libraries_with_hash(
+                    &environment,
+                    "x64",
+                    "10",
+                    "10",
+                    &[],
+                    |path| hasher.hash(path),
+                    None,
+                )
+                .unwrap();
+                hasher.flush_memo_as_if_settled();
+                assert_eq!(hasher.stats().cache_hits, 0);
+                assert_eq!(hasher.stats().cache_misses, 3);
+                assert_eq!(hasher.stats().bytes_hashed, 210_000);
+                libraries
+            };
+            let first = run();
+            assert_eq!(run(), first);
+            assert_eq!(
+                first["ucrt.lib"],
+                blake3::hash(&vec![b'r'; 70_000]).to_hex().to_string()
+            );
+        });
     }
 
     #[test]
@@ -4637,7 +4925,7 @@ esac
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(67_108_865).unwrap(); // One byte above the independent 64 MiB limit.
         drop(file);
-        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        let error = hash_windows_default_library(&path).unwrap_err();
         assert!(error.to_string().contains("at most 64 MiB"), "{error:#}");
         std::fs::OpenOptions::new()
             .write(true)
@@ -4645,12 +4933,12 @@ esac
             .unwrap()
             .set_len(67_108_864)
             .unwrap();
-        let error = hash_windows_runtime_library(&path, true).unwrap_err();
+        let error = hash_windows_default_library(&path).unwrap_err();
         assert!(
             error.to_string().contains("supported closed COFF archive"),
             "an exactly 64 MiB regular file reaches format validation: {error:#}"
         );
-        assert!(hash_windows_runtime_library(root.path(), true).is_err());
+        assert!(hash_windows_default_library(root.path()).is_err());
     }
 
     #[test]

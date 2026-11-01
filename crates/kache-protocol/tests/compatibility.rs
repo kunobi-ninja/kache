@@ -62,6 +62,32 @@ fn hash_requests_preserve_fingerprints_and_accept_pre_inode_clients() {
 }
 
 #[test]
+fn hash_warmup_reuses_file_fingerprints_and_old_daemons_reject_the_command() {
+    use kache_protocol::Request;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OldRequest {
+        HashFiles(HashFilesRequest),
+    }
+
+    let files = json!({"files": [
+        {"path": "/runtime.lib", "size": 65537, "mtime_ns": 1, "ctime_ns": 2, "inode": 3}
+    ]});
+    let wire = json!({"hash_files_warmup": files.clone()});
+    let request: Request = from_value(wire.clone()).unwrap();
+    assert!(request.is_build_activity());
+    assert_eq!(request.client_version(), None);
+    let Request::HashFilesWarmup(ref payload) = request else {
+        panic!("expected warmup")
+    };
+    assert_eq!(to_value(payload).unwrap(), files);
+    assert_eq!(to_value(request).unwrap(), wire);
+    assert!(from_value::<OldRequest>(wire).is_err());
+    let OldRequest::HashFiles(old) = from_value(json!({"hash_files": files.clone()})).unwrap();
+    assert_eq!(to_value(old).unwrap(), files);
+}
+
+#[test]
 fn clients_cannot_inject_daemon_prefetch_attribution() {
     let request: PrefetchRequest = from_value(json!({
         "keys": [], "origin": {"session_id": "forged"},

@@ -1,6 +1,6 @@
 //! Opt-in, monotonic wrapper intervals for Perfetto diagnostics.
-//! One file per wrapper avoids a shared trace lock during concurrent builds.
-//! This records the calling thread; it does not infer worker-thread intervals.
+//! One file per invocation avoids a shared trace lock during concurrent builds.
+//! Each participating thread owns its recorder; intervals are never inferred.
 
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -137,6 +137,11 @@ impl Drop for Invocation {
         }
         let recorder = ACTIVE.with(|active| active.borrow_mut().take());
         if let Some(mut recorder) = recorder {
+            let scope = if recorder.adapter == "native-runtime-warmup" {
+                "worker-thread"
+            } else {
+                "wrapper-thread"
+            };
             let elapsed = micros(recorder.start.elapsed());
             let root = json!({
                 "name": recorder.unit, "cat": recorder.adapter, "ph": "X",
@@ -156,7 +161,7 @@ impl Drop for Invocation {
                     &json!({
                         "traceEvents": recorder.events,
                         "displayTimeUnit": "ms",
-                        "kache_trace": {"version": 1, "clock": "monotonic", "scope": "wrapper-thread"},
+                        "kache_trace": {"version": 1, "clock": "monotonic", "scope": scope},
                     }),
                 )?;
                 file.keep().map_err(|error| error.error)?;
@@ -219,6 +224,7 @@ mod tests {
             .unwrap()
             .path();
         let data: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(data["kache_trace"]["scope"], "wrapper-thread");
         let events = data["traceEvents"].as_array().unwrap();
         assert_eq!(events[0]["name"], "subject");
         let named = |name| events.iter().find(|e| e["name"] == name).unwrap();

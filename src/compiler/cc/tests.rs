@@ -7613,6 +7613,33 @@ fn header_probe_scanner_binds_constant_arguments_to_token_paste_helpers() {
     }
 }
 
+/// The Windows SDK's specstrings_strict.h, which every unit that includes
+/// windows.h reads, names macros with `$`; refusing them left every C and C++
+/// unit of a Windows target uncached.
+#[test]
+fn header_probe_scanner_reads_dollars_as_part_of_a_name() {
+    let text = b"#define __allowed(p) __$allowed_##p\n#define __$allowed_as_global_decl /* empty */\n#define __$allowed_as_statement_with_arg(x) __pragma(warning(push)) __pragma(warning(pop))\n#define __$allowed_as_statement __$allowed_as_statement_with_arg(1)\nint x;\n";
+    assert_eq!(cc_header_probes(text), Some(Vec::new()));
+    // A probe behind such a name is still a probe.
+    for text in [
+        "#define HAS$ __has_include\n#if HAS$(<optional.h>)\n#endif\n",
+        "#define $HAS(x) __has_include(x)\n#if $HAS(<optional.h>)\n#endif\n",
+        "#define H$S(x) __has_include(x)\n#if H$S(<optional.h>)\n#endif\n",
+    ] {
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![CcHeaderProbe {
+                name: "optional.h".into(),
+                quoted: false
+            }]),
+            "{text}"
+        );
+    }
+    // And so is one its body builds by pasting a dollar name's parts.
+    let text = b"#define J$(a,b) a##b\n#define $HAS(x) __has_include(x)\n#if J$($H,AS)(<optional.h>)\n#endif\n";
+    assert_eq!(cc_header_probes(text), None);
+}
+
 #[test]
 fn header_probe_macro_parameters_shadow_global_paste_helpers() {
     let text = b"#define JOIN(a,b) a##b\n#define SAFE(JOIN) (JOIN)\n#define HAS(x) __has_include(x)\n#if SAFE(1) && HAS(<optional.h>)\n#endif\n";
@@ -7680,10 +7707,10 @@ fn header_probe_scanner_refuses_wrong_arity_even_in_an_inactive_branch() {
 
 #[test]
 fn header_probe_identifiers_exclude_numbers_and_literal_tokens() {
-    for name in ["HAS_INCLUDE", "_HAS", "has2"] {
+    for name in ["HAS_INCLUDE", "_HAS", "has2", "HAS$", "__$allowed"] {
         assert!(cc_header_probe_identifier(name.as_bytes()), "{name}");
     }
-    for token in ["", "7", "2HAS", "HAS(x)", "u8\"HAS\"", "HAS$", ","] {
+    for token in ["", "7", "2HAS", "HAS(x)", "u8\"HAS\"", ","] {
         assert!(!cc_header_probe_identifier(token.as_bytes()), "{token}");
     }
 }

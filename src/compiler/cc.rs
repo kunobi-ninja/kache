@@ -5719,7 +5719,7 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = file_hasher.cc_header_scans(&read_inputs, 5, &|path| {
+    let scans = file_hasher.cc_header_scans(&read_inputs, 6, &|path| {
         let bytes = fs::read(path)
             .with_context(|| format!("reading header availability input {}", path.display()))?;
         let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
@@ -6026,7 +6026,16 @@ fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
             scanned_to = end;
             continue;
         }
-        let end = cc_read_token(text, i, &mut CcStringLiterals::default(), &mut false);
+        let mut end = cc_read_token(text, i, &mut CcStringLiterals::default(), &mut false);
+        // The compilers read `$` as part of a name by default, and a Windows
+        // SDK header every unit reads defines `__$allowed_on_parameter`. A
+        // name that holds one stays one token, so it resolves as any other.
+        if byte == b'$' || (cc_word_end(text, i) == end && !byte.is_ascii_digit()) {
+            end += text[end..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+                .count();
+        }
         line.push(i..end);
         scanned_to = end;
     }
@@ -6216,8 +6225,10 @@ fn cc_header_macro_pastes(
 
 fn cc_header_probe_identifier(word: &[u8]) -> bool {
     word.first()
-        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-        && word.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .is_some_and(|b| b.is_ascii_alphabetic() || matches!(*b, b'_' | b'$'))
+        && word
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'$'))
 }
 
 fn cc_header_macro_use(tokens: &[&[u8]], index: usize) -> CcHeaderMacroUse {

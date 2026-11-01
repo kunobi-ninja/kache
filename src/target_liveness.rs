@@ -1202,6 +1202,52 @@ mod tests {
         assert!(prune(&config, &target, &workspace, None, SystemTime::now()).is_err());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_valid_receipt_preview_keeps_a_program_started_without_cargo() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = 'preview'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let target = workspace.join("target");
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let child = crate::target_processes::tests::RunningProgram::start(&target);
+        std::fs::create_dir(target.join("debug")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        let identity = crate::machine::directory_identity(&target).unwrap();
+        let mut receipt = receipt_for_test(vec![]);
+        receipt.target = target.clone();
+        receipt.workspace = workspace.clone();
+        receipt.device = identity.device;
+        receipt.inode = identity.inode;
+        receipt.environment = environment_digest();
+        receipt.inputs = source_snapshot(&workspace, &target, &config.cache_dir).unwrap();
+        let path = receipt_path(&config, &target);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        validated(&config, &target, &workspace).unwrap();
+        assert!(
+            !crate::cli::target_in_use(&target),
+            "this program holds no Cargo lock"
+        );
+        let busy = preview(&config, &target, &workspace);
+        assert_eq!(busy.status, "busy");
+        assert_eq!(busy.command, receipt.command);
+        assert_eq!(busy.units, 0);
+        drop(child);
+        assert_eq!(preview(&config, &target, &workspace).status, "ready");
+    }
+
     fn unit(live: bool, known: bool, seconds: u64) -> ObservedUnit {
         ObservedUnit {
             fingerprint: PathBuf::from("/target/debug/.fingerprint/pkg-0123456789abcdef"),

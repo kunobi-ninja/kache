@@ -168,8 +168,10 @@ fn build_units(
     env: &[(&str, &str)],
 ) -> BTreeMap<String, Value> {
     let mut command = hermetic_command("cargo", cache, Some(&isolated_config_path(cache)));
+    // Compiler events have a 5 ms lock budget and may be dropped under
+    // contention. This regression needs every unit's event, so build serially.
     command
-        .args(["build", "--offline", "--quiet", "--workspace"])
+        .args(["build", "--offline", "--quiet", "--workspace", "--jobs=1"])
         .current_dir(workspace)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", target)

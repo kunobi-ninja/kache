@@ -1,0 +1,93 @@
+name: Maintainer native runtime warmup
+
+on:
+  push:
+    branches: [validation/preflight-1797-runtime-warmup]
+    paths: [.github/workflows/native-runtime-warmup.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Runtime warmup (${{ matrix.runner }})
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1797-runtime-warmup'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      EXPECTED_HEAD: c9cd3396400b06ace833ffdfc700d318fd41f576
+      EXPECTED_TREE: 1b8a7dbb2bc5874ac09d4516bd485bc57625f286
+    steps:
+      - name: Require an ephemeral hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Hosted runner required' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'runtime-warmup-evidence'
+          [void][IO.Directory]::CreateDirectory($evidence)
+          "EVIDENCE_DIR=$evidence" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'runtime-warmup-target')" >> $env:GITHUB_ENV
+          "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: c9cd3396400b06ace833ffdfc700d318fd41f576
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - name: Verify source and parse the owned fixture
+        run: |
+          if ((git rev-parse HEAD) -ne $env:EXPECTED_HEAD) { throw 'Wrong head' }
+          if ((git rev-parse 'HEAD^{tree}') -ne $env:EXPECTED_TREE) { throw 'Wrong tree' }
+          "tested_head=$env:EXPECTED_HEAD`ntested_tree=$env:EXPECTED_TREE" | Add-Content (Join-Path $env:EVIDENCE_DIR 'provenance.txt')
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd 'scripts/adoption/windows-runtime-warmup-probe.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) {
+            $errors | Format-List | Out-String | Write-Output
+            throw 'Fixture syntax is invalid'
+          }
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+        if: matrix.runner != 'windows-11-arm'
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: --force rust
+          cache: false
+          reshim: false
+      - name: Test native warmup and compatibility controls
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          rustc --version --verbose | Tee-Object (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler unavailable' }
+          cargo test --locked -p kache --lib warmup -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'warmup-tests.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Warmup tests failed' }
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'clippy.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Native clippy failed' }
+      - name: Build candidate binaries
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --locked -p kache --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate build failed' }
+          Get-FileHash -Algorithm SHA256 (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe'), (Join-Path $env:CARGO_TARGET_DIR 'debug/kache-engine.exe') | Format-List | Out-String | Set-Content (Join-Path $env:EVIDENCE_DIR 'binary-hashes.txt')
+      - name: Prove cold compilation, later cache hits, and the blocking opt-out
+        run: |
+          ./scripts/adoption/windows-runtime-warmup-probe.ps1 -Kache (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe') -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'candidate')
+      - name: Upload native acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-warmup-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,52 @@
+name: Manifest merger discovery
+on:
+  push:
+    branches: [validation/manifest-merger-discovery]
+    paths:
+      - .github/workflows/manifest-merger-discovery.yml
+      - scripts/adoption/manifest-merger-discovery.ps1
+permissions:
+  contents: read
+jobs:
+  discover:
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/manifest-merger-discovery'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTUP_TOOLCHAIN: 1.99.1
+    steps:
+      - name: Require ephemeral hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Hosted runner required' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'manifest-merger-evidence'
+          "EVIDENCE_DIR=$evidence" >> $env:GITHUB_ENV
+          [IO.Directory]::CreateDirectory((Join-Path $env:RUNNER_TEMP 'manifest-provenance')) | Out-Null
+          "source=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $env:RUNNER_TEMP 'manifest-provenance/provenance.txt')
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install pinned native Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Toolchain install failed' }
+          rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler unavailable' }
+      - name: Observe manifest merger resolution
+        run: |
+          ./scripts/adoption/manifest-merger-discovery.ps1 -OutputDirectory $env:EVIDENCE_DIR
+      - name: Upload observations
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manifest-merger-discovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}
+            ${{ runner.temp }}/manifest-provenance
+          retention-days: 7
+          if-no-files-found: error

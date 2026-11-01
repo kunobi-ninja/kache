@@ -579,6 +579,92 @@ fn index_auto_compact_is_on_by_default_and_obeys_env_precedence() {
 }
 
 #[test]
+fn index_mode_defaults_to_auto_and_obeys_invocation_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let loaded = |value: Option<&str>| {
+        let mut vars = vec![
+            (
+                "KACHE_CONFIG".to_owned(),
+                config_path.to_string_lossy().into_owned(),
+            ),
+            ("KACHE_HOST_CONFIG".into(), String::new()),
+            ("CI".into(), "true".into()),
+            ("GITHUB_ACTIONS".into(), "true".into()),
+        ];
+        if let Some(value) = value {
+            vars.push(("KACHE_INDEX_MODE".into(), value.into()));
+        }
+        let invocation = InvocationEnv::from_parts(
+            vars,
+            Some(dir.path().to_owned()),
+            Some(dir.path().to_owned()),
+            dir.path().to_owned(),
+        );
+        Config::load_for(&invocation).unwrap().index_mode
+    };
+
+    // Even CI starts with auto, which currently resolves to conservative.
+    assert_eq!(loaded(None), IndexMode::Auto);
+
+    for (value, expected) in [
+        ("auto", IndexMode::Auto),
+        ("conservative", IndexMode::Conservative),
+        ("off", IndexMode::Off),
+    ] {
+        std::fs::write(&config_path, format!("[cache]\nindex_mode = \"{value}\"\n")).unwrap();
+        assert_eq!(loaded(None), expected);
+    }
+
+    std::fs::write(&config_path, "[cache]\nindex_mode = \"off\"\n").unwrap();
+    assert_eq!(loaded(Some(" Conservative ")), IndexMode::Conservative);
+    assert_eq!(loaded(Some("auto")), IndexMode::Auto);
+    for ignored in ["", "  ", "normal", "full"] {
+        assert_eq!(loaded(Some(ignored)), IndexMode::Off, "{ignored:?}");
+    }
+
+    std::fs::write(&config_path, "[cache]\nindex_mode = \"conservative\"\n").unwrap();
+    assert_eq!(loaded(Some("off")), IndexMode::Off);
+
+    for value in ["", "  ", "normal", "fast"] {
+        std::fs::write(&config_path, format!("[cache]\nindex_mode = \"{value}\"\n")).unwrap();
+        assert_eq!(loaded(None), IndexMode::Auto, "{value:?}");
+    }
+
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nindex_mode = \"conservative\"\n",
+    )
+    .unwrap();
+    assert_eq!(loaded(Some("off")), IndexMode::Conservative);
+
+    std::fs::write(&config_path, "[cache]\nignore_env = true\n").unwrap();
+    assert_eq!(loaded(Some("off")), IndexMode::Auto);
+}
+
+#[test]
+fn store_config_carries_the_index_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    for (value, expected) in [
+        ("auto", IndexMode::Auto),
+        ("conservative", IndexMode::Conservative),
+        ("off", IndexMode::Off),
+    ] {
+        let invocation = InvocationEnv::from_parts(
+            vec![("KACHE_INDEX_MODE", value), ("KACHE_HOST_CONFIG", "")],
+            Some(dir.path().to_owned()),
+            Some(dir.path().to_owned()),
+            dir.path().to_owned(),
+        );
+        let config = Config::load_resolved_for(&invocation, Ok(FileConfig::default())).unwrap();
+        assert_eq!(
+            kache_core::store_config::Config::from(&config).index_mode,
+            expected
+        );
+    }
+}
+
+#[test]
 fn target_cleanup_defaults_and_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -2828,6 +2914,7 @@ fn test_file_config_roundtrip() {
             daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
+            index_mode: None,
             auto_clean_orphaned_targets: None,
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
@@ -3489,6 +3576,7 @@ fn test_config_store_dir() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_mode: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -3578,6 +3666,7 @@ fn test_config_index_db_path() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_mode: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -3663,6 +3752,7 @@ fn test_config_event_log_path() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_mode: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -3767,6 +3857,7 @@ fn test_config_socket_path() {
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
+        index_mode: Default::default(),
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
@@ -4507,6 +4598,7 @@ fn test_save_and_load_file_config() {
             daemon_execution_concurrency: None,
             auto_gc: None,
             index_auto_compact: None,
+            index_mode: None,
             auto_clean_orphaned_targets: None,
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,

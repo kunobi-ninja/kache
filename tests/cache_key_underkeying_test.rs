@@ -150,6 +150,8 @@ fn compiled_hit_counts(cache_dir: &Path) -> (u64, u64) {
     assert!(output.status.success(), "kache report failed");
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("report should be valid json");
+    // Keep skipped-cache reasons in the output of a failed count assertion.
+    eprintln!("cache report: {report}");
     let s = &report["summary"];
     let compiled = s["dups"].as_u64().unwrap_or(0) + s["misses"].as_u64().unwrap_or(0);
     (compiled, s["local_hits"].as_u64().unwrap_or(0))
@@ -159,6 +161,8 @@ fn fresh_src() -> (TempDir, PathBuf) {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("lib.rs");
     std::fs::write(&src, b"pub fn f() -> u32 { 42 }\n").unwrap();
+    // A cold compile must be allowed to store before the warm-hit check.
+    common::settle_writes(&[dir.path()]);
     (dir, src)
 }
 

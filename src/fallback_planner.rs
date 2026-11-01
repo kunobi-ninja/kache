@@ -526,6 +526,7 @@ mod tests {
             project_rules: crate::config::ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
+            index_mode: Default::default(),
             auto_clean_orphaned_targets: true,
             auto_share_target_files: true,
             auto_clean_idle_targets_days: 0,

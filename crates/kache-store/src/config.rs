@@ -1,1 +1,1 @@
-pub use kache_core::store_config::Config;
+pub use kache_core::store_config::{Config, IndexMode};

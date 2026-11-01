@@ -5,7 +5,10 @@ use std::io::Write;
 use std::path::Path;
 
 pub(super) fn checks(config: &Config) -> Vec<Check> {
-    let mut checks = vec![access_check(&config.cache_dir, &config.index_db_path())];
+    let mut checks = vec![
+        access_check(&config.cache_dir, &config.index_db_path()),
+        index_mode_check(config.index_mode),
+    ];
     #[cfg(unix)]
     checks.push(file_limits_check());
     let marker = crate::wrapper::warn_marker_path("store", &config.cache_dir);
@@ -13,6 +16,21 @@ pub(super) fn checks(config: &Config) -> Vec<Check> {
         checks.push(check);
     }
     checks
+}
+
+fn index_mode_check(mode: kache_core::store_config::IndexMode) -> Check {
+    let effective = mode.resolve();
+    Check {
+        label: "Index mode",
+        pass: true,
+        detail: format!(
+            "configured {} -> {} (SQLite synchronous={}) for this process",
+            mode.as_str(),
+            effective.as_str(),
+            effective.pragma_value()
+        ),
+        fix: None,
+    }
 }
 
 /// Keep a small working reserve even when automatic recovery is disabled.
@@ -215,6 +233,42 @@ fn display_limit(limit: libc::rlim_t) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn index_mode_reports_the_configured_and_effective_policy() {
+        use kache_core::store_config::IndexMode;
+
+        for (mode, detail) in [
+            (
+                IndexMode::Auto,
+                "configured auto -> conservative (SQLite synchronous=NORMAL) for this process",
+            ),
+            (
+                IndexMode::Conservative,
+                "configured conservative -> conservative (SQLite synchronous=NORMAL) for this process",
+            ),
+            (
+                IndexMode::Off,
+                "configured off -> off (SQLite synchronous=OFF) for this process",
+            ),
+        ] {
+            let check = index_mode_check(mode);
+            assert_eq!(check.label, "Index mode");
+            assert!(check.pass);
+            assert_eq!(check.detail, detail);
+            assert!(check.fix.is_none());
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::test_support::test_config(dir.path().to_owned());
+            config.index_mode = mode;
+            let observations = checks(&config);
+            let reported = observations
+                .iter()
+                .find(|check| check.label == "Index mode")
+                .unwrap();
+            assert_eq!(reported.detail, detail);
+        }
+    }
 
     #[test]
     fn space_and_inode_pressure_are_independent_and_missing_data_is_explicit() {

@@ -2174,6 +2174,7 @@ mod tests {
                 daemon_execution_concurrency: None,
                 auto_gc: None,
                 index_auto_compact: None,
+                index_mode: None,
                 auto_clean_orphaned_targets: None,
                 auto_share_target_files: None,
                 auto_clean_idle_targets_days: None,

@@ -135,6 +135,7 @@ local_max_size = "200GiB"
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
 | `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon heal the blob index and compact `index.db` when the machine is quiet. See [Daemon index maintenance](#daemon-index-maintenance). |
+| `KACHE_INDEX_MODE` | `cache.index_mode` | `auto` | Local index policy: `auto`, `conservative`, or `off`. See [Index mode](#index-mode). |
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_SHARE_TARGET_FILES` | `cache.auto_share_target_files` | `true` | Let the daemon replace target files that are full copies of stored blobs with clones of those blobs. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
@@ -312,6 +313,28 @@ The equivalent environment setting is `KACHE_READONLY_STORE=/kache-host`. The va
 The read-only path is used as configured. `KACHE_TRUST_DOMAIN` isolates your writable store and runtime, but does not change this path. Mount a store that the job is allowed to read for its trust domain.
 
 The local store is not designed for sharing across machines. To share between machines, use a [remote](#remote-settings).
+
+### Index mode
+
+Leave `cache.index_mode = "auto"`, the default, to follow Kache's recommended index policy. Auto currently resolves to `conservative`; both use SQLite WAL mode with `synchronous=NORMAL`. SQLite synchronizes the index at WAL checkpoints. A slow checkpoint can delay processes waiting on the index.
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | Uses the recommended policy. Currently resolves to `conservative`. Future releases may add validated optimizations while preserving the consistency guarantees of `NORMAL`. Auto never selects `off`. |
+| `conservative` | Keeps the established WAL + `NORMAL` policy. Use it to opt out of future automatic policy changes. |
+| `off` | Disables SQLite index synchronization. Select it explicitly for storage discarded with the CI job. |
+
+For example, select the fixed conservative policy with:
+
+```sh
+kache config set cache.index_mode conservative
+```
+
+`KACHE_INDEX_MODE` overrides the file setting unless `cache.ignore_env = true`. Values are case-insensitive and surrounding whitespace is ignored. An unknown or blank value logs a warning and falls back to the next configured source or `auto`.
+
+Each process applies the policy when it opens the index. Restart a running daemon after changing it. `kache doctor` shows the configured and effective mode for its own process; it does not inspect an existing daemon's connection.
+
+`NORMAL` preserves database consistency after a power loss or system crash, but recent transactions may be lost. With `off`, such a failure can corrupt the index. When Kache detects corruption during open, it quarantines the index and attempts to rebuild entries from stored metadata and blobs. Recovery is best-effort: missing or damaged data may require recompilation. Keep `auto` or `conservative` for a persistent cache. CI detection alone never enables `off`.
 
 ### Daemon index maintenance
 

@@ -21,8 +21,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: 02dc32c521f43add02cce54abb809235e8a510a2
-      EXPECTED_TREE: 259f9a71e9fce851bb341532d085a1a398686d35
+      EXPECTED_HEAD: d8ca37f997157f250b132735b285966cb830b748
+      EXPECTED_TREE: 1ec89110645652b6ab1b0fab4b098dca59511949
       BASE_HEAD: cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
     steps:
       - name: Record provenance and require an ephemeral hosted runner
@@ -38,7 +38,7 @@ jobs:
           test "$RUNNER_KIND" = github-hosted
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 02dc32c521f43add02cce54abb809235e8a510a2
+          ref: d8ca37f997157f250b132735b285966cb830b748
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact candidate
@@ -114,8 +114,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: 02dc32c521f43add02cce54abb809235e8a510a2
-      EXPECTED_TREE: 259f9a71e9fce851bb341532d085a1a398686d35
+      EXPECTED_HEAD: d8ca37f997157f250b132735b285966cb830b748
+      EXPECTED_TREE: 1ec89110645652b6ab1b0fab4b098dca59511949
     steps:
       - name: Require hosted runner and record provenance
         env:
@@ -129,7 +129,7 @@ jobs:
           "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 02dc32c521f43add02cce54abb809235e8a510a2
+          ref: d8ca37f997157f250b132735b285966cb830b748
           fetch-depth: 0
           persist-credentials: false
       - name: Verify candidate source

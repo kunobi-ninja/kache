@@ -2397,29 +2397,35 @@ fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
     use crate::cache_key::ObservedFingerprint;
 
     // No tripped flag: nothing to excuse, whatever was recorded.
-    assert!(!key_inputs_changed_during_compile(false, &[]));
+    assert!(!key_inputs_changed_during_compile(
+        false,
+        &crate::cache_key::GuardedInputs::default()
+    ));
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("input.rs");
     std::fs::write(&file, b"pub fn x() {}").unwrap();
     let recorded = ObservedFingerprint::from_path(&file).unwrap();
     assert!(!key_inputs_changed_during_compile(
         false,
-        std::slice::from_ref(&recorded)
+        &vec![recorded.clone()].into()
     ));
     // Tripped flag with nothing verifiable stays a refusal.
-    assert!(key_inputs_changed_during_compile(true, &[]));
+    assert!(key_inputs_changed_during_compile(
+        true,
+        &crate::cache_key::GuardedInputs::default()
+    ));
     #[cfg(unix)]
     {
         // Tripped flag, untouched inputs: a skewed clock, not a race.
         assert!(!key_inputs_changed_during_compile(
             true,
-            std::slice::from_ref(&recorded)
+            &vec![recorded.clone()].into()
         ));
         // Tripped flag, rewritten inputs: a real race.
         std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
         assert!(key_inputs_changed_during_compile(
             true,
-            std::slice::from_ref(&recorded)
+            &vec![recorded.clone()].into()
         ));
     }
 }
@@ -2438,7 +2444,7 @@ fn a_keyed_input_moved_since_the_key_refuses_without_a_tripped_flag() {
     // Old, so the save below gets another write time on any clock.
     filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_000_000, 0)).unwrap();
     let recorded = ObservedFingerprint::from_path(&file).unwrap();
-    let changed = || key_inputs_changed_during_compile(false, std::slice::from_ref(&recorded));
+    let changed = || key_inputs_changed_during_compile(false, &vec![recorded.clone()].into());
     assert!(!changed(), "nothing moved");
     #[cfg(unix)]
     {
@@ -2523,7 +2529,10 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
     ];
     let written = sources_written_since(&hashed, &sources, start);
     assert_eq!(written.len(), 1, "{written:?}");
-    assert!(emitted_sources_changed_during_compile(&written, &[]));
+    assert!(emitted_sources_changed_during_compile(
+        &written,
+        &crate::cache_key::GuardedInputs::default()
+    ));
     assert!(sources_written_since(&hashed, &sources, 0).is_empty());
 
     // A source the hasher recorded nothing for counts as written.
@@ -2562,21 +2571,27 @@ fn a_source_written_during_the_compile_refuses_a_key_derived_after_it() {
         // A settled fingerprint that still matches excuses it: a skewed
         // clock, not a race.
         let earlier = [taken(&module, 0)];
-        assert!(!emitted_sources_changed_during_compile(&written, &earlier));
+        assert!(!emitted_sources_changed_during_compile(
+            &written,
+            &earlier.to_vec().into()
+        ));
         // One taken inside the window does not: a write in the same tick
         // would have kept it matching.
         assert!(emitted_sources_changed_during_compile(
             &written,
-            &[taken(&module, -1)]
+            &vec![taken(&module, -1)].into()
         ));
         // One of another file does not.
         assert!(emitted_sources_changed_during_compile(
             &written,
-            &[taken(&source, 0)]
+            &vec![taken(&source, 0)].into()
         ));
         // A file rewritten since its earlier fingerprint refuses.
         std::fs::write(&module, b"pub fn g() { 1 }").unwrap();
-        assert!(emitted_sources_changed_during_compile(&written, &earlier));
+        assert!(emitted_sources_changed_during_compile(
+            &written,
+            &earlier.to_vec().into()
+        ));
     }
 }
 

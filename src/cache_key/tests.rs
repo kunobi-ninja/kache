@@ -1,5 +1,6 @@
 use super::*;
 use crate::args::RustcArgs;
+use crate::native_link_key::WindowsLinkInput;
 use crate::test_support::process_state_test_lock;
 
 const GNU_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
@@ -1254,6 +1255,12 @@ fn windows_defaultlib_requests_are_not_rustc_libraries() {
 
 #[test]
 fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() {
+    assert_eq!(
+        crate::native_link_key::WindowsDefaultLibrary::parse("-defaultlib:UCRT")
+            .unwrap()
+            .canonical_name(),
+        "ucrt.lib"
+    );
     let dir = tempfile::tempdir().unwrap();
     let invocation = client_invocation(dir.path(), &[]);
     let file_hasher = FileHasher::new_for(&invocation);
@@ -1277,6 +1284,7 @@ fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() 
                     ucrt: "10".into(),
                     architecture: "x64".into(),
                     wrapper: None,
+                    manifest_tool: None,
                     libraries: BTreeMap::from([
                         ("ucrt.lib".into(), "ucrt-digest".into()),
                         ("msvcrt.lib".into(), "msvcrt-digest".into()),
@@ -1293,6 +1301,16 @@ fn windows_defaultlib_requests_change_the_folded_identity_and_require_runtime() 
         key(&["-Clink-args=-defaultlib:UCRT"]).unwrap(),
         requested,
         "both carriers use canonical runtime names"
+    );
+    assert_eq!(
+        key(&["-Clink-arg=/DEFAULTLIB:ucrt.lib", "-Clink-args=/DEBUG"]).unwrap(),
+        key(&["-Clink-args=-defaultlib:UCRT", "-Clink-args=/DEBUG"]).unwrap(),
+        "canonical runtime names survive mixed options"
+    );
+    assert_ne!(
+        key(&["-Clink-arg=/DEFAULTLIB:ucrt.lib", "-Clink-args=/DEBUG"]).unwrap(),
+        key(&["-Clink-args=/DEBUG", "-Clink-arg=/DEFAULTLIB:ucrt.lib"]).unwrap(),
+        "mixed option order remains keyed"
     );
     assert_ne!(
         key(&["-Clink-args=/DEFAULTLIB:ucrt /DEFAULTLIB:msvcrt"]).unwrap(),
@@ -1495,6 +1513,7 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
                         &search_dirs.default_libraries,
                         |path| file_hasher.hash_static_lib(path),
                         &invocation,
+                        None,
                     )?;
                 selected_digest = identity.libraries.get("ucrt.lib").cloned();
                 Ok(identity)
@@ -1598,9 +1617,11 @@ fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
         "rustc".into(),
         "--crate-type=bin".into(),
         r"-Clink-arg=C:\w\target\debug\build\app-1\out\resource.res".into(),
+        r"-Clink-args=/MANIFESTINPUT:C:\w\first.xml".into(),
         "-Clink-arg=/MANIFEST:EMBED".into(),
         "-Clink-arg=/WX".into(),
         r"-Clink-args=/DEBUG C:\w\extra.res".into(),
+        r"-Clink-arg=-manifestinput:C:\w\last.xml".into(),
         r"-Clink-arg=/LIBPATH:C:\shadow".into(),
     ])
     .unwrap();
@@ -1611,8 +1632,12 @@ fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
             linker: vec![PathBuf::from(r"C:\shadow")],
             default_libraries: vec![],
             files: vec![
-                PathBuf::from(r"C:\w\target\debug\build\app-1\out\resource.res"),
-                PathBuf::from(r"C:\w\extra.res"),
+                WindowsLinkInput::Resource(PathBuf::from(
+                    r"C:\w\target\debug\build\app-1\out\resource.res"
+                )),
+                WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\first.xml")),
+                WindowsLinkInput::Resource(PathBuf::from(r"C:\w\extra.res")),
+                WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\last.xml")),
             ],
         }
     );
@@ -1628,8 +1653,6 @@ fn windows_resources_do_not_hide_mixed_search_paths_or_unsupported_files() {
         r"C:\w\a.res /DEF:C:\w\exports.def",
         r"C:\w\a.res C:\w\extra.obj",
         r"C:\w\a.res C:\w\opaque.dat",
-        r"C:\w\a.res /MANIFESTINPUT:C:\w\app.xml",
-        r"/MANIFESTINPUT:C:\w\Manifest.xml",
         r"C:\w\opaque.dat",
     ] {
         let args = RustcArgs::parse(&[
@@ -1708,7 +1731,7 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
                     search_dirs.files,
                     files
                         .iter()
-                        .map(|path| path.to_path_buf())
+                        .map(|path| WindowsLinkInput::Resource(path.to_path_buf()))
                         .collect::<Vec<_>>()
                 );
                 Ok(crate::native_link_key::WindowsMsvcIdentity {
@@ -1719,6 +1742,7 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
                     ucrt: "10".into(),
                     architecture: architecture.into(),
                     wrapper: None,
+                    manifest_tool: None,
                     libraries: BTreeMap::new(),
                 })
             },
@@ -1761,7 +1785,7 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
     );
     for argument in [
         "C:/extra.obj",
-        "/MANIFESTINPUT:C:/app.xml",
+        "/MANIFESTINPUT:app.xml",
         "/LIBPATH:C:/other C:/extra.res",
     ] {
         assert!(key(&files, Some(argument)).is_err(), "{argument}");
@@ -1794,7 +1818,7 @@ fn windows_resource_hash_rejects_truncated_headers_and_renamed_containers() {
     let identity = || {
         windows_link_identity_with_argument_files(
             "linker=LINK 14".into(),
-            std::slice::from_ref(&path),
+            &[WindowsLinkInput::Resource(path.clone())],
             &file_hasher,
         )
     };
@@ -1887,6 +1911,568 @@ fn windows_resource_validation_reads_after_the_guarded_stat() {
         guarded
             .iter()
             .any(|input| input.fingerprint.size == original.len() as i64)
+    );
+}
+
+fn windows_test_manifest(description: &str) -> Vec<u8> {
+    format!(r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><description>{description}</description></assembly>"#).into_bytes()
+}
+
+#[test]
+fn windows_manifest_bytes_order_and_removal_reach_the_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.xml");
+    let second = dir.path().join("second.xml");
+    let resource = dir.path().join("resource.res");
+    std::fs::write(&first, windows_test_manifest("first")).unwrap();
+    std::fs::write(&second, windows_test_manifest("second")).unwrap();
+    std::fs::write(&resource, windows_test_resource(b"resource")).unwrap();
+    let file_hasher = FileHasher::new();
+    let identity = |files: &[WindowsLinkInput]| {
+        windows_link_identity_with_argument_files("LINK".into(), files, &file_hasher)
+    };
+    let inputs = || {
+        vec![
+            WindowsLinkInput::Manifest(first.clone()),
+            WindowsLinkInput::Resource(resource.clone()),
+            WindowsLinkInput::Manifest(second.clone()),
+        ]
+    };
+    let original = identity(&inputs()).unwrap();
+    assert_eq!(identity(&inputs()).unwrap(), original);
+    assert!(original.contains("link_arg_input.v2=0=manifest="));
+    assert!(original.contains("link_arg_input.v2=1=resource="));
+    assert!(original.contains("link_arg_input.v2=2=manifest="));
+    std::fs::write(&first, windows_test_manifest("edited first")).unwrap();
+    assert_ne!(identity(&inputs()).unwrap(), original);
+    std::fs::write(&first, windows_test_manifest("first")).unwrap();
+    std::fs::write(&second, windows_test_manifest("edited second")).unwrap();
+    assert_ne!(identity(&inputs()).unwrap(), original);
+    std::fs::write(&second, windows_test_manifest("second")).unwrap();
+    assert_eq!(identity(&inputs()).unwrap(), original);
+    let mut reversed = inputs();
+    reversed.reverse();
+    assert_ne!(identity(&reversed).unwrap(), original);
+    assert!(
+        identity(&[WindowsLinkInput::Resource(first.clone())]).is_err(),
+        "XML renamed to .res is not a compiled resource"
+    );
+    assert!(
+        identity(&[WindowsLinkInput::Manifest(resource.clone())]).is_err(),
+        "a resource is not manifest XML"
+    );
+    std::fs::remove_file(&first).unwrap();
+    assert!(identity(&inputs()).is_err());
+    std::fs::create_dir(&first).unwrap();
+    assert!(identity(&inputs()).is_err());
+}
+
+#[test]
+fn windows_manifest_tool_requirement_depends_on_input_kinds() {
+    let resource = || WindowsLinkInput::Resource(PathBuf::from("resource.xml"));
+    let manifest = || WindowsLinkInput::Manifest(PathBuf::from("manifest.res"));
+    for (files, expected) in [
+        (vec![], false),
+        (vec![resource()], false),
+        (vec![resource(), resource()], false),
+        (vec![manifest()], true),
+        (vec![manifest(), resource()], true),
+        (vec![resource(), manifest()], true),
+        (vec![resource(), manifest(), resource()], true),
+    ] {
+        assert_eq!(
+            windows_link_inputs_need_manifest_tool(&files),
+            expected,
+            "{files:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_link_options_preserve_order_across_carrier_names() {
+    let fold = |options: &[&str]| {
+        let mut argv = vec!["rustc".into(), "--crate-type=bin".into()];
+        argv.extend(options.iter().map(|option| (*option).into()));
+        let args = RustcArgs::parse(&argv).unwrap();
+        windows_fold_key(&args, WINDOWS_RUSTC_VERSION, "LINK").unwrap()
+    };
+    let embed_then_no = ["-Clink-arg=/MANIFEST:EMBED", "-Clink-args=/MANIFEST:NO"];
+    let no_then_embed = ["-Clink-args=/MANIFEST:NO", "-Clink-arg=/MANIFEST:EMBED"];
+    assert_ne!(fold(&embed_then_no), fold(&no_then_embed));
+    assert_eq!(fold(&embed_then_no), fold(&embed_then_no));
+    assert_ne!(fold(&["-Clink-arg=/DEBUG"]), fold(&["-Clink-args=/DEBUG"]));
+    assert_ne!(fold(&["-Clink-arg=/DEBUG"]), fold(&["-Clink-arg=/WX"]));
+    assert_ne!(
+        fold(&["-Clink-arg=/DEBUG", "-Clink-arg=/WX"]),
+        fold(&["-Clink-args=/DEBUG /WX"])
+    );
+}
+
+#[test]
+fn windows_manifest_admission_and_hash_ignore_misleading_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.manifest");
+    let bytes = windows_test_manifest("original &amp; &#65;");
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let stamp = FileFingerprint::from_path(&path).unwrap();
+    FileHashCache::Borrowed(&db)
+        .put(&stamp, &"0".repeat(64))
+        .unwrap();
+    let file_hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    for _ in 0..2 {
+        assert_eq!(
+            file_hasher.hash_windows_manifest(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+    }
+    assert_eq!(file_hasher.stats().cache_hits, 0);
+    assert_eq!(file_hasher.stats().bytes_hashed, 2 * bytes.len() as u64);
+    assert!(file_hasher.pending_memo.borrow().is_empty());
+    let invalid = windows_test_manifest("&external;");
+    std::fs::write(&path, &invalid).unwrap();
+    let stamp = FileFingerprint::from_path(&path).unwrap();
+    FileHashCache::Borrowed(&db)
+        .put(&stamp, blake3::hash(&bytes).to_hex().as_ref())
+        .unwrap();
+    assert!(
+        file_hasher.hash_windows_manifest(&path).is_err(),
+        "no memo can substitute for validating current XML bytes"
+    );
+}
+
+#[test]
+fn windows_manifest_hash_preserves_encoding_bytes_and_bounds_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.manifest");
+    let plain = windows_test_manifest("Unicode π");
+    let text = std::str::from_utf8(&plain).unwrap();
+    let file_hasher = FileHasher::new();
+    let mut expected_hashes = std::collections::BTreeSet::new();
+    for bytes in [
+        plain.clone(),
+        [b"\xef\xbb\xbf".as_slice(), plain.as_slice()].concat(),
+        [
+            b"\xff\xfe".as_slice(),
+            text.encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        ]
+        .concat(),
+        [
+            b"\xfe\xff".as_slice(),
+            text.encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        ]
+        .concat(),
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+        let digest = file_hasher.hash_windows_manifest(&path).unwrap();
+        assert_eq!(digest, blake3::hash(&bytes).to_hex().to_string());
+        expected_hashes.insert(digest);
+    }
+    assert_eq!(
+        expected_hashes.len(),
+        4,
+        "encoding changes retain distinct byte identities"
+    );
+    let mut oversized = plain;
+    oversized.resize(1_048_577, b' ');
+    std::fs::write(&path, oversized).unwrap();
+    assert!(file_hasher.hash_windows_manifest(&path).is_err());
+}
+
+#[test]
+fn windows_manifest_validation_hashes_the_guarded_read_and_tracks_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.manifest");
+    let original = windows_test_manifest("original");
+    std::fs::write(&path, &original).unwrap();
+    let mut file_hasher = FileHasher::new();
+    file_hasher.arm_too_new_guard(1, 0);
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, windows_test_manifest("&external;")).unwrap();
+    })));
+    let result = file_hasher.hash_windows_manifest(&path);
+    set_before_read(None);
+    assert!(result.is_err());
+    std::fs::write(&path, &original).unwrap();
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, windows_test_manifest("changed and longer")).unwrap();
+    })));
+    let result = file_hasher.hash_windows_manifest(&path);
+    set_before_read(None);
+    assert_eq!(
+        result.unwrap(),
+        hash_file(&path).unwrap(),
+        "hash exactly the validated bytes"
+    );
+    assert!(file_hasher.too_new());
+    assert!(file_hasher.inputs_changed_since_keyed());
+    let guarded = file_hasher.take_guarded_inputs();
+    assert!(guarded.len() >= 2);
+    assert!(
+        guarded
+            .iter()
+            .any(|input| input.fingerprint.size == original.len() as i64)
+    );
+}
+
+#[test]
+fn windows_manifest_tools_stream_original_bytes_without_any_memo_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mt.exe");
+    let bytes = b"original merger bytes".repeat(5000);
+    std::fs::write(&path, &bytes).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let fingerprint = FileFingerprint::from_path(&path).unwrap();
+    FileHashCache::Borrowed(&db)
+        .put(&fingerprint, &"0".repeat(64))
+        .unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    for _ in 0..2 {
+        assert_eq!(
+            hasher.hash_windows_manifest_tool(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+    }
+    assert_eq!(hasher.stats().cache_hits, 0);
+    assert_eq!(hasher.stats().cache_misses, 2);
+    assert_eq!(hasher.stats().bytes_hashed, 2 * bytes.len() as u64);
+    assert!(hasher.pending_memo.borrow().is_empty());
+    assert_eq!(
+        hasher.recent_hashes.borrow()[&path].hash,
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(hasher.hash_windows_manifest_tool(&path).is_err());
+    std::fs::create_dir(&path).unwrap();
+    assert!(hasher.hash_windows_manifest_tool(&path).is_err());
+}
+
+#[test]
+fn windows_manifest_tool_read_changes_keep_both_input_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mt.exe");
+    std::fs::write(&path, b"old merger").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    set_before_read(Some(Box::new(|path| {
+        std::fs::write(path, b"a replaced merger with different bytes").unwrap();
+    })));
+    let digest = hasher.hash_windows_manifest_tool(&path);
+    set_before_read(None);
+    assert_eq!(digest.unwrap(), hash_file(&path).unwrap());
+    assert!(hasher.too_new());
+    assert!(hasher.inputs_changed_since_keyed());
+    let guarded = hasher.take_guarded_inputs();
+    assert!(guarded.iter().any(|input| input.fingerprint.size == 10));
+    assert!(guarded.iter().any(|input| input.fingerprint.size == 38));
+}
+
+#[test]
+fn windows_manifest_tool_lookup_guards_earlier_absences_and_directory_replacements() {
+    for change in [
+        "earlier-file",
+        "missing-directory",
+        "replace-directory",
+        "shadow",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let early = dir.path().join("early");
+        let late = dir.path().join("late");
+        let missing = dir.path().join("not-created/nested");
+        let shadow = dir.path().join("shadow");
+        for directory in [&early, &late, &shadow] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(late.join("mt.exe"), b"original merger").unwrap();
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        let selected = crate::native_link_key::select_windows_manifest_tool(
+            &[missing.clone(), early.clone(), late.clone()],
+            std::slice::from_ref(&shadow),
+            |directory| hasher.observe_windows_tool_directory(directory),
+            |path| hasher.record_absent_tool_candidate(path),
+        )
+        .unwrap();
+        assert_eq!(selected, late.join("mt.exe"));
+        hasher.hash_windows_manifest_tool(&selected).unwrap();
+        assert!(
+            !hasher.inputs_changed_since_keyed(),
+            "initial inputs: {change}"
+        );
+        let guarded = GuardedInputs {
+            files: hasher.guard_inputs.borrow().clone(),
+            absent_paths: hasher.guard_absent_paths.borrow().clone(),
+            tool_directories: hasher.guard_tool_directories.borrow().clone(),
+        };
+        assert!(
+            guarded
+                .iter()
+                .any(|input| Path::new(&input.fingerprint.path) == dir.path()),
+            "nearest existing ancestor guards the absent directory"
+        );
+        assert!(
+            guarded
+                .iter()
+                .any(|input| Path::new(&input.fingerprint.path) == selected)
+        );
+        match change {
+            "earlier-file" => {
+                std::fs::write(early.join("mt.exe"), b"earlier merger").unwrap();
+            }
+            "missing-directory" => {
+                std::fs::create_dir_all(&missing).unwrap();
+                std::fs::write(missing.join("mt.exe"), b"new directory merger").unwrap();
+            }
+            "replace-directory" => {
+                std::fs::rename(&early, dir.path().join("old-early")).unwrap();
+                std::fs::create_dir(&early).unwrap();
+            }
+            "shadow" => {
+                std::fs::write(shadow.join("mt.exe"), b"shadow merger").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            hasher.inputs_changed_since_keyed(),
+            "changed lookup: {change}"
+        );
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&guarded));
+        let next = crate::native_link_key::select_windows_manifest_tool(
+            &[missing.clone(), early.clone(), late.clone()],
+            std::slice::from_ref(&shadow),
+            |directory| FileHasher::new().observe_windows_tool_directory(directory),
+            |_| Ok(()),
+        );
+        match change {
+            "earlier-file" => assert_eq!(next.unwrap(), early.join("mt.exe")),
+            "missing-directory" => assert_eq!(next.unwrap(), missing.join("mt.exe")),
+            "shadow" => assert!(next.is_err()),
+            "replace-directory" => assert_eq!(next.unwrap(), selected),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn windows_manifest_tool_disappearing_after_directory_observation_retains_absence() {
+    for missing_kind in ["shadow", "path"] {
+        let dir = tempfile::tempdir().unwrap();
+        let early = dir.path().join("early");
+        let late = dir.path().join("late");
+        let stable = dir.path().join("stable.rs");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        std::fs::write(&stable, b"stable file evidence").unwrap();
+        let candidate = early.join("mt.exe");
+        std::fs::write(&candidate, b"earlier original merger").unwrap();
+        std::fs::write(late.join("mt.exe"), b"later selected merger").unwrap();
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        let search = if missing_kind == "path" {
+            vec![early.clone(), late.clone()]
+        } else {
+            vec![late.clone()]
+        };
+        let shadows = if missing_kind == "shadow" {
+            vec![early.clone()]
+        } else {
+            vec![]
+        };
+        let selected = crate::native_link_key::select_windows_manifest_tool(
+            &search,
+            &shadows,
+            |directory| {
+                hasher.observe_windows_tool_directory(directory)?;
+                if directory == early.as_path() {
+                    assert!(std::fs::symlink_metadata(&candidate).unwrap().is_file());
+                    std::fs::remove_file(&candidate).unwrap();
+                }
+                Ok(())
+            },
+            |path| hasher.record_absent_tool_candidate(path),
+        )
+        .unwrap();
+        assert_eq!(selected, late.join("mt.exe"));
+        let mut guarded = hasher.take_guarded_inputs();
+        assert_eq!(
+            guarded.absent_paths,
+            std::slice::from_ref(&candidate),
+            "{missing_kind}"
+        );
+        // Hold supplied file observations stable to isolate negative evidence.
+        let observed = ObservedFingerprint::from_path(&stable).unwrap();
+        guarded.files = vec![observed.clone()];
+        assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+        assert_eq!(
+            FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            observed.fingerprint.inode != 0
+        );
+        let directory_time =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&early).unwrap());
+        std::fs::write(&candidate, b"reappeared earlier merger").unwrap();
+        filetime::set_file_mtime(&early, directory_time).unwrap();
+        assert!(
+            FileHasher::guarded_inputs_moved_since_hash(&guarded),
+            "{missing_kind}"
+        );
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            "{missing_kind}"
+        );
+    }
+}
+
+#[test]
+fn windows_manifest_tool_file_only_drain_preserves_negative_candidate_veto() {
+    let dir = tempfile::tempdir().unwrap();
+    let early = dir.path().join("early");
+    let late = dir.path().join("late");
+    let stable = dir.path().join("stable.rs");
+    std::fs::create_dir(&early).unwrap();
+    std::fs::create_dir(&late).unwrap();
+    std::fs::write(&stable, b"stable file evidence").unwrap();
+    std::fs::write(late.join("mt.exe"), b"selected merger").unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    hasher.hash(&stable).unwrap();
+    crate::native_link_key::select_windows_manifest_tool(
+        &[early.clone(), late],
+        &[],
+        |directory| hasher.observe_windows_tool_directory(directory),
+        |path| hasher.record_absent_tool_candidate(path),
+    )
+    .unwrap();
+    let files = hasher.take_guarded_file_observations();
+    assert!(
+        files
+            .iter()
+            .any(|input| Path::new(&input.fingerprint.path) == stable.as_path())
+    );
+    assert!(hasher.guard_inputs.borrow().is_empty());
+    assert!(!hasher.inputs_changed_since_keyed());
+    std::fs::write(early.join("mt.exe"), b"new earlier merger").unwrap();
+    assert!(hasher.inputs_changed_since_keyed());
+    let remaining = hasher.take_guarded_inputs();
+    assert!(remaining.files.is_empty());
+    assert!(
+        !remaining.is_empty(),
+        "negative evidence survives file-only serialization"
+    );
+    assert!(FileHasher::guarded_inputs_moved_since_hash(&remaining));
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&remaining));
+    assert!(hasher.take_guarded_inputs().is_empty());
+}
+
+#[test]
+fn windows_manifest_tool_directory_guards_do_not_claim_unsettled_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    hasher.observe_windows_tool_directory(dir.path()).unwrap();
+    assert!(hasher.too_new());
+    assert!(hasher.inputs_changed_since_keyed());
+    assert_eq!(
+        hasher.stats().cache_misses,
+        0,
+        "directory observations are not file hashes"
+    );
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    assert!(hasher.observe_windows_tool_directory(&file).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_manifest_tool_directory_guards_refuse_dangling_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("linked-tools");
+    let target = dir.path().join("absent-tools");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    assert!(hasher.observe_windows_tool_directory(&link).is_err());
+    assert!(
+        hasher
+            .observe_windows_tool_directory(&link.join("nested"))
+            .is_err()
+    );
+    std::fs::create_dir(&target).unwrap();
+    hasher.observe_windows_tool_directory(&link).unwrap();
+    assert!(!hasher.inputs_changed_since_keyed());
+    let replacement = dir.path().join("other-tools");
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&replacement, &link).unwrap();
+    assert!(hasher.inputs_changed_since_keyed());
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_manifest_tool_search_permission_errors_fail_closed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let early = dir.path().join("early");
+    let late = dir.path().join("late");
+    std::fs::create_dir(&early).unwrap();
+    std::fs::create_dir(&late).unwrap();
+    std::fs::write(late.join("mt.exe"), b"later merger").unwrap();
+    std::fs::set_permissions(&early, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let metadata = std::fs::metadata(early.join("mt.exe"));
+    let hasher = FileHasher::new();
+    let result = crate::native_link_key::select_windows_manifest_tool(
+        &[early.clone(), late],
+        &[],
+        |directory| hasher.observe_windows_tool_directory(directory),
+        |path| hasher.record_absent_tool_candidate(path),
+    );
+    std::fs::set_permissions(&early, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if metadata.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) {
+        assert!(
+            result.is_err(),
+            "an unreadable earlier candidate cannot select the later tool"
+        );
+    }
+}
+
+#[test]
+fn missing_tool_directory_requires_both_observations_to_report_not_found() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotADirectory,
+        ErrorKind::Other,
+    ] {
+        assert!(
+            confirm_missing_tool_directory(Error::from(kind), || {
+                panic!("a failed directory observation must stop before probing the link")
+            })
+            .is_err()
+        );
+        assert!(
+            confirm_missing_tool_directory(Error::from(ErrorKind::NotFound), || {
+                Err(Error::from(kind))
+            })
+            .is_err()
+        );
+    }
+    confirm_missing_tool_directory(Error::from(ErrorKind::NotFound), || {
+        Err(Error::from(ErrorKind::NotFound))
+    })
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        confirm_missing_tool_directory(Error::from(ErrorKind::NotFound), || {
+            std::fs::metadata(root.path())
+        })
+        .is_err()
     );
 }
 
@@ -14715,9 +15301,233 @@ fn guarded_inputs_record_only_while_armed() {
 #[test]
 fn guarded_inputs_empty_set_never_excuses() {
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(&[]),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&GuardedInputs::default()),
         "a vacuous check must not waive a tripped guard"
     );
+}
+
+#[test]
+fn guarded_tool_directory_identity_survives_transfer_and_file_only_drains() {
+    for change in ["replace", "remove", "file"] {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("tools");
+        let stable = dir.path().join("stable.rs");
+        std::fs::create_dir(&tools).unwrap();
+        std::fs::write(&stable, b"stable source").unwrap();
+        let observed = ObservedFingerprint::from_path(&stable).unwrap();
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        hasher.hash(&stable).unwrap();
+        hasher.observe_windows_tool_directory(&tools).unwrap();
+        assert!(!hasher.inputs_changed_since_keyed());
+        let files = hasher.take_guarded_file_observations();
+        assert!(
+            files
+                .iter()
+                .any(|file| file.fingerprint == observed.fingerprint)
+        );
+        let lookup = hasher.take_guarded_inputs();
+        assert!(lookup.files.is_empty());
+        assert!(lookup.absent_paths.is_empty());
+        assert_eq!(lookup.tool_directories.len(), 1);
+        assert!(
+            !lookup.is_empty(),
+            "directory identities survive the file-only drain"
+        );
+        assert!(!FileHasher::guarded_inputs_moved_since_hash(&lookup));
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&lookup));
+        assert!(hasher.take_guarded_inputs().is_empty());
+
+        let mut guarded: GuardedInputs = vec![observed.clone()].into();
+        guarded.extend(lookup);
+        let one_file = guarded.for_file(&observed);
+        assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+        assert_eq!(
+            FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            observed.fingerprint.inode != 0
+        );
+        let directory_time =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&tools).unwrap());
+        std::fs::rename(&tools, dir.path().join("old-tools")).unwrap();
+        match change {
+            "replace" => {
+                std::fs::create_dir(&tools).unwrap();
+                filetime::set_file_mtime(&tools, directory_time).unwrap();
+                assert_ne!(
+                    kache_fs::directory_identity(&tools).unwrap(),
+                    guarded.tool_directories[0].1
+                );
+            }
+            "file" => std::fs::write(&tools, b"not a directory").unwrap(),
+            "remove" => {}
+            _ => unreachable!(),
+        }
+        assert!(
+            FileHasher::guarded_inputs_moved_since_hash(&guarded),
+            "{change}"
+        );
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+            "{change}"
+        );
+        assert!(FileHasher::guarded_inputs_moved_since_hash(&one_file));
+        assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&one_file));
+        // Keep file evidence identical; only the directory identity can veto.
+        *hasher.guard_inputs.borrow_mut() = guarded.files.clone();
+        *hasher.guard_tool_directories.borrow_mut() = guarded.tool_directories.clone();
+        assert!(hasher.inputs_changed_since_keyed(), "{change}");
+    }
+}
+
+#[test]
+fn guarded_absences_survive_transfer_and_merge_without_directory_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let stable = dir.path().join("stable.rs");
+    let tools = dir.path().join("tools");
+    std::fs::write(&stable, b"stable input").unwrap();
+    std::fs::create_dir(&tools).unwrap();
+    let absent = tools.join("mt.exe");
+    let observed = ObservedFingerprint::from_path(&stable).unwrap();
+    let mut hasher = FileHasher::new();
+    hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+    hasher.observe_windows_tool_directory(&tools).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&absent)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+    hasher.record_absent_tool_candidate(&absent).unwrap();
+    // Supply stable file evidence only: the absence check must not depend
+    // on the parent directory's time, size or identity changing.
+    *hasher.guard_inputs.borrow_mut() = vec![observed.clone()];
+    assert!(!hasher.inputs_changed_since_keyed());
+    let mut guarded = GuardedInputs::default();
+    guarded.extend(hasher.take_guarded_inputs());
+    assert!(
+        hasher.take_guarded_inputs().is_empty(),
+        "both evidence sets are drained"
+    );
+    assert_eq!(guarded.len(), 1);
+    assert!(!guarded.is_empty());
+    assert_eq!(guarded.absent_paths, std::slice::from_ref(&absent));
+    let one_file = guarded.for_file(&observed);
+    assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert_eq!(
+        FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        observed.fingerprint.inode != 0
+    );
+    let directory_time =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&tools).unwrap());
+    std::fs::write(&absent, b"new earlier merger").unwrap();
+    filetime::set_file_mtime(&tools, directory_time).unwrap();
+    assert_eq!(
+        FileFingerprint::from_path(&stable).unwrap(),
+        observed.fingerprint
+    );
+    assert!(
+        FileHasher::guarded_inputs_moved_since_hash(&guarded),
+        "postcompile proof rejects the new candidate"
+    );
+    assert!(
+        !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        "postrestore proof rejects the new candidate"
+    );
+    assert!(FileHasher::guarded_inputs_moved_since_hash(&one_file));
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&one_file));
+    // Keep the local guard's supplied file evidence identical too.
+    *hasher.guard_inputs.borrow_mut() = guarded.files.clone();
+    *hasher.guard_absent_paths.borrow_mut() = guarded.absent_paths.clone();
+    assert!(hasher.inputs_changed_since_keyed());
+    std::fs::remove_file(&absent).unwrap();
+    assert!(!hasher.inputs_changed_since_keyed());
+    assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert_eq!(
+        FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        observed.fingerprint.inode != 0
+    );
+}
+
+#[test]
+fn guarded_absence_only_is_nonempty_but_cannot_excuse_a_file_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("mt.exe");
+    let file = dir.path().join("stable.rs");
+    std::fs::write(&file, b"stable").unwrap();
+    let files_only: GuardedInputs = vec![ObservedFingerprint::from_path(&file).unwrap()].into();
+    assert!(!files_only.is_empty());
+    let mut guarded = GuardedInputs::default();
+    assert!(guarded.is_empty());
+    guarded.extend(GuardedInputs {
+        files: Vec::new(),
+        absent_paths: vec![absent.clone()],
+        ..GuardedInputs::default()
+    });
+    assert!(!guarded.is_empty());
+    assert!(!FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert!(
+        !FileHasher::guarded_inputs_unchanged_since_hash(&guarded),
+        "file evidence is still required"
+    );
+    std::fs::write(&absent, b"present").unwrap();
+    assert!(FileHasher::guarded_inputs_moved_since_hash(&guarded));
+    assert!(!FileHasher::guarded_inputs_unchanged_since_hash(&guarded));
+}
+
+#[cfg(unix)]
+#[test]
+fn guarded_absences_reject_dangling_symlinks_and_lookup_errors() {
+    for mode in ["dangling", "loop", "permission"] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let stable = dir.path().join("stable.rs");
+        std::fs::write(&stable, b"stable input").unwrap();
+        let tools = dir.path().join("tools");
+        let absent = if mode == "dangling" {
+            dir.path().join("mt.exe")
+        } else {
+            tools.join("mt.exe")
+        };
+        if mode == "permission" {
+            std::fs::create_dir(&tools).unwrap();
+        }
+        let observed = ObservedFingerprint::from_path(&stable).unwrap();
+        let guarded = GuardedInputs {
+            files: vec![observed.clone()],
+            absent_paths: vec![absent.clone()],
+            ..GuardedInputs::default()
+        };
+        assert!(FileHasher::guarded_inputs_unchanged_since_hash(&guarded));
+        match mode {
+            "dangling" => std::os::unix::fs::symlink("missing-target", &absent).unwrap(),
+            "loop" => std::os::unix::fs::symlink("tools", &tools).unwrap(),
+            "permission" => {
+                std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o0)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let actual = std::fs::symlink_metadata(&absent);
+        let moved = FileHasher::guarded_inputs_moved_since_hash(&guarded);
+        let unchanged = FileHasher::guarded_inputs_unchanged_since_hash(&guarded);
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(wall_clock_ns() + 5_000_000_000, 0);
+        *hasher.guard_inputs.borrow_mut() = guarded.files.clone();
+        *hasher.guard_absent_paths.borrow_mut() = guarded.absent_paths.clone();
+        let local_changed = hasher.inputs_changed_since_keyed();
+        if mode == "permission" {
+            std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if mode == "permission"
+            && actual.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue; // A privileged process may traverse a mode-000 directory.
+        }
+        assert!(moved, "{mode}");
+        assert!(!unchanged, "{mode}");
+        assert!(local_changed, "{mode}");
+        assert_eq!(
+            FileFingerprint::from_path(&stable).unwrap(),
+            observed.fingerprint
+        );
+    }
 }
 
 #[test]
@@ -14729,13 +15539,13 @@ fn guarded_inputs_reject_changed_or_missing_files() {
 
     std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&vec![recorded.clone()].into()),
         "rewritten bytes must fail verification even when the wall clock cannot tell"
     );
 
     std::fs::remove_file(&file).unwrap();
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&vec![recorded.clone()].into()),
         "a file that vanished mid-build must fail verification"
     );
 }
@@ -14748,7 +15558,7 @@ fn guarded_inputs_reject_weak_identity() {
     let mut recorded = ObservedFingerprint::from_path(&file).unwrap();
     recorded.fingerprint.inode = 0;
     assert!(
-        !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+        !FileHasher::guarded_inputs_unchanged_since_hash(&vec![recorded.clone()].into()),
         "without an inode a replace-by-rename is invisible, so verification must fail closed"
     );
 }
@@ -14843,7 +15653,7 @@ fn a_file_removed_after_its_read_counts_as_too_new() {
     assert!(hasher.too_new());
     assert_eq!(reported, before);
     assert!(!FileHasher::guarded_inputs_unchanged_since_hash(
-        std::slice::from_ref(&reported)
+        &vec![reported.clone()].into()
     ));
 }
 
@@ -14909,7 +15719,7 @@ fn guarded_inputs_keep_when_they_were_observed() {
         let before = wall_clock_ns();
         hasher.hash(&file).unwrap();
         let after = wall_clock_ns();
-        let [input] = hasher.take_guarded_inputs().try_into().unwrap();
+        let [input] = hasher.take_guarded_inputs().files.try_into().unwrap();
         assert!((before..=after).contains(&input.observed_ns), "{input:?}");
         assert_eq!(
             input.fingerprint,

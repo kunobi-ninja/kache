@@ -42,6 +42,7 @@ compile uncached. A PE without a CodeView record needs no PDB. See
 rules.
 
 Rust links can key supported `rust-lld` toolchains, compiled resource inputs,
+supported application manifests passed with `/MANIFESTINPUT` and `/MANIFEST:EMBED`,
 and modeled runtime/default-library selections. This does not make direct
 `cl.exe` object compilation cacheable. On main, DLL caching also retains import
 libraries omitted from rustc's artifact notifications.

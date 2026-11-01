@@ -482,6 +482,10 @@ exclude_re = [
     # Only the Windows body performs discovery. The non-Windows body is the
     # constant Ok(()) stub. Snapshot/path/probe validation stays in scope.
     "src/native_link_key.rs:.*WindowsProbeEnvironment::augment_from_installed_msvc",
+    # The Windows directory API adapter and its named nested query cannot
+    # run on Linux. The same-named non-Windows refusal has a unit test.
+    # Merger selection, identity, hashing and directory guards stay in scope.
+    "src/native_link_key.rs:.*\\b(windows_manifest_system_directories|query_windows_manifest_directory)( ->|$)",
     "SqlitePlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
     "crates/kache-store/src/link.rs:.*replace warn_no_cow_restore_once with \\(\\)",
     # Build-script execution cache. The non-Unix `install` is a stub that

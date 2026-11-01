@@ -21,8 +21,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: c5d4e4f0e069da759cb9d263f6e18fd2a3891a8b
-      EXPECTED_TREE: 5e07539bdab427d15d0aea4b332fd7e5aa85fede
+      EXPECTED_HEAD: 5afa58d1972dbadf267c0ff8f835b37b70e6226e
+      EXPECTED_TREE: 69f668b03e200c5b501983825a7f1f25c7184be9
       BASE_HEAD: cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
     steps:
       - name: Record provenance and require an ephemeral hosted runner
@@ -38,7 +38,7 @@ jobs:
           test "$RUNNER_KIND" = github-hosted
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: c5d4e4f0e069da759cb9d263f6e18fd2a3891a8b
+          ref: 5afa58d1972dbadf267c0ff8f835b37b70e6226e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact candidate
@@ -75,6 +75,71 @@ jobs:
         run: |
           set -euo pipefail
           just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Prove refusal tests kill the reported mutations
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import difflib
+          import os
+          from pathlib import Path
+          import subprocess
+
+          root = Path.cwd()
+          evidence = Path(os.environ["EVIDENCE_DIR"]) / "mutation-controls"
+          evidence.mkdir(parents=True, exist_ok=True)
+          manifest = Path("src/windows_manifest.rs").read_text()
+          namespace_start = manifest.index("fn known_namespace(")
+          namespace_end = manifest.index("\nfn attributes(", namespace_start)
+          namespace = manifest[namespace_start:namespace_end]
+          cache = Path("src/cache_key.rs").read_text()
+          confirm_start = cache.index("fn confirm_missing_tool_directory(")
+          confirm_end = cache.index("\n/// Thin abstraction", confirm_start)
+          confirm = cache[confirm_start:confirm_end]
+          native = Path("src/native_link_key.rs").read_text()
+          selector_start = native.index("pub(crate) fn select_windows_manifest_tool<")
+          shadow_guard = native.index("Err(error) if error.kind() == std::io::ErrorKind::NotFound", selector_start)
+          selector_prefix = native[selector_start:shadow_guard]
+          selector_needle = selector_prefix + "Err(error) if error.kind() == std::io::ErrorKind::NotFound"
+          cases = [
+              ("unknown-namespace", "src/windows_manifest.rs", namespace,
+               "fn known_namespace(_namespace: &str) -> bool { true }\n",
+               "windows_manifest::tests::file_bearing_and_unmodeled_xml_shapes_are_refused"),
+              ("attribute-quote-state", "src/windows_manifest.rs",
+               "quote.is_none() && matches!(byte, b'\\'' | b'\"')",
+               "quote.is_none() || matches!(byte, b'\\'' | b'\"')",
+               "windows_manifest::tests::attribute_whitespace_and_embedded_quotes_remain_well_formed"),
+              ("first-absence-check", "src/cache_key.rs", confirm,
+               confirm.replace("if error.kind() != std::io::ErrorKind::NotFound {", "if false {", 1),
+               "missing_tool_directory_requires_both_observations_to_report_not_found"),
+              ("second-absence-check", "src/cache_key.rs", confirm,
+               confirm.replace("Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(())", "Err(_error) => Ok(())", 1),
+               "missing_tool_directory_requires_both_observations_to_report_not_found"),
+              ("shadow-absence-check", "src/native_link_key.rs", selector_needle,
+               selector_prefix + "Err(_error)",
+               "manifest_merger_shadow_lookup_errors_are_not_recorded_as_absences"),
+          ]
+          for name, filename, needle, replacement, test in cases:
+              path = Path(filename)
+              original = path.read_text()
+              if needle == replacement or original.count(needle) != 1:
+                  raise SystemExit(f"Mutation {name} has no unique source match")
+              changed = original.replace(needle, replacement, 1)
+              (evidence / f"{name}.diff").write_text("".join(difflib.unified_diff(
+                  original.splitlines(keepends=True), changed.splitlines(keepends=True),
+                  fromfile=filename, tofile=filename)))
+              try:
+                  path.write_text(changed)
+                  result = subprocess.run(["cargo", "test", "--locked", "-p", "kache", "--lib", test,
+                                           "--", "--nocapture"], stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT, text=True, timeout=600)
+                  (evidence / f"{name}.log").write_text(result.stdout)
+                  if result.returncode == 0 or "test result: FAILED" not in result.stdout:
+                      raise SystemExit(f"Mutation {name} was not killed by a failing test")
+                  print(f"CAUGHT {name}: {test}", flush=True)
+              finally:
+                  path.write_text(original)
+          subprocess.run(["cargo", "test", "--locked", "-p", "kache", "--lib", "manifest", "--", "--nocapture"], check=True)
+          PY
       - name: Check documentation
         id: docs
         run: |
@@ -115,8 +180,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: c5d4e4f0e069da759cb9d263f6e18fd2a3891a8b
-      EXPECTED_TREE: 5e07539bdab427d15d0aea4b332fd7e5aa85fede
+      EXPECTED_HEAD: 5afa58d1972dbadf267c0ff8f835b37b70e6226e
+      EXPECTED_TREE: 69f668b03e200c5b501983825a7f1f25c7184be9
     steps:
       - name: Require hosted runner and record provenance
         env:
@@ -130,7 +195,7 @@ jobs:
           "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: c5d4e4f0e069da759cb9d263f6e18fd2a3891a8b
+          ref: 5afa58d1972dbadf267c0ff8f835b37b70e6226e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify candidate source

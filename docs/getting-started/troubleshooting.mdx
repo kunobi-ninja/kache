@@ -146,7 +146,7 @@ row shows `DEGRADED` after three transport timeouts or transient remote errors i
 Builds then compile locally and uploads wait in the queue; the daemon tries the
 remote again every 45 seconds until it answers.
 
-Reaching Kache's operation deadline, including the three-second demand lookup
+Reaching Kache's operation deadline, including the configured synchronous demand lookup
 budget, returns a cache miss without changing remote health. Uploads that reach
 their deadline remain queued for retry.
 

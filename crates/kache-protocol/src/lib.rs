@@ -50,10 +50,9 @@ pub struct RemoteCheckRequest {
     #[serde(default)]
     pub crate_name: String,
     /// Client-side end-to-end budget. New daemons use the stricter of this,
-    /// their own configured budget, and the legacy three-second demand cap, so
-    /// config drift cannot make the client time out while the daemon keeps
-    /// doing abandoned work. Missing/zero values retain that legacy cap for
-    /// compatibility with old clients.
+    /// their configured synchronous demand budget and enabled operation limit.
+    /// Missing/zero values retain the legacy three-second wait for old clients.
+    /// This prevents a newer daemon from outliving an older wrapper's request.
     #[serde(default)]
     pub deadline_ms: Option<u64>,
     /// Volume-shard cache dir to import into. Missing or empty keeps the

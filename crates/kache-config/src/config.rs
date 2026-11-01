@@ -74,13 +74,23 @@ pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 /// Remote resilience (kunobi-ninja/kache#327, #564). The daemon-side operation
 /// deadline matches `DEFAULT_PREFETCH_DEADLINE_SECS`: generous enough that no
 /// legitimate background transfer changes behavior while still bounding a
-/// slow-drip body. Synchronous compiler-wrapper demand separately retains its
-/// legacy three-second ceiling; this setting can only tighten that path. The
+/// slow-drip body. Synchronous compiler-wrapper demand has its own configurable
+/// budget, which this operation deadline may shorten. The
 /// negative TTL matches `DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS`: the daemon
 /// already treats LIST data of that age as authoritative for misses, so
 /// remembering a per-key definitive 404 for the same period introduces no new
 /// staleness class.
 pub const DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS: u64 = 300;
+/// Default end-to-end synchronous restore wait, independently configurable.
+pub const DEFAULT_DEMAND_TIMEOUT_SECS: u64 = 3;
+
+/// A demand wait must stay positive and fit a finite, portable seconds range.
+/// This also keeps conversion to milliseconds and supported Instant clocks bounded.
+pub fn checked_demand_timeout_secs(seconds: u64) -> Option<u64> {
+    let seconds = u32::try_from(seconds).ok()?;
+    (seconds != 0).then_some(u64::from(seconds))
+}
+
 pub const DEFAULT_REMOTE_NEGATIVE_TTL_SECS: u64 = 60;
 /// Hard bound on durable upload intents. Shared by spool persistence/replay and
 /// GC protection so an overfull directory fails closed instead of leaving an
@@ -275,15 +285,18 @@ pub struct Config {
     /// connections silently.
     pub s3_pool_idle_secs: u64,
     /// Total daemon deadline for a remote operation, in seconds (default 300,
-    /// 0 = no daemon-configured deadline; kunobi-ninja/kache#327). A synchronous
-    /// compiler-wrapper demand always retains its legacy three-second
-    /// end-to-end ceiling, and this setting may only tighten it; background
-    /// upload/prefetch work uses the configured deadline directly. On demand
+    /// 0 = no daemon-configured deadline; kunobi-ninja/kache#327). Synchronous
+    /// demand also respects `demand_timeout_secs`; background upload/prefetch
+    /// work uses this operation deadline directly. On demand
     /// expiry the daemon reports a miss so rustc recompiles locally — the cache
     /// is an optimization, never a hard dependency. Set via
     /// `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` or
     /// `[cache] remote_restore_timeout_secs`.
     pub remote_restore_timeout_secs: u64,
+    /// Maximum synchronous wrapper demand wait, in seconds (default 3).
+    /// Set on both peers and restart the daemon to allow a longer restore.
+    /// Invalid zero or out-of-range values fall back to the file or default.
+    pub demand_timeout_secs: u64,
     /// How long the daemon remembers a definitive remote miss (404 only), in
     /// seconds (default 60, 0 = disabled; kunobi-ninja/kache#564). Repeated
     /// checks for the same absent key within the TTL answer miss without
@@ -1036,6 +1049,8 @@ pub struct CacheFileConfig {
     pub s3_pool_idle_secs: Option<u64>,
     /// Restore deadline. See [`Config::remote_restore_timeout_secs`].
     pub remote_restore_timeout_secs: Option<u64>,
+    /// Synchronous demand deadline. See [`Config::demand_timeout_secs`].
+    pub demand_timeout_secs: Option<u64>,
     /// Negative-result TTL. See [`Config::remote_negative_ttl_secs`].
     pub remote_negative_ttl_secs: Option<u64>,
     /// Secondary compiler-wrapper for passed-through compiles.
@@ -1378,6 +1393,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PULL_REQUEST_PREFIX",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
+    "KACHE_DEMAND_TIMEOUT_SECS",
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
     "KACHE_MIN_STORE_COMPILE_MS",
     "KACHE_GC_MAX_AGE_HOURS",
@@ -1481,6 +1497,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
         "cache.remote_restore_timeout_secs",
     ),
+    ("KACHE_DEMAND_TIMEOUT_SECS", "cache.demand_timeout_secs"),
     (
         "KACHE_REMOTE_NEGATIVE_TTL_SECS",
         "cache.remote_negative_ttl_secs",
@@ -2045,6 +2062,38 @@ impl Config {
                 })
                 .unwrap_or(DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS);
 
+        let demand_timeout_secs = env_or_ignored_for(
+            invocation,
+            "KACHE_DEMAND_TIMEOUT_SECS",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|value| {
+            let parsed = value.parse().ok().and_then(checked_demand_timeout_secs);
+            if parsed.is_none() {
+                tracing::warn!(
+                    "ignoring invalid KACHE_DEMAND_TIMEOUT_SECS; expected positive finite seconds"
+                );
+            }
+            parsed
+        })
+        .or_else(|| {
+            let value = file_config
+                .as_ref()
+                .ok()?
+                .cache
+                .as_ref()?
+                .demand_timeout_secs?;
+            let parsed = checked_demand_timeout_secs(value);
+            if parsed.is_none() {
+                tracing::warn!(
+                    "ignoring invalid cache.demand_timeout_secs; expected positive finite seconds"
+                );
+            }
+            parsed
+        })
+        .unwrap_or(DEFAULT_DEMAND_TIMEOUT_SECS);
+
         let remote_negative_ttl_secs =
             env_or_ignored_for(invocation, "KACHE_REMOTE_NEGATIVE_TTL_SECS", ignore_env)
                 .ok()
@@ -2461,6 +2510,7 @@ impl Config {
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             remote_restore_timeout_secs,
+            demand_timeout_secs,
             remote_negative_ttl_secs,
             fallback,
             key_salt,

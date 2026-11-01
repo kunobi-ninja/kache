@@ -60,10 +60,7 @@ const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
 const KEY_CACHE_AUTHORITATIVE_MAX_AGE: Duration = Duration::from_secs(300);
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
 const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
-// A synchronous compiler-wrapper demand has historically been best-effort for
-// at most three seconds. Keep that hard build-path bound across mixed-version
-// clients and daemons; the daemon's remote timeout may tighten it, never
-// lengthen it.
+// Legacy clients do not send a deadline; their historical wait stays bounded.
 const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
 const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -71,20 +68,29 @@ const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 mod capacity;
 use capacity::DaemonCapacity;
 
-fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
-    let configured_ms = if configured_secs == 0 {
-        REMOTE_CHECK_LEGACY_BUDGET_MS
+fn wrapper_remote_check_budget_ms(operation_secs: u64, demand_secs: u64) -> NonZeroU64 {
+    let demand_ms = crate::config::checked_demand_timeout_secs(demand_secs)
+        .unwrap_or(crate::config::DEFAULT_DEMAND_TIMEOUT_SECS)
+        * 1_000;
+    let budget = if operation_secs == 0 {
+        demand_ms
     } else {
-        configured_secs
-            .saturating_mul(1_000)
-            .min(REMOTE_CHECK_LEGACY_BUDGET_MS)
+        demand_ms.min(operation_secs.saturating_mul(1_000))
     };
-    let client_ms = client_ms
+    NonZeroU64::new(budget).expect("the synchronous demand budget is positive and finite")
+}
+
+fn remote_check_budget_ms(
+    operation_secs: u64,
+    demand_secs: u64,
+    client_ms: Option<u64>,
+) -> NonZeroU64 {
+    let configured = wrapper_remote_check_budget_ms(operation_secs, demand_secs);
+    let client = client_ms
         .filter(|milliseconds| *milliseconds != 0)
-        .unwrap_or(REMOTE_CHECK_LEGACY_BUDGET_MS)
-        .min(REMOTE_CHECK_LEGACY_BUDGET_MS);
-    NonZeroU64::new(configured_ms.min(client_ms))
-        .expect("the synchronous remote-check budget is always positive")
+        .unwrap_or(REMOTE_CHECK_LEGACY_BUDGET_MS);
+    NonZeroU64::new(configured.get().min(client))
+        .expect("both synchronous demand budgets are positive")
 }
 
 fn key_cache_miss_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
@@ -3662,7 +3668,12 @@ impl Daemon {
         // also counts singleflight queue time against that original budget.
         let deadline = RemoteDeadline::from_millis_at(
             request_started_at,
-            remote_check_budget_ms(self.config.remote_restore_timeout_secs, req.deadline_ms).get(),
+            remote_check_budget_ms(
+                self.config.remote_restore_timeout_secs,
+                self.config.demand_timeout_secs,
+                req.deadline_ms,
+            )
+            .get(),
         );
         match self.remote_checks.claim(&req.key) {
             SingleflightClaim::Follower(follower) => follower
@@ -8434,7 +8445,10 @@ pub fn send_remote_check(
         return None;
     }
 
-    let client_budget_ms = remote_check_budget_ms(config.remote_restore_timeout_secs, None);
+    let client_budget_ms = wrapper_remote_check_budget_ms(
+        config.remote_restore_timeout_secs,
+        config.demand_timeout_secs,
+    );
     let req = Request::RemoteCheck(RemoteCheckRequest {
         key: key.to_string(),
         entry_dir: entry_dir.to_string_lossy().into_owned(),
@@ -8443,9 +8457,8 @@ pub fn send_remote_check(
         shard_dir: shard_dir.map(|dir| dir.to_string_lossy().into_owned()),
     });
 
-    // This wait is on rustc's synchronous miss path. Preserve the historical
-    // hard three-second ceiling even when talking to an older daemon that
-    // ignores `deadline_ms`; configuration may only shorten the wait.
+    // Bound the complete synchronous wait, including an older daemon that
+    // ignores deadline_ms. An older daemon may still answer at its own 3 s cap.
     let client_timeout = Duration::from_millis(client_budget_ms.get());
     match send_request_with_timeout(&socket_path, &req, client_timeout) {
         Ok(resp_str) => remote_check_result_from_response_line(&resp_str),

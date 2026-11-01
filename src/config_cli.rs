@@ -254,6 +254,17 @@ fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str
             bail!("{} must be greater than zero", keys.join("."));
         }
     }
+    if keys == ["cache", "demand_timeout_secs"]
+        && let Some(value) = replacement.as_ref()
+    {
+        let seconds = value
+            .as_integer()
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .and_then(crate::config::checked_demand_timeout_secs);
+        if seconds.is_none() {
+            bail!("cache.demand_timeout_secs must be positive integer seconds, at most 4294967295");
+        }
+    }
     if replacement
         .as_ref()
         .is_some_and(toml_edit::Value::is_inline_table)
@@ -346,6 +357,45 @@ mod tests {
             assert!(edit(&path, key, Some("1GiB")).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn demand_timeout_edits_require_positive_finite_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# Keep this comment\n[cache]\nlocal_only = true\n").unwrap();
+        for (raw, expected) in [("1", 1), ("60", 60), ("4294967295", 4_294_967_295)] {
+            edit(&path, "cache.demand_timeout_secs", Some(raw)).unwrap();
+            let values: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                values["cache"]["demand_timeout_secs"].as_integer(),
+                Some(expected)
+            );
+        }
+        let original = fs::read_to_string(&path).unwrap();
+        for raw in [
+            "0",
+            "-1",
+            "4294967296",
+            "18446744073709551616",
+            "1.5",
+            "true",
+            "\"60\"",
+            "60s",
+            "[]",
+        ] {
+            assert!(
+                edit(&path, "cache.demand_timeout_secs", Some(raw)).is_err(),
+                "{raw}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        edit(&path, "cache.demand_timeout_secs", None).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# Keep this comment"));
+        let values: toml::Value = toml::from_str(&text).unwrap();
+        assert!(values["cache"].get("demand_timeout_secs").is_none());
+        assert_eq!(values["cache"]["local_only"].as_bool(), Some(true));
     }
 
     #[test]

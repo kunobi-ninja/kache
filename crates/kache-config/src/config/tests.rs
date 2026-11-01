@@ -5,6 +5,152 @@ use crate::testing::{TestEnvGuard, config_path_lock, set_env_for_test};
 use std::ffi::OsString;
 
 #[test]
+fn demand_timeout_values_are_positive_and_have_a_finite_seconds_range() {
+    for (input, expected) in [
+        (0, None),
+        (1, Some(1)),
+        (60, Some(60)),
+        (4_294_967_295, Some(4_294_967_295)),
+        (4_294_967_296, None),
+        (u64::MAX, None),
+    ] {
+        assert_eq!(checked_demand_timeout_secs(input), expected, "{input}");
+    }
+}
+
+#[test]
+fn demand_timeout_resolution_uses_invocation_precedence_and_rejects_invalid_values() {
+    let root = tempfile::tempdir().unwrap();
+    let invocation = |value: Option<&str>| {
+        let vars = value
+            .map(|value| vec![("KACHE_DEMAND_TIMEOUT_SECS", value)])
+            .unwrap_or_default();
+        InvocationEnv::from_parts(
+            vars,
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let file = |value: Option<u64>, ignore_env| {
+        Ok(FileConfig {
+            cache: Some(CacheFileConfig {
+                demand_timeout_secs: value,
+                ignore_env: Some(ignore_env),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    assert_eq!(
+        Config::load_resolved_for(&invocation(None), file(None, false))
+            .unwrap()
+            .demand_timeout_secs,
+        3
+    );
+    assert_eq!(
+        Config::load_resolved_for(&invocation(None), file(Some(30), false))
+            .unwrap()
+            .demand_timeout_secs,
+        30
+    );
+    assert_eq!(
+        Config::load_resolved_for(&invocation(Some("60")), file(Some(30), false))
+            .unwrap()
+            .demand_timeout_secs,
+        60
+    );
+    assert_eq!(
+        Config::load_resolved_for(&invocation(Some("60")), file(Some(30), true))
+            .unwrap()
+            .demand_timeout_secs,
+        30
+    );
+    assert_eq!(
+        Config::load_resolved_for(&invocation(Some("60")), file(None, true))
+            .unwrap()
+            .demand_timeout_secs,
+        3
+    );
+    for invalid in [
+        "0",
+        "-1",
+        "4294967296",
+        "18446744073709551616",
+        "not-seconds",
+    ] {
+        assert_eq!(
+            Config::load_resolved_for(&invocation(Some(invalid)), file(Some(30), false))
+                .unwrap()
+                .demand_timeout_secs,
+            30,
+            "{invalid}"
+        );
+        assert_eq!(
+            Config::load_resolved_for(&invocation(Some(invalid)), file(None, false))
+                .unwrap()
+                .demand_timeout_secs,
+            3,
+            "{invalid}"
+        );
+    }
+    for invalid in [0, 4_294_967_296, u64::MAX] {
+        assert_eq!(
+            Config::load_resolved_for(&invocation(None), file(Some(invalid), false))
+                .unwrap()
+                .demand_timeout_secs,
+            3,
+            "{invalid}"
+        );
+    }
+    assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_DEMAND_TIMEOUT_SECS"));
+}
+
+#[test]
+fn demand_timeout_file_values_keep_invalid_waits_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let invocation = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.path().to_owned()),
+        None,
+        root.path().to_owned(),
+    );
+    for (value, expected) in [
+        ("1", 1),
+        ("60", 60),
+        ("4294967295", 4_294_967_295),
+        ("0", 3),
+        ("4294967296", 3),
+    ] {
+        let file = toml::from_str::<FileConfig>(&format!(
+            "[cache]\nlocal_only = true\ndemand_timeout_secs = {value}\n"
+        ))
+        .unwrap();
+        let config = Config::load_resolved_for(&invocation, Ok(file)).unwrap();
+        assert_eq!(config.demand_timeout_secs, expected, "{value}");
+        assert!(
+            config.local_only,
+            "an invalid timeout must preserve other valid file settings"
+        );
+    }
+    for value in ["-1", "18446744073709551616", "1.5", "true", "\"60\""] {
+        let file =
+            toml::from_str::<FileConfig>(&format!("[cache]\ndemand_timeout_secs = {value}\n"));
+        assert!(
+            file.is_err(),
+            "{value} follows the normal unusable-file path"
+        );
+        assert_eq!(
+            Config::load_resolved_for(&invocation, file.map_err(anyhow::Error::from))
+                .unwrap()
+                .demand_timeout_secs,
+            3,
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn ignored_override_warnings_use_only_client_keys_and_never_their_values() {
     use std::sync::{Arc, Mutex};
     use tracing::{Event, Metadata, Subscriber, span};
@@ -2965,6 +3111,7 @@ fn test_file_config_roundtrip() {
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,
+            demand_timeout_secs: None,
             remote_negative_ttl_secs: None,
             remote: Some(RemoteFileConfig {
                 _type: Some("s3".to_string()),
@@ -3629,6 +3776,7 @@ fn test_config_store_dir() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
     assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
@@ -3719,6 +3867,7 @@ fn test_config_index_db_path() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
     assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
@@ -3805,6 +3954,7 @@ fn test_config_event_log_path() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
     assert_eq!(
@@ -3910,6 +4060,7 @@ fn test_config_socket_path() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
     assert_eq!(
@@ -4649,6 +4800,7 @@ fn test_save_and_load_file_config() {
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,
+            demand_timeout_secs: None,
             remote_negative_ttl_secs: None,
             remote: None,
             scheduler: None,

@@ -2233,6 +2233,7 @@ mod tests {
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
                 remote_restore_timeout_secs: Some(180),
+                demand_timeout_secs: Some(60),
                 remote_negative_ttl_secs: Some(45),
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
@@ -2267,6 +2268,7 @@ mod tests {
         assert_eq!(cache.prefetch_enabled, Some(false));
         assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
         assert_eq!(cache.remote_restore_timeout_secs, Some(180));
+        assert_eq!(cache.demand_timeout_secs, Some(60));
         assert_eq!(cache.remote_negative_ttl_secs, Some(45));
         assert_eq!(cache.min_store_compile_ms, Some(750));
         assert_eq!(cache.gc_max_age_hours, Some(72));

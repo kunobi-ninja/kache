@@ -5,6 +5,128 @@ use crate::test_support::process_state_test_lock;
 const GNU_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
 const DARWIN_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: aarch64-apple-darwin\nrelease: 1.90.0\n";
 
+#[test]
+fn apple_deployment_targets_retire_old_keys_even_when_unset() {
+    let legacy = blake3::Hasher::new().finalize();
+    for (target, custom) in [
+        (Some("aarch64-apple-darwin"), false),
+        (Some("aarch64-apple-ios"), false),
+        (Some("custom.json"), true),
+        (None, false),
+    ] {
+        let mut hasher = blake3::Hasher::new();
+        fold_apple_deployment_targets(&mut hasher, target, custom, &KeyEnv::default());
+        assert_ne!(hasher.finalize(), legacy, "{target:?}");
+    }
+    for target in ["x86_64-unknown-linux-gnu", "apple-unknown-linux-gnu"] {
+        let mut hasher = blake3::Hasher::new();
+        fold_apple_deployment_targets(
+            &mut hasher,
+            Some(target),
+            false,
+            &KeyEnv::from_parts([("MACOSX_DEPLOYMENT_TARGET", "15.0")], None),
+        );
+        assert_eq!(hasher.finalize(), legacy, "{target}");
+    }
+}
+
+#[test]
+fn apple_library_keys_follow_every_deployment_target_variable() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = root.join("lib.rs");
+    std::fs::write(&source, "pub fn value() {}\n").unwrap();
+    let invocation = client_invocation(&root, &[("OUT_DIR", None)]);
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    for (name, target) in [
+        ("MACOSX_DEPLOYMENT_TARGET", Some("aarch64-apple-darwin")),
+        ("IPHONEOS_DEPLOYMENT_TARGET", Some("aarch64-apple-ios")),
+        ("TVOS_DEPLOYMENT_TARGET", Some("aarch64-apple-tvos")),
+        ("WATCHOS_DEPLOYMENT_TARGET", Some("aarch64-apple-watchos")),
+        ("XROS_DEPLOYMENT_TARGET", Some("aarch64-apple-visionos")),
+        ("MACOSX_DEPLOYMENT_TARGET", None),
+    ] {
+        let mut argv = vec![
+            "rustc".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+        ];
+        if let Some(target) = target {
+            argv.push(format!("--target={target}"));
+        }
+        let args = RustcArgs::parse_for(&argv, &invocation).unwrap();
+        let key = |value: Option<&str>| {
+            provide_dep_info(
+                DepInfo {
+                    source_files: vec![source.clone()],
+                    env_deps: vec![],
+                },
+                None,
+            );
+            let env = KeyEnv::from_parts(value.map(|value| (name, value)), Some(root.clone()));
+            compute_cache_key(&args, &hasher, &normalizer, &env).unwrap()
+        };
+        let unset = key(None);
+        let high = key(Some("26.0"));
+        let low = key(Some("18.0"));
+        if target.is_some() || cfg!(target_os = "macos") {
+            assert_ne!(high, low, "{name}: lowering the target must miss");
+            assert_ne!(unset, high, "{name}: setting the target must miss");
+            assert_ne!(unset, key(Some("")), "{name}: preserve the exact input");
+        } else {
+            assert_eq!(unset, high, "non-Apple native keys must stay unchanged");
+            assert_eq!(high, low, "non-Apple native keys must stay unchanged");
+        }
+        assert_eq!(low, key(Some("18.0")), "{name}: stable input must hit");
+    }
+}
+
+#[test]
+fn apple_deployment_targets_are_keyed_for_named_custom_targets() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = root.join("lib.rs");
+    std::fs::write(&source, "pub fn value() {}\n").unwrap();
+    let invocation = client_invocation(
+        &root,
+        &[
+            ("OUT_DIR", None),
+            ("RUST_TARGET_PATH", Some(root.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--target=custom_ios".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let key = |value: Option<&str>| {
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        let env = KeyEnv::from_parts(
+            value.map(|value| ("IPHONEOS_DEPLOYMENT_TARGET", value)),
+            Some(root.clone()),
+        );
+        compute_cache_key(&args, &hasher, &PathNormalizer::empty(), &env).unwrap()
+    };
+    assert_ne!(key(Some("26.0")), key(Some("18.0")));
+    assert_ne!(key(None), key(Some("18.0")));
+    assert_eq!(key(Some("18.0")), key(Some("18.0")));
+}
+
 fn client_invocation(cwd: &Path, overrides: &[(&str, Option<&std::ffi::OsStr>)]) -> InvocationEnv {
     let captured = InvocationEnv::capture();
     let vars = captured
@@ -12897,10 +13019,11 @@ fn rust_keys_reject_the_legacy_explicit_emit_recipe() {
     key.unwrap();
 
     // Reconstruct the compiler prefix with the same invocation snapshot as
-    // production, including only the emit marker beyond the historical recipe.
+    // production, including the emit and Apple migration markers.
+    let version = get_rustc_version_for(&args.rustc, &invocation).unwrap();
     let identity = format!(
         "rustc_version:{}\ntarget:{}\n",
-        get_rustc_version_for(&args.rustc, &invocation).unwrap(),
+        version,
         host_target_triple(),
     );
     let mut expected = blake3::Hasher::new();
@@ -12908,6 +13031,9 @@ fn rust_keys_reject_the_legacy_explicit_emit_recipe() {
     expected.update(&14_u64.to_le_bytes());
     expected.update(b"compiler-owned");
     expected.update(identity.as_bytes());
+    if rustc_host_triple(&version).is_none_or(|target| target.split('-').nth(1) == Some("apple")) {
+        expected.update(b"apple_deployment_targets.v1\n");
+    }
     let fields = outputs.fields.unwrap();
     let compiler = &fields["compiler"];
     assert_eq!(compiler, &expected.finalize().to_hex()[..16]);

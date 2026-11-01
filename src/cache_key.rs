@@ -695,6 +695,34 @@ fn fold_field<H: KeyFold>(hasher: &mut H, label: &[u8], value: &[u8]) {
     hasher.update(value);
 }
 
+/// rustc reads these while resolving Apple target specs, without recording
+/// them in dep-info. This applies to libraries too, before any native link.
+/// Custom specs can select Apple platforms without an Apple triple.
+fn fold_apple_deployment_targets<H: KeyFold>(
+    hasher: &mut H,
+    target: Option<&str>,
+    custom_target: bool,
+    env: &KeyEnv,
+) {
+    if target.is_some_and(|target| target.split('-').nth(1) != Some("apple")) && !custom_target {
+        return;
+    }
+    // Retire old entries even when every variable is unset: an old key may
+    // have stored objects built with an explicit minimum OS version.
+    hasher.update(b"apple_deployment_targets.v1\n");
+    for name in [
+        "MACOSX_DEPLOYMENT_TARGET",
+        "IPHONEOS_DEPLOYMENT_TARGET",
+        "TVOS_DEPLOYMENT_TARGET",
+        "WATCHOS_DEPLOYMENT_TARGET",
+        "XROS_DEPLOYMENT_TARGET",
+    ] {
+        if let Some(value) = env.var_os(name) {
+            fold_field(hasher, name.as_bytes(), value.as_encoded_bytes());
+        }
+    }
+}
+
 /// The byte-fold surface shared by [`blake3::Hasher`] and [`GroupedHasher`],
 /// so the key-fold helpers (and their tests, which drive a plain hasher) stay
 /// agnostic to whether per-group tee-hashing is active.
@@ -3319,6 +3347,11 @@ fn compute_key_into(
         }
     }
 
+    let compiler_target = args
+        .target
+        .as_deref()
+        .or_else(|| rustc_host_triple(&rustc_version));
+
     // Pre-audit clients can store an EXE-only entry under the old key. Keep
     // those entries out of every local/remote lookup and committed-peer
     // recheck. Custom specs can choose PE without saying so in
@@ -3329,6 +3362,7 @@ fn compute_key_into(
                 || target.ends_with(".json")
                 || invocation.var_os("RUST_TARGET_PATH").is_some()
         });
+    fold_apple_deployment_targets(&mut hasher, compiler_target, custom_target, env);
     if executable_pdb_admission(args, &rustc_version, custom_target) {
         hasher.set_group("pe_pdb_admission");
         fold_field(&mut hasher, b"executable_pdb_pairing.v1:", b"verified");

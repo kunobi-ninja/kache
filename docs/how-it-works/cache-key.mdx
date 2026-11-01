@@ -7,6 +7,8 @@ Kache hashes the inputs that can change compiler output and normalizes machine-l
 
 ## Rust key inputs
 
+Apple targets and custom target specs use a new key namespace. Their first build after upgrading misses old Rust entries, even with deployment-target variables unset, because older entries may contain objects built for a different minimum OS version.
+
 The exact set depends on the invocation. It can include:
 
 - rustc identity and target, including the contents of a custom target spec file
@@ -22,6 +24,7 @@ The exact set depends on the invocation. It can include:
 - the contents of `--extern` dependencies
 - native static archives the unit links, found through `-L` directories, `-l` specs and `-C link-arg`
 - compile-time environment values rustc reports
+- `MACOSX_DEPLOYMENT_TARGET`, `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, `WATCHOS_DEPLOYMENT_TARGET`, and `XROS_DEPLOYMENT_TARGET` for Apple targets and custom target specs, including library and metadata compilations
 - native libc version and hashed CRT/startup objects for host-loaded Linux outputs, and the contents of the linker the C compiler driver runs for them (the driver's default `ld`, or the one `-fuse-ld`, `--ld-path` or `-B` in `-C link-arg` selects)
 - macOS SDK identity (version and build) and `MACOSX_DEPLOYMENT_TARGET`, when set, for host-loaded Darwin outputs
 - for native Windows MSVC links: the linker (`link.exe`, `lld-link.exe`, or the `rust-lld.exe` in rustc's sysroot), the MSVC, SDK and UCRT environment for the architecture, and the import and static libraries

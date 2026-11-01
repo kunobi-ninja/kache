@@ -85,6 +85,7 @@ mod store_view;
 mod target_cleanup;
 mod target_dedup;
 mod target_liveness;
+mod target_processes;
 mod target_seed;
 mod target_use;
 mod term;

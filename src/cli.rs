@@ -5935,6 +5935,7 @@ fn remove_targets(
     failed: &mut Vec<CleanFailed>,
 ) -> (usize, u64, u64) {
     let mut estimated_reclaimed = 0u64;
+    let programs = crate::target_processes::ActivePrograms::default();
     let mut apparent_gap = 0u64;
     let mut removed = 0usize;
     let reservation = crate::target_use::try_exclusive(cache_dir).unwrap_or_else(|error| {
@@ -5966,7 +5967,7 @@ fn remove_targets(
             });
             continue;
         }
-        if target_in_use(&target.path) {
+        if target_in_use(&target.path) || programs.uses(&target.path) {
             if human_clean_output(quiet) {
                 println!("  skipped {} — {TARGET_IN_USE}", rel.display());
             }
@@ -6052,7 +6053,11 @@ fn removal_notes(cache_dir: &std::path::Path, paths: &[&std::path::Path]) -> Vec
             "Not now: {reason}; until then `kache clean --yes` skips them."
         )];
     }
-    let in_use = paths.iter().filter(|path| target_in_use(path)).count();
+    let programs = crate::target_processes::ActivePrograms::default();
+    let in_use = paths
+        .iter()
+        .filter(|path| target_in_use(path) || programs.uses(path))
+        .count();
     if in_use == 0 {
         return Vec::new();
     }
@@ -6066,7 +6071,7 @@ fn human_clean_output(quiet: bool) -> bool {
     !quiet
 }
 
-const TARGET_IN_USE: &str = "in use by a running Cargo command or test";
+const TARGET_IN_USE: &str = "in use by a running command or program";
 
 /// Whether a Cargo process holds one of `target`'s build locks. Cargo takes
 /// an exclusive lock on `<profile>/.cargo-lock` (and

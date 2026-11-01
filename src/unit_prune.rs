@@ -414,6 +414,9 @@ fn prune_with(
     now: SystemTime,
     shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
 ) -> Pruned {
+    if crate::target_processes::ActivePrograms::default().uses(target_dir) {
+        return Pruned::default();
+    }
     let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
         return Pruned::default();
     };
@@ -514,6 +517,9 @@ pub(crate) fn preview(
     window: Duration,
     now: SystemTime,
 ) -> Pruned {
+    if crate::target_processes::ActivePrograms::default().uses(target_dir) {
+        return Pruned::default();
+    }
     let Step::Judge(armed) = step(
         read_armed(&armed_record(cache_dir, target_dir)),
         now,
@@ -667,6 +673,35 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_running_program_keeps_unused_units_and_the_preview_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        shared_profile(&profile);
+        set_times(&profile, ago(60));
+        let window = Duration::from_secs(30 * DAY);
+        judge(&cache, &target, window, ago(40));
+        let child = crate::target_processes::tests::RunningProgram::start(&target);
+        let now = SystemTime::now();
+        assert_eq!(preview(&cache, &target, window, now), Pruned::default());
+        assert_eq!(
+            prune_with(&cache, &target, window, now, |_| panic!(
+                "busy target must not be armed"
+            )),
+            Pruned::default()
+        );
+        assert_eq!(units(&profile).len(), 2);
+        drop(child);
+        assert_eq!(preview(&cache, &target, window, now).units, 2);
+        assert_eq!(
+            prune_with(&cache, &target, window, now, |_| Ok(true)).units,
+            2
+        );
+    }
 
     const OLD: &str = "0123456789abcdef";
     const NEW: &str = "fedcba9876543210";

@@ -66,6 +66,27 @@ fn a_recovered_index_keeps_the_configured_synchronous_mode() {
 }
 
 #[test]
+fn an_unopenable_index_path_does_not_start_corruption_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    fs::create_dir(&path).unwrap();
+    let marker = path.join("kept");
+    fs::write(&marker, b"keep this directory").unwrap();
+
+    let err = open_index_db_reporting_recovery(&path, IndexMode::Off).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().unwrap();
+    assert!(matches!(
+        sql_err,
+        SqlError::SqliteFailure(code, _) if code.code == ErrorCode::CannotOpen
+    ));
+    assert!(
+        !index_sidecar_path(&path, ".recovery-lock").exists(),
+        "an ordinary open error must not acquire the corruption-recovery lock"
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"keep this directory");
+}
+
+#[test]
 fn incompatible_predictions_are_relearned_without_removing_compiled_entries() {
     for generation in [11, INDEX_SCHEMA_GENERATION] {
         for payload in ["record_json", "prediction_json"] {

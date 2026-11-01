@@ -75,7 +75,7 @@ jobs:
           git -C "$baseline" apply --check "$RUNNER_TEMP/regression.patch"
           git -C "$baseline" apply "$RUNNER_TEMP/regression.patch"
           set +e
-          (cd "$baseline" && cargo test --locked -p kache --lib configured_demand_timeout_restores_after_the_legacy_three_seconds -- --nocapture) > "$EVIDENCE_DIR/regression-red.log" 2>&1
+          (cd "$baseline" && CARGO_TARGET_DIR="$RUNNER_TEMP/preflight-1783/baseline-target" cargo test --locked -p kache --lib configured_demand_timeout_restores_after_the_legacy_three_seconds -- --nocapture) > "$EVIDENCE_DIR/regression-red.log" 2>&1
           result=$?
           set -e
           cat "$EVIDENCE_DIR/regression-red.log"

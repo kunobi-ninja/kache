@@ -24,6 +24,7 @@ pub(crate) const KEY_ENV_VARS: &[&str] = &[
     "CLIPPY_ARGS",
     "CLIPPY_CONF_DIR",
     "CLIPPY_DISABLE_DOCS_LINKS",
+    "IPHONEOS_DEPLOYMENT_TARGET",
     "KACHE_VERIFY_INPUT_PREDICTIONS",
     "LIBRARY_PATH",
     "MACOSX_DEPLOYMENT_TARGET",
@@ -31,6 +32,9 @@ pub(crate) const KEY_ENV_VARS: &[&str] = &[
     "RUSTC_BOOTSTRAP",
     "RUSTFLAGS",
     "SDKROOT",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
 ];
 
 /// The one family the key reads by prefix: Cargo's `CARGO_CFG_*` variables.

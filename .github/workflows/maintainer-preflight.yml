@@ -1,0 +1,123 @@
+name: Maintainer preflight (1797 repair)
+
+on:
+  push:
+    branches: [validation/preflight-1797-repair]
+    paths: [.github/workflows/maintainer-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Windows prerequisites (Linux)
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1797-repair'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      EXPECTED_HEAD: bfda1f1e568906eead5c8729657bc5b84d4a1420
+      EXPECTED_TREE: 7c5f8811bc6b95b7cbaee436412184e0637ba71b
+      BASE_HEAD: cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
+    steps:
+      - name: Record provenance and require an ephemeral hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/preflight-1792/evidence"
+          mkdir -p "$evidence"
+          printf 'EVIDENCE_DIR=%s\n' "$evidence" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/preflight-1792/target" >> "$GITHUB_ENV"
+          printf 'helper=%s\nrun=%s\nrunner=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_KIND" | tee "$evidence/provenance.txt"
+          test "$RUNNER_KIND" = github-hosted
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: bfda1f1e568906eead5c8729657bc5b84d4a1420
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate
+        id: verify
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          printf 'tested_head=%s\ntested_tree=%s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE" >> "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - name: Record toolchain
+        run: |
+          set -euo pipefail
+          rustc --version --verbose | tee "$EVIDENCE_DIR/toolchain.txt"
+          cargo --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          just --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+      - name: Verify runtime memo regression fails with the old callback
+        id: red
+        env:
+          REGRESSION_PATCH_BASE64: LS0tIGEvc3JjL2NhY2hlX2tleS5ycworKysgYi9zcmMvY2FjaGVfa2V5LnJzCkBAIC0xMDc5MSw3ICsxMDc5MSw3IEBACiAgICAgICAgICZhcmdzLmxpbmtfbGlicywKICAgICAgICAgJnNlYXJjaF9kaXJzLmRlZmF1bHRfbGlicmFyaWVzLAogICAgICAgICB8cGF0aHwgZmlsZV9oYXNoZXIuaGFzaF9zdGF0aWNfbGliKHBhdGgpLAotICAgICAgICB8cGF0aHwgZmlsZV9oYXNoZXIuaGFzaChwYXRoKSwKKyAgICAgICAgfHBhdGh8IGthY2hlX3N0b3JlOjpmaWxlX2hhc2g6Omhhc2hfZmlsZShwYXRoKSwKICAgICAgICAgaW52b2NhdGlvbiwKICAgICApCiB9Cg==
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH'
+          import os, base64, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'regression.patch').write_bytes(base64.b64decode(os.environ['REGRESSION_PATCH_BASE64'], validate=True))
+          PY_PATCH
+          git apply --check "$RUNNER_TEMP/regression.patch"
+          git apply "$RUNNER_TEMP/regression.patch"
+          set +e
+          cargo test --locked -p kache --lib cache_key::tests::windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe -- --exact --nocapture > "$EVIDENCE_DIR/regression-red.log" 2>&1
+          result=$?
+          set -e
+          git apply -R "$RUNNER_TEMP/regression.patch"
+          git diff --exit-code HEAD
+          cat "$EVIDENCE_DIR/regression-red.log"
+          test "$result" -ne 0
+          grep -F 'test cache_key::tests::windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe ... FAILED' "$EVIDENCE_DIR/regression-red.log"
+          grep -F 'assertion' "$EVIDENCE_DIR/regression-red.log"
+      - name: Verify the production runtime callback regression passes
+        id: green
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --lib cache_key::tests::windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/regression-green.log"
+      - name: Check portable identity decoding and Windows policy
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache-store windows_fingerprint_parts -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/portable-identity.log"
+          cargo test --locked -p kache-store file_hash_memo_policy -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/memo-policy.log"
+      - name: Run just check
+        id: check
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation
+        id: docs
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+      - name: Record outcomes
+        if: always()
+        env:
+          VERIFY: ${{ steps.verify.outcome }}
+          RED: ${{ steps.red.outcome }}
+          GREEN: ${{ steps.green.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          printf 'verify=%s\nred=%s\ngreen=%s\njust_check=%s\ndocs=%s\n' "$VERIFY" "$RED" "$GREEN" "$CHECK" "$DOCS" | tee "$EVIDENCE_DIR/outcomes.txt"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maintainer-preflight-1792-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

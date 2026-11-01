@@ -21,8 +21,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: 8aa90bf22fa12cdb4c6c0480cab9c7d1be84e58c
-      EXPECTED_TREE: 02668c57ac701d6b606df0abf939412d74da5090
+      EXPECTED_HEAD: 02dc32c521f43add02cce54abb809235e8a510a2
+      EXPECTED_TREE: 259f9a71e9fce851bb341532d085a1a398686d35
       BASE_HEAD: cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
     steps:
       - name: Record provenance and require an ephemeral hosted runner
@@ -38,7 +38,7 @@ jobs:
           test "$RUNNER_KIND" = github-hosted
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 8aa90bf22fa12cdb4c6c0480cab9c7d1be84e58c
+          ref: 02dc32c521f43add02cce54abb809235e8a510a2
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact candidate
@@ -64,6 +64,7 @@ jobs:
         id: green
         run: |
           set -euo pipefail
+          cargo test --locked -p kache --lib guarded_tool_directory_identity -- --nocapture
           cargo test --locked -p kache --lib guarded_absence -- --nocapture
           cargo test --locked -p kache --lib guarded_inputs -- --nocapture
           cargo test --locked -p kache --lib key_inputs_changed -- --nocapture
@@ -113,8 +114,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: 8aa90bf22fa12cdb4c6c0480cab9c7d1be84e58c
-      EXPECTED_TREE: 02668c57ac701d6b606df0abf939412d74da5090
+      EXPECTED_HEAD: 02dc32c521f43add02cce54abb809235e8a510a2
+      EXPECTED_TREE: 259f9a71e9fce851bb341532d085a1a398686d35
     steps:
       - name: Require hosted runner and record provenance
         env:
@@ -128,7 +129,7 @@ jobs:
           "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 8aa90bf22fa12cdb4c6c0480cab9c7d1be84e58c
+          ref: 02dc32c521f43add02cce54abb809235e8a510a2
           fetch-depth: 0
           persist-credentials: false
       - name: Verify candidate source
@@ -150,6 +151,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           rustc --version --verbose | Tee-Object (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
           if ($LASTEXITCODE -ne 0) { throw 'Compiler unavailable' }
+          cargo test --locked -p kache --lib guarded_tool_directory_identity -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Directory identity guards failed' }
           cargo test --locked -p kache --lib manifest -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'manifest-tests.log')
           if ($LASTEXITCODE -ne 0) { throw 'Manifest unit tests failed' }
           cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'clippy.log')

@@ -21,8 +21,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: d80bb5d74ffb9999c7eb09eed48282eef12a600a
-      EXPECTED_TREE: ee5962ad27e77c9209ad9800736a5a5e2a359b30
+      EXPECTED_HEAD: 2ef68c2345203e636d3a9b4ad4066d893859fd82
+      EXPECTED_TREE: 88544fe482cf4a802a14be9d3469ae0a8a876a4d
       BASE_HEAD: cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
     steps:
       - name: Record provenance and require an ephemeral hosted runner
@@ -38,7 +38,7 @@ jobs:
           test "$RUNNER_KIND" = github-hosted
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: d80bb5d74ffb9999c7eb09eed48282eef12a600a
+          ref: 2ef68c2345203e636d3a9b4ad4066d893859fd82
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact candidate
@@ -64,6 +64,9 @@ jobs:
         id: green
         run: |
           set -euo pipefail
+          cargo test --locked -p kache --lib guarded_absence -- --nocapture
+          cargo test --locked -p kache --lib guarded_inputs -- --nocapture
+          cargo test --locked -p kache --lib key_inputs_changed -- --nocapture
           cargo test --locked -p kache --lib manifest -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/manifest-tests.log"
       - name: Run just check
         id: check
@@ -110,8 +113,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: d80bb5d74ffb9999c7eb09eed48282eef12a600a
-      EXPECTED_TREE: ee5962ad27e77c9209ad9800736a5a5e2a359b30
+      EXPECTED_HEAD: 2ef68c2345203e636d3a9b4ad4066d893859fd82
+      EXPECTED_TREE: 88544fe482cf4a802a14be9d3469ae0a8a876a4d
     steps:
       - name: Require hosted runner and record provenance
         env:
@@ -125,7 +128,7 @@ jobs:
           "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: d80bb5d74ffb9999c7eb09eed48282eef12a600a
+          ref: 2ef68c2345203e636d3a9b4ad4066d893859fd82
           fetch-depth: 0
           persist-credentials: false
       - name: Verify candidate source

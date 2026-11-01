@@ -1,0 +1,118 @@
+name: Maintainer preflight (1783)
+
+on:
+  push:
+    branches: [validation/preflight-1783-demand-timeout]
+    paths: [.github/workflows/maintainer-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Demand timeout red and green
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1783-demand-timeout'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      EXPECTED_HEAD: cb89b4ce4f0aaea5ecbc490f63f467795d9ab384
+      EXPECTED_TREE: adb63275c383456446958d05e3b8f69abb1cfabe
+      BASE_HEAD: 5c90a41e07eaeeedfcd57c0a08f5b501dc718e45
+    steps:
+      - name: Record provenance and require an ephemeral hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/preflight-1783/evidence"
+          mkdir -p "$evidence"
+          printf 'EVIDENCE_DIR=%s\n' "$evidence" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/preflight-1783/target" >> "$GITHUB_ENV"
+          printf 'helper=%s\nrun=%s\nrunner=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_KIND" | tee "$evidence/provenance.txt"
+          test "$RUNNER_KIND" = github-hosted
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: cb89b4ce4f0aaea5ecbc490f63f467795d9ab384
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate
+        id: verify
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          printf 'tested_head=%s\ntested_tree=%s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE" >> "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - name: Record toolchain
+        run: |
+          set -euo pipefail
+          rustc --version --verbose | tee "$EVIDENCE_DIR/toolchain.txt"
+          cargo --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          just --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+      - name: Verify regression fails on the old implementation
+        id: red
+        env:
+          REGRESSION_PATCH_BASE64: LS0tIGEvc3JjL2RhZW1vbi90ZXN0cy5ycworKysgYi9zcmMvZGFlbW9uL3Rlc3RzLnJzCkBAIC0xMjA5MSw2ICsxMjA5MSw4NyBAQAogICAgIH0KIH0KIAorI1t0b2tpbzo6dGVzdChmbGF2b3IgPSAibXVsdGlfdGhyZWFkIiwgd29ya2VyX3RocmVhZHMgPSAyKV0KK2FzeW5jIGZuIGNvbmZpZ3VyZWRfZGVtYW5kX3RpbWVvdXRfcmVzdG9yZXNfYWZ0ZXJfdGhlX2xlZ2FjeV90aHJlZV9zZWNvbmRzKCkgeworICAgIGxldCBkaXIgPSB0ZW1wZmlsZTo6dGVtcGRpcigpLnVud3JhcCgpOworICAgIGxldCBjb25maWdfcGF0aCA9IGRpci5wYXRoKCkuam9pbigiY29uZmlnLnRvbWwiKTsKKyAgICBsZXQgc3RvcmUgPSB0b21sOjpWYWx1ZTo6U3RyaW5nKGRpci5wYXRoKCkuam9pbigic3RvcmUiKS50b19zdHJpbmdfbG9zc3koKS5pbnRvX293bmVkKCkpOworICAgIGxldCBydW50aW1lID0gdG9tbDo6VmFsdWU6OlN0cmluZyhkaXIucGF0aCgpLnRvX3N0cmluZ19sb3NzeSgpLmludG9fb3duZWQoKSk7CisgICAgZnM6OndyaXRlKAorICAgICAgICAmY29uZmlnX3BhdGgsCisgICAgICAgIGZvcm1hdCEoCisgICAgICAgICAgICAiW2NhY2hlXVxuaWdub3JlX2VudiA9IHRydWVcbmxvY2FsX3N0b3JlID0ge3N0b3JlfVxucnVudGltZV9kaXIgPSB7cnVudGltZX1cblwKKyAgICAgICAgICAgICBkZW1hbmRfdGltZW91dF9zZWNzID0gMTBcbnJlbW90ZV9yZXN0b3JlX3RpbWVvdXRfc2VjcyA9IDMwXG4iCisgICAgICAgICksCisgICAgKQorICAgIC51bndyYXAoKTsKKyAgICBsZXQgaW52b2NhdGlvbiA9IGthY2hlX2NvbmZpZzo6SW52b2NhdGlvbkVudjo6ZnJvbV9wYXJ0cygKKyAgICAgICAgWworICAgICAgICAgICAgKCJLQUNIRV9DT05GSUciLCBjb25maWdfcGF0aC50b19zdHIoKS51bndyYXAoKSksCisgICAgICAgICAgICAoIktBQ0hFX0hPU1RfQ09ORklHIiwgIiIpLAorICAgICAgICBdLAorICAgICAgICBTb21lKGRpci5wYXRoKCkudG9fb3duZWQoKSksCisgICAgICAgIE5vbmUsCisgICAgICAgIGRpci5wYXRoKCkudG9fb3duZWQoKSwKKyAgICApOworICAgIGxldCBtdXQgY29uZmlnID0gQ29uZmlnOjpsb2FkX2ZvcigmaW52b2NhdGlvbikudW53cmFwKCk7CisgICAgY29uZmlnLnJlbW90ZSA9IFNvbWUodGVzdF9yZW1vdGVfY29uZmlnKCkpOworICAgIGxldCBrZXkgPSB0ZXN0X2NhY2hlX2tleSgicmVzdG9yZS1hZnRlci10aHJlZS1zZWNvbmRzIik7CisgICAgbGV0IGlubmVyID0gdGVzdF9yZW1vdGVfYmFja2VuZCgpOworICAgIHB1dF90ZXN0X29iamVjdCgKKyAgICAgICAgJmlubmVyLAorICAgICAgICAmdGVzdF9wYWNrX29iamVjdF9rZXkoJmtleSwgInNlcmRlIiksCisgICAgICAgICZidWlsZF9lbnRyeV9wYWNrKCZrZXksICJzZXJkZSIpLAorICAgICkKKyAgICAuYXdhaXQ7CisgICAgbGV0IGJhY2tlbmQgPSBBcmM6Om5ldyhEaXJlY3RSZXN0b3JlQmFja2VuZCB7CisgICAgICAgIGlubmVyLAorICAgICAgICBnZXRzOiAwLmludG8oKSwKKyAgICAgICAgc3RhcnRlZDogdG9raW86OnN5bmM6OlNlbWFwaG9yZTo6bmV3KDApLAorICAgICAgICByZWxlYXNlOiBTb21lKHRva2lvOjpzeW5jOjpTZW1hcGhvcmU6Om5ldygwKSksCisgICAgfSk7CisgICAgbGV0IGRhZW1vbiA9IEFyYzo6bmV3KERhZW1vbjo6bmV3KGNvbmZpZy5jbG9uZSgpKSk7CisgICAgZGFlbW9uLnNpZ25hbF93YXJtaW5nX2NvbXBsZXRlKCk7CisgICAgYXNzZXJ0IShkYWVtb24ucmVtb3RlX2JhY2tlbmQuc2V0KGJhY2tlbmQuY2xvbmUoKSkuaXNfb2soKSk7CisgICAgbGV0IGVudHJ5ID0gZGFlbW9uLmVudHJ5X2Rpcl9mb3IoJmtleSk7CisgICAgbGV0IHNvY2tldCA9IGNvbmZpZy5zb2NrZXRfcGF0aCgpOworICAgIGxldCBsaXN0ZW5lciA9IGJpbmRfbGlzdGVuZXIoJnNvY2tldCk7CisgICAgbGV0IHNlcnZpbmcgPSBkYWVtb24uY2xvbmUoKTsKKyAgICBsZXQgc2VydmVyID0gdG9raW86OnNwYXduKGFzeW5jIG1vdmUgeworICAgICAgICBsZXQgbXV0IGhhbmRsZXJzID0gdG9raW86OnRhc2s6OkpvaW5TZXQ6Om5ldygpOworICAgICAgICAvLyBzZW5kX3JlbW90ZV9jaGVjayBmaXJzdCBwcm9iZXMgcmVhY2hhYmlsaXR5LCB0aGVuIHNlbmRzIGl0cyByZXF1ZXN0LgorICAgICAgICBmb3IgXyBpbiAwLi4yIHsKKyAgICAgICAgICAgIGxldCBzdHJlYW0gPSBsaXN0ZW5lci5hY2NlcHQoKS5hd2FpdC51bndyYXAoKTsKKyAgICAgICAgICAgIGxldCBkYWVtb24gPSBzZXJ2aW5nLmNsb25lKCk7CisgICAgICAgICAgICBoYW5kbGVycy5zcGF3bihhc3luYyBtb3ZlIHsKKyAgICAgICAgICAgICAgICBsZXQgXyA9IGhhbmRsZV9jb25uZWN0aW9uKHN0cmVhbSwgJmRhZW1vbiwgJkFyYzo6bmV3KExpZmVjeWNsZTo6ZGVmYXVsdCgpKSkuYXdhaXQ7CisgICAgICAgICAgICB9KTsKKyAgICAgICAgfQorICAgICAgICB3aGlsZSBsZXQgU29tZShyZXN1bHQpID0gaGFuZGxlcnMuam9pbl9uZXh0KCkuYXdhaXQgeworICAgICAgICAgICAgcmVzdWx0LnVud3JhcCgpOworICAgICAgICB9CisgICAgfSk7CisgICAgbGV0IGNsaWVudF9lbnRyeSA9IGVudHJ5LmNsb25lKCk7CisgICAgbGV0IGNsaWVudCA9IHRva2lvOjp0YXNrOjpzcGF3bl9ibG9ja2luZyhtb3ZlIHx8IHsKKyAgICAgICAgc2VuZF9yZW1vdGVfY2hlY2soJmNvbmZpZywgJmtleSwgJmNsaWVudF9lbnRyeSwgInNlcmRlIiwgTm9uZSkKKyAgICB9KTsKKyAgICB0b2tpbzo6dGltZTo6dGltZW91dChEdXJhdGlvbjo6ZnJvbV9zZWNzKDUpLCBiYWNrZW5kLnN0YXJ0ZWQuYWNxdWlyZSgpKQorICAgICAgICAuYXdhaXQKKyAgICAgICAgLmV4cGVjdCgidGhlIHdyYXBwZXIgbXVzdCByZWFjaCB0aGUgZGFlbW9uJ3MgcmVzdG9yZSIpCisgICAgICAgIC51bndyYXAoKQorICAgICAgICAuZm9yZ2V0KCk7CisgICAgdG9raW86OnRpbWU6OnNsZWVwKER1cmF0aW9uOjpmcm9tX21pbGxpcygzXzI1MCkpLmF3YWl0OworICAgIGJhY2tlbmQucmVsZWFzZS5hc19yZWYoKS51bndyYXAoKS5hZGRfcGVybWl0cygxKTsKKyAgICBsZXQgcmVzcG9uc2UgPSBjbGllbnQuYXdhaXQudW53cmFwKCkuZXhwZWN0KCJjb25maWd1cmVkIHdyYXBwZXIgd2FpdCIpOworICAgIHNlcnZlci5hd2FpdC51bndyYXAoKTsKKyAgICBhc3NlcnQhKAorICAgICAgICByZXNwb25zZS5mb3VuZCwKKyAgICAgICAgInRoZSByYWlzZWQgZGVtYW5kIGJ1ZGdldCBtdXN0IHJlc3RvcmUgdGhlIGVudHJ5IgorICAgICk7CisgICAgYXNzZXJ0IShlbnRyeS5qb2luKCJtZXRhLmpzb24iKS5pc19maWxlKCkpOworICAgIGFzc2VydCEoIWRhZW1vbi5yZW1vdGVfYnJlYWtlci5pc19kZWdyYWRlZCgpKTsKK30KKwogLy8vICM1NjQ6IHRoZSBzZWNvbmQgY2hlY2sgZm9yIHRoZSBzYW1lIGRlZmluaXRpdmVseS1taXNzaW5nIGtleSBtdXN0IGJlCiAvLy8gYW5zd2VyZWQgZnJvbSB0aGUgbmVnYXRpdmUgY2FjaGUg4oCUIG9uZSBTMyByb3VuZCB0cmlwLCBvbmUgbmVnYXRpdmUKIC8vLyBoaXQg4oCUIGFuZCBhIHN1Y2Nlc3NmdWwgdXBsb2FkIG9mIHRoZSBrZXkgbXVzdCBjbGVhciB0aGUgZW50cnkuCg==
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/demand-baseline"
+          git worktree add --detach "$baseline" "$BASE_HEAD"
+          python3 - <<'PY_PATCH'
+          import os, base64, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'regression.patch').write_bytes(base64.b64decode(os.environ['REGRESSION_PATCH_BASE64'], validate=True))
+          PY_PATCH
+          git -C "$baseline" apply --check "$RUNNER_TEMP/regression.patch"
+          git -C "$baseline" apply "$RUNNER_TEMP/regression.patch"
+          set +e
+          (cd "$baseline" && cargo test --locked -p kache --lib configured_demand_timeout_restores_after_the_legacy_three_seconds -- --nocapture) > "$EVIDENCE_DIR/regression-red.log" 2>&1
+          result=$?
+          set -e
+          cat "$EVIDENCE_DIR/regression-red.log"
+          test "$result" -ne 0
+          grep -F 'test daemon::tests::configured_demand_timeout_restores_after_the_legacy_three_seconds ... FAILED' "$EVIDENCE_DIR/regression-red.log"
+          grep -F 'configured wrapper wait' "$EVIDENCE_DIR/regression-red.log"
+      - name: Verify the same regression passes with the fix
+        id: green
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --lib configured_demand_timeout_restores_after_the_legacy_three_seconds -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/regression-green.log"
+      - name: Run just check
+        id: check
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation
+        id: docs
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+      - name: Record outcomes
+        if: always()
+        env:
+          VERIFY: ${{ steps.verify.outcome }}
+          RED: ${{ steps.red.outcome }}
+          GREEN: ${{ steps.green.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          printf 'verify=%s\nred=%s\ngreen=%s\njust_check=%s\ndocs=%s\n' "$VERIFY" "$RED" "$GREEN" "$CHECK" "$DOCS" | tee "$EVIDENCE_DIR/outcomes.txt"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maintainer-preflight-1783-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

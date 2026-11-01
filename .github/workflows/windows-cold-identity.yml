@@ -1,0 +1,77 @@
+name: Fresh Windows cold-key attribution
+on:
+  push:
+    branches: [validation/windows-cold-first-key]
+    paths: [.github/workflows/windows-cold-identity.yml]
+permissions:
+  contents: read
+jobs:
+  native:
+    name: Fresh ARM64 (${{ matrix.kind }})
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/windows-cold-first-key'
+    runs-on: windows-11-arm
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: old-behavior-instrumented
+            head: 356697e30e4aadd8fa8bf96f5e254bb1f12f6d89
+            tree: c3c8f9f2bf61cb1f84b596467d2ff4381c9b8915
+          - kind: repaired-candidate-first
+            head: bfda1f1e568906eead5c8729657bc5b84d4a1420
+            tree: 7c5f8811bc6b95b7cbaee436412184e0637ba71b
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      EXPECTED_HEAD: ${{ matrix.head }}
+      EXPECTED_TREE: ${{ matrix.tree }}
+    steps:
+      - name: Require a fresh hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Hosted runner required' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'cold-key-evidence'
+          [IO.Directory]::CreateDirectory($evidence) | Out-Null
+          "EVIDENCE_DIR=$evidence" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cold-key-target')" >> $env:GITHUB_ENV
+          "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion`nsource=$env:EXPECTED_HEAD" | Set-Content (Join-Path $evidence 'provenance.txt')
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ matrix.head }}
+          persist-credentials: false
+      - name: Verify source
+        run: |
+          if ((git rev-parse HEAD) -ne $env:EXPECTED_HEAD) { throw 'Wrong head' }
+          if ((git rev-parse 'HEAD^{tree}') -ne $env:EXPECTED_TREE) { throw 'Wrong tree' }
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: --force rust
+          cache: false
+          reshim: false
+      - name: Build this source only
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          rustc --version --verbose | Tee-Object (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
+          cargo build --locked -p kache --release --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic build failed' }
+          Get-FileHash -Algorithm SHA256 (Join-Path $env:CARGO_TARGET_DIR 'release/kache.exe'), (Join-Path $env:CARGO_TARGET_DIR 'release/kache-engine.exe') | Format-List | Out-String | Set-Content (Join-Path $env:EVIDENCE_DIR 'binaries.txt')
+      - name: Measure the first native keys on this VM
+        run: |
+          ./scripts/adoption/windows-native-key-probe.ps1 -Kache (Join-Path $env:CARGO_TARGET_DIR 'release/kache.exe') -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'probe')
+      - name: Upload attribution evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fresh-windows-${{ matrix.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

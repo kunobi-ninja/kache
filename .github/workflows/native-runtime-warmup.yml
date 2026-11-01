@@ -25,8 +25,8 @@ jobs:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: 90b83ffe441125111f1ed6335d7abf975492e660
-      EXPECTED_TREE: 7380107f0cff50e281bb06b2fb73f2145291f709
+      EXPECTED_HEAD: 2040082f008358bbb95b74fe8d8e949b2537c021
+      EXPECTED_TREE: d04f34f01a4328bd305486769cb18c6abd0244a7
     steps:
       - name: Require an ephemeral hosted runner
         env:
@@ -40,7 +40,7 @@ jobs:
           "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 90b83ffe441125111f1ed6335d7abf975492e660
+          ref: 2040082f008358bbb95b74fe8d8e949b2537c021
           fetch-depth: 0
           persist-credentials: false
           submodules: recursive

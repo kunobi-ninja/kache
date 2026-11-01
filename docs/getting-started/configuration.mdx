@@ -646,8 +646,20 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_PULL_REQUEST_PREFIX` | `cache.remote.pull_request_prefix` | none | In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), read this prefix after `prefix` and write only here. It must differ from `prefix`, and neither may contain the other. OCI remotes stay read-only. See [A prefix for pull requests](/docs/remote-cache/ci#a-prefix-for-pull-requests). |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Concurrent operations for all remote backends |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
-| `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
+| `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; `0` disables this operation limit |
+| `KACHE_DEMAND_TIMEOUT_SECS` | `cache.demand_timeout_secs` | `3` | End-to-end synchronous remote restore wait in positive integer seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
+
+Raise the synchronous demand wait when downloading and unpacking a large cached entry is still faster than compiling it:
+
+```sh
+kache config set cache.demand_timeout_secs 60
+kache daemon restart
+```
+
+The wrapper and daemon use the shortest of their demand budgets, the client's request deadline, and the enabled `remote_restore_timeout_secs` limit. A shorter client deadline still wins. A legacy client with no deadline keeps its three-second budget; an older daemon still stops at three seconds, so upgrade both peers to use longer waits. Background upload and prefetch retain their separate operation deadlines.
+
+Demand timeouts accept integers from `1` through `4294967295` seconds. Zero does not disable the wait. `config set` rejects invalid values before saving. Invalid environment values warn and fall back to a valid file value or three seconds. Zero or out-of-range file values warn and use three seconds. Malformed TOML or a value of the wrong type follows the usual unusable-file handling; commands report the file error and use defaults.
 
 Prediction-row fetches wait at most two seconds, or less when `remote_restore_timeout_secs` is shorter. Setting it to `0` keeps the two-second prediction cap. While the read circuit breaker is degraded, prediction fetches return immediately and leave recovery probes to artifact restores.
 

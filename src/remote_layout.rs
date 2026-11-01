@@ -1120,6 +1120,7 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         let store = Store::open(&config).unwrap();
@@ -1243,6 +1244,7 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         let restore_store = Store::open(&restore_config).unwrap();
@@ -1571,6 +1573,7 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
         let store = Store::open(&config).unwrap();
@@ -1751,6 +1754,7 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
     }

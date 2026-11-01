@@ -460,23 +460,60 @@ fn ambient_remote_env_list_covers_every_remote_deciding_var() {
 }
 
 #[test]
-fn remote_check_demand_budget_keeps_legacy_cap_and_only_allows_tightening() {
-    // Mixed-version/config table: a legacy client omits the wire field, a
-    // zero-valued early client must not disable the safety bound, and a new
-    // client/daemon may independently tighten but never lengthen it.
-    for (case, configured_secs, wire_ms, expected_ms) in [
-        ("legacy client / default daemon", 300, None, 3_000),
-        ("legacy client / disabled daemon deadline", 0, None, 3_000),
-        ("overflowing daemon config", u64::MAX, None, 3_000),
-        ("daemon tightens", 2, None, 2_000),
-        ("daemon tighter than client", 1, Some(3_000), 1_000),
-        ("client tightens", 300, Some(1_500), 1_500),
-        ("zero wire value", 300, Some(0), 3_000),
-        ("oversized wire value", 300, Some(u64::MAX), 3_000),
+fn remote_check_demand_budget_preserves_legacy_peers_and_honors_explicit_limits() {
+    for (case, operation_secs, demand_secs, wire_ms, expected_ms) in [
+        ("legacy client / default daemon", 300, 3, None, 3_000),
+        (
+            "legacy client / disabled operation limit",
+            0,
+            3,
+            None,
+            3_000,
+        ),
+        ("overflowing operation config", u64::MAX, 3, None, 3_000),
+        ("operation tightens", 2, 3, None, 2_000),
+        ("operation tighter than client", 1, 3, Some(3_000), 1_000),
+        ("client tightens", 300, 3, Some(1_500), 1_500),
+        ("zero legacy wire value", 300, 3, Some(0), 3_000),
+        ("oversized wire value", 300, 3, Some(u64::MAX), 3_000),
+        ("explicit longer demand", 300, 60, Some(60_000), 60_000),
+        ("legacy peer still waits 3s", 300, 60, None, 3_000),
+        ("zero wire stays legacy", 300, 60, Some(0), 3_000),
+        ("local demand is stricter", 300, 60, Some(120_000), 60_000),
+        ("client demand is stricter", 300, 60, Some(10_000), 10_000),
+        (
+            "operation limits raised demand",
+            30,
+            60,
+            Some(60_000),
+            30_000,
+        ),
+        ("operation limit disabled", 0, 60, Some(60_000), 60_000),
+        ("zero direct demand config", 300, 0, Some(60_000), 3_000),
+        (
+            "overflowing direct demand config",
+            300,
+            u64::MAX,
+            Some(60_000),
+            3_000,
+        ),
+        (
+            "largest valid demand",
+            0,
+            4_294_967_295,
+            Some(u64::MAX),
+            4_294_967_295_000,
+        ),
     ] {
+        let budget = remote_check_budget_ms(operation_secs, demand_secs, wire_ms);
+        assert_eq!(budget.get(), expected_ms, "{case}");
+        let started_at = Instant::now();
+        let at = RemoteDeadline::from_millis_at(started_at, budget.get())
+            .at()
+            .expect("a finite demand budget must produce a deadline");
         assert_eq!(
-            remote_check_budget_ms(configured_secs, wire_ms).get(),
-            expected_ms,
+            at.duration_since(started_at),
+            Duration::from_millis(expected_ms),
             "{case}"
         );
     }
@@ -492,17 +529,14 @@ fn remote_check_demand_budget_keeps_legacy_cap_and_only_allows_tightening() {
     };
     assert_eq!(legacy_request.deadline_ms, None);
     assert_eq!(
-        remote_check_budget_ms(300, legacy_request.deadline_ms).get(),
+        remote_check_budget_ms(300, 60, legacy_request.deadline_ms).get(),
         3_000
     );
 
     let accepted_at = Instant::now();
-    let legacy_client_deadline =
-        RemoteDeadline::from_millis_at(accepted_at, remote_check_budget_ms(300, None).get());
-    assert_eq!(
-        legacy_client_deadline.at(),
-        Some(accepted_at + Duration::from_secs(3))
-    );
+    let deadline =
+        RemoteDeadline::from_millis_at(accepted_at, remote_check_budget_ms(300, 60, None).get());
+    assert_eq!(deadline.at(), Some(accepted_at + Duration::from_secs(3)));
 }
 
 /// #581: the old counters incremented checks and hits in the same branch,
@@ -1482,6 +1516,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     }
 }
@@ -12091,6 +12126,87 @@ fn check_request(dir: &Path, key: &str) -> RemoteCheckRequest {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_demand_timeout_restores_after_the_legacy_three_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let store = toml::Value::String(dir.path().join("store").to_string_lossy().into_owned());
+    let runtime = toml::Value::String(dir.path().to_string_lossy().into_owned());
+    fs::write(
+        &config_path,
+        format!(
+            "[cache]\nignore_env = true\nlocal_store = {store}\nruntime_dir = {runtime}\n\
+             demand_timeout_secs = 10\nremote_restore_timeout_secs = 30\n"
+        ),
+    )
+    .unwrap();
+    let invocation = kache_config::InvocationEnv::from_parts(
+        [
+            ("KACHE_CONFIG", config_path.to_str().unwrap()),
+            ("KACHE_HOST_CONFIG", ""),
+        ],
+        Some(dir.path().to_owned()),
+        None,
+        dir.path().to_owned(),
+    );
+    let mut config = Config::load_for(&invocation).unwrap();
+    config.remote = Some(test_remote_config());
+    let key = test_cache_key("restore-after-three-seconds");
+    let inner = test_remote_backend();
+    put_test_object(
+        &inner,
+        &test_pack_object_key(&key, "serde"),
+        &build_entry_pack(&key, "serde"),
+    )
+    .await;
+    let backend = Arc::new(DirectRestoreBackend {
+        inner,
+        gets: 0.into(),
+        started: tokio::sync::Semaphore::new(0),
+        release: Some(tokio::sync::Semaphore::new(0)),
+    });
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    daemon.signal_warming_complete();
+    assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+    let entry = daemon.entry_dir_for(&key);
+    let socket = config.socket_path();
+    let listener = bind_listener(&socket);
+    let serving = daemon.clone();
+    let server = tokio::spawn(async move {
+        let mut handlers = tokio::task::JoinSet::new();
+        // send_remote_check first probes reachability, then sends its request.
+        for _ in 0..2 {
+            let stream = listener.accept().await.unwrap();
+            let daemon = serving.clone();
+            handlers.spawn(async move {
+                let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
+            });
+        }
+        while let Some(result) = handlers.join_next().await {
+            result.unwrap();
+        }
+    });
+    let client_entry = entry.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        send_remote_check(&config, &key, &client_entry, "serde", None)
+    });
+    tokio::time::timeout(Duration::from_secs(5), backend.started.acquire())
+        .await
+        .expect("the wrapper must reach the daemon's restore")
+        .unwrap()
+        .forget();
+    tokio::time::sleep(Duration::from_millis(3_250)).await;
+    backend.release.as_ref().unwrap().add_permits(1);
+    let response = client.await.unwrap().expect("configured wrapper wait");
+    server.await.unwrap();
+    assert!(
+        response.found,
+        "the raised demand budget must restore the entry"
+    );
+    assert!(entry.join("meta.json").is_file());
+    assert!(!daemon.remote_breaker.is_degraded());
+}
+
 /// #564: the second check for the same definitively-missing key must be
 /// answered from the negative cache — one S3 round trip, one negative
 /// hit — and a successful upload of the key must clear the entry.
@@ -12303,6 +12419,70 @@ async fn demand_deadlines_do_not_suppress_a_healthy_remote_hit() {
             .config
             .store_dir()
             .join(&recovery.key)
+            .join("meta.json")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn configured_demand_timeout_returns_a_miss_and_keeps_the_remote_healthy() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = test_remote_backend();
+    let mut request = check_request(dir.path(), "configured-demand-recovery");
+    request.deadline_ms = Some(60_000);
+    put_test_object(
+        &inner,
+        &test_pack_object_key(&request.key, &request.crate_name),
+        &build_entry_pack(&request.key, &request.crate_name),
+    )
+    .await;
+    let backend = Arc::new(DirectRestoreBackend {
+        inner,
+        gets: 0.into(),
+        started: tokio::sync::Semaphore::new(0),
+        release: Some(tokio::sync::Semaphore::new(0)),
+    });
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    config.remote_restore_timeout_secs = 0;
+    config.demand_timeout_secs = 1;
+    let daemon = Daemon::new(config);
+    daemon.signal_warming_complete();
+    assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(2_500),
+        daemon.handle_remote_check(&request),
+    )
+    .await
+    .expect("the daemon's one-second demand limit must bound a longer client request");
+    assert!(response.ok);
+    assert_eq!(response.found, Some(false));
+    assert_eq!(daemon.negative_keys.len(), 0);
+    assert!(!daemon.remote_breaker.is_degraded());
+    assert!(
+        !daemon
+            .entry_dir_for(&request.key)
+            .join("meta.json")
+            .exists()
+    );
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_failed
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    backend.release.as_ref().unwrap().add_permits(1);
+    let response = daemon.handle_remote_check(&request).await;
+    assert!(response.ok);
+    assert_eq!(response.found, Some(true));
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 2);
+    assert!(!daemon.remote_breaker.is_degraded());
+    assert!(
+        daemon
+            .entry_dir_for(&request.key)
             .join("meta.json")
             .is_file()
     );

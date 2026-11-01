@@ -1,0 +1,197 @@
+name: Maintainer preflight (1680 manifests)
+
+on:
+  push:
+    branches: [validation/preflight-1680-manifests]
+    paths: [.github/workflows/maintainer-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Manifest parser and key checks (Linux)
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1680-manifests'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      EXPECTED_HEAD: d80bb5d74ffb9999c7eb09eed48282eef12a600a
+      EXPECTED_TREE: ee5962ad27e77c9209ad9800736a5a5e2a359b30
+      BASE_HEAD: cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
+    steps:
+      - name: Record provenance and require an ephemeral hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/preflight-1680/evidence"
+          mkdir -p "$evidence"
+          printf 'EVIDENCE_DIR=%s\n' "$evidence" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/preflight-1680/target" >> "$GITHUB_ENV"
+          printf 'helper=%s\nrun=%s\nrunner=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_KIND" | tee "$evidence/provenance.txt"
+          test "$RUNNER_KIND" = github-hosted
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: d80bb5d74ffb9999c7eb09eed48282eef12a600a
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate
+        id: verify
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          printf 'tested_head=%s\ntested_tree=%s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE" >> "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - name: Record toolchain
+        run: |
+          set -euo pipefail
+          rustc --version --verbose | tee "$EVIDENCE_DIR/toolchain.txt"
+          cargo --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          just --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+      - name: Check closed XML and manifest key controls
+        id: green
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --lib manifest -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/manifest-tests.log"
+      - name: Run just check
+        id: check
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation
+        id: docs
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+      - name: Record outcomes
+        if: always()
+        env:
+          VERIFY: ${{ steps.verify.outcome }}
+          GREEN: ${{ steps.green.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          printf 'verify=%s\ngreen=%s\njust_check=%s\ndocs=%s\n' "$VERIFY" "$GREEN" "$CHECK" "$DOCS" | tee "$EVIDENCE_DIR/outcomes.txt"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maintainer-preflight-1680-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error
+
+  native:
+    name: Native manifests (${{ matrix.runner }})
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1680-manifests'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      EXPECTED_HEAD: d80bb5d74ffb9999c7eb09eed48282eef12a600a
+      EXPECTED_TREE: ee5962ad27e77c9209ad9800736a5a5e2a359b30
+    steps:
+      - name: Require hosted runner and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Hosted runner required' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'manifest-native-evidence'
+          [IO.Directory]::CreateDirectory($evidence) | Out-Null
+          "EVIDENCE_DIR=$evidence" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'manifest-candidate-target')" >> $env:GITHUB_ENV
+          "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: d80bb5d74ffb9999c7eb09eed48282eef12a600a
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify candidate source
+        run: |
+          if ((git rev-parse HEAD) -ne $env:EXPECTED_HEAD) { throw 'Wrong head' }
+          if ((git rev-parse 'HEAD^{tree}') -ne $env:EXPECTED_TREE) { throw 'Wrong tree' }
+          "tested_head=$env:EXPECTED_HEAD`ntested_tree=$env:EXPECTED_TREE" | Add-Content (Join-Path $env:EVIDENCE_DIR 'provenance.txt')
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+        if: matrix.runner != 'windows-11-arm'
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: --force rust
+          cache: false
+          reshim: false
+      - name: Compile and test parser and tool identity
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          rustc --version --verbose | Tee-Object (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler unavailable' }
+          cargo test --locked -p kache --lib manifest -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'manifest-tests.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest unit tests failed' }
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'clippy.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Native clippy failed' }
+      - name: Build baseline with independent artifacts
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $baseline = Join-Path $env:RUNNER_TEMP 'manifest-baseline'
+          git worktree add --detach $baseline cabbf2bcf0a4a017fb59836bbc6c0ef3b785448e
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline checkout failed' }
+          Push-Location $baseline
+          try {
+            cargo build --locked -p kache --bins --target-dir (Join-Path $env:RUNNER_TEMP 'manifest-baseline-target') 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-baseline.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Baseline build failed' }
+          } finally { Pop-Location }
+      - name: Prove baseline refuses manifest caching after a successful native link
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:EVIDENCE_DIR 'baseline-control.log'
+          $observedFailure = $false
+          try {
+            ./scripts/adoption/msvc-manifest-probe.ps1 -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'baseline') -KachePath (Join-Path $env:RUNNER_TEMP 'manifest-baseline-target/debug/kache.exe') *> $log
+          } catch {
+            $_ | Out-String | Add-Content $log
+            $observedFailure = $true
+          }
+          $text = Get-Content -Raw $log
+          Write-Output $text
+          if (-not $observedFailure -or $text -notmatch 'Expected miss, got') { throw 'Baseline did not fail the cache-admission assertion' }
+          $xml = Join-Path $env:EVIDENCE_DIR 'baseline/cache-cold.RT_MANIFEST.xml'
+          if (-not (Test-Path -LiteralPath $xml) -or (Get-Content -Raw $xml) -notmatch 'KACHE_MANIFEST_V1') { throw 'Baseline failed before a successful resource-bearing native compile' }
+      - name: Build candidate binaries
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --locked -p kache --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-candidate.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate build failed' }
+          Get-FileHash -Algorithm SHA256 (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe'), (Join-Path $env:CARGO_TARGET_DIR 'debug/kache-engine.exe') | Format-List | Out-String | Set-Content (Join-Path $env:EVIDENCE_DIR 'candidate-binary-hashes.txt')
+      - name: Prove XML and merger edit and revert behavior in actual RT_MANIFEST
+        run: |
+          ./scripts/adoption/msvc-manifest-probe.ps1 -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'candidate') -KachePath (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe')
+      - name: Upload native manifest evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manifest-native-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

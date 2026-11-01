@@ -1,0 +1,245 @@
+name: Maintainer preflight (1792)
+
+on:
+  push:
+    branches: [validation/preflight-1792-windows]
+    paths: [.github/workflows/maintainer-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Windows prerequisites (Linux)
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1792-windows'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      EXPECTED_HEAD: 0140827a59a96ada99a8b5219b5a91ac6d453d36
+      EXPECTED_TREE: 735ba32ff4f41127f437932f648227c905b9115e
+      BASE_HEAD: 5c90a41e07eaeeedfcd57c0a08f5b501dc718e45
+    steps:
+      - name: Record provenance and require an ephemeral hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/preflight-1792/evidence"
+          mkdir -p "$evidence"
+          printf 'EVIDENCE_DIR=%s\n' "$evidence" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/preflight-1792/target" >> "$GITHUB_ENV"
+          printf 'helper=%s\nrun=%s\nrunner=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_KIND" | tee "$evidence/provenance.txt"
+          test "$RUNNER_KIND" = github-hosted
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: 0140827a59a96ada99a8b5219b5a91ac6d453d36
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate
+        id: verify
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          printf 'tested_head=%s\ntested_tree=%s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE" >> "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - name: Record toolchain
+        run: |
+          set -euo pipefail
+          rustc --version --verbose | tee "$EVIDENCE_DIR/toolchain.txt"
+          cargo --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+          just --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
+      - name: Verify runtime memo regression fails with the old callback
+        id: red
+        env:
+          REGRESSION_PATCH_BASE64: LS0tIGEvc3JjL2NhY2hlX2tleS5ycworKysgYi9zcmMvY2FjaGVfa2V5LnJzCkBAIC0xMDc5MSw3ICsxMDc5MSw3IEBACiAgICAgICAgICZhcmdzLmxpbmtfbGlicywKICAgICAgICAgJnNlYXJjaF9kaXJzLmRlZmF1bHRfbGlicmFyaWVzLAogICAgICAgICB8cGF0aHwgZmlsZV9oYXNoZXIuaGFzaF9zdGF0aWNfbGliKHBhdGgpLAotICAgICAgICB8cGF0aHwgZmlsZV9oYXNoZXIuaGFzaChwYXRoKSwKKyAgICAgICAgfHBhdGh8IGthY2hlX3N0b3JlOjpmaWxlX2hhc2g6Omhhc2hfZmlsZShwYXRoKSwKICAgICAgICAgaW52b2NhdGlvbiwKICAgICApCiB9Cg==
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH'
+          import os, base64, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'regression.patch').write_bytes(base64.b64decode(os.environ['REGRESSION_PATCH_BASE64'], validate=True))
+          PY_PATCH
+          git apply --check "$RUNNER_TEMP/regression.patch"
+          git apply "$RUNNER_TEMP/regression.patch"
+          set +e
+          cargo test --locked -p kache --lib cache_key::tests::windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe -- --exact --nocapture > "$EVIDENCE_DIR/regression-red.log" 2>&1
+          result=$?
+          set -e
+          git apply -R "$RUNNER_TEMP/regression.patch"
+          git diff --exit-code HEAD
+          cat "$EVIDENCE_DIR/regression-red.log"
+          test "$result" -ne 0
+          grep -F 'test cache_key::tests::windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe ... FAILED' "$EVIDENCE_DIR/regression-red.log"
+          grep -F 'assertion' "$EVIDENCE_DIR/regression-red.log"
+      - name: Verify the production runtime callback regression passes
+        id: green
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --lib cache_key::tests::windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/regression-green.log"
+      - name: Run just check
+        id: check
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation
+        id: docs
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+      - name: Record outcomes
+        if: always()
+        env:
+          VERIFY: ${{ steps.verify.outcome }}
+          RED: ${{ steps.red.outcome }}
+          GREEN: ${{ steps.green.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          printf 'verify=%s\nred=%s\ngreen=%s\njust_check=%s\ndocs=%s\n' "$VERIFY" "$RED" "$GREEN" "$CHECK" "$DOCS" | tee "$EVIDENCE_DIR/outcomes.txt"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maintainer-preflight-1792-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error
+
+  native:
+    name: Native Windows (${{ matrix.runner }})
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/preflight-1792-windows'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      EXPECTED_HEAD: 0140827a59a96ada99a8b5219b5a91ac6d453d36
+      EXPECTED_TREE: 735ba32ff4f41127f437932f648227c905b9115e
+    steps:
+      - name: Require hosted runner and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Requires ephemeral hosted runner' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-1792-evidence'
+          [IO.Directory]::CreateDirectory($evidence) | Out-Null
+          "EVIDENCE_DIR=$evidence" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'windows-1792-target')" >> $env:GITHUB_ENV
+          "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: 0140827a59a96ada99a8b5219b5a91ac6d453d36
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate
+        run: |
+          if ((git rev-parse HEAD) -ne $env:EXPECTED_HEAD) { throw 'Wrong head' }
+          if ((git rev-parse 'HEAD^{tree}') -ne $env:EXPECTED_TREE) { throw 'Wrong tree' }
+          "tested_head=$env:EXPECTED_HEAD`ntested_tree=$env:EXPECTED_TREE" | Add-Content (Join-Path $env:EVIDENCE_DIR 'provenance.txt')
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: --force rust
+          cache: false
+          reshim: false
+      - name: Record toolchain
+        run: |
+          rustc --version --verbose | Tee-Object (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'rustc unavailable' }
+          cargo --version | Add-Content (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
+      - name: Named-pipe red and green control
+        env:
+          SOCKET_PATCH_BASE64: LS0tIGEvc3JjL2RhZW1vbi5ycworKysgYi9zcmMvZGFlbW9uLnJzCkBAIC04NTA3LDYgKzg1MDcsOSBAQAogICAgIGlmIGZpbGVzLmlzX2VtcHR5KCkgewogICAgICAgICByZXR1cm4gT2soVmVjOjpuZXcoKSk7CiAgICAgfQorICAgIGlmICFzb2NrZXRfcGF0aC5leGlzdHMoKSB7CisgICAgICAgIGFueWhvdzo6YmFpbCEoImRhZW1vbiBzb2NrZXQgZG9lcyBub3QgZXhpc3Q6IHt9Iiwgc29ja2V0X3BhdGguZGlzcGxheSgpKTsKKyAgICB9CiAgICAgbGV0IHJlcSA9IFJlcXVlc3Q6Okhhc2hGaWxlcyhIYXNoRmlsZXNSZXF1ZXN0IHsgZmlsZXMgfSk7CiAgICAgbGV0IHJlc3Bfc3RyID0gc2VuZF9yZXF1ZXN0X3dpdGhfdGltZW91dChzb2NrZXRfcGF0aCwgJnJlcSwgc3RkOjp0aW1lOjpEdXJhdGlvbjo6ZnJvbV9zZWNzKDMpKT87CiAgICAgaGFzaF9maWxlc19yZXN1bHRzX2Zyb21fcmVzcG9uc2VfbGluZSgmcmVzcF9zdHIpCg==
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $patch = Join-Path $env:RUNNER_TEMP 'socket-red.patch'
+          [IO.File]::WriteAllBytes($patch, [Convert]::FromBase64String($env:SOCKET_PATCH_BASE64))
+          git apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Bad control patch' }
+          git apply $patch
+          try {
+            cargo test --locked -p kache --lib daemon::tests::send_hash_files_request_client_roundtrip -- --exact --nocapture *> (Join-Path $env:EVIDENCE_DIR 'socket-red.log')
+            $result = $LASTEXITCODE
+          } finally {
+            git apply -R $patch
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot restore candidate' }
+          }
+          $log = Get-Content -Raw (Join-Path $env:EVIDENCE_DIR 'socket-red.log')
+          Write-Output $log
+          if ($result -eq 0 -or $log -notmatch 'send_hash_files_request_client_roundtrip \.\.\. FAILED' -or $log -notmatch 'daemon socket does not exist') { throw 'Red control did not fail for the expected socket guard' }
+          git diff --exit-code HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate differs after control' }
+          cargo test --locked -p kache --lib daemon::tests::send_hash_files_request_client_roundtrip -- --exact --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'socket-green.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Named-pipe fix failed' }
+      - name: Native file identity and memo guards
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo test --locked -p kache-store file_hash -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'file-identity.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Store tests failed' }
+          cargo test --locked -p kache --lib windows_runtime -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'runtime-memo.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime tests failed' }
+          cargo test --locked -p kache --lib weak_windows -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'weak-identity.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Weak identity tests failed' }
+          cargo test --locked -p kache-ipc -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'security.log')
+          if ($LASTEXITCODE -ne 0) { throw 'IPC/security tests failed' }
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'clippy.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows clippy failed' }
+      - name: Build and measure baseline binaries
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $baseline = Join-Path $env:RUNNER_TEMP 'windows-1792-baseline'
+          git worktree add --detach $baseline 5c90a41e07eaeeedfcd57c0a08f5b501dc718e45
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline checkout failed' }
+          Push-Location $baseline
+          try {
+            cargo build --locked -p kache --release --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-baseline.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Baseline build failed' }
+          } finally { Pop-Location }
+          $bin = Join-Path $env:RUNNER_TEMP 'baseline-bin'
+          [IO.Directory]::CreateDirectory($bin) | Out-Null
+          Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release/kache.exe') $bin
+          Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release/kache-engine.exe') $bin
+          ./scripts/adoption/windows-native-key-probe.ps1 -Kache (Join-Path $bin 'kache.exe') -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'baseline')
+      - name: Build and measure candidate binaries
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --locked -p kache --release --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-candidate.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate build failed' }
+          ./scripts/adoption/windows-native-key-probe.ps1 -Kache (Join-Path $env:CARGO_TARGET_DIR 'release/kache.exe') -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'candidate')
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-native-1792-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

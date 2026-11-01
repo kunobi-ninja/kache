@@ -53,8 +53,10 @@ pub(crate) struct RunningProgram(std::process::Child);
 impl RunningProgram {
     pub(crate) fn start(target: &Path) -> Self {
         std::fs::create_dir_all(target).unwrap();
-        let executable = target.join("running-program");
-        std::fs::copy("/bin/sleep", &executable).unwrap();
+        // Coreutils can dispatch by executable name in multicall builds.
+        let executable = target.join("sleep");
+        let sleep = option_env!("KACHE_TEST_SLEEP").unwrap_or("/bin/sleep");
+        std::fs::copy(sleep, &executable).unwrap();
         let program = Self(
             std::process::Command::new(&executable)
                 .arg("60")

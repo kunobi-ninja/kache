@@ -974,7 +974,7 @@ mod tests {
         .unwrap();
         assert!(!removed);
         assert!(
-            target.join("running-program").exists(),
+            target.join("sleep").exists(),
             "the rename must be rolled back"
         );
         drop(child);

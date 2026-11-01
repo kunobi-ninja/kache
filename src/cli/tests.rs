@@ -8767,7 +8767,7 @@ fn clean_skips_a_directly_started_program_but_removes_an_idle_sibling() {
     assert!(failed.is_empty());
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0].reason, TARGET_IN_USE);
-    assert!(busy.join("running-program").exists());
+    assert!(busy.join("sleep").exists());
     assert!(!idle.exists());
     drop(child);
 }

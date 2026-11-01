@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   cacert,
+  coreutils,
   stdenv,
   bashInteractive,
   zsh,
@@ -91,6 +92,9 @@ rustPlatform.buildRustPackage {
 
   # Shell fixtures use the build shell and its builtins.
   env.KACHE_TEST_SHELL = stdenv.shell;
+
+  # Process-liveness fixtures copy a native binary into the target directory.
+  env.KACHE_TEST_SLEEP = lib.getExe' coreutils "sleep";
 
   # Avoid bootstrapping loop: don't let kache wrap itself during build
   env.RUSTC_WRAPPER = "";

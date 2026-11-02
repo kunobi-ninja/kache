@@ -21,9 +21,10 @@
 //! `-C link-arg` that hands LINK a file the identity does not hash. That last
 //! group is checked by [`windows_link_argument_input_files`]. Absolute `.res`
 //! inputs with the standard binary resource header are hashed from their
-//! validated bytes. Objects, archives, explicit manifest inputs and other
-//! file-carrying options stay refused; their further inputs or side outputs
-//! are not modeled.
+//! validated bytes. Absolute `/MANIFESTINPUT` files are validated as a closed
+//! application-metadata XML subset and hashed from those same bytes. Objects,
+//! archives and other file-carrying options stay refused; their further inputs
+//! or side outputs are not modeled.
 //!
 //! `NODEFAULTLIB` excludes libraries rather than introducing file inputs.
 //! `DEFAULTLIB` is admitted only for the modeled CRT/vcruntime/UCRT names,
@@ -847,7 +848,8 @@ pub(crate) fn encode_crt_objects(objects: &BTreeMap<String, String>) -> String {
 /// paths select the tools and libraries on this machine; absolute paths would
 /// make a cache key differ for every Visual Studio installation. Library
 /// contents are retained as hashes because a version directory can be
-/// replaced in place by a servicing update.
+/// replaced in place by a servicing update. Explicit manifest inputs also
+/// pin the selected external merger's path and original file bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowsMsvcIdentity {
     pub(crate) linker: String,
@@ -861,6 +863,9 @@ pub(crate) struct WindowsMsvcIdentity {
     /// `cargo-host-linker.bat` via `MOZ_CARGO_WRAP_*`). Empty when rustc
     /// invoked `link.exe` / `lld-link.exe` directly.
     pub(crate) wrapper: Option<(String, Vec<String>)>,
+    /// Only explicit manifest inputs need the external merger's selected
+    /// path and original bytes. Ordinary link identities retain their format.
+    pub(crate) manifest_tool: Option<(PathBuf, String)>,
 }
 
 impl WindowsMsvcIdentity {
@@ -900,6 +905,16 @@ impl WindowsMsvcIdentity {
             for flag in extra {
                 fields.push(format!("wrapper_flag={flag}"));
             }
+        }
+        if let Some((path, digest)) = &self.manifest_tool {
+            let path = hex::encode(path.as_os_str().as_encoded_bytes());
+            fields.push(format!(
+                "manifest_tool.v1={}:{}={}:{}",
+                path.len(),
+                path,
+                digest.len(),
+                digest
+            ));
         }
         fields.extend(
             self.libraries
@@ -1310,6 +1325,9 @@ fn windows_link_token_is_file_option(token: &str) -> bool {
         || named("NATVIS")
         || named("SOURCELINK")
         || named("MANIFESTINPUT")
+        // This option can enable a side-by-side manifest output. Until the
+        // effective EMBED context is modeled, no spelling is admitted.
+        || named("MANIFESTDEPENDENCY")
         || named("ASSEMBLYMODULE")
         || named("ASSEMBLYRESOURCE")
         || named("ASSEMBLYLINKRESOURCE")
@@ -1331,18 +1349,32 @@ fn manifest_value_writes_no_side_file(value: Option<&str>) -> bool {
 }
 
 /// Holds modeled inputs in Windows linker argument order.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WindowsLinkInput {
+    Resource(PathBuf),
+    Manifest(PathBuf),
+}
+
+impl WindowsLinkInput {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Resource(path) | Self::Manifest(path) => path,
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowsLinkArgumentInputs {
-    pub files: Vec<PathBuf>,
+    pub files: Vec<WindowsLinkInput>,
     pub default_libraries: Vec<WindowsDefaultLibrary>,
 }
 
 /// Parses modeled inputs carried by one link-arg or link-args value.
 ///
-/// Absolute compiled-resource files carried by one link-arg or
-/// whitespace-split link-args value. Their binary format is checked by the
-/// hasher. Objects and archives can name further inputs; XML manifests need
-/// a separate proof of the merger's external-file behavior. Both stay refused.
+/// Absolute compiled resources and `/MANIFESTINPUT` files carried by one
+/// link-arg or whitespace-split link-args value. Their formats are checked by
+/// the hasher. The manifest parser excludes elements that can name more files.
+/// Objects and archives can name further inputs and stay refused.
 ///
 /// A bare token is a possible input even without a recognized extension.
 /// Embedded quotes, relative paths and C-driver spellings stay outside this
@@ -1372,11 +1404,20 @@ pub(crate) fn windows_link_argument_input_files(
     Some(inputs)
 }
 
-fn windows_link_argument_input_file(argument: &str) -> Option<PathBuf> {
-    (windows_absolute_path(argument)
-        && ends_with_ignore_ascii_case(argument, ".res")
-        && !argument.contains('"'))
-    .then(|| PathBuf::from(argument))
+fn windows_link_argument_input_file(argument: &str) -> Option<WindowsLinkInput> {
+    if argument.contains('"') {
+        return None;
+    }
+    if let Some((_, path)) = argument
+        .strip_prefix(['/', '-'])
+        .and_then(|option| option.split_once(':'))
+        .filter(|(option, _)| option.eq_ignore_ascii_case("MANIFESTINPUT"))
+    {
+        return windows_absolute_path(path)
+            .then(|| WindowsLinkInput::Manifest(PathBuf::from(path)));
+    }
+    (windows_absolute_path(argument) && ends_with_ignore_ascii_case(argument, ".res"))
+        .then(|| WindowsLinkInput::Resource(PathBuf::from(argument)))
 }
 
 /// A Windows path that does not depend on a working directory or a current
@@ -1602,6 +1643,135 @@ fn directory_lookup<'a>(
                 })
         })
     })
+}
+
+/// Observe each directory before testing it, including absent directories.
+/// The observer must guard its nearest existing ancestor when it is absent.
+/// Record only the precise NotFound observations used by this selection.
+pub(crate) fn select_windows_manifest_tool<Observe, RecordAbsence>(
+    search_dirs: &[PathBuf],
+    shadow_dirs: &[PathBuf],
+    observe: Observe,
+    record_absence: RecordAbsence,
+) -> Result<PathBuf>
+where
+    Observe: Fn(&Path) -> Result<()>,
+    RecordAbsence: Fn(&Path) -> Result<()>,
+{
+    for directory in shadow_dirs {
+        observe(directory)?;
+        let candidate = directory.join("mt.exe");
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => bail!(
+                "manifest merger shadow {} is not modeled",
+                candidate.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                record_absence(&candidate)?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspecting manifest merger shadow {}", candidate.display())
+                });
+            }
+        }
+    }
+    for directory in search_dirs {
+        observe(directory)?;
+        let candidate = directory.join("mt.exe");
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(candidate),
+            Ok(_) => bail!(
+                "manifest merger {} is not a regular file",
+                candidate.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                record_absence(&candidate)?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspecting manifest merger {}", candidate.display())
+                });
+            }
+        }
+    }
+    bail!("mt.exe was not found in the effective native linker PATH")
+}
+
+/// Hashing and negative-lookup guards belong to the invocation's FileHasher.
+pub(crate) struct WindowsManifestProbe<'a> {
+    pub hash_tool: &'a dyn Fn(&Path) -> Result<String>,
+    pub observe_directory: &'a dyn Fn(&Path) -> Result<()>,
+    pub record_absence: &'a dyn Fn(&Path) -> Result<()>,
+}
+
+#[cfg(windows)]
+fn windows_manifest_system_directories() -> Result<Vec<PathBuf>> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemDirectoryW, GetWindowsDirectoryW,
+    };
+
+    fn query_windows_manifest_directory(
+        get: unsafe extern "system" fn(*mut u16, u32) -> u32,
+    ) -> Result<PathBuf> {
+        let mut buffer = vec![0u16; 32_768];
+        // These APIs return the required size if the buffer is too short.
+        // SAFETY: both callers provide a Windows directory query; the buffer
+        // is writable for the advertised number of UTF-16 code units.
+        let len = unsafe { get(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if len == 0 || len >= buffer.len() {
+            bail!("cannot identify the Windows manifest-merger search directories");
+        }
+        Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
+    }
+    let system = query_windows_manifest_directory(GetSystemDirectoryW)?;
+    let windows = query_windows_manifest_directory(GetWindowsDirectoryW)?;
+    Ok(vec![system, windows.join("System"), windows])
+}
+
+#[cfg(not(windows))]
+fn windows_manifest_system_directories() -> Result<Vec<PathBuf>> {
+    bail!("native Windows manifest-merger discovery requires Windows")
+}
+
+fn key_windows_manifest_tool(
+    identity: &mut WindowsMsvcIdentity,
+    linker: &Path,
+    environment: &WindowsProbeEnvironment,
+    system_dirs: &[PathBuf],
+    probe: WindowsManifestProbe<'_>,
+) -> Result<()> {
+    if identity.wrapper.is_some() {
+        bail!("linker wrappers are not modeled for manifest inputs");
+    }
+    let mut shadows = vec![
+        linker
+            .parent()
+            .context("selected linker has no parent directory")?
+            .to_path_buf(),
+        environment
+            .cwd
+            .clone()
+            .context("manifest input requires the invocation working directory")?,
+    ];
+    shadows.extend_from_slice(system_dirs);
+    let search_dirs = environment
+        .rustc_tool_dirs
+        .iter()
+        .chain(&environment.path)
+        .cloned()
+        .collect::<Vec<_>>();
+    let path = select_windows_manifest_tool(
+        &search_dirs,
+        &shadows,
+        probe.observe_directory,
+        probe.record_absence,
+    )?;
+    let digest = (probe.hash_tool)(&path)
+        .with_context(|| format!("hashing manifest merger {}", path.display()))?;
+    identity.manifest_tool = Some((path, digest));
+    Ok(())
 }
 
 fn is_path_like(path: &Path) -> bool {
@@ -2331,6 +2501,10 @@ const UCRT: &[&str] = &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"];
 pub(crate) struct WindowsDefaultLibrary(&'static str);
 
 impl WindowsDefaultLibrary {
+    pub(crate) fn canonical_name(self) -> &'static str {
+        self.0
+    }
+
     /// Parses a single LINK default-library option for an already modeled runtime.
     pub(crate) fn parse(argument: &str) -> Option<Self> {
         let (option, name) = argument.strip_prefix(['/', '-'])?.split_once(':')?;
@@ -2491,6 +2665,7 @@ where
         hash_file,
         &InvocationEnv::capture(),
         None,
+        None,
     )
 }
 
@@ -2505,6 +2680,7 @@ pub(crate) fn probe_windows_msvc_identity_with_library_dirs_for<HashLibrary, Has
     hash_library: HashLibrary,
     hash_runtime: HashRuntime,
     env: &InvocationEnv,
+    manifest: Option<WindowsManifestProbe<'_>>,
     prepare_runtime: Option<WindowsRuntimePreparation<'_>>,
 ) -> Result<WindowsMsvcIdentity>
 where
@@ -2531,17 +2707,32 @@ where
     environment.requested_default_libraries = requested_default_libraries.to_vec();
     environment.augment_from_installed_msvc(target_architecture, env)?;
     environment.root_invocation_paths(env)?;
+    let mut selected_linker = None;
     let mut identity = probe_windows_msvc_identity_with_runtime_hash(
         linker,
         target_architecture,
         &linker_library_dirs,
         &environment,
         |tool, path| {
+            if matches!(tool, WindowsTool::Link | WindowsTool::LldLink) {
+                selected_linker = Some(path.to_path_buf());
+            }
             run_windows_tool_for(tool, path, environment.command_environment(tool, path), env)
         },
         hash_runtime,
         prepare_runtime,
     )?;
+    if let Some(probe) = manifest {
+        key_windows_manifest_tool(
+            &mut identity,
+            selected_linker
+                .as_deref()
+                .context("selected manifest linker is unavailable")?,
+            &environment,
+            &windows_manifest_system_directories()?,
+            probe,
+        )?;
+    }
     let directories = windows_library_dirs(
         &environment,
         &identity.architecture,
@@ -2697,6 +2888,7 @@ where
         architecture,
         libraries,
         wrapper,
+        manifest_tool: None,
     })
 }
 
@@ -3239,6 +3431,7 @@ esac
                 hash_file,
                 env,
                 None,
+                None,
             )
             .unwrap();
             let cwd = env.cwd().unwrap();
@@ -3572,6 +3765,242 @@ esac
         assert_eq!(
             environment.path,
             [PathBuf::from("one"), PathBuf::from("two")]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn manifest_system_directory_queries_cannot_use_another_hosts_paths() {
+        assert!(windows_manifest_system_directories().is_err());
+    }
+
+    #[test]
+    fn manifest_tool_selection_observes_shadows_and_only_the_searched_path_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs: Vec<_> = ["shadow", "rustc", "earlier", "sdk", "later"]
+            .iter()
+            .map(|name| root.path().join(name))
+            .collect();
+        for directory in &dirs {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let selected = dirs[3].join("mt.exe");
+        std::fs::write(&selected, b"merger").unwrap();
+        let observed = std::cell::RefCell::new(Vec::new());
+        let absent = std::cell::RefCell::new(Vec::new());
+        let result = select_windows_manifest_tool(
+            &dirs[1..],
+            &dirs[..1],
+            |directory| {
+                observed.borrow_mut().push(directory.to_path_buf());
+                Ok(())
+            },
+            |path| {
+                absent.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, selected);
+        assert_eq!(*observed.borrow(), dirs[..4]);
+        assert_eq!(
+            *absent.borrow(),
+            dirs[..3]
+                .iter()
+                .map(|dir| dir.join("mt.exe"))
+                .collect::<Vec<_>>()
+        );
+        let earlier = dirs[1].join("mt.exe");
+        std::fs::write(&earlier, b"rustc-prefix merger").unwrap();
+        assert_eq!(
+            select_windows_manifest_tool(&dirs[1..], &dirs[..1], |_| Ok(()), |_| Ok(())).unwrap(),
+            earlier
+        );
+        std::fs::write(dirs[0].join("mt.exe"), b"shadow").unwrap();
+        assert!(
+            select_windows_manifest_tool(&dirs[1..], &dirs[..1], |_| Ok(()), |_| Ok(())).is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_tool_selection_refuses_nonfiles_missing_tools_and_observation_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let early = root.path().join("early");
+        let late = root.path().join("late");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[missing.clone(), early.clone()],
+                &[],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        std::fs::write(late.join("mt.exe"), b"late").unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[early.clone(), late.clone()],
+                &[],
+                |_| Ok(()),
+                |_| bail!("cannot retain absence evidence"),
+            )
+            .is_err()
+        );
+        assert!(
+            select_windows_manifest_tool(
+                std::slice::from_ref(&late),
+                &[],
+                |_| bail!("unreadable directory"),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        std::fs::create_dir(early.join("mt.exe")).unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[early.clone(), late.clone()],
+                &[],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            select_windows_manifest_tool(
+                std::slice::from_ref(&late),
+                &[early],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        std::fs::write(&missing, b"not a directory").unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[missing, late],
+                &[],
+                |directory| {
+                    if std::fs::metadata(directory)?.is_dir() {
+                        Ok(())
+                    } else {
+                        bail!("not a directory")
+                    }
+                },
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_tool_symlinks_do_not_fall_through() {
+        let root = tempfile::tempdir().unwrap();
+        let early = root.path().join("early");
+        let late = root.path().join("late");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::create_dir(&late).unwrap();
+        std::os::unix::fs::symlink("mt.exe", early.join("mt.exe")).unwrap();
+        std::fs::write(late.join("mt.exe"), b"late").unwrap();
+        assert!(
+            select_windows_manifest_tool(
+                &[early.clone(), late.clone()],
+                &[],
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(select_windows_manifest_tool(&[late], &[early], |_| Ok(()), |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn manifest_merger_identity_keys_selected_path_and_bytes_and_refuses_wrappers() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = windows_environment(root.path(), "x64");
+        let mut base =
+            probe_windows_msvc_identity_with(None, "x64", &[], &environment, |tool, _| {
+                Ok(match tool {
+                    WindowsTool::Link => LINK_BANNER.into(),
+                    WindowsTool::Cl => compiler_banner("x64"),
+                    WindowsTool::LldLink => unreachable!(),
+                })
+            })
+            .unwrap();
+        let ordinary = base.encode();
+        assert!(!ordinary.contains("manifest_tool"));
+        let rustc = root.path().join("rustc-tools");
+        let sdk = root.path().join("sdk");
+        std::fs::create_dir(&rustc).unwrap();
+        std::fs::create_dir(&sdk).unwrap();
+        let tool = sdk.join("mt.exe");
+        std::fs::write(&tool, b"merger v1").unwrap();
+        let mut environment = environment;
+        environment.rustc_tool_dirs = vec![rustc.clone()];
+        environment.path = vec![sdk.clone()];
+        assert!(
+            key_windows_manifest_tool(
+                &mut base.clone(),
+                &root.path().join("link.exe"),
+                &environment,
+                &[],
+                WindowsManifestProbe {
+                    hash_tool: &|_| bail!("unreadable merger bytes"),
+                    observe_directory: &|_| Ok(()),
+                    record_absence: &|_| Ok(()),
+                },
+            )
+            .is_err()
+        );
+        let key = || {
+            let mut identity = base.clone();
+            key_windows_manifest_tool(
+                &mut identity,
+                &root.path().join("link.exe"),
+                &environment,
+                &[],
+                WindowsManifestProbe {
+                    hash_tool: &hash_file,
+                    observe_directory: &|_| Ok(()),
+                    record_absence: &|_| Ok(()),
+                },
+            )?;
+            Ok::<_, anyhow::Error>(identity.encode())
+        };
+        let first = key().unwrap();
+        assert_ne!(ordinary, first);
+        assert!(first.contains(&blake3::hash(b"merger v1").to_hex().to_string()));
+        assert_eq!(key().unwrap(), first);
+        std::fs::write(&tool, b"merger v2").unwrap();
+        assert_ne!(key().unwrap(), first);
+        std::fs::write(&tool, b"merger v1").unwrap();
+        assert_eq!(key().unwrap(), first);
+        std::fs::write(rustc.join("mt.exe"), b"merger v1").unwrap();
+        assert_ne!(
+            key().unwrap(),
+            first,
+            "the selected path is part of the key even for equal bytes"
+        );
+        std::fs::remove_file(rustc.join("mt.exe")).unwrap();
+        std::fs::remove_file(&tool).unwrap();
+        assert!(key().is_err());
+        base.wrapper = Some(("wrapper digest".into(), vec![]));
+        assert!(
+            key_windows_manifest_tool(
+                &mut base,
+                &root.path().join("link.exe"),
+                &environment,
+                &[],
+                WindowsManifestProbe {
+                    hash_tool: &|_| panic!("no wrapper tool hash"),
+                    observe_directory: &|_| panic!("no wrapper search"),
+                    record_absence: &|_| panic!("no wrapper absence")
+                }
+            )
+            .is_err()
         );
     }
 
@@ -4828,6 +5257,29 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn manifest_merger_shadow_lookup_errors_are_not_recorded_as_absences() {
+        let root = tempfile::tempdir().unwrap();
+        let shadow = root.path().join("not-a-directory");
+        let tools = root.path().join("tools");
+        std::fs::write(&shadow, b"file").unwrap();
+        std::fs::create_dir(&tools).unwrap();
+        std::fs::write(tools.join("mt.exe"), b"later merger").unwrap();
+        let absences = std::cell::RefCell::new(Vec::new());
+        let result = select_windows_manifest_tool(
+            &[tools],
+            &[shadow],
+            |_| Ok(()),
+            |path| {
+                absences.borrow_mut().push(path.to_owned());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(absences.borrow().is_empty());
+    }
+
     #[test]
     fn windows_runtime_libraries_reject_non_file_candidates_before_fallback() {
         let root = tempfile::tempdir().unwrap();
@@ -5988,7 +6440,10 @@ esac
             assert_eq!(
                 windows_link_argument_input_files(key, value),
                 Some(WindowsLinkArgumentInputs {
-                    files: expected.into_iter().map(PathBuf::from).collect(),
+                    files: expected
+                        .into_iter()
+                        .map(|path| WindowsLinkInput::Resource(PathBuf::from(path)))
+                        .collect(),
                     default_libraries: Vec::new(),
                 }),
                 "{key}={value}"
@@ -6005,6 +6460,10 @@ esac
             ("link-arg", r"C:app.res"),
             ("link-arg", r"\w\app.res"),
             ("link-arg", "/MANIFESTINPUT:extra.manifest"),
+            ("link-arg", r"/MANIFESTINPUT:C:app.xml"),
+            ("link-arg", r"/MANIFESTINPUT:\app.xml"),
+            ("link-arg", "/MANIFESTINPUT:"),
+            ("link-arg", r"-Wl,/MANIFESTINPUT:C:\w\app.xml"),
             // Embedded quotes need parsing beyond this accepted subset.
             ("link-arg", r#""C:\out dir\app.res""#),
             ("link-arg", r#"/MANIFESTINPUT:"C:\w\Manifest.xml""#),
@@ -6017,9 +6476,6 @@ esac
             ("link-arg", r"C:\w\opaque.dat"),
             ("link-arg", r"C:\w\extensionless"),
             ("link-args", r"C:\w\a.res C:\w\opaque.dat"),
-            ("link-args", r"C:\w\a.res /MANIFESTINPUT:C:\w\app.xml"),
-            ("link-arg", r"/MANIFESTINPUT:C:\w\Manifest.xml"),
-            ("link-arg", r"-manifestinput:C:\w\app.res"),
             // Objects/archives can name further inputs through directives or
             // thin members. Renamed containers are also checked by the hasher.
             ("link-arg", r"C:\w\extra.obj"),
@@ -6043,6 +6499,75 @@ esac
                 windows_link_argument_input_files(key, value),
                 None,
                 "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_manifest_inputs_keep_their_kind_and_total_argument_order() {
+        for option in ["/MANIFESTINPUT:", "-manifestinput:", "/MaNiFeStInPuT:"] {
+            for path in [
+                r"C:\w\app.xml",
+                "C:/w/app",
+                r"\\server\share\app.xml",
+                r"C:\out dir\app.res",
+            ] {
+                assert_eq!(
+                    windows_link_argument_input_files("link-arg", &format!("{option}{path}")),
+                    Some(WindowsLinkArgumentInputs {
+                        files: vec![WindowsLinkInput::Manifest(PathBuf::from(path))],
+                        default_libraries: vec![],
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            windows_link_argument_input_files(
+                "link-args",
+                r"/MANIFESTINPUT:C:\w\first.xml C:\w\app.res /DEBUG -manifestinput:C:\w\last.xml"
+            ),
+            Some(WindowsLinkArgumentInputs {
+                files: vec![
+                    WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\first.xml")),
+                    WindowsLinkInput::Resource(PathBuf::from(r"C:\w\app.res")),
+                    WindowsLinkInput::Manifest(PathBuf::from(r"C:\w\last.xml")),
+                ],
+                default_libraries: vec![],
+            })
+        );
+        assert!(
+            windows_link_argument_input_files("link-args", r"/MANIFESTINPUT:C:\out dir\app.xml")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn windows_manifest_dependency_options_stay_refused() {
+        for argument in [
+            "/MANIFESTDEPENDENCY:type='win32'",
+            "-manifestdependency:type='win32'",
+            "/MaNiFeStDePeNdEnCy=type='win32'",
+            "-MANIFESTDEPENDENCY=dependency",
+            "/MANIFESTDEPENDENCY",
+            "-manifestdependency",
+        ] {
+            assert!(
+                windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+            for carrier in ["link-arg", "link-args"] {
+                assert!(
+                    windows_link_argument_input_files(carrier, argument).is_none(),
+                    "{carrier}={argument}"
+                );
+            }
+            assert!(
+                windows_link_argument_input_files(
+                    "link-args",
+                    &format!("/MANIFEST:EMBED {argument}")
+                )
+                .is_none(),
+                "EMBED context remains unmodeled: {argument}"
             );
         }
     }

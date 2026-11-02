@@ -101,6 +101,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 filetime = "0.2"
 anyhow = "1"
+quick-xml = "=0.42.0"
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
@@ -152,6 +153,7 @@ windows-sys = { version = "0.61", features = [
     # FILE_SUPPORTS_BLOCK_REFCOUNTING — ask the volume whether it block-clones
     # instead of inferring "no CoW" from one failed clone (#508).
     "Win32_System_SystemServices",
+    "Win32_System_SystemInformation",
     # `kache test-runner` leaves Ctrl-C to the test it runs.
     "Win32_System_Console",
     "Win32_System_JobObjects",

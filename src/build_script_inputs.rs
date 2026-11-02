@@ -366,7 +366,7 @@ pub(crate) fn resolve(located: &Located, resolver: &Resolver<'_, '_>) -> Result<
         trees,
         files: resolver
             .file_hasher
-            .take_guarded_inputs()
+            .take_guarded_file_observations()
             .into_iter()
             .map(|observed| observed.fingerprint)
             .collect(),

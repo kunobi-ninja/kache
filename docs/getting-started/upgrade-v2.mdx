@@ -8,26 +8,15 @@ executes and coordinates compiler work; it does not add a `kache build` command.
 
 ## Choose the version
 
-These docs track v2 on `main`. The `v2.0.0-rc.3` preview can be installed
-explicitly:
+V2.0.0 is the first stable v2 release. Pin it with Cargo:
 
 ```bash
-cargo install kache --locked --version 2.0.0-rc.3
+cargo install kache --locked --version 2.0.0
 ```
 
-Unversioned Cargo and stable package-manager commands select the stable channel.
-They do not opt into release candidates. See
-[Installation](/docs/getting-started/installation) for prebuilt preview packages
-and building `main`.
-
-| Workflow | Available in |
-| --- | --- |
-| Paired client/engine and daemon-backed compiler pipelines | v2 release candidates |
-| Private incremental state and compatible seeds between worktrees | v2 release candidates; seed import needs supported rustc 1.98+ |
-| Init-managed shell completions and the responsive Now build view | `v2.0.0-rc.2` |
-| Scriptable configuration, history-wide `explain --all`, volume/inode diagnostics | `v2.0.0-rc.2` |
-| Optional local Blaze routing | `v2.0.0-rc.3`; off by default |
-| Producer versions in explanations and a separate section for recognized older bugs | `v2.0.0-rc.4` (unreleased) |
+Unversioned commands select the latest stable release. See
+[Installation](/docs/getting-started/installation) for prebuilt packages. The
+steps below apply to upgrades from 1.x and from v2 previews.
 
 ## Upgrade the complete installation
 
@@ -70,8 +59,8 @@ prediction-table layout. RC.3 and later discard those incompatible predictions
 and learn them again from source. Compiled entries stay in the store; no manual
 cache deletion is needed.
 
-Historical errors remain in `explain --all`. From RC.4, recognized failures from
-older versions appear under "Earlier Kache bugs". The report also shows the
+Historical errors remain in `explain --all`. V2.0.0 groups recognized failures
+from older versions under "Earlier Kache bugs". The report also shows the
 versions that recorded a build and the version currently installed.
 
 ## Expect some cold state

@@ -21,3 +21,10 @@ filter = 'test(=identity::tests::earlier_lockfiles_are_read_from_git)'
 # This Git fixture exercises a one-second lookup deadline. Reserve the test
 # pool so other tests do not consume that deadline through process contention.
 threads-required = "num-test-threads"
+
+[[profile.ci.overrides]]
+platform = 'cfg(windows)'
+filter = 'test(=cache_key::tests::file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply)'
+# The local IPC fixture has a five-second request deadline. Reserve the pool
+# so parallel compiler fixtures cannot consume that deadline during setup.
+threads-required = "num-test-threads"

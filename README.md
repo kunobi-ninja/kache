@@ -17,16 +17,16 @@ Built by [Kunobi][kunobi-brand].
 
 ## Install
 
-This README follows v2 on `main`. To install the published v2 preview:
+Install Kache v2.0.0 and enable it for your build tools:
 
 ```bash
-cargo install kache --locked --version 2.0.0-rc.3
+cargo install kache --locked --version 2.0.0
 kache init
 kache doctor --probe
 ```
 
-Unversioned install commands select the stable channel. Optional Blaze routing
-is available from `v2.0.0-rc.3`.
+Unversioned install commands select the latest stable release. Blaze routing is
+optional and off by default.
 
 If you use RC.2 with an older cache index, upgrade. RC.3 and later rebuild
 incompatible prediction metadata and keep compiled entries.
@@ -56,7 +56,7 @@ copying an installation into a container or managing release archives yourself.
 | Inspect one build, its misses, and work Kache did not cache | [Monitor](https://kunobi.ninja/docs/kache/monitor) · [Troubleshooting](https://kunobi.ninja/docs/kache/getting-started/troubleshooting) |
 | Manage storage, cleanup, and configuration files | [Storage and cleanup](https://kunobi.ninja/docs/kache/getting-started/storage) · [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration) |
 | Understand the client, engine, and concurrent daemon pipelines | [Architecture](https://kunobi.ninja/docs/kache/how-it-works/architecture) |
-| Opt into local Blaze routing on main | [Blaze](https://kunobi.ninja/docs/kache/getting-started/blaze) |
+| Opt into local Blaze routing | [Blaze](https://kunobi.ninja/docs/kache/getting-started/blaze) |
 
 ## See it reuse a build
 
@@ -106,7 +106,7 @@ to see the workload, platform, and validation behind each result.
 
 ## Optional Blaze builds
 
-From `v2.0.0-rc.3`, the Cargo shim can route eligible local commands
+The Cargo shim can route eligible local commands
 through an installed [Blaze](https://github.com/indexable-inc/blaze) client.
 Install Blaze separately and opt in from the project:
 
@@ -153,7 +153,7 @@ Install your Rust toolchain, then add the official action before your build:
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
   with:
-    version: v2.0.0-rc.3
+    version: v2.0.0
 - run: cargo build --locked
 ```
 

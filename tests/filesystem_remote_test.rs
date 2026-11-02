@@ -128,7 +128,9 @@ impl Client {
             .env_remove("KACHE_BASE_DIR")
             .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
             // Cargo sets this test's own package. A compile that is a
             // package sets its own (`compile_unit`); the rest are bare rustc.
             .env_remove("CARGO_MANIFEST_DIR")
@@ -973,6 +975,11 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
     let beta = Client::new(shared.path());
     let cargo_home = TempDir::new().unwrap();
     let fresh_cargo_home = TempDir::new().unwrap();
+    std::fs::write(
+        fresh_cargo_home.path().join("config.toml"),
+        "[build]\nrustc-wrapper = \"kache-test-missing-wrapper\"\nrustc-workspace-wrapper = \"kache-test-missing-workspace-wrapper\"\n",
+    )
+    .unwrap();
     let outputs = TempDir::new().unwrap();
     let build = |client: &Client| {
         let output = client.run_within_at_env(
@@ -1069,8 +1076,9 @@ fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
                 .join(key)
                 .join("meta.json")
                 .is_file(),
-            "filtered pull missed {name}: {}",
-            String::from_utf8_lossy(&pulled.stdout)
+            "filtered pull missed {name}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&pulled.stdout),
+            String::from_utf8_lossy(&pulled.stderr)
         );
     }
     assert!(

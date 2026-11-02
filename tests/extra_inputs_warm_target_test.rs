@@ -923,13 +923,20 @@ edition = "2021"
         "adding kache.toml cannot invoke a wrapper Cargo already considers Fresh"
     );
 
+    std::fs::create_dir_all(bootstrap_project.path().join(".cargo")).unwrap();
+    std::fs::write(
+        bootstrap_project.path().join(".cargo/config.toml"),
+        "[build]\nrustc-wrapper = \"kache-test-missing-wrapper\"\n",
+    )
+    .unwrap();
     let clean = Command::new("cargo")
         .args(["clean", "--package", "extra-input-warm-target"])
         .current_dir(bootstrap_project.path())
         .env("CARGO_TARGET_DIR", bootstrap_target.path())
         .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
         .output()
         .unwrap();
     assert!(

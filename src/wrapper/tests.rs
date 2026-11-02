@@ -1961,9 +1961,11 @@ fn explain_miss_diff_keeps_the_units_name_root_and_hit_policy() {
             distractor.crate_name = name.into();
             distractor.result = result;
             distractor.cache_key = "newkey".into();
-            distractor.key_fields = fields
-                .then(|| std::collections::BTreeMap::from([("link".into(), "new".into())]))
-                .unwrap_or_default();
+            distractor.key_fields = if fields {
+                std::collections::BTreeMap::from([("link".into(), "new".into())])
+            } else {
+                Default::default()
+            };
             events::log_event(&config.event_log_path(), &distractor).unwrap();
         }
         let current = std::collections::BTreeMap::from([("link".into(), "new".into())]);

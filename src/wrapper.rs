@@ -9470,7 +9470,15 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
     } else {
         (String::new(), Default::default())
     };
-    let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
+    let key_diff = explain_miss_diff(
+        config,
+        root,
+        crate_name,
+        &unit_id,
+        result,
+        cache_key,
+        &key_fields,
+    );
     let miss_reason = events::MissReason::classify(&passthrough_reason);
     BuildEvent {
         ts: Utc::now(),
@@ -9568,15 +9576,14 @@ pub(crate) fn recorded_object_output(path: Option<std::path::PathBuf>) -> String
 /// changed". Costs one event-log read per miss, which is why it's opt-in;
 /// returns empty (and reads nothing) when disabled, on non-miss results, or
 /// when this compile produced no group digests (cc path).
-/// Caveat (documented, not fixed): the last-hit baseline matches on
-/// `crate_name + root`, which conflates duplicate crate versions and
-/// host-vs-target units of the same crate — the named groups are then
-/// approximate. Precise unit identity would need the metadata hash, which is
-/// deliberately not keyed. Acceptable for an opt-in diagnostic.
+/// Match Cargo's recorded compilation unit as well as the name and build tree.
+/// Without a unit id, a same-named library, binary, or host build is not a
+/// reliable baseline, so leave the explanation empty.
 fn explain_miss_diff(
     config: &Config,
     root: &str,
     crate_name: &str,
+    unit_id: &str,
     result: EventResult,
     cache_key: &str,
     key_fields: &std::collections::BTreeMap<String, String>,
@@ -9584,6 +9591,7 @@ fn explain_miss_diff(
     if !config.explain_miss
         || !matches!(result, EventResult::Miss | EventResult::Dup)
         || key_fields.is_empty()
+        || unit_id.is_empty()
     {
         return Vec::new();
     }
@@ -9594,6 +9602,7 @@ fn explain_miss_diff(
     let Some(last_hit) = events.iter().rev().find(|e| {
         e.crate_name == crate_name
             && e.root == root
+            && e.unit_id == unit_id
             && !e.key_fields.is_empty()
             && matches!(
                 e.result,

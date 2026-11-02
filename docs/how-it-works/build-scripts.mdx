@@ -38,8 +38,13 @@ are brought along. A unit whose launcher record is invalid or whose pin is
 missing is left for Cargo to build through the wrapper.
 
 On macOS, Kache runs the script with `ZERO_AR_DATE=1` unless the variable is
-already set, so archives the script builds with `ar` or `libtool` come out the
-same on every run.
+already set. Apple `ar` and `libtool` use it to avoid archive timestamp churn.
+Other differences, such as member names and object contents, can still change
+an archive.
+
+GNU ar on Linux may need deterministic mode enabled explicitly. If an archive's
+member timestamps change between identical builds, see
+[Native archives change on every clean build](/docs/getting-started/troubleshooting#native-archives-change-on-every-clean-build).
 
 ## What a run is keyed on
 

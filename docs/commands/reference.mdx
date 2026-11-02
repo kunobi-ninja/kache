@@ -412,6 +412,11 @@ The payload also carries this host's shared cache: registered blob bytes (`kache
 
 With `[cache] explain_miss = true`, `kache explain <crate>` names compiler-reported environment variables that differ from the prior build of that unit. It compares normalized value hashes, so the log keeps variable names without their values. Older events without these hashes cannot supply the hints. The same hints appear in the JSON report.
 
+The wrapper's changed-group notice and recorded `key_diff` use the last hit
+with the same compilation-unit identity, crate name and build tree. A
+same-named library, binary or host build cannot supply another unit's baseline.
+Records without a unit identity do not supply this comparison.
+
 ```bash
 kache explain
 kache explain --root "$PWD"
@@ -433,7 +438,7 @@ Without a crate, `explain` reads the latest recorded build and says why it misse
 | built before with this exact key, but the entry was gone | Nothing in its inputs changed; the entry was evicted or never reached this machine |
 | downstream of a crate | A dependency changed and every crate built on it recompiled; the crate where the change started is named |
 | own inputs changed | Its sources, compiler flags, profile or features, an environment variable it reads, its linker, or its path remapping changed |
-| differs from the build in another checkout | The first build of the crate in this tree, and its inputs differ from the same crate built in another checkout. `kache explain <crate>` names the input. A path into the checkout that Kache did not map needs `KACHE_BASE_DIR`; a C or C++ library a build script generated with the checkout's path or a timestamp in it needs prefix maps and `ZERO_AR_DATE`; a flag or file that really differs needs nothing |
+| differs from the build in another checkout | The first build of the crate in this tree, and its inputs differ from the same crate built in another checkout. `kache explain <crate>` names the input. A path into the checkout that Kache did not map needs `KACHE_BASE_DIR`; a generated C or C++ library may need prefix maps or [deterministic archive settings](/docs/getting-started/troubleshooting#native-archives-change-on-every-clean-build); a flag or file that really differs needs nothing |
 | no earlier compile | The first build of the crate in this tree, or older history was rotated away |
 | miss details were not recorded | The retained event lacks key-comparison details; `[cache] explain_miss = true` records them from the next build. Older releases call this unexplained |
 

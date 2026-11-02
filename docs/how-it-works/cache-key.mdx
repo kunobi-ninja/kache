@@ -273,7 +273,14 @@ kache explain my_crate
 
 `kache explain` with no crate explains the latest build: each cause of its misses, costliest first, against the build before it. `--root` limits it to one build tree. `kache explain my_crate` says why that crate's last compile missed and how its stored entries differ in target, profile, features and crate type.
 
-To have explain name the input groups that changed, turn on `[cache] explain_miss` (or `KACHE_EXPLAIN_MISS=1`) before the builds you want to compare; both builds need it. It records which groups changed since the last hit, plus the dependency digests and unit ids that let explain follow a miss down to the dependency that changed and, in a second checkout with no earlier build of the crate, compare with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. The exception is `remap` when path remapping is off: that group keys the checkout path on purpose. Any other group that differs between checkouts is a real input difference or a path that normalization missed.
+To have explain name the input groups that changed, turn on `[cache] explain_miss` (or `KACHE_EXPLAIN_MISS=1`) before the builds you want to compare; both builds need it. The wrapper compares a miss with the last recorded hit for the same Cargo compilation unit in that build tree. A library and binary with the same crate name are separate units. If either record lacks a unit identity, the wrapper leaves its group comparison unavailable.
+
+The setting also records dependency digests and unit ids that let explain follow a miss down to the dependency that changed and, in a second checkout with no earlier build of the crate, compare with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. The exception is `remap` when path remapping is off: that group keys the checkout path on purpose. Any other group that differs between checkouts is a real input difference or a path that normalization missed.
+
+A changed `link` group can include timestamps in native archives, even when
+their object code is identical. See
+[deterministic native archives](/docs/getting-started/troubleshooting#native-archives-change-on-every-clean-build)
+before changing cache settings.
 
 For individual components, run the trace command `kache explain my_crate` suggests, typically:
 

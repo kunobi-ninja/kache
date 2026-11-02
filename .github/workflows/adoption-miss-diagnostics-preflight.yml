@@ -32,8 +32,8 @@ jobs:
       RUSTC_WRAPPER: ""
       RUSTC_WORKSPACE_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: 358c413f0213425579de0c49264e22515928446b
-      SOURCE_TREE: 620fa1ba3f571c4cb05a4c7808768bd8061142dc
+      SOURCE_HEAD: c73d1045f06d145cbb3471b92e3048b64eb877db
+      SOURCE_TREE: eba3e1c8f4edd62acdf35d8992743df3e94ca98f
     steps:
       - name: Require a disposable hosted runner
         working-directory: ${{ github.workspace }}

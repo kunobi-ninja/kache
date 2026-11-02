@@ -320,7 +320,7 @@ fn volume_inventory_reaches_direct_stats_daemon_stats_and_reports() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains(&shard_config.cache_dir.display().to_string()))
+            .any(|line| line.contains(&crate::term::home_path(&shard_config.cache_dir)))
     );
     let daemon = crate::daemon::Daemon::new(config.clone());
     let req: crate::daemon::StatsRequest = serde_json::from_value(serde_json::json!({

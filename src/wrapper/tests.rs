@@ -1769,6 +1769,7 @@ fn explain_miss_diff_names_changed_groups() {
             &config,
             "/w",
             "gkrust",
+            "unit",
             EventResult::Miss,
             "newkey",
             &fields_now
@@ -1777,7 +1778,7 @@ fn explain_miss_diff_names_changed_groups() {
     );
 
     let hit: crate::events::BuildEvent = serde_json::from_str(
-        r#"{"ts":"2026-07-23T00:00:00Z","crate_name":"gkrust","root":"/w",
+        r#"{"ts":"2026-07-23T00:00:00Z","crate_name":"gkrust","root":"/w","unit_id":"unit",
                 "result":"local_hit","elapsed_ms":1,"size":1,
                 "key_fields":{"args":"aaaa","sources":"ssss","link":"llll"}}"#,
     )
@@ -1788,6 +1789,7 @@ fn explain_miss_diff_names_changed_groups() {
         &config,
         "/w",
         "gkrust",
+        "unit",
         EventResult::Miss,
         "newkey",
         &fields_now,
@@ -1810,6 +1812,7 @@ fn explain_miss_diff_names_changed_groups() {
             &config,
             "/w",
             "gkrust",
+            "unit",
             EventResult::Miss,
             "newkey",
             &unchanged
@@ -1823,6 +1826,7 @@ fn explain_miss_diff_names_changed_groups() {
             &config,
             "/w",
             "gkrust",
+            "unit",
             EventResult::LocalHit,
             "newkey",
             &fields_now
@@ -1835,9 +1839,77 @@ fn explain_miss_diff_names_changed_groups() {
             &config,
             "/w",
             "gkrust",
+            "unit",
             EventResult::Miss,
             "newkey",
             &fields_now
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn explain_miss_diff_uses_the_current_compilation_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().to_path_buf());
+    config.explain_miss = true;
+    let fields =
+        |link: &str| std::collections::BTreeMap::from([("link".to_string(), link.to_string())]);
+    let hit: crate::events::BuildEvent = serde_json::from_str(
+        r#"{"ts":"2026-07-23T00:00:00Z","crate_name":"typst","root":"/w",
+            "unit_id":"binary","result":"local_hit","cache_key":"oldkey",
+            "elapsed_ms":1,"size":1,"key_fields":{"link":"old"}}"#,
+    )
+    .unwrap();
+    events::log_event(&config.event_log_path(), &hit).unwrap();
+
+    // More recent hits for sibling units or legacy records must not shadow
+    // the binary's own baseline, even when their key matches this miss.
+    for unit in ["library", "host", "other-version", ""] {
+        let mut sibling = hit.clone();
+        sibling.unit_id = unit.to_string();
+        sibling.cache_key = "newkey".to_string();
+        sibling.key_fields = fields("new");
+        events::log_event(&config.event_log_path(), &sibling).unwrap();
+    }
+    for result in [EventResult::Miss, EventResult::Dup] {
+        let event = build_event_details(
+            &config,
+            EventInputs::new("/w", "typst", result, 1)
+                .keyed("newkey", 0, FileHashStats::default())
+                .key_record(KeyEventRecord {
+                    fields: Some(fields("new")),
+                    externs: Some(Default::default()),
+                    unit_id: Some("binary".to_string()),
+                    ..Default::default()
+                }),
+        );
+        assert_eq!(event.key_diff, ["link"]);
+    }
+
+    // With no hit for this unit, don't borrow a sibling's or legacy hit.
+    assert!(
+        explain_miss_diff(
+            &config,
+            "/w",
+            "typst",
+            "unseen",
+            EventResult::Miss,
+            "newkey",
+            &fields("new")
+        )
+        .is_empty()
+    );
+    // Two empty ids are not evidence that the compilation units match.
+    assert!(
+        explain_miss_diff(
+            &config,
+            "/w",
+            "typst",
+            "",
+            EventResult::Miss,
+            "newkey",
+            &fields("new")
         )
         .is_empty()
     );

@@ -69,6 +69,41 @@ and [build-script inputs](/docs/how-it-works/build-scripts).
 Adaptive incremental mode can also compile a unit you are editing using its
 private incremental state. See [Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds).
 
+## Native archives change on every clean build
+
+If a crate that links a build-script-generated `.a` file keeps missing with
+only the `link` key group changed, compare the archives from two clean builds.
+The object code can be identical while the archive's member timestamps differ.
+Kache includes those timestamps in the native-link key, so the Rust crate and
+binaries that link it can miss too.
+
+For a native Rust build using the `cc` crate and **GNU ar**, enable deterministic
+archives before building:
+
+```bash
+ar --version # Confirm this is GNU ar and the archiver your build uses.
+HOST_ARFLAGS=D CARGO_INCREMENTAL=0 cargo build --release
+```
+
+GNU ar's [`D` modifier](https://sourceware.org/binutils/docs/binutils/ar-cmdline.html)
+zeros archive member timestamps and normalizes ownership and modes. Some GNU
+binutils builds enable it by default; others do not. `ZERO_AR_DATE=1`, which
+helps on macOS, does not enable GNU ar's deterministic mode.
+
+`HOST_ARFLAGS` is a [`cc` crate setting](https://docs.rs/cc/latest/cc/#external-configuration-via-environment-variables),
+not a Kache setting. It applies when the build's host and target match. For a
+cross-target build, configure the target's archiver flags instead, after
+checking that archiver supports deterministic mode. Preserve any existing
+archiver selection and required flags: target-specific `ARFLAGS_<target>` can
+take precedence, and an existing `U` flag requests nondeterministic archives.
+Other build systems need their own archiver configuration.
+
+After changing the flags, rebuild the affected native library and compare two
+clean builds with the same inputs. `ar tv libexample.a` shows member timestamps;
+`cmp first.a second.a` checks whether the whole archives match. Deterministic
+mode fixes archive metadata churn; it does not remove other differences such
+as paths embedded in object files.
+
 ## Miss details or old errors are missing from history
 
 `kache explain` describes recorded builds. A historical SQL/schema error in a

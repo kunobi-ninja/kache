@@ -86,11 +86,8 @@ impl Prepared {
                 use std::os::windows::ffi::OsStrExt;
                 let key = key.encode_wide().collect::<Vec<_>>();
                 !key.is_empty()
-                    && (!key.contains(&u16::from(b'='))
-                        || (key.len() == 3
-                            && key[0] == u16::from(b'=')
-                            && key[2] == u16::from(b':')
-                            && u8::try_from(key[1]).is_ok_and(|drive| drive.is_ascii_alphabetic())))
+                    && (key[0] != u16::from(b'=') || key.len() > 1)
+                    && !key[1..].contains(&u16::from(b'='))
             }),
             "invalid compiler environment key"
         );
@@ -332,4 +329,87 @@ async fn service_call(
         let _ = sender.send(Ok(reply));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparation_preserves_windows_hidden_environment_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let native = |value: &std::ffi::OsStr| NativeString::capture(value);
+        let request = ExecutionRequest {
+            version: EXECUTION_VERSION,
+            entry: ExecutionEntry::Compiler,
+            client_version: crate::VERSION.into(),
+            client_pid: std::process::id(),
+            creation_mask: None,
+            argv: vec![native("rustc".as_ref())],
+            env: vec![
+                (native("X".as_ref()), native("".as_ref())),
+                (native("UNICODE_🦀".as_ref()), native("value".as_ref())),
+                (native("=C:".as_ref()), native(r"C:\work".as_ref())),
+                (native("=::".as_ref()), native(r"::\".as_ref())),
+                (native("=ExitCode".as_ref()), native("00000000".as_ref())),
+            ],
+            cwd: native(root.path().as_os_str()),
+            home: None,
+            temp: native(root.path().as_os_str()),
+            cache: None,
+            executable: native(std::env::current_exe().unwrap().as_os_str()),
+            startup_micros: 0,
+            channels: ExecutionChannels::Windows {
+                stdin: 0,
+                stdout: 0,
+                stderr: 0,
+                process_broker: true,
+                trusted_pipeline: false,
+            },
+        };
+        let prepared = Prepared::decode(request.clone(), crate::VERSION).unwrap();
+        for (key, value) in request.env {
+            assert_eq!(
+                prepared
+                    .env
+                    .var_os(&key.decode().unwrap().to_string_lossy()),
+                Some(value.decode().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_rejects_malformed_windows_environment_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let native = |value: &std::ffi::OsStr| NativeString::capture(value);
+        let request = ExecutionRequest {
+            version: EXECUTION_VERSION,
+            entry: ExecutionEntry::Compiler,
+            client_version: crate::VERSION.into(),
+            client_pid: std::process::id(),
+            creation_mask: None,
+            argv: vec![native("rustc".as_ref())],
+            env: vec![],
+            cwd: native(root.path().as_os_str()),
+            home: None,
+            temp: native(root.path().as_os_str()),
+            cache: None,
+            executable: native(std::env::current_exe().unwrap().as_os_str()),
+            startup_micros: 0,
+            channels: ExecutionChannels::Windows {
+                stdin: 0,
+                stdout: 0,
+                stderr: 0,
+                process_broker: true,
+                trusted_pipeline: false,
+            },
+        };
+        for key in ["", "=", "A=B", "=A=B"] {
+            let mut request = request.clone();
+            request
+                .env
+                .push((native(key.as_ref()), native("value".as_ref())));
+            assert!(Prepared::decode(request, crate::VERSION).is_err(), "{key}");
+        }
+    }
 }

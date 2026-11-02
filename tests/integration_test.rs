@@ -30,9 +30,39 @@ fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
     );
 }
 
+fn selected_cc_compiler() -> String {
+    #[cfg(not(windows))]
+    {
+        "cc".to_owned()
+    }
+    #[cfg(windows)]
+    {
+        for name in ["cc.exe", "clang.exe"] {
+            for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+                let path = dir.join(name);
+                if !path.is_file() {
+                    continue;
+                }
+                let Ok(probe) = std::process::Command::new(&path)
+                    .args(["-x", "c", "-E", "-"])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                else {
+                    continue;
+                };
+                if probe.status.success() {
+                    return path.to_string_lossy().into_owned();
+                }
+            }
+        }
+        panic!("these C integration tests require a gcc/clang-style C compiler on PATH");
+    }
+}
+
 #[test]
 fn test_cc_cache_hit_replays_warning_locations_in_the_receiving_checkout() {
     build_kache();
+    let compiler = selected_cc_compiler();
     let project = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     let _cache_daemon = common::DaemonGuard::new(kache_binary(), cache.path());
@@ -58,7 +88,7 @@ fn test_cc_cache_hit_replays_warning_locations_in_the_receiving_checkout() {
             cache.path(),
             Some(&isolated_config_path(cache.path())),
         )
-        .arg("cc")
+        .arg(&compiler)
         .args(["-Wsign-compare", "-c"])
         .arg(root.join("unit.c"))
         .arg("-I")
@@ -78,12 +108,25 @@ fn test_cc_cache_hit_replays_warning_locations_in_the_receiving_checkout() {
         String::from_utf8(output.stderr).unwrap()
     };
     let cold = compile(&producer);
+    let cold_paths = cold.replace('\\', "/");
     assert!(
-        cold.contains(&producer.join("unit.c").display().to_string()),
+        cold_paths.contains(
+            &producer
+                .join("unit.c")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
         "{cold}"
     );
     assert!(
-        cold.contains(&producer.join("include/warning.h").display().to_string()),
+        cold_paths.contains(
+            &producer
+                .join("include/warning.h")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
         "{cold}"
     );
     let warm = compile(&consumer);
@@ -1821,6 +1864,7 @@ fn test_cc_cache_output_stays_writable_across_miss_hit_and_recompile() {
 #[test]
 fn test_cc_existing_plain_output_hits_and_reconfigured_miss_is_stored() {
     build_kache();
+    let compiler = selected_cc_compiler();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
     let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
@@ -1830,8 +1874,24 @@ fn test_cc_existing_plain_output_hits_and_reconfigured_miss_is_stored() {
 
     let source_str = source.to_string_lossy().into_owned();
     let output_str = output.to_string_lossy().into_owned();
-    let o0 = ["cc", "-c", &source_str, "-o", &output_str, "-O0", "-g0"];
-    let o2 = ["cc", "-c", &source_str, "-o", &output_str, "-O2", "-g0"];
+    let o0 = [
+        compiler.as_str(),
+        "-c",
+        &source_str,
+        "-o",
+        &output_str,
+        "-O0",
+        "-g0",
+    ];
+    let o2 = [
+        compiler.as_str(),
+        "-c",
+        &source_str,
+        "-o",
+        &output_str,
+        "-O2",
+        "-g0",
+    ];
 
     run_kache_cc(project.path(), cache_dir.path(), &o0);
     let cached_o0 = std::fs::read(&output).unwrap();
@@ -2795,6 +2855,7 @@ fn test_cc_merge_all_constants_keys_on_probe_issue_856() {
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -2813,7 +2874,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     .unwrap();
 
     let base_args = [
-        "cc",
+        &compiler,
         "-O0",
         "-g0",
         "-MMD",
@@ -2827,11 +2888,12 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
 
     run_kache_cc(project.path(), cache_dir.path(), &base_args);
     let cold_depinfo = std::fs::read_to_string(project.path().join("build/foo.d")).unwrap();
+    let cold_depinfo_paths = cold_depinfo.replace('\\', "/");
     assert!(project.path().join("build/foo.o").exists());
-    assert!(cold_depinfo.contains("build/foo.o"));
-    assert!(cold_depinfo.contains("src/foo.c"));
-    assert!(cold_depinfo.contains("src/bar.h"));
-    assert!(!cold_depinfo.contains("./foo.o"));
+    assert!(cold_depinfo_paths.contains("build/foo.o"));
+    assert!(cold_depinfo_paths.contains("src/foo.c"));
+    assert!(cold_depinfo_paths.contains("src/bar.h"));
+    assert!(!cold_depinfo_paths.contains("./foo.o"));
     let report = kache_report(cache_dir.path());
     assert_cc_report_counts(&report, 1, 0);
     assert_last_cc_event(&report, "miss", 1);
@@ -2850,7 +2912,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     std::fs::create_dir_all(project.path().join("build")).unwrap();
     std::fs::create_dir_all(project.path().join("deps")).unwrap();
     let mf_args = [
-        "cc",
+        &compiler,
         "-O0",
         "-g0",
         "-MMD",
@@ -2879,7 +2941,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     std::fs::create_dir_all(project.path().join("build")).unwrap();
     std::fs::create_dir_all(project.path().join("deps")).unwrap();
     let pp_args = [
-        "cc",
+        &compiler,
         "-O0",
         "-g0",
         "-MMD",
@@ -2894,10 +2956,11 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     ];
     run_kache_cc(project.path(), pp_cache_dir.path(), &pp_args);
     let cold_pp_depinfo = std::fs::read_to_string(project.path().join("deps/custom.pp")).unwrap();
+    let cold_pp_depinfo_paths = cold_pp_depinfo.replace('\\', "/");
     assert!(project.path().join("build/foo.o").exists());
-    assert!(cold_pp_depinfo.contains("build/foo.o"));
-    assert!(cold_pp_depinfo.contains("src/foo.c"));
-    assert!(cold_pp_depinfo.contains("src/bar.h"));
+    assert!(cold_pp_depinfo_paths.contains("build/foo.o"));
+    assert!(cold_pp_depinfo_paths.contains("src/foo.c"));
+    assert!(cold_pp_depinfo_paths.contains("src/bar.h"));
     let report = kache_report(pp_cache_dir.path());
     assert_cc_report_counts(&report, 1, 0);
     assert_last_cc_event(&report, "miss", 1);
@@ -2918,6 +2981,7 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
 #[test]
 fn test_cc_preprocess_memo_skips_warm_probe_and_invalidates_on_header_change() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -2929,7 +2993,7 @@ fn test_cc_preprocess_memo_skips_warm_probe_and_invalidates_on_header_change() {
     )
     .unwrap();
     let args = [
-        "cc", "-O0", "-g0", "-MMD", "-MF", "foo.d", "-c", "foo.c", "-o", "foo.o",
+        &compiler, "-O0", "-g0", "-MMD", "-MF", "foo.d", "-c", "foo.c", "-o", "foo.o",
     ];
 
     run_kache_cc(project.path(), cache_dir.path(), &args);
@@ -3127,6 +3191,7 @@ fn test_cc_legacy_compound_depinfo_entry_self_heals_and_why_miss_explains_it() {
 #[test]
 fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -3143,7 +3208,7 @@ fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
     .unwrap();
 
     let args = [
-        "cc",
+        &compiler,
         "-O0",
         "-g0",
         "-MMD",
@@ -3159,13 +3224,14 @@ fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
 
     run_kache_cc_from(&object_dir, cache_dir.path(), &args);
     let cold_depinfo = std::fs::read_to_string(object_dir.join(".deps/foo.o.pp")).unwrap();
+    let cold_depinfo_paths = cold_depinfo.replace('\\', "/");
     assert!(object_dir.join("foo.o").exists());
     assert!(
-        cold_depinfo.contains("../../../../src/foo.c"),
+        cold_depinfo_paths.contains("../../../../src/foo.c"),
         "cold depfile should preserve compiler parent-relative source path: {cold_depinfo}"
     );
     assert!(
-        cold_depinfo.contains("../../../../src/bar.h"),
+        cold_depinfo_paths.contains("../../../../src/bar.h"),
         "cold depfile should preserve compiler parent-relative header path: {cold_depinfo}"
     );
     assert!(
@@ -3461,6 +3527,7 @@ fn workspace_wrapper_passthrough_executes_every_time() {
 #[test]
 fn test_cc_direct_key_compiles_once_without_a_preprocess() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -3473,7 +3540,15 @@ fn test_cc_direct_key_compiles_once_without_a_preprocess() {
         "#include <stdio.h>\n#include \"value.h\"\nint value(void) { return VALUE; }\n",
     )
     .unwrap();
-    let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];
+    let args = [
+        compiler.as_str(),
+        "-O0",
+        "-g0",
+        "-c",
+        "foo.c",
+        "-o",
+        "foo.o",
+    ];
 
     run_kache_cc(project.path(), cache_dir.path(), &args);
     assert!(project.path().join("foo.o").exists());
@@ -3515,6 +3590,7 @@ fn test_cc_direct_key_compiles_once_without_a_preprocess() {
 #[test]
 fn test_cc_direct_key_uses_the_callers_depfile() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -3526,7 +3602,7 @@ fn test_cc_direct_key_uses_the_callers_depfile() {
     )
     .unwrap();
     let args = [
-        "cc", "-O0", "-g0", "-MD", "-MF", "foo.d", "-c", "foo.c", "-o", "foo.o",
+        &compiler, "-O0", "-g0", "-MD", "-MF", "foo.d", "-c", "foo.c", "-o", "foo.o",
     ];
 
     run_kache_cc(project.path(), cache_dir.path(), &args);
@@ -3553,6 +3629,7 @@ fn test_cc_direct_key_uses_the_callers_depfile() {
 #[test]
 fn test_cc_direct_key_refuses_an_assembler_read_file() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -3563,7 +3640,15 @@ fn test_cc_direct_key_refuses_an_assembler_read_file() {
         "__asm__(\".incbin \\\"blob.bin\\\"\");\nint value(void) { return 1; }\n",
     )
     .unwrap();
-    let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];
+    let args = [
+        compiler.as_str(),
+        "-O0",
+        "-g0",
+        "-c",
+        "foo.c",
+        "-o",
+        "foo.o",
+    ];
 
     // Skipped compiles are kept out of the report's hit/miss summary, so
     // read the event log itself.
@@ -3595,6 +3680,7 @@ fn test_cc_direct_key_refuses_an_assembler_read_file() {
 #[test]
 fn test_cc_direct_key_binds_a_root_spelling_object_to_its_checkout() {
     build_kache();
+    let compiler = selected_cc_compiler();
 
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -3612,7 +3698,15 @@ fn test_cc_direct_key_binds_a_root_spelling_object_to_its_checkout() {
         .unwrap();
     };
     write(project.path());
-    let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];
+    let args = [
+        compiler.as_str(),
+        "-O0",
+        "-g0",
+        "-c",
+        "foo.c",
+        "-o",
+        "foo.o",
+    ];
 
     run_kache_cc(project.path(), cache_dir.path(), &args);
     let report = kache_report(cache_dir.path());

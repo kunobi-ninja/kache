@@ -92,6 +92,10 @@ zeros archive member timestamps and normalizes ownership and modes. Some GNU
 binutils builds enable it by default; others do not. `ZERO_AR_DATE=1`, which
 helps on macOS, does not enable GNU ar's deterministic mode.
 
+Some `cc` releases already request `D` automatically. Extra flags are useful
+when the archive timestamps actually change, not when two archives already
+match byte for byte.
+
 `HOST_ARFLAGS` is a [`cc` crate setting](https://docs.rs/cc/latest/cc/#external-configuration-via-environment-variables),
 not a Kache setting. It applies when the build's host and target match. For a
 cross-target build, configure the target's archiver flags instead, after

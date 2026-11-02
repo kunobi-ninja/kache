@@ -97,7 +97,7 @@ fn checkout_fix(groups: &[String]) -> String {
     }
     if has("sources") || has("link") {
         advice.push(
-            "a C or C++ library a build script generated: add `-ffile-prefix-map=$PWD=.` to `CFLAGS` and `CXXFLAGS` and set `ZERO_AR_DATE=1` and `SOURCE_DATE_EPOCH`"
+            "a C or C++ library a build script generated: use `-ffile-prefix-map=$PWD=.` in `CFLAGS` and `CXXFLAGS` for embedded paths; for archive timestamps use GNU ar's `D` mode (`HOST_ARFLAGS=D` for native builds using `cc`) or `ZERO_AR_DATE=1` with Apple tools"
                 .to_string(),
         );
     }
@@ -715,7 +715,10 @@ mod tests {
             assert!(text.contains("KACHE_BASE_DIR"), "{text}");
             assert!(text.contains("if it is a C or C++ library"), "{text}");
             assert!(text.contains("-ffile-prefix-map=$PWD=."), "{text}");
+            assert!(text.contains("GNU ar's `D` mode"), "{text}");
+            assert!(text.contains("HOST_ARFLAGS=D"), "{text}");
             assert!(text.contains("ZERO_AR_DATE=1"), "{text}");
+            assert!(text.contains("with Apple tools"), "{text}");
         }
         assert!(checkout(&["args"]).contains("KACHE_BASE_DIR"));
         let remap = checkout(&["remap"]);

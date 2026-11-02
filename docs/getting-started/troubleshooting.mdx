@@ -78,7 +78,9 @@ Kache includes those timestamps in the native-link key, so the Rust crate and
 binaries that link it can miss too.
 
 For a native Rust build using the `cc` crate and **GNU ar**, enable deterministic
-archives before building:
+archives before building. Check which archiver the build script invokes; an
+explicit `AR` or target-specific setting can select a different tool from the
+`ar` on `PATH`.
 
 ```bash
 ar --version # Confirm this is GNU ar and the archiver your build uses.
@@ -94,9 +96,12 @@ helps on macOS, does not enable GNU ar's deterministic mode.
 not a Kache setting. It applies when the build's host and target match. For a
 cross-target build, configure the target's archiver flags instead, after
 checking that archiver supports deterministic mode. Preserve any existing
-archiver selection and required flags: target-specific `ARFLAGS_<target>` can
-take precedence, and an existing `U` flag requests nondeterministic archives.
-Other build systems need their own archiver configuration.
+archiver selection and required flags. Flag resolution depends on the `cc`
+version locked by the project: some releases select a target-specific
+`ARFLAGS_<target>` before `HOST_ARFLAGS`, while others combine the configured
+flag variables. Check that version's configuration rules and remove any `U`
+flag when requesting deterministic archives. Other build systems need their
+own archiver configuration.
 
 After changing the flags, rebuild the affected native library and compare two
 clean builds with the same inputs. `ar tv libexample.a` shows member timestamps;

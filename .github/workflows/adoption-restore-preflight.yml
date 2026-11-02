@@ -44,8 +44,6 @@ jobs:
     env:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/adoption-1790-target
-      EVIDENCE_DIR: ${{ runner.temp }}/adoption-1790-evidence
       SOURCE_HEAD: c128eabd556b3be3c098ebde24ba5d91a6e9955a
       SOURCE_TREE: 9494183b0f4c452128853c34f0374f270811720d
     steps:
@@ -53,7 +51,13 @@ jobs:
         working-directory: ${{ github.workspace }}
         env:
           RUNNER_KIND: ${{ runner.environment }}
-        run: test "$RUNNER_KIND" = github-hosted
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          {
+            printf 'CARGO_TARGET_DIR=%s/adoption-1790-target\n' "$RUNNER_TEMP"
+            printf 'EVIDENCE_DIR=%s/adoption-1790-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
       - name: Check out the maintainer validation helper
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:

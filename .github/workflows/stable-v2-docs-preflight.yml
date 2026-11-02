@@ -1,0 +1,68 @@
+name: Stable v2 documentation preflight
+
+on:
+  push:
+    branches: [validation/kache-v2-docs-preflight-20261102]
+    paths: [.github/workflows/stable-v2-docs-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/validation/kache-v2-docs-preflight-20261102'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      SOURCE_HEAD: 3aa4dd4cf11a8b74d10c441e0f967b5f82f51eaf
+      SOURCE_TREE: d1fbccd5de34ac248fcbe8b79ce393724e2d6a6e
+    steps:
+      - name: Require a hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: test "$RUNNER_KIND" = github-hosted
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          persist-credentials: false
+      - name: Verify source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          mkdir -p "$RUNNER_TEMP/stable-v2-docs-evidence"
+          {
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+          } | tee "$RUNNER_TEMP/stable-v2-docs-evidence/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0
+        with:
+          version: 2026.6.9
+          install: true
+          cache: false
+      - name: Run just check
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$RUNNER_TEMP/stable-v2-docs-evidence/just-check.log"
+      - name: Check documentation
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$RUNNER_TEMP/stable-v2-docs-evidence/docs.log"
+          python3 scripts/test-docs.py 2>&1 | tee "$RUNNER_TEMP/stable-v2-docs-evidence/docs-tests.log"
+          git diff --exit-code
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: stable-v2-docs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stable-v2-docs-evidence
+          retention-days: 7
+          if-no-files-found: error

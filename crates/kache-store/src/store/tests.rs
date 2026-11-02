@@ -169,7 +169,10 @@ fn lock_polls_back_off_from_a_millisecond_to_the_interval() {
 fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
     for upgrade in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
+        let config = Config {
+            deferred_durability: true,
+            ..test_config(dir.path())
+        };
         let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
         store
             .db
@@ -227,6 +230,44 @@ fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
                 "upgrade={upgrade}: {sql}"
             );
         }
+
+        // Insert newest first so the batch must follow created_at rather
+        // than insertion order. Durable and uncommitted rows stay excluded.
+        for (key, created_at) in [
+            ("pending-new", "2001-01-01 00:00:00"),
+            ("pending-old", "2000-01-01 00:00:00"),
+        ] {
+            let output = dir.path().join(format!("{key}.rlib"));
+            fs::write(&output, key.as_bytes()).unwrap();
+            store
+                .put(
+                    key,
+                    "crate",
+                    &["lib".into()],
+                    &[],
+                    "target",
+                    "dev",
+                    &[(output, "libout.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET created_at = ?1 WHERE cache_key = ?2",
+                    params![created_at, key],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.pending_durability().unwrap(), 2);
+        assert_eq!(store.flush_durability(0).unwrap(), 0);
+        assert_eq!(store.flush_durability(1).unwrap(), 1);
+        assert!(store.entry_is_durable("pending-old"));
+        assert!(!store.entry_is_durable("pending-new"));
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        assert_eq!(store.flush_durability(1).unwrap(), 1);
+        assert_eq!(store.pending_durability().unwrap(), 0);
     }
 }
 

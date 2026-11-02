@@ -1429,7 +1429,8 @@ pub(crate) fn run_nvcc_for(
             let restore_start = std::time::Instant::now();
             if let Err(e) = restore_nvcc_from_cache(hit_store, &parsed, &meta) {
                 tracing::warn!(
-                    "restoring nvcc cache hit for {crate_name} failed: {e:#} — recompiling"
+                    "restoring nvcc cache hit for {crate_name} failed: {} — recompiling",
+                    store_error_for_event(&e)
                 );
                 return nvcc_passthrough_with_event(
                     config,
@@ -1507,7 +1508,8 @@ pub(crate) fn run_nvcc_for(
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_nvcc_from_cache(&store, &parsed, &meta) {
             tracing::warn!(
-                "restoring nvcc coalesced hit for {crate_name} failed: {e:#} — recompiling"
+                "restoring nvcc coalesced hit for {crate_name} failed: {} — recompiling",
+                store_error_for_event(&e)
             );
             return nvcc_passthrough_with_event(
                 config,
@@ -1916,7 +1918,8 @@ fn nvcc_try_remote_hit(
     let restore_start = std::time::Instant::now();
     if let Err(e) = restore_nvcc_from_cache(store, parsed, &meta) {
         tracing::warn!(
-            "restoring nvcc remote cache hit for {crate_name} failed: {e:#} — recompiling"
+            "restoring nvcc remote cache hit for {crate_name} failed: {} — recompiling",
+            store_error_for_event(&e)
         );
         return Ok(Some(nvcc_passthrough_with_event(
             config,
@@ -2300,9 +2303,9 @@ fn run_cc_with_store(
                     return restored.map(|_| 0);
                 }
                 tracing::warn!(
-                    "restoring cc cache hit for {} failed: {:#} — recompiling",
+                    "restoring cc cache hit for {} failed: {} — recompiling",
                     crate_name,
-                    e
+                    store_error_for_event(e)
                 );
                 if !hit_store.is_read_only() {
                     return cc_passthrough_with_event(
@@ -2314,7 +2317,7 @@ fn run_cc_with_store(
                         restore_failure_reason(e),
                     );
                 }
-                lookup_rejection = format!("read-only restore failed: {e:#}");
+                lookup_rejection = format!("read-only {}", restore_failure_reason(e));
             }
             if let Ok(meta) = restored {
                 let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -2432,9 +2435,9 @@ fn run_cc_with_store(
                 return Err(e);
             }
             tracing::warn!(
-                "restoring cc coalesced hit for {} failed: {:#} — recompiling",
+                "restoring cc coalesced hit for {} failed: {} — recompiling",
                 crate_name,
-                e
+                store_error_for_event(&e)
             );
             return cc_passthrough_with_event(
                 config,
@@ -3461,9 +3464,9 @@ fn cc_try_remote_hit(
             return Err(e);
         }
         tracing::warn!(
-            "restoring cc remote cache hit for {} failed: {:#} — recompiling",
+            "restoring cc remote cache hit for {} failed: {} — recompiling",
             crate_name,
-            e
+            store_error_for_event(&e)
         );
         return Ok(Some(cc_passthrough_with_event(
             config,
@@ -4517,9 +4520,9 @@ fn run_parsed_rustc(
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "restoring local cache hit for {} failed: {:#} — recompiling",
+                            "restoring local cache hit for {} failed: {} — recompiling",
                             crate_name,
-                            e
+                            store_error_for_event(&e)
                         );
                         if !hit_store.is_read_only() {
                             return passthrough_with_event(
@@ -4557,9 +4560,9 @@ fn run_parsed_rustc(
         ) {
             if let Err(e) = restored {
                 tracing::warn!(
-                    "restoring cache hit for {} failed: {:#} — recompiling",
+                    "restoring cache hit for {} failed: {} — recompiling",
                     crate_name,
-                    e
+                    store_error_for_event(&e)
                 );
                 return passthrough_with_event(
                     config,
@@ -4739,9 +4742,9 @@ fn run_parsed_rustc(
             &key_record,
         ) {
             tracing::warn!(
-                "restoring cache hit for {} failed: {:#} — recompiling",
+                "restoring cache hit for {} failed: {} — recompiling",
                 crate_name,
-                e
+                store_error_for_event(&e)
             );
             return passthrough_with_event(
                 config,
@@ -8716,8 +8719,10 @@ fn uncacheable_reason(error: &anyhow::Error) -> String {
 }
 
 /// Keep the root cause when a failed restore is recorded for report/explain.
+/// The chain can quote a tar entry name from a remote archive, so it gets the
+/// same guards as a store error before it is persisted.
 fn restore_failure_reason(error: &anyhow::Error) -> String {
-    format!("restore failed: {error:#}")
+    format!("restore failed: {}", store_error_for_event(error))
 }
 
 /// What a passthrough reason quotes of rustc's own output. A failed pre-pass
@@ -9305,20 +9310,21 @@ pub(crate) fn log_event(config: &Config, inputs: EventInputs<'_>) {
     write_event(config, &event);
 }
 
-/// Render a failed `Store::put` for the event log and the report.
+/// Render a failed `Store::put`, or a failed restore through
+/// `restore_failure_reason`, for logs and reports.
 ///
 /// `{:#}` keeps anyhow's whole context chain — the outer context alone
-/// ("creating blob shard directory") never names the cause. Two guards, because
-/// unlike the `WARN` this string is persisted and re-rendered inside JSON, a
-/// text table and a markdown table:
+/// ("creating blob shard directory") never names the cause. This string reaches
+/// diagnostic logs and is persisted and re-rendered in JSON and report tables:
 /// - control characters (a newline from a nested compiler error) become spaces,
 ///   so one failure cannot break the row it is printed in;
 /// - the result is capped, so a pathological error message cannot bloat every
 ///   event line in the log.
 ///
 /// Hardening for shape, not secrecy: it does not redact. The reason is derived
-/// from filesystem and SQLite errors, so it can carry absolute paths, and a
-/// report shared outside the machine carries them too.
+/// from filesystem, SQLite and archive errors, so it can carry absolute paths
+/// and entry names from a remote archive, and a report shared outside the
+/// machine carries them too.
 pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
     const MAX_CHARS: usize = 2048;
 

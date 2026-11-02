@@ -1429,7 +1429,8 @@ pub(crate) fn run_nvcc_for(
             let restore_start = std::time::Instant::now();
             if let Err(e) = restore_nvcc_from_cache(hit_store, &parsed, &meta) {
                 tracing::warn!(
-                    "restoring nvcc cache hit for {crate_name} failed: {e:#} — recompiling"
+                    "restoring nvcc cache hit for {crate_name} failed: {} — recompiling",
+                    store_error_for_event(&e)
                 );
                 return nvcc_passthrough_with_event(
                     config,
@@ -1507,7 +1508,8 @@ pub(crate) fn run_nvcc_for(
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_nvcc_from_cache(&store, &parsed, &meta) {
             tracing::warn!(
-                "restoring nvcc coalesced hit for {crate_name} failed: {e:#} — recompiling"
+                "restoring nvcc coalesced hit for {crate_name} failed: {} — recompiling",
+                store_error_for_event(&e)
             );
             return nvcc_passthrough_with_event(
                 config,
@@ -1916,7 +1918,8 @@ fn nvcc_try_remote_hit(
     let restore_start = std::time::Instant::now();
     if let Err(e) = restore_nvcc_from_cache(store, parsed, &meta) {
         tracing::warn!(
-            "restoring nvcc remote cache hit for {crate_name} failed: {e:#} — recompiling"
+            "restoring nvcc remote cache hit for {crate_name} failed: {} — recompiling",
+            store_error_for_event(&e)
         );
         return Ok(Some(nvcc_passthrough_with_event(
             config,
@@ -2300,9 +2303,9 @@ fn run_cc_with_store(
                     return restored.map(|_| 0);
                 }
                 tracing::warn!(
-                    "restoring cc cache hit for {} failed: {:#} — recompiling",
+                    "restoring cc cache hit for {} failed: {} — recompiling",
                     crate_name,
-                    e
+                    store_error_for_event(e)
                 );
                 if !hit_store.is_read_only() {
                     return cc_passthrough_with_event(
@@ -2432,9 +2435,9 @@ fn run_cc_with_store(
                 return Err(e);
             }
             tracing::warn!(
-                "restoring cc coalesced hit for {} failed: {:#} — recompiling",
+                "restoring cc coalesced hit for {} failed: {} — recompiling",
                 crate_name,
-                e
+                store_error_for_event(&e)
             );
             return cc_passthrough_with_event(
                 config,
@@ -3461,9 +3464,9 @@ fn cc_try_remote_hit(
             return Err(e);
         }
         tracing::warn!(
-            "restoring cc remote cache hit for {} failed: {:#} — recompiling",
+            "restoring cc remote cache hit for {} failed: {} — recompiling",
             crate_name,
-            e
+            store_error_for_event(&e)
         );
         return Ok(Some(cc_passthrough_with_event(
             config,
@@ -4517,9 +4520,9 @@ fn run_parsed_rustc(
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "restoring local cache hit for {} failed: {:#} — recompiling",
+                            "restoring local cache hit for {} failed: {} — recompiling",
                             crate_name,
-                            e
+                            store_error_for_event(&e)
                         );
                         if !hit_store.is_read_only() {
                             return passthrough_with_event(
@@ -4557,9 +4560,9 @@ fn run_parsed_rustc(
         ) {
             if let Err(e) = restored {
                 tracing::warn!(
-                    "restoring cache hit for {} failed: {:#} — recompiling",
+                    "restoring cache hit for {} failed: {} — recompiling",
                     crate_name,
-                    e
+                    store_error_for_event(&e)
                 );
                 return passthrough_with_event(
                     config,
@@ -4739,9 +4742,9 @@ fn run_parsed_rustc(
             &key_record,
         ) {
             tracing::warn!(
-                "restoring cache hit for {} failed: {:#} — recompiling",
+                "restoring cache hit for {} failed: {} — recompiling",
                 crate_name,
-                e
+                store_error_for_event(&e)
             );
             return passthrough_with_event(
                 config,
@@ -9308,12 +9311,11 @@ pub(crate) fn log_event(config: &Config, inputs: EventInputs<'_>) {
 }
 
 /// Render a failed `Store::put`, or a failed restore through
-/// `restore_failure_reason`, for the event log and the report.
+/// `restore_failure_reason`, for logs and reports.
 ///
 /// `{:#}` keeps anyhow's whole context chain — the outer context alone
-/// ("creating blob shard directory") never names the cause. Two guards, because
-/// unlike the `WARN` this string is persisted and re-rendered inside JSON, a
-/// text table and a markdown table:
+/// ("creating blob shard directory") never names the cause. This string reaches
+/// diagnostic logs and is persisted and re-rendered in JSON and report tables:
 /// - control characters (a newline from a nested compiler error) become spaces,
 ///   so one failure cannot break the row it is printed in;
 /// - the result is capped, so a pathological error message cannot bloat every

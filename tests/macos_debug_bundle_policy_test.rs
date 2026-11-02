@@ -58,12 +58,17 @@ impl Project {
 
     /// `cargo build` through kache, then the package's events so far.
     fn build(&self) -> Vec<serde_json::Value> {
+        self.build_with_stderr().0
+    }
+
+    fn build_with_stderr(&self) -> (Vec<serde_json::Value>, String) {
         let output = hermetic_command(env!("CARGO"), &self.cache, Some(&self.config))
             .args(["build", "--offline"])
             .current_dir(&self.root)
             .env("RUSTC_WRAPPER", kache_binary())
             .env("CARGO_TARGET_DIR", &self.target)
             .env("CARGO_INCREMENTAL", "0")
+            .env("KACHE_LOG", "kache=warn")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
@@ -75,12 +80,13 @@ impl Project {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        fs::read_to_string(self.cache.join("events.jsonl"))
+        let events = fs::read_to_string(self.cache.join("events.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .filter(|event: &serde_json::Value| event["crate_name"] == "debug_bundle_policy")
-            .collect()
+            .collect();
+        (events, String::from_utf8_lossy(&output.stderr).into_owned())
     }
 
     fn stop_daemon(&self) {
@@ -158,7 +164,7 @@ fn a_bundle_that_fails_to_unpack_recompiles_and_records_the_cause() {
     fs::write(&staged, forged).unwrap();
     fs::rename(&staged, &blob).unwrap();
 
-    let events = project.build();
+    let (events, stderr) = project.build_with_stderr();
     let event = events.last().unwrap();
     assert_eq!(event["result"], "passthrough", "{events:?}");
     let reason = event["passthrough_reason"].as_str().unwrap();
@@ -166,6 +172,14 @@ fn a_bundle_that_fails_to_unpack_recompiles_and_records_the_cause() {
         reason,
         "restore failed: rustc restore: applying UnpackDebugBundle: \
          debug bundle entry is a link (rejected): Contents forged row"
+    );
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("restoring local cache hit for debug_bundle_policy failed:"))
+        .unwrap_or_else(|| panic!("restore warning missing: {stderr}"));
+    assert!(
+        warning.contains("Contents forged row — recompiling"),
+        "restore warning contains an unflattened archive name: {stderr}"
     );
     project.stop_daemon();
 }

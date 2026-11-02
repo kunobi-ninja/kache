@@ -8976,10 +8976,10 @@ fn store_error_for_event_keeps_the_chain_but_bounds_the_shape() {
     );
 
     // A newline would break the report row this string is printed inside.
-    let multiline = anyhow::anyhow!("line one\nline two\r\tline three");
+    let multiline = anyhow::anyhow!("line one\nline two\r\tline three\x1b[31m\x07\u{0085}");
     let flattened = store_error_for_event(&multiline);
     assert!(!flattened.contains('\n') && !flattened.contains('\r'));
-    assert_eq!(flattened, "line one line two  line three");
+    assert_eq!(flattened, "line one line two  line three [31m  ");
 
     // And it cannot grow without bound: this reason is persisted on every
     // failing compile.
@@ -8989,6 +8989,17 @@ fn store_error_for_event_keeps_the_chain_but_bounds_the_shape() {
     assert_eq!(
         capped.chars().count(),
         2048 + "… [truncated]".chars().count()
+    );
+
+    // The boundary is measured in Unicode characters, without splitting UTF-8.
+    let boundary = "🦀".repeat(2048);
+    assert_eq!(
+        store_error_for_event(&anyhow::anyhow!(boundary.clone())),
+        boundary
+    );
+    assert_eq!(
+        store_error_for_event(&anyhow::anyhow!(format!("{boundary}x"))),
+        format!("{boundary}… [truncated]")
     );
 }
 

@@ -2811,6 +2811,28 @@ fn test_parse_cargo_lock_crate_names_from_valid_missing_and_bad_files() {
 
 #[test]
 fn test_is_macos_protected() {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("KACHE_TEST_MACOS_PROTECTED_CHILD").is_none() {
+        // The prefix cache captures HOME once. Other tests temporarily change
+        // HOME, so check it in a fresh process with a fixed home directory.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::test_is_macos_protected",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_MACOS_PROTECTED_CHILD", "1")
+            .env("HOME", "/Users/kache-protected-test")
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "{output:?}"
+        );
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+
     // On non-macOS the stub always returns false — verify that invariant
     // and skip the positive-match assertions.
     if !cfg!(target_os = "macos") {

@@ -1330,7 +1330,8 @@ mod tests {
             matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
             "with_activity must hold the lock while its closure runs"
         );
-        std::fs::write(root.join("blocked"), b"blocked").unwrap();
+        // The parent reads as soon as this path exists, so publish complete bytes.
+        write_atomic(&root.join("blocked"), b"blocked").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !root.join("release").is_file() {
             assert!(

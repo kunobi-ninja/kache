@@ -81,6 +81,10 @@ const ACTION_SUFFIX: &str = ".kache-real.action";
 /// listing the directory.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const LAUNCH_RECORD: &str = ".kache-launch";
+/// Beside the launcher: held while one install runs, so two wrappers that
+/// restore the same build script at once install its launcher one at a time.
+#[cfg(unix)]
+const INSTALL_LOCK: &str = ".kache-launch.lock";
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const SHIM_DIR: &str = ".kache-build-script-shims";
 /// The launcher binary for this target, built from `launcher/build_script.rs`.
@@ -173,6 +177,12 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
+    let _guard = executable.parent().and_then(lock_unit_directory);
+    // An earlier install already put the launcher here and preserved the
+    // script. Preserving the launcher in its place would lose the script.
+    if is_launcher(executable) {
+        return Ok(());
+    }
     let metadata = std::fs::metadata(executable)?;
     let modified = metadata.modified()?;
     let real = with_suffix(executable, REAL_SUFFIX);
@@ -198,7 +208,6 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
         .strip_prefix(profile)
         .context("pinned kache is outside the profile directory")?;
 
-    let _ = std::fs::remove_file(&real);
     std::fs::rename(executable, &real).context("preserving the build script")?;
     let installed = (|| -> Result<()> {
         std::fs::write(&action, &binary_hash)?;
@@ -235,6 +244,36 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Locks the build-script directory for one install. `None` when the
+/// filesystem cannot lock: the launcher checks in [`install`] and
+/// [`find_real`] still keep the launcher from standing in for the script.
+#[cfg(unix)]
+fn lock_unit_directory(directory: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join(INSTALL_LOCK))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
+/// Whether `path` holds this kache's launcher. The length is checked first,
+/// so a build script, usually far larger, is never read.
+fn is_launcher(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == LAUNCHER.len() as u64)
+            && std::fs::read(path).is_ok_and(|bytes| bytes == LAUNCHER)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 #[cfg(not(unix))]
@@ -392,7 +431,23 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// The preserved binary for the path Cargo invoked. Before 1.100 Cargo runs
 /// the un-hashed `build-script-build` hardlink and the wrapper preserved the
 /// hashed original; from 1.100 it runs the compiled binary itself.
+///
+/// Never a launcher: a launcher preserved as the script, or started as a
+/// preserved script, would start kache again for the same path, without end
+/// (kunobi-ninja/kache#1808).
 fn find_real(invoked: &Path) -> Option<PathBuf> {
+    if invoked
+        .as_os_str()
+        .as_encoded_bytes()
+        .ends_with(REAL_SUFFIX.as_bytes())
+    {
+        return None;
+    }
+    find_preserved(invoked).filter(|real| !is_launcher(real))
+}
+
+/// Any preserved binary beside `invoked`, launcher or not.
+fn find_preserved(invoked: &Path) -> Option<PathBuf> {
     let direct = with_suffix(invoked, REAL_SUFFIX);
     if direct.is_file() {
         return Some(direct);
@@ -424,7 +479,7 @@ pub fn run_shim() -> i32 {
     };
     let Some(real) = find_real(&invoked) else {
         eprintln!(
-            "kache: the preserved build script beside {} is missing; run `cargo clean`",
+            "kache: the preserved build script beside {} is missing or invalid; run `cargo clean`",
             invoked.display()
         );
         return 1;
@@ -6308,6 +6363,169 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "real\n");
+    }
+
+    /// The state two overlapping installs left behind in kunobi-ninja/kache#1808:
+    /// the launcher preserved as the script. kache must not run it, from the
+    /// compiled binary's path or from Cargo's `build-script-build` hardlink.
+    #[cfg(unix)]
+    #[test]
+    fn find_real_never_returns_a_launcher_preserved_as_the_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+        install(&executable).unwrap();
+        let real = with_suffix(&executable, REAL_SUFFIX);
+        let hardlink = unit.join("build-script-build");
+        std::fs::hard_link(&executable, &hardlink).unwrap();
+        assert_eq!(find_real(&executable), Some(real.clone()));
+        assert_eq!(find_real(&hardlink), Some(real.clone()));
+
+        std::fs::remove_file(&real).unwrap();
+        std::fs::write(&real, LAUNCHER).unwrap();
+        assert_eq!(find_real(&executable), None);
+        assert_eq!(find_real(&hardlink), None);
+    }
+
+    /// A launcher Cargo started through a preserved script's name, even one
+    /// whose bytes are not this kache's launcher, names no script to run.
+    #[cfg(unix)]
+    #[test]
+    fn find_real_refuses_a_path_that_is_itself_a_preserved_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let invoked = dir.path().join("build_script_build-1.kache-real");
+        kache_fs::testutil::write_executable(&invoked, "#!/bin/sh\necho real\n");
+        assert_eq!(find_real(&invoked), None);
+        // The scan alone would accept it: it is the one preserved script here.
+        assert_eq!(find_preserved(&invoked), Some(invoked.clone()));
+    }
+
+    /// The second of two installs for one build script finds the launcher
+    /// and keeps the script the first one preserved.
+    #[cfg(unix)]
+    #[test]
+    fn installing_the_launcher_twice_keeps_the_preserved_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+        install(&executable).unwrap();
+        install(&executable).unwrap();
+
+        let real = with_suffix(&executable, REAL_SUFFIX);
+        assert!(
+            !is_launcher(&real),
+            "the launcher was preserved as the script"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&real).unwrap()),
+            "#!/bin/sh\necho real\n"
+        );
+        assert!(is_launcher(&executable), "the launcher stays in place");
+        assert_eq!(find_real(&executable), Some(real.clone()));
+        assert_eq!(
+            stored_binary_hash(&real).unwrap(),
+            kache_store::file_hash::hash_file(&real).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_launcher_compares_length_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("launcher");
+        std::fs::write(&launcher, LAUNCHER).unwrap();
+        assert!(is_launcher(&launcher));
+
+        let script = dir.path().join("script");
+        kache_fs::testutil::write_executable(&script, "#!/bin/sh\necho real\n");
+        assert_ne!(
+            std::fs::metadata(&script).unwrap().len(),
+            LAUNCHER.len() as u64
+        );
+        assert!(!is_launcher(&script));
+
+        // Same length, different bytes.
+        let mut bytes = LAUNCHER.to_vec();
+        bytes[0] ^= 0xff;
+        let same_length = dir.path().join("same-length");
+        std::fs::write(&same_length, &bytes).unwrap();
+        assert!(!is_launcher(&same_length));
+
+        assert!(!is_launcher(&dir.path().join("missing")));
+    }
+
+    /// Two wrappers that restored the same build script install its launcher
+    /// at the same moment, as in kunobi-ninja/kache#1808. Whichever goes
+    /// second, the script stays preserved.
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_installs_keep_the_preserved_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        let real = with_suffix(&executable, REAL_SUFFIX);
+        for round in 0..50 {
+            // Both restores land before either install.
+            let _ = std::fs::remove_file(&executable);
+            kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<String> = std::thread::scope(|scope| {
+                let installs: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            install(&executable).map_err(|error| format!("{error:#}"))
+                        })
+                    })
+                    .collect();
+                installs
+                    .into_iter()
+                    .filter_map(|install| install.join().unwrap().err())
+                    .collect()
+            });
+            assert_eq!(results, Vec::<String>::new(), "round {round}");
+            assert_eq!(
+                std::fs::read_to_string(&real).ok().as_deref(),
+                Some("#!/bin/sh\necho real\n"),
+                "round {round}"
+            );
+        }
+    }
+
+    /// While one install holds the directory's lock, another open of the lock
+    /// file cannot take it; once the first lets go, it can.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_lock_excludes_a_second_holder_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_unit_directory(dir.path()).expect("the directory locks");
+        let other = std::fs::File::open(dir.path().join(INSTALL_LOCK)).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        // A child another test thread forks keeps the lock's file description
+        // until it execs, so the lock can outlive `held` for a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match other.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the lock was never released"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
     }
 
     /// Cargo spells a `links` dependency's metadata keys as the script printed

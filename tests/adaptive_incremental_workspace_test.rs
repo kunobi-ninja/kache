@@ -285,10 +285,10 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     );
 }
 
-/// Cargo gives a path package that also builds a `staticlib` or `cdylib` no
-/// extra filename, so its outputs keep stable names. Such a crate between an
-/// edited library and the app still seeds and then compiles on the active
-/// lane, instead of compiling without incremental state after every edit.
+/// The middle crate also builds a `staticlib` and `cdylib`, so Cargo gives it
+/// no extra filename. Edits to the library below it still put it in adaptive
+/// incremental mode: the first rebuild seeds its incremental state, and later
+/// rebuilds reuse it.
 #[test]
 fn an_unselected_cdylib_crate_seeds_then_stays_active() {
     let checkout = tempfile::tempdir().unwrap();

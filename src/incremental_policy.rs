@@ -233,7 +233,7 @@ impl AdaptiveUnit {
     /// plus `<profile>/incremental`, both absolute. A build script is not:
     /// Cargo gives it no extra filename, so it has no unit id. A path package
     /// that builds a `cdylib`, `dylib` or `staticlib` has no extra filename
-    /// either, and is identified by its `-C metadata` hash instead.
+    /// either, but it is identified by its `-C metadata` hash instead.
     pub(crate) fn eligible(args: &RustcArgs, policy_guard: &[u8]) -> Option<Self> {
         if !args.is_primary {
             return None;
@@ -1014,12 +1014,12 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
     }
 }
 
-/// Unit id for a path package whose outputs Cargo names without a hash.
+/// Unit id for a path package that builds a `cdylib`, `dylib` or `staticlib`.
 ///
-/// Cargo omits `-C extra-filename` for a package that builds a `cdylib`,
-/// `dylib` or `staticlib`, so its library keeps a stable file name, but it
-/// still passes `-C metadata`. A build script also has no extra filename, but
-/// it builds a `bin`, so it gets no id here and stays ineligible.
+/// Cargo gives these packages no `-C extra-filename`. Adaptive incremental mode
+/// ([`AdaptiveUnit::eligible`]) only needs a stable id for the unit, so their
+/// `-C metadata` hash is used instead. Build scripts have no extra filename
+/// either, but they build a `bin` and stay out of adaptive incremental mode.
 fn unhashed_library_id(args: &RustcArgs) -> Option<String> {
     if !args.has_crate_type(|kind| matches!(kind, "cdylib" | "dylib" | "staticlib")) {
         return None;
@@ -2002,7 +2002,7 @@ mod tests {
                 b""
             )
             .is_none(),
-            "the metadata fallback is validated like an extra filename"
+            "a non-hex -C metadata is rejected, like a non-hex extra filename"
         );
         assert!(
             AdaptiveUnit::eligible(
@@ -2010,7 +2010,7 @@ mod tests {
                 b""
             )
             .is_none(),
-            "a build script stays ineligible even with -C metadata"
+            "a build script stays out of adaptive incremental mode, even with -C metadata"
         );
         assert!(
             AdaptiveUnit::eligible(&argv("sample", &["--crate-type", "lib", metadata]), b"")

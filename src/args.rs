@@ -1206,7 +1206,7 @@ impl RustcArgs {
         self.emits_link() && self.has_crate_type(|kind| kind == "lib" || kind == "rlib")
     }
 
-    fn has_crate_type(&self, matches: impl Fn(&str) -> bool) -> bool {
+    pub(crate) fn has_crate_type(&self, matches: impl Fn(&str) -> bool) -> bool {
         self.crate_types
             .iter()
             .flat_map(|kinds| kinds.split(','))

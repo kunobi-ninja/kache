@@ -30,8 +30,6 @@ jobs:
       RUSTC_WRAPPER: ""
       RUSTC_WORKSPACE_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/receipt-diagnostic-target
-      EVIDENCE_DIR: ${{ runner.temp }}/receipt-diagnostic-evidence
       SOURCE_HEAD: cc05ff7f3b9147cb27846b7ebf74eec48ff587e3
       SOURCE_TREE: 8120ef3673fb35081ff2582823ffdb9b59524ad0
     steps:
@@ -44,6 +42,10 @@ jobs:
           set -euo pipefail
           test "$RUNNER_KIND" = github-hosted
           test "$HOST_OS" = Linux
+          {
+            printf 'CARGO_TARGET_DIR=%s/receipt-diagnostic-target\n' "$RUNNER_TEMP"
+            printf 'EVIDENCE_DIR=%s/receipt-diagnostic-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
       - name: Check out the maintainer validation helper
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:

@@ -23,9 +23,10 @@ moving shared settings into a project file.
 
 ## What the shim routes
 
-The Cargo shim checks for Blaze's `ra-jit` executable on PATH once per eligible
-Cargo command. Installing Blaze after init needs no new init. Routing supports
-Linux and Apple silicon macOS.
+The Cargo shim checks for Blaze's `blaze-engine` executable on PATH once per
+eligible Cargo command, falling back to `ra-jit` for older installations.
+Installing Blaze after init needs no new init. Routing supports Linux and Apple
+silicon macOS.
 
 Local default-profile `build`, `run`, `test`, and `check` commands, including
 their standard short aliases, can use Blaze. Kache leaves these commands on

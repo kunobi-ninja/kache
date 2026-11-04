@@ -174,8 +174,9 @@ kache config set --project cache.blaze true
 cargo build
 ```
 
-The shim checks for `ra-jit` on each eligible command, so installing Blaze later
-needs no new `init`. Routing supports Linux and Apple silicon macOS. Local
+The shim checks for `blaze-engine` (or legacy `ra-jit`) on each eligible command,
+so installing Blaze later needs no new `init`. Routing supports Linux and Apple
+silicon macOS. Local
 `build`, `run`, `test` and `check` commands can use Blaze. CI, release builds,
 explicit profiles, `+toolchain` invocations and leading global options use Cargo.
 

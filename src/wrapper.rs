@@ -9354,7 +9354,8 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
     let _trace = crate::phase_trace::phase("event_log");
-    if events::log_event_for_build(&config.event_log_path(), event).is_err() {
+    if let Err(error) = events::log_event_for_build(&config.event_log_path(), event) {
+        tracing::debug!(crate_name = %event.crate_name, "could not record compiler event: {error:#}");
         return;
     }
     let _ = events::rotate_events_if_needed(

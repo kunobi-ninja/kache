@@ -91,7 +91,7 @@ jobs:
         with:
           version: 2026.6.9
           install: true
-          install_args: rust just
+          install_args: rust github:casey/just
           cache: false
       - name: Run repository checks
         run: |

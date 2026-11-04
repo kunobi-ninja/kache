@@ -956,7 +956,9 @@ impl ReceiptAcceptance {
             .unwrap();
         assert!(
             output.status.success(),
-            "{args:?}: {}",
+            "{args:?}: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         output
@@ -988,12 +990,73 @@ impl ReceiptAcceptance {
         receipts.into_iter().next().unwrap()
     }
 
-    fn clean(&self, flags: &[&str], environment: &str) -> Value {
+    fn receipt_diagnostics(&self) -> Value {
+        let receipts = match std::fs::read_dir(self.cache.join("target-liveness")) {
+            Ok(entries) => entries
+                .map(|entry| {
+                    let path = match entry {
+                        Ok(entry) => entry.path(),
+                        Err(error) => return serde_json::json!({"error": error.to_string()}),
+                    };
+                    let receipt = std::fs::read(&path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<Value>(&bytes)
+                                .map_err(|error| error.to_string())
+                        });
+                    match receipt {
+                        Ok(receipt) => serde_json::json!({
+                            "path": path,
+                            "schema": receipt["schema"],
+                            "target": receipt["target"],
+                            "workspace": receipt["workspace"],
+                            "recorded": receipt["recorded"],
+                            "command": receipt["command"],
+                            "units": receipt["units"],
+                        }),
+                        Err(error) => serde_json::json!({"path": path, "error": error}),
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => vec![serde_json::json!({"error": error.to_string()})],
+        };
+        let profiles = ["debug", "release"].map(|profile| {
+            let path = self.target.join(profile);
+            let fingerprints = match std::fs::read_dir(path.join(".fingerprint")) {
+                Ok(entries) => entries
+                    .map(|entry| format!("{:?}", entry.map(|entry| entry.path())))
+                    .collect::<Vec<_>>(),
+                Err(error) => vec![error.to_string()],
+            };
+            serde_json::json!({
+                "path": path,
+                "metadata": format!("{:?}", std::fs::metadata(&path)),
+                "fingerprints": fingerprints,
+            })
+        });
+        serde_json::json!({"receipts": receipts, "profiles": profiles})
+    }
+
+    fn clean_with_output(&self, flags: &[&str], environment: &str) -> (Output, Value) {
         let args: Vec<_> = ["clean", "--units"]
             .into_iter()
             .chain(flags.iter().copied())
             .collect();
-        serde_json::from_slice(&self.run(&args, true, environment).stdout).unwrap()
+        let output = self.run(&args, true, environment);
+        let parsed = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "cannot parse clean output: {error}\nstatus: {}\nstdout:\n{}\nstderr:\n{}\nfixture: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                self.receipt_diagnostics(),
+            )
+        });
+        (output, parsed)
+    }
+
+    fn clean(&self, flags: &[&str], environment: &str) -> Value {
+        self.clean_with_output(flags, environment).1
     }
 }
 
@@ -1349,7 +1412,7 @@ fn receipt_cleanup_tracks_default_build_script_inputs_outside_the_workspace() {
 #[test]
 fn receipt_cleanup_preserves_units_in_unobserved_profiles() {
     let fixture = ReceiptAcceptance::new();
-    fixture.run(
+    let release_output = fixture.run(
         &[
             "cargo",
             "--",
@@ -1363,15 +1426,41 @@ fn receipt_cleanup_preserves_units_in_unobserved_profiles() {
         "alpha",
     );
     fixture.capture();
+    let diagnostics = |output: &Output, parsed: Option<&Value>| {
+        let parsed = parsed.map_or_else(|| "not parsed".to_string(), Value::to_string);
+        format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}\nparsed output: {parsed}\nfixture: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fixture.receipt_diagnostics(),
+        )
+    };
     let before = receipt_target_files(&fixture.target.join("release"));
-    assert!(!before.is_empty());
-    let preview = fixture.clean(&["--json"], "alpha");
-    assert!(preview["targets"][0]["plan"]["unknown"].as_u64().unwrap() > 0);
-    let cleaned = fixture.clean(&["--json", "--yes"], "alpha");
-    assert!(cleaned["targets"][0]["removed"]["units"].as_u64().unwrap() > 0);
+    assert!(!before.is_empty(), "{}", diagnostics(&release_output, None));
+    let (preview_output, preview) = fixture.clean_with_output(&["--json"], "alpha");
+    assert!(
+        preview["targets"][0]["plan"]["unknown"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{}", diagnostics(&preview_output, Some(&preview))))
+            > 0,
+        "{}",
+        diagnostics(&preview_output, Some(&preview)),
+    );
+    let (cleaned_output, cleaned) = fixture.clean_with_output(&["--json", "--yes"], "alpha");
+    assert!(
+        cleaned["targets"][0]["removed"]["units"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{}", diagnostics(&cleaned_output, Some(&cleaned))))
+            > 0,
+        "{}",
+        diagnostics(&cleaned_output, Some(&cleaned)),
+    );
     assert_eq!(
         receipt_target_files(&fixture.target.join("release")),
-        before
+        before,
+        "preview: {preview}\n{}",
+        diagnostics(&cleaned_output, Some(&cleaned)),
     );
 }
 

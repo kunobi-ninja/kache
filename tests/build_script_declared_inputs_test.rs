@@ -148,19 +148,21 @@ pub fn listing(_input: TokenStream) -> TokenStream {
 /// Builds `workspace` into `target` and returns the newest event of each of
 /// [`UNITS`] this build wrote.
 fn build(
+    stage: &str,
     workspace: &Path,
     target: &Path,
     cache: &Path,
     mode: Option<&str>,
 ) -> BTreeMap<String, Value> {
     let env: Vec<(&str, &str)> = mode.map(|mode| ("APP_MODE", mode)).into_iter().collect();
-    build_units(workspace, target, cache, &UNITS, &env)
+    build_units(stage, workspace, target, cache, &UNITS, &env)
 }
 
 /// Builds `workspace` into `target` with `env` set and `APP_MODE` unset
 /// unless `env` sets it, and returns the newest event of each of `units`
 /// this build wrote.
 fn build_units(
+    stage: &str,
     workspace: &Path,
     target: &Path,
     cache: &Path,
@@ -177,6 +179,7 @@ fn build_units(
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_CACHE_EXECUTABLES", "1")
+        .env("KACHE_LOG", "kache=debug")
         .env_remove("APP_MODE")
         .env_remove("KACHE_BASE_DIR")
         .env_remove("KACHE_DISABLED")
@@ -193,13 +196,30 @@ fn build_units(
         String::from_utf8_lossy(&output.stderr)
     );
     let mut latest = BTreeMap::new();
-    for line in std::fs::read_to_string(log).unwrap()[before..].lines() {
+    let raw = std::fs::read_to_string(&log).unwrap();
+    for line in raw[before..].lines() {
         let event: Value = serde_json::from_str(line).unwrap();
         if let Some(name) = event["crate_name"].as_str()
             && units.contains(&name)
         {
             latest.insert(name.to_string(), event);
         }
+    }
+    let missing: Vec<_> = units
+        .iter()
+        .filter(|name| !latest.contains_key(**name))
+        .collect();
+    if !missing.is_empty() {
+        let tail_start = raw.len().saturating_sub(16 * 1024);
+        eprintln!(
+            "stage={stage} workspace={} target={} mode={env:?} missing={missing:?}\n\
+             stdout:\n{}\nstderr:\n{}\nevent tail (up to 16 KiB):\n{}",
+            workspace.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&raw.as_bytes()[tail_start..]),
+        );
     }
     latest
 }
@@ -265,17 +285,17 @@ fn declared_inputs_of_a_packages_build_script_key_its_units() {
     workspace(&checkout);
     let target = root.join("target");
 
-    let cold = build(&checkout, &target, &cache, None);
+    let cold = build("cold", &checkout, &target, &cache, None);
     assert_eq!(
         outputs(&target),
         ["v1:unset", "v1:unset", "v1:unset", "a.txt"].map(String::from)
     );
 
     // Another target directory and another checkout find the same keys.
-    let elsewhere = build(&checkout, &root.join("target2"), &cache, None);
+    let elsewhere = build("elsewhere", &checkout, &root.join("target2"), &cache, None);
     let moved = root.join("moved");
     copy_tree(&checkout, &moved);
-    let relocated = build(&moved, &root.join("target3"), &cache, None);
+    let relocated = build("relocated", &moved, &root.join("target3"), &cache, None);
     for unit in UNITS {
         assert_eq!(key(&elsewhere, unit), key(&cold, unit), "{unit}");
         assert_eq!(result(&elsewhere, unit), "local_hit", "{unit}");
@@ -288,7 +308,7 @@ fn declared_inputs_of_a_packages_build_script_key_its_units() {
         edit(&checkout.join(package).join("data/value.txt"), "v2\n");
     }
     edit(&checkout.join("app4/assets/b.txt"), "b");
-    let edited = build(&checkout, &target, &cache, None);
+    let edited = build("edited", &checkout, &target, &cache, None);
     assert_eq!(
         outputs(&target),
         ["v2:unset", "v2:unset", "v2:unset", "a.txt,b.txt"].map(String::from),
@@ -300,13 +320,13 @@ fn declared_inputs_of_a_packages_build_script_key_its_units() {
     }
 
     // A declared variable changes, then goes back.
-    let set = build(&checkout, &target, &cache, Some("x"));
+    let set = build("set", &checkout, &target, &cache, Some("x"));
     assert_eq!(&outputs(&target)[..2], ["v2:x", "v2:x"]);
     for unit in ["app", "app_cli", "app2"] {
         assert_ne!(key(&set, unit), key(&edited, unit), "{unit}");
         assert_eq!(result(&set, unit), "miss", "{unit}");
     }
-    let unset = build(&checkout, &target, &cache, None);
+    let unset = build("unset", &checkout, &target, &cache, None);
     assert_eq!(&outputs(&target)[..2], ["v2:unset", "v2:unset"]);
     for unit in ["app", "app_cli", "app2"] {
         assert_eq!(key(&unset, unit), key(&edited, unit), "{unit}");
@@ -317,7 +337,7 @@ fn declared_inputs_of_a_packages_build_script_key_its_units() {
     for package in ["app", "app2", "app3"] {
         edit(&checkout.join(package).join("data/value.txt"), "v2\n");
     }
-    let touched = build(&checkout, &target, &cache, None);
+    let touched = build("touched", &checkout, &target, &cache, None);
     for unit in ["app", "app_cli", "app2", "app3"] {
         assert_eq!(key(&touched, unit), key(&edited, unit), "{unit}");
         assert_eq!(result(&touched, unit), "local_hit", "{unit}");
@@ -373,7 +393,7 @@ pub fn rewrite(_input: TokenStream) -> TokenStream {
 
     // A fresh cache compiles before the key and keys from what the compile
     // wrote, with the inputs resolved before it.
-    let first = build_units(&checkout, &target, &cache, &["live"], &[]);
+    let first = build_units("first", &checkout, &target, &cache, &["live"], &[]);
     assert_eq!(result(&first, "live"), "skipped", "{}", first["live"]);
     assert_eq!(
         first["live"]["skip_reason"], "build-script-inputs-changed",
@@ -385,6 +405,7 @@ pub fn rewrite(_input: TokenStream) -> TokenStream {
     for deferred in ["1", "0"] {
         edit(&value, "v1\n");
         let again = build_units(
+            deferred,
             &checkout,
             &target,
             &cache,

@@ -48,6 +48,8 @@ fn server_pid(port: u16) -> Option<i32> {
     command.args([
         "-nP",
         "-a",
+        "-c",
+        "sccache",
         "-i",
         &format!("TCP@127.0.0.1:{port}"),
         "-sTCP:LISTEN",

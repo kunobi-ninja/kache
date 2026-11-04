@@ -148,6 +148,27 @@ fn installing_blaze_after_setup_is_detected_and_returning_cargo_never_loops() {
 }
 
 #[test]
+fn renamed_engine_is_used_without_a_legacy_alias_and_preferred_when_both_exist() {
+    for legacy_installed in [false, true] {
+        let f = Fixture::new();
+        f.engine();
+        fs::rename(f.tools.join("ra-jit"), f.tools.join("blaze-engine")).unwrap();
+        if legacy_installed {
+            script(&f.tools.join("ra-jit"), "#!/bin/sh\nexit 97\n");
+        }
+        success(&f.run(&["test", "--lib", "--", "--nocapture"]));
+        assert_eq!(
+            fs::read_to_string(f.root.path().join("blaze.log")).unwrap(),
+            "engine\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.path().join("cargo.log")).unwrap(),
+            "test --lib -- --nocapture\n"
+        );
+    }
+}
+
+#[test]
 fn ordinary_cargo_keeps_explicit_profiles_ci_and_disabled_projects() {
     let f = Fixture::new();
     f.engine();
@@ -249,7 +270,7 @@ fn a_workspace_wrapper_can_report_success_without_rewriting_existing_outputs() {
     let rlib = out.join("libexample.rlib");
     fs::write(&rlib, "existing artifact").unwrap();
     fs::set_permissions(&rlib, fs::Permissions::from_mode(0o444)).unwrap();
-    for name in ["ra-jit-rustc", "ra-jit-rustc-first"] {
+    for name in ["blaze-rustc", "ra-jit-rustc", "ra-jit-rustc-first"] {
         let wrapper = f.tools.join(name);
         script(
             &wrapper,

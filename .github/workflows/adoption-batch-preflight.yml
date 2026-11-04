@@ -81,7 +81,7 @@ jobs:
           install: true
           install_args: rust github:taiki-e/cargo-llvm-cov
           cache: false
-      - name: Compare three parallel suites and five isolated receipts
+      - name: Complete the five isolated receipt controls
         run: |
           set -euo pipefail
           printf 'phase\ttrial\texit\n' > "$EVIDENCE_DIR/exits.tsv"
@@ -109,12 +109,11 @@ jobs:
               fi
             fi
           }
-          for trial in 1 2 3; do
-            run_trial parallel "$trial" -- --nocapture
-          done
+          # Run 41888141747 already passed all three parallel suites (26/26 each).
+          # Its isolated commands failed argument parsing before any test ran.
           for trial in 1 2 3 4 5; do
-            run_trial isolated "$trial" receipt_cleanup_preserves_units_in_unobserved_profiles \
-              -- --exact --nocapture --test-threads=1
+            run_trial isolated "$trial" -- receipt_cleanup_preserves_units_in_unobserved_profiles \
+              --exact --nocapture --test-threads=1
           done
           exit "$failed"
       - name: Verify the candidate was not changed

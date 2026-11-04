@@ -1970,8 +1970,31 @@ async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() 
         .name(kache_ipc::socket_name(&socket).unwrap())
         .create_tokio()
         .unwrap();
+    // Start the protocol deadline after the blocking worker and SQLite are
+    // ready, so slow fixture preparation cannot expire the mock's listener.
+    let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let invocation = InvocationEnv::from_parts(
+        Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let client = tokio::task::spawn_blocking(move || {
+        let hasher = FileHasher::persistent(&root.join("index.db"))
+            .with_invocation_env(&invocation)
+            .with_daemon(socket);
+        prepared_tx.send(()).expect("prepare file-hash client");
+        start_rx.recv().expect("start file-hash request");
+        hasher.prefetch(&[small.as_path(), large.as_path()]);
+        let prefetched = hasher.prefetched.borrow().len();
+        let hash = hasher.hash(&large).unwrap();
+        (hash, prefetched, hasher.stats())
+    });
+    prepared_rx.await.expect("prepare file-hash client");
     let server = tokio::spawn(async move {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            start_tx.send(()).expect("release file-hash client");
             let stream = listener.accept().await.unwrap();
             let mut reader = tokio::io::BufReader::new(&stream);
             let mut line = String::new();
@@ -1987,23 +2010,7 @@ async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() 
         .await
         .expect("file-hash prefetch did not complete its request");
     });
-    let invocation = InvocationEnv::from_parts(
-        Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
-        Some(root.clone()),
-        None,
-        root.clone(),
-    );
-    let client = tokio::task::spawn_blocking(move || {
-        let hasher = FileHasher::persistent(&root.join("index.db"))
-            .with_invocation_env(&invocation)
-            .with_daemon(socket);
-        hasher.prefetch(&[small.as_path(), large.as_path()]);
-        let prefetched = hasher.prefetched.borrow().len();
-        let hash = hasher.hash(&large).unwrap();
-        (hash, prefetched, hasher.stats())
-    })
-    .await
-    .unwrap();
+    let client = client.await.unwrap();
     server.await.unwrap();
     assert_eq!(client.0, expected);
     assert_eq!(client.1, 1);

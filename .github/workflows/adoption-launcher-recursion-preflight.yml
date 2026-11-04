@@ -43,8 +43,8 @@ jobs:
       RUSTC_WRAPPER: ""
       RUSTC_WORKSPACE_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: aa1a9a04805684f72f4ed10fbd2b2cf7dbfc1f7e
-      SOURCE_TREE: 3d1b6548e06eb80a7b0b34a7300c1378074906d7
+      SOURCE_HEAD: 6076f2572077fddb9a793e7a63f0f32bbb7c5014
+      SOURCE_TREE: e7d083acfba03c889d47984260cfe284a79bba5c
     steps:
       - name: Require a disposable hosted runner
         working-directory: ${{ github.workspace }}
@@ -109,6 +109,7 @@ jobs:
           set -euo pipefail
           cargo test --locked -p kache --lib build_script::tests:: 2>&1 | tee "$EVIDENCE_DIR/macos-build-scripts.log"
           cargo test --locked -p kache --lib wrapper::tests::build_script_store_inputs_are_frozen_before_another_install_replaces_them -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/macos-publication.log"
+          cargo test --locked --test launcher_personality_test 2>&1 | tee "$EVIDENCE_DIR/macos-launcher-personality.log"
       - name: Verify that the candidate was restored
         if: always()
         run: git diff --exit-code

@@ -14,14 +14,25 @@ concurrency:
 
 jobs:
   check:
-    name: Prepare PR 1819 (just check)
+    name: Prepare PR 1819 (${{ matrix.platform }})
     if: >-
       github.repository == 'kunobi-ninja/kache' &&
       !github.event.repository.private &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/review-contribution/preflight-1819-blaze'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-latest
+            install_args: rust github:casey/just
+          - platform: macOS
+            runner: macos-latest
+            install_args: rust
     defaults:
       run:
         shell: bash
@@ -58,6 +69,7 @@ jobs:
       - name: Verify source and record provenance
         env:
           RUNNER_KIND: ${{ runner.environment }}
+          RUNNER_ARCHITECTURE: ${{ runner.arch }}
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -69,6 +81,7 @@ jobs:
             printf 'source_tree=%s\n' "$SOURCE_TREE"
             printf 'runner_environment=%s\n' "$RUNNER_KIND"
             printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCHITECTURE"
             printf 'run_id=%s\n' "$GITHUB_RUN_ID"
             printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
           } | tee "$EVIDENCE_DIR/provenance.txt"
@@ -77,17 +90,27 @@ jobs:
         with:
           version: 2026.6.9
           install: true
-          install_args: rust github:casey/just
+          install_args: ${{ matrix.install_args }}
           cache: false
       - name: Run repository checks
+        if: matrix.platform == 'Linux'
         run: |
           set -euo pipefail
           just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
       - name: Check documentation routes and source parity
+        if: matrix.platform == 'Linux'
         run: |
           set -euo pipefail
           bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
           python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-tests.log"
+      - name: Check native macOS fallback and supported Blaze routing
+        if: matrix.platform == 'macOS'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --test fallback_recovery_test sandbox_preflight_bypasses_denied_server_but_keeps_allowed_server -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/macos-fallback.log"
+          if [ "$(uname -m)" = arm64 ]; then
+            cargo test --locked -p kache --test blaze_test -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/macos-blaze.log"
+          fi
       - name: Verify the candidate was not changed
         if: always()
         run: git diff --exit-code
@@ -95,7 +118,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: adoption-1819-${{ github.run_id }}-${{ github.run_attempt }}
+          name: adoption-1819-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE_DIR }}
           retention-days: 7
           if-no-files-found: error

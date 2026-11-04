@@ -1,25 +1,25 @@
-name: Receipt cleanup diagnostic preflight (1817)
+name: Declared input event diagnostic preflight (1819)
 
 on:
   push:
-    branches: [review-contribution/preflight-1817-receipt]
+    branches: [review-contribution/preflight-1819-events]
     paths: [.github/workflows/adoption-batch-preflight.yml]
 
 permissions:
   contents: read
 
 concurrency:
-  group: receipt-diagnostic-1817-${{ github.ref }}
+  group: event-diagnostic-1819-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   diagnose:
-    name: Compare parallel and isolated receipt cleanup
+    name: Diagnose missing declared input events
     if: >-
       github.repository == 'kunobi-ninja/kache' &&
       !github.event.repository.private &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/review-contribution/preflight-1817-receipt'
+      github.ref == 'refs/heads/review-contribution/preflight-1819-events'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -30,8 +30,10 @@ jobs:
       RUSTC_WRAPPER: ""
       RUSTC_WORKSPACE_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: cc05ff7f3b9147cb27846b7ebf74eec48ff587e3
-      SOURCE_TREE: 8120ef3673fb35081ff2582823ffdb9b59524ad0
+      CARGO_INCREMENTAL: "1"
+      PROPTEST_DISABLE_FAILURE_PERSISTENCE: "1"
+      SOURCE_HEAD: c225fbf6f233d1b1f9e1ced83c532fd9bfc88450
+      SOURCE_TREE: b6aec83fcb10c017449f014d0a4cc0807fc7743c
     steps:
       - name: Require a disposable hosted Linux runner
         working-directory: ${{ github.workspace }}
@@ -43,8 +45,8 @@ jobs:
           test "$RUNNER_KIND" = github-hosted
           test "$HOST_OS" = Linux
           {
-            printf 'CARGO_TARGET_DIR=%s/receipt-diagnostic-target\n' "$RUNNER_TEMP"
-            printf 'EVIDENCE_DIR=%s/receipt-diagnostic-evidence\n' "$RUNNER_TEMP"
+            printf 'CARGO_TARGET_DIR=%s/event-diagnostic-target\n' "$RUNNER_TEMP"
+            printf 'EVIDENCE_DIR=%s/event-diagnostic-evidence\n' "$RUNNER_TEMP"
           } >> "$GITHUB_ENV"
       - name: Check out the maintainer validation helper
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -79,42 +81,32 @@ jobs:
         with:
           version: 2026.6.9
           install: true
-          install_args: rust github:taiki-e/cargo-llvm-cov
+          install_args: rust
           cache: false
-      - name: Compare three parallel suites and five isolated receipts
+      - name: Repeat the failed ordinary Cargo fixture three times
         run: |
           set -euo pipefail
-          printf 'phase\ttrial\texit\n' > "$EVIDENCE_DIR/exits.tsv"
+          printf 'trial\texit\n' > "$EVIDENCE_DIR/exits.tsv"
           failed=0
-          run_trial() {
-            local phase="$1" trial="$2"
-            shift 2
-            local log="$EVIDENCE_DIR/$phase-$trial.log"
-            local status tee_status
-            local -a statuses
+          for trial in 1 2 3; do
+            log="$EVIDENCE_DIR/trial-$trial.log"
             set +e
-            ./scripts/with-test-resources.sh cargo llvm-cov --locked --all-features \
-              -p kache --test cargo_proxy_test --no-report "$@" 2>&1 | tee "$log"
+            ./scripts/with-test-resources.sh cargo test --verbose --package=kache@2.0.1 \
+              --all-features --test build_script_declared_inputs_test \
+              declared_inputs_of_a_packages_build_script_key_its_units \
+              -- --exact --nocapture 2>&1 | tee "$log"
             statuses=("${PIPESTATUS[@]}")
             set -e
             status="${statuses[0]}"
-            tee_status="${statuses[1]}"
-            test "$tee_status" -eq 0
-            printf '%s\t%s\t%s\n' "$phase" "$trial" "$status" | tee -a "$EVIDENCE_DIR/exits.tsv"
+            test "${statuses[1]}" -eq 0
+            printf '%s\t%s\n' "$trial" "$status" | tee -a "$EVIDENCE_DIR/exits.tsv"
             if [ "$status" -ne 0 ]; then
               failed=1
               if [ ! -e "$EVIDENCE_DIR/first-failure.log" ]; then
                 cp "$log" "$EVIDENCE_DIR/first-failure.log"
-                printf '%s\t%s\t%s\n' "$phase" "$trial" "$status" > "$EVIDENCE_DIR/first-failure.tsv"
+                printf '%s\t%s\n' "$trial" "$status" > "$EVIDENCE_DIR/first-failure.tsv"
               fi
             fi
-          }
-          for trial in 1 2 3; do
-            run_trial parallel "$trial" -- --nocapture
-          done
-          for trial in 1 2 3 4 5; do
-            run_trial isolated "$trial" receipt_cleanup_preserves_units_in_unobserved_profiles \
-              -- --exact --nocapture --test-threads=1
           done
           exit "$failed"
       - name: Verify the candidate was not changed
@@ -128,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: receipt-diagnostic-1817-${{ github.run_id }}-${{ github.run_attempt }}
+          name: event-diagnostic-1819-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE_DIR }}
           retention-days: 7
           if-no-files-found: error

@@ -30,6 +30,19 @@ keep running the copy they were installed with
 until their script is rebuilt or the target directory is cleaned. If that copy
 is gone, the launcher runs the script directly, uncached.
 
+Launcher installation is serialized within each build-script directory. If its
+lock is unavailable, Kache leaves the compiler's executable in place and skips
+installation. A launcher found where the preserved script should be stops with
+an error, including when the pinned Kache is missing.
+
+Build-script executables are snapshotted before cache publication. Kache refuses
+to store launcher bytes as a compiler result. The build-script compilation key
+also changes once to retire older entries that could contain a launcher. Other
+Rust compilation keys keep their existing namespace.
+
+If a target already contains an invalid preserved script, see
+[Repair an invalid build-script launcher](/docs/getting-started/troubleshooting#repair-an-invalid-build-script-launcher).
+
 When Kache seeds a new target from another checkout, it copies each seeded
 launcher's pinned executable before copying the unit. The pin uses a filesystem
 clone or byte copy, so the new profile owns its executable inode and continues

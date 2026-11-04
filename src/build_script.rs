@@ -136,6 +136,17 @@ pub fn build_script_output(args: &RustcArgs) -> Option<PathBuf> {
     build_script_output_for(args, std::env::var_os("CARGO_BIN_NAME").is_some())
 }
 
+/// Build-script outputs that can receive a native launcher on this host.
+/// Recognition uses the invocation snapshot and does not require an output yet.
+pub(crate) fn is_launcher_compilation(args: &RustcArgs) -> bool {
+    cfg!(unix)
+        && build_script_output_for(
+            args,
+            args.invocation_env().var_os("CARGO_BIN_NAME").is_some(),
+        )
+        .is_some()
+}
+
 /// [`build_script_output`] with whether Cargo set `CARGO_BIN_NAME`. Cargo
 /// sets it for a `[[bin]]` and never for a build script, and from 1.100 a
 /// bin named `build-script-build` compiles under the same crate name into
@@ -177,7 +188,11 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = executable.parent().and_then(lock_unit_directory);
+    let directory = executable
+        .parent()
+        .context("build script has no parent directory")?;
+    let _guard =
+        lock_unit_directory(directory).context("locking the build-script launcher installation")?;
     // An earlier install already put the launcher here and preserved the
     // script. Preserving the launcher in its place would lose the script.
     if is_launcher(executable) {
@@ -246,19 +261,40 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Locks the build-script directory for one install. `None` when the
-/// filesystem cannot lock: the launcher checks in [`install`] and
-/// [`find_real`] still keep the launcher from standing in for the script.
+/// Serialize installs before reading or replacing either executable.
+/// An unavailable lock leaves the compiler's output untouched.
 #[cfg(unix)]
-fn lock_unit_directory(directory: &Path) -> Option<std::fs::File> {
+fn lock_unit_directory(directory: &Path) -> std::io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(directory.join(INSTALL_LOCK))
-        .ok()?;
-    file.lock().ok()?;
-    Some(file)
+        .open(directory.join(INSTALL_LOCK))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// Freeze a build-script executable before a concurrent install can replace
+/// its path with a launcher. Only these private bytes may enter the store.
+pub(crate) fn stage_compiled_script(
+    executable: &Path,
+    temporary_directory: &Path,
+) -> Result<tempfile::TempPath> {
+    let staged = tempfile::Builder::new()
+        .prefix("kache-build-script-artifact-")
+        .tempfile_in(temporary_directory)
+        .context("creating a private build-script artifact")?;
+    if kache_fs::try_clone_extents_into(executable, staged.as_file()).is_err() {
+        kache_fs::copy_writable(executable, staged.path(), true)
+            .context("snapshotting the compiled build script")?;
+    }
+    kache_fs::set_writable_permissions(staged.path(), true)
+        .context("setting the compiled build-script snapshot mode")?;
+    anyhow::ensure!(
+        !is_launcher(staged.path()),
+        "the compiled build-script output is a launcher; refusing to cache it"
+    );
+    Ok(staged.into_temp_path())
 }
 
 /// Whether `path` holds this kache's launcher. The length is checked first,
@@ -6456,6 +6492,233 @@ mod tests {
         assert!(!is_launcher(&same_length));
 
         assert!(!is_launcher(&dir.path().join("missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_compilation_recognition_uses_the_invocation_before_outputs_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        let mut env = crate::invocation::InvocationEnv::from_parts(
+            Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+            Some(dir.path().to_path_buf()),
+            None,
+            dir.path().to_path_buf(),
+        );
+        let parse = |name: &str, kind: &str, at: &Path, env: &crate::invocation::InvocationEnv| {
+            RustcArgs::parse_for(
+                &[
+                    "rustc".into(),
+                    "--crate-name".into(),
+                    name.into(),
+                    "--crate-type".into(),
+                    kind.into(),
+                    "build.rs".into(),
+                    "--out-dir".into(),
+                    at.to_string_lossy().into_owned(),
+                ],
+                env,
+            )
+            .unwrap()
+        };
+        let script = parse("build_script_build", "bin", &unit, &env);
+        assert!(!unit.exists());
+        assert!(is_launcher_compilation(&script));
+        assert!(!is_launcher_compilation(&parse("app", "bin", &unit, &env)));
+        assert!(!is_launcher_compilation(&parse(
+            "build_script_build",
+            "lib",
+            &unit,
+            &env
+        )));
+        assert!(!is_launcher_compilation(&parse(
+            "build_script_build",
+            "bin",
+            dir.path(),
+            &env
+        )));
+        env.set("CARGO_BIN_NAME", "build-script-build");
+        let app = parse("build_script_build", "bin", &unit, &env);
+        assert!(!is_launcher_compilation(&app));
+        assert!(
+            is_launcher_compilation(&script),
+            "the first invocation stays independent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child fixture for launcher_install_lock_is_released_for_another_process"]
+    fn launcher_install_lock_probe_child() {
+        let path = std::env::var_os("KACHE_TEST_LAUNCHER_LOCK").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        if std::env::var_os("KACHE_TEST_LAUNCHER_LOCK_BLOCKED").is_some() {
+            assert!(matches!(
+                file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the parent kept the install lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_install_lock_is_released_for_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_unit_directory(dir.path()).unwrap();
+        let probe = |blocked: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "build_script::tests::launcher_install_lock_probe_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("KACHE_TEST_LAUNCHER_LOCK", dir.path().join(INSTALL_LOCK));
+            command.env_remove("KACHE_TEST_LAUNCHER_LOCK_BLOCKED");
+            if blocked {
+                command.env("KACHE_TEST_LAUNCHER_LOCK_BLOCKED", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "{output:?}"
+            );
+        };
+        probe(true);
+        drop(held);
+        probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_leaves_the_script_untouched_when_the_lock_cannot_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(unit.join(INSTALL_LOCK)).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+        let error = install(&executable).unwrap_err();
+        assert!(format!("{error:#}").contains("locking the build-script launcher"));
+        assert_eq!(
+            std::fs::read(&executable).unwrap(),
+            b"#!/bin/sh\necho real\n"
+        );
+        assert!(!with_suffix(&executable, REAL_SUFFIX).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_snapshot_survives_launcher_installation_and_rejects_launcher_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+        let snapshot = stage_compiled_script(&executable, dir.path()).unwrap();
+        assert_ne!(&*snapshot, executable.as_path());
+        assert_eq!(
+            std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        install(&executable).unwrap();
+        assert!(is_launcher(&executable));
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"#!/bin/sh\necho real\n");
+        let error = stage_compiled_script(&executable, dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("refusing to cache"));
+        assert!(stage_compiled_script(&dir.path().join("missing"), dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    fn bounded_launcher_output(executable: &Path) -> std::process::Output {
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut child = ChildGuard(Some(
+            Command::new(executable)
+                .env_remove("OUT_DIR")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher did not stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.0.take().unwrap().wait_with_output().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_without_kache_stops_when_the_preserved_script_is_a_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+        install(&executable).unwrap();
+        std::fs::copy(&executable, with_suffix(&executable, REAL_SUFFIX)).unwrap();
+        std::fs::remove_dir_all(dir.path().join("debug").join(SHIM_DIR)).unwrap();
+        let output = bounded_launcher_output(&executable);
+        assert_eq!(output.status.code(), Some(127));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("preserved build script is invalid")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_rejects_a_self_reference_or_path_in_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+        install(&executable).unwrap();
+        std::fs::remove_dir_all(dir.path().join("debug").join(SHIM_DIR)).unwrap();
+        let record_path = unit.join(LAUNCH_RECORD);
+        let record = std::fs::read(&record_path).unwrap();
+        let tail = &record[record.iter().position(|byte| *byte == 0).unwrap()..];
+        for invalid in [
+            b"build_script_build-1".as_slice(),
+            b"../elsewhere.kache-real",
+        ] {
+            std::fs::write(&record_path, [invalid, tail].concat()).unwrap();
+            let output = bounded_launcher_output(&executable);
+            assert_eq!(output.status.code(), Some(127));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("invalid preserved script name")
+            );
+        }
     }
 
     /// Two wrappers that restored the same build script install its launcher

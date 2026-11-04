@@ -695,6 +695,12 @@ fn fold_field<H: KeyFold>(hasher: &mut H, label: &[u8], value: &[u8]) {
     hasher.update(value);
 }
 
+fn fold_build_script_artifact_recipe<H: KeyFold>(hasher: &mut H, launcher: bool) {
+    if launcher {
+        hasher.update(b"build_script_artifact.v2\n");
+    }
+}
+
 /// rustc reads these while resolving Apple target specs, without recording
 /// them in dep-info. This applies to libraries too, before any native link.
 /// Custom specs can select Apple platforms without an Apple triple.
@@ -3261,6 +3267,13 @@ fn compute_key_into(
 
     // Older entries can carry arbitrary explicit-emit filenames under a default key.
     fold_field(&mut hasher, b"emit_placement.v1:", b"compiler-owned");
+
+    // Older build-script entries may contain installed launcher bytes instead
+    // of compiler output. Retire that namespace without discarding library keys.
+    fold_build_script_artifact_recipe(
+        &mut hasher,
+        crate::build_script::is_launcher_compilation(args),
+    );
 
     // Distinguish configured from unconfigured clients of this same release.
     // Only the stable sentinel/target SET (represented by its deterministic

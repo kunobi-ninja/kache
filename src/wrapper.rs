@@ -5108,11 +5108,12 @@ fn run_parsed_rustc(
         depinfo_workspace_dir,
         &depinfo_configured_roots,
         args.invocation_env().temp_dir(),
+        crate::build_script::is_launcher_compilation(args),
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
             tracing::warn!(
-                "not caching {}: dep-info could not be staged safely: {error:#}",
+                "not caching {}: compiler artifacts could not be staged safely: {error:#}",
                 crate_name
             );
             after_store(config, &store, Some(&error));
@@ -5121,7 +5122,7 @@ fn run_parsed_rustc(
                 config,
                 EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
                     .rebuilt_observed(rebuilt.clone())
-                    .skip_reason(format!("dep-info-staging: {error:#}"))
+                    .skip_reason(format!("artifact-staging: {error:#}"))
                     .compile_time_ms(compile_time_ms)
                     .keyed(&cache_key, key_ms, key_hash_stats)
                     .lookup_ms(lookup_ms)
@@ -5579,6 +5580,7 @@ fn prepare_rustc_store_files(
         workspace_dir,
         configured_roots,
         crate::invocation::InvocationEnv::capture().temp_dir(),
+        false,
     )
 }
 
@@ -5589,6 +5591,7 @@ fn prepare_rustc_store_files_for(
     workspace_dir: Option<&Path>,
     configured_roots: &[(PathBuf, String, u8)],
     temp_dir: &Path,
+    protect_build_script: bool,
 ) -> Result<PreparedRustcStoreFiles> {
     use std::io::{Read, Write};
 
@@ -5596,6 +5599,12 @@ fn prepare_rustc_store_files_for(
     let mut temporary_files = Vec::with_capacity(artifacts.outputs().len());
     for artifact in artifacts.outputs() {
         if artifact.kind != ArtifactKind::DepInfo {
+            if protect_build_script && artifact.kind == ArtifactKind::Executable {
+                let staged = crate::build_script::stage_compiled_script(&artifact.path, temp_dir)?;
+                files.push((staged.to_path_buf(), artifact.store_name.clone()));
+                temporary_files.push(staged);
+                continue;
+            }
             // Preserve the compiler-owned path (and therefore executable mode)
             // for ordinary artifacts. Only dep-info needs transformed bytes.
             files.push((artifact.path.clone(), artifact.store_name.clone()));

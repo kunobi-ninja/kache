@@ -52,6 +52,7 @@ const X_OK: c_int = 1;
 const PATH_CAPACITY: usize = 4096;
 const SHIM_PATH_ENV: &[u8] = b"KACHE_BUILD_SCRIPT_PATH=";
 const LAUNCH_RECORD: &[u8] = b".kache-launch";
+const REAL_SUFFIX: &[u8] = b".kache-real";
 /// `<profile>/build/<pkg>-<hash>/`: the profile is two levels above. Used
 /// when the record does not say.
 const LEGACY_TO_PROFILE: &[u8] = b"../../";
@@ -91,6 +92,11 @@ pub unsafe extern "C" fn main(
             fail(b"kache: build-script launcher started without argv[0]\n");
         }
         let invoked = c_bytes(*argv);
+        // This also bounds the direct fallback when the pinned kache is gone:
+        // a launcher preserved as the real script must never exec itself.
+        if invoked.ends_with(REAL_SUFFIX) {
+            fail(b"kache: the preserved build script is invalid; clean the affected package and rebuild\n");
+        }
         // Cargo runs the script by path; the directory prefix, slash included.
         let Some(slash) = invoked.iter().rposition(|&byte| byte == b'/') else {
             fail(b"kache: build-script launcher was not started by path\n");
@@ -104,6 +110,9 @@ pub unsafe extern "C" fn main(
         let (Some(real_name), Some(kache_relative)) = (fields.next(), fields.next()) else {
             fail(b"kache: build-script launcher found no .kache-launch record\n");
         };
+        if !real_name.ends_with(REAL_SUFFIX) || real_name.contains(&b'/') {
+            fail(b"kache: build-script launcher found an invalid preserved script name\n");
+        }
 
         let to_profile = match fields.next() {
             Some(field) if !field.is_empty() => field,

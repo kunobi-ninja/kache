@@ -2244,6 +2244,27 @@ fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
         eprintln!("skipping: running as root, mode 0555 does not deny removal");
         return;
     }
+    // A sibling test can fork with this fixture's open descriptors and make
+    // cleanup keep the target as busy. Create it in a process with one test.
+    const CHILD: &str = "KACHE_TEST_CLEAN_DENIED_REMOVAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_clean_that_cannot_remove_a_target_says_so_and_fails",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "the isolated test must run: {output:?}"
+        );
+        return;
+    }
     let e = env();
     let project = TempDir::new().unwrap();
     let root = project.path();
@@ -2269,7 +2290,7 @@ fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
         .unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["success"], false);
     // cli.schema.json: a failed document carries `error`.
@@ -2286,7 +2307,7 @@ fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
         root.join("target").display().to_string()
     );
     assert!(value["removed_paths"].as_array().unwrap().is_empty());
-    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
     assert!(String::from_utf8_lossy(&human.stdout).contains("  failed  "));
 }
 

@@ -1,0 +1,187 @@
+name: Adoption preflight (1742, 1813, 1815)
+
+on:
+  push:
+    branches: [review-contribution/preflight-1742-1813-1815]
+    paths: [.github/workflows/adoption-batch-preflight.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adoption-1742-1813-1815-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Prepare PR ${{ matrix.pr }} (just check)
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1742-1813-1815'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: 1742
+            head: 940a132215321cf3d11406c93c20b6f527147ad8
+            tree: eb5f270165d48ec369b96c42be4719230684cc1a
+          - pr: 1813
+            head: 6142b0bda9439285c92c8d3a7057bfaa55e66f28
+            tree: e9114742ddd00ee9b4ff1dcd1e0ade646db1ef68
+          - pr: 1815
+            head: 738b27d57cc4a04f99e30fe0e2ba5f7d6820ebe5
+            tree: 3ca526c032ca961605013e327850ee641d0838f8
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTC_WORKSPACE_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      SOURCE_HEAD: ${{ matrix.head }}
+      SOURCE_TREE: ${{ matrix.tree }}
+    steps:
+      - name: Require a disposable hosted runner
+        working-directory: ${{ github.workspace }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          {
+            printf 'CARGO_TARGET_DIR=%s/adoption-target\n' "$RUNNER_TEMP"
+            printf 'EVIDENCE_DIR=%s/adoption-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+      - name: Check out the maintainer validation helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          {
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } | tee "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: rust just
+          cache: false
+      - name: Run repository checks
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation routes and source parity
+        if: matrix.pr == 1742
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+          python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-tests.log"
+      - name: Verify the candidate was not changed
+        if: always()
+        run: git diff --exit-code
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adoption-${{ matrix.pr }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error
+
+  nix:
+    name: Verify the shared Nix fixture repair
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      SOURCE_HEAD: 738b27d57cc4a04f99e30fe0e2ba5f7d6820ebe5
+      SOURCE_TREE: 3ca526c032ca961605013e327850ee641d0838f8
+    steps:
+      - name: Require a disposable hosted runner
+        working-directory: ${{ github.workspace }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          printf 'EVIDENCE_DIR=%s/adoption-nix-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Check out the pinned candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          {
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } | tee "$EVIDENCE_DIR/provenance.txt"
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        timeout-minutes: 10
+      - name: Restore Nix store without saving candidate outputs
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/flake.lock', 'source/rust-toolchain.toml', 'source/Cargo.lock') }}
+          save: false
+      - name: Check flake evaluation
+        run: |
+          set -euo pipefail
+          nix flake check --all-systems --no-build 2>&1 | tee "$EVIDENCE_DIR/nix-evaluation.log"
+      - name: Build flake checks
+        run: |
+          set -euo pipefail
+          nix flake check --keep-going --print-build-logs 2>&1 | tee "$EVIDENCE_DIR/nix-build.log"
+      - name: Verify the candidate was not changed
+        if: always()
+        run: git diff --exit-code
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adoption-batch-nix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

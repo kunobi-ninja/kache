@@ -1973,6 +1973,8 @@ mod tests {
         let metadata = "-Cmetadata=0123456789abcdef";
 
         for crate_types in [
+            &["--crate-type", "cdylib"][..],
+            &["--crate-type", "staticlib"][..],
             &[
                 "--crate-type",
                 "lib",

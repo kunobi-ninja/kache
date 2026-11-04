@@ -280,16 +280,29 @@ pub(crate) fn stage_compiled_script(
     executable: &Path,
     temporary_directory: &Path,
 ) -> Result<tempfile::TempPath> {
-    let staged = tempfile::Builder::new()
+    let mut staged = tempfile::Builder::new()
         .prefix("kache-build-script-artifact-")
         .tempfile_in(temporary_directory)
         .context("creating a private build-script artifact")?;
     if kache_fs::try_clone_extents_into(executable, staged.as_file()).is_err() {
-        kache_fs::copy_writable(executable, staged.path(), true)
+        // Copy bytes without copying source permissions into the temporary directory.
+        let mut input = std::fs::File::open(executable)
+            .context("opening the compiled build script for its snapshot")?;
+        let copied = std::io::copy(&mut input, staged.as_file_mut())
             .context("snapshotting the compiled build script")?;
+        staged
+            .as_file()
+            .set_len(copied)
+            .context("setting the compiled build-script snapshot length")?;
     }
-    kache_fs::set_writable_permissions(staged.path(), true)
-        .context("setting the compiled build-script snapshot mode")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .context("setting the private build-script snapshot mode")?;
+    }
     anyhow::ensure!(
         !is_launcher(staged.path()),
         "the compiled build-script output is a launcher; refusing to cache it"
@@ -6637,7 +6650,7 @@ mod tests {
         assert_ne!(&*snapshot, executable.as_path());
         assert_eq!(
             std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
-            0o755
+            0o700
         );
         install(&executable).unwrap();
         assert!(is_launcher(&executable));

@@ -1,38 +1,27 @@
-name: Adoption preflight (1742, 1813, 1815)
+name: Receipt cleanup diagnostic preflight (1817)
 
 on:
   push:
-    branches: [review-contribution/preflight-1742-1813-1815]
+    branches: [review-contribution/preflight-1817-receipt]
     paths: [.github/workflows/adoption-batch-preflight.yml]
 
 permissions:
   contents: read
 
 concurrency:
-  group: adoption-1742-1813-1815-${{ github.ref }}
-  cancel-in-progress: true
+  group: receipt-diagnostic-1817-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  check:
-    name: Prepare PR ${{ matrix.pr }} (just check)
+  diagnose:
+    name: Compare parallel and isolated receipt cleanup
     if: >-
       github.repository == 'kunobi-ninja/kache' &&
       !github.event.repository.private &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/review-contribution/preflight-1742-1813-1815'
+      github.ref == 'refs/heads/review-contribution/preflight-1817-receipt'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        include:
-          - pr: 1742
-            head: b172417ba96638982591d515cc8c8a6c58ffb9ed
-            tree: cf324105f69c308f445edcb9ab67355c54155142
-          - pr: 1815
-            head: 738b27d57cc4a04f99e30fe0e2ba5f7d6820ebe5
-            tree: 3ca526c032ca961605013e327850ee641d0838f8
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -41,26 +30,26 @@ jobs:
       RUSTC_WRAPPER: ""
       RUSTC_WORKSPACE_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: ${{ matrix.head }}
-      SOURCE_TREE: ${{ matrix.tree }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/receipt-diagnostic-target
+      EVIDENCE_DIR: ${{ runner.temp }}/receipt-diagnostic-evidence
+      SOURCE_HEAD: cc05ff7f3b9147cb27846b7ebf74eec48ff587e3
+      SOURCE_TREE: 8120ef3673fb35081ff2582823ffdb9b59524ad0
     steps:
-      - name: Require a disposable hosted runner
+      - name: Require a disposable hosted Linux runner
         working-directory: ${{ github.workspace }}
         env:
           RUNNER_KIND: ${{ runner.environment }}
+          HOST_OS: ${{ runner.os }}
         run: |
           set -euo pipefail
           test "$RUNNER_KIND" = github-hosted
-          {
-            printf 'CARGO_TARGET_DIR=%s/adoption-target\n' "$RUNNER_TEMP"
-            printf 'EVIDENCE_DIR=%s/adoption-evidence\n' "$RUNNER_TEMP"
-          } >> "$GITHUB_ENV"
+          test "$HOST_OS" = Linux
       - name: Check out the maintainer validation helper
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Check out the pinned candidate
+      - name: Check out the pinned diagnostic candidate
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ env.SOURCE_HEAD }}
@@ -88,106 +77,56 @@ jobs:
         with:
           version: 2026.6.9
           install: true
-          install_args: rust github:casey/just
+          install_args: rust github:taiki-e/cargo-llvm-cov
           cache: false
-      - name: Check process-aware pruning without other test threads
-        if: matrix.pr == 1815
+      - name: Compare three parallel suites and five isolated receipts
         run: |
           set -euo pipefail
-          cargo test --locked -p kache --lib unit_prune::tests::a_running_program_keeps_unused_units_and_the_preview_agrees -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/unit-prune-control.log"
-      - name: Run repository checks
-        run: |
-          set -euo pipefail
-          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
-      - name: Check documentation routes and source parity
-        if: matrix.pr == 1742
-        run: |
-          set -euo pipefail
-          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
-          python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-tests.log"
+          printf 'phase\ttrial\texit\n' > "$EVIDENCE_DIR/exits.tsv"
+          failed=0
+          run_trial() {
+            local phase="$1" trial="$2"
+            shift 2
+            local log="$EVIDENCE_DIR/$phase-$trial.log"
+            local status tee_status
+            local -a statuses
+            set +e
+            ./scripts/with-test-resources.sh cargo llvm-cov --locked --all-features \
+              -p kache --test cargo_proxy_test --no-report "$@" 2>&1 | tee "$log"
+            statuses=("${PIPESTATUS[@]}")
+            set -e
+            status="${statuses[0]}"
+            tee_status="${statuses[1]}"
+            test "$tee_status" -eq 0
+            printf '%s\t%s\t%s\n' "$phase" "$trial" "$status" | tee -a "$EVIDENCE_DIR/exits.tsv"
+            if [ "$status" -ne 0 ]; then
+              failed=1
+              if [ ! -e "$EVIDENCE_DIR/first-failure.log" ]; then
+                cp "$log" "$EVIDENCE_DIR/first-failure.log"
+                printf '%s\t%s\t%s\n' "$phase" "$trial" "$status" > "$EVIDENCE_DIR/first-failure.tsv"
+              fi
+            fi
+          }
+          for trial in 1 2 3; do
+            run_trial parallel "$trial" -- --nocapture
+          done
+          for trial in 1 2 3 4 5; do
+            run_trial isolated "$trial" receipt_cleanup_preserves_units_in_unobserved_profiles \
+              -- --exact --nocapture --test-threads=1
+          done
+          exit "$failed"
       - name: Verify the candidate was not changed
         if: always()
-        run: git diff --exit-code
-      - name: Upload evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: adoption-${{ matrix.pr }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.EVIDENCE_DIR }}
-          retention-days: 7
-          if-no-files-found: error
-
-  nix:
-    name: Verify the shared Nix fixture repair
-    if: >-
-      github.repository == 'kunobi-ninja/kache' &&
-      !github.event.repository.private &&
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/review-contribution/preflight-1742-1813-1815'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    env:
-      SOURCE_HEAD: 738b27d57cc4a04f99e30fe0e2ba5f7d6820ebe5
-      SOURCE_TREE: 3ca526c032ca961605013e327850ee641d0838f8
-    steps:
-      - name: Require a disposable hosted runner
-        working-directory: ${{ github.workspace }}
-        env:
-          RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -euo pipefail
-          test "$RUNNER_KIND" = github-hosted
-          printf 'EVIDENCE_DIR=%s/adoption-nix-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Check out the pinned candidate
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: ${{ env.SOURCE_HEAD }}
-          path: source
-          persist-credentials: false
-      - name: Verify source and record provenance
-        env:
-          RUNNER_KIND: ${{ runner.environment }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$EVIDENCE_DIR"
           test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
-          {
-            printf 'helper_head=%s\n' "$GITHUB_SHA"
-            printf 'source_head=%s\n' "$SOURCE_HEAD"
-            printf 'source_tree=%s\n' "$SOURCE_TREE"
-            printf 'runner_environment=%s\n' "$RUNNER_KIND"
-            printf 'runner_name=%s\n' "$RUNNER_NAME"
-            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
-            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
-          } | tee "$EVIDENCE_DIR/provenance.txt"
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-        timeout-minutes: 10
-      - name: Restore Nix store without saving candidate outputs
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/flake.lock', 'source/rust-toolchain.toml', 'source/Cargo.lock') }}
-          save: false
-      - name: Check flake evaluation
-        run: |
-          set -euo pipefail
-          nix flake check --all-systems --no-build 2>&1 | tee "$EVIDENCE_DIR/nix-evaluation.log"
-      - name: Build flake checks
-        run: |
-          set -euo pipefail
-          nix flake check --keep-going --print-build-logs 2>&1 | tee "$EVIDENCE_DIR/nix-build.log"
-      - name: Verify the candidate was not changed
-        if: always()
-        run: git diff --exit-code
-      - name: Upload evidence
+          git diff --exit-code
+      - name: Upload diagnostic evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: adoption-batch-nix-${{ github.run_id }}-${{ github.run_attempt }}
+          name: receipt-diagnostic-1817-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE_DIR }}
           retention-days: 7
           if-no-files-found: error

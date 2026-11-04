@@ -38,10 +38,14 @@ fn the_launcher_links_with_current_core_and_runs_the_preserved_script() {
     // A successful link is the symbol oracle. Executing the fallback also
     // proves that the generated launcher remains usable, rather than merely
     // carrying a chosen string somewhere in its image.
-    let preserved = fixture.path().join("preserved");
+    let preserved = fixture.path().join("preserved.kache-real");
     std::fs::write(&preserved, "#!/bin/sh\nexit 23\n").unwrap();
     std::fs::set_permissions(&preserved, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(fixture.path().join(".kache-launch"), b"preserved\0\0./\0").unwrap();
+    std::fs::write(
+        fixture.path().join(".kache-launch"),
+        b"preserved.kache-real\0\0./\0",
+    )
+    .unwrap();
     let output = Command::new(&out).env_clear().output().unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
 }

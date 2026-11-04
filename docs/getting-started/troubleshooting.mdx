@@ -41,6 +41,25 @@ wrapper. For C/C++, check that `kache doctor` reports the compiler shims as
 active in that shell, or that `CC`/`CXX` name Kache as in the
 [prefix method](/docs/getting-started/c-cpp#prefix-method).
 
+## Repair an invalid build-script launcher
+
+For a missing or invalid preserved build script, or a recursive chain of Kache
+processes, stop the affected build and its process tree before cleaning outputs.
+Update Kache to a version containing the launcher fix, then remove the affected
+package's build outputs and rebuild without importing an old target:
+
+```sh
+cargo clean -p <package>
+KACHE_SEED_NEW_TARGETS=0 cargo build
+```
+
+Replace `<package>` with the package named by Cargo's failed build-script step.
+Older concurrent launcher installations could preserve a launcher in place of
+the real script. Existing launchers keep their pinned Kache until their package
+is rebuilt, so repeat the cleanup in each affected worktree. The updated
+launcher detects recursive fallback, and new build-script compilation keys
+retire older cache entries. A full cache deletion is unnecessary.
+
 ## Some units always compile
 
 Open `kache monitor` and check the Why tab, or save a report:

@@ -7,6 +7,21 @@ const GNU_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nr
 const DARWIN_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: aarch64-apple-darwin\nrelease: 1.90.0\n";
 
 #[test]
+fn build_script_artifact_recipe_retires_only_launcher_compilations() {
+    let legacy = blake3::Hasher::new().finalize();
+    let mut script = blake3::Hasher::new();
+    fold_build_script_artifact_recipe(&mut script, true);
+    assert_ne!(script.finalize(), legacy);
+    assert_eq!(
+        script.finalize(),
+        blake3::hash(b"build_script_artifact.v2\n")
+    );
+    let mut ordinary = blake3::Hasher::new();
+    fold_build_script_artifact_recipe(&mut ordinary, false);
+    assert_eq!(ordinary.finalize(), legacy);
+}
+
+#[test]
 fn apple_deployment_targets_retire_old_keys_even_when_unset() {
     let legacy = blake3::Hasher::new().finalize();
     for (target, custom) in [

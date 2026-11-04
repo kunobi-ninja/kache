@@ -52,6 +52,39 @@ fn rustc_args(args: &[&str]) -> RustcArgs {
     RustcCompiler::new().parse(&s(args)).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn build_script_store_inputs_are_frozen_before_another_install_replaces_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let unit = dir.path().join("debug/build/pkg-1");
+    std::fs::create_dir_all(&unit).unwrap();
+    let executable = unit.join("build_script_build-1");
+    kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
+    let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
+        path: executable.clone(),
+        store_name: "build_script_build-1".into(),
+        kind: ArtifactKind::Executable,
+        required: true,
+    }]);
+    let prepared =
+        prepare_rustc_store_files_for(&outputs, None, dir.path(), None, &[], dir.path(), true)
+            .unwrap();
+    assert_ne!(prepared.files[0].0, executable);
+    crate::build_script::install(&executable).unwrap();
+    assert_eq!(
+        std::fs::read(&prepared.files[0].0).unwrap(),
+        b"#!/bin/sh\necho real\n"
+    );
+    let error =
+        prepare_rustc_store_files_for(&outputs, None, dir.path(), None, &[], dir.path(), true)
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("refusing to cache"));
+    let ordinary =
+        prepare_rustc_store_files_for(&outputs, None, dir.path(), None, &[], dir.path(), false)
+            .unwrap();
+    assert_eq!(ordinary.files[0].0, executable);
+}
+
 /// The rule that keeps a prediction from ever being an authority.
 ///
 /// Reached only once both lookups have missed, so it is not asking "did we
@@ -3706,6 +3739,7 @@ fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
         Some(&producing_workspace),
         &[],
         &client_temp,
+        false,
     )
     .unwrap();
     assert_eq!(std::fs::read_to_string(&depfile).unwrap(), original);
@@ -3802,6 +3836,7 @@ fn stored_dep_info_blobs_are_world_readable() {
         Some(&workspace),
         &[],
         &temp,
+        false,
     )
     .unwrap();
     store

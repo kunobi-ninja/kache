@@ -30,6 +30,9 @@ jobs:
           - pr: 1742
             head: b172417ba96638982591d515cc8c8a6c58ffb9ed
             tree: cf324105f69c308f445edcb9ab67355c54155142
+          - pr: 1815
+            head: 738b27d57cc4a04f99e30fe0e2ba5f7d6820ebe5
+            tree: 3ca526c032ca961605013e327850ee641d0838f8
     defaults:
       run:
         shell: bash
@@ -87,6 +90,11 @@ jobs:
           install: true
           install_args: rust github:casey/just
           cache: false
+      - name: Check process-aware pruning without other test threads
+        if: matrix.pr == 1815
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --lib unit_prune::tests::a_running_program_keeps_unused_units_and_the_preview_agrees -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/unit-prune-control.log"
       - name: Run repository checks
         run: |
           set -euo pipefail

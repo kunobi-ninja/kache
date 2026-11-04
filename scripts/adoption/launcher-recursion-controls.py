@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 
 ROOT = Path.cwd()
@@ -65,7 +66,12 @@ CONTROLS = [
 ]
 
 
+selected = set(sys.argv[1:]) or {control[0] for control in CONTROLS}
+assert selected <= {control[0] for control in CONTROLS}, "unknown negative control"
+
 for label, filename, before, after, test in CONTROLS:
+    if label not in selected:
+        continue
     path = ROOT / filename
     original = path.read_bytes()
     text = original.decode()
@@ -78,4 +84,4 @@ for label, filename, before, after, test in CONTROLS:
         path.write_bytes(original)
     run_test(test, f"{label}-restored")
 
-print("All three negative controls failed at the intended assertion; restored tests passed.")
+print("Negative controls passed after restoration: " + ", ".join(sorted(selected)))

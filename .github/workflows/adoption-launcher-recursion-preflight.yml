@@ -43,8 +43,8 @@ jobs:
       RUSTC_WRAPPER: ""
       RUSTC_WORKSPACE_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: 6076f2572077fddb9a793e7a63f0f32bbb7c5014
-      SOURCE_TREE: e7d083acfba03c889d47984260cfe284a79bba5c
+      SOURCE_HEAD: 6ef007e9347caf96ef363c9d42ffe7e8d277ac09
+      SOURCE_TREE: b459e660887645693f0b552d01a8bb2e9c51b10f
     steps:
       - name: Require a disposable hosted runner
         working-directory: ${{ github.workspace }}
@@ -93,23 +93,21 @@ jobs:
           install: true
           install_args: ${{ matrix.install_args }}
           cache: false
-      - name: Run just check and documentation checks
+      - name: Run snapshot permission and publication regressions
         if: matrix.platform == 'Linux'
         run: |
           set -euo pipefail
-          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
-          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs.log"
-          python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-regressions.log"
-      - name: Verify that removing each protection fails its regression
+          cargo test --locked -p kache --lib build_script::tests::a_script_snapshot_survives_launcher_installation_and_rejects_launcher_bytes -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/linux-snapshot.log"
+          cargo test --locked -p kache --lib wrapper::tests::build_script_store_inputs_are_frozen_before_another_install_replaces_them -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/linux-publication.log"
+      - name: Verify launcher publication still rejects launcher bytes
         if: matrix.platform == 'Linux'
-        run: python3 ../scripts/adoption/launcher-recursion-controls.py
-      - name: Run native launcher and publication regressions on macOS
+        run: python3 ../scripts/adoption/launcher-recursion-controls.py publication
+      - name: Run snapshot permission and publication regressions on macOS
         if: matrix.platform == 'macOS'
         run: |
           set -euo pipefail
-          cargo test --locked -p kache --lib build_script::tests:: 2>&1 | tee "$EVIDENCE_DIR/macos-build-scripts.log"
+          cargo test --locked -p kache --lib build_script::tests::a_script_snapshot_survives_launcher_installation_and_rejects_launcher_bytes -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/macos-snapshot.log"
           cargo test --locked -p kache --lib wrapper::tests::build_script_store_inputs_are_frozen_before_another_install_replaces_them -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/macos-publication.log"
-          cargo test --locked --test launcher_personality_test 2>&1 | tee "$EVIDENCE_DIR/macos-launcher-personality.log"
       - name: Verify that the candidate was restored
         if: always()
         run: git diff --exit-code

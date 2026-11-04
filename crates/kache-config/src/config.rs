@@ -277,8 +277,8 @@ pub struct Config {
     pub gc_evict_shared: bool,
     /// Whether bytes a build output still holds count toward `max_size`.
     /// Left out by default (kunobi-ninja/kache#1206). Counted, a size sweep
-    /// still keeps those entries but evicts others until the whole store is
-    /// under its target. Set via `KACHE_COUNT_HELD_IN_MAX_SIZE=1`/`=true` or
+    /// still keeps those entries and tries to reach its target by evicting
+    /// others. Set via `KACHE_COUNT_HELD_IN_MAX_SIZE=1`/`=true` or
     /// `[cache] count_held_in_max_size = true`.
     pub held_bytes_budget: kache_core::store_config::HeldBytesBudget,
     /// Daemon idle timeout in seconds (default 0 = no timeout).

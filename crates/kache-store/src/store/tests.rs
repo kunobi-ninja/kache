@@ -7073,7 +7073,7 @@ fn test_store_remove_entry() {
     assert_eq!(store.entry_count().unwrap(), 0);
 }
 
-/// Put `key` with one blob and return the store's blob refcount sum.
+/// Put `key` with one blob.
 fn put_one_blob_entry(store: &Store, dir: &Path, key: &str) {
     let output = dir.join(format!("{key}.rlib"));
     std::fs::write(&output, key.as_bytes()).unwrap();
@@ -7129,6 +7129,113 @@ fn remove_entry_releases_a_corrupt_meta_entry_through_its_blob_mapping() {
     assert!(!blob.exists(), "the last reference took the blob with it");
     assert!(!store.entry_dir("corrupt1").exists());
     assert_eq!(store.blob_index_drift().unwrap().total(), 0);
+}
+
+#[test]
+fn corrupt_metadata_removal_releases_repeated_refs_without_losing_a_shared_blob() {
+    for missing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let source = dir.path().join("shared.rlib");
+        std::fs::write(&source, b"shared payload").unwrap();
+        store
+            .put(
+                "broken",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[
+                    (source.clone(), "first.rlib".into()),
+                    (source.clone(), "second.rlib".into()),
+                ],
+                "",
+                "",
+            )
+            .unwrap();
+        store
+            .put(
+                "healthy",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(source, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let healthy = store.get("healthy").unwrap().unwrap();
+        let blob = store.blob_path(&healthy.files[0].hash);
+        assert_eq!(blob_refcount_sum(&store), 3);
+        let meta = store.entry_dir("broken").join("meta.json");
+        if missing {
+            std::fs::remove_file(meta).unwrap();
+        } else {
+            std::fs::write(meta, vec![0; 64]).unwrap();
+        }
+
+        store.remove_entry("broken").unwrap();
+
+        assert!(!store.contains("broken"));
+        assert!(store.get("healthy").unwrap().is_some());
+        assert_eq!(std::fs::read(&blob).unwrap(), b"shared payload");
+        assert_eq!(blob_refcount_sum(&store), 1);
+        assert_eq!(store.blob_index_drift().unwrap().total(), 0);
+        store.remove_entry("healthy").unwrap();
+        assert!(!blob.exists());
+        assert_eq!(blob_refcount_sum(&store), 0);
+    }
+}
+
+#[test]
+fn republication_after_a_missing_or_corrupt_meta_snapshot_survives_removal() {
+    for missing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let publisher = Store::open(&config).unwrap();
+        put_one_blob_entry(&store, dir.path(), "key");
+        let meta = store.entry_dir("key").join("meta.json");
+        if missing {
+            std::fs::remove_file(meta).unwrap();
+        } else {
+            std::fs::write(meta, vec![0; 64]).unwrap();
+        }
+        let next = dir.path().join("next.rlib");
+        std::fs::write(&next, b"republished payload").unwrap();
+
+        let outcome = store
+            .remove_entry_guarded_with_hook("key", None, || {
+                publisher
+                    .put(
+                        "key",
+                        "c",
+                        &["lib".into()],
+                        &[],
+                        "",
+                        "dev",
+                        &[(next, "lib.rlib".into())],
+                        "",
+                        "",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+
+        assert!(matches!(outcome, GuardedRemoval::Skipped));
+        let current = store.get("key").unwrap().expect("new publication survives");
+        assert_eq!(
+            std::fs::read(store.blob_path(&current.files[0].hash)).unwrap(),
+            b"republished payload"
+        );
+        assert_eq!(store.entry_count().unwrap(), 1);
+        assert_eq!(blob_refcount_sum(&store), 1);
+        assert_eq!(store.blob_index_drift().unwrap().total(), 0);
+    }
 }
 
 /// #276: without a blob mapping an unparseable meta.json leaves the
@@ -14294,6 +14401,26 @@ fn a_size_sweep_counting_held_bytes_evicts_other_entries_to_the_target() {
     assert!(store.contains("held") && store.contains("small"));
     assert!(!store.contains("large"));
     assert_eq!(store.physical_size().unwrap(), 80_000);
+}
+
+#[test]
+fn counted_held_bytes_can_exceed_the_budget_without_losing_the_held_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100_000;
+    config.held_bytes_budget = crate::eviction::HeldBytesBudget::Counted;
+    let store = Store::open(&config).unwrap();
+    let held = put_idle_entry(&store, dir.path(), "held", 120_000);
+    std::fs::hard_link(&held, dir.path().join("target-copy.rlib")).unwrap();
+    put_idle_entry(&store, dir.path(), "other", 20_000);
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.bytes_held, 120_000, "{stats:?}");
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(store.contains("held"));
+    assert!(!store.contains("other"));
+    assert_eq!(store.physical_size().unwrap(), 120_000);
 }
 
 /// A blob two entries share is not either one's last reference, so

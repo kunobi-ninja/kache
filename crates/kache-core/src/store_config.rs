@@ -12,8 +12,8 @@ pub enum HeldBytesBudget {
     /// by what build outputs hold.
     #[default]
     LeftOut,
-    /// Counted: a sweep evicts other entries until the whole store is under
-    /// its target, so `max_size` bounds everything the store holds.
+    /// Counted: a sweep includes held bytes in its target and evicts other
+    /// eligible entries. Protected entries can leave it above `max_size`.
     Counted,
 }
 
@@ -135,6 +135,27 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_bytes_are_excluded_by_default_and_counting_is_explicit() {
+        assert_eq!(HeldBytesBudget::default(), HeldBytesBudget::LeftOut);
+        assert_eq!(
+            HeldBytesBudget::from_count_held_in_max_size(false),
+            HeldBytesBudget::LeftOut
+        );
+        assert_eq!(
+            HeldBytesBudget::from_count_held_in_max_size(true),
+            HeldBytesBudget::Counted
+        );
+    }
+
+    #[test]
+    fn held_byte_accounting_leaves_out_only_the_selected_amount() {
+        for held in [0, 137] {
+            assert_eq!(HeldBytesBudget::LeftOut.left_out(held), held);
+            assert_eq!(HeldBytesBudget::Counted.left_out(held), 0);
+        }
+    }
 
     #[test]
     fn index_mode_parses_each_mode_and_rejects_the_rest() {

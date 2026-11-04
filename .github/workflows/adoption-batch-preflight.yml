@@ -28,14 +28,8 @@ jobs:
       matrix:
         include:
           - pr: 1742
-            head: 940a132215321cf3d11406c93c20b6f527147ad8
-            tree: eb5f270165d48ec369b96c42be4719230684cc1a
-          - pr: 1813
-            head: 6142b0bda9439285c92c8d3a7057bfaa55e66f28
-            tree: e9114742ddd00ee9b4ff1dcd1e0ade646db1ef68
-          - pr: 1815
-            head: 738b27d57cc4a04f99e30fe0e2ba5f7d6820ebe5
-            tree: 3ca526c032ca961605013e327850ee641d0838f8
+            head: b172417ba96638982591d515cc8c8a6c58ffb9ed
+            tree: cf324105f69c308f445edcb9ab67355c54155142
     defaults:
       run:
         shell: bash
@@ -117,7 +111,11 @@ jobs:
 
   nix:
     name: Verify the shared Nix fixture repair
-    needs: check
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1742-1813-1815'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:

@@ -21,6 +21,35 @@ pub(crate) fn can_track_client(pid: u32) -> bool {
     macos::Identity::capture(pid).is_ok()
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn capture_owned_identity<I>(
+    mut capture: impl FnMut() -> io::Result<I>,
+    mut exited: impl FnMut() -> io::Result<bool>,
+    mut pause: impl FnMut() -> io::Result<()>,
+    release: impl FnOnce(),
+) -> io::Result<Option<I>> {
+    let error = match capture() {
+        Ok(identity) => return Ok(Some(identity)),
+        Err(error) => error,
+    };
+    let recovered = (|| {
+        // macOS can stop exposing a process before wait4 reports its exit.
+        // Retry only this failed capture, with at most 100ms of pauses. Every
+        // live child still needs an identity; only its owner can prove exit.
+        for _ in 0..20 {
+            if exited()? {
+                return Ok(None);
+            }
+            pause()?;
+            if let Ok(identity) = capture() {
+                return Ok(Some(identity));
+            }
+        }
+        if exited()? { Ok(None) } else { Err(error) }
+    })();
+    recovered.inspect_err(|_| release())
+}
+
 pub(crate) struct Broker {
     channel: Mutex<Channel>,
     env: InvocationEnv,
@@ -181,28 +210,23 @@ impl Broker {
             return Err(io::Error::other("invalid native compiler spawn response"));
         };
         #[cfg(target_os = "macos")]
-        let identity = match macos::Identity::capture(pid) {
-            Ok(identity) => Some(identity),
-            Err(error) => {
-                // An instant compiler may already be a zombie before its task
-                // port can be pinned. Its status remains owned by the client.
-                if matches!(
-                    self.call(Command::TryWait { id }, 0),
-                    Ok((
-                        Reply::Waited {
-                            status: Some(_),
-                            ..
-                        },
-                        _
-                    ))
-                ) {
-                    None
-                } else {
-                    let _ = self.done(Command::Release { id });
-                    return Err(error);
+        let identity = capture_owned_identity(
+            || macos::Identity::capture(pid),
+            || {
+                super::process::check()?;
+                match self.call(Command::TryWait { id }, 0)?.0 {
+                    Reply::Waited { status, .. } => Ok(status.is_some()),
+                    _ => Err(io::Error::other("invalid native compiler wait response")),
                 }
-            }
-        };
+            },
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                super::process::check()
+            },
+            || {
+                let _ = self.done(Command::Release { id });
+            },
+        )?;
         let mut files = files.into_iter();
         let mut next = |mode| {
             if mode == Stream::Pipe {
@@ -362,6 +386,166 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::super::workspace::content_file;
     use super::*;
+
+    #[test]
+    fn captured_live_identity_needs_no_recovery() {
+        let identity = capture_owned_identity(
+            || Ok(42),
+            || panic!("successful capture must not query exit"),
+            || panic!("successful capture must not pause"),
+            || panic!("successful capture must retain its owner"),
+        )
+        .unwrap();
+        assert_eq!(identity, Some(42));
+    }
+
+    #[test]
+    fn already_exited_child_needs_no_identity_or_pause() {
+        let identity = capture_owned_identity::<u32>(
+            || Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            || Ok(true),
+            || panic!("an owned exit status needs no pause"),
+            || panic!("the caller must retain the exit status"),
+        )
+        .unwrap();
+        assert_eq!(identity, None);
+    }
+
+    #[test]
+    fn an_exit_transition_waits_for_the_owned_status() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let waits = std::cell::Cell::new(0);
+        let identity = capture_owned_identity::<u32>(
+            || {
+                calls.borrow_mut().push("capture");
+                Err(io::Error::from_raw_os_error(libc::ESRCH))
+            },
+            || {
+                calls.borrow_mut().push("wait");
+                waits.set(waits.get() + 1);
+                Ok(waits.get() == 2)
+            },
+            || {
+                calls.borrow_mut().push("pause");
+                Ok(())
+            },
+            || panic!("the caller must retain the exit status"),
+        )
+        .unwrap();
+        assert_eq!(identity, None);
+        assert_eq!(
+            *calls.borrow(),
+            ["capture", "wait", "pause", "capture", "wait"]
+        );
+    }
+
+    #[test]
+    fn a_live_child_must_recover_its_identity() {
+        let mut captures = 0;
+        let calls = std::cell::RefCell::new(Vec::new());
+        let identity = capture_owned_identity(
+            || {
+                calls.borrow_mut().push("capture");
+                captures += 1;
+                if captures == 1 {
+                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                } else {
+                    Ok(42)
+                }
+            },
+            || {
+                calls.borrow_mut().push("wait");
+                Ok(false)
+            },
+            || {
+                calls.borrow_mut().push("pause");
+                Ok(())
+            },
+            || panic!("a captured live child must retain its owner"),
+        )
+        .unwrap();
+        assert_eq!(identity, Some(42));
+        assert_eq!(*calls.borrow(), ["capture", "wait", "pause", "capture"]);
+    }
+
+    #[test]
+    fn failed_identity_recovery_is_bounded_and_releases_the_child() {
+        let captures = std::cell::Cell::new(0);
+        let waits = std::cell::Cell::new(0);
+        let pauses = std::cell::Cell::new(0);
+        let releases = std::cell::Cell::new(0);
+        let error = capture_owned_identity::<u32>(
+            || {
+                captures.set(captures.get() + 1);
+                Err(io::Error::from_raw_os_error(if captures.get() == 1 {
+                    libc::ESRCH
+                } else {
+                    libc::EACCES
+                }))
+            },
+            || {
+                waits.set(waits.get() + 1);
+                Ok(false)
+            },
+            || {
+                pauses.set(pauses.get() + 1);
+                Ok(())
+            },
+            || releases.set(releases.get() + 1),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(captures.get(), 21);
+        assert_eq!(waits.get(), 21);
+        assert_eq!(pauses.get(), 20);
+        assert_eq!(releases.get(), 1);
+    }
+
+    #[test]
+    fn the_final_recovery_poll_retains_an_exit_status() {
+        let mut waits = 0;
+        let identity = capture_owned_identity::<u32>(
+            || Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            || {
+                waits += 1;
+                Ok(waits == 21)
+            },
+            || Ok(()),
+            || panic!("the caller must retain the final exit status"),
+        )
+        .unwrap();
+        assert_eq!(identity, None);
+        assert_eq!(waits, 21);
+    }
+
+    #[test]
+    fn identity_recovery_releases_on_wait_failure_or_cancellation() {
+        for cancel_during_pause in [false, true] {
+            let releases = std::cell::Cell::new(0);
+            let error = capture_owned_identity::<u32>(
+                || Err(io::Error::from_raw_os_error(libc::ESRCH)),
+                || {
+                    if cancel_during_pause {
+                        Ok(false)
+                    } else {
+                        Err(io::Error::from_raw_os_error(libc::EPIPE))
+                    }
+                },
+                || Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+                || releases.set(releases.get() + 1),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancel_during_pause {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::BrokenPipe
+                }
+            );
+            assert_eq!(releases.get(), 1);
+        }
+    }
 
     fn sized_frame(bytes: usize) -> Command {
         let command = |units| {

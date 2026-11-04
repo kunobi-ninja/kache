@@ -136,7 +136,15 @@ fn unique_id(pid: u32) -> io::Result<u64> {
     let size = std::mem::size_of::<UniqueInfo>() as i32;
     let read = unsafe { libc::proc_pidinfo(pid as i32, 17, 0, info.as_mut_ptr().cast(), size) };
     if read != size {
-        return Err(io::Error::other("cannot read compiler process identity"));
+        let error = io::Error::last_os_error();
+        let message = format!(
+            "cannot read compiler process identity: proc_pidinfo returned {read} of {size} bytes"
+        );
+        return Err(if read == 0 {
+            io::Error::new(error.kind(), format!("{message}: {error}"))
+        } else {
+            io::Error::new(io::ErrorKind::InvalidData, message)
+        });
     }
     Ok(unsafe { info.assume_init() }.unique)
 }

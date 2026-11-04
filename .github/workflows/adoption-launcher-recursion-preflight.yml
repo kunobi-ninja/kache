@@ -1,0 +1,122 @@
+name: Adoption preflight (1809 launcher recursion)
+
+on:
+  push:
+    branches: [review-contribution/preflight-1809-launcher]
+    paths:
+      - .github/workflows/adoption-launcher-recursion-preflight.yml
+      - scripts/adoption/launcher-recursion-controls.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adoption-1809-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Launcher preflight (${{ matrix.platform }})
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1809-launcher'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-latest
+            install_args: ""
+          - platform: macOS
+            runner: macos-latest
+            install_args: rust
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTC_WORKSPACE_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      SOURCE_HEAD: aa1a9a04805684f72f4ed10fbd2b2cf7dbfc1f7e
+      SOURCE_TREE: 3d1b6548e06eb80a7b0b34a7300c1378074906d7
+    steps:
+      - name: Require a disposable hosted runner
+        working-directory: ${{ github.workspace }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          {
+            printf 'CARGO_TARGET_DIR=%s/adoption-1809-target\n' "$RUNNER_TEMP"
+            printf 'EVIDENCE_DIR=%s/adoption-1809-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+      - name: Check out the maintainer validation helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify source and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          {
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } | tee "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: ${{ matrix.install_args }}
+          cache: false
+      - name: Run just check and documentation checks
+        if: matrix.platform == 'Linux'
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs.log"
+          python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-regressions.log"
+      - name: Verify that removing each protection fails its regression
+        if: matrix.platform == 'Linux'
+        run: python3 ../scripts/adoption/launcher-recursion-controls.py
+      - name: Run native launcher and publication regressions on macOS
+        if: matrix.platform == 'macOS'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kache --lib build_script::tests:: 2>&1 | tee "$EVIDENCE_DIR/macos-build-scripts.log"
+          cargo test --locked -p kache --lib wrapper::tests::build_script_store_inputs_are_frozen_before_another_install_replaces_them -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/macos-publication.log"
+      - name: Verify that the candidate was restored
+        if: always()
+        run: git diff --exit-code
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: adoption-1809-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

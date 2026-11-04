@@ -10055,9 +10055,9 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
     // the store write lock so a concurrent publisher/remover cannot create a
     // transient mismatch, and rebuild them atomically when requested (#819).
     let index_drift = if repair {
-        // Dropping, not strict: an entry whose meta.json cannot be parsed is
-        // one `remove_entry` above refuses to touch (#276), and a strict
-        // rebuild would then refuse the whole store because of it.
+        // Dropping, not strict: corrupt metadata without an entry_blobs
+        // mapping still makes `remove_entry` refuse removal (#276), and a
+        // strict rebuild would then refuse the whole store because of it.
         match store.reconcile_blob_index_dropping_unverifiable() {
             Ok((drift, dropped)) => {
                 // A corrupted entry `remove_entry` refused is gone now too.

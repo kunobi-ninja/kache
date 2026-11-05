@@ -31,8 +31,8 @@ jobs:
       RUSTC_WORKSPACE_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: 6cb995c94ec82884733d6a62ba65e8482513d03b
-      SOURCE_TREE: 48a20fcbe3f59bf5bf2c12b84173966de450ad11
+      SOURCE_HEAD: c0ce5c44ef2a8f6afdf2d74c8ab9173a9cbf909c
+      SOURCE_TREE: 1dacbda5cfba6b8b894715a338cee858ee7c9f43
       VALIDATION_RUST: 1.99.1-x86_64-pc-windows-msvc
     steps:
       - name: Require a disposable hosted Windows runner
@@ -158,8 +158,8 @@ jobs:
       RUSTC_WORKSPACE_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      SOURCE_HEAD: ef2b2f6d0b15fde7364bd7957b47cf43f06317ab
-      SOURCE_TREE: 069bbcbd5459ab6009ad27c0af1008075fd17592
+      SOURCE_HEAD: 49a59e16830799f48530c1e699603ebede77d7bd
+      SOURCE_TREE: f1171071f2a94de7887a0cf79691516a2256bf2a
       VALIDATION_RUST: 1.99.1-aarch64-apple-darwin
     steps:
       - name: Require a disposable hosted ARM64 macOS runner

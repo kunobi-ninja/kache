@@ -598,6 +598,10 @@ fn report_main_error(error: &anyhow::Error) -> u8 {
 fn run_main() -> Result<()> {
     // Recover frontend timing before configuration, logging or worker threads.
     let entry = kache_client::engine_entry(std::env::args_os().collect(), VERSION)?;
+    // Windows frontends already try the daemon, bootstrap it, then retry before
+    // forwarding here. A local fallback must not repeat that startup budget.
+    let daemon_attempted =
+        frontend_completed_daemon_attempt(cfg!(windows), entry.frontend.is_some());
     opcounts::mark_process_start_at(entry.started_at);
     if let Some(frontend) = entry.frontend {
         platform::set_frontend_image(frontend)?;
@@ -680,7 +684,7 @@ fn run_main() -> Result<()> {
                 "compiler wrapper arguments contain non-UTF-8 bytes and cannot be cached safely"
             );
         }
-        return run_wrapper_mode(&shim_args);
+        return run_wrapper_mode(&shim_args, daemon_attempted);
     }
 
     let log_mode = detect_log_mode(detection_args);
@@ -692,7 +696,7 @@ fn run_main() -> Result<()> {
 
     if is_wrapper {
         if let Some(env_args) = env_args {
-            return run_wrapper_mode(&env_args[1..]);
+            return run_wrapper_mode(&env_args[1..], daemon_attempted);
         }
         anyhow::bail!(
             "compiler wrapper arguments contain non-UTF-8 bytes and cannot be cached safely"
@@ -1454,7 +1458,7 @@ enum WrapperTarget {
     Nvcc,
 }
 
-fn run_wrapper_mode(args: &[String]) -> Result<()> {
+fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
     let context = invocation::InvocationContext {
         daemon: None,
         env: invocation::InvocationEnv::capture(),
@@ -1475,30 +1479,27 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     #[cfg(any(unix, windows))]
     let config = if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         let config = config::Config::load_for(&context.env)?;
-        if let Some(exit) = invocation::execution::try_execute_with_trust(
-            &config.socket_path(),
-            args,
-            &context,
-            config.trust_daemon_execution,
+        if let Some(exit) = try_wrapper_daemon(
+            daemon_attempted,
+            || {
+                invocation::execution::try_execute_with_trust(
+                    &config.socket_path(),
+                    args,
+                    &context,
+                    config.trust_daemon_execution,
+                )
+            },
+            || {
+                // The coordinator checks a held run lock's owner and version
+                // before replacing a daemon left by an earlier release.
+                if cfg!(test) || config.disabled {
+                    Ok(false)
+                } else {
+                    daemon::start(&config).map(|_| true)
+                }
+            },
         )? {
             std::process::exit(exit);
-        }
-        // A held run lock can belong to the release we just upgraded from.
-        // The coordinator checks its version and drains it before replacing it.
-        if !cfg!(test) && !config.disabled {
-            match daemon::start(&config) {
-                Ok(_) => {
-                    if let Some(exit) = invocation::execution::try_execute_with_trust(
-                        &config.socket_path(),
-                        args,
-                        &context,
-                        config.trust_daemon_execution,
-                    )? {
-                        std::process::exit(exit);
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "compiler daemon did not start"),
-            }
         }
         Some(config)
     } else {
@@ -1508,6 +1509,35 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     let config = None;
     let exit = run_compiler_invocation_with_config(args, context, config)?;
     std::process::exit(exit);
+}
+
+fn frontend_completed_daemon_attempt(windows: bool, forwarded: bool) -> bool {
+    windows && forwarded
+}
+
+/// A frontend's unsuccessful handoff permits local execution, not another
+/// startup attempt in its companion engine. Errors from a committed request
+/// must still reach the caller without running that compiler again.
+#[cfg(any(unix, windows))]
+fn try_wrapper_daemon(
+    already_attempted: bool,
+    mut execute: impl FnMut() -> Result<Option<i32>>,
+    start: impl FnOnce() -> Result<bool>,
+) -> Result<Option<i32>> {
+    if already_attempted {
+        return Ok(None);
+    }
+    if let Some(exit) = execute()? {
+        return Ok(Some(exit));
+    }
+    match start() {
+        Ok(true) => execute(),
+        Ok(false) => Ok(None),
+        Err(error) => {
+            tracing::debug!(%error, "compiler daemon did not start");
+            Ok(None)
+        }
+    }
 }
 
 /// Decide whether raw argv can enter the compiler pipeline without probing a
@@ -1841,6 +1871,140 @@ fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn frontend_provenance_keeps_each_platforms_startup_policy() {
+        for (windows, forwarded, expected_attempts, expected_starts) in [
+            (true, true, 0, 0),
+            (true, false, 2, 1),
+            (false, true, 2, 1),
+            (false, false, 2, 1),
+        ] {
+            let mut attempts = 0;
+            let mut starts = 0;
+            let result = try_wrapper_daemon(
+                frontend_completed_daemon_attempt(windows, forwarded),
+                || {
+                    attempts += 1;
+                    Ok(None)
+                },
+                || {
+                    starts += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(result, None);
+            assert_eq!(attempts, expected_attempts, "{windows} {forwarded}");
+            assert_eq!(starts, expected_starts, "{windows} {forwarded}");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn engine_fallback_does_not_repeat_the_frontends_startup_budget() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let attempts = Cell::new(0);
+        let starts = Cell::new(0);
+        let waited = Cell::new(Duration::ZERO);
+        let execute = || {
+            attempts.set(attempts.get() + 1);
+            Ok(None)
+        };
+        let start = || {
+            starts.set(starts.get() + 1);
+            // Simulate an unavailable daemon consuming its complete startup
+            // budget. No clock or slow process is needed to expose duplication.
+            waited.set(waited.get() + Duration::from_secs(8));
+            Ok(true)
+        };
+        assert_eq!(try_wrapper_daemon(false, execute, start).unwrap(), None);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(waited.get(), Duration::from_secs(8));
+
+        assert_eq!(try_wrapper_daemon(true, execute, start).unwrap(), None);
+        assert_eq!(attempts.get(), 2, "the engine must run locally now");
+        assert_eq!(starts.get(), 1, "the engine must not bootstrap again");
+        assert_eq!(waited.get(), Duration::from_secs(8));
+
+        // The decision belongs to this invocation. A later frontend or a
+        // direct engine invocation must still get its own recovery attempt.
+        assert_eq!(try_wrapper_daemon(false, execute, start).unwrap(), None);
+        assert_eq!(attempts.get(), 4);
+        assert_eq!(starts.get(), 2);
+        assert_eq!(waited.get(), Duration::from_secs(16));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn daemon_handoff_preserves_warm_and_recovered_compiler_exit_codes() {
+        assert_eq!(
+            try_wrapper_daemon(false, || Ok(Some(23)), || panic!("warm daemon")).unwrap(),
+            Some(23)
+        );
+        let mut exits = [None, Some(17)].into_iter();
+        assert_eq!(
+            try_wrapper_daemon(false, || Ok(exits.next().unwrap()), || Ok(true)).unwrap(),
+            Some(17)
+        );
+        assert!(exits.next().is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn committed_compiler_errors_never_retry_or_fall_back() {
+        for fail_after_start in [false, true] {
+            let mut attempts = 0;
+            let mut starts = 0;
+            let error = try_wrapper_daemon(
+                false,
+                || {
+                    attempts += 1;
+                    if fail_after_start && attempts == 1 {
+                        Ok(None)
+                    } else {
+                        anyhow::bail!("committed compiler disconnected")
+                    }
+                },
+                || {
+                    starts += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "committed compiler disconnected");
+            assert_eq!(attempts, if fail_after_start { 2 } else { 1 });
+            assert_eq!(starts, usize::from(fail_after_start));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disabled_or_failed_startup_keeps_the_local_fallback() {
+        for failed in [false, true] {
+            let mut attempts = 0;
+            let result = try_wrapper_daemon(
+                false,
+                || {
+                    attempts += 1;
+                    Ok(None)
+                },
+                || {
+                    if failed {
+                        anyhow::bail!("service startup failed")
+                    }
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            assert_eq!(result, None);
+            assert_eq!(attempts, 1);
+        }
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn original_compiler_requests_use_only_the_supplied_arguments_and_environment() {

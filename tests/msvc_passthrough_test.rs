@@ -44,7 +44,7 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
     );
 
     let cache = dir.path().join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
     let config = dir.path().join("kache.toml");
     fs::write(&config, "").unwrap();
     let args = [
@@ -89,19 +89,58 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
             assert_eq!(fs::read_to_string(&log).unwrap(), expected, "{mode}");
         }
     }
-    // Starting the daemon creates its store even for uncached compilers.
+    // Stop the fixture's background work before inspecting the index. A
+    // passthrough can initialize hash memos without creating entry tables.
+    drop(daemon);
+    assert_eq!(
+        cache_entry_count(&cache).unwrap(),
+        0,
+        "MSVC must not publish a cache entry"
+    );
+}
+
+fn cache_entry_count(cache: &std::path::Path) -> rusqlite::Result<i64> {
     let index = cache.join("index.db");
-    let entries: i64 = if index.is_file() {
-        let index = rusqlite::Connection::open_with_flags(
-            index,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    if !index.is_file() {
+        return Ok(0);
+    }
+    let index =
+        rusqlite::Connection::open_with_flags(index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_entries: bool = index.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_entries {
+        return Ok(0);
+    }
+    index.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+}
+
+#[test]
+fn entry_count_accepts_memo_only_indexes_but_preserves_rows_and_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path();
+    let path = cache.join("index.db");
+    assert_eq!(cache_entry_count(cache).unwrap(), 0);
+    assert!(!path.exists(), "observation must not create an index");
+
+    let index = rusqlite::Connection::open(&path).unwrap();
+    index
+        .execute_batch("CREATE TABLE file_hash_memo (path TEXT PRIMARY KEY, digest TEXT)")
+        .unwrap();
+    assert_eq!(cache_entry_count(cache).unwrap(), 0);
+    index
+        .execute_batch(
+            "CREATE TABLE entries (cache_key TEXT PRIMARY KEY);
+             INSERT INTO entries VALUES ('first'), ('second');",
         )
         .unwrap();
-        index
-            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
-            .unwrap()
-    } else {
-        0
-    };
-    assert_eq!(entries, 0, "MSVC must not publish a cache entry");
+    assert_eq!(cache_entry_count(cache).unwrap(), 2);
+    index.execute("DELETE FROM entries", []).unwrap();
+    assert_eq!(cache_entry_count(cache).unwrap(), 0);
+    drop(index);
+
+    fs::write(path, b"not a SQLite database").unwrap();
+    assert!(cache_entry_count(cache).is_err());
 }

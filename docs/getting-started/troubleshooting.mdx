@@ -41,6 +41,34 @@ wrapper. For C/C++, check that `kache doctor` reports the compiler shims as
 active in that shell, or that `CC`/`CXX` name Kache as in the
 [prefix method](/docs/getting-started/c-cpp#prefix-method).
 
+## A build-script launcher cannot locate kache-engine
+
+If a build script fails with `locating kache-engine; reinstall both Kache
+binaries together`, check the executable path in the error. For an ordinary
+Kache installation, reinstall the client and engine together.
+
+For a path inside a Cargo target's `.kache-build-script-shims/` directory,
+the current release's recovery is to stop its builds and programs, then use
+the package cleanup below.
+
+Source builds and the next release also provide a repair command that keeps
+the compiled scripts. Stop that target's builds and programs, then run:
+
+```sh
+kache doctor --repair-build-scripts target
+cargo build
+```
+
+Use the actual target directory if `CARGO_TARGET_DIR` points elsewhere. On
+Linux and macOS, this command validates Kache's launcher records and preserved
+scripts, holds Cargo's profile locks, and switches the records to a new copy of
+the installed engine. It leaves the old runtime pins and real scripts intact.
+`kache init` configures future builds; it does not refresh existing runtime pins.
+
+If validation reports a missing or invalid preserved script, use the package
+cleanup below. Do not copy a client or symlink an arbitrary engine into an old
+runtime pin: the client and engine must come from the same release.
+
 ## Repair an invalid build-script launcher
 
 For a missing or invalid preserved build script, or a recursive chain of Kache

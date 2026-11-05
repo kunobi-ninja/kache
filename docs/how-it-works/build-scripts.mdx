@@ -30,6 +30,15 @@ keep running the copy they were installed with
 until their script is rebuilt or the target directory is cleaned. If that copy
 is gone, the launcher runs the script directly, uncached.
 
+Source builds and the next release support refreshing existing runtime pins
+without rebuilding scripts. Stop that target's builds and programs and run
+`kache doctor --repair-build-scripts target`.
+The command validates each Kache launcher and its preserved script, locks the
+Cargo profiles, then atomically switches each record to a new engine copy.
+Old runtime pins and preserved scripts are kept. It refuses foreign or corrupt
+records; those need a package rebuild. See
+[A build-script launcher cannot locate kache-engine](/docs/getting-started/troubleshooting#a-build-script-launcher-cannot-locate-kache-engine).
+
 Launcher installation is serialized within each build-script directory. If its
 lock is unavailable, Kache leaves the compiler's executable in place and skips
 installation. A launcher found where the preserved script should be stops with

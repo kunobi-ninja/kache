@@ -187,6 +187,10 @@ enum Commands {
         #[arg(long)]
         repair: bool,
 
+        /// Refresh build-script runtime pins in this idle Cargo target directory
+        #[arg(long, value_name = "TARGET_DIR", conflicts_with_all = ["fix", "purge_sccache", "verify", "checksums", "repair", "probe"])]
+        repair_build_scripts: Option<std::path::PathBuf>,
+
         /// Compile a temporary Rust library and verify a local cache hit (no remote access)
         #[arg(long)]
         probe: bool,

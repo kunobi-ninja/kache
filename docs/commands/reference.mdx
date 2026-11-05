@@ -7,7 +7,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 
 Human output uses section headings, aligned values and status colors. Colors are disabled when stdout is redirected, `NO_COLOR` is nonempty, or `TERM=dumb`. Long summary notes wrap to the terminal width; paths remain complete.
 
-`--json` emits one versioned JSON document for `init`, `list`, `stats`, `report`, `clean`, `gc`, `doctor`, `explain`, `diff`, `targets`, and `daemon status`. It works before or after the command. Use `init --json --check` to preview setup, or `init --json --yes` to apply it without prompts. `init --shims` has no JSON form. `doctor --json` only reports; combined with `--fix`, `--purge-sccache`, `--verify`, `--checksums` or `--repair` it exits with an error.
+`--json` emits one versioned JSON document for `init`, `list`, `stats`, `report`, `clean`, `gc`, `doctor`, `explain`, `diff`, `targets`, and `daemon status`. It works before or after the command. Use `init --json --check` to preview setup, or `init --json --yes` to apply it without prompts. `init --shims` has no JSON form. `doctor --json` only reports; combined with `--fix`, `--purge-sccache`, `--verify`, `--checksums`, `--repair` or `--repair-build-scripts` it exits with an error.
 
 `clean --json` and `clean --units --json` preview target removal unless `--yes` is also present. A target `clean --json --yes` could not remove is listed under `failed` with its `reason`; the document then has `success: false` and an `error`, and the command exits 1. The cache forms preview with `--dry-run`: the document has `preview`, `entries`, `bytes` and `message`. `clean --cache --json` and `clean --crate <name> --json` are refused even with `--yes`. `clean --cache --stale <age> --json` and `clean --cache --stale-schema --json` evict at once and print the `gc` fields.
 
@@ -217,6 +217,7 @@ kache doctor --repair
 - `--probe` compiles a small Rust library, removes its output, then checks that the second invocation restores identical bytes without running the compiler. It uses an isolated temporary cache and configuration, never accesses the remote, and removes its files afterwards. Each wrapped invocation has a 30-second deadline. It can also run with `--json`; findings appear in `checks` and `issues`.
 - `--checksums` also hashes blob contents and implies `--verify`.
 - `--repair` removes corrupted entries, reconciles the index with the entries on disk, reclaims orphan blobs, prunes stale C/C++ memos, input predictions and old file hashes, and compacts a large, sparse index when disk space allows. It implies `--verify`.
+- `--repair-build-scripts <TARGET_DIR>` is available in source builds and the next release on Linux and macOS. It validates an idle Cargo target's Kache launchers and preserved scripts, holds Cargo's profile locks, then atomically retargets their records to a new copy of the current engine. Old pins and real scripts are kept. It runs separately from the other doctor actions and has no JSON form. For current releases, use the [package cleanup](/docs/getting-started/troubleshooting#repair-an-invalid-build-script-launcher).
 
 `--purge-sccache` and `--repair` delete data. Check what they will remove before running them.
 

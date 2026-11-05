@@ -951,6 +951,7 @@ impl ReceiptAcceptance {
             .env("KACHE_REAL_CARGO", env!("CARGO"))
             .env("KACHE_TARGET_LIVENESS", if enabled { "1" } else { "0" })
             .env("KACHE_AUTO_GC", "0")
+            .env("KACHE_LOG", "kache::target_processes=debug")
             .env("RECEIPT_BUILD_VALUE", environment)
             .output()
             .unwrap();
@@ -1043,7 +1044,7 @@ impl ReceiptAcceptance {
             .chain(flags.iter().copied())
             .collect();
         let output = self.run(&args, true, environment);
-        let parsed = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        let parsed: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(
                 "cannot parse clean output: {error}\nstatus: {}\nstdout:\n{}\nstderr:\n{}\nfixture: {}",
                 output.status,
@@ -1052,6 +1053,17 @@ impl ReceiptAcceptance {
                 self.receipt_diagnostics(),
             )
         });
+        if parsed["targets"].as_array().is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| target["plan"]["status"] == "busy")
+        }) {
+            eprintln!(
+                "clean reported a busy target: {}\nflags: {flags:?}\nstderr:\n{}",
+                self.target.display(),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
         (output, parsed)
     }
 

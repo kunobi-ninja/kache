@@ -29,7 +29,8 @@
 //! - Before, a unit's fingerprint is `<profile>/.fingerprint/<pkg>-<hash>/`,
 //!   a build script's directory `<profile>/build/<pkg>-<hash>/`, and its
 //!   outputs are named `<crate>-<hash>…` in `deps/` and `examples/`. A file
-//!   there goes only when both its hash and its crate name match the unit.
+//!   there goes only when its hash matches the unit and its name matches the
+//!   unit's crate or one of the targets its fingerprint records.
 //!
 //! Every lock Cargo takes in a profile directory is held while its units are
 //! removed, so a build waits rather than lose a unit it just found fresh. The
@@ -166,8 +167,13 @@ impl Unit {
                     profile.join("build").join(&named),
                 ];
                 let crate_name = package.replace('-', "_");
+                let targets = target_names(&self.fingerprint());
                 for (stem, path) in outputs.get(hash).into_iter().flatten() {
-                    if stem.strip_prefix("lib").unwrap_or(stem) == crate_name || *stem == crate_name
+                    if stem.strip_prefix("lib").unwrap_or(stem) == crate_name
+                        || *stem == crate_name
+                        || targets.iter().any(|name| {
+                            stem.strip_prefix("lib").unwrap_or(stem) == name || stem == name
+                        })
                     {
                         parts.push(path.clone());
                     }
@@ -176,6 +182,34 @@ impl Unit {
             }
         }
     }
+}
+
+/// The targets a shared-layout `fingerprint` records, named as their output
+/// files are, with `-` as `_`. Each target has a `<flavor><kind>-<target>.json`
+/// file there: `test-integration-test-my-it.json` gives `my_it`. An
+/// unreadable fingerprint gives none.
+fn target_names(fingerprint: &Path) -> Vec<String> {
+    entries(fingerprint)
+        .iter()
+        .filter_map(|file| {
+            let name = file_name(file);
+            let name = name.strip_suffix(".json")?;
+            let name = ["test-", "doc-", "run-"]
+                .iter()
+                .find_map(|flavor| name.strip_prefix(flavor))
+                .unwrap_or(name);
+            let kinds = [
+                "lib-",
+                "bin-",
+                "integration-test-",
+                "example-",
+                "bench-",
+                "build-script-",
+            ];
+            let target = kinds.iter().find_map(|kind| name.strip_prefix(kind))?;
+            Some(target.replace('-', "_"))
+        })
+        .collect()
 }
 
 /// A shared layout's `deps/` and `examples/` entries by the hash in their
@@ -907,6 +941,219 @@ mod tests {
             hyphenated
                 .parts(&outputs(&profile))
                 .contains(&profile.join(format!("deps/libproc_macro2-{NEW}.rlib")))
+        );
+    }
+
+    /// Unit hashes of package `quine-bin` from a real pre-1.100 build: the
+    /// integration tests `it` and `my-it`, the `[[bin]] quine`, the example
+    /// `ex-one` and the library.
+    const IT: &str = "64af9ab1c1773faf";
+    const MY_IT: &str = "f0b78e97f798958b";
+    const BIN: &str = "329664fb96dc80be";
+    const EXAMPLE: &str = "6b99befd73183126";
+    const LIB: &str = "44154d820ebe8be3";
+
+    /// A shared-layout profile laid out as Cargo 1.99 builds `quine-bin`, with
+    /// an output of another crate that happens to carry `IT`.
+    fn named_targets_profile(profile: &Path) {
+        for (hash, file) in [
+            (IT, "test-integration-test-it"),
+            (MY_IT, "test-integration-test-my-it"),
+            (BIN, "bin-quine"),
+            (EXAMPLE, "example-ex-one"),
+            (LIB, "lib-quine_bin"),
+        ] {
+            let fingerprint = profile.join(format!(".fingerprint/quine-bin-{hash}"));
+            for name in [
+                format!("dep-{file}"),
+                "invoked.timestamp".into(),
+                file.into(),
+                format!("{file}.json"),
+            ] {
+                write(&fingerprint.join(name), "fp");
+            }
+        }
+        for output in [
+            format!("deps/it-{IT}"),
+            format!("deps/it-{IT}.d"),
+            format!("deps/it-{IT}.it.510195681e19be85-cgu.00.rcgu.dwo"),
+            format!("deps/libother-{IT}.rlib"),
+            format!("deps/my_it-{MY_IT}"),
+            format!("deps/my_it-{MY_IT}.d"),
+            format!("deps/quine-{BIN}"),
+            format!("deps/quine-{BIN}.d"),
+            format!("examples/ex_one-{EXAMPLE}"),
+            format!("examples/ex_one-{EXAMPLE}.d"),
+            format!("examples/ex_one-{EXAMPLE}.ex_one.2f1e3a1c5b0d9e87-cgu.0.rcgu.o"),
+            "examples/ex-one".into(),
+            "examples/ex-one.d".into(),
+            format!("deps/libquine_bin-{LIB}.rlib"),
+            format!("deps/libquine_bin-{LIB}.rmeta"),
+            format!("deps/quine_bin-{LIB}.d"),
+        ] {
+            write(&profile.join(output), "output");
+        }
+    }
+
+    #[test]
+    fn a_shared_unit_owns_the_outputs_of_targets_named_apart_from_its_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        named_targets_profile(&profile);
+        let outputs = outputs(&profile);
+        let parts = |hash: &str, files: &[String]| {
+            let unit = unit_named(&profile, hash);
+            let named = format!("quine-bin-{hash}");
+            let mut expected = vec![
+                profile.join(".fingerprint").join(&named),
+                profile.join("build").join(&named),
+            ];
+            expected.extend(files.iter().map(|file| profile.join(file)));
+            assert_eq!(unit.parts(&outputs), expected, "{hash}");
+        };
+        parts(
+            IT,
+            &[
+                format!("deps/it-{IT}"),
+                format!("deps/it-{IT}.d"),
+                format!("deps/it-{IT}.it.510195681e19be85-cgu.00.rcgu.dwo"),
+            ],
+        );
+        parts(
+            MY_IT,
+            &[
+                format!("deps/my_it-{MY_IT}"),
+                format!("deps/my_it-{MY_IT}.d"),
+            ],
+        );
+        parts(
+            BIN,
+            &[format!("deps/quine-{BIN}"), format!("deps/quine-{BIN}.d")],
+        );
+        parts(
+            EXAMPLE,
+            &[
+                format!("examples/ex_one-{EXAMPLE}"),
+                format!("examples/ex_one-{EXAMPLE}.d"),
+                format!("examples/ex_one-{EXAMPLE}.ex_one.2f1e3a1c5b0d9e87-cgu.0.rcgu.o"),
+            ],
+        );
+        parts(
+            LIB,
+            &[
+                format!("deps/libquine_bin-{LIB}.rlib"),
+                format!("deps/libquine_bin-{LIB}.rmeta"),
+                format!("deps/quine_bin-{LIB}.d"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_target_name_matches_with_or_without_the_lib_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        // `md-5` names its library `md5`; a test may start with `lib`.
+        write(
+            &profile.join(format!(".fingerprint/md-5-{OLD}/lib-md5.json")),
+            "",
+        );
+        write(
+            &profile.join(format!(
+                ".fingerprint/quine-bin-{NEW}/test-integration-test-library.json"
+            )),
+            "",
+        );
+        for output in [
+            format!("deps/libmd5-{OLD}.rlib"),
+            format!("deps/md5-{OLD}.d"),
+            format!("deps/library-{NEW}"),
+        ] {
+            write(&profile.join(output), "output");
+        }
+        let outputs = outputs(&profile);
+        assert_eq!(
+            unit_named(&profile, OLD).parts(&outputs)[2..],
+            [
+                profile.join(format!("deps/libmd5-{OLD}.rlib")),
+                profile.join(format!("deps/md5-{OLD}.d")),
+            ]
+        );
+        assert_eq!(
+            unit_named(&profile, NEW).parts(&outputs)[2..],
+            [profile.join(format!("deps/library-{NEW}"))]
+        );
+    }
+
+    #[test]
+    fn target_names_come_from_json_files_of_a_known_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let fingerprint = dir.path().join("fp");
+        for file in [
+            "dep-test-integration-test-it",
+            "test-integration-test-it",
+            "invoked.timestamp",
+        ] {
+            write(&fingerprint.join(file), "fp");
+        }
+        assert!(target_names(&fingerprint).is_empty(), "only .json counts");
+        write(&fingerprint.join("test-integration-test-it.json"), "{}");
+        assert_eq!(target_names(&fingerprint), ["it"]);
+
+        let names = |file: &str| {
+            let fingerprint = dir.path().join(file);
+            write(&fingerprint.join(file), "{}");
+            target_names(&fingerprint)
+        };
+        assert_eq!(names("test-integration-test-my-it.json"), ["my_it"]);
+        assert_eq!(names("bin-quine.json"), ["quine"]);
+        assert_eq!(names("example-ex-one.json"), ["ex_one"]);
+        assert_eq!(names("test-bench-b.json"), ["b"]);
+        assert_eq!(names("test-lib-quine_bin.json"), ["quine_bin"]);
+        assert_eq!(names("doc-lib-quine_bin.json"), ["quine_bin"]);
+        assert_eq!(
+            names("run-build-script-build-script-build.json"),
+            ["build_script_build"]
+        );
+        assert!(names("test-unknown-x.json").is_empty(), "unknown kind");
+        assert!(names("unknown-x.json").is_empty(), "unknown kind");
+        assert!(target_names(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn removes_the_outputs_of_unused_targets_named_apart_from_their_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        named_targets_profile(&profile);
+        set_times(&profile, ago(60));
+        let window = Duration::from_secs(30 * DAY);
+        assert_eq!(judge(&cache, &target, window, ago(40)), Pruned::default());
+        // A build used the binary and the library after arming.
+        read_now(&unit_named(&profile, BIN));
+        read_now(&unit_named(&profile, LIB));
+        let now = SystemTime::now();
+        let expected = preview(&cache, &target, window, now);
+        assert_eq!((expected.units, expected.used), (3, 2));
+        assert_eq!(judge(&cache, &target, window, now), expected);
+        let left: Vec<_> = entries(&profile.join("deps"))
+            .iter()
+            .chain(&entries(&profile.join("examples")))
+            .map(|path| file_name(path))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                format!("libother-{IT}.rlib"),
+                format!("libquine_bin-{LIB}.rlib"),
+                format!("libquine_bin-{LIB}.rmeta"),
+                format!("quine-{BIN}"),
+                format!("quine-{BIN}.d"),
+                format!("quine_bin-{LIB}.d"),
+                // Cargo's unhashed copy belongs to no unit.
+                "ex-one".into(),
+                "ex-one.d".into(),
+            ]
         );
     }
 

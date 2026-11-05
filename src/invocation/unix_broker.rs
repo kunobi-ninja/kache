@@ -25,6 +25,8 @@ pub(crate) struct Broker {
     channel: Mutex<Channel>,
     env: InvocationEnv,
     jobserver: kache_ipc::jobserver::Descriptors,
+    /// Client child ids whose Release failed on a live channel.
+    unreleased: Mutex<Vec<u64>>,
 }
 
 struct Channel {
@@ -52,6 +54,7 @@ impl Broker {
             }),
             env,
             jobserver,
+            unreleased: Mutex::new(Vec::new()),
         }))
     }
 
@@ -184,23 +187,8 @@ impl Broker {
         let identity = match macos::Identity::capture(pid) {
             Ok(identity) => Some(identity),
             Err(error) => {
-                // An instant compiler may already be a zombie before its task
-                // port can be pinned. Its status remains owned by the client.
-                if matches!(
-                    self.call(Command::TryWait { id }, 0),
-                    Ok((
-                        Reply::Waited {
-                            status: Some(_),
-                            ..
-                        },
-                        _
-                    ))
-                ) {
-                    None
-                } else {
-                    let _ = self.done(Command::Release { id });
-                    return Err(error);
-                }
+                self.wait_after_identity_capture_failure(id, error)?;
+                None
             }
         };
         let mut files = files.into_iter();
@@ -225,10 +213,93 @@ impl Broker {
         })
     }
 
+    #[cfg(any(test, target_os = "macos"))]
+    fn wait_after_identity_capture_failure(&self, id: u64, error: io::Error) -> io::Result<()> {
+        let result = (|| {
+            // XNU can lose the process identity before wait reports its exit.
+            // Only a completed status makes an unpinned child safe to return.
+            for attempt in 0..50 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                super::process::check()?;
+                match self.call(Command::TryWait { id }, 0)?.0 {
+                    Reply::Waited {
+                        status: Some(_), ..
+                    } => return Ok(()),
+                    Reply::Waited { status: None, .. } => {}
+                    _ => return Err(io::Error::other("invalid native compiler wait response")),
+                }
+            }
+            Err(error)
+        })();
+        let Err(primary) = result else {
+            return Ok(());
+        };
+        // The client still owns this child when Release fails. Report that
+        // cleanup failure and keep the id so shutdown can retry it.
+        match self.done(Command::Release { id }) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => {
+                // A transport failure already shut the socket down. Keep the id
+                // only when another Release can still reach the client.
+                if release_can_be_retried(&cleanup) {
+                    self.unreleased
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(id);
+                }
+                Err(io::Error::new(
+                    primary.kind(),
+                    format!("{primary}; release of native compiler child {id} failed: {cleanup}"),
+                ))
+            }
+        }
+    }
+
     fn done(&self, command: Command) -> io::Result<()> {
         match self.call(command, 0)?.0 {
             Reply::Done => Ok(()),
             _ => Err(io::Error::other("invalid native compiler acknowledgement")),
+        }
+    }
+}
+
+/// `call` shuts the control socket down for transport and framing failures.
+/// Protocol errors leave it open, so Release can be retried.
+#[cfg(any(test, target_os = "macos"))]
+fn release_can_be_retried(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let pending = std::mem::take(
+            &mut *self
+                .unreleased
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        // Connection close reaps a child whose retry Release still fails.
+        for id in pending {
+            if let Err(error) = self.done(Command::Release { id }) {
+                tracing::warn!(
+                    %error,
+                    child_id = id,
+                    "native compiler release failed"
+                );
+            }
         }
     }
 }
@@ -621,6 +692,378 @@ mod tests {
                 ))
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn spawn_recovers_status_after_identity_capture_exit_race() {
+        let (broker, client) = pair();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Spawn { .. }
+                ));
+                // XNU PIDs cannot reach i32::MAX.
+                let reply = Reply::Spawned {
+                    id: 5,
+                    pid: i32::MAX as u32,
+                };
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                reader.get_mut().write_all(&bytes).unwrap();
+                for (expected, reply) in [
+                    (
+                        Command::TryWait { id: 5 },
+                        Reply::Waited {
+                            status: None,
+                            max_rss: 0,
+                        },
+                    ),
+                    (
+                        Command::TryWait { id: 5 },
+                        Reply::Waited {
+                            status: Some(7 << 8),
+                            max_rss: 99,
+                        },
+                    ),
+                    (
+                        Command::TryWait { id: 5 },
+                        Reply::Waited {
+                            status: Some(7 << 8),
+                            max_rss: 99,
+                        },
+                    ),
+                    (Command::Release { id: 5 }, Reply::Done),
+                ] {
+                    frame.clear();
+                    reader.read_line(&mut frame).unwrap();
+                    assert_eq!(serde_json::from_str::<Command>(&frame).unwrap(), expected);
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).unwrap();
+                }
+            });
+            let mut command = std::process::Command::new("/usr/bin/true");
+            command.current_dir("/");
+            let child = broker
+                .spawn(
+                    &command,
+                    Stdio {
+                        stdin: Stream::Null,
+                        stdout: Stream::Null,
+                        stderr: Stream::Null,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(child.inner, Inner::Remote { identity: None, .. }));
+            let (status, max_rss) = child.try_wait_remote().unwrap();
+            assert_eq!(status.unwrap().into_raw(), 7 << 8);
+            assert_eq!(max_rss, 99);
+            drop(child);
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn identity_capture_recovery_preserves_completed_status() {
+        for (pending, raw_status) in [(0, 0), (3, 7 << 8), (49, libc::SIGTERM)] {
+            let (broker, client) = pair();
+            std::thread::scope(|threads| {
+                let peer = threads.spawn(move || {
+                    let mut reader = BufReader::new(client);
+                    for attempt in 0..=pending {
+                        let mut frame = String::new();
+                        reader.read_line(&mut frame).unwrap();
+                        assert_eq!(
+                            serde_json::from_str::<Command>(&frame).unwrap(),
+                            Command::TryWait { id: 5 }
+                        );
+                        let reply = Reply::Waited {
+                            status: (attempt == pending).then_some(raw_status),
+                            max_rss: 99,
+                        };
+                        let mut bytes = serde_json::to_vec(&reply).unwrap();
+                        bytes.push(b'\n');
+                        reader.get_mut().write_all(&bytes).unwrap();
+                    }
+                    for (expected, reply) in [
+                        (
+                            Command::TryWait { id: 5 },
+                            Reply::Waited {
+                                status: Some(raw_status),
+                                max_rss: 99,
+                            },
+                        ),
+                        (Command::Release { id: 5 }, Reply::Done),
+                    ] {
+                        let mut frame = String::new();
+                        reader.read_line(&mut frame).unwrap();
+                        assert_eq!(serde_json::from_str::<Command>(&frame).unwrap(), expected);
+                        let mut bytes = serde_json::to_vec(&reply).unwrap();
+                        bytes.push(b'\n');
+                        reader.get_mut().write_all(&bytes).unwrap();
+                    }
+                });
+                broker
+                    .wait_after_identity_capture_failure(5, io::Error::other("identity failed"))
+                    .unwrap();
+                let child = Child {
+                    inner: Inner::Remote {
+                        id: 5,
+                        pid: 7,
+                        broker,
+                        #[cfg(target_os = "macos")]
+                        identity: None,
+                    },
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                };
+                let (status, max_rss) = child.try_wait_remote().unwrap();
+                let status = status.unwrap();
+                assert_eq!(status.into_raw(), raw_status);
+                assert_eq!(status.success(), raw_status == 0);
+                assert_eq!(
+                    status.code(),
+                    (raw_status != libc::SIGTERM).then_some(raw_status >> 8)
+                );
+                assert_eq!(
+                    status.signal(),
+                    (raw_status == libc::SIGTERM).then_some(libc::SIGTERM)
+                );
+                assert_eq!(max_rss, 99);
+                drop(child);
+                peer.join().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn identity_capture_recovery_exhaustion_releases_and_preserves_error() {
+        let (broker, client) = pair();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                #[cfg(target_os = "macos")]
+                {
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    assert!(matches!(
+                        serde_json::from_str::<Command>(&frame).unwrap(),
+                        Command::Spawn { .. }
+                    ));
+                    let reply = Reply::Spawned {
+                        id: 5,
+                        pid: i32::MAX as u32,
+                    };
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).unwrap();
+                }
+                for _ in 0..50 {
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Command>(&frame).unwrap(),
+                        Command::TryWait { id: 5 }
+                    );
+                    let reply = Reply::Waited {
+                        status: None,
+                        max_rss: 0,
+                    };
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).unwrap();
+                }
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Release { id: 5 }
+                );
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::to_string(&Reply::Done).unwrap()
+                )
+                .unwrap();
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            });
+            #[cfg(target_os = "macos")]
+            let error = {
+                let mut command = std::process::Command::new("/usr/bin/true");
+                command.current_dir("/");
+                broker
+                    .spawn(
+                        &command,
+                        Stdio {
+                            stdin: Stream::Null,
+                            stdout: Stream::Null,
+                            stderr: Stream::Null,
+                        },
+                    )
+                    .err()
+                    .unwrap()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let error = broker
+                .wait_after_identity_capture_failure(5, io::Error::other("identity failed"))
+                .unwrap_err();
+            #[cfg(target_os = "macos")]
+            let expected = macos::Identity::capture(i32::MAX as u32).err().unwrap();
+            #[cfg(not(target_os = "macos"))]
+            let expected = io::Error::other("identity failed");
+            assert_eq!(error.kind(), expected.kind());
+            assert_eq!(error.to_string(), expected.to_string());
+            drop(broker);
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn identity_capture_recovery_errors_stop_polling_and_cleanup() {
+        for (reply, kind, release) in [
+            (
+                Some("{\"operation_result\":\"done\"}\n"),
+                io::ErrorKind::Other,
+                true,
+            ),
+            (
+                Some("{\"operation_result\":\"failed\",\"os_error\":13,\"message\":\"denied\"}\n"),
+                io::ErrorKind::PermissionDenied,
+                true,
+            ),
+            (Some("malformed\n"), io::ErrorKind::InvalidData, false),
+            (None, io::ErrorKind::BrokenPipe, false),
+        ] {
+            let (broker, client) = pair();
+            std::thread::scope(|threads| {
+                let peer = threads.spawn(move || {
+                    let mut reader = BufReader::new(client);
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Command>(&frame).unwrap(),
+                        Command::TryWait { id: 5 }
+                    );
+                    let Some(reply) = reply else { return };
+                    reader.get_mut().write_all(reply.as_bytes()).unwrap();
+                    if release {
+                        frame.clear();
+                        reader.read_line(&mut frame).unwrap();
+                        assert_eq!(
+                            serde_json::from_str::<Command>(&frame).unwrap(),
+                            Command::Release { id: 5 }
+                        );
+                        reader
+                            .get_mut()
+                            .write_all(b"{\"operation_result\":\"done\"}\n")
+                            .unwrap();
+                    }
+                    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                });
+                let error = broker
+                    .wait_after_identity_capture_failure(5, io::Error::other("identity failed"))
+                    .unwrap_err();
+                assert_eq!(error.kind(), kind);
+                drop(broker);
+                peer.join().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn identity_capture_recovery_cancellation_releases_without_another_wait() {
+        let (broker, client) = pair();
+        let cancellation = super::super::process::Cancellation::default();
+        let _scope = super::super::process::CancellationScope::borrow(Some(cancellation.clone()));
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::TryWait { id: 5 }
+                );
+                cancellation.cancel();
+                let reply = Reply::Waited {
+                    status: None,
+                    max_rss: 0,
+                };
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                reader.get_mut().write_all(&bytes).unwrap();
+                frame.clear();
+                reader.read_line(&mut frame).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Release { id: 5 }
+                );
+                reader
+                    .get_mut()
+                    .write_all(b"{\"operation_result\":\"done\"}\n")
+                    .unwrap();
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            });
+            let error = broker
+                .wait_after_identity_capture_failure(5, io::Error::other("identity failed"))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            drop(broker);
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn identity_capture_recovery_reports_release_failure_and_retries_that_child() {
+        let (broker, client) = pair();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                for expected in [Command::TryWait { id: 5 }, Command::Release { id: 5 }] {
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    assert_eq!(serde_json::from_str::<Command>(&frame).unwrap(), expected);
+                    let reply = Reply::Failed {
+                        os_error: None,
+                        message: if matches!(expected, Command::TryWait { .. }) {
+                            "wait failed".into()
+                        } else {
+                            "release failed".into()
+                        },
+                    };
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    reader.get_mut().write_all(&bytes).unwrap();
+                }
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Release { id: 5 }
+                );
+                reader
+                    .get_mut()
+                    .write_all(b"{\"operation_result\":\"done\"}\n")
+                    .unwrap();
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            });
+            let error = broker
+                .wait_after_identity_capture_failure(5, io::Error::other("identity failed"))
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("wait failed"), "{message}");
+            assert!(message.contains("release failed"), "{message}");
+            assert!(message.contains("native compiler child 5"), "{message}");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            drop(broker);
             peer.join().unwrap();
         });
     }

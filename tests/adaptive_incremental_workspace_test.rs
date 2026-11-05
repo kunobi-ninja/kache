@@ -285,6 +285,41 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     );
 }
 
+/// The middle crate also builds a `staticlib` and `cdylib`, so Cargo gives it
+/// no extra filename. Edits to the library below it still put it in adaptive
+/// incremental mode: the first rebuild seeds its incremental state, and later
+/// rebuilds reuse it.
+#[test]
+fn an_unselected_cdylib_crate_seeds_then_stays_active() {
+    let checkout = tempfile::tempdir().unwrap();
+    let project = checkout_path(checkout.path());
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let target = project.join("target");
+    create_workspace(&project);
+    let manifest = project.join("mid/Cargo.toml");
+    let mut contents = fs::read_to_string(&manifest).unwrap();
+    contents.push_str("\n[lib]\ncrate-type = [\"lib\", \"staticlib\", \"cdylib\"]\n");
+    fs::write(&manifest, contents).unwrap();
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    let build = |mtime: Option<i64>, answer| {
+        build_unselected(&project, cache.path(), &target, mtime, answer)
+    };
+
+    let (_lib, mid) = build(None, 1);
+    assert_eq!(mid["result"], "miss", "event: {mid:#}");
+
+    let (_lib, mid) = build(Some(future), 2);
+    assert_passthrough(&mid, "adaptive seed");
+
+    let (_lib, mid) = build(Some(future + 1), 3);
+    assert_passthrough(&mid, "adaptive active");
+}
+
 /// A rustc that writes `$RACE_NEXT` over `$RACE_SOURCE` once, just before
 /// the compile of `$RACE_CRATE` reads it: a save that lands after Kache took
 /// the unit's key. The dep-info pre-pass passes `--emit dep-info` as two

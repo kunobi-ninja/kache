@@ -1,0 +1,288 @@
+name: Adoption oracle preflight (1817, 1821)
+
+on:
+  push:
+    branches: [review-contribution/preflight-1817-windows-oracle]
+    paths: [.github/workflows/adoption-1817-windows-oracle.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-oracle-1817-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  oracle:
+    name: Repeat the Windows concurrent cache-pipeline oracle
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1817-windows-oracle'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTC_WORKSPACE_WRAPPER: ""
+      CARGO_INCREMENTAL: "0"
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      SOURCE_HEAD: 6cb995c94ec82884733d6a62ba65e8482513d03b
+      SOURCE_TREE: 48a20fcbe3f59bf5bf2c12b84173966de450ad11
+      VALIDATION_RUST: 1.99.1-x86_64-pc-windows-msvc
+    steps:
+      - name: Require a disposable hosted Windows runner
+        working-directory: ${{ github.workspace }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_OS" = Windows
+          mkdir -p "$RUNNER_TEMP/windows-oracle-evidence"
+      - name: Check out the maintainer validation helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          {
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } | tee "$RUNNER_TEMP/windows-oracle-evidence/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - name: Install isolated Rust and run three exact oracle trials
+        timeout-minutes: 18
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/windows-oracle-evidence"
+          trusted_rustup="$(command -v rustup)"
+          export RUSTUP_HOME="$RUNNER_TEMP/windows-oracle-rustup"
+          export CARGO_HOME="$RUNNER_TEMP/windows-oracle-cargo"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/windows-oracle-target"
+          export RUSTUP_TOOLCHAIN="$VALIDATION_RUST"
+          mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+          "$trusted_rustup" toolchain install "$VALIDATION_RUST" --profile minimal --no-self-update \
+            2>&1 | tee "$evidence_dir/rustup-install.log"
+          rustc_windows="$("$trusted_rustup" which --toolchain "$VALIDATION_RUST" rustc)"
+          toolchain_bin="$(dirname "$(cygpath -u "$rustc_windows")")"
+          export PATH="$toolchain_bin:$PATH"
+          {
+            printf 'rustc_path=%s\n' "$(command -v rustc)"
+            printf 'cargo_path=%s\n' "$(command -v cargo)"
+            rustc -vV
+            cargo --version
+          } | tee "$evidence_dir/toolchain.txt"
+          rust_host="$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')"
+          rust_release="$(rustc -vV | sed -n 's/^release: //p' | tr -d '\r')"
+          test "$rust_host" = x86_64-pc-windows-msvc
+          test "$rust_release" = 1.99.1
+          printf 'trial\tcargo_exit\toracle_exit\n' > "$evidence_dir/exits.tsv"
+          failed=0
+          for trial in 1 2 3; do
+            log="$evidence_dir/trial-$trial.log"
+            set +e
+            cargo test --locked -p kache --all-features --test windows_execution_test \
+              concurrent_cache_pipelines_keep_each_clients_environment_and_store \
+              -- --exact --nocapture 2>&1 | tee "$log"
+            statuses=("${PIPESTATUS[@]}")
+            set -e
+            cargo_status="${statuses[0]}"
+            test "${statuses[1]}" -eq 0
+            oracle_status=0
+            if [ "$cargo_status" -ne 0 ] || ! grep -Fq 'test result: ok. 1 passed; 0 failed;' "$log"; then
+              oracle_status=1
+              failed=1
+              if [ ! -e "$evidence_dir/first-failure.log" ]; then
+                cp "$log" "$evidence_dir/first-failure.log"
+                printf '%s\t%s\t%s\n' "$trial" "$cargo_status" "$oracle_status" > "$evidence_dir/first-failure.tsv"
+              fi
+            fi
+            printf '%s\t%s\t%s\n' "$trial" "$cargo_status" "$oracle_status" | tee -a "$evidence_dir/exits.tsv"
+          done
+          exit "$failed"
+      - name: Verify the candidate was not changed
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          git diff --exit-code
+      - name: Upload oracle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-oracle-1817-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-oracle-evidence
+          retention-days: 7
+          if-no-files-found: error
+
+  macos:
+    name: Repeat the ARM64 frame boundary and process-guard regressions
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1817-windows-oracle'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTC_WORKSPACE_WRAPPER: ""
+      CARGO_INCREMENTAL: "0"
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      SOURCE_HEAD: ef2b2f6d0b15fde7364bd7957b47cf43f06317ab
+      SOURCE_TREE: 069bbcbd5459ab6009ad27c0af1008075fd17592
+      VALIDATION_RUST: 1.99.1-aarch64-apple-darwin
+    steps:
+      - name: Require a disposable hosted ARM64 macOS runner
+        working-directory: ${{ github.workspace }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_OS" = macOS
+          test "$(uname -m)" = arm64
+          mkdir -p "$RUNNER_TEMP/macos-oracle-evidence"
+      - name: Check out the maintainer validation helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          {
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } | tee "$RUNNER_TEMP/macos-oracle-evidence/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - name: Install isolated Rust and run focused macOS regressions
+        timeout-minutes: 18
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/macos-oracle-evidence"
+          trusted_rustup="$(command -v rustup)"
+          export RUSTUP_HOME="$RUNNER_TEMP/macos-oracle-rustup"
+          export CARGO_HOME="$RUNNER_TEMP/macos-oracle-cargo"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/macos-oracle-target"
+          export RUSTUP_TOOLCHAIN="$VALIDATION_RUST"
+          mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+          "$trusted_rustup" toolchain install "$VALIDATION_RUST" --profile minimal --no-self-update \
+            2>&1 | tee "$evidence_dir/rustup-install.log"
+          toolchain_bin="$(dirname "$("$trusted_rustup" which --toolchain "$VALIDATION_RUST" rustc)")"
+          export PATH="$toolchain_bin:$PATH"
+          {
+            printf 'rustc_path=%s\n' "$(command -v rustc)"
+            printf 'cargo_path=%s\n' "$(command -v cargo)"
+            rustc -vV
+            cargo --version
+          } | tee "$evidence_dir/toolchain.txt"
+          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+          rust_release="$(rustc -vV | sed -n 's/^release: //p')"
+          test "$rust_host" = aarch64-apple-darwin
+          test "$rust_release" = 1.99.1
+          printf 'phase\ttrial\tcargo_exit\toracle_exit\n' > "$evidence_dir/exits.tsv"
+          failed=0
+          run_trial() {
+            local phase="$1" trial="$2"
+            shift 2
+            local log="$evidence_dir/$phase-$trial.log"
+            local cargo_status oracle_status regression
+            local -a statuses
+            set +e
+            cargo test --locked -p kache --all-features --lib "$@" 2>&1 | tee "$log"
+            statuses=("${PIPESTATUS[@]}")
+            set -e
+            cargo_status="${statuses[0]}"
+            test "${statuses[1]}" -eq 0
+            oracle_status=0
+            if [ "$cargo_status" -ne 0 ]; then
+              oracle_status=1
+            elif [ "$phase" = frame ]; then
+              grep -Fq 'test result: ok. 1 passed; 0 failed;' "$log" || oracle_status=1
+            else
+              for regression in \
+                a_process_disappearing_before_its_first_maps_line_keeps_previous_paths \
+                a_process_disappearing_after_a_maps_line_keeps_its_observed_mapping \
+                other_maps_read_errors_still_reject_the_scan \
+                an_expired_maps_scan_still_fails_when_the_process_has_disappeared; do
+                grep -Fq "test target_processes::tests::$regression ... ok" "$log" || oracle_status=1
+              done
+            fi
+            if [ "$oracle_status" -ne 0 ]; then
+              failed=1
+              if [ ! -e "$evidence_dir/first-failure.log" ]; then
+                cp "$log" "$evidence_dir/first-failure.log"
+                printf '%s\t%s\t%s\t%s\n' "$phase" "$trial" "$cargo_status" "$oracle_status" > "$evidence_dir/first-failure.tsv"
+              fi
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$phase" "$trial" "$cargo_status" "$oracle_status" | tee -a "$evidence_dir/exits.tsv"
+          }
+          for trial in 1 2 3; do
+            run_trial frame "$trial" \
+              invocation::unix_broker::tests::frame_limit_accepts_the_boundary_and_rejects_larger_requests_before_writing \
+              -- --exact --nocapture
+          done
+          run_trial processes 1 target_processes::tests -- --nocapture
+          exit "$failed"
+      - name: Verify the candidate was not changed
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          git diff --exit-code
+      - name: Upload oracle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-oracle-1821-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/macos-oracle-evidence
+          retention-days: 7
+          if-no-files-found: error

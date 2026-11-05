@@ -65,37 +65,51 @@ fn native_aliases_forward_to_the_selected_driver_without_a_shell() {
         (env!("CARGO_BIN_EXE_kache-clang-cl"), "clang-cl"),
         (env!("CARGO_BIN_EXE_kache-cl"), "cl"),
     ] {
-        let launcher = root.join(PathBuf::from(binary).file_name().unwrap());
-        std::fs::copy(binary, &launcher).unwrap();
         let real = toolchain.join(format!("{driver}{}", std::env::consts::EXE_SUFFIX));
         std::fs::copy(std::env::current_exe().unwrap(), &real).unwrap();
-        let result = root.join(format!("{driver}-result"));
-        let output = command(&launcher, &root, &toolchain)
-            .args([
-                "--exact",
-                "native_driver_fixture",
-                "--ignored",
-                "--nocapture",
-                "--skip",
-                "source with spaces 日本語.c",
-            ])
-            .env("KACHE_LAUNCHER_RESULT", &result)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(37), "{driver}: {output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("compiler stdout"),
-            "{output:?}"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("compiler stderr"),
-            "{output:?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(result).unwrap(),
-            "native driver reached"
-        );
+        let original_name = PathBuf::from(binary);
+        for filename in [
+            original_name.file_name().unwrap(),
+            std::ffi::OsStr::new("KACHE-~1.EXE"),
+            std::ffi::OsStr::new("unexpected-launcher.exe"),
+        ] {
+            let launcher = root.join(filename);
+            std::fs::copy(binary, &launcher).unwrap();
+            let result = root.join(format!("{driver}-{}-result", filename.to_string_lossy()));
+            let mut invocation = command(&launcher, &root, &toolchain);
+            #[cfg(unix)]
+            if filename == "unexpected-launcher.exe" {
+                use std::os::unix::process::CommandExt;
+                invocation.arg0("unrelated-wrapper");
+            }
+            let output = invocation
+                .args([
+                    "--exact",
+                    "native_driver_fixture",
+                    "--ignored",
+                    "--nocapture",
+                    "--skip",
+                    "source with spaces 日本語.c",
+                ])
+                .env("KACHE_LAUNCHER_RESULT", &result)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(37), "{driver}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("compiler stdout"),
+                "{output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("compiler stderr"),
+                "{output:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(result).unwrap(),
+                "native driver reached"
+            );
+        }
         std::fs::remove_file(real).unwrap();
+        let launcher = root.join("KACHE-~1.EXE");
         let missing = command(&launcher, &root, &toolchain)
             .arg("--version")
             .output()
@@ -103,6 +117,14 @@ fn native_aliases_forward_to_the_selected_driver_without_a_shell() {
         assert!(!missing.status.success(), "{driver}: {missing:?}");
         assert!(
             String::from_utf8_lossy(&missing.stderr).contains(&format!("no real `{driver}`")),
+            "{missing:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).contains(if driver == "cl" {
+                "Visual Studio Developer Command Prompt"
+            } else {
+                "Install LLVM"
+            }),
             "{missing:?}"
         );
     }

@@ -2366,19 +2366,32 @@ pub(crate) mod shim {
         if !invoked_as_compiler_for(arg0, env) {
             return None;
         }
-        let name = kache_shims::compiler_launcher_driver(arg0)
-            .or_else(|| super::command_basename(arg0))?;
+        let launcher_driver = kache_shims::compiler_launcher_driver(arg0);
+        let name = launcher_driver.or_else(|| super::command_basename(arg0))?;
         let paths = env.var_os("PATH").unwrap_or_default();
         let paths = std::env::split_paths(&paths)
             .filter_map(|path| env.resolve(&path))
             .collect::<Vec<_>>();
         let Some(real) = resolve_real_compiler_on(name, &paths, executable) else {
-            return Some(Err(format!(
-                "kache was invoked through a compiler shim named `{name}`, but no real `{name}` \
-                 was found on PATH behind it. Every `{name}` on PATH resolves to kache itself, \
-                 so there is nothing to run. Check that the real toolchain is still on PATH \
-                 after the shim directory."
-            )));
+            let message = match launcher_driver {
+                Some("cl") => {
+                    "`kache-cl` found no real `cl` compiler on PATH. Open a Visual Studio \
+                    Developer Command Prompt or run its environment setup script, then retry."
+                        .to_owned()
+                }
+                Some(_) => {
+                    "`kache-clang-cl` found no real `clang-cl` compiler on PATH. Install LLVM \
+                    and add its bin directory to PATH, then retry."
+                        .to_owned()
+                }
+                None => format!(
+                    "kache was invoked through a compiler shim named `{name}`, but no real `{name}` \
+                     was found on PATH behind it. Every `{name}` on PATH resolves to kache itself, \
+                     so there is nothing to run. Check that the real toolchain is still on PATH \
+                     after the shim directory."
+                ),
+            };
+            return Some(Err(message));
         };
         let Some(real) = real.to_str() else {
             return Some(Err(format!(
@@ -2445,6 +2458,16 @@ mod shim_tests {
             std::fs::remove_file(&real).unwrap();
             let error = wrapper_args_for(&argv, &env, None).unwrap().unwrap_err();
             assert!(error.contains(&format!("no real `{driver}`")), "{error}");
+            assert!(error.contains(launcher), "{error}");
+            assert!(
+                error.contains(if driver == "cl" {
+                    "Visual Studio Developer Command Prompt"
+                } else {
+                    "Install LLVM"
+                }),
+                "{error}"
+            );
+            assert!(!error.contains("Every"), "{error}");
         }
     }
 

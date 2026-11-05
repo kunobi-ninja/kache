@@ -112,7 +112,7 @@ $env:CC = "kache-clang-cl"
 $env:CXX = "kache-clang-cl"
 ```
 
-Each launcher finds the real `clang-cl.exe` or `cl.exe` on `PATH` and forwards the compiler arguments without a shell. Keep the matching `kache-engine.exe` beside the launchers when installing manually. A full path to the launcher works when its installation directory contains spaces. The selected real compiler must still be on `PATH`.
+Each launcher finds the real `clang-cl.exe` or `cl.exe` on `PATH` and forwards the compiler arguments without a shell. Keep the matching `kache-engine.exe` beside the launchers when installing manually. A full path to the launcher works when its installation directory contains spaces, including when a build system substitutes a Windows short path. The launcher's compiler role stays the same if its executable is renamed. The selected real compiler must still be on `PATH`; run `kache-cl` from a Visual Studio Developer Command Prompt or load its environment setup script first.
 
 `kache-clang-cl` uses the existing clang-cl cache support. `kache-cl` runs MSVC directly without caching; it does not add an MSVC cache adapter. These launchers do not change `CC` or `CXX` during `kache init`.
 

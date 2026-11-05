@@ -8,8 +8,15 @@ mod windows;
 
 /// Run the thin compiler client, or replace it with the companion CLI engine.
 pub fn run(version: &str) -> Result<i32> {
+    run_with_binary_name(version, "")
+}
+
+/// Retain a native compiler launcher's compiled role when callers rename it.
+/// Other frontend binaries continue to select their role from argv[0].
+pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
     let started_at = std::time::Instant::now();
-    let args = std::env::args_os().collect::<Vec<_>>();
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    native_launcher_role(&mut args, binary_name);
     anyhow::ensure!(
         args.get(1)
             .is_none_or(|arg| arg != crate::FORWARDED_ARGV_FLAG),
@@ -72,6 +79,12 @@ pub fn run(version: &str) -> Result<i32> {
         }
     }
     forward_engine(&executable, version, &args, started_at)
+}
+
+fn native_launcher_role(args: &mut [OsString], binary_name: &str) {
+    if let ("kache-clang-cl" | "kache-cl", Some(arg0)) = (binary_name, args.first_mut()) {
+        *arg0 = binary_name.into();
+    }
 }
 
 fn forward_engine(
@@ -178,6 +191,38 @@ fn engine_only(args: &[OsString]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_native_launchers_restore_their_compiled_role_before_routing() {
+        for binary in ["kache-clang-cl", "kache-cl"] {
+            for arg0 in [
+                "renamed-client",
+                r"C:\Program Files\Kache\KACHE-~1.EXE",
+                "gcc",
+            ] {
+                let mut args = [arg0, "/nologo", "--help"].map(OsString::from);
+                native_launcher_role(&mut args, binary);
+                assert_eq!(args, [binary, "/nologo", "--help"].map(OsString::from));
+                assert!(!engine_only(&args));
+            }
+            native_launcher_role(&mut [], binary);
+        }
+        for binary in [
+            "",
+            "kache",
+            "kache-engine",
+            "kache-cl.exe",
+            "KACHE-CL",
+            "kache-gcc",
+        ] {
+            for arg0 in ["kache", "gcc", "clang-cl", "renamed-client"] {
+                let original = [arg0, "--version"].map(OsString::from);
+                let mut args = original.clone();
+                native_launcher_role(&mut args, binary);
+                assert_eq!(args, original);
+            }
+        }
+    }
 
     #[test]
     fn long_windows_handoff_uses_a_file_and_preserves_the_versioned_envelope() {

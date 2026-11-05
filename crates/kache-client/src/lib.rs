@@ -19,7 +19,7 @@ mod dyld_env;
 #[cfg(target_os = "macos")]
 pub use dyld_env::restore_dyld_env;
 mod frontend;
-pub use frontend::run;
+pub use frontend::{run, run_with_binary_name};
 
 /// Internal argv envelope passed from the frontend to its companion engine.
 pub const FORWARDED_ARGV_FLAG: &str = "--kache-forwarded-argv-v1";

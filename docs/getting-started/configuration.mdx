@@ -134,6 +134,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
+| `KACHE_COUNT_HELD_IN_MAX_SIZE` | `cache.count_held_in_max_size` | `false` | Count bytes build outputs still hold toward `local_max_size`, evicting other entries to make up for them |
 | `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon heal the blob index and compact `index.db` when the machine is quiet. See [Daemon index maintenance](#daemon-index-maintenance). |
 | `KACHE_INDEX_MODE` | `cache.index_mode` | `auto` | Local index policy: `auto`, `conservative`, or `off`. See [Index mode](#index-mode). |
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
@@ -253,7 +254,7 @@ While a daemon is running, it does the sweeping. A build that finds the store ov
 
 Every automatic sweep records the store size it ended at, whichever of the three started it. When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The wait applies to all three, so one sweep that cannot free enough holds the others back too. The 6-hour sweep still expires entries by `cache.gc_max_age_hours` and removes duplicates during a wait; only its size eviction is skipped. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
 
-`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. For 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
+`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. By default, for 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
 
 Automatic sweeps also keep entries downloaded from the remote in the last 6 hours, whether a build has used them yet or not. A CI job that downloads entries from the remote and then runs several cargo commands keeps them for the whole job; without this, an upload between two commands could evict what the next command needs. If those entries alone keep the store over budget, the sweep stops and backs off as described above. `kache gc` does not keep them.
 
@@ -276,6 +277,17 @@ gc_evict_shared = true
 ```
 
 The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this option, GC can drop an entry even though target files still hold all its blocks. The registered store size falls, but disk usage does not. A later build must compile or download that entry again. Explicit `purge` and repair operations remain unconditional regardless of this setting.
+
+To count bytes retained by build outputs toward the size budget, enable this option. It is disabled by default:
+
+```toml title="~/.config/kache/config.toml"
+[cache]
+count_held_in_max_size = true
+```
+
+The equivalent environment setting is `KACHE_COUNT_HELD_IN_MAX_SIZE=1`. The automatic trigger then compares the whole store with 110% of `local_max_size`. A size sweep tries to reach 90% by evicting other eligible entries. Keep `gc_evict_shared = false` to retain the entries backed by build outputs.
+
+This is a budget target. Retained outputs and other protected entries can keep the store above it. If retained bytes alone exceed the target, the sweep can remove every other eligible entry and still remain over budget. Removing those build outputs releases the retained blocks. Counting them can increase future misses because the sweep removes other cache entries to make room for them.
 
 ### Volume shards
 

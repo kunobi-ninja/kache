@@ -1,5 +1,41 @@
 use std::path::PathBuf;
 
+/// How a size budget treats the bytes a live build output still holds:
+/// blobs whose last store reference an entry holds while a target directory
+/// hardlinks or clones them too. Evicting such an entry frees no disk, so a
+/// sweep keeps it either way; this decides whether its bytes count toward
+/// `max_size`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeldBytesBudget {
+    /// Left out (kunobi-ninja/kache#1206): a sweep stops once the rest of
+    /// the store is under its target, so the store can stay over `max_size`
+    /// by what build outputs hold.
+    #[default]
+    LeftOut,
+    /// Counted: a sweep includes held bytes in its target and evicts other
+    /// eligible entries. Protected entries can leave it above `max_size`.
+    Counted,
+}
+
+impl HeldBytesBudget {
+    /// `[cache] count_held_in_max_size`.
+    pub fn from_count_held_in_max_size(counted: bool) -> Self {
+        if counted {
+            Self::Counted
+        } else {
+            Self::LeftOut
+        }
+    }
+
+    /// The part of `held` bytes the budget leaves out.
+    pub fn left_out(self, held: u64) -> u64 {
+        match self {
+            Self::LeftOut => held,
+            Self::Counted => 0,
+        }
+    }
+}
+
 /// Performance policy for the local SQLite index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexMode {
@@ -67,6 +103,8 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub max_size: u64,
     pub gc_evict_shared: bool,
+    /// Whether bytes a build output still holds count toward `max_size`.
+    pub held_bytes_budget: HeldBytesBudget,
     pub upload_spool_max_jobs: usize,
     /// Store new entries without an fsync on the build path and flush them
     /// later; a hit on an entry still pending verifies its bytes first.
@@ -97,6 +135,27 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_bytes_are_excluded_by_default_and_counting_is_explicit() {
+        assert_eq!(HeldBytesBudget::default(), HeldBytesBudget::LeftOut);
+        assert_eq!(
+            HeldBytesBudget::from_count_held_in_max_size(false),
+            HeldBytesBudget::LeftOut
+        );
+        assert_eq!(
+            HeldBytesBudget::from_count_held_in_max_size(true),
+            HeldBytesBudget::Counted
+        );
+    }
+
+    #[test]
+    fn held_byte_accounting_leaves_out_only_the_selected_amount() {
+        for held in [0, 137] {
+            assert_eq!(HeldBytesBudget::LeftOut.left_out(held), held);
+            assert_eq!(HeldBytesBudget::Counted.left_out(held), 0);
+        }
+    }
 
     #[test]
     fn index_mode_parses_each_mode_and_rejects_the_rest() {
@@ -153,6 +212,7 @@ mod tests {
             cache_dir: PathBuf::from("first cache"),
             max_size: 1,
             gc_evict_shared: false,
+            held_bytes_budget: HeldBytesBudget::default(),
             upload_spool_max_jobs: 2,
             deferred_durability: false,
             index_mode: IndexMode::default(),

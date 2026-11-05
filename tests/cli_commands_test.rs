@@ -2244,6 +2244,27 @@ fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
         eprintln!("skipping: running as root, mode 0555 does not deny removal");
         return;
     }
+    // A sibling test can fork with this fixture's open descriptors and make
+    // cleanup keep the target as busy. Create it in a process with one test.
+    const CHILD: &str = "KACHE_TEST_CLEAN_DENIED_REMOVAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_clean_that_cannot_remove_a_target_says_so_and_fails",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "the isolated test must run: {output:?}"
+        );
+        return;
+    }
     let e = env();
     let project = TempDir::new().unwrap();
     let root = project.path();
@@ -2269,7 +2290,7 @@ fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
         .unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["success"], false);
     // cli.schema.json: a failed document carries `error`.
@@ -2286,7 +2307,7 @@ fn a_clean_that_cannot_remove_a_target_says_so_and_fails() {
         root.join("target").display().to_string()
     );
     assert!(value["removed_paths"].as_array().unwrap().is_empty());
-    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
     assert!(String::from_utf8_lossy(&human.stdout).contains("  failed  "));
 }
 
@@ -4651,46 +4672,59 @@ fn doctor_repair_removes_corrupted_entries() {
         .stdout(predicates::str::contains("No cached entries"));
 }
 
-/// An entry whose meta.json no longer parses cannot be removed through the
-/// normal path (#276), and used to make the index rebuild refuse the whole
-/// store. `doctor --repair` now drops it as part of the rebuild.
+/// Repair malformed metadata through its recorded blob mapping. Legacy
+/// entries without a mapping still need the dropping index rebuild (#276).
 #[test]
 fn doctor_repair_drops_entries_with_unparseable_metadata() {
-    let e = env();
-    let project = scaffold_lib("metarepair", "pub fn m() -> u8 { 6 }\n");
-    let target_dir = project.path().join("target");
-    assert!(
-        e.wrapper_build(project.path(), &target_dir)
-            .status
-            .success(),
-        "build failed"
-    );
-    let store = e.cache.join("store");
-    let metas: Vec<_> = std::fs::read_dir(&store)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path().join("meta.json"))
-        .filter(|meta| meta.is_file())
-        .collect();
-    assert!(!metas.is_empty(), "the build should have stored an entry");
-    for meta in &metas {
-        std::fs::write(meta, b"not json").unwrap();
-    }
+    for has_mapping in [true, false] {
+        let e = env();
+        let project = scaffold_lib("metarepair", "pub fn m() -> u8 { 6 }\n");
+        let target_dir = project.path().join("target");
+        assert!(
+            e.wrapper_build(project.path(), &target_dir)
+                .status
+                .success(),
+            "build failed"
+        );
+        let store = e.cache.join("store");
+        let metas: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path().join("meta.json"))
+            .filter(|meta| meta.is_file())
+            .collect();
+        assert!(!metas.is_empty(), "the build should have stored an entry");
+        if !has_mapping {
+            let db = rusqlite::Connection::open(e.cache.join("index.db")).unwrap();
+            let removed = db.execute("DELETE FROM entry_blobs", []).unwrap();
+            assert!(removed > 0, "the legacy fixture must remove a real mapping");
+        }
+        for meta in &metas {
+            std::fs::write(meta, b"not json").unwrap();
+        }
 
-    e.cmd()
-        .args(["doctor", "--repair"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains(format!(
+        let result = e.cmd().args(["doctor", "--repair"]).assert().success();
+        let stdout = String::from_utf8(result.get_output().stdout.clone()).unwrap();
+        assert!(
+            stdout.contains(&format!(
+                "Repairing: removing {} corrupted entries...",
+                metas.len()
+            )),
+            "{stdout}"
+        );
+        let rebuild_message = format!(
             "Repairing: removed {} {} that failed verification.",
             metas.len(),
             if metas.len() == 1 { "entry" } else { "entries" }
-        )));
-    e.cmd()
-        .arg("list")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("No cached entries"));
+        );
+        assert_eq!(stdout.contains(&rebuild_message), !has_mapping, "{stdout}");
+        assert!(stdout.contains("Blob index drift: 0"), "{stdout}");
+        e.cmd()
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("No cached entries"));
+    }
 }
 
 /// `gc --max-age` runs the eviction sweep (backfill, dedup, age eviction) over a

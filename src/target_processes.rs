@@ -114,8 +114,13 @@ fn read_maps(
     loop {
         check_deadline(Instant::now(), deadline)?;
         line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            // procfs can return ESRCH after maps opens if the process exits.
+            // Keep paths read so far and continue scanning other processes.
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+            Err(error) => return Err(error),
         }
         if let Some(start) = line.iter().position(|byte| *byte == b'/') {
             let raw = &line[start..];

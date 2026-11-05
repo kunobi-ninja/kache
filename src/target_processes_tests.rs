@@ -175,6 +175,97 @@ fn mapped_paths_preserve_spaces_non_utf8_and_both_newline_spellings() {
     assert!(read_maps(b"".as_slice(), Instant::now(), &mut paths).is_err());
 }
 
+#[cfg(unix)]
+struct MapsReadError<'a> {
+    prefix: &'a [u8],
+    error: i32,
+}
+
+#[cfg(unix)]
+impl std::io::Read for MapsReadError<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.prefix.is_empty() {
+            Err(io::Error::from_raw_os_error(self.error))
+        } else {
+            std::io::Read::read(&mut self.prefix, buffer)
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_process_disappearing_before_its_first_maps_line_keeps_previous_paths() {
+    let previous = PathBuf::from("/targets/previous/app");
+    let mut paths = BTreeSet::from([previous.clone()]);
+    read_maps(
+        std::io::BufReader::new(MapsReadError {
+            prefix: b"",
+            error: libc::ESRCH,
+        }),
+        Instant::now() + SCAN_LIMIT,
+        &mut paths,
+    )
+    .unwrap();
+    assert_eq!(paths, BTreeSet::from([previous]));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_process_disappearing_after_a_maps_line_keeps_its_observed_mapping() {
+    let previous = PathBuf::from("/targets/previous/app");
+    let mut paths = BTreeSet::from([previous.clone()]);
+    read_maps(
+        std::io::BufReader::new(MapsReadError {
+            prefix: b"0-1 r--p 0 00:00 1 /targets/current/library\n",
+            error: libc::ESRCH,
+        }),
+        Instant::now() + SCAN_LIMIT,
+        &mut paths,
+    )
+    .unwrap();
+    assert_eq!(
+        paths,
+        BTreeSet::from([previous, PathBuf::from("/targets/current/library")])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn other_maps_read_errors_still_reject_the_scan() {
+    for error in [libc::EIO, libc::EACCES] {
+        let mut paths = BTreeSet::new();
+        let failure = read_maps(
+            std::io::BufReader::new(MapsReadError {
+                prefix: b"0-1 r--p 0 00:00 1 /targets/current/library\n",
+                error,
+            }),
+            Instant::now() + SCAN_LIMIT,
+            &mut paths,
+        )
+        .unwrap_err();
+        assert_eq!(failure.raw_os_error(), Some(error));
+        assert_eq!(
+            paths,
+            BTreeSet::from([PathBuf::from("/targets/current/library")])
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_expired_maps_scan_still_fails_when_the_process_has_disappeared() {
+    let failure = read_maps(
+        std::io::BufReader::new(MapsReadError {
+            prefix: b"",
+            error: libc::ESRCH,
+        }),
+        Instant::now(),
+        &mut BTreeSet::new(),
+    )
+    .unwrap_err();
+    assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn an_open_file_keeps_a_target_even_without_a_running_binary_in_it() {

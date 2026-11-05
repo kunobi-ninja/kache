@@ -7906,6 +7906,24 @@ fn doctor_section(label: &str) -> &'static str {
     }
 }
 
+pub fn repair_build_scripts(target: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let config = crate::config::Config::load()?;
+        let changed = crate::build_script::repair::run(&config, target)?;
+        println!(
+            "Refreshed {changed} build-script launchers in {}. Rerun Cargo.",
+            target.display()
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        anyhow::bail!("build-script runtime pin repair is only supported on Linux and macOS")
+    }
+}
+
 pub fn doctor(
     fix: bool,
     purge_sccache: bool,

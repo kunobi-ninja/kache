@@ -54,6 +54,8 @@ pub(crate) mod declarations;
 mod hermetic;
 pub(crate) mod inputs;
 mod outside;
+#[cfg(unix)]
+pub(crate) mod repair;
 mod restore;
 mod rooted_links;
 

@@ -367,10 +367,18 @@ fn doctor_json_is_read_only(
     verify: bool,
     checksums: bool,
     repair: bool,
+    repair_build_scripts: bool,
 ) -> bool {
-    ![fix, purge_sccache, verify, checksums, repair]
-        .into_iter()
-        .any(|enabled| enabled)
+    ![
+        fix,
+        purge_sccache,
+        verify,
+        checksums,
+        repair,
+        repair_build_scripts,
+    ]
+    .into_iter()
+    .any(|enabled| enabled)
 }
 
 /// Diagnostic log file path.
@@ -903,12 +911,25 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             verify,
             checksums,
             repair,
+            repair_build_scripts,
             probe,
         }) => {
-            if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
+            if json
+                && !doctor_json_is_read_only(
+                    fix,
+                    purge_sccache,
+                    verify,
+                    checksums,
+                    repair,
+                    repair_build_scripts.is_some(),
+                )
+            {
                 return Err(machine::invalid_arguments(
                     "`kache doctor --json` reports diagnostics only; run repair options without `--json`.",
                 ));
+            }
+            if let Some(target) = repair_build_scripts {
+                return cli::repair_build_scripts(&target);
             }
             cli::doctor(
                 fix,
@@ -3126,7 +3147,12 @@ mod tests {
         })));
         assert!(!command_supports_json(&None));
 
-        assert!(doctor_json_is_read_only(false, false, false, false, false));
+        assert!(doctor_json_is_read_only(
+            false, false, false, false, false, false
+        ));
+        assert!(!doctor_json_is_read_only(
+            false, false, false, false, false, true
+        ));
         for flags in [
             (true, false, false, false, false),
             (false, true, false, false, false),
@@ -3135,8 +3161,32 @@ mod tests {
             (false, false, false, false, true),
         ] {
             assert!(!doctor_json_is_read_only(
-                flags.0, flags.1, flags.2, flags.3, flags.4
+                flags.0, flags.1, flags.2, flags.3, flags.4, false
             ));
+        }
+    }
+
+    #[test]
+    fn doctor_build_script_repair_requires_a_target_and_excludes_store_repairs() {
+        let cli =
+            Cli::try_parse_from(["kache", "doctor", "--repair-build-scripts", "target"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Doctor { repair_build_scripts: Some(target), .. }) if target == std::path::Path::new("target"))
+        );
+        assert!(Cli::try_parse_from(["kache", "doctor", "--repair-build-scripts"]).is_err());
+        for other in [
+            "--fix",
+            "--purge-sccache",
+            "--verify",
+            "--checksums",
+            "--repair",
+            "--probe",
+        ] {
+            assert!(
+                Cli::try_parse_from(["kache", "doctor", "--repair-build-scripts", "target", other])
+                    .is_err(),
+                "{other}"
+            );
         }
     }
 

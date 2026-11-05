@@ -382,8 +382,11 @@ mod tests {
 
     #[test]
     fn frame_limit_accepts_the_boundary_and_rejects_larger_requests_before_writing() {
+        // Build and size-check both requests before the peer's read deadline.
+        let oversized = sized_frame(8_388_609);
+        let boundary = sized_frame(8_388_608);
         let (broker, client) = pair();
-        let error = broker.call(sized_frame(8_388_609), 0).unwrap_err();
+        let error = broker.call(oversized, 0).unwrap_err();
         assert!(error.to_string().contains("exceeds frame limit"));
         std::thread::scope(|threads| {
             let peer = threads.spawn(move || {
@@ -397,10 +400,7 @@ mod tests {
                     .write_all(b"{\"operation_result\":\"done\"}\n")
                     .unwrap();
             });
-            assert_eq!(
-                broker.call(sized_frame(8_388_608), 0).unwrap().0,
-                Reply::Done
-            );
+            assert_eq!(broker.call(boundary, 0).unwrap().0, Reply::Done);
             peer.join().unwrap();
         });
     }

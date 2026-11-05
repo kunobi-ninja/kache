@@ -22,6 +22,14 @@ pub(crate) fn can_track_client(pid: u32) -> bool {
 }
 
 #[cfg(any(test, target_os = "macos"))]
+fn decode_owned_exit_reply(reply: Reply) -> io::Result<bool> {
+    match reply {
+        Reply::Waited { status, .. } => Ok(status.is_some()),
+        _ => Err(io::Error::other("invalid native compiler wait response")),
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
 fn capture_owned_identity<I>(
     mut capture: impl FnMut() -> io::Result<I>,
     mut exited: impl FnMut() -> io::Result<bool>,
@@ -42,7 +50,14 @@ fn capture_owned_identity<I>(
             }
             pause()?;
             if let Ok(identity) = capture() {
-                return Ok(Some(identity));
+                // The owner may disconnect and reap between the previous
+                // status check and this capture. Confirm ownership again
+                // before retaining a newly captured task port.
+                return if exited()? {
+                    Ok(None)
+                } else {
+                    Ok(Some(identity))
+                };
             }
         }
         if exited()? { Ok(None) } else { Err(error) }
@@ -214,10 +229,7 @@ impl Broker {
             || macos::Identity::capture(pid),
             || {
                 super::process::check()?;
-                match self.call(Command::TryWait { id }, 0)?.0 {
-                    Reply::Waited { status, .. } => Ok(status.is_some()),
-                    _ => Err(io::Error::other("invalid native compiler wait response")),
-                }
+                decode_owned_exit_reply(self.call(Command::TryWait { id }, 0)?.0)
             },
             || {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -388,6 +400,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owned_exit_reply_distinguishes_running_and_retained_status() {
+        for (status, expected) in [(None, false), (Some(0), true), (Some(256), true)] {
+            assert_eq!(
+                decode_owned_exit_reply(Reply::Waited {
+                    status,
+                    max_rss: 42,
+                })
+                .unwrap(),
+                expected,
+                "status {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_exit_reply_rejects_every_other_reply_kind() {
+        for reply in [
+            Reply::Done,
+            Reply::Spawned { id: 7, pid: 11 },
+            Reply::PreparedFile {
+                id: 3,
+                bytes: 5,
+                reflinked: true,
+            },
+            Reply::Failed {
+                os_error: Some(libc::EPIPE),
+                message: "fixture failure".into(),
+            },
+        ] {
+            let error = decode_owned_exit_reply(reply).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "invalid native compiler wait response");
+        }
+    }
+
+    #[test]
     fn captured_live_identity_needs_no_recovery() {
         let identity = capture_owned_identity(
             || Ok(42),
@@ -465,7 +513,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity, Some(42));
-        assert_eq!(*calls.borrow(), ["capture", "wait", "pause", "capture"]);
+        assert_eq!(
+            *calls.borrow(),
+            ["capture", "wait", "pause", "capture", "wait"]
+        );
+    }
+
+    #[derive(Debug)]
+    struct RecoveredIdentity<'a>(&'a std::cell::Cell<usize>);
+
+    impl Drop for RecoveredIdentity<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn an_exit_after_recapture_discards_the_identity_and_retains_status() {
+        let dropped = std::cell::Cell::new(0);
+        let mut captures = 0;
+        let mut waits = 0;
+        let identity = capture_owned_identity(
+            || {
+                captures += 1;
+                if captures == 1 {
+                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                } else {
+                    Ok(RecoveredIdentity(&dropped))
+                }
+            },
+            || {
+                waits += 1;
+                Ok(waits == 2)
+            },
+            || Ok(()),
+            || panic!("the caller must retain the exit status"),
+        )
+        .unwrap();
+        assert!(identity.is_none());
+        assert_eq!(waits, 2);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn a_lost_owner_after_recapture_discards_the_identity_and_fails() {
+        let dropped = std::cell::Cell::new(0);
+        let releases = std::cell::Cell::new(0);
+        let mut captures = 0;
+        let mut waits = 0;
+        let error = capture_owned_identity(
+            || {
+                captures += 1;
+                if captures == 1 {
+                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                } else {
+                    Ok(RecoveredIdentity(&dropped))
+                }
+            },
+            || {
+                waits += 1;
+                if waits == 1 {
+                    Ok(false)
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EPIPE))
+                }
+            },
+            || Ok(()),
+            || releases.set(releases.get() + 1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(waits, 2);
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(releases.get(), 1);
     }
 
     #[test]

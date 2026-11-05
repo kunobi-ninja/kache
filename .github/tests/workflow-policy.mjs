@@ -113,12 +113,38 @@ const measurementJobs = new Set([
   "prefetch-qualification.yml:seed",
   "prefetch-qualification-consumer.yml:consume",
 ]);
+// A branch-only native acceptance probe has no private-repository route.
+// Validate both fixed hosted architectures before excluding it from the
+// ordinary public/private runner selector matrix.
+const nativeWarmup = files["native-runtime-warmup.yml"];
+if (nativeWarmup) {
+  eq(nativeWarmup.on.push.branches, ["validation/current-1792-native-runtime"], "native acceptance branch");
+  eq(nativeWarmup.permissions, { contents: "read" }, "native acceptance token");
+  const native = nativeWarmup.jobs.native;
+  eq(native["runs-on"], "${{ matrix.runner }}", "native acceptance runner");
+  eq(native.strategy.matrix.include, [
+    { runner: "windows-2025", host: "x86_64-pc-windows-msvc" },
+    { runner: "windows-11-arm", host: "aarch64-pc-windows-msvc" },
+  ], "native acceptance hosted architectures");
+  eq(native["timeout-minutes"], 45, "native acceptance deadline");
+  assert(native.steps[0].run.includes("$env:RUNNER_KIND -ne 'github-hosted'"));
+  for (const repository of [...publicRepos, ...privateRepos]) {
+    for (const isPrivate of [false, true]) {
+      const candidate = context(repository, isPrivate, privateVars, "push");
+      candidate.github.ref = "refs/heads/validation/current-1792-native-runtime";
+      eq(evaluate(native.if, candidate), repository === "kunobi-ninja/kache" && !isPrivate, "native acceptance canonical public branch");
+      candidate.github.ref = "refs/heads/unrelated";
+      eq(evaluate(native.if, candidate), false, "native acceptance rejects other branches");
+    }
+  }
+}
 const routing = [];
 for (const [file, workflow] of Object.entries(files)) {
   if (publicationWorkflows.has(file)) continue;
   for (const [id, job] of Object.entries(workflow.jobs)) {
     const name = `${file}:${id}`;
     if (measurementJobs.has(name) || job.uses) continue;
+    if (name === "native-runtime-warmup.yml:native") continue;
     assert(Object.hasOwn(job, "runs-on"), `${name} must select a runner`);
     if (/^\$\{\{\s*matrix\.runner\s*\}\}$/.test(job["runs-on"])) {
       const rows = job.strategy?.matrix?.include;

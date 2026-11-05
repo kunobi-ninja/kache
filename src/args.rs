@@ -742,9 +742,12 @@ impl RustcArgs {
         })
     }
 
-    /// Exclude one valid terminal width when lint warnings are silenced.
-    /// Preserve malformed and repeated options so a
-    /// cached success cannot hide rustc's argument errors.
+    /// Exclude one valid terminal width. Cargo passes it only when stderr is a
+    /// terminal, and it only wraps rendered diagnostics, so terminal and piped
+    /// builds share entries. A hit replays diagnostics wrapped for the build
+    /// that recorded them, as Cargo does for a fresh unit. Preserve malformed
+    /// and repeated options so a cached success cannot hide rustc's argument
+    /// errors.
     pub(crate) fn cache_key_diagnostic_flags(&self) -> impl Iterator<Item = &String> {
         let mut widths = self.diagnostic_flags.iter().filter(|flag| {
             flag.as_str() == "--diagnostic-width" || flag.starts_with("--diagnostic-width=")
@@ -754,35 +757,10 @@ impl RustcArgs {
             .and_then(|flag| flag.strip_prefix("--diagnostic-width="))
             .and_then(|value| value.parse::<u16>().ok())
             .is_some_and(|columns| columns > 0);
-        let omit_width = valid_width && widths.next().is_none() && self.lints_silenced();
+        let omit_width = valid_width && widths.next().is_none();
         self.diagnostic_flags
             .iter()
             .filter(move |flag| !omit_width || !flag.starts_with("--diagnostic-width="))
-    }
-
-    fn lints_silenced(&self) -> bool {
-        let mut cap = None;
-        let mut flags = self.outcome_lint_flags.iter();
-        while let Some(flag) = flags.next() {
-            if flag == "--force-warn" || flag.starts_with("--force-warn=") {
-                return false;
-            }
-            let value = if flag == "--cap-lints" {
-                flags.next().map(String::as_str)
-            } else if let Some(value) = flag.strip_prefix("--cap-lints=") {
-                Some(value)
-            } else {
-                if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&flag.as_str()) {
-                    let _ = flags.next();
-                }
-                continue;
-            };
-            if cap.is_some() {
-                return false;
-            }
-            cap = value;
-        }
-        cap == Some("allow")
     }
 
     /// Original compact argv. This differs from [`Self::all_args`] only after
@@ -1268,7 +1246,7 @@ mod tests {
             vec!["--diagnostic-width=80"],
             vec!["--diagnostic-width", "80"],
         ] {
-            let mut argv = vec!["rustc", "lib.rs", "--cap-lints=allow", "--color=never"];
+            let mut argv = vec!["rustc", "lib.rs", "--color=never"];
             argv.extend(width);
             let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
             let parsed = RustcArgs::parse(&argv).unwrap();

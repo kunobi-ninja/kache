@@ -12060,7 +12060,6 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         ("--error-format", "json", "human"),
         ("--json", "artifacts", "diagnostic-rendered-ansi"),
         ("--color", "always", "never"),
-        ("--diagnostic-width", "80", "120"),
     ] {
         let attached = format!("{flag}={value}");
         let first = key_of_flags(&flag_base(&source, &[&attached]));
@@ -12079,81 +12078,69 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
 }
 
 #[test]
-fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
+fn terminal_width_is_left_out_of_the_key() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
-    for cap in [vec!["--cap-lints=allow"], vec!["--cap-lints", "allow"]] {
+    // Workspace crates (no lint cap) as well as capped dependencies: a build
+    // in a terminal and a piped build share one entry.
+    for lint_flags in [
+        vec![],
+        vec!["--cap-lints=allow"],
+        vec!["--cap-lints", "allow"],
+        vec!["--cap-lints=warn"],
+        vec!["--cap-lints=allow", "--force-warn=unused"],
+        vec!["-D", "warnings"],
+    ] {
         let key = |extra: &[&str]| {
-            let mut flags = cap.clone();
+            let mut flags = lint_flags.clone();
             flags.extend_from_slice(extra);
             key_of_flags(&flag_base(&source, &flags))
         };
-        let base = key(&[]);
+        let piped = key(&[]);
         for width in ["1", "80", "120", "65535"] {
-            assert_eq!(base, key(&["--diagnostic-width", width]), "{width}");
             assert_eq!(
-                base,
+                piped,
+                key(&["--diagnostic-width", width]),
+                "{lint_flags:?} {width}"
+            );
+            assert_eq!(
+                piped,
                 key(&[&format!("--diagnostic-width={width}")]),
-                "{width}"
+                "{lint_flags:?} {width}"
             );
         }
         for flag in ["--color=always", "--error-format=json", "--json=artifacts"] {
             let other = key(&[flag]);
-            assert_ne!(base, other, "{flag}");
+            assert_ne!(piped, other, "{flag}");
             assert_eq!(other, key(&[flag, "--diagnostic-width=80"]), "{flag}");
         }
     }
 }
 
 #[test]
-fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
+fn diagnostic_width_keeps_unusual_arguments_keyed() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
     let key = |flags: &[&str]| key_of_flags(&flag_base(&source, flags));
-    let capped = key(&["--cap-lints=allow"]);
-    for retained in [
-        vec!["--diagnostic-width"],
-        vec!["--diagnostic-width="],
-        vec!["--diagnostic-width=not-a-number"],
-        vec!["--diagnostic-width=0"],
-        vec!["--diagnostic-width=65536"],
-        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
-        vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
-    ] {
-        let mut flags = vec!["--cap-lints=allow"];
-        flags.extend_from_slice(&retained);
-        assert_ne!(capped, key(&flags), "{retained:?}");
-    }
-    for lint_flags in [
-        vec![],
-        vec!["--cap-lints=warn"],
-        vec!["--cap-lints=allow", "--cap-lints", "warn"],
-        vec!["--cap-lints", "allow", "--cap-lints=warn"],
-        vec!["--cap-lints=warn", "--cap-lints", "allow"],
-        vec!["--cap-lints", "warn", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints"],
-        vec!["--cap-lints=allow", "--force-warn=unused"],
-        vec!["--force-warn", "unused", "--cap-lints=allow"],
-        vec!["--check-cfg", "--cap-lints=allow"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        let mut wide = lint_flags.clone();
-        wide.push("--diagnostic-width=120");
-        assert_ne!(key(&narrow), key(&wide), "{lint_flags:?}");
-    }
-    for lint_flags in [
-        vec!["--cap-lints=allow", "-W", "unused"],
-        vec!["--cap-lints=allow", "-D", "warnings"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        assert_eq!(key(&lint_flags), key(&narrow), "{lint_flags:?}");
+    for lint_flags in [vec![], vec!["--cap-lints=allow"]] {
+        let base = key(&lint_flags);
+        for retained in [
+            vec!["--diagnostic-width"],
+            vec!["--diagnostic-width="],
+            vec!["--diagnostic-width=not-a-number"],
+            vec!["--diagnostic-width=0"],
+            vec!["--diagnostic-width=65536"],
+            vec!["--diagnostic-width=80", "--diagnostic-width=120"],
+            vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
+        ] {
+            let mut flags = lint_flags.clone();
+            flags.extend_from_slice(&retained);
+            assert_ne!(base, key(&flags), "{lint_flags:?} {retained:?}");
+        }
     }
 }
 

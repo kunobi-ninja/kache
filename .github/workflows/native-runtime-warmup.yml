@@ -20,8 +20,6 @@ jobs:
         include:
           - runner: windows-2025
             host: x86_64-pc-windows-msvc
-          - runner: windows-11-arm
-            host: aarch64-pc-windows-msvc
     defaults:
       run:
         shell: pwsh
@@ -66,6 +64,9 @@ jobs:
           $scratch = Join-Path $env:RUNNER_TEMP "runtime-warmup-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           [void][IO.Directory]::CreateDirectory($scratch)
           foreach ($entry in @{
+            # setup-mise atomically renames its download into MISE_DATA_DIR.
+            # Keep the action's OS temp on the same volume as its isolated tools.
+            TEMP = 'temp'; TMP = 'temp';
             RUSTUP_HOME = 'rustup'; CARGO_HOME = 'cargo'; MISE_DATA_DIR = 'mise-data';
             MISE_CACHE_DIR = 'mise-cache'; MISE_STATE_DIR = 'mise-state'; MISE_DL_TMPDIR = 'mise-downloads'
           }.GetEnumerator()) {

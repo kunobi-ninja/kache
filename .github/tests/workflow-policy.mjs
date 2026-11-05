@@ -114,7 +114,7 @@ const measurementJobs = new Set([
   "prefetch-qualification-consumer.yml:consume",
 ]);
 // A branch-only native acceptance probe has no private-repository route.
-// Validate both fixed hosted architectures before excluding it from the
+// Validate the fixed hosted architecture before excluding it from the
 // ordinary public/private runner selector matrix.
 const nativeWarmup = files["native-runtime-warmup.yml"];
 if (nativeWarmup) {
@@ -124,7 +124,6 @@ if (nativeWarmup) {
   eq(native["runs-on"], "${{ matrix.runner }}", "native acceptance runner");
   eq(native.strategy.matrix.include, [
     { runner: "windows-2025", host: "x86_64-pc-windows-msvc" },
-    { runner: "windows-11-arm", host: "aarch64-pc-windows-msvc" },
   ], "native acceptance hosted architectures");
   eq(native["timeout-minutes"], 45, "native acceptance deadline");
   assert(native.steps[0].run.includes("$env:RUNNER_KIND -ne 'github-hosted'"));

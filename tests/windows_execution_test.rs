@@ -318,6 +318,65 @@ fn isolated_cache_key(cache: &Path) -> String {
 }
 
 #[test]
+fn forwarded_fallback_does_not_bootstrap_again_but_direct_engine_does() {
+    let fixture = Fixture::new();
+    let rustc = fixture.rustc();
+    let expected = fixture.success(fixture.command(&rustc).arg("-vV"));
+    let frontend = fixture.path("install/kache.exe").canonicalize().unwrap();
+
+    // This is the existing private envelope sent after a Windows frontend has
+    // exhausted its daemon attempt. With the old engine each such fallback
+    // starts the daemon again before running the query.
+    for _ in 0..2 {
+        let output = fixture.success(
+            fixture
+                .command(fixture.path("install/kache-engine.exe"))
+                .arg(kache_client::FORWARDED_ARGV_FLAG)
+                .arg(kache::VERSION)
+                .arg("0")
+                .arg(&frontend)
+                .arg("-")
+                .arg(&frontend)
+                .arg(&rustc)
+                .arg("-vV"),
+        );
+        assert_eq!(output.stdout, expected.stdout);
+        assert_eq!(output.stderr, expected.stderr);
+        let states = std::fs::read_dir(fixture.path("runtime"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".state.json"))
+            .collect::<Vec<_>>();
+        assert!(states.is_empty(), "fallback repeated startup: {states:?}");
+        assert!(
+            !fixture.path("cache/index.db").exists(),
+            "a compiler query opened the cache"
+        );
+    }
+
+    // A direct engine has no prior frontend attempt and must retain cold
+    // startup. The following ordinary frontend can then use that daemon.
+    let direct = fixture.success(
+        fixture
+            .command(fixture.path("install/kache-engine.exe"))
+            .arg(&rustc)
+            .arg("-vV"),
+    );
+    assert_eq!(direct.stdout, expected.stdout);
+    assert_eq!(direct.stderr, expected.stderr);
+    let daemon = fixture.daemon_pid();
+    let warm = fixture.success(
+        fixture
+            .command(fixture.path("frontend-only/kache.exe"))
+            .arg(&rustc)
+            .arg("-vV"),
+    );
+    assert_eq!(warm.stdout, expected.stdout);
+    assert_eq!(warm.stderr, expected.stderr);
+    assert_eq!(fixture.daemon_pid(), daemon);
+}
+
+#[test]
 fn cold_daemon_survives_the_client_and_warm_frontends_need_no_engine() {
     let fixture = Fixture::new();
     let rustc = fixture.rustc();

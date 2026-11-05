@@ -23,6 +23,14 @@ path = "src/frontend.rs"
 name = "kache-engine"
 path = "src/engine.rs"
 
+[[bin]]
+name = "kache-clang-cl"
+path = "src/clang_cl_frontend.rs"
+
+[[bin]]
+name = "kache-cl"
+path = "src/cl_frontend.rs"
+
 [workspace]
 members = [
     "crates/kache-core",
@@ -213,6 +221,8 @@ depends = ""
 assets = [
     ["target/release/kache", "usr/bin/kache", "755"],
     ["target/release/kache-engine", "usr/bin/kache-engine", "755"],
+    ["target/release/kache-clang-cl", "usr/bin/kache-clang-cl", "755"],
+    ["target/release/kache-cl", "usr/bin/kache-cl", "755"],
     ["README.md", "usr/share/doc/kache/README", "644"],
 ]
 # postinst runs `kache init --shims /usr/lib/kache --force --canonical-only`

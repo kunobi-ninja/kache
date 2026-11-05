@@ -19,6 +19,11 @@ Preparation checks archive contents, PE architectures, checksums and the whole
 manifest set before updating the installer file. Submit the resulting directory
 with `komac submit --yes <manifests>`.
 
+Archives with native compiler launchers must contain both `kache-clang-cl.exe`
+and `kache-cl.exe` beside `kache.exe` and `kache-engine.exe`. Preparation checks
+each executable's architecture and adds portable command aliases for the two
+launchers. Older paired and monolithic archives remain supported.
+
 The published installer supplies metadata for both architectures. Komac can
 drop an architecture when analysing ZIPs with more than one executable.
 

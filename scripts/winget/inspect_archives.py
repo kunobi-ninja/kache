@@ -13,6 +13,7 @@ import zipfile
 TARGETS = {"x64": ("x86_64", 0x8664), "arm64": ("aarch64", 0xAA64)}
 PRIMARY = "kache.exe"
 COMPANION = "kache-engine.exe"
+LAUNCHERS = ("kache-clang-cl.exe", "kache-cl.exe")
 
 
 def digest(path):
@@ -56,6 +57,7 @@ def inspect_archives(directory, version, select=False):
     base = f"https://github.com/kunobi-ninja/kache/releases/download/v{version}"
     results = []
     layouts = set()
+    launcher_sets = set()
     for architecture, (target, machine) in TARGETS.items():
         stem = f"kache-{target}-pc-windows-msvc"
         path = directory / (stem + ".zip")
@@ -68,10 +70,14 @@ def inspect_archives(directory, version, select=False):
             if PRIMARY not in names:
                 raise ValueError(f"{path.name} is missing {PRIMARY}")
             layout = "paired" if COMPANION in names else "legacy"
-            allowed = {PRIMARY, COMPANION, PRIMARY + ".asc", COMPANION + ".asc"}
+            launchers = tuple(name for name in LAUNCHERS if name in names)
+            if launchers and (launchers != LAUNCHERS or layout != "paired"):
+                raise ValueError(f"incomplete compiler launcher payload in {path.name}")
+            allowed = {name for binary in (PRIMARY, COMPANION, *LAUNCHERS)
+                       for name in (binary, binary + ".asc")}
             if any(name not in allowed for name in names):
                 raise ValueError(f"unexpected ZIP member in {path.name}")
-            required = [PRIMARY, COMPANION] if layout == "paired" else [PRIMARY]
+            required = [PRIMARY, COMPANION, *launchers] if layout == "paired" else [PRIMARY]
             for name in required:
                 info = archive.getinfo(name)
                 with archive.open(info) as stream:
@@ -80,6 +86,7 @@ def inspect_archives(directory, version, select=False):
                 raise ValueError(f"corrupt ZIP member in {path.name}")
             primary_hash = hashlib.sha256(archive.read(PRIMARY)).hexdigest()
         layouts.add(layout)
+        launcher_sets.add(launchers)
         if layout == "paired":
             installer_path, installer_hash = path, archive_hash
         elif select:
@@ -98,7 +105,10 @@ def inspect_archives(directory, version, select=False):
         })
     if len(layouts) != 1:
         raise ValueError("Windows architectures have different installation layouts")
-    return {"layout": layouts.pop(), "installers": results}
+    if len(launcher_sets) != 1:
+        raise ValueError("Windows architectures have different compiler launchers")
+    return {"layout": layouts.pop(), "installers": results,
+            "compiler_launchers": [name.removesuffix(".exe") for name in launcher_sets.pop()]}
 
 
 def main():

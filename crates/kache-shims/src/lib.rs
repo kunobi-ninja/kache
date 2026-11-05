@@ -20,4 +20,6 @@ pub use select::{
 };
 
 mod compiler_name;
-pub use compiler_name::{compiler_driver, is_cc_compiler_name, is_compiler_shim_name};
+pub use compiler_name::{
+    compiler_driver, compiler_launcher_driver, is_cc_compiler_name, is_compiler_shim_name,
+};

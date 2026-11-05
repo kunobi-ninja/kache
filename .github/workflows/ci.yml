@@ -1622,9 +1622,9 @@ jobs:
     uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@d604e5a4402c5fdaf3968f897b0fa4357c8295fa
     with:
       binary_name: kache
-      companion_binaries: '["kache-engine"]'
+      companion_binaries: '["kache-engine", "kache-clang-cl", "kache-cl"]'
       cache_windows_sysroot: true
-      # Include both binaries in Debian packages and release archives.
+      # Include the engine and native CC/CXX launchers in packages and archives.
       build_deb: true
       # Winget installs the ZIP so kache-engine stays beside the frontend.
       upload_windows_exe: false

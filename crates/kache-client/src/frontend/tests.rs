@@ -96,7 +96,7 @@ fn run_case(arg0: OsString, flag: Option<&str>, expected_connections: usize) -> 
     let original_args = std::iter::once(arg0.clone())
         .chain(args.map(OsString::from))
         .collect::<Vec<_>>();
-    let compiler = arg0 == "cc";
+    let compiler = matches!(arg0.to_str(), Some("cc" | "kache-clang-cl" | "kache-cl"));
     assert_eq!(engine_only(&original_args), !compiler);
     let mut command = Command::new(&frontend);
     command
@@ -196,6 +196,13 @@ fn cli_forwarding_preserves_native_argv_streams_version_and_image_identity() {
 #[test]
 fn compiler_requests_try_the_daemon_before_forwarding_a_declined_request() {
     assert_eq!(run_case("cc".into(), None, 1), 29);
+}
+
+#[test]
+fn native_launcher_requests_try_the_daemon_and_preserve_argv_on_fallback() {
+    for launcher in ["kache-clang-cl", "kache-cl"] {
+        assert_eq!(run_case(launcher.into(), None, 1), 29);
+    }
 }
 
 #[test]

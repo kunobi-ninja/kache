@@ -727,13 +727,28 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
                 let key = isolated_cache_key(&cache);
                 // The same compile without Kache must execute again. This
                 // catches a counter that accidentally ignores repeated calls.
+                // Keep it away from restored files, which may share cache blobs.
+                let uncached_out = cwd.join("uncached-out");
+                std::fs::create_dir(&uncached_out).unwrap();
+                let mut uncached_args = command
+                    .get_args()
+                    .skip(1)
+                    .map(|arg| arg.to_owned())
+                    .collect::<Vec<_>>();
+                let out_dir = uncached_args
+                    .iter()
+                    .position(|arg| arg == "--out-dir")
+                    .expect("fixture compile must specify its output directory");
+                uncached_args[out_dir + 1] = uncached_out.as_os_str().to_owned();
                 fixture.success(
                     fixture
                         .command(compiler)
-                        .args(command.get_args().skip(1))
+                        .args(uncached_args)
                         .current_dir(&cwd)
                         .env("CLIENT", value),
                 );
+                assert!(uncached_out.join("libisolated.rlib").is_file());
+                assert!(uncached_out.join("libisolated.rmeta").is_file());
                 assert_eq!(
                     std::fs::read_to_string(&counter).unwrap(),
                     format!("{value}\n{value}\n"),

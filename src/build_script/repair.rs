@@ -16,12 +16,28 @@ struct Record {
     permissions: std::fs::Permissions,
 }
 
-struct InstallLock(std::fs::File);
+struct RepairLock(std::fs::File);
 
-impl Drop for InstallLock {
+impl Drop for RepairLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
+}
+
+fn acquire_lock(path: &Path) -> Result<RepairLock> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(std::ops::BitOr::bitor(libc::O_NOFOLLOW, libc::O_NONBLOCK))
+        .open(path)
+        .with_context(|| format!("opening repair lock {}", path.display()))?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "repair lock is not a regular file"
+    );
+    file.try_lock()?;
+    Ok(RepairLock(file))
 }
 
 /// Refresh only validated launcher records, without modifying old runtime pins
@@ -80,13 +96,8 @@ fn repair_with_scan(
     let mut held = Vec::new();
     for profile in &profiles {
         for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
-            match std::fs::symlink_metadata(profile.join(name)) {
-                Ok(metadata) => ensure!(metadata.is_file(), "Cargo lock is not a regular file"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            held.push(acquire_lock(&profile.join(name)).context("a Cargo profile is busy")?);
         }
-        held.push(crate::unit_prune::hold(profile).context("a Cargo profile is busy")?);
     }
     let mut records = Vec::new();
     let mut install_locks = Vec::new();
@@ -105,19 +116,8 @@ fn repair_with_scan(
                 Ok(_) => {}
             }
             real_directories(&profile, &directory)?;
-            let lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(directory.join(INSTALL_LOCK))?;
-            ensure!(
-                lock.metadata()?.is_file(),
-                "launcher installation lock is not a regular file"
-            );
-            lock.try_lock()
+            let guard = acquire_lock(&directory.join(INSTALL_LOCK))
                 .context("a build-script launcher installation is busy")?;
-            let guard = InstallLock(lock);
             let planned = read_record(&directory, &profile)?;
             install_locks.push(guard);
             records.push(planned);
@@ -315,19 +315,16 @@ fn pin_engine(engine: &Path, profile: &Path) -> Result<PathBuf> {
         "runtime image directory is not a real directory"
     );
     let pin = directory.join("kache");
-    match std::fs::symlink_metadata(&pin) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.is_file()
-                    && metadata.nlink() == 1
-                    && metadata.permissions().mode() & 0o111 != 0
-                    && kache_store::file_hash::hash_file(&pin)? == expected_hash,
-                "repair runtime pin already contains different or shared bytes; refusing to overwrite it"
-            );
-            return Ok(pin);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    if pin.try_exists()? {
+        let metadata = std::fs::symlink_metadata(&pin)?;
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.permissions().mode() & 0o111 != 0
+                && kache_store::file_hash::hash_file(&pin)? == expected_hash,
+            "repair runtime pin already contains different or shared bytes; refusing to overwrite it"
+        );
+        return Ok(pin);
     }
     let temporary = tempfile::TempDir::new_in(&directory)?;
     let staged = temporary.path().join("kache");
@@ -340,7 +337,9 @@ fn pin_engine(engine: &Path, profile: &Path) -> Result<PathBuf> {
         "Kache engine changed while creating its repair pin"
     );
     super::wait_for_no_writers(&staged);
-    std::fs::rename(&staged, &pin)?;
+    tempfile::TempPath::try_from_path(staged)?
+        .persist_noclobber(&pin)
+        .map_err(|error| error.error)?;
     Ok(pin)
 }
 
@@ -373,9 +372,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(INSTALL_LOCK);
-        let file = std::fs::File::create(&path).unwrap();
-        file.lock().unwrap();
-        let guard = InstallLock(file);
+        let guard = acquire_lock(&path).unwrap();
         // A concurrent fork can keep the same open file description alive.
         let duplicate = guard.0.try_clone().unwrap();
         let probe = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -561,6 +558,53 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_units_without_launcher_records_do_not_block_owned_repairs() {
+        for has_build_directory in [false, true] {
+            let fixture = Fixture::new(false);
+            let other = "ordinary-1111111111111111";
+            std::fs::create_dir_all(fixture.profile.join(".fingerprint").join(other)).unwrap();
+            let directory = fixture.profile.join("build").join(other);
+            let untouched = directory.join("ordinary-output");
+            if has_build_directory {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(&untouched, b"ordinary output").unwrap();
+            }
+            assert_eq!(fixture.repair().unwrap(), 1);
+            if has_build_directory {
+                assert_eq!(std::fs::read(&untouched).unwrap(), b"ordinary output");
+            } else {
+                assert!(!directory.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_in_place_of_a_unit_refuses_the_whole_batch_before_pin_publication() {
+        let fixture = Fixture::new(false);
+        let blocked = "blocked-1111111111111111";
+        std::fs::create_dir_all(fixture.profile.join(".fingerprint").join(blocked)).unwrap();
+        let directory = fixture.profile.join("build").join(blocked);
+        std::fs::write(&directory, b"foreign unit file").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(directory.join(LAUNCH_RECORD))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        let before = std::fs::read(&fixture.record).unwrap();
+        let result = fixture.repair();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&fixture.record).unwrap(), before);
+        assert_eq!(std::fs::read(&directory).unwrap(), b"foreign unit file");
+        assert_eq!(
+            std::fs::read_dir(fixture.profile.join(SHIM_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn foreign_launchers_and_corrupt_preserved_scripts_are_rejected() {
         for corruption in [
             "foreign",
@@ -709,6 +753,7 @@ mod tests {
     fn symlink_records_and_unit_directories_are_rejected() {
         for part in [
             "record",
+            "dangling-record",
             "real",
             "action",
             "launcher",
@@ -718,7 +763,7 @@ mod tests {
         ] {
             let fixture = Fixture::new(false);
             let path = match part {
-                "record" => fixture.record.clone(),
+                "record" | "dangling-record" => fixture.record.clone(),
                 "real" => fixture.real.clone(),
                 "action" => super::super::with_suffix(&fixture.launcher, ACTION_SUFFIX),
                 "launcher" => fixture.launcher.clone(),
@@ -732,6 +777,9 @@ mod tests {
             } else {
                 std::fs::write(&moved, b"foreign lock").unwrap();
             }
+            if part == "dangling-record" {
+                std::fs::remove_file(&moved).unwrap();
+            }
             std::os::unix::fs::symlink(&moved, &path).unwrap();
             assert!(fixture.repair().is_err(), "{part}");
         }
@@ -742,12 +790,22 @@ mod tests {
         let fixture = Fixture::new(false);
         let pin = pin_engine(&fixture.engine, &fixture.profile).unwrap();
         assert_eq!(pin_engine(&fixture.engine, &fixture.profile).unwrap(), pin);
-        for corruption in ["different", "shared", "symlink", "not-executable"] {
+        for corruption in [
+            "different",
+            "shared",
+            "symlink",
+            "dangling-symlink",
+            "not-executable",
+        ] {
             std::fs::remove_file(&pin).unwrap();
             match corruption {
                 "different" => kache_fs::testutil::write_executable(&pin, "different"),
                 "shared" => std::fs::hard_link(&fixture.engine, &pin).unwrap(),
                 "symlink" => std::os::unix::fs::symlink(&fixture.engine, &pin).unwrap(),
+                "dangling-symlink" => {
+                    std::os::unix::fs::symlink(fixture._root.path().join("absent-engine"), &pin)
+                        .unwrap()
+                }
                 _ => {
                     std::fs::copy(&fixture.engine, &pin).unwrap();
                     std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();

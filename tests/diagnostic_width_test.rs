@@ -1,4 +1,5 @@
-//! Terminal width can be shared only when rustc cannot emit lint warnings.
+//! Terminal width stays out of the key: terminal and piped builds share entries,
+//! and a hit replays warnings wrapped for the build that recorded them.
 
 use serde_json::Value;
 use std::fs;
@@ -70,7 +71,7 @@ fn diagnostics(output: &Output, project: &Path) -> String {
 }
 
 #[test]
-fn warm_capped_cache_does_not_hide_argument_errors_or_warning_widths() {
+fn warm_cache_shares_widths_without_hiding_argument_errors() {
     build_kache();
     let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
@@ -120,33 +121,47 @@ fn warm_capped_cache_does_not_hide_argument_errors_or_warning_widths() {
         vec!["--cap-lints=allow", "--force-warn=unused_variables"],
         vec!["--cap-lints=warn", "--cap-lints=allow"],
     ] {
-        let mut rendered = Vec::new();
-        for width in ["--diagnostic-width=40", "--diagnostic-width=120"] {
+        let with_width = |width: &'static str| {
             let mut flags = lint_flags.clone();
             flags.push(width);
-            let direct = compile(project, &cache, false, &flags);
+            flags
+        };
+        let narrow = with_width("--diagnostic-width=40");
+        let wide = with_width("--diagnostic-width=120");
+        let direct_narrow = compile(project, &cache, false, &narrow);
+        let direct_wide = compile(project, &cache, false, &wide);
+        for direct in [&direct_narrow, &direct_wide] {
             assert!(direct.status.success(), "{direct:?}");
             assert!(String::from_utf8_lossy(&direct.stderr).contains("unused variable"));
-            for _ in 0..2 {
-                let cached = compile(project, &cache, true, &flags);
-                assert!(cached.status.success(), "{cached:?}");
-                assert_eq!(
-                    diagnostics(&cached, project),
-                    diagnostics(&direct, project),
-                    "{flags:?}"
-                );
-            }
-            rendered.push(direct.stderr);
         }
         assert_ne!(
-            rendered[0], rendered[1],
+            direct_narrow.stderr, direct_wide.stderr,
             "fixture must exercise width rendering"
         );
+
+        // The first build records its wrapping; builds of another width, or
+        // with piped output, hit the same entry and replay that wrapping.
+        for flags in [&narrow, &wide, &lint_flags] {
+            let cached = compile(project, &cache, true, flags);
+            assert!(cached.status.success(), "{cached:?}");
+            assert_eq!(
+                diagnostics(&cached, project),
+                diagnostics(&direct_narrow, project),
+                "{flags:?}"
+            );
+        }
         let recorded = events(&cache, "width_fixture");
-        let pair = &recorded[recorded.len() - 4..];
-        assert_eq!(pair[1]["result"], "local_hit");
-        assert_eq!(pair[3]["result"], "local_hit");
-        assert_ne!(pair[0]["cache_key"], pair[2]["cache_key"]);
+        let run = &recorded[recorded.len() - 3..];
+        // Same output bytes as an earlier build, so the miss may store only
+        // blobs the cache already holds.
+        assert!(
+            matches!(run[0]["result"].as_str(), Some("miss" | "dup")),
+            "{lint_flags:?}: {run:?}"
+        );
+        assert_eq!(run[1]["result"], "local_hit", "{lint_flags:?}");
+        assert_eq!(run[2]["result"], "local_hit", "{lint_flags:?}");
+        assert_eq!(run[0]["cache_key"], run[1]["cache_key"]);
+        assert_eq!(run[0]["cache_key"], run[2]["cache_key"]);
     }
 }
 
@@ -206,7 +221,7 @@ fn terminal_output(mut command: std::process::Command, columns: u16) -> Output {
 
 #[cfg(unix)]
 #[test]
-fn cargo_dependency_hits_between_terminal_widths_and_pipes() {
+fn cargo_builds_hit_between_terminal_widths_and_pipes() {
     use std::os::unix::fs::PermissionsExt;
 
     build_kache();
@@ -295,5 +310,14 @@ fn cargo_dependency_hits_between_terminal_widths_and_pipes() {
             "{recorded:?}"
         );
         assert_eq!(recorded[0]["cache_key"], recorded[index]["cache_key"]);
+        // The workspace crate can emit warnings and still shares its entry.
+        let workspace = events(&cache, "width_consumer");
+        assert_eq!(workspace.len(), index + 1);
+        assert_eq!(
+            workspace[index]["result"],
+            if index == 0 { "miss" } else { "local_hit" },
+            "{workspace:?}"
+        );
+        assert_eq!(workspace[0]["cache_key"], workspace[index]["cache_key"]);
     }
 }

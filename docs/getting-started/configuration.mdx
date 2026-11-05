@@ -461,7 +461,7 @@ Cargo units are kept on a filesystem where reads never change an access time (`n
 
 The same pass reclaims idle graphs under `incremental.kache-auto`, including graphs left after Cargo removed their fingerprints. On local filesystems, managed graphs use their recorded use and directory modification time rather than access times. A running compiler's unit lock protects its graph. Cleanup retains the small lock files so future compilers keep using the same locks.
 
-Terminal width, color and diagnostic format share one incremental directory. Cached diagnostics still use separate cache keys.
+Terminal width, color and diagnostic format share one incremental directory. Color and diagnostic format still use separate cache keys; terminal width does not.
 
 ### Recorded-command cleanup
 

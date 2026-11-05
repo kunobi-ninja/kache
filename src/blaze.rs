@@ -57,9 +57,8 @@ pub(crate) fn installed(env: &InvocationEnv) -> Option<PathBuf> {
     if !(cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "aarch64"))) {
         return None;
     }
-    // The engine name is stable across the ra-jit -> Blaze rename. Look it
-    // up for each eligible command so installing it later needs no new init.
-    env.resolve_program(Path::new("ra-jit"))
+    env.resolve_program(Path::new("blaze-engine"))
+        .or_else(|| env.resolve_program(Path::new("ra-jit")))
 }
 
 pub(crate) fn returning_cargo(env: &InvocationEnv) -> Option<OsString> {
@@ -85,7 +84,7 @@ pub(crate) fn try_run(
     }
     let Some(engine) = installed(env) else {
         eprintln!(
-            "kache: Blaze is enabled but ra-jit is unavailable on this platform or PATH; using Cargo"
+            "kache: Blaze is enabled but blaze-engine (or legacy ra-jit) is unavailable on this platform or PATH; using Cargo"
         );
         return Ok(None);
     };
@@ -153,7 +152,7 @@ fn event_root(env: &InvocationEnv, args: &[OsString]) -> Option<PathBuf> {
 pub(crate) fn workspace_wrapper(program: &str) -> bool {
     matches!(
         crate::compiler::command_basename(program),
-        Some("ra-jit-rustc" | "ra-jit-rustc-first")
+        Some("blaze-rustc" | "ra-jit-rustc" | "ra-jit-rustc-first")
     )
 }
 
@@ -275,7 +274,11 @@ mod tests {
 
     #[test]
     fn only_known_blaze_wrappers_keep_their_outputs() {
-        for program in ["/bin/ra-jit-rustc", "/bin/ra-jit-rustc-first"] {
+        for program in [
+            "/bin/blaze-rustc",
+            "/bin/ra-jit-rustc",
+            "/bin/ra-jit-rustc-first",
+        ] {
             assert!(workspace_wrapper(program));
         }
         for program in ["rustc", "ra-jit", "clippy-driver", "other-wrapper"] {
@@ -298,6 +301,14 @@ mod tests {
         std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(installed(&env), None);
         std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(installed(&env), Some(engine));
+        assert_eq!(installed(&env), Some(engine.clone()));
+        let renamed = root.path().join("blaze-engine");
+        std::fs::write(&renamed, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(installed(&env), Some(engine.clone()));
+        std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(installed(&env), Some(renamed.clone()));
+        std::fs::remove_file(engine).unwrap();
+        assert_eq!(installed(&env), Some(renamed));
     }
 }

@@ -245,6 +245,78 @@ fn compile(fixture: &Fixture, frontend: &Path, rustc: &Path, name: &str) -> Comm
     command
 }
 
+fn counting_rustc(fixture: &Fixture, rustc: &Path) -> PathBuf {
+    let source = fixture.path("counting-rustc.rs");
+    std::fs::write(
+        &source,
+        format!(
+            "const REAL_RUSTC: &str = {:?};\n{}",
+            rustc.to_str().unwrap(),
+            r#"
+use std::io::Write;
+
+fn main() {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let words = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>();
+    let query = words.iter().any(|arg| {
+        matches!(arg.as_ref(), "-vV" | "-V" | "--version" | "--print")
+            || arg.starts_with("--print=")
+    });
+    let isolated = words.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "isolated")
+        || words.iter().any(|arg| arg == "--crate-name=isolated");
+    let links = words.iter().enumerate().any(|(index, arg)| {
+        let emits = if arg == "--emit" {
+            words.get(index + 1).map(|next| next.as_ref())
+        } else {
+            arg.strip_prefix("--emit=")
+        };
+        emits.is_some_and(|emits| emits.split(',').any(|kind| kind.split('=').next() == Some("link")))
+    });
+    if isolated && links && !query {
+        let mut counter = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("actual-compiles.log")
+            .unwrap();
+        writeln!(counter, "{}", std::env::var("CLIENT").unwrap()).unwrap();
+    }
+    let status = std::process::Command::new(REAL_RUSTC).args(args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}
+"#,
+        ),
+    )
+    .unwrap();
+    let compiler = fixture.path("rustc.exe");
+    fixture.success(
+        fixture
+            .command(rustc)
+            .args(["--crate-name", "counting_rustc"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&compiler),
+    );
+    compiler
+}
+
+fn isolated_cache_key(cache: &Path) -> String {
+    let db = rusqlite::Connection::open_with_flags(
+        cache.join("index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut query = db
+        .prepare("SELECT cache_key FROM entries WHERE crate_name = 'isolated' AND committed = 1")
+        .unwrap();
+    let keys = query
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys.len(), 1, "{}: {keys:?}", cache.display());
+    keys.into_iter().next().unwrap()
+}
+
 #[test]
 fn cold_daemon_survives_the_client_and_warm_frontends_need_no_engine() {
     let fixture = Fixture::new();
@@ -576,6 +648,7 @@ fn native_msvc_defaultlib_and_exclusion_links_restore_a_runnable_executable() {
 fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
     let fixture = Fixture::new();
     let rustc = fixture.rustc();
+    let compiler = counting_rustc(&fixture, &rustc);
     fixture.success(
         fixture
             .command(fixture.path("install/kache.exe"))
@@ -595,18 +668,22 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
     }
     common::settle_writes(&[fixture.root.path()]);
     let barrier = std::sync::Barrier::new(2);
-    std::thread::scope(|threads| {
+    let keys = std::thread::scope(|threads| {
+        let mut workers = Vec::new();
         for (client, value) in clients {
             let fixture = &fixture;
             let rustc = &rustc;
+            let compiler = &compiler;
             let barrier = &barrier;
-            threads.spawn(move || {
+            workers.push(threads.spawn(move || {
                 let cwd = fixture.path(client);
                 let cache = fixture.path(&format!("cache-{client}"));
+                let counter = cwd.join("actual-compiles.log");
+                assert!(!counter.exists());
                 let mut command = compile(
                     fixture,
                     &fixture.path("frontend-only/kache.exe"),
-                    rustc,
+                    compiler,
                     "isolated",
                 );
                 command
@@ -615,6 +692,8 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
                     .env("CLIENT", value);
                 barrier.wait();
                 fixture.success(&mut command);
+                let cold = std::fs::read_to_string(&counter).unwrap();
+                assert_eq!(cold, format!("{value}\n"), "{client}: cold compiler calls");
                 let library = cwd.join("out/libisolated.rlib");
                 let metadata = cwd.join("out/libisolated.rmeta");
                 let expected_library = std::fs::read(&library).unwrap();
@@ -622,6 +701,11 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
                 std::fs::remove_file(&library).unwrap();
                 std::fs::remove_file(&metadata).unwrap();
                 fixture.success(&mut command);
+                assert_eq!(
+                    std::fs::read_to_string(&counter).unwrap(),
+                    cold,
+                    "{client}: a warm restore must not run the compiler"
+                );
                 assert_eq!(std::fs::read(&library).unwrap(), expected_library);
                 assert_eq!(std::fs::read(&metadata).unwrap(), expected_metadata);
                 assert!(cache.join("index.db").is_file());
@@ -640,28 +724,44 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
                     std::str::from_utf8(&output.stdout).unwrap(),
                     format!("{value}|{client}")
                 );
-            });
+                let key = isolated_cache_key(&cache);
+                // The same compile without Kache must execute again. This
+                // catches a counter that accidentally ignores repeated calls.
+                // Keep it away from restored files, which may share cache blobs.
+                let uncached_out = cwd.join("uncached-out");
+                std::fs::create_dir(&uncached_out).unwrap();
+                let mut uncached_args = command
+                    .get_args()
+                    .skip(1)
+                    .map(|arg| arg.to_owned())
+                    .collect::<Vec<_>>();
+                let out_dir = uncached_args
+                    .iter()
+                    .position(|arg| arg == "--out-dir")
+                    .expect("fixture compile must specify its output directory");
+                uncached_args[out_dir + 1] = uncached_out.as_os_str().to_owned();
+                fixture.success(
+                    fixture
+                        .command(compiler)
+                        .args(uncached_args)
+                        .current_dir(&cwd)
+                        .env("CLIENT", value),
+                );
+                assert!(uncached_out.join("libisolated.rlib").is_file());
+                assert!(uncached_out.join("libisolated.rmeta").is_file());
+                assert_eq!(
+                    std::fs::read_to_string(&counter).unwrap(),
+                    format!("{value}\n{value}\n"),
+                    "{client}: uncached control must count another compile"
+                );
+                key
+            }));
         }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
     });
-    let events = fixture.events("isolated", 4);
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["result"] == "miss")
-            .count(),
-        2
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["result"] == "local_hit")
-            .count(),
-        2
-    );
-    let keys = events
-        .iter()
-        .map(|event| event["cache_key"].as_str().unwrap())
-        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(keys.len(), 2);
     assert_eq!(fixture.daemon_pid(), pid);
 }

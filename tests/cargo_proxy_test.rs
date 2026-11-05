@@ -951,6 +951,7 @@ impl ReceiptAcceptance {
             .env("KACHE_REAL_CARGO", env!("CARGO"))
             .env("KACHE_TARGET_LIVENESS", if enabled { "1" } else { "0" })
             .env("KACHE_AUTO_GC", "0")
+            .env("KACHE_LOG", "kache::target_processes=debug")
             .env("RECEIPT_BUILD_VALUE", environment)
             .output()
             .unwrap();
@@ -993,7 +994,20 @@ impl ReceiptAcceptance {
             .into_iter()
             .chain(flags.iter().copied())
             .collect();
-        serde_json::from_slice(&self.run(&args, true, environment).stdout).unwrap()
+        let output = self.run(&args, true, environment);
+        let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if preview["targets"].as_array().is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| target["plan"]["status"] == "busy")
+        }) {
+            eprintln!(
+                "clean reported a busy target: {}\nflags: {flags:?}\nstderr:\n{}",
+                self.target.display(),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        preview
     }
 }
 

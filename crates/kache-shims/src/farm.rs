@@ -71,7 +71,11 @@ pub fn write_marker(dir: &Path) -> io::Result<bool> {
 /// Catches shims of another kache install, including farms older than the marker.
 pub fn is_kache_binary(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
-        name.eq_ignore_ascii_case("kache") || name.eq_ignore_ascii_case("kache.exe")
+        name.eq_ignore_ascii_case("kache")
+            || name.eq_ignore_ascii_case("kache.exe")
+            || name
+                .to_str()
+                .is_some_and(|name| crate::compiler_launcher_driver(name).is_some())
     })
 }
 

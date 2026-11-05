@@ -272,6 +272,9 @@ mod tests {
         }
         for args in [
             vec!["cc", "init"],
+            vec!["kache-clang-cl", "--version"],
+            vec![r"C:\Program Files\Kache\KACHE-CL.EXE", "/?"],
+            vec!["kache-cl"],
             vec!["x86_64-linux-gnu-gcc-13", "--help"],
             vec!["kache", "-E", "probe.c"],
             vec!["kache", "rustc", "lib.rs"],

@@ -10,7 +10,7 @@ import { prepare } from "./prepare.mjs";
 
 const source = path.dirname(fileURLToPath(import.meta.url));
 
-function fixture(t, { legacy = false, unstable = false } = {}) {
+function fixture(t, { legacy = false, unstable = false, launchers = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "kache-winget-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const archives = path.join(root, "archives");
@@ -18,7 +18,7 @@ function fixture(t, { legacy = false, unstable = false } = {}) {
     path.join(source, "test_inspect_archives.py"),
     "fixture",
     archives,
-    legacy ? "legacy" : "paired",
+    legacy ? "legacy" : launchers ? "launchers" : "paired",
   ]);
   const version = unstable ? "1.2.3-rc.1" : "1.2.3";
   const packageId = unstable
@@ -121,6 +121,21 @@ for (const unstable of [false, true]) {
     assert.deepEqual(prepare(f.args), result, "preparation is repeatable");
   });
 }
+
+test("native compiler launchers get portable aliases and survive later base manifests", (t) => {
+  const f = fixture(t, { launchers: true });
+  prepare(f.args);
+  const installer = f.read();
+  assert.deepEqual(installer.Commands, ["kache", "kache-clang-cl", "kache-cl"]);
+  assert.deepEqual(installer.NestedInstallerFiles, [
+    { RelativeFilePath: "kache.exe", PortableCommandAlias: "kache" },
+    { RelativeFilePath: "kache-clang-cl.exe", PortableCommandAlias: "kache-clang-cl" },
+    { RelativeFilePath: "kache-cl.exe", PortableCommandAlias: "kache-cl" },
+  ]);
+  fs.writeFileSync(f.args.baseInstaller, stringify(installer));
+  prepare(f.args);
+  assert.deepEqual(f.read(), installer);
+});
 
 test("per-installer types and guessed archive architectures are replaced with inspected values", (t) => {
   const f = fixture(t);

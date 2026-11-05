@@ -22,7 +22,7 @@ exec "$(dirname "$0")/kache-engine" "$@"
 
 
 class AurInstallationTests(unittest.TestCase):
-    def install(self, package, companion):
+    def install(self, package, companion, launchers=False):
         with tempfile.TemporaryDirectory(prefix="kache aur ") as directory:
             root = Path(directory)
             source = root / "source"
@@ -38,6 +38,11 @@ class AurInstallationTests(unittest.TestCase):
                 engine = binaries / "kache-engine"
                 engine.write_text(ENGINE)
                 engine.chmod(0o755)
+            if launchers or package == "kache-git":
+                for name in ["kache-clang-cl", "kache-cl"]:
+                    launcher = binaries / name
+                    launcher.write_text(ENGINE)
+                    launcher.chmod(0o755)
             environment = dict(os.environ, srcdir=str(source), pkgdir=str(destination))
             subprocess.run(
                 ["bash", "-euc", 'source "$1"; package', "package-test",
@@ -49,6 +54,8 @@ class AurInstallationTests(unittest.TestCase):
             )
             installed = destination / "usr/bin"
             expected = {"kache", "kache-engine"} if companion else {"kache"}
+            if launchers or package == "kache-git":
+                expected.update(["kache-clang-cl", "kache-cl"])
             self.assertEqual({file.name for file in installed.iterdir()}, expected)
             result = subprocess.run(
                 [str(installed / "kache"), "--version"],
@@ -57,6 +64,9 @@ class AurInstallationTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.stdout, "package fixture\n")
+            for name in expected - {"kache", "kache-engine"}:
+                result = subprocess.run([str(installed / name), "--version"], check=True, capture_output=True, text=True)
+                self.assertEqual(result.stdout, "package fixture\n")
             for shell, relative in [
                 ("bash", "bash-completion/completions/kache"),
                 ("zsh", "zsh/site-functions/_kache"),
@@ -78,6 +88,11 @@ class AurInstallationTests(unittest.TestCase):
         for package in ["kache-bin", "kache-git"]:
             with self.subTest(package=package):
                 self.install(package, companion=True)
+
+    def test_native_launcher_archives_install_every_entry_point(self):
+        for package in ["kache-bin", "kache-git"]:
+            with self.subTest(package=package):
+                self.install(package, companion=True, launchers=True)
 
 
 if __name__ == "__main__":

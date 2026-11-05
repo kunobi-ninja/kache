@@ -101,7 +101,20 @@ For clang-cl driver mode:
 $env:CC = "kache clang-cl"
 ```
 
-Windows has no shim generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.exe` and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory as well, so another Kache install does not mistake the copies for compilers.
+Windows has no compiler-name shim generator yet. On v2.0.0, use a wrapper prefix if your build system supports it. For a manual compiler-name shim, copy `kache.exe` to `gcc.exe`, keep the matching `kache-engine.exe` beside the copy, and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory so another Kache install skips the copies when finding the real compiler.
+
+### Single-executable CC/CXX launchers
+
+Source builds include native `kache-clang-cl` and `kache-cl` launchers; these are not part of v2.0.0. The release pipeline includes them in archives and Debian, AUR, and Winget packages from the next release. Use them when a build system treats `CC` or `CXX` as one executable path and cannot split `kache clang-cl`:
+
+```powershell
+$env:CC = "kache-clang-cl"
+$env:CXX = "kache-clang-cl"
+```
+
+Each launcher finds the real `clang-cl.exe` or `cl.exe` on `PATH` and forwards the compiler arguments without a shell. Keep the matching `kache-engine.exe` beside the launchers when installing manually. A full path to the launcher works when its installation directory contains spaces. The selected real compiler must still be on `PATH`.
+
+`kache-clang-cl` uses the existing clang-cl cache support. `kache-cl` runs MSVC directly without caching; it does not add an MSVC cache adapter. These launchers do not change `CC` or `CXX` during `kache init`.
 
 ## Cached invocations
 

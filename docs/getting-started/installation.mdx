@@ -3,7 +3,7 @@ title: Installation
 description: Install Kache from a release, package manager, crates.io, or Nix
 ---
 
-Kache ships two executables: the `kache` client and `kache-engine`. Keep the same
+Kache requires the `kache` client and `kache-engine`. Keep the same
 version of both in the same directory when installing a release manually.
 
 ```bash
@@ -206,6 +206,8 @@ cargo install --path . --locked
 
 A git checkout builds with the toolchain pinned in `rust-toolchain.toml`, which rustup installs on first use.
 
-Both commands install `kache` and `kache-engine`. Build locally without installing
-with `cargo build --release --bins`; keep the two outputs together if you copy
-them from `target/release/`.
+Both commands install `kache`, `kache-engine`, and the native `kache-clang-cl`
+and `kache-cl` compiler launchers. The launchers support build systems that need
+one executable in `CC` or `CXX`; see [C/C++ setup](/docs/getting-started/c-cpp#single-executable-cccxx-launchers).
+Build locally without installing with `cargo build --release --bins`. Keep the
+matching `kache-engine` beside every frontend you copy from `target/release/`.

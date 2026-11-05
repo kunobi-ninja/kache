@@ -50,6 +50,16 @@ function yamlFiles(directory) {
   });
 }
 
+function checkCommands(commands) {
+  assert(
+    [
+      '["kache"]',
+      '["kache","kache-clang-cl","kache-cl"]',
+    ].includes(JSON.stringify(commands)),
+    "unexpected command aliases",
+  );
+}
+
 export function prepare({
   directory,
   archives,
@@ -146,11 +156,7 @@ export function prepare({
       inspected.sha256,
       "installer checksum differs from release asset",
     );
-    assert.deepEqual(
-      row.Commands ?? installer.data.Commands,
-      ["kache"],
-      "unexpected command aliases",
-    );
+    checkCommands(row.Commands ?? installer.data.Commands);
   }
   // Komac can collapse two multi-executable ZIPs into one installer. Preserve
   // the published architecture-specific metadata and bind it to inspected assets.
@@ -170,11 +176,8 @@ export function prepare({
       `base manifest is missing or duplicates ${inspected.architecture}`,
     );
     const row = structuredClone(candidates[0]);
-    assert.deepEqual(
-      row.Commands ?? base.Commands,
-      ["kache"],
-      "unexpected base command aliases",
-    );
+    checkCommands(row.Commands ?? base.Commands);
+    delete row.Commands;
     row.Architecture = inspected.architecture;
     row.InstallerUrl = inspected.url;
     row.InstallerSha256 = inspected.sha256.toUpperCase();
@@ -186,15 +189,16 @@ export function prepare({
     return row;
   });
   installer.data = prepared;
+  installer.data.Commands = ["kache", ...inspection.compiler_launchers];
   delete installer.data.Architecture;
   installer.data.InstallerType =
     inspection.layout === "paired" ? "zip" : "portable";
   if (inspection.layout === "paired") {
     installer.data.NestedInstallerType = "portable";
-    // Winget retains the whole archive; expose only the frontend command.
-    installer.data.NestedInstallerFiles = [
-      { RelativeFilePath: "kache.exe", PortableCommandAlias: "kache" },
-    ];
+    // Keep the engine beside every native frontend in the extracted archive.
+    installer.data.NestedInstallerFiles = installer.data.Commands.map((command) => ({
+      RelativeFilePath: `${command}.exe`, PortableCommandAlias: command,
+    }));
   } else {
     delete installer.data.NestedInstallerType;
     delete installer.data.NestedInstallerFiles;

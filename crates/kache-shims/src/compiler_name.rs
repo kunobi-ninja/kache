@@ -63,7 +63,23 @@ pub fn is_cc_compiler_name(program: &str) -> bool {
 
 /// Compiler-name shims have priority over CLI-looking compiler arguments.
 pub fn is_compiler_shim_name(program: &str) -> bool {
-    basename(program).eq_ignore_ascii_case("rustdoc") || is_cc_compiler_name(program)
+    compiler_launcher_driver(program).is_some()
+        || basename(program).eq_ignore_ascii_case("rustdoc")
+        || is_cc_compiler_name(program)
+}
+
+/// Native launchers for callers that require one executable in CC/CXX.
+/// Unlike target-prefixed compiler names, these aliases select a different
+/// executable basename on PATH.
+pub fn compiler_launcher_driver(program: &str) -> Option<&'static str> {
+    let name = basename(program);
+    if name.eq_ignore_ascii_case("kache-clang-cl") {
+        Some("clang-cl")
+    } else if name.eq_ignore_ascii_case("kache-cl") {
+        Some("cl")
+    } else {
+        None
+    }
 }
 
 fn basename(program: &str) -> &str {
@@ -82,6 +98,36 @@ fn basename(program: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_launchers_select_only_the_two_explicit_drivers() {
+        for (program, expected) in [
+            ("kache-clang-cl", "clang-cl"),
+            ("kache-cl", "cl"),
+            ("/opt/kache/kache-clang-cl.exe", "clang-cl"),
+            (r"C:\Program Files\Kache\KACHE-CL.EXE", "cl"),
+        ] {
+            assert_eq!(
+                compiler_launcher_driver(program),
+                Some(expected),
+                "{program}"
+            );
+            assert!(is_compiler_shim_name(program), "{program}");
+        }
+        for program in [
+            "kache",
+            "clang-cl",
+            "cl",
+            "kache-gcc",
+            "kache-clang-cl-19",
+            "not-kache-cl",
+            "kache-cl.exe.bak",
+            "kache-cl.cmd",
+            "",
+        ] {
+            assert_eq!(compiler_launcher_driver(program), None, "{program}");
+        }
+    }
 
     #[test]
     fn drivers_keep_the_family_of_versioned_and_cross_compilers() {

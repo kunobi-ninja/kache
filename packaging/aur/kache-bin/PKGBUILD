@@ -30,6 +30,11 @@ package() {
   if [[ -f kache-engine ]]; then
     install -Dm0755 kache-engine "$pkgdir/usr/bin/kache-engine"
   fi
+  for launcher in kache-clang-cl kache-cl; do
+    if [[ -f "$launcher" ]]; then
+      install -Dm0755 "$launcher" "$pkgdir/usr/bin/$launcher"
+    fi
+  done
   install -Dm0644 kache.bash   "$pkgdir/usr/share/bash-completion/completions/kache"
   install -Dm0644 kache.zsh    "$pkgdir/usr/share/zsh/site-functions/_kache"
   install -Dm0644 kache.fish   "$pkgdir/usr/share/fish/vendor_completions.d/kache.fish"

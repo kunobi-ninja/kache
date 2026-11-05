@@ -2128,7 +2128,8 @@ pub(crate) mod shim {
 
     fn invoked_as_compiler_for(arg0: &str, env: &super::InvocationEnv) -> bool {
         let argv = [arg0.to_owned()];
-        super::rustdoc::RustdocCompiler::recognizes(&argv)
+        kache_shims::compiler_launcher_driver(arg0).is_some()
+            || super::rustdoc::RustdocCompiler::recognizes(&argv)
             || super::cc::CcCompiler::recognizes_for(&argv, env)
     }
 
@@ -2365,7 +2366,8 @@ pub(crate) mod shim {
         if !invoked_as_compiler_for(arg0, env) {
             return None;
         }
-        let name = super::command_basename(arg0)?;
+        let name = kache_shims::compiler_launcher_driver(arg0)
+            .or_else(|| super::command_basename(arg0))?;
         let paths = env.var_os("PATH").unwrap_or_default();
         let paths = std::env::split_paths(&paths)
             .filter_map(|path| env.resolve(&path))
@@ -2395,6 +2397,82 @@ pub(crate) mod shim {
 mod shim_tests {
     use super::shim::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn native_launchers_resolve_the_selected_driver_in_the_clients_path() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let marked = cwd.join("marked shims");
+        let toolchain = cwd.join("real toolchain");
+        std::fs::create_dir(&marked).unwrap();
+        std::fs::create_dir(&toolchain).unwrap();
+        kache_shims::farm::write_marker(&marked).unwrap();
+        let paths =
+            std::env::join_paths([Path::new("marked shims"), Path::new("real toolchain")]).unwrap();
+        let env = super::InvocationEnv::from_parts(
+            [("PATH", paths)],
+            Some(cwd.clone()),
+            None,
+            cwd.clone(),
+        );
+        for (launcher, driver) in [("kache-clang-cl", "clang-cl"), ("kache-cl", "cl")] {
+            let filename = format!("{driver}{}", std::env::consts::EXE_SUFFIX);
+            let real = toolchain.join(&filename);
+            for path in [marked.join(&filename), real.clone()] {
+                std::fs::write(&path, b"compiler fixture").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+            }
+            // A same-named program is a trap: the launcher must drop its prefix.
+            std::fs::copy(&real, toolchain.join(launcher)).unwrap();
+            let argv = vec![
+                launcher.to_owned(),
+                "/c".to_owned(),
+                "source with spaces.c".to_owned(),
+                "--help".to_owned(),
+            ];
+            let rewritten = wrapper_args_for(&argv, &env, None).unwrap().unwrap();
+            assert_eq!(rewritten[0], real.to_str().unwrap());
+            assert_eq!(&rewritten[1..], &argv[1..]);
+            assert_eq!(
+                super::is_passthrough_compiler_invocation_for(&rewritten, &env),
+                driver == "cl"
+            );
+            std::fs::remove_file(&real).unwrap();
+            let error = wrapper_args_for(&argv, &env, None).unwrap().unwrap_err();
+            assert!(error.contains(&format!("no real `{driver}`")), "{error}");
+        }
+    }
+
+    #[test]
+    fn windows_driver_resolution_skips_another_installs_native_launcher() {
+        for (driver, launcher) in [("clang-cl", "kache-clang-cl.exe"), ("cl", "kache-cl.exe")] {
+            let dirs = [PathBuf::from("other shims"), PathBuf::from("toolchain")];
+            let found = resolve_real_compiler_with_extensions(
+                driver,
+                &dirs,
+                None,
+                &[".exe"],
+                &|_| true,
+                &|path| {
+                    Some(if path.starts_with("other shims") {
+                        Path::new("other install").join(launcher)
+                    } else {
+                        path.to_owned()
+                    })
+                },
+                &|_| false,
+            );
+            assert_eq!(
+                found,
+                Some(Path::new("toolchain").join(format!("{driver}.exe")))
+            );
+        }
+    }
 
     #[test]
     fn compiler_shaped_argv0_is_recognized_but_kache_itself_is_not() {

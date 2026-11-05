@@ -36,12 +36,14 @@ def write_zip(directory, target, files):
     return path
 
 
-def write_assets(directory, legacy=False):
+def write_assets(directory, legacy=False, launchers=False):
     directory.mkdir(parents=True, exist_ok=True)
     for target, machine in [("x86_64", 0x8664), ("aarch64", 0xAA64)]:
         files = [("kache.exe", pe(machine))]
         if not legacy:
             files.append(("kache-engine.exe", pe(machine)))
+        if launchers:
+            files.extend((name, pe(machine)) for name in ["kache-clang-cl.exe", "kache-cl.exe"])
         write_zip(directory, target, files)
         if legacy:
             bare = directory / f"kache-{target}-pc-windows-msvc.exe"
@@ -75,6 +77,32 @@ class ArchiveTests(unittest.TestCase):
         checksum(bare)
         with self.assertRaisesRegex(ValueError, "differs from ZIP"):
             inspect_archives(self.root, "0.15.0-rc.3")
+
+    def test_native_launchers_are_validated_and_exposed_for_both_architectures(self):
+        write_assets(self.root, launchers=True)
+        result = inspect_archives(self.root, "2.0.1")
+        self.assertEqual(result["compiler_launchers"], ["kache-clang-cl", "kache-cl"])
+        self.assertEqual(result["layout"], "paired")
+        files = [(name, pe(0x8664)) for name in ["kache.exe", "kache-engine.exe", "kache-clang-cl.exe"]]
+        write_zip(self.root, "x86_64", files)
+        with self.assertRaisesRegex(ValueError, "incomplete compiler launcher"):
+            inspect_archives(self.root, "2.0.1")
+        files.append(("kache-cl.exe", pe(0xAA64)))
+        write_zip(self.root, "x86_64", files)
+        with self.assertRaisesRegex(ValueError, "kache-cl.exe has the wrong architecture"):
+            inspect_archives(self.root, "2.0.1")
+
+    def test_architectures_must_ship_the_same_launchers(self):
+        write_assets(self.root, launchers=True)
+        write_zip(self.root, "x86_64", [(name, pe(0x8664)) for name in ["kache.exe", "kache-engine.exe"]])
+        with self.assertRaisesRegex(ValueError, "different compiler launchers"):
+            inspect_archives(self.root, "2.0.1")
+
+    def test_native_launchers_require_the_companion(self):
+        self.assertEqual(inspect_archives(self.root, "2.0.1")["compiler_launchers"], [])
+        write_assets(self.root, legacy=True, launchers=True)
+        with self.assertRaisesRegex(ValueError, "incomplete compiler launcher"):
+            inspect_archives(self.root, "2.0.1")
 
     def test_selection_precedes_legacy_download_but_validation_requires_it(self):
         write_assets(self.root, legacy=True)
@@ -139,6 +167,6 @@ class ArchiveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "fixture":
-        write_assets(Path(sys.argv[2]), legacy=sys.argv[3] == "legacy")
+        write_assets(Path(sys.argv[2]), legacy=sys.argv[3] == "legacy", launchers=sys.argv[3] == "launchers")
     else:
         unittest.main()

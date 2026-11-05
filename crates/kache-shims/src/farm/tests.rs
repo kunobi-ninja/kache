@@ -145,6 +145,8 @@ fn kache_binary_names_are_recognized_case_insensitively() {
         "C:/kache/kache.exe",
         "C:/kache/KACHE.EXE",
         "/opt/Kache",
+        "/opt/kache-clang-cl",
+        "C:/kache/KACHE-CL.EXE",
     ] {
         assert!(is_kache_binary(Path::new(path)), "{path}");
     }
@@ -166,6 +168,8 @@ fn resolves_to_kache_by_identity_or_by_name() {
         match path.to_str()? {
             "/shims/cc" => Some(me.to_path_buf()),
             "/other/cc" => Some("/usr/bin/kache".into()),
+            "/launchers/clang-cl" => Some("/other/kache-clang-cl".into()),
+            "/launchers/cl" => Some("/other/kache-cl.exe".into()),
             "/usr/bin/cc" => Some("/usr/bin/cc".into()),
             _ => None,
         }
@@ -177,6 +181,9 @@ fn resolves_to_kache_by_identity_or_by_name() {
     ));
     assert!(!resolves_to_kache(Path::new("/shims/cc"), None, &resolve));
     assert!(resolves_to_kache(Path::new("/other/cc"), None, &resolve));
+    for path in ["/launchers/clang-cl", "/launchers/cl"] {
+        assert!(resolves_to_kache(Path::new(path), None, &resolve));
+    }
     assert!(!resolves_to_kache(
         Path::new("/usr/bin/cc"),
         Some(me),

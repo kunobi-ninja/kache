@@ -100,6 +100,8 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
 pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let cargo = real_cargo_program(true)?;
     let env = crate::invocation::InvocationEnv::capture();
+    let shims_above = cargo_shims_above(env.var_os(CARGO_SHIM_DEPTH_ENV).as_deref());
+    check_cargo_shim_depth(shims_above, &cargo)?;
     let config =
         crate::config::Config::load_for(&env).context("loading the cache configuration")?;
     let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
@@ -120,9 +122,56 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     }
     let mut command = Command::new(&cargo);
     command.args(&cargo_args);
+    command.env(CARGO_SHIM_DEPTH_ENV, next_cargo_shim_depth(shims_above));
     check_targets::configure(&mut command, &cargo, &config, &env);
     crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
     run_cargo_guarded(command, &cargo, lease, &config)
+}
+
+/// Environment variable kache's Cargo shim sets on the Cargo it runs. The
+/// value counts the kache Cargo shims above the process that reads it. No
+/// cache key reads it, and the probe and cc memos and target receipts leave
+/// out every `KACHE_*` variable.
+const CARGO_SHIM_DEPTH_ENV: &str = "KACHE_CARGO_SHIM_DEPTH";
+
+/// How many kache Cargo shims may run one inside the other before the chain
+/// is taken to be a loop. Real nesting stays small: an xtask or a build
+/// script that runs `cargo` adds one level.
+const MAX_CARGO_SHIMS_ABOVE: u32 = 8;
+
+/// How many kache Cargo shims sit above this process, from the value of
+/// [`CARGO_SHIM_DEPTH_ENV`]. Absent means none. A value that is not a number
+/// counts as one, like [`crate::wrappers_above`].
+fn cargo_shims_above(depth: Option<&OsStr>) -> u32 {
+    depth.map_or(0, |depth| {
+        depth.to_str().and_then(|v| v.parse().ok()).unwrap_or(1)
+    })
+}
+
+/// The [`CARGO_SHIM_DEPTH_ENV`] value the shim hands to the Cargo it runs.
+fn next_cargo_shim_depth(above: u32) -> String {
+    above.saturating_add(1).to_string()
+}
+
+/// Stop a chain of Cargo shims that only a loop could produce.
+///
+/// `cargo` is the program [`real_cargo_program`] found. It is not kache, yet
+/// it started kache's Cargo shim again. Another tool's shim does that when it
+/// falls back to the first `cargo` on PATH. Nothing left on PATH is known to
+/// be the real Cargo, so kache stops and names the cause, where the loop
+/// would otherwise start processes without end.
+fn check_cargo_shim_depth(above: u32, cargo: &Path) -> Result<()> {
+    if above < MAX_CARGO_SHIMS_ABOVE {
+        return Ok(());
+    }
+    bail!(
+        "the Cargo program kache found, `{}`, started kache's Cargo shim again, and the \
+         chain is now {above} levels deep. That program is probably another tool's shim, \
+         mise for example, that runs the first `cargo` on PATH when the tool does not \
+         manage Rust. Set KACHE_REAL_CARGO to the real Cargo, for example \
+         $HOME/.cargo/bin/cargo.",
+        cargo.display()
+    )
 }
 
 fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
@@ -1106,6 +1155,35 @@ mod tests {
             ]),
             "cargo build"
         );
+    }
+
+    #[test]
+    fn cargo_shim_depth_counts_shims_above() {
+        assert_eq!(cargo_shims_above(None), 0);
+        assert_eq!(cargo_shims_above(Some(OsStr::new("3"))), 3);
+        assert_eq!(cargo_shims_above(Some(OsStr::new("x"))), 1);
+    }
+
+    #[test]
+    fn cargo_shim_depth_stops_at_eight_and_names_the_program() {
+        let cargo = Path::new("/opt/other-tool/shims-1834/cargo");
+        check_cargo_shim_depth(7, cargo).unwrap();
+        let error = check_cargo_shim_depth(8, cargo).unwrap_err().to_string();
+        assert!(
+            error.contains("`/opt/other-tool/shims-1834/cargo`"),
+            "{error}"
+        );
+        assert!(error.contains("8 levels deep"), "{error}");
+        assert!(error.contains("KACHE_REAL_CARGO"), "{error}");
+    }
+
+    #[test]
+    fn cargo_shim_hands_cargo_one_more_level() {
+        let next =
+            |depth: Option<&str>| next_cargo_shim_depth(cargo_shims_above(depth.map(OsStr::new)));
+        assert_eq!(next(Some("3")), "4");
+        assert_eq!(next(None), "1");
+        assert_eq!(next_cargo_shim_depth(u32::MAX), "4294967295");
     }
 
     #[test]

@@ -1697,3 +1697,155 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
     assert_eq!(absent["selected"]["entries"], 0);
     assert!(absent.get("eviction").is_none());
 }
+
+/// A `cargo` that stands in for mise's shim in a project where mise does not
+/// manage Rust: it skips its own directory and execs the first other `cargo`
+/// on PATH, with PATH unchanged. Each run appends one line to
+/// `$FAKE_MISE_LOG`. It exits 97 past 30 levels, so the chain ends even when
+/// kache does not end it.
+const FAKE_MISE_CARGO: &str = r#"#!/bin/sh
+d=$(( ${FAKE_MISE_DEPTH:-0} + 1 ))
+export FAKE_MISE_DEPTH=$d
+echo "level=$d KACHE_CARGO_SHIM_DEPTH=${KACHE_CARGO_SHIM_DEPTH-unset}" >> "$FAKE_MISE_LOG"
+if [ "$d" -gt 30 ]; then
+  echo "fake mise: depth cap 30 reached" >&2
+  exit 97
+fi
+self=$(cd "${0%/*}" && pwd)
+IFS=:
+for dir in $PATH; do
+  [ "$dir" = "$self" ] && continue
+  if [ -x "$dir/cargo" ]; then exec "$dir/cargo" "$@"; fi
+done
+echo "fake mise: no cargo on PATH" >&2
+exit 98
+"#;
+
+/// How long a chain of Cargo shims may run before the test kills it.
+const SHIM_CHAIN_LIMIT: Duration = Duration::from_secs(60);
+
+/// `cargo --version` through a marked kache shim farm under `root`. `dirs`
+/// follow the farm on PATH, ahead of the inherited PATH.
+fn shimmed_cargo_version(root: &Path, dirs: &[&Path]) -> Command {
+    let shims = root.join("shims");
+    let cache = root.join("cache");
+    let project = root.join("project");
+    for dir in [&shims, &cache, &project] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
+    std::fs::write(shims.join(".kache-shims"), "").unwrap();
+    let base_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(shims.clone())
+            .chain(dirs.iter().map(|dir| dir.to_path_buf()))
+            .chain(std::env::split_paths(&base_path)),
+    )
+    .unwrap();
+    let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+    command
+        .arg("--version")
+        .current_dir(&project)
+        .env("PATH", path)
+        .env("KACHE_LOG", "off")
+        .env_remove("KACHE_REAL_CARGO")
+        .stdin(std::process::Stdio::null());
+    command
+}
+
+/// Run `command` in a process group of its own, with stdout and stderr in
+/// files under `dir`. Past [`SHIM_CHAIN_LIMIT`] the whole group is killed and
+/// the test fails, so a chain of shims cannot hang the suite. Returns the
+/// exit status and stderr.
+fn run_shim_chain(mut command: Command, dir: &Path) -> (std::process::ExitStatus, String) {
+    use std::os::unix::process::CommandExt;
+    let stderr = dir.join("stderr");
+    let mut child = command
+        .process_group(0)
+        .stdout(std::fs::File::create(dir.join("stdout")).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + SHIM_CHAIN_LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // SAFETY: the child leads its own process group and has not been
+            // waited on, so the group id is still the child's.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            child.wait().unwrap();
+            panic!(
+                "the Cargo shim chain still ran after {SHIM_CHAIN_LIMIT:?}; stderr:\n{}",
+                std::fs::read_to_string(&stderr).unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status, std::fs::read_to_string(&stderr).unwrap())
+}
+
+#[test]
+fn cargo_shim_stops_a_loop_through_another_tools_cargo_shim() {
+    let dir = tempfile::tempdir().unwrap();
+    let mise = dir.path().join("mise-shims");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&mise).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    kache_fs::testutil::write_executable(&mise.join("cargo"), FAKE_MISE_CARGO);
+    kache_fs::testutil::write_executable(
+        &real.join("cargo"),
+        "#!/bin/sh\n: > \"$REAL_CARGO_RAN\"\n",
+    );
+    let log = dir.path().join("fake-mise.log");
+    let ran = dir.path().join("real-cargo-ran");
+    let mut command = shimmed_cargo_version(dir.path(), &[&mise, &real]);
+    command
+        .env("FAKE_MISE_LOG", &log)
+        .env("REAL_CARGO_RAN", &ran)
+        .env_remove("FAKE_MISE_DEPTH");
+
+    let (status, stderr) = run_shim_chain(command, dir.path());
+    let levels = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        levels.lines().count(),
+        8,
+        "fake mise levels:\n{levels}\nstderr:\n{stderr}"
+    );
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("`{}`", mise.join("cargo").display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("KACHE_REAL_CARGO"), "{stderr}");
+    assert!(!ran.exists(), "the real Cargo ran");
+}
+
+#[test]
+fn nested_cargo_shims_hand_cargo_one_more_level() {
+    for (depth, expected) in [(Some("7"), "8"), (None, "1")] {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        kache_fs::testutil::write_executable(
+            &real.join("cargo"),
+            "#!/bin/sh\nprintf '%s' \"${KACHE_CARGO_SHIM_DEPTH-unset}\" > \"$REAL_CARGO_RAN\"\n",
+        );
+        let recorded = dir.path().join("real-cargo-depth");
+        let mut command = shimmed_cargo_version(dir.path(), &[&real]);
+        command.env("REAL_CARGO_RAN", &recorded);
+        match depth {
+            Some(depth) => command.env("KACHE_CARGO_SHIM_DEPTH", depth),
+            None => command.env_remove("KACHE_CARGO_SHIM_DEPTH"),
+        };
+
+        let (status, stderr) = run_shim_chain(command, dir.path());
+        assert!(status.success(), "depth {depth:?}: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap(),
+            expected,
+            "depth {depth:?}"
+        );
+    }
+}

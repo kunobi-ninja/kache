@@ -174,6 +174,8 @@ pub fn hermetic_command(
         .env_remove("KACHE_SOCKET_PATH")
         .env_remove("KACHE_EVENT_ROOT")
         .env_remove("KACHE_ACTIVE")
+        // Left behind when the suite itself runs through kache's Cargo shim.
+        .env_remove("KACHE_CARGO_SHIM_DEPTH")
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_OUT_DIR_ALIAS_ROOT")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")

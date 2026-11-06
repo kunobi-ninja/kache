@@ -3307,14 +3307,32 @@ mod tests {
             .acquire_permit(1)
             .expect("holder takes the only slot");
         let root = dir.path().to_path_buf();
-        let waiter =
-            std::thread::spawn(move || test_scheduler(&root, 1).acquire_permit(1).is_some());
+        #[cfg(target_os = "macos")]
+        let (ready, receive_ready) = std::sync::mpsc::channel();
+        #[cfg(target_os = "macos")]
+        let (resume, receive_resume) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            permit_wait::mac_test::observe_next_park(ready, receive_resume);
+            let admitted = test_scheduler(&root, 1).acquire_permit(1).is_some();
+            #[cfg(target_os = "macos")]
+            {
+                (admitted, permit_wait::mac_test::observed_unlock())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                admitted
+            }
+        });
         #[cfg(target_os = "linux")]
         wait_until("the permit waiter to queue", || {
             queued(dir.path()).len() == 1
         });
-        // macOS observes the kernel unlock event rather than a wake counter.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        receive_ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the actual waiter must arm and rescan before release");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             !waiter.is_finished(),
@@ -3335,15 +3353,26 @@ mod tests {
                 "dropping the permit must publish a wake"
             );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let started = std::time::Instant::now();
         #[cfg(not(target_os = "linux"))]
         drop(permit);
+        #[cfg(target_os = "macos")]
+        resume.send(()).expect("resume the actual permit waiter");
+        #[cfg(target_os = "macos")]
+        let (admitted, notified) = waiter.join().unwrap();
+        #[cfg(target_os = "macos")]
         assert!(
-            waiter.join().unwrap(),
+            notified,
+            "the actual waiter must receive NOTE_FUNLOCK; polling cannot satisfy this"
+        );
+        #[cfg(not(target_os = "macos"))]
+        let admitted = waiter.join().unwrap();
+        assert!(
+            admitted,
             "the waiter must take the slot after it is released"
         );
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "woke after {:?}; releasing a permit has to interrupt the wait",

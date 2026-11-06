@@ -63,11 +63,64 @@ pub(super) fn snapshot(root: &Path) -> u32 {
 #[mutants::skip]
 pub(super) fn park(root: &Path, armed: Option<Armed>, seen: u32, limit: Duration) {
     if let Some(armed) = armed {
-        armed.watch.stay(limit);
+        #[cfg(test)]
+        mac_test::before_park();
+        let event = armed.watch.stay(limit);
+        #[cfg(test)]
+        mac_test::record(event.as_ref());
+        let _ = event;
         return;
     }
     let _ = (root, seen);
     std::thread::sleep(limit);
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+pub(super) mod mac_test {
+    use std::cell::{Cell, RefCell};
+    use std::sync::mpsc::{Receiver, Sender};
+
+    struct Gate {
+        ready: Sender<()>,
+        resume: Receiver<()>,
+    }
+
+    thread_local! {
+        static GATE: RefCell<Option<Gate>> = const { RefCell::new(None) };
+        static UNLOCK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn observe_next_park(ready: Sender<()>, resume: Receiver<()>) {
+        GATE.with(|gate| assert!(gate.borrow_mut().replace(Gate { ready, resume }).is_none()));
+        UNLOCK.with(|seen| seen.set(false));
+    }
+
+    pub(crate) fn observed_unlock() -> bool {
+        UNLOCK.with(Cell::get)
+    }
+
+    pub(super) fn before_park() {
+        let gate = GATE.with(|gate| gate.borrow_mut().take());
+        if let Some(Gate { ready, resume }) = gate {
+            ready
+                .send(())
+                .expect("report the actual waiter before park");
+            resume
+                .recv()
+                .expect("resume the actual waiter after release");
+        }
+    }
+
+    pub(super) fn record(event: Option<&libc::kevent>) {
+        if event.is_some_and(|event| {
+            event.filter == libc::EVFILT_VNODE
+                && event.flags & libc::EV_ERROR == 0
+                && event.fflags & libc::NOTE_FUNLOCK != 0
+        }) {
+            UNLOCK.with(|seen| seen.set(true));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -127,12 +180,8 @@ impl MacWatch {
             unsafe { libc::close(kq) };
             return None;
         }
-        Some(Self { kq, files })
-    }
-
-    #[mutants::skip]
-    fn stay(&self, limit: Duration) {
-        let changes: Vec<libc::kevent> = self
+        let watch = Self { kq, files };
+        let changes: Vec<libc::kevent> = watch
             .files
             .iter()
             .map(|file| libc::kevent {
@@ -144,6 +193,27 @@ impl MacWatch {
                 udata: std::ptr::null_mut(),
             })
             .collect();
+        let timeout = timespec(Duration::ZERO);
+        // Register before the caller rescans the slots. With no output list,
+        // this call keeps an unlock pending and reports registration errors
+        // through its return value. `watch` owns all descriptors on failure.
+        // SAFETY: the descriptors, changelist and zero timeout outlive the
+        // call; the null output pointer has an event count of zero.
+        let registered = unsafe {
+            libc::kevent(
+                watch.kq,
+                changes.as_ptr(),
+                changes.len() as libc::c_int,
+                std::ptr::null_mut(),
+                0,
+                &timeout,
+            )
+        };
+        (registered >= 0).then_some(watch)
+    }
+
+    #[mutants::skip]
+    fn stay(&self, limit: Duration) -> Option<libc::kevent> {
         let deadline = std::time::Instant::now() + limit;
         let mut event = libc::kevent {
             ident: 0,
@@ -153,33 +223,63 @@ impl MacWatch {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        while std::time::Instant::now() < deadline {
+        loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return;
-            }
             let timeout = timespec(remaining);
-            // SAFETY: `kq` is a live kqueue, `changes` is the changelist for
-            // this call only, `event` is a one-slot output, and `timeout`
-            // outlives the call. The file descriptors stay open on `self`.
-            // `EV_ADD` is sent again after `EINTR`; adding the same watch twice
-            // is the same watch.
-            let ready = unsafe {
-                libc::kevent(
-                    self.kq,
-                    changes.as_ptr(),
-                    changes.len() as libc::c_int,
-                    &mut event,
-                    1,
-                    &timeout,
-                )
-            };
-            if ready >= 0
+            // SAFETY: `kq` has the watches registered by `open`; no changes
+            // are submitted here. `event` and `timeout` outlive the call,
+            // and the watched descriptors stay open on `self`.
+            let ready =
+                unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut event, 1, &timeout) };
+            if ready > 0 {
+                return Some(event);
+            }
+            if ready == 0
                 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                || std::time::Instant::now() >= deadline
             {
-                return;
+                return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod mac_tests {
+    use super::*;
+    use crate::store::StoreLock;
+
+    #[test]
+    fn an_unlock_before_parking_remains_a_kernel_event() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("permits")).unwrap();
+        let permit = StoreLock::try_acquire(&root.path().join("permits/0"))
+            .unwrap()
+            .unwrap();
+        let armed = arm(root.path(), &[0]).expect("arm the held permit");
+
+        // Release after arm returns, before the first park. Registration in
+        // park would miss this transition and fall back to its polling slice.
+        drop(permit);
+        let event = armed
+            .watch
+            .stay(Duration::ZERO)
+            .expect("the unlock must already be pending; no polling timeout can satisfy this");
+        assert_eq!(event.filter, libc::EVFILT_VNODE);
+        assert_eq!(event.flags & libc::EV_ERROR, 0);
+        assert_ne!(event.fflags & libc::NOTE_FUNLOCK, 0);
+    }
+
+    #[test]
+    fn a_held_permit_has_no_pending_unlock() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("permits")).unwrap();
+        let _permit = StoreLock::try_acquire(&root.path().join("permits/0"))
+            .unwrap()
+            .unwrap();
+        let armed = arm(root.path(), &[0]).expect("arm the held permit");
+        assert!(armed.watch.stay(Duration::ZERO).is_none());
     }
 }
 

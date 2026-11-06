@@ -2070,6 +2070,7 @@ fn codegen_knob_stems_classify_in_both_polarities() {
         "unroll-loops",
         "fast-math",
         "finite-math-only",
+        "builtin",
     ] {
         for flag in [format!("-f{stem}"), format!("-fno-{stem}")] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", &flag]);
@@ -2080,11 +2081,34 @@ fn codegen_knob_stems_classify_in_both_polarities() {
         }
     }
     // The polarity matcher must NOT overreach to a non-knob `-f…` flag.
-    let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", "-fomit-not-a-knob"]);
-    assert!(
-        descs.iter().any(|d| d.contains("unsupported flag")),
-        "an unknown -f flag must still refuse, got: {descs:?}"
-    );
+    for flag in ["-fomit-not-a-knob", "-fno-builtin-memcpy"] {
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "{flag} is not a listed knob and must still refuse, got: {descs:?}"
+        );
+    }
+}
+
+#[test]
+fn builtin_flags_require_resolved_codegen_in_both_dialects() {
+    for (program, dialect) in [("cc", Dialect::Gnu), ("clang-cl", Dialect::Cl)] {
+        for flag in ["-fbuiltin", "-fno-builtin"] {
+            let parsed = CcArgs::parse(&s(&[program, "-c", "foo.c", "-o", "foo.o", flag])).unwrap();
+            assert_eq!(
+                classify_cc_flag(flag, dialect),
+                Some(FlagClass::CapturedByProbe),
+                "{program}: {flag} changes codegen, not only preprocessed text"
+            );
+            assert!(
+                cc_flags_need_resolved_invocation(&parsed),
+                "{program}: {flag}"
+            );
+            assert!(parsed.config_args().iter().any(|arg| arg == flag));
+            assert!(parsed.probe_args().iter().any(|arg| arg == flag));
+            assert!(build_preprocess_args(&parsed).iter().any(|arg| arg == flag));
+        }
+    }
 }
 
 #[test]
@@ -2880,6 +2904,135 @@ fn closed_set_m_flags_are_raw_keyed_issue_826() {
             "{flag} is host-relative and must still refuse, got: {descs:?}"
         );
     }
+}
+
+/// The `cc` crate adds `-static` to every C compile of a musl
+/// `+crt-static` build. Its object effect is target-dependent (clang turns
+/// it into `-static-define`, Darwin drivers change the relocation model), so
+/// the spelling is keyed rather than dropped.
+#[test]
+fn static_on_a_compile_is_raw_keyed_and_cacheable() {
+    assert_eq!(
+        classify_cc_flag("-static", Dialect::Gnu),
+        Some(FlagClass::RawKeyed)
+    );
+    // clang-cl ignores `-static` with an unknown-argument warning.
+    assert_eq!(classify_cc_flag("-static", Dialect::Cl), None);
+
+    let musl_static = [
+        "x86_64-linux-musl-gcc",
+        "-O3",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "-static",
+        "-I",
+        "include",
+        "-Wall",
+        "-Wextra",
+        "-o",
+        "bcm.o",
+        "-c",
+        "bcm.c",
+    ];
+    let descs = refuse_descriptions(&musl_static);
+    assert!(descs.is_empty(), "a -static compile must cache: {descs:?}");
+
+    let raw = |args: &[&str]| cc_raw_flags_for_key(&CcArgs::parse(&s(args)).unwrap(), &[]);
+    let without: Vec<&str> = musl_static
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "-static")
+        .collect();
+    assert_eq!(raw(&musl_static), vec![b"-static".to_vec()]);
+    assert_ne!(raw(&musl_static), raw(&without));
+
+    for flag in ["-static-pie", "-static-libgcc", "-shared"] {
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "{flag} is not modeled and must still refuse, got: {descs:?}"
+        );
+    }
+}
+
+/// `-ftls-model=` picks the TLS access sequence the object uses. The four
+/// models GCC and clang accept are a closed set, keyed verbatim.
+#[test]
+fn tls_model_is_raw_keyed_and_cacheable() {
+    let models = [
+        "global-dynamic",
+        "local-dynamic",
+        "initial-exec",
+        "local-exec",
+    ];
+    let raw = |flag: &str| {
+        cc_raw_flags_for_key(
+            &CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", flag])).unwrap(),
+            &[],
+        )
+    };
+    for model in models {
+        let flag = format!("-ftls-model={model}");
+        assert_eq!(
+            classify_cc_flag(&flag, Dialect::Gnu),
+            Some(FlagClass::RawKeyed),
+            "{flag} must fold verbatim"
+        );
+        // clang-cl ignores `-ftls-model=` with an unknown-argument warning.
+        assert_eq!(classify_cc_flag(&flag, Dialect::Cl), None);
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", &flag]);
+        assert!(descs.is_empty(), "{flag} should be cacheable: {descs:?}");
+        assert_eq!(raw(&flag), vec![flag.as_bytes().to_vec()]);
+    }
+    assert_ne!(
+        raw("-ftls-model=initial-exec"),
+        raw("-ftls-model=local-exec")
+    );
+    for flag in ["-ftls-model=", "-ftls-model=native", "-ftls-model=initial"] {
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "{flag} is not a TLS model and must still refuse, got: {descs:?}"
+        );
+    }
+}
+
+/// The joined `-xassembler-with-cpp` reaches the driver exactly like the
+/// separated `-x assembler-with-cpp`, which already caches.
+#[test]
+fn joined_assembler_with_cpp_override_matches_the_separated_form() {
+    let joined = CcArgs::parse(&s(&[
+        "cc",
+        "-xassembler-with-cpp",
+        "-c",
+        "aesni-x86_64.S",
+        "-o",
+        "aesni-x86_64.o",
+    ]))
+    .unwrap();
+    let separated = CcArgs::parse(&s(&[
+        "cc",
+        "-x",
+        "assembler-with-cpp",
+        "-c",
+        "aesni-x86_64.S",
+        "-o",
+        "aesni-x86_64.o",
+    ]))
+    .unwrap();
+    assert_eq!(
+        classify_cc_flag("-xassembler-with-cpp", Dialect::Gnu),
+        classify_cc_flag("-x", Dialect::Gnu)
+    );
+    assert_eq!(joined.language_override, separated.language_override);
+    assert!(
+        joined.refuse_reasons(&[]).is_empty(),
+        "{:?}",
+        joined.refuse_reasons(&[])
+    );
+    assert!(cc_flags_need_resolved_invocation(&joined));
 }
 
 #[test]
@@ -3771,7 +3924,6 @@ fn classifier_does_not_overreach_115_additions() {
         "-Wa,-mfp",
         "-Wa,--something-else",
         // Other sticky `-x` variants still need explicit rows.
-        "-xassembler-with-cpp",
         "-xnone",
         // ObjC variants not on the list
         "-fno-objc-arc",
@@ -4113,7 +4265,14 @@ fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
     // before the preprocessor hash runs. Every `CapturedByProbe`
     // shape fails closed here; `-gdwarf-2` pins the #838 row.
     let compiler = CcCompiler::new();
-    for flag in ["-fno-rtti", "-gdwarf-2", "-gfull"] {
+    for flag in [
+        "-fno-rtti",
+        "-gdwarf-2",
+        "-gfull",
+        "-fbuiltin",
+        "-fno-builtin",
+        "-xassembler-with-cpp",
+    ] {
         let parsed = compiler
             .parse(&s(&["true", "-c", "foo.c", "-o", "foo.o", flag]))
             .unwrap();

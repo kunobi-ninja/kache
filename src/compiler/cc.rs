@@ -2544,7 +2544,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         matcher: Matcher::Regex(concat!(
             r"-f(?:no-)?(?:",
-            "associative-math|asynchronous-unwind-tables|cxx-exceptions|data-sections|",
+            "associative-math|asynchronous-unwind-tables|builtin|cxx-exceptions|data-sections|",
             "fast-math|finite-math-only|freestanding|function-sections|math-errno|",
             "merge-all-constants|omit-frame-pointer|reciprocal-math|rounding-math|",
             "semantic-interposition|signaling-nans|signed-zeros|strict-aliasing|",
@@ -2552,7 +2552,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
             ")",
         )),
         class: FlagClass::CapturedByProbe,
-        source: "#114/#245/#418/#422/#426/#580/#856 + 0.20 nightly — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class). unroll-loops / asynchronous-unwind-tables from lance/Firefox passthroughs. cxx-exceptions / freestanding from Firefox Windows nightly.",
+        source: "#114/#245/#418/#422/#426/#580/#856 + 0.20 nightly — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class). unroll-loops / asynchronous-unwind-tables from lance/Firefox passthroughs. cxx-exceptions / freestanding from Firefox Windows nightly. builtin from cc crate musl builds (gcc and clang forward -fno-builtin to cc1).",
         dialect: None,
     },
     FlagSpec {
@@ -2998,6 +2998,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        matcher: Matcher::Regex(
+            r"-ftls-model=(?:global-dynamic|local-dynamic|initial-exec|local-exec)",
+        ),
+        class: FlagClass::RawKeyed,
+        source: "cc crate musl builds (aws-lc-sys) — TLS access model; the four models gcc and clang accept, keyed verbatim. clang-cl ignores it with a warning, so Gnu only.",
+        dialect: Some(Dialect::Gnu),
+    },
+    FlagSpec {
         // aarch64 pointer-auth / BTI / GCS. Combinations gcc documents;
         // `native`/`auto` are not in this set and keep refusing.
         matcher: Matcher::Regex(
@@ -3083,9 +3091,9 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // language mode into the `-cc1` invocation. One regex row
         // covers the sticky forms while `-x <lang>` stays an exact
         // row because its language value is a separate argv token.
-        matcher: Matcher::Regex(r"-x(?:c|c\+\+|objective-c|objective-c\+\+)"),
+        matcher: Matcher::Regex(r"-x(?:c|c\+\+|objective-c|objective-c\+\+|assembler-with-cpp)"),
         class: FlagClass::CapturedByProbe,
-        source: "Issue #115 / flag audit — sticky language override forms.",
+        source: "Issue #115 / flag audit — sticky language override forms. assembler-with-cpp from cc crate assembly sources; gcc/clang -### and -E output identical to the separated `-x assembler-with-cpp`.",
         dialect: None,
     },
     FlagSpec {
@@ -3197,6 +3205,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         class: FlagClass::RawKeyed,
         source: "linker selection; unused-argument diagnostics can change compile success.",
         dialect: None,
+    },
+    FlagSpec {
+        // A link option, but not inert on every compile: clang passes cc1
+        // `-static-define` and Darwin drivers switch to a static relocation model.
+        matcher: Matcher::Exact("-static"),
+        class: FlagClass::RawKeyed,
+        source: "cc crate musl +crt-static builds (aws-lc-sys, ring) pass -static on every C compile; Linux gcc/clang -c objects and -dM macros identical with and without it. clang-cl ignores it with a warning, so Gnu only.",
+        dialect: Some(Dialect::Gnu),
     },
     FlagSpec {
         // Separated and joined (`-iquote<dir>`) forms, as for `-isystem`.

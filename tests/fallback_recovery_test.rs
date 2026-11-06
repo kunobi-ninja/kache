@@ -64,7 +64,7 @@ printf 'complete-object' > "$TEST_OBJECT"
                 "object.o",
             ]
         } else {
-            vec!["-xassembler-with-cpp", "-c", "input.s", "-o", "object.o"]
+            vec!["-xnone", "-c", "input.s", "-o", "object.o"]
         }
         .into_iter()
         .map(String::from)

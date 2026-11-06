@@ -94,11 +94,14 @@ fn parse_holder(name: &str, text: &str) -> Option<Holder> {
     use crate::process_identity::ProcessIdentity;
     let mut parts = name.split('-');
     let pid = parts.next()?.parse().ok()?;
-    let _taken = parts.next()?;
+    let _taken: u128 = parts.next()?.parse().ok()?;
     let process = match parts.next() {
         Some(start) => ProcessIdentity::started_at(pid, start.parse().ok()?),
         None => ProcessIdentity::unrecorded(pid),
     };
+    if parts.next().is_some() {
+        return None;
+    }
     let (since, what) = text.split_once('\t')?;
     Some(Holder {
         process,
@@ -278,20 +281,32 @@ mod tests {
             })
         );
         assert_eq!(parse_holder("x-9", "17\tcargo"), None);
+        for name in ["42", "42-", "42-invalid", "42-9-invalid", "42-9-1-extra"] {
+            assert_eq!(parse_holder(name, "17\tcargo"), None, "{name}");
+        }
+        assert_eq!(parse_holder("42-9", "invalid\tcargo"), None);
+        assert_eq!(parse_holder("42-9", "17 no-tab"), None);
+        assert_eq!(
+            parse_holder("42-9-23", "17\tcargo\targument"),
+            Some(Holder {
+                process: crate::process_identity::ProcessIdentity::started_at(42, 23),
+                what: "cargo\targument".to_owned(),
+                since: 17,
+            })
+        );
     }
 
     /// Linux reuses process numbers, and answers for a thread's ID as for a
     /// process, so a record's number can name a live stranger.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_record_whose_number_now_names_another_process_or_thread_is_dropped() {
-        let mut stranger = std::process::Command::new("sleep")
-            .arg("600")
-            .spawn()
-            .unwrap();
+    fn reused_numbers_are_pruned_without_discarding_live_legacy_holders() {
+        let current = crate::process_identity::ProcessIdentity::current();
+        let start = current.start().expect("this process reports its start");
         let (sent_tid, thread_id) = std::sync::mpsc::channel();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments and returns this thread's ID.
             sent_tid.send(unsafe { libc::gettid() } as u32).unwrap();
             let _ = stopped.recv();
         });
@@ -302,17 +317,19 @@ mod tests {
         let records = holders_dir(dir.path());
         let reused = [
             // A thread of this very process.
-            format!("{tid}-1"),
+            format!("{tid}-1-{start}"),
             // A process that started after the one that wrote the record.
-            format!("{}-1-0", stranger.id()),
-            // A record from before records named a start.
-            format!("{}-2", stranger.id()),
+            format!("{}-1-{}", current.pid(), start ^ 1),
         ];
         for name in &reused {
             std::fs::write(records.join(name), "5\tcargo nextest").unwrap();
         }
+        let legacy = records.join(format!("{}-2", current.pid()));
+        std::fs::write(&legacy, "5\tlegacy cargo").unwrap();
         let named: Vec<String> = holders(dir.path()).into_iter().map(|h| h.what).collect();
-        assert_eq!(named, ["cargo build"]);
+        assert_eq!(named, ["legacy cargo", "cargo build"]);
+        assert!(legacy.exists(), "an active legacy holder lost its record");
+        assert!(try_exclusive(dir.path()).unwrap().is_none());
         for name in &reused {
             assert!(!records.join(name).exists(), "{name} kept");
         }
@@ -320,8 +337,7 @@ mod tests {
         drop(lease);
         drop(stop);
         thread.join().unwrap();
-        stranger.kill().unwrap();
-        stranger.wait().unwrap();
+        assert!(try_exclusive(dir.path()).unwrap().is_some());
     }
 
     #[test]
@@ -333,6 +349,21 @@ mod tests {
         drop(first);
         assert!(try_exclusive(dir.path()).unwrap().is_none());
         drop(second);
+        assert!(try_exclusive(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn holder_records_name_blockers_but_do_not_hold_the_cleanup_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = holders_dir(dir.path());
+        std::fs::create_dir_all(&records).unwrap();
+        std::fs::write(
+            records.join(format!("{}-1", std::process::id())),
+            "1\told cargo command",
+        )
+        .unwrap();
+        assert_eq!(holders(dir.path()).len(), 1);
+        assert_eq!(blockers(dir.path()), None);
         assert!(try_exclusive(dir.path()).unwrap().is_some());
     }
 

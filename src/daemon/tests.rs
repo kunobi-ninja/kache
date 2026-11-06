@@ -991,6 +991,7 @@ fn in_flight_compile_under_a_reused_number_is_pruned() {
     let (sent, received) = std::sync::mpsc::channel();
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::spawn(move || {
+        // SAFETY: gettid has no arguments and returns this thread's ID.
         sent.send(unsafe { libc::gettid() } as u32).unwrap();
         let _ = stopped.recv();
     });
@@ -1007,6 +1008,98 @@ fn in_flight_compile_under_a_reused_number_is_pruned() {
     assert!(daemon.in_flight_snapshot().is_empty());
     drop(stop);
     thread.join().unwrap();
+}
+
+#[test]
+fn in_flight_age_limit_includes_its_boundary_and_legacy_finish_still_removes() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    let pid = std::process::id();
+    let started_at = 100_000_000;
+    daemon.handle_compile_started(CompileStartedRequest {
+        crate_name: "age-boundary".into(),
+        root: "/w".into(),
+        pid,
+        started_at_ms: started_at,
+        typical_ms: None,
+        client_epoch: 0,
+        client_version: None,
+    });
+    {
+        let mut map = daemon.in_flight_compiles.lock().unwrap();
+        prune_in_flight_at(&mut map, started_at + 21_600_000);
+        assert_eq!(map.len(), 1, "the inclusive six-hour boundary was pruned");
+        prune_in_flight_at(&mut map, started_at + 21_600_001);
+        assert!(map.is_empty(), "an entry beyond six hours was retained");
+    }
+    daemon.handle_compile_started(CompileStartedRequest {
+        crate_name: "legacy-finish".into(),
+        root: "/w".into(),
+        pid,
+        started_at_ms: unix_time_ms(),
+        typical_ms: None,
+        client_epoch: 0,
+        client_version: None,
+    });
+    assert_eq!(daemon.in_flight_snapshot().len(), 1);
+    daemon.handle_compile_finished(&CompileFinishedRequest {
+        pid,
+        started_at_ms: 0,
+    });
+    assert!(daemon.in_flight_snapshot().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn in_flight_refresh_preserves_identity_and_new_compiles_capture_their_own() {
+    use crate::process_identity::ProcessIdentity;
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    let pid = std::process::id();
+    let now = unix_time_ms();
+    let request = |started_at_ms| CompileStartedRequest {
+        crate_name: "refresh".into(),
+        root: "/w".into(),
+        pid,
+        started_at_ms,
+        typical_ms: None,
+        client_epoch: 0,
+        client_version: None,
+    };
+    daemon.handle_compile_started(request(now));
+    // An inconclusive initial probe must not be replaced on the same
+    // compile's heartbeat. A fresh compile gets a fresh identity.
+    daemon
+        .in_flight_compiles
+        .lock()
+        .unwrap()
+        .get_mut(&pid)
+        .unwrap()
+        .process = ProcessIdentity::unrecorded(pid);
+    daemon.handle_compile_started(request(now));
+    assert_eq!(
+        daemon.in_flight_compiles.lock().unwrap()[&pid].process,
+        ProcessIdentity::unrecorded(pid)
+    );
+    daemon.handle_compile_started(request(now + 1));
+    let current = ProcessIdentity::current();
+    assert!(current.start().is_some());
+    assert_eq!(
+        daemon.in_flight_compiles.lock().unwrap()[&pid].process,
+        current
+    );
+
+    daemon
+        .in_flight_compiles
+        .lock()
+        .unwrap()
+        .get_mut(&pid)
+        .unwrap()
+        .process = ProcessIdentity::started_at(pid, current.start().unwrap() ^ 1);
+    assert!(
+        daemon.in_flight_snapshot().is_empty(),
+        "a reused PID kept the old compile"
+    );
 }
 
 /// #131 wire shape: the new variants serialize under snake_case tags an

@@ -9083,7 +9083,10 @@ struct InFlightCompile {
 /// on both the register and snapshot paths (kunobi-ninja/kache#131) — a
 /// wrapper killed by OOM or ^C never sends CompileFinished.
 fn prune_in_flight(map: &mut HashMap<u32, InFlightCompile>) {
-    let now = unix_time_ms();
+    prune_in_flight_at(map, unix_time_ms());
+}
+
+fn prune_in_flight_at(map: &mut HashMap<u32, InFlightCompile>, now: u64) {
     map.retain(|_, entry| {
         now.saturating_sub(entry.compile.started_at_ms) <= IN_FLIGHT_MAX_AGE_MS
             && entry.process.is_running()

@@ -1,4 +1,4 @@
-name: Adoption preflight (1831, 1832, 1833, 1836)
+name: Adoption preflight (1836)
 
 on:
   push:
@@ -27,30 +27,6 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - pr: "1831"
-            platform: Linux
-            runner: ubuntu-latest
-            install_args: rust github:casey/just
-            head: bb324609564e016c21a5d24132948defe685d49b
-            tree: a261493d56976da6f4260d96aea6292626f23d17
-          - pr: "1832"
-            platform: Linux
-            runner: ubuntu-latest
-            install_args: rust github:casey/just
-            head: a5ce93fb53daef10fad459b21037aa4a75f1d783
-            tree: 7582b2bf888a99bf6f37569d7a839ec9783833c2
-          - pr: "1832"
-            platform: macOS
-            runner: macos-latest
-            install_args: rust
-            head: a5ce93fb53daef10fad459b21037aa4a75f1d783
-            tree: 7582b2bf888a99bf6f37569d7a839ec9783833c2
-          - pr: "1833"
-            platform: Linux
-            runner: ubuntu-latest
-            install_args: rust github:casey/just
-            head: fd2ec19622370f5a38c4f8143236837d59ffeac3
-            tree: 3288b72bf7bec75501d761d9c05daa2744090b26
           - pr: "1836"
             platform: Linux
             runner: ubuntu-latest
@@ -149,7 +125,11 @@ jobs:
               cargo test --locked -p kache --lib compiler::flags::tests::flag_regexes_match_like_the_default_engine -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/flag-regexes.log"
               grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/flag-regexes.log"
               cargo test --locked -p kache --test fallback_recovery_test -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/fallback-recovery.log"
-              grep -Fq 'test result: ok. 6 passed; 0 failed;' "$EVIDENCE_DIR/fallback-recovery.log"
+              # One additional fallback test is macOS-only. Require every Linux case.
+              grep -Fq 'test result: ok. 5 passed; 0 failed;' "$EVIDENCE_DIR/fallback-recovery.log"
+              for regression in failed_fallback_retries_once_preserving_compiler_inputs_and_events genuine_compiler_failure_is_preserved_after_retry successful_and_cancelled_fallbacks_do_not_retry missing_and_non_executable_fallbacks_compile_directly stdin_reaches_the_direct_compiler_once_without_partial_fallback_stdout; do
+                grep -Fxq "test $regression ... ok" "$EVIDENCE_DIR/fallback-recovery.log"
+              done
               ;;
             *) exit 2 ;;
           esac

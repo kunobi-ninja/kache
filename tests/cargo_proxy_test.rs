@@ -5,7 +5,8 @@
 use serde_json::Value;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::path::Path;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -553,37 +554,105 @@ fn explicit_rustflags_keep_their_cargo_precedence() {
 /// `kache cargo` leaves none behind, whatever Cargo's exit code.
 #[test]
 fn a_finished_cargo_run_leaves_no_lease_record() {
+    for shimmed in [false, true] {
+        for code in [0, 3] {
+            let script = format!(
+                "#!/bin/sh\nls \"$KACHE_TEST_HOLDERS\" > \"$KACHE_TEST_CAPTURE\"\nexit {code}\n"
+            );
+            let (_dir, holders, seen, output) = cargo_lease_probe(shimmed, &script);
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "shim={shimmed}: {output:?}"
+            );
+            assert_eq!(output.status.signal(), None, "{output:?}");
+            let while_running = std::fs::read_to_string(&seen).unwrap();
+            assert_eq!(while_running.lines().count(), 1, "{while_running:?}");
+            assert_cargo_lease_gone(&holders);
+        }
+    }
+}
+
+#[test]
+fn a_signalled_cargo_run_releases_its_lease_before_reraising_the_signal() {
+    for shimmed in [false, true] {
+        let (_dir, holders, seen, output) = cargo_lease_probe(
+            shimmed,
+            "#!/bin/sh\nls \"$KACHE_TEST_HOLDERS\" > \"$KACHE_TEST_CAPTURE\"\nkill -TERM $$\n",
+        );
+        assert_eq!(output.status.code(), None, "shim={shimmed}: {output:?}");
+        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        let while_running = std::fs::read_to_string(&seen).unwrap();
+        assert_eq!(while_running.lines().count(), 1, "{while_running:?}");
+        assert_cargo_lease_gone(&holders);
+    }
+}
+
+#[test]
+fn a_cargo_spawn_error_releases_its_lease_and_remains_an_error() {
+    for shimmed in [false, true] {
+        let (_dir, holders, _seen, output) =
+            cargo_lease_probe(shimmed, "#!/kache-test-missing-interpreter\n");
+        assert_eq!(output.status.code(), Some(1), "shim={shimmed}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("running Cargo program"),
+            "{output:?}"
+        );
+        assert_cargo_lease_gone(&holders);
+    }
+}
+
+fn cargo_lease_probe(shimmed: bool, script: &str) -> (tempfile::TempDir, PathBuf, PathBuf, Output) {
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("cache");
     let holders = cache.join("target-use.holders");
     let seen = dir.path().join("seen");
     let fake_cargo = dir.path().join("cargo");
-    kache_fs::testutil::write_executable(
-        &fake_cargo,
-        "#!/bin/sh\nls \"$KACHE_TEST_HOLDERS\" > \"$KACHE_TEST_CAPTURE\"\nexit 3\n",
-    );
-
-    let output = proxied_cargo(dir.path(), &cache, &dir.path().join("target"))
-        .args(["cargo", "build"])
+    std::fs::create_dir_all(&cache).unwrap();
+    let config = cache.join("config.toml");
+    std::fs::write(&config, "[cache]\nblaze=false\nlocal_only=true\n").unwrap();
+    kache_fs::testutil::write_executable(&fake_cargo, script);
+    let program = if shimmed {
+        let shim = dir.path().join("shims/cargo");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(KACHE_BIN, &shim).unwrap();
+        shim
+    } else {
+        PathBuf::from(KACHE_BIN)
+    };
+    let mut command = hermetic_command(program, &cache, Some(&config));
+    if !shimmed {
+        command.arg("cargo");
+    }
+    let output = command
+        .arg("build")
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("CARGO_HOME", dir.path().join(".cargo"))
+        .env("CARGO_TARGET_DIR", dir.path().join("target"))
+        .env("KACHE_BLAZE", "false")
+        .env("KACHE_LOG", "off")
         .env("KACHE_REAL_CARGO", &fake_cargo)
         .env("KACHE_TEST_HOLDERS", &holders)
         .env("KACHE_TEST_CAPTURE", &seen)
         .output()
         .unwrap();
+    (dir, holders, seen, output)
+}
 
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let while_running = std::fs::read_to_string(&seen).unwrap();
-    assert_eq!(while_running.lines().count(), 1, "{while_running:?}");
-    let left: Vec<_> = std::fs::read_dir(&holders)
+fn assert_cargo_lease_gone(holders: &Path) {
+    let left: Vec<_> = std::fs::read_dir(holders)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "records left behind: {left:?}");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(holders.parent().unwrap().join("target-use.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    lock.unlock().unwrap();
 }
 
 #[test]

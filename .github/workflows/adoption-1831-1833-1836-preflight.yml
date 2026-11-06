@@ -1,0 +1,177 @@
+name: Adoption preflight (1831, 1832, 1833, 1836)
+
+on:
+  push:
+    branches: [review-contribution/preflight-1831-1833-1836]
+    paths: [.github/workflows/adoption-1831-1833-1836-preflight.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adoption-1831-1833-1836-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Prepare PR ${{ matrix.pr }} (${{ matrix.platform }})
+    if: >-
+      github.repository == 'kunobi-ninja/kache' &&
+      !github.event.repository.private &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/review-contribution/preflight-1831-1833-1836'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: "1831"
+            platform: Linux
+            runner: ubuntu-latest
+            install_args: rust github:casey/just
+            head: bb324609564e016c21a5d24132948defe685d49b
+            tree: a261493d56976da6f4260d96aea6292626f23d17
+          - pr: "1832"
+            platform: Linux
+            runner: ubuntu-latest
+            install_args: rust github:casey/just
+            head: a5ce93fb53daef10fad459b21037aa4a75f1d783
+            tree: 7582b2bf888a99bf6f37569d7a839ec9783833c2
+          - pr: "1832"
+            platform: macOS
+            runner: macos-latest
+            install_args: rust
+            head: a5ce93fb53daef10fad459b21037aa4a75f1d783
+            tree: 7582b2bf888a99bf6f37569d7a839ec9783833c2
+          - pr: "1833"
+            platform: Linux
+            runner: ubuntu-latest
+            install_args: rust github:casey/just
+            head: fd2ec19622370f5a38c4f8143236837d59ffeac3
+            tree: 3288b72bf7bec75501d761d9c05daa2744090b26
+          - pr: "1836"
+            platform: Linux
+            runner: ubuntu-latest
+            install_args: rust github:casey/just
+            head: dfd2782c89cc778f61eb0c72b0092b77aa3a0048
+            tree: a98543523f37f6f1975e2c6a9b28973b79a771a9
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      RUSTC_WRAPPER: ""
+      RUSTC_WORKSPACE_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      KACHE_SELF_HOST: "0"
+      SOURCE_PR: ${{ matrix.pr }}
+      SOURCE_HEAD: ${{ matrix.head }}
+      SOURCE_TREE: ${{ matrix.tree }}
+    steps:
+      - name: Require a disposable hosted runner
+        working-directory: ${{ github.workspace }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          {
+            printf 'CARGO_TARGET_DIR=%s/adoption-target\n' "$RUNNER_TEMP"
+            printf 'EVIDENCE_DIR=%s/adoption-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+      - name: Check out the maintainer validation helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned candidate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and record provenance
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          RUNNER_ARCHITECTURE: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          {
+            printf 'helper_head=%s\n' "$GITHUB_SHA"
+            printf 'source_head=%s\n' "$SOURCE_HEAD"
+            printf 'source_tree=%s\n' "$SOURCE_TREE"
+            printf 'runner_environment=%s\n' "$RUNNER_KIND"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCHITECTURE"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } | tee "$EVIDENCE_DIR/provenance.txt"
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: ${{ matrix.install_args }}
+          cache: false
+      - name: Run focused regressions
+        run: |
+          set -euo pipefail
+          case "$SOURCE_PR" in
+            1831)
+              for regression in kache_by_its_own_name_is_never_probed_as_a_compiler kache_is_known_by_name_with_or_without_a_path_or_exe; do
+                cargo test --locked -p kache --lib "compiler::shim_tests::$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
+                grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
+              done
+              ;;
+            1832)
+              for group in process_identity::tests target_use::tests daemon::tests::in_flight_; do
+                log="$EVIDENCE_DIR/${group//::/-}.log"
+                cargo test --locked -p kache --lib "$group" -- --nocapture 2>&1 | tee "$log"
+                grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$log"
+              done
+              ;;
+            1833)
+              for regression in a_finished_cargo_run_leaves_no_lease_record a_signalled_cargo_run_releases_its_lease_before_reraising_the_signal a_cargo_spawn_error_releases_its_lease_and_remains_an_error; do
+                cargo test --locked -p kache --test cargo_proxy_test "$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
+                grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
+              done
+              ;;
+            1836)
+              for regression in static_on_a_compile_is_raw_keyed_and_cacheable tls_model_is_raw_keyed_and_cacheable joined_assembler_with_cpp_override_matches_the_separated_form builtin_flags_require_resolved_codegen_in_both_dialects codegen_knob_stems_classify_in_both_polarities cache_key_refuses_probe_captured_flags_without_resolved_invocation; do
+                cargo test --locked -p kache --lib "compiler::cc::tests::$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
+                grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
+              done
+              cargo test --locked -p kache --lib compiler::flags::tests::flag_regexes_match_like_the_default_engine -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/flag-regexes.log"
+              grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/flag-regexes.log"
+              cargo test --locked -p kache --test fallback_recovery_test -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/fallback-recovery.log"
+              grep -Fq 'test result: ok. 6 passed; 0 failed;' "$EVIDENCE_DIR/fallback-recovery.log"
+              ;;
+            *) exit 2 ;;
+          esac
+      - name: Run repository checks
+        if: matrix.platform == 'Linux'
+        run: |
+          set -euo pipefail
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
+      - name: Check documentation routes and source parity
+        if: matrix.platform == 'Linux'
+        run: |
+          set -euo pipefail
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+          python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-tests.log"
+      - name: Verify the candidate was not changed
+        if: always()
+        run: git diff --exit-code
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adoption-${{ matrix.pr }}-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 7
+          if-no-files-found: error

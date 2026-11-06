@@ -2091,6 +2091,27 @@ fn codegen_knob_stems_classify_in_both_polarities() {
 }
 
 #[test]
+fn builtin_flags_require_resolved_codegen_in_both_dialects() {
+    for (program, dialect) in [("cc", Dialect::Gnu), ("clang-cl", Dialect::Cl)] {
+        for flag in ["-fbuiltin", "-fno-builtin"] {
+            let parsed = CcArgs::parse(&s(&[program, "-c", "foo.c", "-o", "foo.o", flag])).unwrap();
+            assert_eq!(
+                classify_cc_flag(flag, dialect),
+                Some(FlagClass::CapturedByProbe),
+                "{program}: {flag} changes codegen, not only preprocessed text"
+            );
+            assert!(
+                cc_flags_need_resolved_invocation(&parsed),
+                "{program}: {flag}"
+            );
+            assert!(parsed.config_args().iter().any(|arg| arg == flag));
+            assert!(parsed.probe_args().iter().any(|arg| arg == flag));
+            assert!(build_preprocess_args(&parsed).iter().any(|arg| arg == flag));
+        }
+    }
+}
+
+#[test]
 fn firefox_windows_oy_no_longer_refuses() {
     // clang-cl `-Oy` is the MSVC spelling of `-fomit-frame-pointer`.
     // #285 modeled only `-Oy-` (disable). Firefox Windows still passes
@@ -4244,7 +4265,14 @@ fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
     // before the preprocessor hash runs. Every `CapturedByProbe`
     // shape fails closed here; `-gdwarf-2` pins the #838 row.
     let compiler = CcCompiler::new();
-    for flag in ["-fno-rtti", "-gdwarf-2", "-gfull"] {
+    for flag in [
+        "-fno-rtti",
+        "-gdwarf-2",
+        "-gfull",
+        "-fbuiltin",
+        "-fno-builtin",
+        "-xassembler-with-cpp",
+    ] {
         let parsed = compiler
             .parse(&s(&["true", "-c", "foo.c", "-o", "foo.o", flag]))
             .unwrap();

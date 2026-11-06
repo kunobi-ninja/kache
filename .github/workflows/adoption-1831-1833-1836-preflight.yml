@@ -1,4 +1,4 @@
-name: Adoption preflight (1836)
+name: Adoption preflight (1839 candidate 3)
 
 on:
   push:
@@ -27,12 +27,18 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - pr: "1836"
+          - pr: "1833"
             platform: Linux
             runner: ubuntu-latest
             install_args: rust github:casey/just
-            head: c269640e4ff335d12c81fad403d9b4da45bce4d9
-            tree: 807ffee50e8fd59f8824d3090b2e5f9ed7ab21a0
+            head: 3ad77367ee406d2b272778846f02b564dd4f381f
+            tree: 8bcba38a771fdc81b0eec5f329bc60a25d4791ab
+          - pr: "1833"
+            platform: macOS
+            runner: macos-latest
+            install_args: rust github:casey/just
+            head: 3ad77367ee406d2b272778846f02b564dd4f381f
+            tree: 8bcba38a771fdc81b0eec5f329bc60a25d4791ab
     defaults:
       run:
         shell: bash
@@ -94,45 +100,95 @@ jobs:
           install: true
           install_args: ${{ matrix.install_args }}
           cache: false
+      - name: Prove the macOS arm-before-park regression rejects late registration
+        if: matrix.platform == 'macOS'
+        run: |
+          set -euo pipefail
+          trap 'git restore --source="$SOURCE_HEAD" -- src/scheduler/permit_wait.rs' EXIT
+          cat > "$EVIDENCE_DIR/mac-registration-negative.patch" <<'NEGATIVE_PATCH'
+          --- a/src/scheduler/permit_wait.rs
+          +++ b/src/scheduler/permit_wait.rs
+          @@ -181,7 +181,12 @@
+                       return None;
+                   }
+                   let watch = Self { kq, files };
+          -        let changes: Vec<libc::kevent> = watch
+          +        Some(watch)
+          +    }
+          +
+          +    #[mutants::skip]
+          +    fn stay(&self, limit: Duration) -> Option<libc::kevent> {
+          +        let changes: Vec<libc::kevent> = self
+                       .files
+                       .iter()
+                       .map(|file| libc::kevent {
+          @@ -193,27 +198,6 @@
+                           udata: std::ptr::null_mut(),
+                       })
+                       .collect();
+          -        let timeout = timespec(Duration::ZERO);
+          -        // Register before the caller rescans the slots. With no output list,
+          -        // this call keeps an unlock pending and reports registration errors
+          -        // through its return value. `watch` owns all descriptors on failure.
+          -        // SAFETY: the descriptors, changelist and zero timeout outlive the
+          -        // call; the null output pointer has an event count of zero.
+          -        let registered = unsafe {
+          -            libc::kevent(
+          -                watch.kq,
+          -                changes.as_ptr(),
+          -                changes.len() as libc::c_int,
+          -                std::ptr::null_mut(),
+          -                0,
+          -                &timeout,
+          -            )
+          -        };
+          -        (registered >= 0).then_some(watch)
+          -    }
+          -
+          -    #[mutants::skip]
+          -    fn stay(&self, limit: Duration) -> Option<libc::kevent> {
+                   let deadline = std::time::Instant::now() + limit;
+                   let mut event = libc::kevent {
+                       ident: 0,
+          @@ -230,7 +214,7 @@
+                       // are submitted here. `event` and `timeout` outlive the call,
+                       // and the watched descriptors stay open on `self`.
+                       let ready =
+          -                unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut event, 1, &timeout) };
+          +                unsafe { libc::kevent(self.kq, changes.as_ptr(), changes.len() as libc::c_int, &mut event, 1, &timeout) };
+                       if ready > 0 {
+                           return Some(event);
+                       }
+          NEGATIVE_PATCH
+          git apply --check "$EVIDENCE_DIR/mac-registration-negative.patch"
+          git apply "$EVIDENCE_DIR/mac-registration-negative.patch"
+          set +e
+          cargo test --locked -p kache --lib scheduler::permit_wait::mac_tests::an_unlock_before_parking_remains_a_kernel_event -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/mac-registration-negative.log"
+          result=("${PIPESTATUS[@]}")
+          set -e
+          test "${result[0]}" -eq 101
+          test "${result[1]}" -eq 0
+          grep -Fxq 'running 1 test' "$EVIDENCE_DIR/mac-registration-negative.log"
+          grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$EVIDENCE_DIR/mac-registration-negative.log"
+          grep -Fq 'the unlock must already be pending; no polling timeout can satisfy this' "$EVIDENCE_DIR/mac-registration-negative.log"
+          git restore --source="$SOURCE_HEAD" -- src/scheduler/permit_wait.rs
+          git diff --exit-code
+          trap - EXIT
       - name: Run focused regressions
         run: |
           set -euo pipefail
-          case "$SOURCE_PR" in
-            1831)
-              for regression in kache_by_its_own_name_is_never_probed_as_a_compiler kache_is_known_by_name_with_or_without_a_path_or_exe; do
-                cargo test --locked -p kache --lib "compiler::shim_tests::$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
-                grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
-              done
-              ;;
-            1832)
-              for group in process_identity::tests target_use::tests daemon::tests::in_flight_; do
-                log="$EVIDENCE_DIR/${group//::/-}.log"
-                cargo test --locked -p kache --lib "$group" -- --nocapture 2>&1 | tee "$log"
-                grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$log"
-              done
-              ;;
-            1833)
-              for regression in a_finished_cargo_run_leaves_no_lease_record a_signalled_cargo_run_releases_its_lease_before_reraising_the_signal a_cargo_spawn_error_releases_its_lease_and_remains_an_error; do
-                cargo test --locked -p kache --test cargo_proxy_test "$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
-                grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
-              done
-              ;;
-            1836)
-              for regression in static_on_a_compile_is_raw_keyed_and_cacheable tls_model_is_raw_keyed_and_cacheable joined_assembler_with_cpp_override_matches_the_separated_form builtin_flags_require_resolved_codegen_in_both_dialects codegen_knob_stems_classify_in_both_polarities cache_key_refuses_probe_captured_flags_without_resolved_invocation; do
-                cargo test --locked -p kache --lib "compiler::cc::tests::$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
-                grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
-              done
-              cargo test --locked -p kache --lib compiler::flags::tests::flag_regexes_match_like_the_default_engine -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/flag-regexes.log"
-              grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/flag-regexes.log"
-              cargo test --locked -p kache --test fallback_recovery_test -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/fallback-recovery.log"
-              # One additional fallback test is macOS-only. Require every Linux case.
-              grep -Fq 'test result: ok. 5 passed; 0 failed;' "$EVIDENCE_DIR/fallback-recovery.log"
-              for regression in failed_fallback_retries_once_preserving_compiler_inputs_and_events genuine_compiler_failure_is_preserved_after_retry successful_and_cancelled_fallbacks_do_not_retry missing_and_non_executable_fallbacks_compile_directly stdin_reaches_the_direct_compiler_once_without_partial_fallback_stdout; do
-                grep -Fxq "test $regression ... ok" "$EVIDENCE_DIR/fallback-recovery.log"
-              done
-              ;;
-            *) exit 2 ;;
-          esac
+          test "$SOURCE_PR" = 1833
+          for regression in a_finished_cargo_run_leaves_no_lease_record a_signalled_cargo_run_releases_its_lease_before_reraising_the_signal a_cargo_spawn_error_releases_its_lease_and_remains_an_error; do
+            cargo test --locked -p kache --test cargo_proxy_test "$regression" -- --exact --nocapture 2>&1 | tee "$EVIDENCE_DIR/$regression.log"
+            grep -Fq 'test result: ok. 1 passed; 0 failed;' "$EVIDENCE_DIR/$regression.log"
+          done
+          if [ "${{ matrix.platform }}" = macOS ]; then
+            for regression in scheduler::tests::dropping_a_permit_wakes_the_waiter scheduler::permit_wait::mac_tests::an_unlock_before_parking_remains_a_kernel_event scheduler::permit_wait::mac_tests::a_held_permit_has_no_pending_unlock; do
+              log="$EVIDENCE_DIR/${regression//::/-}.log"
+              cargo test --locked -p kache --lib "$regression" -- --exact --nocapture 2>&1 | tee "$log"
+              grep -Fq 'test result: ok. 1 passed; 0 failed;' "$log"
+            done
+          fi
       - name: Run repository checks
         if: matrix.platform == 'Linux'
         run: |

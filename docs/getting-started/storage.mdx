@@ -83,7 +83,15 @@ freeable estimates, and active-command blockers.
 
 The Cargo shim holds a target-use lease for the whole command, including a
 long-running `cargo run`. Cleanup can therefore retain targets until that
-command exits. Without a terminal, a removal requiring confirmation exits
+command exits.
+
+On Linux, source builds and the next release include process start times in
+waiting-command records, so a reused PID does not name an unrelated command.
+Older records and unreadable process metadata use conservative liveness checks.
+The shared lock controls removal; records supply the command names shown while
+it is busy.
+
+Without a terminal, a removal requiring confirmation exits
 nonzero unless you explicitly select a supported noninteractive mode. A failed
 removal is reported and makes the command fail.
 

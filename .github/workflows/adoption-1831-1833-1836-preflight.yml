@@ -31,14 +31,14 @@ jobs:
             platform: Linux
             runner: ubuntu-latest
             install_args: rust github:casey/just
-            head: 3ad77367ee406d2b272778846f02b564dd4f381f
-            tree: 8bcba38a771fdc81b0eec5f329bc60a25d4791ab
+            head: 2e63bafdb4079dd1d46b8fa5ef65c4d177d1da02
+            tree: ee20ecb900d50848187f544b8d586d009860a1c5
           - pr: "1833"
             platform: macOS
             runner: macos-latest
             install_args: rust github:casey/just
-            head: 3ad77367ee406d2b272778846f02b564dd4f381f
-            tree: 8bcba38a771fdc81b0eec5f329bc60a25d4791ab
+            head: 2e63bafdb4079dd1d46b8fa5ef65c4d177d1da02
+            tree: ee20ecb900d50848187f544b8d586d009860a1c5
     defaults:
       run:
         shell: bash

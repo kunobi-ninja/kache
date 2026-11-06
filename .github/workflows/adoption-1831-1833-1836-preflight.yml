@@ -31,8 +31,8 @@ jobs:
             platform: Linux
             runner: ubuntu-latest
             install_args: rust github:casey/just
-            head: dfd2782c89cc778f61eb0c72b0092b77aa3a0048
-            tree: a98543523f37f6f1975e2c6a9b28973b79a771a9
+            head: c269640e4ff335d12c81fad403d9b4da45bce4d9
+            tree: 807ffee50e8fd59f8824d3090b2e5f9ed7ab21a0
     defaults:
       run:
         shell: bash

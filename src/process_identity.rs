@@ -6,6 +6,9 @@
 //! reads as alive for as long as anything holds that number. Recording when
 //! the process started, too, tells the two apart.
 
+#[cfg(not(target_os = "linux"))]
+use crate::daemon::process_is_alive as process_may_be_running;
+
 /// One run of a process: its number and, where the OS reports one, its start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessIdentity {
@@ -131,11 +134,6 @@ fn liveness_from_signal_probe(result: libc::c_int, error: impl FnOnce() -> Optio
     result == 0 || error() != Some(libc::ESRCH)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn process_may_be_running(pid: u32) -> bool {
-    crate::daemon::process_is_alive(pid)
-}
-
 /// PID 1 names init, which Kache excludes from its records. PID 0 has no
 /// procfs entry; the fallback also rejects it and values that would become
 /// broadcasts to `kill`.
@@ -143,7 +141,14 @@ fn found(pid: u32) -> Found {
     if pid == 1 {
         return Found::Gone;
     }
-    found_on_this_platform(pid)
+    #[cfg(target_os = "linux")]
+    {
+        found_on_this_platform(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Found::Unknown
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -174,11 +179,6 @@ fn found_in_proc(pid: u32, read: impl Fn(&str) -> std::io::Result<String>) -> Fo
         Ok(stat) => process_from_stat(&stat),
         Err(_) => Found::Unknown,
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn found_on_this_platform(_pid: u32) -> Found {
-    Found::Unknown
 }
 
 /// The `Tgid` line of `/proc/<pid>/status`: the process a thread belongs to.

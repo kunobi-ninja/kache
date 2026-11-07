@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1840,6 +1840,8 @@ pub(crate) struct Daemon {
     listing_refused: AtomicBool,
     /// Own both coordinators and their independently scheduled download tasks.
     prefetch_tasks: Mutex<tokio::task::JoinSet<()>>,
+    /// Blocking imports outlive a cancelled async caller, including its claims.
+    import_tasks: Arc<ImportTasks>,
     prefetch_cancellations: Arc<Mutex<PrefetchCancellations>>,
     prefetch_receipts: Arc<Mutex<PrefetchReceiptQueue>>,
     prefetch_receipt_writers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -1893,6 +1895,42 @@ pub(crate) struct Daemon {
     #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
     capacity: DaemonCapacity,
+}
+
+#[derive(Default)]
+struct ImportTasks {
+    active: AtomicUsize,
+    changed: Notify,
+}
+
+struct ImportTaskGuard(Arc<ImportTasks>);
+
+impl ImportTasks {
+    fn start(self: &Arc<Self>) -> ImportTaskGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ImportTaskGuard(Arc::clone(self))
+    }
+
+    /// Call after async producers have stopped so no new import can race idle.
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for ImportTaskGuard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
 }
 
 /// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
@@ -2351,6 +2389,7 @@ impl Daemon {
             prefetch_stopping: AtomicBool::new(false),
             listing_refused: AtomicBool::new(false),
             prefetch_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            import_tasks: Arc::new(ImportTasks::default()),
             prefetch_cancellations: Arc::new(Mutex::new(PrefetchCancellations::default())),
             prefetch_receipts: Arc::new(Mutex::new(PrefetchReceiptQueue::default())),
             prefetch_receipt_writers: Mutex::new(Vec::new()),
@@ -2461,7 +2500,13 @@ impl Daemon {
             Ok(lock) => lock,
             Err(error) => return (Err(error), 0, 0),
         };
+        // Register before spawning, including work still queued in the pool.
+        // Cancelling this future must not hide a running import from shutdown.
+        let pending = self.import_tasks.start();
         let timed = tokio::task::spawn_blocking(move || {
+            let _pending = pending;
+            // Drop captured claims before the tracker even on lock failure.
+            let operation = f;
             let wait_started = Instant::now();
             let Ok(guard) = lock.lock() else {
                 return (
@@ -2472,7 +2517,7 @@ impl Daemon {
             };
             let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
             let import_started = Instant::now();
-            let result = f(&guard);
+            let result = operation(&guard);
             let import_ms = import_started.elapsed().as_millis() as u64;
             (result, lock_wait_ms, import_ms)
         })
@@ -2485,6 +2530,34 @@ impl Daemon {
                 0,
             ),
         }
+    }
+
+    async fn import_packed_batch(
+        &self,
+        entries: Arc<[crate::store::VerifiedRestoredEntry]>,
+        claims: Vec<DownloadingGuard>,
+    ) -> Result<usize> {
+        self.with_import_store_timed(&self.config.cache_dir, move |store| {
+            let _claims = claims;
+            Self::import_packed_entries(store, &entries)
+        })
+        .await
+        .0
+    }
+
+    fn import_packed_entries(
+        store: &Store,
+        entries: &[crate::store::VerifiedRestoredEntry],
+    ) -> Result<usize> {
+        let result = store.import_verified_restored_entries(entries);
+        if result.is_err() {
+            // Strict flushing can fail after registration commits. Cleanup
+            // shares the import's lock and claims, and preserves committed rows.
+            if let Err(error) = Self::discard_uncommitted_packed_entries(store, entries) {
+                tracing::warn!("packed-prefetch residue cleanup failed: {error:#}");
+            }
+        }
+        result
     }
 
     fn discard_uncommitted_packed_entries(
@@ -4938,37 +5011,38 @@ impl Daemon {
             }
         }
 
+        let (verified, claims): (Vec<_>, Vec<_>) = verified
+            .into_iter()
+            .map(|(entry, guard, pack_index, entry_index)| {
+                ((entry, pack_index, entry_index), guard)
+            })
+            .unzip();
         let batch = verified
             .iter()
-            .map(|(entry, _, _, _)| entry.restored.clone())
+            .map(|(entry, _, _)| entry.restored.clone())
             .collect::<Arc<[_]>>();
         if !batch.is_empty() {
             let import_start = Instant::now();
             let import_batch = Arc::clone(&batch);
-            let imported_batch = self
-                .with_import_store_timed(&self.config.cache_dir, move |store| {
-                    store.import_verified_restored_entries(&import_batch)
-                })
-                .await
-                .0;
+            let imported_batch = self.import_packed_batch(import_batch, claims).await;
             match imported_batch {
                 Ok(_) => {
                     let completed_at_ms = unix_time_ms();
                     let original_bytes = verified
                         .iter()
-                        .map(|(entry, _, _, _)| entry.original_bytes)
+                        .map(|(entry, _, _)| entry.original_bytes)
                         .sum::<u64>();
                     let extract_ms = verified
                         .iter()
-                        .map(|(entry, _, _, _)| entry.extract_ms)
+                        .map(|(entry, _, _)| entry.extract_ms)
                         .sum::<u64>();
                     // No await before every successfully imported entry has its
                     // exact availability boundary, including other packs in this batch.
                     let import_ms = import_start.elapsed().as_millis() as u64;
                     // One shared batch import: charge its duration once, to
                     // the first imported pack, rather than once per object.
-                    receipts[verified[0].2].event.import_ms = import_ms;
-                    for (entry, _, pack_index, entry_index) in &verified {
+                    receipts[verified[0].1].event.import_ms = import_ms;
+                    for (entry, pack_index, entry_index) in &verified {
                         let receipt = &mut receipts[*pack_index];
                         charge_packed_import(
                             &mut receipt.event,
@@ -5005,20 +5079,9 @@ impl Daemon {
                     self.prefetch_stats
                         .pack_validation_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    for (_, _, pack_index, entry_index) in &verified {
+                    for (_, pack_index, entry_index) in &verified {
                         receipts[*pack_index].accounting().entries[*entry_index].outcome =
                             "import_error".to_owned();
-                    }
-                    // Strict flushing can fail after registration commits.
-                    // Preserve those rows' metadata, including existing keys.
-                    let cleanup = self
-                        .with_import_store_timed(&self.config.cache_dir, move |store| {
-                            Self::discard_uncommitted_packed_entries(store, &batch)
-                        })
-                        .await
-                        .0;
-                    if let Err(cleanup_error) = cleanup {
-                        tracing::warn!("packed-prefetch residue cleanup failed: {cleanup_error:#}");
                     }
                 }
             }
@@ -5034,7 +5097,7 @@ impl Daemon {
             receipt.finish(if failed { "import_error" } else { "completed" });
         }
         drop(receipts);
-        for (entry, _, _, _) in &verified {
+        for (entry, _, _) in &verified {
             if imported.contains(&entry.restored.cache_key) {
                 self.note_key_present(&entry.restored.cache_key, &entry.restored.meta.crate_name)
                     .await;
@@ -5110,8 +5173,10 @@ impl Daemon {
     }
 
     /// Stop admission, drain, then abort and join actual tasks before the
-    /// summary. Inline extraction and filesystem I/O cannot be preempted by
-    /// Tokio; the timeout bounds async waiting, not stalled synchronous I/O.
+    /// summary. Include imports whose async callers were already cancelled.
+    /// The timeout bounds waiting; started blocking work cannot be preempted.
+    /// Inline Store opening, extraction and filesystem I/O can still prevent
+    /// an async task from yielding; this is not a bound on synchronous I/O.
     async fn finish_prefetch_shutdown(self: &Arc<Self>, timeout: Duration) -> bool {
         self.stop_prefetch_admission();
         let mut tasks = std::mem::take(
@@ -5122,13 +5187,22 @@ impl Daemon {
         );
         let timed_out = tokio::time::timeout(timeout, async {
             while tasks.join_next().await.is_some() {}
+            self.import_tasks.wait().await;
         })
         .await
         .is_err();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
 
-        // All producers have exited; persist receipts before the summary.
+        let pending_imports = self.import_tasks.active.load(Ordering::Acquire);
+        if pending_imports != 0 {
+            tracing::warn!(
+                pending_imports,
+                "blocking remote imports still running after prefetch drain"
+            );
+        }
+        // Async producers have exited; persist their receipts before the
+        // summary. Outstanding blocking imports keep the summary incomplete.
         let receipts_complete = self.finish_prefetch_receipts().await;
         let cancellations = std::mem::take(
             &mut *self
@@ -5147,6 +5221,7 @@ impl Daemon {
         if let Some(mut plan) = plan {
             let incomplete = !receipts_complete
                 || timed_out
+                || pending_imports != 0
                 || cancellations.overflowed
                 || cancellations.origins.iter().any(|origin| {
                     plan.session_id == origin.session_id
@@ -5155,7 +5230,7 @@ impl Daemon {
                 });
             plan.cancelled |= incomplete;
             let daemon = self.clone();
-            let reason = if timed_out {
+            let reason = if timed_out || pending_imports != 0 {
                 "shutdown_timeout"
             } else {
                 "shutdown"
@@ -5172,7 +5247,7 @@ impl Daemon {
                 tracing::warn!("shutdown summary write is still blocked on local I/O");
             }
         }
-        timed_out
+        timed_out || pending_imports != 0
     }
 
     /// Handle a prefetch request through an owned background coordinator.
@@ -5992,6 +6067,7 @@ impl Daemon {
             cancellations.overflowed || !cancellations.origins.is_empty()
         };
         tasks_pending
+            || self.import_tasks.active.load(Ordering::Acquire) != 0
             || receipts_pending
             || cancelled
             || self.prefetch_receipt_failed.load(Ordering::Acquire)
@@ -7365,7 +7441,9 @@ async fn server_main(
         .finish_prefetch_shutdown(Duration::from_secs(5))
         .await
     {
-        tracing::warn!("prefetch drain timed out; remaining tasks aborted and joined");
+        tracing::warn!(
+            "prefetch drain incomplete; async tasks joined, blocking imports may still finish"
+        );
     }
     heartbeat_handle.abort();
     config_watch_handle.abort();

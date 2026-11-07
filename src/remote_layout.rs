@@ -944,6 +944,50 @@ pub(crate) mod tests {
     use std::time::Instant;
 
     #[test]
+    fn upload_pack_memory_bound_includes_padding_and_long_name_allowance() {
+        let mut meta = EntryMeta {
+            cache_key: String::new(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            rustc_version: None,
+            crate_name: String::new(),
+            crate_types: Vec::new(),
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        assert_eq!(
+            super::pack_size_bound(&meta, 1),
+            zstd::zstd_safe::compress_bound(4097) as u64
+        );
+        meta.files.push(CachedFile {
+            name: "abc".to_string(),
+            size: 1,
+            hash: String::new(),
+            executable: false,
+        });
+        assert_eq!(
+            super::pack_size_bound(&meta, 0),
+            zstd::zstd_safe::compress_bound(8710) as u64
+        );
+        meta.files[0].size = 512;
+        meta.files.push(CachedFile {
+            name: "longer".to_string(),
+            size: 513,
+            hash: String::new(),
+            executable: false,
+        });
+        assert_eq!(
+            super::pack_size_bound(&meta, 17),
+            zstd::zstd_safe::compress_bound(13859) as u64
+        );
+    }
+
+    #[test]
     fn v3_keys_follow_the_documented_layout() {
         // {prefix}/v3/manifests/{crate}/{key}.json and .../packs/{crate}/{key}.tar.zst
         assert_eq!(

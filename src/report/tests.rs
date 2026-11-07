@@ -514,6 +514,7 @@ fn test_event(
         prediction_mismatches: 0,
         flight_wait_ms: 0,
         permit_wait_ms: 0,
+        scheduler_decisions: Vec::new(),
         store_output_blobs: 0,
         store_duplicate_blobs: 0,
         store_new_blobs: 0,
@@ -1645,6 +1646,8 @@ fn trace_phase_events_nest_in_wrapper_order_on_the_parent_lane() {
             ("dep-info", 1_000, 4_000, "key"),
             ("lookup", 11_000, 2_000, "miss: m"),
             ("wait", 13_000, 8_000, "miss: m"),
+            ("flight_wait", 13_000, 3_000, "wait"),
+            ("permit_wait", 16_000, 5_000, "wait"),
             ("compile", 21_000, 100_000, "miss: m"),
             ("store", 121_000, 6_000, "miss: m"),
         ]
@@ -1943,22 +1946,30 @@ fn trace_json_emits_each_crate_slice_followed_by_its_phases() {
         .sum();
     assert_eq!(
         expected_phases,
-        5 + 7,
-        "hit: startup, key, dep-info, lookup, restore; miss: all seven"
+        5 + 9,
+        "hit: five phases; miss: seven phases plus flight and capacity waits"
     );
     let phases: Vec<_> = arr.iter().filter(|e| e["cat"] == "kache.phase").collect();
     assert_eq!(phases.len(), expected_phases);
 
     let miss_at = arr.iter().position(|e| e["name"] == "miss: m").unwrap();
     let miss = &arr[miss_at];
-    let names: Vec<&str> = arr[miss_at + 1..miss_at + 8]
+    let names: Vec<&str> = arr[miss_at + 1..miss_at + 10]
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
     assert_eq!(
         names,
         [
-            "startup", "key", "dep-info", "lookup", "wait", "compile", "store"
+            "startup",
+            "key",
+            "dep-info",
+            "lookup",
+            "wait",
+            "flight_wait",
+            "permit_wait",
+            "compile",
+            "store"
         ]
     );
     for phase in &arr[miss_at + 1..miss_at + 8] {
@@ -5016,4 +5027,203 @@ fn a_windowed_report_counts_archived_events_without_claiming_they_are_lost() {
         rotation_cut_notice(config.event_log_max_size, true)
             .contains("counts above are incomplete")
     );
+}
+
+#[test]
+fn scheduler_decisions_round_trip_in_rows_and_each_trace_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    events::clear_events(&config.event_log_path()).unwrap();
+    let decisions = vec![
+        SchedulerDecision {
+            phase: SchedulerPhase::Flight,
+            outcome: SchedulerOutcome::PeerCompleted,
+            elapsed_ms: 2000,
+            ..Default::default()
+        },
+        SchedulerDecision {
+            phase: SchedulerPhase::Capacity,
+            outcome: SchedulerOutcome::TimeoutFallback,
+            elapsed_ms: 30002,
+            requested_slots: Some(4),
+            available_slots: Some(0),
+            pool_slots: Some(8),
+            pressure: Some(kache_core::scheduler::SchedulerPressure::Warning),
+            pressure_ceiling: Some(4),
+            background: Some(true),
+            queued_ms: Some(30000),
+            ..Default::default()
+        },
+    ];
+    let mut event = test_event("queued", EventResult::Miss, 34000, 1000, 0, "key");
+    event.schema = 27;
+    event.flight_wait_ms = 2000;
+    event.permit_wait_ms = 30002;
+    event.scheduler_decisions = decisions.clone();
+    events::log_event(&config.event_log_path(), &event).unwrap();
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    assert_eq!(report.all_events[0].scheduler_decisions, decisions);
+    assert_eq!(report.top_misses[0].scheduler_decisions, decisions);
+    assert_eq!(report.trace_events[0].args.scheduler_decisions, decisions);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json["all_events"][0]["scheduler_decisions"],
+        json["traceEvents"][0]["args"]["scheduler_decisions"]
+    );
+    let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+    validate_json_value(&json, &schema, &schema, "report");
+    let trace = format_trace_json(&report).unwrap();
+    let trace: serde_json::Value = serde_json::from_str(&trace).unwrap();
+    let slices = trace["traceEvents"].as_array().unwrap();
+    for (phase, expected) in [
+        ("flight_wait", &decisions[0]),
+        ("permit_wait", &decisions[1]),
+    ] {
+        let slice = slices.iter().find(|slice| slice["name"] == phase).unwrap();
+        assert_eq!(
+            slice["args"]["scheduler_decisions"],
+            serde_json::json!([expected])
+        );
+        assert_eq!(slice["args"]["phase_ms"], expected.elapsed_ms);
+    }
+    let text = format_text(&report);
+    assert!(text.contains("Recorded scheduler wait for `queued`"));
+    assert!(text.contains("capacity: timeout fallback"));
+    assert!(text.contains("observed pressure warning"));
+    assert!(!text.contains("current machine"));
+    drop(dir);
+}
+
+#[test]
+fn legacy_scheduler_waits_keep_timings_without_invented_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    events::clear_events(&config.event_log_path()).unwrap();
+    let raw = serde_json::json!({"ts":Utc::now(),"crate_name":"old","result":"miss","elapsed_ms":31000,"size":0,"schema":17,"permit_wait_ms":30002,"flight_wait_ms":0});
+    let event: BuildEvent = serde_json::from_value(raw).unwrap();
+    assert!(event.scheduler_decisions.is_empty());
+    events::log_event(&config.event_log_path(), &event).unwrap();
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["all_events"][0]["permit_wait_ms"], 30002);
+    assert!(json["all_events"][0].get("scheduler_decisions").is_none());
+    let text = format_text(&report);
+    assert!(text.contains("outcome and cause unknown (no decision recorded)"));
+    assert!(!text.contains("timeout fallback"));
+    assert!(!text.contains("observed pressure"));
+    let legacy: BuildReport = serde_json::from_value(json).unwrap();
+    assert!(legacy.all_events[0].scheduler_decisions.is_empty());
+}
+
+#[test]
+fn scheduler_notes_render_only_the_recorded_outcome_and_observations() {
+    for (outcome, text) in [
+        (SchedulerOutcome::Admitted, "admitted"),
+        (
+            SchedulerOutcome::PeerCompleted,
+            "peer released flight (recheck required)",
+        ),
+        (SchedulerOutcome::RecoveryAdmitted, "recovery admitted"),
+        (SchedulerOutcome::LeaseCovered, "covered by test lease"),
+        (SchedulerOutcome::Cancelled, "cancelled"),
+        (SchedulerOutcome::Unavailable, "scheduler unavailable"),
+        (SchedulerOutcome::TimeoutFallback, "timeout fallback"),
+        (SchedulerOutcome::Unknown, "unknown outcome"),
+    ] {
+        let wait = SchedulerWait {
+            crate_name: "sample".into(),
+            flight_wait_ms: 0,
+            permit_wait_ms: 17,
+            decisions: vec![SchedulerDecision {
+                phase: SchedulerPhase::Capacity,
+                outcome,
+                elapsed_ms: 17,
+                ..Default::default()
+            }],
+        };
+        let note = scheduler_wait_note(&wait);
+        assert!(
+            note.contains(&format!("capacity: {text} (17 ms)")),
+            "{note}"
+        );
+        assert!(!note.contains("observed pressure"));
+        assert!(!note.contains("requested up to"));
+        assert!(!note.contains("least observed free"));
+    }
+    for (pressure, text) in [
+        (kache_core::scheduler::SchedulerPressure::Calm, "calm"),
+        (kache_core::scheduler::SchedulerPressure::Warning, "warning"),
+        (
+            kache_core::scheduler::SchedulerPressure::Critical,
+            "critical",
+        ),
+        (kache_core::scheduler::SchedulerPressure::Unknown, "unknown"),
+    ] {
+        let wait = SchedulerWait {
+            decisions: vec![SchedulerDecision {
+                phase: SchedulerPhase::Discovery,
+                outcome: SchedulerOutcome::Unknown,
+                elapsed_ms: 17,
+                pressure: Some(pressure),
+                requested_slots: Some(4),
+                available_slots: Some(2),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let note = scheduler_wait_note(&wait);
+        assert!(note.contains("discovery: unknown outcome (17 ms)"));
+        assert!(note.contains("requested up to 4 slots"));
+        assert!(note.contains("least observed free 2"));
+        assert!(note.contains(&format!("observed pressure {text}")));
+    }
+}
+
+#[test]
+fn report_names_the_three_costliest_waits_from_all_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    events::clear_events(&config.event_log_path()).unwrap();
+    for ms in [999, 1000] {
+        let mut event = test_event(
+            &format!("wait_{ms}"),
+            EventResult::Miss,
+            ms + 1,
+            1,
+            0,
+            "key",
+        );
+        event.permit_wait_ms = ms;
+        events::log_event(&config.event_log_path(), &event).unwrap();
+    }
+    let report = generate_report(&config, SinceWindow::DEFAULT, 1).unwrap();
+    let notes: Vec<_> = report
+        .suggestions
+        .iter()
+        .filter(|note| note.starts_with("Recorded scheduler wait"))
+        .collect();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].contains("`wait_1000`"));
+    for ms in [2000, 4000, 3000] {
+        let mut event = test_event(
+            &format!("wait_{ms}"),
+            EventResult::Miss,
+            ms + 1,
+            1,
+            0,
+            "key",
+        );
+        event.flight_wait_ms = ms;
+        events::log_event(&config.event_log_path(), &event).unwrap();
+    }
+    let report = generate_report(&config, SinceWindow::DEFAULT, 1).unwrap();
+    let notes: Vec<_> = report
+        .suggestions
+        .iter()
+        .filter(|note| note.starts_with("Recorded scheduler wait"))
+        .collect();
+    assert_eq!(notes.len(), 3);
+    for (note, expected) in notes.iter().zip(["wait_4000", "wait_3000", "wait_2000"]) {
+        assert!(note.contains(expected), "{note}");
+    }
 }

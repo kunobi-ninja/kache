@@ -239,11 +239,18 @@ impl Ceiling {
 /// The ceiling for this wrapper's pool of `pool` slots under the cache's
 /// scheduler `root`, after taking a reading. The pool itself when the check
 /// is off.
+#[cfg(test)]
 pub(crate) fn ceiling(root: &Path, pool: u32) -> u32 {
-    match now() {
+    ceiling_observed(root, pool).0
+}
+
+pub(crate) fn ceiling_observed(root: &Path, pool: u32) -> (u32, Option<Level>) {
+    let level = now();
+    let ceiling = match level {
         Some(level) => shared(root, pool, level, super::queue::millis(SystemTime::now())),
         None => pool,
-    }
+    };
+    (ceiling, level)
 }
 
 /// Apply a reading of `level` at `now` to the ceiling stored under `root`,

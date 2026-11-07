@@ -113,6 +113,21 @@ pub(crate) fn decision(name: &'static str, outcome: &str) {
     });
 }
 
+pub(crate) fn scheduler_decision(decision: &kache_protocol::SchedulerDecision) {
+    ACTIVE.with(|active| {
+        if let Some(recorder) = active.borrow_mut().as_mut() {
+            let ts = recorder
+                .epoch_us
+                .saturating_add(micros(recorder.start.elapsed()));
+            recorder.push(json!({
+                "name": "scheduler_decision", "cat": recorder.adapter, "ph": "i", "s": "t",
+                "pid": std::process::id(), "tid": recorder.thread, "ts": ts,
+                "args": decision,
+            }));
+        }
+    });
+}
+
 fn micros(duration: std::time::Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
@@ -269,5 +284,37 @@ mod tests {
         assert_eq!(data["traceEvents"][0]["args"]["dropped_events"], 4);
         let file = tempfile::NamedTempFile::new().unwrap();
         drop(start_at(Some(file.path().into()), "rustc", &[]));
+    }
+    #[test]
+    fn phase_trace_keeps_the_original_scheduler_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let decision = kache_protocol::SchedulerDecision {
+            phase: kache_protocol::SchedulerPhase::Capacity,
+            outcome: kache_protocol::SchedulerOutcome::TimeoutFallback,
+            elapsed_ms: 30002,
+            requested_slots: Some(4),
+            available_slots: Some(0),
+            ..Default::default()
+        };
+        {
+            let _trace = start_at(Some(directory.path().into()), "rustc", &[]);
+            scheduler_decision(&decision);
+        }
+        let path = std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let data: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let event = data["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["name"] == "scheduler_decision")
+            .unwrap();
+        assert_eq!(event["args"], serde_json::to_value(decision).unwrap());
+        assert_eq!(event["ph"], "i");
+        assert_eq!(event["s"], "t");
     }
 }

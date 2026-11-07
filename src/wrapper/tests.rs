@@ -9016,7 +9016,7 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].schema, 26);
+    assert_eq!(events[0].schema, 27);
     let demands = &events[0].demands;
     assert_eq!(demands.len(), 1);
     assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -9065,7 +9065,7 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
     assert_eq!(event.compile_time_ms, 20);
     assert_eq!(event.size, 30);
     assert_eq!(event.cache_key, "cache-key");
-    assert_eq!(event.schema, 26);
+    assert_eq!(event.schema, 27);
     assert_eq!(event.key_ms, 40);
     assert_eq!(event.key_hash_hits, 4);
     assert_eq!(event.key_hash_misses, 5);
@@ -9183,7 +9183,7 @@ fn log_event_records_the_wrapper_phase_accumulators() {
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     let event = &events[0];
-    assert_eq!(event.schema, 26);
+    assert_eq!(event.schema, 27);
     // Whatever other tests add is real time, far under the next band.
     for (name, value, floor, fed) in [
         ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -9319,7 +9319,7 @@ fn log_event_persists_same_key_lookup_rejection() {
     let event = &events[0];
     assert_eq!(event.result, EventResult::Miss);
     assert_eq!(event.cache_key, "same-key");
-    assert_eq!(event.schema, 26);
+    assert_eq!(event.schema, 27);
     assert_eq!(
         event.lookup_rejection,
         "matching entry lacks dep-info required by this invocation"
@@ -9389,7 +9389,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
             .keyed("hit-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
-    assert_eq!(events[0].schema, 26);
+    assert_eq!(events[0].schema, 27);
     assert_eq!(events[0].result, EventResult::LocalHit);
     assert!(
         events[0].verify_compare.is_empty(),
@@ -9407,7 +9407,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].schema, 26);
+    assert_eq!(events[1].schema, 27);
     assert_eq!(
         events[1].verify_compare,
         "content: libfoo.rlib (byte mismatch)"
@@ -12299,7 +12299,7 @@ fn a_passthrough_reason_is_classified_on_the_event() {
         EventInputs::new("/repo", "foo.c", EventResult::Passthrough, 10)
             .passthrough_reason("unsupported|cc link mode".to_string()),
     );
-    assert_eq!(event.schema, 26);
+    assert_eq!(event.schema, 27);
     assert_eq!(event.miss_reason, crate::events::MissReason::Unsupported);
     let hit = super::build_event_details(
         &config,
@@ -12626,7 +12626,7 @@ fn rebuilt_event_uses_actual_outputs_for_success_even_without_store() {
                 .store_error("cannot store".into())
                 .rebuilt(true, &artifacts, Some("cargo-package-name".into())),
         );
-        assert_eq!(event.schema, 26);
+        assert_eq!(event.schema, 27);
         assert_eq!(event.rebuilt_package.as_deref(), Some("cargo-package-name"));
         assert_eq!(
             event.rebuilt_fingerprint.as_deref(),
@@ -13829,4 +13829,143 @@ fn restore_paths_honor_configured_debug_bundle_budget() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_scheduler_waits_reach_error_events_without_spawning_compilers() {
+    use crate::invocation::{
+        InvocationEnv,
+        process::{Cancellation, CancellationScope},
+    };
+    use std::time::Instant;
+    for adapter in ["rustc", "cc"] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let _counts = crate::opcounts::InvocationScope::enter(Instant::now());
+        let token = Cancellation::default();
+        token.cancel();
+        let _cancel = CancellationScope::enter(Some(token));
+        let marker = dir.path().join("compiler-ran");
+        let compiler = dir.path().join(adapter);
+        kache_fs::testutil::write_executable(
+            &compiler,
+            format!("#!/bin/sh\nprintf ran > '{}'\nexit 0\n", marker.display()),
+        );
+        let env = InvocationEnv::from_parts(
+            Vec::<(String, String)>::new(),
+            Some(dir.path().into()),
+            None,
+            dir.path().into(),
+        );
+        let source = dir.path().join(if adapter == "rustc" {
+            "lib.rs"
+        } else {
+            "sample.c"
+        });
+        std::fs::write(
+            &source,
+            if adapter == "rustc" {
+                "pub fn sample() {}"
+            } else {
+                "int sample(void) { return 1; }"
+            },
+        )
+        .unwrap();
+        // Use the real scheduler cancellation path; it must not invent capacity.
+        drop(scheduler::begin_keyless_compile(
+            &config.cache_dir,
+            true,
+            "cancelled",
+            false,
+            None,
+        ));
+        let error = if adapter == "rustc" {
+            run_for(
+                &config,
+                &[
+                    compiler.to_string_lossy().into_owned(),
+                    "--crate-name".into(),
+                    "cancelled".into(),
+                    "--crate-type".into(),
+                    "lib".into(),
+                    "--emit=metadata".into(),
+                    source.to_string_lossy().into_owned(),
+                    "--out-dir".into(),
+                    dir.path().to_string_lossy().into_owned(),
+                ],
+                &env,
+            )
+            .unwrap_err()
+        } else {
+            run_cc_for(
+                &config,
+                &[
+                    compiler.to_string_lossy().into_owned(),
+                    "-c".into(),
+                    source.to_string_lossy().into_owned(),
+                    "-o".into(),
+                    dir.path().join("sample.o").to_string_lossy().into_owned(),
+                ],
+                &env,
+            )
+            .unwrap_err()
+        };
+        let original = error
+            .downcast_ref::<std::io::Error>()
+            .expect("original cancellation error");
+        assert_eq!(original.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(original.to_string(), "compiler invocation cancelled");
+        assert!(!marker.exists(), "cancelled wrapper spawned {adapter}");
+        let events = events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.result, EventResult::Error);
+        assert_eq!(event.schema, 27);
+        assert_eq!(event.exit_code, None, "there was no compiler exit");
+        assert!(event.passthrough_reason.is_empty());
+        assert!(
+            event
+                .scheduler_decisions
+                .iter()
+                .any(|decision| decision.outcome == kache_protocol::SchedulerOutcome::Cancelled)
+        );
+        assert!(
+            event
+                .scheduler_decisions
+                .iter()
+                .all(|decision| decision.available_slots.is_none())
+        );
+    }
+}
+
+#[test]
+fn scheduler_cancellation_guard_keeps_an_existing_error_event() {
+    use std::time::Instant;
+    let _counts = crate::opcounts::InvocationScope::enter(Instant::now());
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    crate::opcounts::record_scheduler_decision(kache_protocol::SchedulerDecision {
+        phase: kache_protocol::SchedulerPhase::Capacity,
+        outcome: kache_protocol::SchedulerOutcome::Cancelled,
+        elapsed_ms: 17,
+        ..Default::default()
+    });
+    {
+        let _guard = SchedulerCancellationEvent {
+            config: &config,
+            root: "/recorded",
+            crate_name: "cancelled",
+            start: Instant::now(),
+        };
+        log_event(
+            &config,
+            EventInputs::new("/recorded", "cancelled", EventResult::Error, 19).exit_code(101),
+        );
+    }
+    let events = events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].exit_code, Some(101));
+    assert_eq!(events[0].elapsed_ms, 19);
+    assert_eq!(events[0].scheduler_decisions[0].elapsed_ms, 17);
 }

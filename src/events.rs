@@ -1327,6 +1327,7 @@ pub struct EventStats {
     /// stay distinguishable.
     pub total_flight_wait_ms: u64,
     pub total_permit_wait_ms: u64,
+    pub longest_scheduler_wait: Option<kache_core::scheduler::SchedulerWait>,
     /// Wrapper overhead no phase accounts for (see
     /// [`BuildEvent::unattributed_ms`]).
     pub total_unattributed_ms: u64,
@@ -1435,6 +1436,19 @@ pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> Event
         stats.total_prediction_mismatches += u64::from(event.prediction_mismatches);
         stats.total_flight_wait_ms += event.flight_wait_ms;
         stats.total_permit_wait_ms += event.permit_wait_ms;
+        if event.wait_ms()
+            > stats
+                .longest_scheduler_wait
+                .as_ref()
+                .map_or(0, |wait| wait.elapsed_ms())
+        {
+            stats.longest_scheduler_wait = Some(kache_core::scheduler::SchedulerWait {
+                crate_name: event.crate_name.clone(),
+                flight_wait_ms: event.flight_wait_ms,
+                permit_wait_ms: event.permit_wait_ms,
+                decisions: event.scheduler_decisions.clone(),
+            });
+        }
         stats.total_unattributed_ms += event.unattributed_ms();
         stats.store_output_blobs += event.store_output_blobs;
         stats.store_duplicate_blobs += event.store_duplicate_blobs;
@@ -1583,6 +1597,7 @@ mod tests {
             prediction_mismatches: 0,
             flight_wait_ms: 0,
             permit_wait_ms: 0,
+            scheduler_decisions: Vec::new(),
             store_output_blobs: 0,
             store_duplicate_blobs: 0,
             store_new_blobs: 0,
@@ -3393,6 +3408,38 @@ mod tests {
             actual_polled.len(),
             actual_polled.last()
         );
+    }
+    #[test]
+    fn stats_keep_the_longest_wait_and_its_original_decisions_across_segments() {
+        use kache_protocol::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
+        let mut a = BuildEvent::new_for_test("flight", EventResult::LocalHit);
+        a.flight_wait_ms = 2000;
+        a.scheduler_decisions = vec![SchedulerDecision {
+            phase: SchedulerPhase::Flight,
+            outcome: SchedulerOutcome::PeerCompleted,
+            elapsed_ms: 2000,
+            ..Default::default()
+        }];
+        let stats = compute_stats(&[a.clone()]);
+        assert_eq!(
+            stats.longest_scheduler_wait.as_ref().unwrap().crate_name,
+            "flight"
+        );
+        let mut b = BuildEvent::new_for_test("capacity", EventResult::Miss);
+        b.permit_wait_ms = 30002;
+        b.scheduler_decisions = vec![SchedulerDecision {
+            phase: SchedulerPhase::Capacity,
+            outcome: SchedulerOutcome::TimeoutFallback,
+            elapsed_ms: 30002,
+            ..Default::default()
+        }];
+        let stats = compute_stats_onto(stats, &[b.clone(), a]);
+        let longest = stats.longest_scheduler_wait.unwrap();
+        assert_eq!(longest.crate_name, "capacity");
+        assert_eq!(longest.elapsed_ms(), 30002);
+        assert_eq!(longest.decisions, b.scheduler_decisions);
+        assert_eq!(stats.total_flight_wait_ms, 4000);
+        assert_eq!(stats.total_permit_wait_ms, 30002);
     }
 }
 

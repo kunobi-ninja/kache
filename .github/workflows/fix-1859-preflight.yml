@@ -1,0 +1,137 @@
+name: Fix 1859 preflight
+
+on:
+  push:
+    branches: [ci/preflight-1859]
+    paths: [.github/workflows/fix-1859-preflight.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fix-1859-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
+    name: Check issue ${{ matrix.issue }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - issue: '1859'
+            base: bbfa892bb513df8a7079055b75a7f48449a2ae8d
+            head: e903c73448737ea885834c380c1c24fed4b59238
+            tree: bfc47360d2987e33386865780a45ee7ff0037cbd
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_HEAD: ${{ matrix.head }}
+      SOURCE_TREE: ${{ matrix.tree }}
+      SOURCE_BASE: ${{ matrix.base }}
+      RUSTC_WRAPPER: ''
+      RUSTC_WORKSPACE_WRAPPER: ''
+    steps:
+      - name: Require reviewed pins and a disposable hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          [[ "$SOURCE_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p "$RUNNER_TEMP/fix-1859-evidence"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ matrix.head }}
+          path: source
+          persist-credentials: false
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: rust github:casey/just
+          cache: false
+      - name: Resolve tools from the trusted helper root
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          just_exe="$(mise which just)"
+          cargo_exe="$(mise which cargo)"
+          rustc_exe="$(mise which rustc)"
+          test -x "$just_exe"
+          test -x "$cargo_exe"
+          test -x "$rustc_exe"
+          expected_rustc="$("$rustc_exe" --version)"
+          expected_cargo="$("$cargo_exe" --version)"
+          [[ "$expected_rustc" == "rustc 1.99.1 "* ]]
+          {
+            printf 'VALIDATION_JUST=%s\nVALIDATION_CARGO=%s\nVALIDATION_RUSTC=%s\n' "$just_exe" "$cargo_exe" "$rustc_exe"
+            printf 'VALIDATION_EXPECTED_RUSTC=%s\nVALIDATION_EXPECTED_CARGO=%s\n' "$expected_rustc" "$expected_cargo"
+            printf 'VALIDATION_PATH=%s:%s:%s\n' "$(dirname "$just_exe")" "$(dirname "$cargo_exe")" "$PATH"
+            printf 'VALIDATION_RUSTUP_HOME=%s\n' "${RUSTUP_HOME:-$HOME/.rustup}"
+          } >> "$GITHUB_ENV"
+      - name: Validate the exact candidate without passing credentials to its checks
+        working-directory: source
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          evidence="$RUNNER_TEMP/fix-1859-evidence"
+          private_home="$RUNNER_TEMP/fix-1859-home"
+          mkdir -p "$private_home" "$RUNNER_TEMP/fix-1859-cargo" "$RUNNER_TEMP/fix-1859-tmp"
+          {
+            printf 'helper_head=%s\nsource_head=%s\nsource_tree=%s\nbase_head=%s\n' "$GITHUB_SHA" "$SOURCE_HEAD" "$SOURCE_TREE" "$SOURCE_BASE"
+            printf 'run_id=%s\nrun_attempt=%s\nrunner=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RUNNER_NAME"
+          } > "$evidence/provenance.txt"
+          validation_env() {
+            env -i PATH="$VALIDATION_PATH" HOME="$private_home" \
+              CARGO_HOME="$RUNNER_TEMP/fix-1859-cargo" RUSTUP_HOME="$VALIDATION_RUSTUP_HOME" \
+              RUSTUP_TOOLCHAIN=1.99.1 RUSTC="$VALIDATION_RUSTC" \
+              TMPDIR="$RUNNER_TEMP/fix-1859-tmp" CI=true CARGO_TERM_COLOR=always \
+              CARGO_TARGET_DIR="$RUNNER_TEMP/fix-1859-target" \
+              RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' KACHE_SELF_HOST=0 \
+              KACHE_TEST_USE_CARGO_BIN_EXE=1 GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$@"
+          }
+          validation_env "$VALIDATION_RUSTC" --version --verbose | tee "$evidence/rustc-identity.txt"
+          validation_env "$VALIDATION_CARGO" --version | tee "$evidence/cargo-identity.txt"
+          test "$(head -n 1 "$evidence/rustc-identity.txt")" = "$VALIDATION_EXPECTED_RUSTC"
+          test "$(head -n 1 "$evidence/cargo-identity.txt")" = "$VALIDATION_EXPECTED_CARGO"
+          {
+            printf 'rustup_toolchain=1.99.1\nrustc_path=%s\ncargo_path=%s\n' "$VALIDATION_RUSTC" "$VALIDATION_CARGO"
+            printf 'rustc_identity=%s\ncargo_identity=%s\n' "$VALIDATION_EXPECTED_RUSTC" "$VALIDATION_EXPECTED_CARGO"
+          } >> "$evidence/provenance.txt"
+          set +e
+          validation_env "$VALIDATION_JUST" check 2>&1 | tee "$evidence/just-check.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          tracked_status=0
+          git diff --exit-code HEAD -- > "$evidence/tracked-diff.patch" || tracked_status=$?
+          {
+            printf 'just_check_exit=%s\nlog_exit=%s\ntracked_diff_exit=%s\n' "${statuses[0]}" "${statuses[1]}" "$tracked_status"
+            printf 'source_head_after=%s\nsource_tree_after=%s\nrunner_environment=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" "$RUNNER_KIND"
+          } | tee -a "$evidence/provenance.txt"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi
+          if [ "${statuses[1]}" -ne 0 ]; then exit "${statuses[1]}"; fi
+          exit "$tracked_status"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: fix-1859-${{ matrix.issue }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fix-1859-evidence
+          retention-days: 7
+          if-no-files-found: warn

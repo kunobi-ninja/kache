@@ -6700,12 +6700,20 @@ impl Daemon {
 
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
-        let housekeeping = gc_store.sweep_housekeeping();
+        let mut housekeeping = gc_store.sweep_housekeeping();
+        // Flight files grow the same way, one per missed key (scheduler/).
+        if !gc_store.is_read_only() {
+            let flights = crate::scheduler::sweep_stale_flights(&config.cache_dir);
+            housekeeping.flights_removed = flights.removed;
+            housekeeping.flights_remaining = flights.remaining;
+        }
         let prestage_pruned =
             crate::prestage::prune(&self.config.cache_dir, std::time::SystemTime::now());
         tracing::info!(
             key_locks_removed = housekeeping.key_locks_removed,
             key_locks_remaining = housekeeping.key_locks_remaining,
+            flights_removed = housekeeping.flights_removed,
+            flights_remaining = housekeeping.flights_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
             prestage_pruned,

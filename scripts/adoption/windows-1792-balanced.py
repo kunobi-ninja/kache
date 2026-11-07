@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import threading
@@ -17,6 +18,10 @@ import time
 SOURCE = "a31c14b58e8a58f283e7af86ee982519ee0e72cc"
 WORKLOAD = "287cf9c6d266ce28d644bed050ce9a835f31fd80"
 HOST = "aarch64-pc-windows-msvc"
+TIMED_UNIT = "ab_riscv_interpreter"
+# The pinned all-targets workload reports one library and one final test compile.
+EXPECTED_TIMED_COMPILATIONS = 2
+KNOWN_ROUTES = {'daemon_pipeline', 'local_engine_pipeline', 'client_pipeline'}
 TOOLCHAIN = "nightly-2026-08-25-" + HOST
 FLAGS = "-C strip=symbols -C linker=rust-lld -Cllvm-args=--inline-threshold=10000 -C embed-bitcode -C lto -Z dylib-lto -C target-cpu=native"
 ROUNDS = (("bare", "default", "disabled"), ("default", "disabled", "bare"), ("disabled", "bare", "default"))
@@ -145,6 +150,17 @@ def private_config(root, scheduler=True):
     return env
 
 
+def candidate_process_name(name, expected_names):
+    # NTFS may expose KACHE-~1.EXE for kache-engine.exe (issue #1792).
+    # This widens only the cheap prefilter; the resolved image must still match.
+    lowered = name.lower()
+    return lowered in expected_names or re.fullmatch(r'kache[-_]?~[1-9][0-9]*\.exe', lowered) is not None
+
+
+def pinned_image(path, expected):
+    return expected.get(os.path.normcase(str(Path(path).resolve())))
+
+
 def windows_processes(expected):
     """Retain only PID/start/image provenance for our two pinned binary paths."""
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -177,7 +193,7 @@ def windows_processes(expected):
         present = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
         names = {Path(path).name.lower() for path in expected}
         while present:
-            if entry.szExeFile.lower() in names:
+            if candidate_process_name(entry.szExeFile, names):
                 handle = kernel.OpenProcess(0x1000, False, entry.th32ProcessID)
                 if handle:
                     try:
@@ -186,15 +202,15 @@ def windows_processes(expected):
                         times = [wintypes.FILETIME() for _ in range(4)]
                         if (kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length))
                                 and kernel.GetProcessTimes(handle, *[ctypes.byref(t) for t in times])):
-                            path = os.path.normcase(str(Path(image.value).resolve()))
-                            if path in expected:
+                            binary = pinned_image(image.value, expected)
+                            if binary is not None:
                                 creation = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
                                 found.append({'pid': int(entry.th32ProcessID),
                                               'parent_pid': int(entry.th32ParentProcessID),
                                               'start_filetime': creation,
                                               'start_us': creation // 10 - FILETIME_EPOCH_US,
                                               'observed_us': time.time_ns() // 1000,
-                                              'binary': expected[path]})
+                                              'binary': binary})
                     finally:
                         kernel.CloseHandle(handle)
             present = kernel.Process32NextW(snapshot, ctypes.byref(entry))
@@ -254,9 +270,11 @@ def classify_trace(document, receipt):
     if not events or not isinstance(events[0], dict):
         return {'route': 'unknown', 'reason': 'missing root event'}
     root = events[0]
-    result = {'unit': root.get('name'), 'pid': root.get('pid')}
+    result = {'unit': root.get('name'), 'pid': root.get('pid'),
+              'start_us': root.get('ts'), 'duration_us': root.get('dur')}
     pipeline = [event for event in events[1:] if event.get('name') in PIPELINE_MARKERS
                 and event.get('ph') == 'X' and event.get('cat') == 'rustc']
+    result['pipeline_markers'] = sorted({event['name'] for event in pipeline})
     if not pipeline:
         return {**result, 'route': 'unknown', 'reason': 'proxy or no recorded pipeline work'}
     if (root.get('cat') != 'rustc' or root.get('ph') != 'X'
@@ -288,7 +306,6 @@ def classify_trace(document, receipt):
     else:
         return {**result, 'route': 'unknown', 'reason': 'unexpected pipeline binary'}
     return {**result, 'route': route, 'start_filetime': identity['start_filetime'],
-            'pipeline_markers': sorted({event['name'] for event in pipeline}),
             'fallback_reason': 'not observed; placement does not identify why delegation was declined'}
 
 
@@ -338,9 +355,43 @@ def stop_private(kache, root, env, evidence):
 
 def export_stats(kache, workload, env, evidence, budget):
     for name, command in (
-            ('report', ['stats', '--format', 'json']),
+            ('report', ['report', '--format', 'json']),
+            ('stats', ['stats', '--format', 'json']),
             ('timeline', ['stats', '--format', 'trace'])):
         capture([kache, *command], workload, env, evidence / name, budget, timeout=60)
+
+
+def require_timed_route(receipt, evidence):
+    relevant = [record for record in receipt['traces'] if record.get('unit') == TIMED_UNIT]
+    compilers = [record for record in relevant if 'compiler' in record.get('pipeline_markers', [])]
+    # Use the original raw report schema, not the stats machine-envelope schema.
+    report = json.loads((evidence / 'report.stdout').read_text(encoding='utf-8'))
+    reported = [event for event in report['all_events']
+                if event.get('crate_name') == TIMED_UNIT and event.get('compiler_runs', 0) > 0]
+    identities = {(record.get('pid'), record.get('start_us'), record.get('duration_us')) for record in compilers}
+    passed = (len(reported) == EXPECTED_TIMED_COMPILATIONS
+              and all(event['compiler_runs'] == 1 for event in reported)
+              and len(compilers) == len(identities) == EXPECTED_TIMED_COMPILATIONS
+              and all(record['route'] in KNOWN_ROUTES for record in compilers))
+    write_json(evidence / 'timed-route-gate.json', {
+        'unit': TIMED_UNIT, 'passed': passed, 'compiler_traces': compilers,
+        'expected_compiler_invocations': EXPECTED_TIMED_COMPILATIONS,
+        'reported_compiler_invocations': len(reported),
+        'other_unit_traces': len(relevant) - len(compilers),
+        'rule': 'Both reported compiler invocations require distinct, positively placed real compiler traces; proxy roots do not qualify.'})
+    if not passed:
+        raise RuntimeError('Timed RISC-V unit has absent or ambiguous pipeline placement; preserve evidence and stop')
+
+
+def workload_environment(base, target, kache=None):
+    env = base.copy()
+    env.update(RUSTFLAGS=FLAGS, RUSTUP_TOOLCHAIN=TOOLCHAIN, CARGO_INCREMENTAL='0',
+               CARGO_BUILD_WARNINGS='deny', CARGO_TERM_COLOR='always', RUST_BACKTRACE='full',
+               CARGO_TARGET_DIR=str(target), RUSTC_WORKSPACE_WRAPPER='',
+               RUSTC_WRAPPER=str(kache) if kache is not None else '')
+    # Match cc2891aba: its allowlist filtered the workflow's setup-only jobs=2.
+    env.pop('CARGO_BUILD_JOBS', None)
+    return env
 
 
 def native_preflight(kache, scratch, output, budget, binaries):
@@ -368,8 +419,7 @@ def native_preflight(kache, scratch, output, budget, binaries):
         if not (target / 'owned_route_probe.rlib').is_file() or not (target / 'owned_route_probe.rlib').stat().st_size:
             raise RuntimeError('Owned Rust preflight produced no rlib')
         route = route_receipt(root, evidence, monitor)
-        if not any(route['counts'].get(name) for name in
-                   ('daemon_pipeline', 'local_engine_pipeline', 'client_pipeline')):
+        if not any(route['counts'].get(name) for name in KNOWN_ROUTES):
             raise RuntimeError('Route preflight is ambiguous; do not spend workload budget')
         clang = shutil.which('clang-cl.exe')
         if not clang:
@@ -414,16 +464,16 @@ def run_case(name, arm, kache, workload, scratch, output, budget, binaries):
     else:
         root.mkdir(parents=True, exist_ok=False)
         env = environment()
-    env.update(RUSTFLAGS=FLAGS, RUSTUP_TOOLCHAIN=TOOLCHAIN, CARGO_INCREMENTAL='0',
-               CARGO_BUILD_WARNINGS='deny', CARGO_TERM_COLOR='always', RUST_BACKTRACE='full',
-               CARGO_TARGET_DIR=str(target))
-    if wrapped:
-        env['RUSTC_WRAPPER'] = str(kache)
+    env = workload_environment(env, target, kache if wrapped else None)
     command = ['cargo', '+' + TOOLCHAIN, '-Zgitoxide', '-Zgit', 'build', '--locked',
                '--release', '--all-targets', '--features', 'no-panic', '--package',
                'ab-riscv-interpreter', '--timings']
     write_json(evidence / 'provenance.json', {'arm': arm, 'cold_store': wrapped, 'fresh_target': True,
                'source': SOURCE, 'workload': WORKLOAD, 'flags': FLAGS, 'toolchain': TOOLCHAIN,
+               'wrappers': {'rustc': env['RUSTC_WRAPPER'], 'workspace': env['RUSTC_WORKSPACE_WRAPPER']},
+               'jobs_policy': {'mode': 'Cargo default/config resolution, matching cc2891aba',
+                               'cli_override': None, 'cargo_build_jobs_env': None,
+                               'setup_jobs_2_not_inherited': True, 'numeric_result': 'not asserted'},
                'free_bytes_before': shutil.disk_usage(scratch).free,
                'instrumentation': '50ms identity polling and phase tracing' if wrapped else 'none'})
     result = None
@@ -433,9 +483,10 @@ def run_case(name, arm, kache, workload, scratch, output, budget, binaries):
             with RouteMonitor(root, binaries) as monitor:
                 _, result = capture(command, workload, env, evidence / 'cargo', budget, timeout=1200)
                 time.sleep(0.15)
-            route_receipt(root, evidence, monitor)
+            receipt = route_receipt(root, evidence, monitor)
             # Collection follows the timed command. Bare never runs these commands.
             export_stats(kache, workload, env, evidence, budget)
+            require_timed_route(receipt, evidence)
         else:
             _, result = capture(command, workload, env, evidence / 'cargo', budget, timeout=1200)
     finally:

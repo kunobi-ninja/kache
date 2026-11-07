@@ -103,6 +103,46 @@ class IsolationGuards(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 helper.private_config(root / 'first')
 
+    def test_bare_and_wrapped_env_override_cargo_config_wrappers(self):
+        inherited = {'PATH': 'native', 'RUSTC_WRAPPER': 'old-wrapper',
+                     'RUSTC_WORKSPACE_WRAPPER': 'old-workspace-wrapper', 'CARGO_BUILD_JOBS': '2'}
+        bare = helper.workload_environment(inherited, Path('target'))
+        wrapped = helper.workload_environment(inherited, Path('target'), Path('pinned/kache.exe'))
+        self.assertEqual(bare['RUSTC_WRAPPER'], '')
+        self.assertEqual(wrapped['RUSTC_WRAPPER'], str(Path('pinned/kache.exe')))
+        for env in (bare, wrapped):
+            self.assertEqual(env['RUSTC_WORKSPACE_WRAPPER'], '')
+            self.assertNotIn('CARGO_BUILD_JOBS', env)
+        self.assertEqual(inherited['RUSTC_WRAPPER'], 'old-wrapper')
+
+    def test_collects_original_report_schema_stats_and_trace_separately(self):
+        with patch.object(helper, 'capture') as capture:
+            helper.export_stats('pinned/kache.exe', Path('workload'), {}, Path('evidence'), object())
+        self.assertEqual([call.args[0] for call in capture.call_args_list], [
+            ['pinned/kache.exe', 'report', '--format', 'json'],
+            ['pinned/kache.exe', 'stats', '--format', 'json'],
+            ['pinned/kache.exe', 'stats', '--format', 'trace']])
+        self.assertEqual([call.args[3].name for call in capture.call_args_list], ['report', 'stats', 'timeline'])
+
+    def test_short_names_only_widen_prefilter_not_authoritative_image_match(self):
+        names = {'kache.exe', 'kache-engine.exe'}
+        for name in ('kache.exe', 'KACHE-ENGINE.EXE', 'KACHE-~1.EXE', 'KACHE-~2.EXE', 'KACHE~1.EXE'):
+            self.assertTrue(helper.candidate_process_name(name, names), name)
+        for name in ('chrome.exe', 'KACHE-~.EXE', 'KACHE-~1.EXE.cmd', 'KACHE-~0.EXE'):
+            self.assertFalse(helper.candidate_process_name(name, names), name)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pinned = root / 'pinned/kache-engine.exe'
+            pinned.parent.mkdir()
+            pinned.write_text('pinned')
+            unrelated = root / 'other/KACHE-~1.EXE'
+            unrelated.parent.mkdir()
+            unrelated.write_text('other')
+            expected = {os.path.normcase(str(pinned.resolve())): 'kache-engine.exe'}
+            self.assertEqual(helper.pinned_image(pinned, expected), 'kache-engine.exe')
+            self.assertTrue(helper.candidate_process_name(unrelated.name, names))
+            self.assertIsNone(helper.pinned_image(unrelated, expected))
+
     def test_evidence_export_never_copies_private_daemon_record_or_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             root, evidence = Path(temp) / 'root', Path(temp) / 'evidence'
@@ -136,6 +176,49 @@ class IsolationGuards(unittest.TestCase):
                          and node.test.id == 'wrapped' and any(isinstance(child, ast.With) for child in node.body))
         calls = [node for child in execution.orelse for node in ast.walk(child) if isinstance(node, ast.Call)]
         self.assertEqual([node.func.id for node in calls if isinstance(node.func, ast.Name)], ['capture'])
+
+
+class TimedRouteGateGuards(unittest.TestCase):
+    def write_report(self, evidence):
+        (evidence / 'report.stdout').write_text(json.dumps({'all_events': [
+            {'crate_name': helper.TIMED_UNIT, 'compiler_runs': 1},
+            {'crate_name': helper.TIMED_UNIT, 'compiler_runs': 1},
+        ]}))
+
+    def compiler(self, route, timestamp=100):
+        return {'unit': helper.TIMED_UNIT, 'route': route, 'pipeline_markers': ['compiler'],
+                'pid': 42, 'start_us': timestamp, 'duration_us': 20}
+
+    def test_positive_local_or_daemon_compiler_phase_qualifies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            evidence = Path(temp)
+            self.write_report(evidence)
+            for route in ('daemon_pipeline', 'local_engine_pipeline', 'client_pipeline'):
+                helper.require_timed_route({'traces': [
+                    self.compiler(route), self.compiler(route, timestamp=120),
+                    {'unit': helper.TIMED_UNIT, 'route': 'unknown', 'pipeline_markers': []},
+                ]}, evidence)
+                self.assertTrue(json.loads((evidence / 'timed-route-gate.json').read_text())['passed'])
+
+    def test_absent_irrelevant_proxy_and_partly_unknown_compilers_stop(self):
+        cases = (
+            [],
+            [{'unit': 'other_crate', 'route': 'daemon_pipeline', 'pipeline_markers': ['compiler']}],
+            [{'unit': helper.TIMED_UNIT, 'route': 'unknown', 'pipeline_markers': []}],
+            [self.compiler('unknown')],
+            [self.compiler('daemon_pipeline'), self.compiler('unknown', timestamp=120)],
+            [self.compiler('daemon_pipeline')],  # Short library known, final test trace missing.
+            [self.compiler('daemon_pipeline'), self.compiler('daemon_pipeline')],  # Duplicate cannot cover the test.
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            evidence = Path(temp)
+            self.write_report(evidence)
+            for records in cases:
+                with self.subTest(records=records), self.assertRaises(RuntimeError):
+                    helper.require_timed_route({'traces': records}, evidence)
+                receipt = json.loads((evidence / 'timed-route-gate.json').read_text())
+                self.assertFalse(receipt['passed'])
+                self.assertEqual(receipt['unit'], helper.TIMED_UNIT)
 
 
 if __name__ == '__main__':

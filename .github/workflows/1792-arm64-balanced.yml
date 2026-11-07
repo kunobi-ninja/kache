@@ -22,7 +22,6 @@ jobs:
         shell: pwsh
     env:
       RUSTC_WRAPPER: ""
-      CARGO_BUILD_JOBS: "2"
       NATIVE_HOST: aarch64-pc-windows-msvc
       KACHE_SOURCE: a31c14b58e8a58f283e7af86ee982519ee0e72cc
     steps:
@@ -49,6 +48,8 @@ jobs:
           persist-credentials: false
       - name: Build the pinned native release binaries
         working-directory: kache-source
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: |
           if ((git rev-parse HEAD) -ne $env:KACHE_SOURCE) { throw 'Wrong Kache source' }
           rustup toolchain install "1.99.1-$env:NATIVE_HOST" --profile minimal

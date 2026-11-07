@@ -33,6 +33,10 @@ def capture(argv, cwd, env, prefix, timeout=120):
     except subprocess.TimeoutExpired as error:
         prefix.with_suffix(".stdout").write_bytes(error.stdout or b"")
         prefix.with_suffix(".stderr").write_bytes(error.stderr or b"")
+        prefix.with_suffix(".json").write_text(json.dumps({
+            "argv": list(map(str, argv)), "timed_out": True,
+            "elapsed_ms": (time.perf_counter() - started) * 1000,
+        }, indent=2), encoding="utf-8")
         raise
     prefix.with_suffix(".stdout").write_bytes(result.stdout)
     prefix.with_suffix(".stderr").write_bytes(result.stderr)
@@ -66,7 +70,7 @@ def stop(kache, root, env):
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
 
 
-def configure(kache, output):
+def configure(kache, output, host):
     clang = shutil.which("clang-cl.exe")
     if not clang:
         candidate = Path(os.environ["ProgramFiles"]) / "LLVM/bin/clang-cl.exe"
@@ -74,6 +78,7 @@ def configure(kache, output):
             clang = str(candidate)
     if not clang:
         raise RuntimeError("Native clang-cl is required; no silent skip")
+    capture([clang, "--version"], output, environment(), output / "clang-identity")
     records = []
     for trust in (False, True):
         root = output / f"configure-trust-{trust}"
@@ -82,13 +87,18 @@ def configure(kache, output):
             for index, flags in enumerate((['-E'], ['-c'], ['-E'], ['-c'])):
                 source = root / f"conftest-{index}.c"
                 source.write_text("int configure_answer(void) { return 42; }\n", encoding="utf-8")
-                args = [clang, "/nologo", *flags, str(source)]
+                args = [clang, "/nologo", "--target=" + host, *flags, str(source)]
                 if flags == ['-c']:
                     args.append('/Fo' + str(root / f'conftest-{index}.obj'))
                 baseline, bare = capture(args, root, env, root / f"bare-{index}")
                 wrapped, timed = capture([kache, *args], root, env, root / f"wrapped-{index}")
                 if wrapped.stdout != baseline.stdout:
                     raise RuntimeError("Preprocessing output changed through the wrapper")
+                if flags == ['-c']:
+                    actual = (root / f'conftest-{index}.obj').read_bytes()[:2]
+                    expected = b'\x64\xaa' if host.startswith('aarch64') else b'\x64\x86'
+                    if actual != expected:
+                        raise RuntimeError(f"Wrong COFF target machine: {actual.hex()}")
                 records.append({"trust_daemon_execution": trust, "flags": flags,
                                 "bare_ms": bare['elapsed_ms'], "wrapped_ms": timed['elapsed_ms']})
         finally:
@@ -101,12 +111,12 @@ def abundance(kache, workload, output, host):
     flags = "-C strip=symbols -C linker=rust-lld -Cllvm-args=--inline-threshold=10000 -C embed-bitcode -C lto -Z dylib-lto -C target-cpu=native"
     records = []
     for cache_executables in (False, True):
-        root = output / f"abundance-executables-{cache_executables}"
-        env = config(root, cache_executables=cache_executables)
-        env.update(RUSTFLAGS=flags, RUSTUP_TOOLCHAIN=toolchain, CARGO_INCREMENTAL="0",
-                   CARGO_BUILD_WARNINGS="deny", CARGO_TERM_COLOR="always", RUST_BACKTRACE="full")
-        try:
-            for crate in ("ab-blake3", "ab-riscv-interpreter"):
+        for crate in ("ab-blake3", "ab-riscv-interpreter"):
+            root = output / f"abundance-executables-{cache_executables}-{crate}"
+            env = config(root, cache_executables=cache_executables)
+            env.update(RUSTFLAGS=flags, RUSTUP_TOOLCHAIN=toolchain, CARGO_INCREMENTAL="0",
+                       CARGO_BUILD_WARNINGS="deny", CARGO_TERM_COLOR="always", RUST_BACKTRACE="full")
+            try:
                 command = ["cargo", "+" + toolchain, "-Zgitoxide", "-Zgit", "build", "--locked",
                            "--release", "--all-targets", "--features", "no-panic", "--package", crate,
                            "--timings"]
@@ -126,10 +136,10 @@ def abundance(kache, workload, output, host):
                         shutil.copytree(timings, root / f"timings-{crate}-{mode}")
                     # This directory was created above in the fixture's owned root.
                     shutil.rmtree(target)
-            for name, args in (("report", ["report", "--format", "json"]), ("daemon", ["daemon", "status", "--json"])):
-                capture([kache, *args], workload, env, root / name)
-        finally:
-            stop(kache, root, env)
+                for name, args in (("report", ["report", "--format", "json"]), ("daemon", ["daemon", "status", "--json"])):
+                    capture([kache, *args], workload, env, root / name)
+            finally:
+                stop(kache, root, env)
     (output / "abundance-summary.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
 
 
@@ -145,7 +155,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     kache = str(args.kache.resolve())
-    configure(kache, output)
+    configure(kache, output, args.host)
     abundance(kache, args.workload.resolve(), output, args.host)
 
 

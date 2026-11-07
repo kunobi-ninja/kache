@@ -75,12 +75,49 @@ fn compile_with_log(
 }
 
 fn diagnostics(output: &Output, project: &Path) -> String {
+    normalize_diagnostic_paths(
+        std::str::from_utf8(&output.stderr).unwrap(),
+        project.to_str().unwrap(),
+    )
+}
+
+fn normalize_diagnostic_paths(stderr: &str, project: &str) -> String {
     // Compare rendering apart from Kache's existing stable workspace paths.
-    String::from_utf8(output.stderr.clone())
-        .unwrap()
-        .replace(project.to_str().unwrap(), "<PROJECT>")
+    let json_project = serde_json::to_string(project).unwrap();
+    stderr
+        .replace(&json_project[1..json_project.len() - 1], "<PROJECT>")
+        .replace(project, "<PROJECT>")
         .replace("/proc/self/cwd", "<PROJECT>")
         .replace("/kache/workspace", "<PROJECT>")
+}
+
+#[test]
+fn windows_project_paths_preserve_rendered_diagnostic_comparisons() {
+    let project = r"D:\a\kache\target\scratch";
+    let record = |path: &str, line: &str| {
+        serde_json::json!({
+            "file_name": path,
+            "rendered": format!("warning: unused variable\n --> {path}:1:30\n1 | {line}\n"),
+        })
+        .to_string()
+    };
+    let full_line = "let unused = \"a long value\";";
+    let direct = record(&format!(r"{project}\lib.rs"), full_line);
+    let wrapped = record(r"/kache/workspace\lib.rs", full_line);
+    let expected = record(r"<PROJECT>\lib.rs", full_line);
+    assert!(direct.contains(r"D:\\a\\kache"), "{direct}");
+    assert_eq!(normalize_diagnostic_paths(&direct, project), expected);
+    assert_eq!(normalize_diagnostic_paths(&wrapped, project), expected);
+    assert_eq!(
+        normalize_diagnostic_paths(&format!(r"warning at {project}\lib.rs"), project),
+        r"warning at <PROJECT>\lib.rs"
+    );
+    let narrow = record(&format!(r"{project}\lib.rs"), "...unused...");
+    assert_ne!(
+        normalize_diagnostic_paths(&direct, project),
+        normalize_diagnostic_paths(&narrow, project),
+        "normalizing paths must preserve width-dependent rendered text"
+    );
 }
 
 fn json_records(output: &Output) -> Vec<String> {

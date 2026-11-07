@@ -8985,11 +8985,14 @@ async fn sync_inner(
         remote,
         config.pull_request_prefix.as_deref(),
         config.s3_pool_idle_secs,
+        config.remote_upload_timeout_secs,
     )
     .await
     .context("connecting to the remote — check its configuration and access")?;
-    let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
-        Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
+    let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> = Arc::new(
+        crate::cache_remote::V3Remote::new(backend, remote.clone())
+            .with_upload_memory(config.remote_upload_memory_bytes),
+    );
     sync_with_client(
         remote_cache.as_ref(),
         config,
@@ -9497,6 +9500,7 @@ fn save_manifest_impl(
             remote,
             config.pull_request_prefix.as_deref(),
             pool_idle_secs,
+            config.remote_upload_timeout_secs,
         )
         .await?;
         let remote_cache = Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));

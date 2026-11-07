@@ -3072,6 +3072,7 @@ impl Daemon {
                     remote,
                     self.config.pull_request_prefix.as_deref(),
                     self.config.s3_pool_idle_secs,
+                    self.config.remote_upload_timeout_secs,
                 )
                 .await
             })
@@ -3090,9 +3091,11 @@ impl Daemon {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no remote configured"))?
                     .clone();
-                Ok::<_, anyhow::Error>(Arc::new(crate::cache_remote::V3Remote::new(
-                    backend, remote,
-                )))
+                Ok::<_, anyhow::Error>(Arc::new(
+                    crate::cache_remote::V3Remote::new(backend, remote)
+                        .with_upload_memory(self.config.remote_upload_memory_bytes)
+                        .with_upload_semaphore(Arc::clone(&self.s3_semaphore)),
+                ))
             })
             .await
     }
@@ -3840,22 +3843,6 @@ impl Daemon {
                 .fetch_add(1, Ordering::Relaxed);
             return Response::err("retryable: write breaker open before PUT");
         };
-        let put_semaphore = match deadline
-            .run("upload PUT queue", async {
-                self.s3_semaphore
-                    .acquire()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
-            })
-            .await
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                let class = classify_remote_error(&error);
-                put_breaker.failure(class, &format!("{error:#}"));
-                return Response::err("retryable: upload PUT queue deadline");
-            }
-        };
         let upload_result = deadline
             .run(
                 "upload PUT",
@@ -3869,7 +3856,6 @@ impl Daemon {
                 ),
             )
             .await;
-        drop(put_semaphore);
         match upload_result {
             Ok(ul) => {
                 put_breaker.success();
@@ -7032,19 +7018,53 @@ fn start_manifest_warming(
 /// error fails it again. Kept, such intents hold the store above its size
 /// limit for as long as the remote refuses.
 async fn run_upload_job(daemon: &Arc<Daemon>, job: &UploadJob) -> Response {
+    run_upload_job_with_delay(daemon, job, UPLOAD_RETRY_DELAY).await
+}
+
+fn upload_retry_delay(attempt: u32, base: Duration) -> Duration {
+    base.saturating_mul(1 << attempt.saturating_sub(1).min(4))
+        .min(Duration::from_secs(60))
+}
+
+async fn run_upload_job_with_delay(
+    daemon: &Arc<Daemon>,
+    job: &UploadJob,
+    retry_base: Duration,
+) -> Response {
+    let max_attempts = daemon.config.remote_upload_max_attempts.max(1);
+    let mut attempts = 0;
+    let mut retry_round = 0_u32;
     let resp = loop {
         let response = daemon.do_upload(job).await;
+        if !matches!(
+            response.error.as_deref(),
+            Some("retryable: write breaker open" | "retryable: write breaker open before PUT")
+        ) {
+            attempts += 1;
+        }
         if upload_result_is_terminal(response.error.as_deref()) {
             break response;
         }
+        if attempts >= max_attempts {
+            break Response::err(format!(
+                "upload retry limit reached after {attempts} attempts: {}",
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown upload failure")
+            ));
+        }
+        retry_round = retry_round.saturating_add(1);
+        let delay = upload_retry_delay(retry_round, retry_base);
         tracing::debug!(
             key = key_prefix(&job.key),
-            retry_after_secs = UPLOAD_RETRY_DELAY.as_secs(),
+            attempts,
+            retry_after_secs = delay.as_secs(),
             "durable upload deferred"
         );
         // No S3 permit is held here: `do_upload` owns and releases
         // each permit before returning a retryable outcome.
-        tokio::time::sleep(UPLOAD_RETRY_DELAY).await;
+        tokio::time::sleep(delay).await;
     };
     match daemon.retire_upload_job(&job.key).await {
         Ok(()) => {

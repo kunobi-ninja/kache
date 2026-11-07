@@ -1303,7 +1303,12 @@ impl crate::remote_backend::RemoteBackend for GatedMissBackend {
         Ok(None)
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         panic!("remote check must not issue PUT");
     }
 
@@ -1642,6 +1647,9 @@ pub(super) fn test_config(dir: &Path) -> Config {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     }
@@ -6342,7 +6350,11 @@ async fn a_malformed_prediction_row_or_identity_is_refused() {
         ),
     );
     backend
-        .put(&key, b"{ not json".to_vec(), Some("application/json"))
+        .put(
+            &key,
+            (b"{ not json".to_vec()).into(),
+            Some("application/json"),
+        )
         .await
         .unwrap();
     let reply = daemon
@@ -6447,7 +6459,7 @@ async fn prediction_fetch_answers_clear_prior_read_failures() {
                 ),
             );
             backend
-                .put(&key, body, Some("application/json"))
+                .put(&key, (body).into(), Some("application/json"))
                 .await
                 .unwrap();
         }
@@ -6559,7 +6571,7 @@ async fn cache_remote_wraps_the_injected_backend() {
     backend
         .put(
             "prefix/v3/manifests/foo/k1.json",
-            b"{}".to_vec(),
+            (b"{}".to_vec()).into(),
             Some("application/json"),
         )
         .await
@@ -6631,7 +6643,7 @@ impl crate::remote_backend::RemoteBackend for BlockingIdentityBackend {
         self.inner.get(key, max_bytes).await
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.inner.put(key, body, content_type).await
     }
 
@@ -6671,7 +6683,7 @@ impl crate::remote_backend::RemoteBackend for FailingIdentityBackend {
         self.inner.get(key, max_bytes).await
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.inner.put(key, body, content_type).await
     }
 
@@ -6715,7 +6727,7 @@ async fn put_test_object(
     body: &[u8],
 ) {
     backend
-        .put(key, body.to_vec(), None)
+        .put(key, (body.to_vec()).into(), None)
         .await
         .expect("seed test remote object");
 }
@@ -6736,7 +6748,12 @@ impl crate::remote_backend::RemoteBackend for PutFailBackend {
         Ok(None)
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         anyhow::bail!("injected PUT failure")
     }
 
@@ -6770,7 +6787,12 @@ impl crate::remote_backend::RemoteBackend for DeadlineUploadBackend {
         panic!("upload must not GET");
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         RemoteDeadline::from_instant(Some(Instant::now())).check("upload PUT")
     }
 
@@ -6847,7 +6869,7 @@ impl crate::remote_backend::RemoteBackend for BlockingPackBackend {
         self.inner.get(key, max_bytes).await
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.inner.put(key, body, content_type).await
     }
 
@@ -6894,7 +6916,7 @@ impl crate::remote_backend::RemoteBackend for ReorderedPackBackend {
         Ok(object)
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.inner.put(key, body, content_type).await
     }
 
@@ -6931,7 +6953,7 @@ impl crate::remote_backend::RemoteBackend for BlockingV3Backend {
         self.inner.get(key, max_bytes).await
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.inner.put(key, body, content_type).await
     }
 
@@ -12277,7 +12299,12 @@ impl crate::remote_backend::RemoteBackend for DirectRestoreBackend {
         self.inner.get(key, max_bytes).await
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         panic!("restore must not upload");
     }
 
@@ -12412,7 +12439,12 @@ impl crate::remote_backend::RemoteBackend for PanicOnGetBackend {
         panic!("GET {key} must not be issued while the remote is degraded");
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         panic!("PUT must not be issued while the remote is degraded");
     }
 
@@ -12443,7 +12475,12 @@ impl crate::remote_backend::RemoteBackend for StallingGetBackend {
         unreachable!()
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -12488,7 +12525,12 @@ impl crate::remote_backend::RemoteBackend for FailingGetBackend {
         }
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -16467,6 +16509,203 @@ async fn upload_retirement_reports_flush_errors_and_skips_already_missing_intent
     }
 }
 
+#[test]
+fn upload_retry_backoff_grows_and_stays_bounded() {
+    let delays: Vec<_> = (1..=7)
+        .map(|attempt| upload_retry_delay(attempt, Duration::from_secs(5)).as_secs())
+        .collect();
+    assert_eq!(delays, [5, 10, 20, 40, 60, 60, 60]);
+    assert_eq!(
+        upload_retry_delay(u32::MAX, Duration::from_secs(5)),
+        Duration::from_secs(60)
+    );
+    assert_eq!(upload_retry_delay(1, Duration::ZERO), Duration::ZERO);
+}
+
+struct BoundedRetryUploadBackend {
+    attempts: AtomicU64,
+    succeeds_at: u64,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for BoundedRetryUploadBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempt == self.succeeds_at {
+            return Ok(true);
+        }
+        RemoteDeadline::from_instant(Some(Instant::now())).check("repeated upload timeout")?;
+        unreachable!()
+    }
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        panic!("upload must not download");
+    }
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
+        panic!("a failed HEAD must not reach PUT");
+    }
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        panic!("upload must not list");
+    }
+    fn describe(&self, key: &str) -> String {
+        format!("retry-test://{key}")
+    }
+}
+
+#[tokio::test]
+async fn repeated_upload_failures_stop_at_the_configured_limit_and_release_gc_pins() {
+    for (limit, succeeds_at) in [(1, 0), (3, 0), (3, 3), (3, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BoundedRetryUploadBackend {
+            attempts: AtomicU64::new(0),
+            succeeds_at,
+        });
+        let mut daemon = resilience_test_daemon(dir.path(), backend.clone());
+        daemon.config.remote_upload_max_attempts = limit;
+        let daemon = Arc::new(daemon);
+        let key = test_cache_key("bounded-retries");
+        seed_store_entry(&daemon.config, &key, "serde", dir.path());
+        let job = persist_upload_job(
+            &daemon.config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: String::new(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+                client_version: None,
+            },
+        )
+        .unwrap();
+        daemon.pending_uploads.write().await.insert(key.clone());
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_upload_job_with_delay(&daemon, &job, Duration::ZERO),
+        )
+        .await
+        .expect("failed upload must stop without waiting for remote recovery");
+        assert_eq!(
+            backend.attempts.load(Ordering::Relaxed),
+            if succeeds_at == 0 {
+                u64::from(limit)
+            } else {
+                succeeds_at
+            }
+        );
+        assert_eq!(response.ok, succeeds_at != 0);
+        if succeeds_at == 0 {
+            let error = response.error.unwrap();
+            assert!(error.starts_with("upload retry limit reached"), "{error}");
+            assert!(!error.starts_with("retryable:"));
+        }
+        assert!(!upload_spool_path(&daemon.config, &key).exists());
+        assert!(daemon.pending_uploads.read().await.is_empty());
+        assert!(
+            Store::open(&daemon.config).unwrap().contains(&key),
+            "retry exhaustion keeps the local entry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_breaker_deferrals_do_not_spend_the_upload_attempt_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(BoundedRetryUploadBackend {
+        attempts: AtomicU64::new(0),
+        succeeds_at: 1,
+    });
+    let mut daemon = resilience_test_daemon(dir.path(), backend.clone());
+    daemon.config.remote_upload_max_attempts = 1;
+    daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(1)));
+    daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::UploadPut)
+        .unwrap()
+        .failure(RemoteErrorClass::Transient, "test outage");
+    let daemon = Arc::new(daemon);
+    let key = test_cache_key("breaker-defers-upload");
+    seed_store_entry(&daemon.config, &key, "serde", dir.path());
+    let job = persist_upload_job(
+        &daemon.config,
+        &UploadJob {
+            key: key.clone(),
+            entry_dir: String::new(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+            client_version: None,
+        },
+    )
+    .unwrap();
+    daemon.pending_uploads.write().await.insert(key.clone());
+    let task_daemon = daemon.clone();
+    let mut worker =
+        tokio::spawn(
+            async move { run_upload_job_with_delay(&task_daemon, &job, Duration::ZERO).await },
+        );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut worker)
+            .await
+            .is_err()
+    );
+    assert_eq!(backend.attempts.load(Ordering::Relaxed), 0);
+    assert!(upload_spool_path(&daemon.config, &key).is_file());
+    let response = tokio::time::timeout(Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        response.ok,
+        "recovery must get its first admitted attempt: {response:?}"
+    );
+    assert_eq!(backend.attempts.load(Ordering::Relaxed), 1);
+    assert!(!upload_spool_path(&daemon.config, &key).exists());
+    assert!(daemon.pending_uploads.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn daemon_applies_upload_memory_configuration_before_starting_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    config.remote_upload_memory_bytes = 2048;
+    let key = test_cache_key("configured-upload-memory");
+    seed_store_entry(&config, &key, "serde", dir.path());
+    let store = Store::open(&config).unwrap();
+    let path = store.entry_dir(&key).join("meta.json");
+    let mut meta: crate::store::EntryMeta =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta.stderr = (0_u64..256)
+        .map(|n| blake3::hash(&n.to_le_bytes()).to_hex().to_string())
+        .collect();
+    std::fs::write(path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let daemon = Arc::new(Daemon::new(config));
+    daemon.set_remote_backend_for_test(Arc::new(PutFailBackend));
+    let job = persist_upload_job(
+        &daemon.config,
+        &UploadJob {
+            key,
+            entry_dir: String::new(),
+            crate_name: "serde".into(),
+            client_epoch: 0,
+            client_version: None,
+        },
+    )
+    .unwrap();
+    let response = daemon.do_upload(&job).await;
+    let error = response.error.unwrap();
+    assert!(
+        error.contains("cache.remote_upload_memory_bytes"),
+        "memory rejection must precede injected PUT failure: {error}"
+    );
+}
+
 struct RetryableThenTerminalUploadBackend {
     heads: AtomicU64,
     first_failure: tokio::sync::Semaphore,
@@ -16498,7 +16737,12 @@ impl crate::remote_backend::RemoteBackend for RetryableThenTerminalUploadBackend
         panic!("upload test must not GET");
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         panic!("failed upload HEAD must not PUT");
     }
 
@@ -16735,14 +16979,19 @@ impl crate::remote_backend::RemoteBackend for ReadOnlyConsumerBackend {
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         self.inner.get(key, max_bytes).await
     }
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("read-only consumer attempted a write")
     }
     async fn put_if_absent(
         &self,
         _key: &str,
-        _body: Vec<u8>,
+        _body: bytes::Bytes,
         _content_type: Option<&str>,
     ) -> Result<crate::remote_backend::PutIfAbsentResult> {
         self.writes.fetch_add(1, Ordering::SeqCst);

@@ -409,7 +409,12 @@ impl crate::remote_backend::RemoteBackend for Silent {
         std::future::pending().await
     }
 
-    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
         std::future::pending().await
     }
 
@@ -3511,9 +3516,17 @@ impl TestBackend {
     }
 
     async fn seed(&self, key: &str, body: impl Into<Vec<u8>>) {
-        crate::remote_backend::RemoteBackend::put(&self.inner, key, body.into(), None)
-            .await
-            .expect("seed remote object");
+        crate::remote_backend::RemoteBackend::put(
+            &self.inner,
+            key,
+            {
+                let bytes: Vec<u8> = body.into();
+                bytes.into()
+            },
+            None,
+        )
+        .await
+        .expect("seed remote object");
     }
 
     fn get_calls(&self) -> Vec<String> {
@@ -3555,7 +3568,7 @@ impl crate::remote_backend::RemoteBackend for TestBackend {
         crate::remote_backend::RemoteBackend::get(&self.inner, key, max_bytes).await
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.calls.lock().unwrap().puts.push(key.to_string());
         if self.fail_put {
             anyhow::bail!("injected PUT failure for {key}");
@@ -3936,6 +3949,9 @@ fn save_manifest_config(
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     }
@@ -7383,7 +7399,7 @@ impl crate::remote_backend::RemoteBackend for DisappearingBackend {
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         self.inner.as_ref().get(key, max_bytes).await
     }
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         if self.on_put_delete.exists() {
             let _ = std::fs::remove_dir_all(&self.on_put_delete);
         }

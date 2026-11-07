@@ -660,6 +660,9 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Concurrent operations for all remote backends |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; `0` disables this operation limit |
+| `KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS` | `cache.remote_upload_max_attempts` | `5` | Maximum attempts per background upload, including the first |
+| `KACHE_REMOTE_UPLOAD_MEMORY_BYTES` | `cache.remote_upload_memory_bytes` | `512MiB` | Buffered compressed upload pack budget; minimum `2KiB` |
+| `KACHE_REMOTE_UPLOAD_TIMEOUT_SECS` | `cache.remote_upload_timeout_secs` | `300` | S3 upload response timeout in positive integer seconds |
 | `KACHE_DEMAND_TIMEOUT_SECS` | `cache.demand_timeout_secs` | `3` | End-to-end synchronous remote restore wait in positive integer seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
 
@@ -673,6 +676,19 @@ kache daemon restart
 The wrapper and daemon use the shortest of their demand budgets, the client's request deadline, and the enabled `remote_restore_timeout_secs` limit. A shorter client deadline still wins. A legacy client with no deadline keeps its three-second budget; an older daemon still stops at three seconds, so upgrade both peers to use longer waits. Background upload and prefetch retain their separate operation deadlines.
 
 Demand timeouts accept integers from `1` through `4294967295` seconds. Zero does not disable the wait. `config set` rejects invalid values before saving. Invalid environment values warn and fall back to a valid file value or three seconds. Zero or out-of-range file values warn and use three seconds. Malformed TOML or a value of the wrong type follows the usual unusable-file handling; commands report the file error and use defaults.
+
+Background uploads retry transient failures up to `remote_upload_max_attempts` times, including the first attempt. Waiting for the write circuit breaker to recover does not spend an attempt. When the limit is reached, Kache warns and abandons the automatic upload. It retires the upload intent so the entry can be evicted; the local cached result remains available until GC removes it. Cancellation during shutdown preserves the intent for replay when the daemon restarts.
+
+`remote_upload_memory_bytes` reserves memory before compression and keeps it reserved until the last upload-body reference is dropped. Create-only writes and fallback writes share the same allocation. The budget covers compressed pack buffers, rather than the daemon's total RSS. Packs that exceed the budget stay local; increase the setting to upload them. Both TOML and `config set` accept units such as `512MiB` or `1GiB`:
+
+```sh
+kache config set cache.remote_upload_memory_bytes 1GiB
+kache daemon restart
+```
+
+S3 reads keep their 30-second inactivity timeout. Uploads use the separate `remote_upload_timeout_secs` response timeout so a slow large PUT has longer to finish. The total daemon operation is still capped by `remote_restore_timeout_secs` when it is enabled. To allow an upload more than five minutes, raise both timeouts and restart the daemon.
+
+Upload attempt counts and timeouts accept integers from `1` through `4294967295`. Invalid environment values warn and fall back to a valid file value or the default. Invalid file values warn and use the default. A malformed value of the wrong TOML type follows the usual unusable-file handling. `config set` rejects invalid ranges and memory budgets below `2KiB` before saving.
 
 Prediction-row fetches wait at most two seconds, or less when `remote_restore_timeout_secs` is shorter. Setting it to `0` keeps the two-second prediction cap. While the read circuit breaker is degraded, prediction fetches return immediately and leave recovery probes to artifact restores.
 

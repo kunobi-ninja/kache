@@ -1,0 +1,141 @@
+name: Adoption preflight (1844 and 1846)
+
+on:
+  push:
+    branches: [review-contribution/preflight-1844-1846]
+    paths: [.github/workflows/adoption-1844-1846-preflight.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adoption-1844-1846-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
+    name: Prepare PR ${{ matrix.pr }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: '1844'
+            original: 33c5b367b673d792b4727da45d9d842f6d76d506
+            head: c0b51f0ba092c2dde774991bd3e1afc8de4db123
+            tree: e9dd1de6c1f2a92d62ee2b7a47166ac75d31bdf7
+          - pr: '1846'
+            original: a4c41dd02ee8732308c4dcae79f252da80651a7b
+            head: e5539d387aee38629ccd70efea576636f8949bc8
+            tree: 4ffc48e846a9f1f3db8fd7220cc2f8e541e7fea0
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_HEAD: ${{ matrix.head }}
+      SOURCE_TREE: ${{ matrix.tree }}
+      SOURCE_ORIGINAL: ${{ matrix.original }}
+      RUSTC_WRAPPER: ''
+      RUSTC_WORKSPACE_WRAPPER: ''
+    steps:
+      - name: Require reviewed pins and a disposable hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          [[ "$SOURCE_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p "$RUNNER_TEMP/adoption-evidence"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ matrix.head }}
+          path: source
+          persist-credentials: false
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0
+        with:
+          version: 2026.6.9
+          install: true
+          install_args: rust github:casey/just
+          cache: false
+      - name: Resolve tools from the trusted helper root
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          just_exe="$(mise which just)"
+          cargo_exe="$(mise which cargo)"
+          rustc_exe="$(mise which rustc)"
+          test -x "$just_exe"
+          test -x "$cargo_exe"
+          test -x "$rustc_exe"
+          expected_rustc="$("$rustc_exe" --version)"
+          expected_cargo="$("$cargo_exe" --version)"
+          [[ "$expected_rustc" == "rustc 1.99.1 "* ]]
+          {
+            printf 'VALIDATION_JUST=%s\nVALIDATION_CARGO=%s\nVALIDATION_RUSTC=%s\n' "$just_exe" "$cargo_exe" "$rustc_exe"
+            printf 'VALIDATION_EXPECTED_RUSTC=%s\nVALIDATION_EXPECTED_CARGO=%s\n' "$expected_rustc" "$expected_cargo"
+            printf 'VALIDATION_PATH=%s:%s:%s\n' "$(dirname "$just_exe")" "$(dirname "$cargo_exe")" "$PATH"
+            printf 'VALIDATION_RUSTUP_HOME=%s\n' "${RUSTUP_HOME:-$HOME/.rustup}"
+          } >> "$GITHUB_ENV"
+      - name: Validate the exact candidate without passing credentials to its checks
+        working-directory: source
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          evidence="$RUNNER_TEMP/adoption-evidence"
+          private_home="$RUNNER_TEMP/adoption-home"
+          mkdir -p "$private_home" "$RUNNER_TEMP/adoption-cargo" "$RUNNER_TEMP/adoption-tmp"
+          {
+            printf 'helper_head=%s\nsource_head=%s\nsource_tree=%s\noriginal_head=%s\n' "$GITHUB_SHA" "$SOURCE_HEAD" "$SOURCE_TREE" "$SOURCE_ORIGINAL"
+            printf 'run_id=%s\nrun_attempt=%s\nrunner=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RUNNER_NAME"
+          } > "$evidence/provenance.txt"
+          validation_env() {
+            env -i PATH="$VALIDATION_PATH" HOME="$private_home" \
+              CARGO_HOME="$RUNNER_TEMP/adoption-cargo" RUSTUP_HOME="$VALIDATION_RUSTUP_HOME" \
+              RUSTUP_TOOLCHAIN=1.99.1 RUSTC="$VALIDATION_RUSTC" \
+              TMPDIR="$RUNNER_TEMP/adoption-tmp" CI=true CARGO_TERM_COLOR=always \
+              CARGO_TARGET_DIR="$RUNNER_TEMP/adoption-target" \
+              RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' KACHE_SELF_HOST=0 \
+              KACHE_TEST_USE_CARGO_BIN_EXE=1 GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$@"
+          }
+          validation_env "$VALIDATION_RUSTC" --version --verbose | tee "$evidence/rustc-identity.txt"
+          validation_env "$VALIDATION_CARGO" --version | tee "$evidence/cargo-identity.txt"
+          test "$(head -n 1 "$evidence/rustc-identity.txt")" = "$VALIDATION_EXPECTED_RUSTC"
+          test "$(head -n 1 "$evidence/cargo-identity.txt")" = "$VALIDATION_EXPECTED_CARGO"
+          {
+            printf 'rustup_toolchain=1.99.1\nrustc_path=%s\ncargo_path=%s\n' "$VALIDATION_RUSTC" "$VALIDATION_CARGO"
+            printf 'rustc_identity=%s\ncargo_identity=%s\n' "$VALIDATION_EXPECTED_RUSTC" "$VALIDATION_EXPECTED_CARGO"
+          } >> "$evidence/provenance.txt"
+          set +e
+          validation_env "$VALIDATION_JUST" check 2>&1 | tee "$evidence/just-check.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          tracked_status=0
+          git diff --exit-code HEAD -- > "$evidence/tracked-diff.patch" || tracked_status=$?
+          {
+            printf 'just_check_exit=%s\nlog_exit=%s\ntracked_diff_exit=%s\n' "${statuses[0]}" "${statuses[1]}" "$tracked_status"
+            printf 'source_head_after=%s\nsource_tree_after=%s\nrunner_environment=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" "$RUNNER_KIND"
+          } | tee -a "$evidence/provenance.txt"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi
+          if [ "${statuses[1]}" -ne 0 ]; then exit "${statuses[1]}"; fi
+          exit "$tracked_status"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: adoption-${{ matrix.pr }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/adoption-evidence
+          retention-days: 7
+          if-no-files-found: warn

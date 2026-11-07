@@ -319,3 +319,96 @@ environment.
 `kache stats --format perfetto` remains the compact event-based view: its
 phase offsets are reconstructed from millisecond totals. The opt-in files
 above record actual interval placement and retain sub-millisecond work.
+
+## Memory-pressure admission qualification
+
+`scripts/bench-pressure.py` compares real Rust builds under measured Linux
+cgroup pressure. It generates an offline workspace with independent crate
+graphs, starts background Cargo builds at nice 10, and starts small foreground
+builds at nice 0. Each arm has a fresh store, runtime and target directories.
+No external source, build script or dependency is downloaded or executed.
+
+Run it on a disposable, dedicated Linux machine with delegated cgroup v2
+`memory`, `cpu` and `pids` controllers and `cgroup.kill`. Eight visible CPUs
+are needed to exercise a sustained warning ceiling above one slot:
+`reserve_for(pool)` is `max(pool / 4, 1)`. Smaller machines can qualify safety
+and accounting, but their warning floor cannot demonstrate that throughput
+benefit. The hard memory cap must leave at least 40% of host memory outside
+the workload. The supervisor stays outside the task cgroup.
+
+Build both arms from the same source revision with the same toolchain and
+build settings. Generate a control patch before building the base arm:
+
+```sh
+python3 scripts/bench/legacy-pressure-control.py "$PWD" > /tmp/kache-pressure-control.patch
+git worktree add --detach /tmp/kache-pressure-control "$(git rev-parse HEAD)"
+git -C /tmp/kache-pressure-control apply /tmp/kache-pressure-control.patch
+```
+
+The control restores the previous ordinary-admission policy: warning or
+critical pressure requests the whole pool and retains those slots until the
+compile ends. It keeps the current pressure observation and persistence costs
+in both arms and leaves bounded recovery unchanged. This isolates admission
+policy; it is not a binary from the historical release. The patch generator
+refuses unfamiliar source so a later refactor needs review.
+
+Build each checkout's `kache` binary separately before measurement. Do not
+compile Kache or run another workload during measurement. With binaries
+prepared and a delegated parent at `/sys/fs/cgroup/kache-pressure`, run:
+
+```sh
+python3 scripts/bench-pressure.py \
+  --base /tmp/kache-pressure-control/target/release/kache \
+  --head "$PWD/target/release/kache" \
+  --base-revision "$(git rev-parse HEAD)" \
+  --head-revision "$(git rev-parse HEAD)" \
+  --control-patch /tmp/kache-pressure-control.patch \
+  --cargo /absolute/path/to/toolchain/bin/cargo \
+  --rustc /absolute/path/to/toolchain/bin/rustc \
+  --output /tmp/kache-pressure-results \
+  --cgroup-parent /sys/fs/cgroup/kache-pressure \
+  --dedicated-host --cpus 8 --memory-max-mib 3072 --memory-high-mib 512
+```
+
+Start with `--scenario sustained --samples 1` as a pilot. Choose the workload
+size and `memory.high` from that pilot, freeze them, then run fresh paired
+measurements. The scenario names describe the limit schedule, not an observed
+kernel state. A run without warning or critical PSI samples does not qualify
+pressure behavior. The default schedules are unrestricted `memory.high`,
+sustained low `memory.high`, and alternating 15-second intervals. The latter
+must produce alternating kernel samples to qualify recovery behavior.
+
+`--second-memory-max-mib` places half the jobs in a tighter child cgroup while
+both children share one store and permit pool. Each sample retains both
+children's usage, limits and PSI. This exposes differing resource domains;
+it does not establish a headroom-based admission policy. The production
+controller still uses PSI and recorded compiler RSS weights. Available
+cgroup headroom remains diagnostic input.
+
+The harness records executable and patch hashes, source revisions, toolchain,
+CPU affinity, arm order and raw 200 ms samples. Its results distinguish:
+
+- Sampled aggregate compiler RSS, which can double-count shared pages, from
+  kernel cgroup peak memory, which includes filesystem page cache.
+- Foreground build completion latency from total completed-build throughput.
+  Completion is polled at the sampling interval, so reported latency can
+  overestimate exit time by up to that interval. Small foreground sample
+  counts do not support a stable tail estimate. Check the foreground/background
+  overlap count before interpreting the latency as contention.
+- Observed OOM counters from prevented OOMs. Swap is disabled inside every
+  task cgroup, so zero swap is a configured condition, not evidence about
+  systems with swap enabled.
+
+Each batch stops on its wall-clock deadline, an OOM event, low host available
+memory, a child reaching 90% of its cap, or a Cargo failure. Cleanup kills
+only the newly created task cgroup and retains logs, generated sources and
+JSON evidence. Sampling cannot guarantee that it sees a short memory spike
+before the kernel acts; `memory.max` remains the containment boundary.
+Limit changes run in separate helper processes with a five-second deadline,
+so synchronous reclaim on older kernels cannot block the supervisor's checks.
+
+Default paired runs are exploratory. Report per-pair results and uncertainty;
+do not infer parity or choose new defaults from two pairs. Real macOS pressure,
+swap-enabled Linux workloads, sustained warning without critical pressure,
+and the cross-cgroup case need separate evidence before closing #1773. The
+simulation in PR #1782 and the ordinary CI perf gate do not cover those gates.

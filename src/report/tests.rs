@@ -227,6 +227,7 @@ fn gc_runs_history_is_appended_only_with_record_sessions() {
             key_locks_remaining: 7,
             predictions_pruned: 8,
             file_hashes_pruned: 9,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -359,6 +360,7 @@ fn record_gc_run_keeps_only_the_last_run() {
             key_locks_remaining: 30,
             predictions_pruned: 40,
             file_hashes_pruned: 50,
+            ..Default::default()
         }),
         ..Default::default()
     };

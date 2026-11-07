@@ -985,6 +985,19 @@ fn local_gc_runs_store_housekeeping_and_records_it() {
             .unwrap();
     }
 
+    // One scheduler flight nobody has held for two hours, one taken just now.
+    let flights = config.cache_dir.join("scheduler/flights");
+    std::fs::create_dir_all(&flights).unwrap();
+    let flight = |seed: u8| flights.join(blake3::hash(&[seed]).to_hex().as_str());
+    std::fs::write(flight(1), b"1").unwrap();
+    std::fs::write(flight(2), b"1").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(flight(1))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+        .unwrap();
+
     let stats = run_gc_local(&config, GcMode::Background).unwrap();
     assert_eq!(
         stats.housekeeping,
@@ -993,11 +1006,15 @@ fn local_gc_runs_store_housekeeping_and_records_it() {
             key_locks_remaining: 1,
             predictions_pruned: 0,
             file_hashes_pruned: 0,
+            flights_removed: 1,
+            flights_remaining: 1,
         })
     );
     assert!(!lock_path(1).exists());
     assert!(!lock_path(2).exists());
     assert!(lock_path(3).exists());
+    assert!(!flight(1).exists());
+    assert!(flight(2).exists());
     let recorded = crate::report::read_gc_stats(&config.cache_dir).expect("run recorded");
     assert_eq!(recorded.key_locks_removed, Some(2));
     assert_eq!(recorded.key_locks_remaining, Some(1));

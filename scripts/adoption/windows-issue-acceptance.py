@@ -2,12 +2,49 @@
 """Retain native configure timings and the pinned #1792 workload comparison."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import time
+
+
+def initialize_sdk(host, output):
+    architecture = "arm64" if host.startswith("aarch64") else "x64"
+    component = "Microsoft.VisualStudio.Component.VC.Tools." + ("ARM64" if architecture == "arm64" else "x86.x64")
+    vswhere = Path(os.environ['ProgramFiles(x86)']) / 'Microsoft Visual Studio/Installer/vswhere.exe'
+    installation = subprocess.check_output(
+        [str(vswhere), '-latest', '-products', '*', '-requires', component,
+         '-property', 'installationPath'], text=True, timeout=30).strip()
+    developer = Path(installation) / 'Common7/Tools/VsDevCmd.bat'
+    if not installation or not developer.is_file():
+        raise RuntimeError("The installed native Visual Studio developer command is required")
+    if any(character in str(developer) for character in '\"%!^&|<>\r\n\0'):
+        raise RuntimeError("Unsupported command expansion character in the installed SDK path")
+    cmd = str(Path(os.environ['SYSTEMROOT']) / 'System32/cmd.exe')
+    # Match the maintained msvc-manifest-probe.ps1 quoting. SET stays in memory;
+    # only the existing allowlist reaches untrusted workload build scripts.
+    command = (f'"{cmd}" /d /u /s /c ""{developer}" -no_logo -arch={architecture} '
+               f'-host_arch={architecture} >nul && set"')
+    result = subprocess.run(command, executable=cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=120, check=True)
+    for line in result.stdout.decode('utf-16-le').splitlines():
+        name, separator, value = line.partition('=')
+        if name and separator:
+            os.environ[name] = value
+    if os.environ.get('VSCMD_ARG_TGT_ARCH') != architecture:
+        raise RuntimeError("Developer environment selected the wrong target architecture")
+    libraries = [Path(path) for path in os.environ.get('LIB', '').split(';') if path]
+    for filename in ('kernel32.lib', 'ucrt.lib', 'vcruntime.lib'):
+        if not any((directory / filename).is_file() for directory in libraries):
+            raise RuntimeError(f"Developer environment cannot locate {filename}")
+    (output / 'sdk-identity.json').write_text(json.dumps({
+        'developer_command': str(developer), 'architecture': architecture,
+        'command_sha256': hashlib.sha256(developer.read_bytes()).hexdigest(),
+        'sdk_version': os.environ.get('WindowsSDKVersion'),
+    }, indent=2), encoding='utf-8')
 
 
 def environment():
@@ -155,6 +192,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     kache = str(args.kache.resolve())
+    initialize_sdk(args.host, output)
     configure(kache, output, args.host)
     abundance(kache, args.workload.resolve(), output, args.host)
 

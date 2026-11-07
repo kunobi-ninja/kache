@@ -351,6 +351,9 @@ def arguments(argv):
                 "foreground_functions", "timeout_s", "sample_interval_s", "samples")
     if any(getattr(args, name) <= 0 for name in positive):
         parser.error("counts, memory limits and time bounds must be positive")
+    if not all(math.isfinite(value) for value in
+               (args.timeout_s, args.sample_interval_s, *args.foreground_at)):
+        parser.error("time bounds and foreground starts must be finite")
     if not .05 <= args.sample_interval_s <= 1 or args.timeout_s > 600:
         parser.error("sample interval must be 0.05–1 s; batch deadline must be at most 600 s")
     if args.memory_high_mib >= args.memory_max_mib * .8:

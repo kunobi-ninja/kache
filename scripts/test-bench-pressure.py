@@ -2,6 +2,8 @@
 """Pressure benchmark guards must fail closed without stressing the test host."""
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -32,6 +34,16 @@ def sample():
 
 
 class PressureBenchTests(unittest.TestCase):
+    def test_nonfinite_timeout_cannot_disable_the_stop_deadline(self):
+        required = ["--base", __file__, "--head", __file__,
+                    "--base-revision", "same", "--head-revision", "same",
+                    "--control-patch", __file__, "--cargo", __file__, "--rustc", __file__,
+                    "--output", "/tmp/unused-pressure-test", "--cgroup-parent", "/tmp",
+                    "--dedicated-host"]
+        for value in ("nan", "inf", "-inf"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                bench.arguments([*required, "--timeout-s=" + value])
+
     def test_stop_guard_handles_parent_and_tighter_child_limits(self):
         current = sample()
         self.assertIsNone(bench.safety_reason(current, 1000, 100))

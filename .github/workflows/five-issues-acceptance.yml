@@ -1,0 +1,86 @@
+name: Maintainer Windows issue acceptance
+
+on:
+  push:
+    branches: [validation/five-issues-20261107]
+    paths:
+      - .github/workflows/five-issues-acceptance.yml
+      - scripts/adoption/windows-issue-acceptance.py
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.repository == 'kunobi-ninja/kache'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            host: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            host: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_JOBS: "2"
+      KACHE_SOURCE: 81fefa80747ceba4687f00703873ce2b3965570d
+    steps:
+      - name: Require a fresh hosted runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Hosted runner required' }
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/adoption/windows-issue-acceptance.py
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: 81fefa80747ceba4687f00703873ce2b3965570d
+          path: kache-source
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: nazar-pc/abundance
+          ref: 287cf9c6d266ce28d644bed050ce9a835f31fd80
+          path: workload
+          persist-credentials: false
+      - name: Build the pinned release binaries
+        working-directory: kache-source
+        env:
+          NATIVE_HOST: ${{ matrix.host }}
+        run: |
+          if ((git rev-parse HEAD) -ne $env:KACHE_SOURCE) { throw 'Wrong Kache source' }
+          rustup toolchain install "1.99.1-$env:NATIVE_HOST" --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Native toolchain unavailable' }
+          cargo "+1.99.1-$env:NATIVE_HOST" build --locked --release -p kache --bin kache --bin kache-engine
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+      - name: Install the workload's pinned toolchain
+        env:
+          NATIVE_HOST: ${{ matrix.host }}
+        run: |
+          rustup toolchain install "nightly-2026-08-25-$env:NATIVE_HOST" --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Workload toolchain unavailable' }
+          $identity = rustc "+nightly-2026-08-25-$env:NATIVE_HOST" --version --verbose
+          if ($LASTEXITCODE -ne 0 -or $identity -notcontains "host: $env:NATIVE_HOST") { throw 'Wrong native workload host' }
+      - name: Measure captured configure commands and the original LTO workload
+        env:
+          NATIVE_HOST: ${{ matrix.host }}
+        run: |
+          $binary = Join-Path $pwd 'kache-source/target/release/kache.exe'
+          $output = Join-Path $env:RUNNER_TEMP 'kache-issue-acceptance'
+          python scripts/adoption/windows-issue-acceptance.py --kache $binary --workload (Join-Path $pwd 'workload') --output $output --host $env:NATIVE_HOST
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance fixture failed; inspect artifacts' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: issue-acceptance-${{ matrix.runner }}
+          path: ${{ runner.temp }}/kache-issue-acceptance
+          retention-days: 7
+          if-no-files-found: warn

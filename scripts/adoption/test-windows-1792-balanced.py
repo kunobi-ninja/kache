@@ -7,7 +7,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -219,6 +221,153 @@ class TimedRouteGateGuards(unittest.TestCase):
                 receipt = json.loads((evidence / 'timed-route-gate.json').read_text())
                 self.assertFalse(receipt['passed'])
                 self.assertEqual(receipt['unit'], helper.TIMED_UNIT)
+
+
+class CleanupGuards(unittest.TestCase):
+    def windows_denied(self, path, code=5):
+        error = PermissionError(13, 'synthetic Windows failure', str(path))
+        error.winerror = code
+        return error
+
+    def metadata(self, changed, attributes=stat.FILE_ATTRIBUTE_READONLY, symlink=False):
+        original = Path.lstat
+
+        def read(path):
+            value = original(path)
+            if path == changed:
+                return SimpleNamespace(st_mode=stat.S_IFLNK if symlink else value.st_mode,
+                                       st_file_attributes=attributes,
+                                       st_dev=value.st_dev, st_ino=value.st_ino)
+            return value
+        return read
+
+    def test_only_failed_owned_readonly_entry_is_changed_then_removed_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            scratch = Path(temp).resolve()
+            root = scratch / 'case'
+            root.mkdir()
+            blob = root / 'blob'
+            blob.write_text('owned')
+            blob.chmod(0o444)
+            other = root / 'other'
+            other.write_text('unchanged')
+            real_rmtree = helper.shutil.rmtree
+            retries = []
+
+            def simulate_windows(path, onerror):
+                error = self.windows_denied(blob)
+                onerror(os.unlink, str(blob), (PermissionError, error, None))
+                retries.append(not blob.exists())
+                self.assertEqual(other.read_text(), 'unchanged')
+                real_rmtree(path)
+
+            with patch.object(Path, 'lstat', self.metadata(blob)), \
+                    patch.object(helper.shutil, 'rmtree', side_effect=simulate_windows), \
+                    patch.object(helper.os, 'chmod', wraps=os.chmod) as chmod:
+                helper.remove_owned_tree(root, scratch)
+            self.assertEqual(retries, [True])
+            self.assertEqual(chmod.call_args_list[0].args[0], blob)
+            self.assertEqual(chmod.call_count, 1)
+            self.assertFalse(root.exists())
+
+    def test_failed_retry_restores_guard_and_propagates_that_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            scratch = Path(temp).resolve()
+            root = scratch / 'case'
+            root.mkdir()
+            blob = root / 'blob'
+            blob.write_text('owned')
+            blob.chmod(0o444)
+            initial = self.windows_denied(blob)
+            locked = self.windows_denied(blob, code=32)
+
+            def simulate_windows(path, onerror):
+                onerror(helper.os.unlink, str(blob), (PermissionError, initial, None))
+
+            with patch.object(Path, 'lstat', self.metadata(blob)), \
+                    patch.object(helper.shutil, 'rmtree', side_effect=simulate_windows), \
+                    patch.object(helper.os, 'unlink', side_effect=locked) as unlink, \
+                    patch.object(helper.os, 'chmod', wraps=os.chmod) as chmod:
+                with self.assertRaises(PermissionError) as caught:
+                    helper.remove_owned_tree(root, scratch)
+            self.assertIs(caught.exception, locked)
+            self.assertEqual(unlink.call_count, 1)
+            self.assertEqual(chmod.call_count, 2)
+            self.assertFalse(blob.stat().st_mode & stat.S_IWUSR)
+            blob.chmod(0o644)
+
+    def test_unrelated_permission_failure_is_not_chmodded_or_suppressed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            scratch = Path(temp).resolve()
+            root = scratch / 'case'
+            root.mkdir()
+            path = root / 'ordinary'
+            path.write_text('owned')
+            for code, attributes in ((5, 0), (32, stat.FILE_ATTRIBUTE_READONLY)):
+                error = self.windows_denied(path, code)
+
+                def fail(root, onerror):
+                    onerror(os.unlink, str(path), (PermissionError, error, None))
+
+                with patch.object(Path, 'lstat', self.metadata(path, attributes)), \
+                        patch.object(helper.shutil, 'rmtree', side_effect=fail), \
+                        patch.object(helper.os, 'chmod') as chmod:
+                    with self.assertRaises(PermissionError) as caught:
+                        helper.remove_owned_tree(root, scratch)
+                self.assertIs(caught.exception, error)
+                chmod.assert_not_called()
+
+    def test_outside_case_and_symlink_or_junction_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            scratch = Path(temp).resolve() / 'scratch'
+            scratch.mkdir()
+            root = scratch / 'case'
+            root.mkdir()
+            outside = scratch.parent / 'outside'
+            outside.mkdir()
+            sentinel = outside / 'keep'
+            sentinel.write_text('untouched')
+            with patch.object(helper.shutil, 'rmtree') as remove:
+                with self.assertRaises(ValueError):
+                    helper.remove_owned_tree(outside, scratch)
+                with self.assertRaises(ValueError):
+                    helper.checked_cleanup_entry(sentinel, root)
+                remove.assert_not_called()
+            def outside_failure(path, onerror):
+                error = self.windows_denied(sentinel)
+                onerror(os.unlink, str(sentinel), (PermissionError, error, None))
+
+            with patch.object(helper.shutil, 'rmtree', side_effect=outside_failure), \
+                    patch.object(helper.os, 'chmod') as chmod:
+                with self.assertRaises(ValueError):
+                    helper.remove_owned_tree(root, scratch)
+                chmod.assert_not_called()
+            self.assertEqual(sentinel.read_text(), 'untouched')
+            link = root / 'link'
+            link.mkdir()
+            for attributes, symlink in ((stat.FILE_ATTRIBUTE_REPARSE_POINT, False), (0, True)):
+                with patch.object(Path, 'lstat', self.metadata(link, attributes, symlink)), \
+                        patch.object(helper.shutil, 'rmtree') as remove, \
+                        patch.object(helper.os, 'chmod') as chmod:
+                    with self.assertRaises(ValueError):
+                        helper.remove_owned_tree(root, scratch)
+                    remove.assert_not_called()
+                    chmod.assert_not_called()
+                self.assertEqual(sentinel.read_text(), 'untouched')
+
+    def test_case_cleanup_stays_after_private_stop_and_evidence_export(self):
+        tree = ast.parse(HELPER.read_text())
+        for name in ('native_preflight', 'run_case'):
+            function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+            cleanup = next(index for index, node in enumerate(function.body)
+                           if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                           and isinstance(node.value.func, ast.Name) and node.value.func.id == 'remove_owned_tree')
+            previous = function.body[cleanup - 1]
+            self.assertIsInstance(previous, ast.Try)
+            finally_calls = [node.func.id for child in previous.finalbody for node in ast.walk(child)
+                             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+            self.assertIn('stop_private', finally_calls)
+            self.assertIn('copy_evidence', finally_calls)
 
 
 if __name__ == '__main__':

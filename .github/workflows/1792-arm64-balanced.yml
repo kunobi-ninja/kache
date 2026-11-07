@@ -13,8 +13,8 @@ permissions:
 
 jobs:
   diagnostic:
-    # One initial branch publication, no reruns or subsequent candidate pushes.
-    if: github.repository == 'kunobi-ninja/kache' && github.event.created && github.run_attempt == 1
+    # One reviewed corrective push from the failed helper; later pushes/reruns skip.
+    if: github.repository == 'kunobi-ninja/kache' && github.event.before == '7c93fc07a3e72cc498fd366ef30d74727c417393' && github.run_attempt == 1
     runs-on: windows-11-arm
     timeout-minutes: 90
     defaults:

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -340,6 +341,64 @@ def copy_evidence(root, target, evidence):
             shutil.copytree(source, evidence / name, dirs_exist_ok=True)
 
 
+def checked_cleanup_entry(path, root):
+    path = Path(os.path.abspath(path))
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise ValueError('Cleanup entry is outside the exact owned case') from None
+    # Check every ancestor before lstat/chmod can cross a replaced directory.
+    for ancestor in reversed((path, *path.parents)):
+        metadata = ancestor.lstat()
+        if (stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError('Cleanup refuses symlinks and junctions')
+    return path, metadata
+
+
+def remove_owned_tree(root, scratch):
+    root, scratch = Path(os.path.abspath(root)), Path(os.path.abspath(scratch))
+    if root.parent != scratch:
+        raise ValueError('Cleanup requires one exact case directly inside owned scratch')
+    checked_cleanup_entry(root, root)
+    # Reject existing links/reparse points before shutil traverses this tree.
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        checked_cleanup_entry(directory, root)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path, metadata = checked_cleanup_entry(entry.path, root)
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append(path)
+
+    def retry_readonly(function, path, exception):
+        error = exception[1]
+        if (function not in (os.unlink, os.remove) or not isinstance(error, PermissionError)
+                or getattr(error, 'winerror', None) != 5):
+            raise error
+        path, metadata = checked_cleanup_entry(path, root)
+        if (not stat.S_ISREG(metadata.st_mode)
+                or not getattr(metadata, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_READONLY):
+            raise error
+        original_mode = stat.S_IMODE(metadata.st_mode)
+        # Only the failed regular file changes, after measurement/export/stop.
+        os.chmod(path, original_mode | stat.S_IWRITE, follow_symlinks=False)
+        try:
+            function(path)  # Exactly one retry; other errors remain fatal.
+        except Exception:
+            # Match Store::unlink_blob: retain the guard if deletion still fails.
+            try:
+                _, current = checked_cleanup_entry(path, root)
+                if (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino):
+                    os.chmod(path, original_mode, follow_symlinks=False)
+            except (OSError, ValueError):
+                pass
+            raise
+
+    shutil.rmtree(root, onerror=retry_readonly)
+
+
 def stop_private(kache, root, env, evidence):
     # This command addresses only the case's own private runtime.
     try:
@@ -448,7 +507,7 @@ def native_preflight(kache, scratch, output, budget, binaries):
             stop_private(kache, root, env, evidence)
         finally:
             copy_evidence(root, target, evidence)
-    shutil.rmtree(root)
+    remove_owned_tree(root, scratch)
 
 
 def run_case(name, arm, kache, workload, scratch, output, budget, binaries):
@@ -498,7 +557,7 @@ def run_case(name, arm, kache, workload, scratch, output, budget, binaries):
         finally:
             copy_evidence(root, target, evidence)
     # Export measurements and provenance before deleting only this owned case.
-    shutil.rmtree(root)
+    remove_owned_tree(root, scratch)
     return {'case': name, 'arm': arm, 'elapsed_ms': result['elapsed_ms'],
             'free_bytes_after_cleanup': shutil.disk_usage(scratch).free}
 

@@ -362,7 +362,25 @@ fn discovery_records_success_timeout_unavailability_and_cancellation() {
 
 #[test]
 fn scheduler_elapsed_milliseconds_preserve_the_recorded_duration() {
-    assert_eq!(duration_ms(Duration::from_micros(17999)), 17);
-    assert_eq!(duration_ms(Duration::ZERO), 0);
-    assert_eq!(duration_ms(Duration::MAX), u64::MAX);
+    let _counts = InvocationScope::enter(Instant::now());
+    for (elapsed, expected_ms) in [
+        (Duration::from_micros(17_999), 17),
+        (Duration::ZERO, 0),
+        (Duration::MAX, u64::MAX),
+    ] {
+        record_decision(
+            SchedulerPhase::Flight,
+            SchedulerOutcome::PeerCompleted,
+            elapsed,
+        );
+        assert_eq!(
+            take_scheduler_decisions(),
+            vec![SchedulerDecision {
+                phase: SchedulerPhase::Flight,
+                outcome: SchedulerOutcome::PeerCompleted,
+                elapsed_ms: expected_ms,
+                ..Default::default()
+            }]
+        );
+    }
 }

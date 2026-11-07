@@ -3441,6 +3441,58 @@ mod tests {
         assert_eq!(stats.total_flight_wait_ms, 4000);
         assert_eq!(stats.total_permit_wait_ms, 30002);
     }
+
+    #[test]
+    fn equal_total_scheduler_waits_preserve_the_first_recorded_example() {
+        use kache_core::scheduler::SchedulerPressure;
+        use kache_protocol::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
+
+        let mut first = BuildEvent::new_for_test("peer_first", EventResult::LocalHit);
+        first.schema = 27;
+        first.elapsed_ms = 9_000;
+        first.compile_time_ms = 1_000;
+        first.flight_wait_ms = 8_000;
+        first.scheduler_decisions = vec![SchedulerDecision {
+            phase: SchedulerPhase::Flight,
+            outcome: SchedulerOutcome::PeerCompleted,
+            elapsed_ms: 8_000,
+            ..Default::default()
+        }];
+        let mut later = BuildEvent::new_for_test("capacity_later", EventResult::Miss);
+        later.schema = 27;
+        later.elapsed_ms = 9_000;
+        later.compile_time_ms = 1_000;
+        later.compiler_runs = 1;
+        later.permit_wait_ms = 8_000;
+        later.scheduler_decisions = vec![SchedulerDecision {
+            phase: SchedulerPhase::Capacity,
+            outcome: SchedulerOutcome::TimeoutFallback,
+            elapsed_ms: 8_000,
+            requested_slots: Some(1),
+            available_slots: Some(0),
+            pool_slots: Some(1),
+            pressure: Some(SchedulerPressure::Warning),
+            pressure_ceiling: Some(1),
+            queued_ms: Some(8_000),
+            ..Default::default()
+        }];
+
+        let prefix = compute_stats(std::slice::from_ref(&first));
+        let expected = prefix.longest_scheduler_wait.clone().unwrap();
+        assert_eq!(expected.crate_name, "peer_first");
+        assert_eq!(expected.elapsed_ms(), 8_000);
+        let appended = compute_stats_onto(prefix, std::slice::from_ref(&later));
+        assert_eq!(appended.longest_scheduler_wait, Some(expected.clone()));
+        assert_eq!(appended.total_flight_wait_ms, 8_000);
+        assert_eq!(appended.total_permit_wait_ms, 8_000);
+
+        let together = compute_stats(&[first.clone(), later.clone()]);
+        assert_eq!(together.longest_scheduler_wait, Some(expected));
+        let reversed = compute_stats(&[later.clone(), first]);
+        let reversed = reversed.longest_scheduler_wait.unwrap();
+        assert_eq!(reversed.crate_name, "capacity_later");
+        assert_eq!(reversed.decisions, later.scheduler_decisions);
+    }
 }
 
 #[cfg(test)]

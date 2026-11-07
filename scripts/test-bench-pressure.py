@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def module(name, relative):
@@ -34,6 +36,48 @@ def sample():
 
 
 class PressureBenchTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "writer helpers use process groups")
+    def test_limit_writer_runs_outside_the_supervisor_and_updates_the_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            leaf = Path(directory)
+            (leaf / "memory.high").write_text("4096")
+            writer = bench.HighLimits()
+            try:
+                writer.update(leaf, "2048")
+                deadline = time.monotonic() + 3
+                while writer.pending and time.monotonic() < deadline:
+                    time.sleep(.01)
+                    writer.update(leaf, "2048")
+                self.assertFalse(writer.pending)
+                self.assertEqual((leaf / "memory.high").read_text(), "2048")
+            finally:
+                writer.stop()
+                writer.wait()
+
+    @unittest.skipUnless(os.name == "posix", "writer helpers use process groups")
+    def test_a_blocked_limit_writer_can_be_stopped_without_blocking_the_supervisor(self):
+        real_popen = subprocess.Popen
+        children = []
+        def blocked_writer(*_args, **_kwargs):
+            child = real_popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                               start_new_session=True, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE)
+            children.append(child)
+            return child
+        with tempfile.TemporaryDirectory() as directory:
+            leaf = Path(directory)
+            (leaf / "memory.high").write_text("4096")
+            writer = bench.HighLimits()
+            try:
+                with patch.object(bench.subprocess, "Popen", side_effect=blocked_writer):
+                    writer.update(leaf, "2048")
+                with self.assertRaisesRegex(RuntimeError, "write exceeded"):
+                    writer.update(leaf, "2048", timeout=0)
+            finally:
+                writer.stop()
+                writer.wait()
+            self.assertEqual(children[0].returncode, -9)
+
     def test_nonfinite_timeout_cannot_disable_the_stop_deadline(self):
         required = ["--base", __file__, "--head", __file__,
                     "--base-revision", "same", "--head-revision", "same",

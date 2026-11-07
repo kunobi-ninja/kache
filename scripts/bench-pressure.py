@@ -100,6 +100,44 @@ def pressure_high(scenario, elapsed, high, maximum):
     return high if int(elapsed // 15) % 2 else maximum
 
 
+class HighLimits:
+    """Keep synchronous reclaim on older kernels out of the supervisor."""
+
+    def __init__(self):
+        self.pending = {}
+
+    def update(self, leaf, desired, timeout=5):
+        path = leaf / "memory.high"
+        if path in self.pending:
+            child, started = self.pending[path]
+            if child.poll() is None:
+                if time.monotonic() - started >= timeout:
+                    raise RuntimeError(f"memory.high write exceeded {timeout}s: {leaf}")
+                return
+            _, error = child.communicate(timeout=1)
+            del self.pending[path]
+            if child.returncode:
+                raise RuntimeError(f"memory.high write failed: {error.decode(errors='replace')}")
+        if read(path) != desired:
+            child = subprocess.Popen([sys.executable, str(SCRIPT), "_write_high", str(path), desired],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                     start_new_session=True)
+            self.pending[path] = (child, time.monotonic())
+
+    def stop(self):
+        for child, _ in self.pending.values():
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def wait(self):
+        for child, _ in self.pending.values():
+            child.communicate(timeout=5)
+        self.pending.clear()
+
+
 class Cgroup:
     def __init__(self, parent, name, maximum, cpus, second_maximum=None):
         self.root = parent / name
@@ -234,6 +272,7 @@ def run_batch(args, label, binary, sample_index, scenario):
                    args.memory_max_mib * MIB, args.cpus,
                    args.second_memory_max_mib * MIB if args.second_memory_max_mib else None)
     jobs, samples, logs = [], [], []
+    high_limits = HighLimits()
     abort = None
     started = time.monotonic()
     try:
@@ -243,14 +282,7 @@ def run_batch(args, label, binary, sample_index, scenario):
                 maximum = int(read(leaf / "memory.max"))
                 high = min(args.memory_high_mib * MIB, maximum * 2 // 3)
                 desired = str(pressure_high(scenario, elapsed, high, maximum))
-                if read(leaf / "memory.high") != desired:
-                    # memory.high can reclaim synchronously on the writer. A
-                    # nonblocking write keeps the supervisor's stop checks live.
-                    fd = os.open(leaf / "memory.high", os.O_WRONLY | os.O_NONBLOCK)
-                    try:
-                        os.write(fd, desired.encode())
-                    finally:
-                        os.close(fd)
+                high_limits.update(leaf, desired)
             while specifications and specifications[0][0] <= elapsed:
                 at, kind, project = specifications.pop(0)
                 leaf = group.leaves[len(jobs) % len(group.leaves)]
@@ -294,7 +326,14 @@ def run_batch(args, label, binary, sample_index, scenario):
     finally:
         elapsed = time.monotonic() - started
         try:
-            group.close()
+            high_limits.stop()
+            try:
+                group.close()
+            finally:
+                high_limits.wait()
+        except BaseException as error:
+            abort = abort or f"cleanup failed: {error}"
+            raise
         finally:
             for job in jobs:
                 child = job.pop("process")
@@ -374,6 +413,15 @@ def arguments(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "_write_high":
+        # Linux 6.1 ignores O_NONBLOCK for memory.high. Use a separate process
+        # even on newer kernels so reclaim cannot stall stop checks.
+        fd = os.open(argv[1], os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, argv[2].encode())
+        finally:
+            os.close(fd)
+        return
     if argv and argv[0] == "_exec":
         # The helper joins before exec: no Cargo/compiler can start outside
         # the task cgroup, and no preexec_fn runs in a multithreaded parent.

@@ -404,6 +404,8 @@ memory, a child reaching 90% of its cap, or a Cargo failure. Cleanup kills
 only the newly created task cgroup and retains logs, generated sources and
 JSON evidence. Sampling cannot guarantee that it sees a short memory spike
 before the kernel acts; `memory.max` remains the containment boundary.
+Limit changes run in separate helper processes with a five-second deadline,
+so synchronous reclaim on older kernels cannot block the supervisor's checks.
 
 Default paired runs are exploratory. Report per-pair results and uncertainty;
 do not infer parity or choose new defaults from two pairs. Real macOS pressure,

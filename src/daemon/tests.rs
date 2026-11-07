@@ -9297,7 +9297,9 @@ fn packed_import_cleanup_preserves_committed_entries_after_a_strict_flush_failur
     )
     .unwrap();
     batch.push(residue);
-    daemon.discard_uncommitted_packed_entries(&batch).unwrap();
+    daemon
+        .with_store(|store| Daemon::discard_uncommitted_packed_entries(store, &batch))
+        .unwrap();
     assert!(!residue_dir.exists());
     for (entry, expected) in batch.iter().zip(metadata) {
         assert!(strict.contains(&entry.cache_key));
@@ -9311,6 +9313,252 @@ fn packed_import_cleanup_preserves_committed_entries_after_a_strict_flush_failur
     std::fs::write(&blob, pending_bytes).unwrap();
     assert!(strict.flush_entry_durability(&keys[1]).unwrap());
     assert_eq!(strict.pending_durability().unwrap(), 0);
+}
+
+fn extracted_import_entry(config: &Config, label: &str) -> crate::store::VerifiedRestoredEntry {
+    let key = test_cache_key(label);
+    let (payload, digest) = build_entry_pack_with_meta(&key, "fixture");
+    crate::remote_layout::extract_verified_prefetch_entry(
+        &key,
+        "fixture",
+        &digest,
+        &payload,
+        &config.store_dir().join(&key),
+        None,
+        config.restore_max_size,
+    )
+    .unwrap()
+    .restored
+}
+
+/// A single async thread makes the channel a submission barrier: after the
+/// sender runs, the import is registered and spawned before that task yields.
+/// The store mutex remains held until cancellation and bounded shutdown finish.
+fn cancel_packed_import_while_store_locked(
+    daemon: &Arc<Daemon>,
+    entries: Vec<crate::store::VerifiedRestoredEntry>,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let keys: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.cache_key.clone())
+        .collect();
+    daemon.install_plan(
+        "session",
+        "plan",
+        "advisory",
+        keys.clone().into_iter(),
+        None,
+    );
+    let claims = runtime.block_on(async {
+        let mut claims = Vec::new();
+        for key in &keys {
+            assert!(claim_download(&daemon.downloading, key).await.is_none());
+            claims.push(DownloadingGuard::new(
+                daemon.downloading.clone(),
+                key.clone(),
+            ));
+        }
+        claims
+    });
+    let lock = daemon.store_lock().unwrap().clone();
+    let held = lock.lock().unwrap();
+    runtime.block_on(async {
+        let (submitted, received) = tokio::sync::oneshot::channel();
+        let importing = daemon.clone();
+        let task = tokio::spawn(async move {
+            submitted.send(()).unwrap();
+            importing.import_packed_batch(entries.into(), claims).await
+        });
+        received.await.unwrap();
+        assert_eq!(daemon.import_tasks.active.load(Ordering::Acquire), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(daemon.import_tasks.active.load(Ordering::Acquire), 1);
+        assert!(daemon.prefetch_accounting_incomplete());
+        for key in &keys {
+            assert!(daemon.downloading.read().await.contains_key(key));
+        }
+
+        // The coordinator was already joined; its detached blocking work
+        // must still exhaust the existing budget and mark the summary incomplete.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                daemon.finish_prefetch_shutdown(Duration::ZERO),
+            )
+            .await
+            .unwrap()
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown_timeout");
+        assert!(summaries[0].incomplete);
+        assert!(summaries[0].cancelled);
+        assert_eq!(daemon.import_tasks.active.load(Ordering::Acquire), 1);
+        for key in &keys {
+            assert!(daemon.downloading.read().await.contains_key(key));
+        }
+    });
+    drop(held);
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), daemon.import_tasks.wait())
+            .await
+            .unwrap();
+        assert!(daemon.downloading.read().await.is_empty());
+        assert!(!daemon.prefetch_accounting_incomplete());
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(5))
+                .await
+        );
+    });
+}
+
+#[test]
+fn cancelled_packed_import_keeps_claims_until_success_and_shutdown_reports_pending_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let entry = extracted_import_entry(&config, "cancelled-packed-success");
+    let key = entry.cache_key.clone();
+    let daemon = Arc::new(Daemon::new(config));
+    cancel_packed_import_while_store_locked(&daemon, vec![entry]);
+    assert!(
+        daemon
+            .with_store(|store| Ok(store.get(&key)?.is_some()))
+            .unwrap()
+    );
+}
+
+#[test]
+fn cancelled_packed_import_cleans_residue_without_removing_committed_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let healthy = extracted_import_entry(&config, "cancelled-packed-healthy");
+    let residue = extracted_import_entry(&config, "cancelled-packed-residue");
+    let daemon = Arc::new(Daemon::new(config));
+    daemon
+        .with_store(|store| store.import_verified_restored_entries(std::slice::from_ref(&healthy)))
+        .unwrap();
+    daemon
+        .with_store(|store| {
+            for file in &healthy.meta.files {
+                std::fs::copy(
+                    store.blob_path(&file.hash),
+                    store.entry_dir(&healthy.cache_key).join(&file.name),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let healthy_meta = daemon.entry_dir_for(&healthy.cache_key).join("meta.json");
+    let expected = std::fs::read(&healthy_meta).unwrap();
+    let residue_dir = daemon.entry_dir_for(&residue.cache_key);
+    // Preserve valid in-memory metadata but invalidate the on-disk binding.
+    std::fs::write(residue_dir.join("meta.json"), b"{}").unwrap();
+    cancel_packed_import_while_store_locked(&daemon, vec![healthy.clone(), residue]);
+    assert!(!residue_dir.exists());
+    assert_eq!(std::fs::read(healthy_meta).unwrap(), expected);
+    assert!(
+        daemon
+            .with_store(|store| Ok(store.get(&healthy.cache_key)?.is_some()))
+            .unwrap()
+    );
+}
+
+#[test]
+fn cancelled_packed_import_preserves_rows_committed_before_strict_flush_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let pending = extracted_import_entry(&config, "cancelled-packed-pending");
+    let mut deferred_config = config.clone();
+    deferred_config.deferred_durability = true;
+    let deferred = Store::open(&deferred_config).unwrap();
+    deferred
+        .import_verified_restored_entries(std::slice::from_ref(&pending))
+        .unwrap();
+    for file in &pending.meta.files {
+        std::fs::copy(
+            deferred.blob_path(&file.hash),
+            deferred.entry_dir(&pending.cache_key).join(&file.name),
+        )
+        .unwrap();
+    }
+    let fresh = extracted_import_entry(&config, "cancelled-packed-new");
+    let blob = deferred.blob_path(&pending.meta.files[0].hash);
+    let original = std::fs::read(&blob).unwrap();
+    let mut permissions = std::fs::metadata(&blob).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&blob, permissions).unwrap();
+    std::fs::write(&blob, vec![b'x'; original.len()]).unwrap();
+    let daemon = Arc::new(Daemon::new(config));
+    let entries = vec![pending, fresh];
+    let metadata: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            std::fs::read(daemon.entry_dir_for(&entry.cache_key).join("meta.json")).unwrap()
+        })
+        .collect();
+    cancel_packed_import_while_store_locked(&daemon, entries.clone());
+    for (entry, expected) in entries.iter().zip(metadata) {
+        assert!(
+            daemon
+                .with_store(|store| Ok(store.contains(&entry.cache_key)))
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(daemon.entry_dir_for(&entry.cache_key).join("meta.json")).unwrap(),
+            expected
+        );
+    }
+    assert!(daemon.with_store(Store::pending_durability).unwrap() > 0);
+    std::fs::write(blob, original).unwrap();
+    for entry in &entries {
+        daemon
+            .with_store(|store| store.flush_entry_durability(&entry.cache_key))
+            .unwrap();
+        assert!(
+            daemon
+                .with_store(|store| Ok(store.get(&entry.cache_key)?.is_some()))
+                .unwrap()
+        );
+    }
+    assert_eq!(daemon.with_store(Store::pending_durability).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn import_task_drain_waits_for_every_guard_and_wakes_all_waiters() {
+    let tasks = Arc::new(ImportTasks::default());
+    let first = tasks.start();
+    let second = tasks.start();
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let waiting = tasks.clone();
+        waiters.push(tokio::spawn(async move {
+            ready.send(()).unwrap();
+            waiting.wait().await;
+        }));
+        received.await.unwrap();
+    }
+    assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+    drop(first);
+    assert_eq!(tasks.active.load(Ordering::Acquire), 1);
+    tokio::task::yield_now().await;
+    assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+    drop(second);
+    for waiter in waiters {
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::ZERO, tasks.wait())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -12099,11 +12347,7 @@ async fn direct_restore_fetches_one_pack_without_a_listing_manifest() {
         }
         assert!(daemon.downloading.read().await.is_empty());
         assert_eq!(daemon.negative_keys.len(), 0);
-        assert!(
-            daemon
-                .with_import_store(dir.path(), |store| Ok(store.contains(&req.key)))
-                .unwrap()
-        );
+        assert!(daemon.import_store_contains(dir.path(), &req.key).await);
     }
 }
 
@@ -12453,6 +12697,285 @@ async fn test_degraded_breaker_gates_the_download_path() {
         0,
         "a suppressed check is not a definitive miss"
     );
+}
+
+/// One worker, so a worker parked on the store mutex leaves no other worker
+/// to run the probe tasks of [`run_with_the_store_locked`].
+fn one_worker_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// What happened while `work` imported into a store whose mutex another
+/// thread held.
+struct LockedStoreRun<R> {
+    extracted: bool,
+    probes_run: usize,
+    finished_while_locked: bool,
+    result: R,
+}
+
+impl<R> LockedStoreRun<R> {
+    fn assert_waited_without_holding_a_worker(&self) {
+        assert!(self.extracted, "the download was never extracted");
+        assert_eq!(self.probes_run, 5, "the import held the only async worker");
+        assert!(
+            !self.finished_while_locked,
+            "the import must wait for the store mutex"
+        );
+    }
+}
+
+/// Lock the main store on another thread, run `work` on `runtime` and wait
+/// until it has extracted `entry_dir`. Then spawn five probe tasks one at a
+/// time and count those that run while the import waits for the mutex.
+fn run_with_the_store_locked<R: Send + 'static>(
+    runtime: &tokio::runtime::Runtime,
+    daemon: &Arc<Daemon>,
+    entry_dir: &Path,
+    work: impl std::future::Future<Output = R> + Send + 'static,
+) -> LockedStoreRun<R> {
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let busy = daemon.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = busy.store_lock().unwrap().lock().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let task = runtime.spawn(work);
+
+    // Extraction writes meta.json before the import asks for the store.
+    let meta = entry_dir.join("meta.json");
+    let extract_by = Instant::now() + Duration::from_secs(30);
+    while !meta.exists() && Instant::now() < extract_by {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let extracted = meta.exists();
+
+    let mut probes_run = 0;
+    for _ in 0..5 {
+        let (ran_tx, ran_rx) = mpsc::channel();
+        // A probe that only runs after the timeout finds no receiver.
+        runtime.spawn(async move {
+            let _ = ran_tx.send(());
+        });
+        if ran_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+            probes_run += 1;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Keep the store locked well past the 250 ms that callers expect the
+    // import to have waited, so a slow start of the import cannot shorten it.
+    std::thread::sleep(Duration::from_millis(500));
+    let finished_while_locked = task.is_finished();
+
+    // Release before the caller asserts: a worker still parked on the mutex
+    // would otherwise keep the runtime from shutting down.
+    drop(release_tx);
+    holder.join().unwrap();
+    let result = runtime.block_on(task).unwrap();
+    LockedStoreRun {
+        extracted,
+        probes_run,
+        finished_while_locked,
+        result,
+    }
+}
+
+#[test]
+fn demand_restore_waits_for_the_store_without_holding_an_async_worker() {
+    let runtime = one_worker_runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let req = check_request(dir.path(), "import-off-worker");
+    let backend = test_remote_backend();
+    runtime.block_on(put_test_object(
+        &backend,
+        &test_pack_object_key(&req.key, &req.crate_name),
+        &build_entry_pack(&req.key, &req.crate_name),
+    ));
+    let daemon = Arc::new(resilience_test_daemon(dir.path(), backend));
+
+    let checking = daemon.clone();
+    let check_req = req.clone();
+    let run = run_with_the_store_locked(&runtime, &daemon, Path::new(&req.entry_dir), async move {
+        checking.handle_remote_check(&check_req).await
+    });
+
+    run.assert_waited_without_holding_a_worker();
+    assert_eq!(run.result.found, Some(true));
+    assert!(
+        daemon
+            .with_store(|store| Ok(store.contains(&req.key)))
+            .unwrap()
+    );
+    let transfers = daemon.recent_transfers.lock().unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert!(
+        transfers[0].import_lock_wait_ms >= 250,
+        "the import waited while the store stayed locked: {}",
+        transfers[0].import_lock_wait_ms
+    );
+}
+
+#[test]
+fn packed_prefetch_import_waits_for_the_store_without_holding_an_async_worker() {
+    let runtime = one_worker_runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote_key_listing = true;
+    config.remote = Some(test_remote_config());
+    let remote = config.remote.clone().unwrap();
+    let backend = test_remote_backend();
+    let daemon = Arc::new(Daemon::new(config));
+    assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+    let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+    let context = PackPrefetchContext::from_deps(
+        crate::identity::host_target_triple(),
+        "linux/toolchain/release",
+        &deps,
+    )
+    .unwrap();
+    let key = test_cache_key("packed-import-off-worker");
+    let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+    runtime.block_on(seed_packed_catalog(
+        &backend,
+        &context,
+        vec![crate::remote_pack::PackInputEntry {
+            cache_key: key.clone(),
+            crate_name: "serde".into(),
+            meta_digest,
+            payload,
+        }],
+        None,
+    ));
+    let entry_dir = daemon.entry_dir_for(&key);
+    let candidates = vec![(key.clone(), "serde".to_string(), entry_dir.clone())];
+
+    let prefetching = daemon.clone();
+    let run = run_with_the_store_locked(&runtime, &daemon, &entry_dir, async move {
+        let v3 = prefetching.v3_remote().await.unwrap();
+        let origin = PrefetchOrigin::default();
+        let ranks = HashMap::new();
+        let sources = HashMap::new();
+        prefetching
+            .try_packed_prefetch(
+                &context,
+                v3,
+                &remote,
+                &candidates,
+                0,
+                &PackedAttribution {
+                    origin: &origin,
+                    ranks: &ranks,
+                    sources: &sources,
+                },
+            )
+            .await
+            .len()
+    });
+
+    run.assert_waited_without_holding_a_worker();
+    assert_eq!(run.result, 1);
+    assert!(daemon.with_store(|store| Ok(store.contains(&key))).unwrap());
+}
+
+#[test]
+fn cancelled_packed_coordinator_moves_claims_into_its_blocking_import() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote_key_listing = true;
+    config.remote = Some(test_remote_config());
+    let remote = config.remote.clone().unwrap();
+    let backend = test_remote_backend();
+    let daemon = Arc::new(Daemon::new(config));
+    assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+    let context = PackPrefetchContext::from_deps(
+        crate::identity::host_target_triple(),
+        "linux/toolchain/release",
+        &[("serde".to_string(), "1.0.0".to_string())],
+    )
+    .unwrap();
+    let key = test_cache_key("cancelled-packed-coordinator");
+    let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+    runtime.block_on(seed_packed_catalog(
+        &backend,
+        &context,
+        vec![crate::remote_pack::PackInputEntry {
+            cache_key: key.clone(),
+            crate_name: "serde".into(),
+            meta_digest,
+            payload,
+        }],
+        None,
+    ));
+    let candidates = vec![(key.clone(), "serde".to_string(), daemon.entry_dir_for(&key))];
+    let lock = daemon.store_lock().unwrap().clone();
+    let held = lock.lock().unwrap();
+    runtime.block_on(async {
+        let (submitted, received) = tokio::sync::oneshot::channel();
+        let prefetching = daemon.clone();
+        let task = tokio::spawn(async move {
+            let v3 = prefetching.v3_remote().await.unwrap();
+            let origin = PrefetchOrigin::default();
+            let ranks = HashMap::new();
+            let sources = HashMap::new();
+            let attribution = PackedAttribution {
+                origin: &origin,
+                ranks: &ranks,
+                sources: &sources,
+            };
+            let work = prefetching.try_packed_prefetch(
+                &context,
+                v3,
+                &remote,
+                &candidates,
+                0,
+                &attribution,
+            );
+            tokio::pin!(work);
+            let mut submitted = Some(submitted);
+            // Observe the production future after each poll. The held mutex
+            // makes its import await pending once registration has happened.
+            std::future::poll_fn(|cx| {
+                let result = work.as_mut().poll(cx);
+                if prefetching.import_tasks.active.load(Ordering::Acquire) != 0
+                    && let Some(submitted) = submitted.take()
+                {
+                    let _ = submitted.send(());
+                }
+                result
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(daemon.import_tasks.active.load(Ordering::Acquire), 1);
+        assert!(daemon.downloading.read().await.contains_key(&key));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(daemon.downloading.read().await.contains_key(&key));
+        assert!(claim_download(&daemon.downloading, &key).await.is_some());
+        assert!(daemon.prefetch_accounting_incomplete());
+    });
+    drop(held);
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), daemon.import_tasks.wait())
+            .await
+            .unwrap();
+        assert!(daemon.downloading.read().await.is_empty());
+        assert!(daemon.import_store_contains(dir.path(), &key).await);
+    });
 }
 
 #[tokio::test]

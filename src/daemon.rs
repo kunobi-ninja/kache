@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1796,7 +1796,7 @@ impl S3KeyCache {
 
 pub(crate) struct Daemon {
     config: Config,
-    store: OnceLock<Mutex<Store>>,
+    store: OnceLock<Arc<Mutex<Store>>>,
     /// Stores opened for `[cache.volumes]` shards. Main stays in `store`.
     shard_stores: Mutex<HashMap<PathBuf, Arc<Mutex<Store>>>>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
@@ -1840,6 +1840,8 @@ pub(crate) struct Daemon {
     listing_refused: AtomicBool,
     /// Own both coordinators and their independently scheduled download tasks.
     prefetch_tasks: Mutex<tokio::task::JoinSet<()>>,
+    /// Blocking imports outlive a cancelled async caller, including its claims.
+    import_tasks: Arc<ImportTasks>,
     prefetch_cancellations: Arc<Mutex<PrefetchCancellations>>,
     prefetch_receipts: Arc<Mutex<PrefetchReceiptQueue>>,
     prefetch_receipt_writers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -1893,6 +1895,42 @@ pub(crate) struct Daemon {
     #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
     capacity: DaemonCapacity,
+}
+
+#[derive(Default)]
+struct ImportTasks {
+    active: AtomicUsize,
+    changed: Notify,
+}
+
+struct ImportTaskGuard(Arc<ImportTasks>);
+
+impl ImportTasks {
+    fn start(self: &Arc<Self>) -> ImportTaskGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ImportTaskGuard(Arc::clone(self))
+    }
+
+    /// Call after async producers have stopped so no new import can race idle.
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for ImportTaskGuard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
 }
 
 /// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
@@ -2351,6 +2389,7 @@ impl Daemon {
             prefetch_stopping: AtomicBool::new(false),
             listing_refused: AtomicBool::new(false),
             prefetch_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            import_tasks: Arc::new(ImportTasks::default()),
             prefetch_cancellations: Arc::new(Mutex::new(PrefetchCancellations::default())),
             prefetch_receipts: Arc::new(Mutex::new(PrefetchReceiptQueue::default())),
             prefetch_receipt_writers: Mutex::new(Vec::new()),
@@ -2379,13 +2418,13 @@ impl Daemon {
         }
     }
 
-    fn store_lock(&self) -> Result<&Mutex<Store>> {
+    fn store_lock(&self) -> Result<&Arc<Mutex<Store>>> {
         if let Some(store) = self.store.get() {
             return Ok(store);
         }
 
         let store = Store::open(&self.config)?;
-        let _ = self.store.set(Mutex::new(store));
+        let _ = self.store.set(Arc::new(Mutex::new(store)));
 
         self.store
             .get()
@@ -2423,84 +2462,112 @@ impl Daemon {
         ))
     }
 
-    fn with_import_store<T>(
-        &self,
-        cache_dir: &Path,
-        f: impl FnOnce(&Store) -> Result<T>,
-    ) -> Result<T> {
+    /// The store a restored entry for `cache_dir` is imported into: the main
+    /// store, or the volume shard the wrapper opened.
+    fn import_store_lock(&self, cache_dir: &Path) -> Result<Arc<Mutex<Store>>> {
         if remote_check_uses_main_store(cache_dir, &self.config.cache_dir) {
-            return self.with_store(f);
+            return self.store_lock().map(Arc::clone);
         }
-        let lock = self.shard_store_lock(cache_dir)?;
-        let guard = lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("daemon shard store mutex poisoned"))?;
-        f(&guard)
+        self.shard_store_lock(cache_dir)
     }
 
-    fn with_store_timed<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> (Result<T>, u64, u64) {
-        let store = match self.store_lock() {
-            Ok(store) => store,
+    /// Whether the import store for `cache_dir` holds a committed row for
+    /// `key`. A store that cannot be opened or locked does not hold it.
+    async fn import_store_contains(&self, cache_dir: &Path, key: &str) -> bool {
+        let key = key.to_owned();
+        self.with_import_store_timed(cache_dir, move |store| Ok(store.contains(&key)))
+            .await
+            .0
+            .unwrap_or(false)
+    }
+
+    /// Run `f` on the import store from tokio's blocking pool. Returns its
+    /// result, the milliseconds spent waiting for the store mutex, and the
+    /// milliseconds `f` took.
+    ///
+    /// Imports, stats, file hashing and garbage collection take this mutex. An
+    /// import also keeps it while SQLite waits, up to its busy timeout, for a
+    /// write lock that another connection holds: the publish worker or a
+    /// wrapper process. An async worker that waits for the mutex runs no other
+    /// task, so downloads scheduled on that worker can overrun their deadlines
+    /// and count as remote failures.
+    async fn with_import_store_timed<T: Send + 'static>(
+        &self,
+        cache_dir: &Path,
+        f: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> (Result<T>, u64, u64) {
+        let lock = match self.import_store_lock(cache_dir) {
+            Ok(lock) => lock,
             Err(error) => return (Err(error), 0, 0),
         };
-        let wait_started = Instant::now();
-        let guard = match store.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
+        // Register before spawning, including work still queued in the pool.
+        // Cancelling this future must not hide a running import from shutdown.
+        let pending = self.import_tasks.start();
+        let timed = tokio::task::spawn_blocking(move || {
+            let _pending = pending;
+            // Drop captured claims before the tracker even on lock failure.
+            let operation = f;
+            let wait_started = Instant::now();
+            let Ok(guard) = lock.lock() else {
                 return (
                     Err(anyhow::anyhow!("daemon store mutex poisoned")),
                     wait_started.elapsed().as_millis() as u64,
                     0,
                 );
-            }
-        };
-        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
-        let import_started = Instant::now();
-        let result = f(&guard);
-        let import_ms = import_started.elapsed().as_millis() as u64;
-        (result, lock_wait_ms, import_ms)
+            };
+            let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
+            let import_started = Instant::now();
+            let result = operation(&guard);
+            let import_ms = import_started.elapsed().as_millis() as u64;
+            (result, lock_wait_ms, import_ms)
+        })
+        .await;
+        match timed {
+            Ok(timed) => timed,
+            Err(error) => (
+                Err(anyhow::anyhow!("daemon store task failed: {error}")),
+                0,
+                0,
+            ),
+        }
     }
 
-    fn with_import_store_timed<T>(
+    async fn import_packed_batch(
         &self,
-        cache_dir: &Path,
-        f: impl FnOnce(&Store) -> Result<T>,
-    ) -> (Result<T>, u64, u64) {
-        if remote_check_uses_main_store(cache_dir, &self.config.cache_dir) {
-            return self.with_store_timed(f);
-        }
-        let lock = match self.shard_store_lock(cache_dir) {
-            Ok(lock) => lock,
-            Err(error) => return (Err(error), 0, 0),
-        };
-        let wait_started = Instant::now();
-        let guard = match lock.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return (
-                    Err(anyhow::anyhow!("daemon shard store mutex poisoned")),
-                    wait_started.elapsed().as_millis() as u64,
-                    0,
-                );
+        entries: Arc<[crate::store::VerifiedRestoredEntry]>,
+        claims: Vec<DownloadingGuard>,
+    ) -> Result<usize> {
+        self.with_import_store_timed(&self.config.cache_dir, move |store| {
+            let _claims = claims;
+            Self::import_packed_entries(store, &entries)
+        })
+        .await
+        .0
+    }
+
+    fn import_packed_entries(
+        store: &Store,
+        entries: &[crate::store::VerifiedRestoredEntry],
+    ) -> Result<usize> {
+        let result = store.import_verified_restored_entries(entries);
+        if result.is_err() {
+            // Strict flushing can fail after registration commits. Cleanup
+            // shares the import's lock and claims, and preserves committed rows.
+            if let Err(error) = Self::discard_uncommitted_packed_entries(store, entries) {
+                tracing::warn!("packed-prefetch residue cleanup failed: {error:#}");
             }
-        };
-        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
-        let import_started = Instant::now();
-        let result = f(&guard);
-        let import_ms = import_started.elapsed().as_millis() as u64;
-        (result, lock_wait_ms, import_ms)
+        }
+        result
     }
 
     fn discard_uncommitted_packed_entries(
-        &self,
+        store: &Store,
         entries: &[crate::store::VerifiedRestoredEntry],
     ) -> Result<()> {
-        self.with_store(|store| {
-            for entry in entries {
-                store.discard_uncommitted_restored_entry(&entry.cache_key)?;
-            }
-            Ok(())
-        })
+        for entry in entries {
+            store.discard_uncommitted_restored_entry(&entry.cache_key)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
@@ -4241,9 +4308,7 @@ impl Daemon {
                     // `meta.json` is only a wake-up hint: extraction writes it
                     // before Store publication, and an import failure may leave
                     // residue. Only a committed Store row is a cache hit.
-                    let committed = self
-                        .with_import_store(&cache_dir, |store| Ok(store.contains(&req.key)))
-                        .unwrap_or(false);
+                    let committed = self.import_store_contains(&cache_dir, &req.key).await;
                     if committed {
                         let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
                         return Response::found_prefetched(true, was_prefetched);
@@ -4269,19 +4334,16 @@ impl Daemon {
         // Leader path: reached only with the claim held — either the first
         // claim above succeeded or this task won the re-claim. The claim is
         // released on every exit path below (incl. panic) by Drop, which also
-        // wakes all waiters.
-        let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
+        // wakes all waiters. After a download the import owns it, so the claim
+        // lasts until the import ends even if this request is cancelled.
+        let dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
 
         // The previous leader may have landed the entry between our
         // pre-re-claim meta.json check and its claim release. Re-check under
         // the claim we now hold so we don't destructively re-download over
         // the freshly published entry (#620, cross-family review finding —
         // the same re-check-under-claim defence the prefetch path uses).
-        if reclaimed
-            && self
-                .with_import_store(&cache_dir, |store| Ok(store.contains(&req.key)))
-                .unwrap_or(false)
-        {
+        if reclaimed && self.import_store_contains(&cache_dir, &req.key).await {
             let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
             return Response::found_prefetched(true, was_prefetched);
         }
@@ -4353,10 +4415,13 @@ impl Daemon {
                         .insert(req.key.clone(), Some(cn.as_str()))
                         .await;
                 }
+                let import_key = req.key.clone();
                 let (import_result, import_lock_wait_ms, import_ms) = self
-                    .with_import_store_timed(&cache_dir, |store| {
-                        store.import_restored_entry(&req.key)
-                    });
+                    .with_import_store_timed(&cache_dir, move |store| {
+                        let _claim = dl_guard;
+                        store.import_restored_entry(&import_key)
+                    })
+                    .await;
                 let import_ok = match import_result {
                     Ok(()) => true,
                     Err(e) => {
@@ -4946,30 +5011,38 @@ impl Daemon {
             }
         }
 
+        let (verified, claims): (Vec<_>, Vec<_>) = verified
+            .into_iter()
+            .map(|(entry, guard, pack_index, entry_index)| {
+                ((entry, pack_index, entry_index), guard)
+            })
+            .unzip();
         let batch = verified
             .iter()
-            .map(|(entry, _, _, _)| entry.restored.clone())
-            .collect::<Vec<_>>();
+            .map(|(entry, _, _)| entry.restored.clone())
+            .collect::<Arc<[_]>>();
         if !batch.is_empty() {
             let import_start = Instant::now();
-            match self.with_store(|store| store.import_verified_restored_entries(&batch)) {
+            let import_batch = Arc::clone(&batch);
+            let imported_batch = self.import_packed_batch(import_batch, claims).await;
+            match imported_batch {
                 Ok(_) => {
                     let completed_at_ms = unix_time_ms();
                     let original_bytes = verified
                         .iter()
-                        .map(|(entry, _, _, _)| entry.original_bytes)
+                        .map(|(entry, _, _)| entry.original_bytes)
                         .sum::<u64>();
                     let extract_ms = verified
                         .iter()
-                        .map(|(entry, _, _, _)| entry.extract_ms)
+                        .map(|(entry, _, _)| entry.extract_ms)
                         .sum::<u64>();
                     // No await before every successfully imported entry has its
                     // exact availability boundary, including other packs in this batch.
                     let import_ms = import_start.elapsed().as_millis() as u64;
                     // One shared batch import: charge its duration once, to
                     // the first imported pack, rather than once per object.
-                    receipts[verified[0].2].event.import_ms = import_ms;
-                    for (entry, _, pack_index, entry_index) in &verified {
+                    receipts[verified[0].1].event.import_ms = import_ms;
+                    for (entry, pack_index, entry_index) in &verified {
                         let receipt = &mut receipts[*pack_index];
                         charge_packed_import(
                             &mut receipt.event,
@@ -5006,14 +5079,9 @@ impl Daemon {
                     self.prefetch_stats
                         .pack_validation_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    for (_, _, pack_index, entry_index) in &verified {
+                    for (_, pack_index, entry_index) in &verified {
                         receipts[*pack_index].accounting().entries[*entry_index].outcome =
                             "import_error".to_owned();
-                    }
-                    // Strict flushing can fail after registration commits.
-                    // Preserve those rows' metadata, including existing keys.
-                    if let Err(cleanup_error) = self.discard_uncommitted_packed_entries(&batch) {
-                        tracing::warn!("packed-prefetch residue cleanup failed: {cleanup_error:#}");
                     }
                 }
             }
@@ -5029,7 +5097,7 @@ impl Daemon {
             receipt.finish(if failed { "import_error" } else { "completed" });
         }
         drop(receipts);
-        for (entry, _, _, _) in &verified {
+        for (entry, _, _) in &verified {
             if imported.contains(&entry.restored.cache_key) {
                 self.note_key_present(&entry.restored.cache_key, &entry.restored.meta.crate_name)
                     .await;
@@ -5105,8 +5173,10 @@ impl Daemon {
     }
 
     /// Stop admission, drain, then abort and join actual tasks before the
-    /// summary. Inline extraction and filesystem I/O cannot be preempted by
-    /// Tokio; the timeout bounds async waiting, not stalled synchronous I/O.
+    /// summary. Include imports whose async callers were already cancelled.
+    /// The timeout bounds waiting; started blocking work cannot be preempted.
+    /// Inline Store opening, extraction and filesystem I/O can still prevent
+    /// an async task from yielding; this is not a bound on synchronous I/O.
     async fn finish_prefetch_shutdown(self: &Arc<Self>, timeout: Duration) -> bool {
         self.stop_prefetch_admission();
         let mut tasks = std::mem::take(
@@ -5117,13 +5187,23 @@ impl Daemon {
         );
         let timed_out = tokio::time::timeout(timeout, async {
             while tasks.join_next().await.is_some() {}
+            self.import_tasks.wait().await;
         })
         .await
         .is_err();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
 
-        // All producers have exited; persist receipts before the summary.
+        let pending_imports = self.import_tasks.active.load(Ordering::Acquire);
+        let imports_pending = pending_imports != 0;
+        if imports_pending {
+            tracing::warn!(
+                pending_imports,
+                "blocking remote imports still running after prefetch drain"
+            );
+        }
+        // Async producers have exited; persist their receipts before the
+        // summary. Outstanding blocking imports keep the summary incomplete.
         let receipts_complete = self.finish_prefetch_receipts().await;
         let cancellations = std::mem::take(
             &mut *self
@@ -5142,6 +5222,7 @@ impl Daemon {
         if let Some(mut plan) = plan {
             let incomplete = !receipts_complete
                 || timed_out
+                || imports_pending
                 || cancellations.overflowed
                 || cancellations.origins.iter().any(|origin| {
                     plan.session_id == origin.session_id
@@ -5150,7 +5231,7 @@ impl Daemon {
                 });
             plan.cancelled |= incomplete;
             let daemon = self.clone();
-            let reason = if timed_out {
+            let reason = if timed_out || imports_pending {
                 "shutdown_timeout"
             } else {
                 "shutdown"
@@ -5167,7 +5248,7 @@ impl Daemon {
                 tracing::warn!("shutdown summary write is still blocked on local I/O");
             }
         }
-        timed_out
+        timed_out || imports_pending
     }
 
     /// Handle a prefetch request through an owned background coordinator.
@@ -5556,8 +5637,10 @@ impl Daemon {
                         return;
                     }
                     // Released on every exit path below (including panic) by
-                    // Drop, which also wakes anyone parked on this key.
-                    let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    // Drop, which also wakes anyone parked on this key. After
+                    // a download the import owns it, so the claim lasts until
+                    // the import ends even if this task is cancelled.
+                    let dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
                     if d.prefetch_stopping.load(Ordering::Acquire) {
                         d.cancel_prefetch_plan(&origin);
                         d.prefetch_stats
@@ -5607,8 +5690,13 @@ impl Daemon {
                                     .insert(key.clone(), Some(crate_name.as_str()))
                                     .await;
                             }
-                            let (import_result, import_lock_wait_ms, import_ms) =
-                                d.with_store_timed(|store| store.import_restored_entry(&key));
+                            let import_key = key.clone();
+                            let (import_result, import_lock_wait_ms, import_ms) = d
+                                .with_import_store_timed(&d.config.cache_dir, move |store| {
+                                    let _claim = dl_guard;
+                                    store.import_restored_entry(&import_key)
+                                })
+                                .await;
                             let import_ok = match import_result {
                                 Ok(()) => true,
                                 Err(e) => {
@@ -5980,6 +6068,7 @@ impl Daemon {
             cancellations.overflowed || !cancellations.origins.is_empty()
         };
         tasks_pending
+            || self.import_tasks.active.load(Ordering::Acquire) != 0
             || receipts_pending
             || cancelled
             || self.prefetch_receipt_failed.load(Ordering::Acquire)
@@ -7353,7 +7442,9 @@ async fn server_main(
         .finish_prefetch_shutdown(Duration::from_secs(5))
         .await
     {
-        tracing::warn!("prefetch drain timed out; remaining tasks aborted and joined");
+        tracing::warn!(
+            "prefetch drain incomplete; async tasks joined, blocking imports may still finish"
+        );
     }
     heartbeat_handle.abort();
     config_watch_handle.abort();

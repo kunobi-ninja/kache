@@ -23,6 +23,8 @@ struct InvocationCounts {
     flight_wait_us: Cell<u64>,
     permit_wait_us: Cell<u64>,
     prediction_mismatches: Cell<u64>,
+    scheduler_decisions: RefCell<Vec<kache_protocol::SchedulerDecision>>,
+    event_written: Cell<bool>,
 }
 
 thread_local! {
@@ -54,6 +56,8 @@ impl InvocationScope {
             flight_wait_us: Cell::new(0),
             permit_wait_us: Cell::new(0),
             prediction_mismatches: Cell::new(0),
+            scheduler_decisions: RefCell::new(Vec::new()),
+            event_written: Cell::new(false),
         });
         let previous = INVOCATION_COUNTS.with(|slot| slot.replace(Some(Rc::clone(&current))));
         Self {
@@ -373,6 +377,68 @@ pub fn permit_wait_ms() -> u64 {
     ms_from_micros(get_u64(&PERMIT_WAIT_US, |counts| &counts.permit_wait_us))
 }
 
+thread_local! {
+    static LEGACY_DECISIONS: RefCell<Vec<kache_protocol::SchedulerDecision>> = const { RefCell::new(Vec::new()) };
+}
+
+/// No system sampling: the scheduler hands over the evidence it already used.
+pub(crate) fn record_scheduler_decision(decision: kache_protocol::SchedulerDecision) {
+    crate::phase_trace::scheduler_decision(&decision);
+    INVOCATION_COUNTS.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            current.scheduler_decisions.borrow_mut().push(decision);
+        } else {
+            LEGACY_DECISIONS.with(|slot| slot.borrow_mut().push(decision));
+        }
+    });
+}
+
+/// Cancellation events require invocation-local evidence. A legacy process
+/// accumulator cannot establish that a decision belongs to this request.
+pub(crate) fn unlogged_scheduler_cancellation() -> bool {
+    INVOCATION_COUNTS.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|counts| {
+            !counts.event_written.get()
+                && counts
+                    .scheduler_decisions
+                    .borrow()
+                    .iter()
+                    .any(|decision| decision.outcome == kache_protocol::SchedulerOutcome::Cancelled)
+        })
+    })
+}
+
+pub(crate) fn mark_event_written() {
+    INVOCATION_COUNTS.with(|slot| {
+        if let Some(counts) = slot.borrow().as_ref() {
+            counts.event_written.set(true);
+        }
+    });
+}
+
+/// Snapshot rather than drain: a declined daemon handoff can build the event
+/// again locally. Both constructions must retain the same admission evidence.
+pub(crate) fn scheduler_decisions() -> Vec<kache_protocol::SchedulerDecision> {
+    INVOCATION_COUNTS.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            current.scheduler_decisions.borrow().clone()
+        } else {
+            LEGACY_DECISIONS.with(|slot| slot.borrow().clone())
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn take_scheduler_decisions() -> Vec<kache_protocol::SchedulerDecision> {
+    INVOCATION_COUNTS.with(|slot| {
+        if let Some(current) = slot.borrow().as_ref() {
+            std::mem::take(&mut *current.scheduler_decisions.borrow_mut())
+        } else {
+            LEGACY_DECISIONS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+        }
+    })
+}
+
 fn micros(spent: Duration) -> u64 {
     u64::try_from(spent.as_micros()).unwrap_or(u64::MAX)
 }
@@ -660,5 +726,76 @@ mod tests {
             SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() == 0),
             "panic inside suspend must not leave spawn counts suppressed"
         );
+    }
+    #[test]
+    fn scheduler_decisions_stay_with_their_invocation_and_drain_once() {
+        use kache_protocol::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
+        let parent = SchedulerDecision {
+            phase: SchedulerPhase::Flight,
+            outcome: SchedulerOutcome::PeerCompleted,
+            elapsed_ms: 7,
+            ..Default::default()
+        };
+        let child = SchedulerDecision {
+            phase: SchedulerPhase::Capacity,
+            outcome: SchedulerOutcome::TimeoutFallback,
+            elapsed_ms: 11,
+            ..Default::default()
+        };
+        let _scope = InvocationScope::enter(Instant::now());
+        record_scheduler_decision(parent.clone());
+        assert_eq!(scheduler_decisions(), vec![parent.clone()]);
+        assert_eq!(
+            scheduler_decisions(),
+            vec![parent.clone()],
+            "a declined handoff may construct the event again"
+        );
+        {
+            let _child = InvocationScope::enter(Instant::now());
+            assert!(take_scheduler_decisions().is_empty());
+            record_scheduler_decision(child.clone());
+            assert_eq!(take_scheduler_decisions(), vec![child]);
+            assert!(take_scheduler_decisions().is_empty());
+        }
+        assert_eq!(take_scheduler_decisions(), vec![parent]);
+        drop(_scope);
+        let _reused = InvocationScope::enter(Instant::now());
+        assert!(take_scheduler_decisions().is_empty());
+    }
+    #[test]
+    fn cancellation_event_eligibility_requires_current_unlogged_evidence() {
+        use kache_protocol::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
+        let cancelled = SchedulerDecision {
+            phase: SchedulerPhase::Capacity,
+            outcome: SchedulerOutcome::Cancelled,
+            elapsed_ms: 17,
+            ..Default::default()
+        };
+        LEGACY_DECISIONS.with(|slot| slot.borrow_mut().push(cancelled.clone()));
+        assert!(
+            !unlogged_scheduler_cancellation(),
+            "legacy process totals are not request evidence"
+        );
+        let _scope = InvocationScope::enter(Instant::now());
+        assert!(!unlogged_scheduler_cancellation());
+        record_scheduler_decision(SchedulerDecision {
+            outcome: SchedulerOutcome::Admitted,
+            ..cancelled.clone()
+        });
+        assert!(!unlogged_scheduler_cancellation());
+        record_scheduler_decision(cancelled);
+        assert!(unlogged_scheduler_cancellation());
+        {
+            let _nested = InvocationScope::enter(Instant::now());
+            assert!(!unlogged_scheduler_cancellation());
+            mark_event_written();
+        }
+        assert!(
+            unlogged_scheduler_cancellation(),
+            "another request cannot claim this event was logged"
+        );
+        mark_event_written();
+        assert!(!unlogged_scheduler_cancellation());
+        LEGACY_DECISIONS.with(|slot| slot.borrow_mut().clear());
     }
 }

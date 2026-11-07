@@ -8,7 +8,7 @@ from pathlib import Path
 
 def control_patch(root):
     replacements = {
-        "src/scheduler/pressure.rs": (
+        "src/scheduler/pressure.rs": [(
             '''    match now() {
         Some(level) => shared(root, pool, level, super::queue::millis(SystemTime::now())),
         None => pool,
@@ -24,8 +24,27 @@ def control_patch(root):
         _ => pool,
     }
 }''',
-        ),
-        "src/scheduler.rs": (
+        ), (
+            '''    let level = now();
+    let ceiling = match level {
+        Some(level) => shared(root, pool, level, super::queue::millis(SystemTime::now())),
+        None => pool,
+    };
+    (ceiling, level)
+}''',
+            '''    let level = now();
+    // Keep observation and persistence costs in both benchmark arms.
+    if let Some(level) = level {
+        let _ = shared(root, pool, level, super::queue::millis(SystemTime::now()));
+    }
+    let ceiling = match level {
+        Some(Level::Warning | Level::Critical) => 1,
+        _ => pool,
+    };
+    (ceiling, level)
+}''',
+        )],
+        "src/scheduler.rs": [(
             '''    fn keep(&self, mut slots: Vec<(u32, StoreLock)>, weight: u32) -> Permit {
         let keep = weight.max(1) as usize;
         if slots.len() > keep {
@@ -37,13 +56,15 @@ def control_patch(root):
             '''    fn keep(&self, slots: Vec<(u32, StoreLock)>, _weight: u32) -> Permit {
         // The legacy policy held the full ordinary request until completion.
         Permit {''',
-        ),
+        )],
     }
     chunks = []
-    for name, (before, after) in replacements.items():
+    for name, alternatives in replacements.items():
         source = (root / name).read_text()
-        if source.count(before) != 1:
+        matches = [(before, after) for before, after in alternatives if before in source]
+        if len(matches) != 1 or source.count(matches[0][0]) != 1:
             raise ValueError(f"{name}: source changed; review the control before benchmarking")
+        before, after = matches[0]
         chunks.extend(difflib.unified_diff(source.splitlines(keepends=True),
                                         source.replace(before, after).splitlines(keepends=True),
                                         fromfile=f"a/{name}", tofile=f"b/{name}"))

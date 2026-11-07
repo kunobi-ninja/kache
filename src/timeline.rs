@@ -236,6 +236,7 @@ fn group_sessions(events: &[BuildEvent]) -> BTreeMap<String, SessionEvents> {
             startup_ms: event.startup_ms,
             flight_wait_ms: event.flight_wait_ms,
             permit_wait_ms: event.permit_wait_ms,
+            scheduler_decisions: event.scheduler_decisions.clone(),
             compiler_runs: event.compiler_runs,
             event_schema: event.schema,
             demands: event.demands.clone(),
@@ -1915,5 +1916,32 @@ mod tests {
         let records = build_timelines(&inputs(&events, &[], &[], &env));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].root_hash, short_hash("/b"));
+    }
+    #[test]
+    fn timeline_retains_the_event_scheduler_decisions() {
+        let mut observed = event("s1", "queued", "k1", 5000, 100);
+        observed.schema = 27;
+        observed.scheduler_decisions = vec![kache_protocol::SchedulerDecision {
+            phase: kache_protocol::SchedulerPhase::Capacity,
+            outcome: kache_protocol::SchedulerOutcome::Unavailable,
+            elapsed_ms: 17,
+            ..Default::default()
+        }];
+        let records = build_timelines(&inputs(
+            &[observed.clone()],
+            &[],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert_eq!(records[0].schema, 7);
+        assert_eq!(
+            records[0].units[0].scheduler_decisions,
+            observed.scheduler_decisions
+        );
+        let raw = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(
+            raw["units"][0]["scheduler_decisions"][0]["outcome"],
+            "unavailable"
+        );
     }
 }

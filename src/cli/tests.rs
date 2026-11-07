@@ -2048,6 +2048,9 @@ fn zero_event_stats() -> daemon::EventStatsResponse {
         misses: 0,
         errors: 0,
         total_elapsed_ms: 0,
+        total_flight_wait_ms: 0,
+        total_permit_wait_ms: 0,
+        longest_scheduler_wait: None,
         hit_elapsed_ms: 0,
         miss_elapsed_ms: 0,
         hit_compile_time_ms: 0,
@@ -6206,6 +6209,7 @@ fn build_event(
         prediction_mismatches: 0,
         flight_wait_ms: 0,
         permit_wait_ms: 0,
+        scheduler_decisions: Vec::new(),
         store_output_blobs: 0,
         store_duplicate_blobs: 0,
         store_new_blobs: 0,
@@ -11580,4 +11584,38 @@ fn native_linker_check_reports_the_linker_cc_runs() {
         check.detail,
         format!("{} (LLD 22.1.8)", bin.join("ld.alt").display())
     );
+}
+
+#[test]
+fn compact_stats_label_scheduler_evidence_as_recorded_history() {
+    let mut snapshot = StatsSnapshot::default();
+    snapshot.event_stats.longest_scheduler_wait = Some(kache_core::scheduler::SchedulerWait {
+        crate_name: "old_build".into(),
+        flight_wait_ms: 0,
+        permit_wait_ms: 30002,
+        decisions: vec![kache_protocol::SchedulerDecision {
+            phase: kache_protocol::SchedulerPhase::Capacity,
+            outcome: kache_protocol::SchedulerOutcome::TimeoutFallback,
+            elapsed_ms: 30002,
+            pressure: Some(kache_core::scheduler::SchedulerPressure::Warning),
+            ..Default::default()
+        }],
+    });
+    let rows = build_rows(&snapshot);
+    let row = rows
+        .iter()
+        .find(|row| row.0 == "Longest scheduler wait")
+        .unwrap();
+    assert!(row.2.contains("Recorded scheduler wait for `old_build`"));
+    assert!(row.2.contains("observed pressure warning"));
+    assert!(row.2.contains("timeout fallback"));
+    let json = serde_json::to_value(&snapshot.event_stats).unwrap();
+    assert_eq!(
+        json["longest_scheduler_wait"]["decisions"][0]["outcome"],
+        "timeout_fallback"
+    );
+    let legacy: crate::daemon::EventStatsResponse = serde_json::from_value(serde_json::json!({"local_hits":0,"remote_hits":0,"misses":0,"errors":0,"total_elapsed_ms":0})).unwrap();
+    assert!(legacy.longest_scheduler_wait.is_none());
+    assert_eq!(legacy.total_flight_wait_ms, 0);
+    assert_eq!(legacy.total_permit_wait_ms, 0);
 }

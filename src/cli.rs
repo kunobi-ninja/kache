@@ -92,6 +92,9 @@ impl Default for StatsSnapshot {
                 misses: 0,
                 errors: 0,
                 total_elapsed_ms: 0,
+                total_flight_wait_ms: 0,
+                total_permit_wait_ms: 0,
+                longest_scheduler_wait: None,
                 hit_elapsed_ms: 0,
                 miss_elapsed_ms: 0,
                 hit_compile_time_ms: 0,
@@ -304,6 +307,9 @@ pub(crate) fn snapshot_from_direct_reads(
             misses: es.misses,
             errors: es.errors,
             total_elapsed_ms: es.total_elapsed_ms,
+            total_flight_wait_ms: es.total_flight_wait_ms,
+            total_permit_wait_ms: es.total_permit_wait_ms,
+            longest_scheduler_wait: es.longest_scheduler_wait.clone(),
             hit_elapsed_ms: es.hit_elapsed_ms,
             miss_elapsed_ms: es.miss_elapsed_ms,
             hit_compile_time_ms: es.hit_compile_time_ms,
@@ -910,6 +916,10 @@ pub fn stats(
             hit_elapsed_ms: u64,
             miss_elapsed_ms: u64,
             total_elapsed_ms: u64,
+            total_flight_wait_ms: u64,
+            total_permit_wait_ms: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            longest_scheduler_wait: Option<&'a kache_core::scheduler::SchedulerWait>,
             local_hits: usize,
             prefetch_hits: usize,
             remote_hits: usize,
@@ -955,6 +965,9 @@ pub fn stats(
                 hit_elapsed_ms: snap.event_stats.hit_elapsed_ms,
                 miss_elapsed_ms: snap.event_stats.miss_elapsed_ms,
                 total_elapsed_ms: snap.event_stats.total_elapsed_ms,
+                total_flight_wait_ms: snap.event_stats.total_flight_wait_ms,
+                total_permit_wait_ms: snap.event_stats.total_permit_wait_ms,
+                longest_scheduler_wait: snap.event_stats.longest_scheduler_wait.as_ref(),
                 local_hits: snap.event_stats.local_hits,
                 prefetch_hits: snap.event_stats.prefetch_hits,
                 remote_hits: snap.event_stats.remote_hits,
@@ -1276,6 +1289,13 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
             "Miss time",
             term::duration_ms(es.miss_elapsed_ms),
             format!("{} of wrapper time", term::percent(miss_share)),
+        ));
+    }
+    if let Some(wait) = &es.longest_scheduler_wait {
+        rows.push((
+            "Longest scheduler wait",
+            term::duration_ms(wait.elapsed_ms()),
+            crate::report::scheduler_wait_note(wait),
         ));
     }
     rows

@@ -232,6 +232,58 @@ class PressureBenchTests(unittest.TestCase):
             second = (root / "foreground/unit-0/src/lib.rs").read_text()
             self.assertNotEqual(first, second)
 
+    @staticmethod
+    def pressure_source_shapes():
+        original = '''pub(crate) fn ceiling(root: &Path, pool: u32) -> u32 {
+    match now() {
+        Some(level) => shared(root, pool, level, super::queue::millis(SystemTime::now())),
+        None => pool,
+    }
+}
+'''
+        observed = '''pub(crate) fn ceiling_observed(root: &Path, pool: u32) -> (u32, Option<Level>) {
+    let level = now();
+    let ceiling = match level {
+        Some(level) => shared(root, pool, level, super::queue::millis(SystemTime::now())),
+        None => pool,
+    };
+    (ceiling, level)
+}
+'''
+        return original, observed
+
+    def test_control_keeps_observation_and_legacy_policy_for_both_source_shapes(self):
+        scheduler = (Path(__file__).resolve().parents[1] / "src/scheduler.rs").read_text()
+        for index, source in enumerate(self.pressure_source_shapes()):
+            with self.subTest(observed=index == 1), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "src/scheduler").mkdir(parents=True)
+                pressure = root / "src/scheduler/pressure.rs"
+                pressure.write_text(source)
+                (root / "src/scheduler.rs").write_text(scheduler)
+                patch = control.control_patch(root)
+                subprocess.run(["git", "apply", "--check", "-"], input=patch,
+                               text=True, cwd=root, check=True, timeout=5)
+                subprocess.run(["git", "apply", "-"], input=patch,
+                               text=True, cwd=root, check=True, timeout=5)
+                result = pressure.read_text()
+                self.assertEqual(result.count("let level = now();"), 1)
+                self.assertEqual(result.count("shared(root, pool, level,"), 1)
+                self.assertIn("if let Some(level) = level {", result)
+                self.assertIn("Some(Level::Warning | Level::Critical) => 1,", result)
+                self.assertIn("_ => pool,", result)
+                self.assertEqual("(ceiling, level)" in result, index == 1)
+
+    def test_control_rejects_ambiguous_or_duplicate_pressure_source_shapes(self):
+        original, observed = self.pressure_source_shapes()
+        for source in (original + observed, original + original, observed + observed):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "src/scheduler").mkdir(parents=True)
+                (root / "src/scheduler/pressure.rs").write_text(source)
+                with self.assertRaisesRegex(ValueError, "source changed"):
+                    control.control_patch(root)
+
     def test_control_patch_applies_to_this_source_and_fails_on_drift(self):
         root = Path(__file__).resolve().parents[1]
         patch = control.control_patch(root)

@@ -48,14 +48,37 @@ mod priority;
 mod queue;
 use anyhow::Result;
 pub(crate) use budget::{BudgetWait, InvocationWaitScope};
+use kache_core::scheduler::SchedulerPressure;
+use kache_protocol::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
 pub(crate) use priority::{InvocationPriorityScope, Priority};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::store::StoreLock;
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn unavailable_outcome() -> SchedulerOutcome {
+    if crate::invocation::process::check().is_err() {
+        SchedulerOutcome::Cancelled
+    } else {
+        SchedulerOutcome::Unavailable
+    }
+}
+
+fn record_decision(phase: SchedulerPhase, outcome: SchedulerOutcome, elapsed: Duration) {
+    crate::opcounts::record_scheduler_decision(SchedulerDecision {
+        phase,
+        outcome,
+        elapsed_ms: duration_ms(elapsed),
+        ..Default::default()
+    });
+}
 
 /// Permit slots occupied by a crate with no RSS sample.
 pub const UNMEASURED_COMPILE_WEIGHT: u32 = 1;
@@ -96,8 +119,9 @@ pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> Discove
     let path = cache_dir
         .join("scheduler/discovery")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
+    let started = Instant::now();
     let wait = BudgetWait::start(WAIT_TIMEOUT);
-    match acquire_discovery(&path, wait.timeout, POLL_INTERVAL) {
+    let result = match acquire_discovery(&path, wait.timeout, POLL_INTERVAL) {
         Ok((lock, waited)) => DiscoveryFlight { lock, waited },
         Err(error) => {
             tracing::debug!("discovery flight unavailable: {error:#}");
@@ -106,7 +130,20 @@ pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> Discove
                 waited: false,
             }
         }
-    }
+    };
+    let outcome = if result.lock.is_some() {
+        if result.waited {
+            SchedulerOutcome::PeerCompleted
+        } else {
+            SchedulerOutcome::Admitted
+        }
+    } else if result.waited {
+        SchedulerOutcome::TimeoutFallback
+    } else {
+        unavailable_outcome()
+    };
+    record_decision(SchedulerPhase::Discovery, outcome, started.elapsed());
+    result
 }
 
 /// Take the flight at `path`, waiting up to `timeout` for its holder. The
@@ -323,6 +360,11 @@ pub fn begin_miss(
         Ok(scheduler) => scheduler,
         Err(error) => {
             tracing::debug!("scheduler unusable ({error:#}); compiling without a permit");
+            record_decision(
+                SchedulerPhase::Capacity,
+                unavailable_outcome(),
+                Duration::ZERO,
+            );
             return BeginMiss::Compile(MissGuard::empty());
         }
     };
@@ -349,6 +391,11 @@ pub fn begin_keyless_compile(
         Ok(scheduler) => scheduler.keyless_compile(crate_name, is_link, lease),
         Err(error) => {
             tracing::debug!("scheduler unusable ({error:#}); compiling without a permit");
+            record_decision(
+                SchedulerPhase::Capacity,
+                unavailable_outcome(),
+                Duration::ZERO,
+            );
             MissGuard::empty()
         }
     }
@@ -416,6 +463,11 @@ impl Scheduler {
         match self.join_flight(identity) {
             FlightJoin::Owner(flight) => {
                 let permit = if lease_covers(lease, &self.root) {
+                    record_decision(
+                        SchedulerPhase::Capacity,
+                        SchedulerOutcome::LeaseCovered,
+                        Duration::ZERO,
+                    );
                     None
                 } else {
                     self.acquire_permit(self.weight_for(crate_name, is_link))
@@ -431,6 +483,11 @@ impl Scheduler {
 
     fn keyless_compile(&self, crate_name: &str, is_link: bool, lease: Option<&Path>) -> MissGuard {
         let permit = if lease_covers(lease, &self.root) {
+            record_decision(
+                SchedulerPhase::Capacity,
+                SchedulerOutcome::LeaseCovered,
+                Duration::ZERO,
+            );
             None
         } else {
             self.acquire_permit(self.weight_for(crate_name, is_link))
@@ -445,44 +502,32 @@ impl Scheduler {
     fn join_flight(&self, identity: &FlightIdentity) -> FlightJoin {
         let _trace = crate::phase_trace::phase("flight_join");
         let path = self.flight_path(identity);
-        match StoreLock::try_acquire(&path) {
-            Ok(Some(lock)) => FlightJoin::Owner(lock),
+        let started = Instant::now();
+        let (joined, outcome) = match StoreLock::try_acquire(&path) {
+            Ok(Some(lock)) => (FlightJoin::Owner(lock), SchedulerOutcome::Admitted),
             Ok(None) => {
-                tracing::debug!(
-                    compiler = %identity.compiler,
-                    crate_name = %identity.crate_name,
-                    output_kind = %identity.output_kind,
-                    "waiting for in-flight compile"
-                );
-                let waited = std::time::Instant::now();
+                tracing::debug!(crate_name = %identity.crate_name, "waiting for in-flight compile");
+                let waited = Instant::now();
                 let _trace_wait = crate::phase_trace::phase("flight_wait");
                 let wait = BudgetWait::start(self.wait_timeout);
                 let outcome = wait_for_lock(&path, wait.timeout, self.poll_interval);
                 crate::opcounts::record_flight_wait(waited.elapsed());
                 match outcome {
-                    Ok(true) => FlightJoin::Waited,
-                    Ok(false) => {
-                        tracing::debug!(
-                            crate_name = %identity.crate_name,
-                            "flight wait timed out; compiling without a permit"
-                        );
-                        FlightJoin::FailOpen
-                    }
+                    Ok(true) => (FlightJoin::Waited, SchedulerOutcome::PeerCompleted),
+                    Ok(false) => (FlightJoin::FailOpen, SchedulerOutcome::TimeoutFallback),
                     Err(error) => {
-                        tracing::debug!(
-                            "scheduler flight wait failed ({error:#}); compiling without a permit"
-                        );
-                        FlightJoin::FailOpen
+                        tracing::debug!("scheduler flight wait failed ({error:#})");
+                        (FlightJoin::FailOpen, unavailable_outcome())
                     }
                 }
             }
             Err(error) => {
-                tracing::debug!(
-                    "scheduler flight lock failed ({error:#}); compiling without a permit"
-                );
-                FlightJoin::FailOpen
+                tracing::debug!("scheduler flight lock failed ({error:#})");
+                (FlightJoin::FailOpen, unavailable_outcome())
             }
-        }
+        };
+        record_decision(SchedulerPhase::Flight, outcome, started.elapsed());
+        joined
     }
 
     fn weight_for(&self, crate_name: &str, is_link: bool) -> u32 {
@@ -507,7 +552,7 @@ impl Scheduler {
         let mut ticket = None;
         let slots = bounded.wait_for_request(
             &request,
-            |waited, saved_for_tests| self.ordinary_need(weight, waited, saved_for_tests),
+            |waited, saved_for_tests| self.observed_need(&request, weight, waited, saved_for_tests),
             &mut ticket,
         );
         let recover = wait.scoped();
@@ -517,7 +562,13 @@ impl Scheduler {
             None if recover => self.acquire_recovery_permit(weight, &request, &mut ticket),
             None => None,
         };
-        crate::opcounts::record_permit_wait(started.elapsed());
+        let outcome = match &permit {
+            Some(permit) if !permit._recovery.is_empty() => SchedulerOutcome::RecoveryAdmitted,
+            Some(_) => SchedulerOutcome::Admitted,
+            None => request.evidence.borrow().outcome,
+        };
+        let elapsed = request.finish(outcome, started);
+        crate::opcounts::record_permit_wait(elapsed);
         permit
     }
 
@@ -534,7 +585,10 @@ impl Scheduler {
         let wait = BudgetWait::start(WAIT_TIMEOUT);
         let started = std::time::Instant::now();
         loop {
-            crate::invocation::process::check().ok()?;
+            if crate::invocation::process::check().is_err() {
+                request.evidence.borrow_mut().outcome = SchedulerOutcome::Cancelled;
+                return None;
+            }
             let seen = permit_wait::snapshot(&self.root);
             let remaining = wait.timeout.saturating_sub(started.elapsed());
             match self.try_recovery_request(weight, request, ticket, remaining) {
@@ -545,6 +599,7 @@ impl Scheduler {
                         tracing::debug!(
                             "scheduler coordination allowance exhausted; compiling without a permit"
                         );
+                        request.evidence.borrow_mut().outcome = SchedulerOutcome::TimeoutFallback;
                         return None;
                     }
                     permit_wait::park(
@@ -558,6 +613,7 @@ impl Scheduler {
                     tracing::debug!(
                         "scheduler recovery unavailable ({error:#}); compiling without a permit"
                     );
+                    request.evidence.borrow_mut().outcome = unavailable_outcome();
                     return None;
                 }
             }
@@ -582,7 +638,7 @@ impl Scheduler {
         allowance: Duration,
     ) -> Result<Option<Permit>> {
         let started = std::time::Instant::now();
-        let ordinary = self.ordinary_need(weight, true, request.saved_for_tests.get());
+        let ordinary = self.observed_need(request, weight, true, request.saved_for_tests.get());
         if let Collect::Ready(slots) = self.admit(request, ordinary, ticket, allowance)? {
             return Ok(Some(self.keep(slots, weight)));
         }
@@ -625,6 +681,7 @@ impl Scheduler {
             recovery_slots = extra,
             "scheduler wait allowance exhausted; admitted one recovery compile"
         );
+        request.evidence.borrow_mut().recovery_slots = Some(extra);
         Ok(Some(Permit {
             root: self.root.clone(),
             _slots: slots,
@@ -635,8 +692,41 @@ impl Scheduler {
     /// Free slots an ordinary compile of `weight` waits for: its weight and
     /// the slots above the memory pressure ceiling (see [`pressure::ask`]),
     /// capped by [`compile_need`] at what tests leave.
-    fn ordinary_need(&self, weight: u32, waited: bool, saved_for_tests: u32) -> u32 {
-        let ceiling = pressure::ceiling(&self.root, self.pool_size);
+    fn observed_need(
+        &self,
+        request: &Request,
+        weight: u32,
+        waited: bool,
+        saved_for_tests: u32,
+    ) -> u32 {
+        let (ceiling, level) = pressure::ceiling_observed(&self.root, self.pool_size);
+        let mut evidence = request.evidence.borrow_mut();
+        evidence.pool_slots = Some(self.pool_size);
+        evidence.pressure_ceiling = Some(
+            evidence
+                .pressure_ceiling
+                .map_or(ceiling, |old| old.min(ceiling)),
+        );
+        if let Some(level) = level {
+            let level = match level {
+                pressure::Level::Calm => SchedulerPressure::Calm,
+                pressure::Level::Warning => SchedulerPressure::Warning,
+                pressure::Level::Critical => SchedulerPressure::Critical,
+                pressure::Level::Unknown => SchedulerPressure::Unknown,
+            };
+            evidence.pressure = Some(match (evidence.pressure, level) {
+                (Some(SchedulerPressure::Critical), _) | (_, SchedulerPressure::Critical) => {
+                    SchedulerPressure::Critical
+                }
+                (Some(SchedulerPressure::Warning), _) | (_, SchedulerPressure::Warning) => {
+                    SchedulerPressure::Warning
+                }
+                (Some(SchedulerPressure::Calm), SchedulerPressure::Unknown) => {
+                    SchedulerPressure::Calm
+                }
+                (_, level) => level,
+            });
+        }
         compile_need(
             pressure::ask(weight, self.pool_size, ceiling),
             self.pool_size,
@@ -694,7 +784,10 @@ impl Scheduler {
         let start = std::time::Instant::now();
         let mut waited = false;
         loop {
-            crate::invocation::process::check().ok()?;
+            if crate::invocation::process::check().is_err() {
+                request.evidence.borrow_mut().outcome = SchedulerOutcome::Cancelled;
+                return None;
+            }
             // A need of zero would never be met.
             let asking = need(waited, request.saved_for_tests.get()).max(1);
             match self.collect_permits(request, asking, ticket, start) {
@@ -983,16 +1076,44 @@ struct Request {
     rank: u64,
     /// What the last scan found the queue saving for a waiting test.
     saved_for_tests: std::cell::Cell<u32>,
+    evidence: std::cell::RefCell<SchedulerDecision>,
+    queued_at: std::cell::Cell<Option<Instant>>,
 }
 
 impl Request {
     fn new(kind: queue::Kind, spare: bool) -> Self {
+        let priority = priority::current();
         Self {
             kind,
             spare,
-            rank: queue::rank(SystemTime::now(), priority::current()),
+            rank: queue::rank(SystemTime::now(), priority),
             saved_for_tests: std::cell::Cell::new(0),
+            evidence: std::cell::RefCell::new(SchedulerDecision {
+                phase: SchedulerPhase::Capacity,
+                background: Some(priority == Priority::Background),
+                ..Default::default()
+            }),
+            queued_at: std::cell::Cell::new(None),
         }
+    }
+
+    fn available(&self, free: u32) {
+        let mut evidence = self.evidence.borrow_mut();
+        evidence.available_slots = Some(evidence.available_slots.map_or(free, |old| old.min(free)));
+    }
+
+    fn finish(&self, outcome: SchedulerOutcome, started: Instant) -> Duration {
+        let finished = Instant::now();
+        let elapsed = finished.saturating_duration_since(started);
+        let mut evidence = self.evidence.borrow().clone();
+        evidence.outcome = outcome;
+        evidence.elapsed_ms = duration_ms(elapsed);
+        evidence.queued_ms = self
+            .queued_at
+            .get()
+            .map(|at| duration_ms(finished.saturating_duration_since(at)));
+        crate::opcounts::record_scheduler_decision(evidence);
+        elapsed
     }
 }
 
@@ -1011,6 +1132,7 @@ impl Scheduler {
             Ok(Collect::Busy(busy)) => {
                 if start.elapsed() >= self.wait_timeout {
                     tracing::debug!("scheduler permit wait timed out; running without a permit");
+                    request.evidence.borrow_mut().outcome = SchedulerOutcome::TimeoutFallback;
                     WaitStep::Stop
                 } else {
                     WaitStep::Busy(busy)
@@ -1020,6 +1142,7 @@ impl Scheduler {
                 tracing::debug!(
                     "scheduler permit lock failed ({error:#}); running without a permit"
                 );
+                request.evidence.borrow_mut().outcome = unavailable_outcome();
                 WaitStep::Stop
             }
         }
@@ -1046,6 +1169,10 @@ impl Scheduler {
         allowance: Duration,
     ) -> Result<Collect> {
         request.saved_for_tests.set(0);
+        {
+            let mut evidence = request.evidence.borrow_mut();
+            evidence.requested_slots = Some(evidence.requested_slots.unwrap_or(0).max(need));
+        }
         let wait = queue::LOCK_WAIT.min(allowance);
         match queue::lock(&self.root, wait) {
             Ok(Some(_queue)) => match self.admit_in_order(request, need, ticket) {
@@ -1095,6 +1222,7 @@ impl Scheduler {
             Collect::Busy(busy) => {
                 if ticket.is_none() {
                     *ticket = Some(queue::Ticket::create(&self.root, me, now)?);
+                    request.queued_at.set(Some(Instant::now()));
                 }
                 Ok(Collect::Busy(busy))
             }
@@ -1105,15 +1233,18 @@ impl Scheduler {
     /// `spare` every other free one.
     fn collect_unordered(&self, request: &Request, need: u32) -> Result<Collect> {
         let range = self.range(request.kind);
-        Ok(
-            match try_collect_slots(self, range.clone(), need as usize)? {
-                Collect::Ready(mut slots) if request.spare => {
-                    slots.extend(self.take_free_slots(range));
-                    Collect::Ready(slots)
-                }
-                collect => collect,
-            },
-        )
+        let collected = try_collect_slots(self, range.clone(), need as usize)?;
+        request.available(match &collected {
+            Collect::Ready(slots) => slots.len() as u32,
+            Collect::Busy(busy) => (range.len() as u32).saturating_sub(busy.len() as u32),
+        });
+        Ok(match collected {
+            Collect::Ready(mut slots) if request.spare => {
+                slots.extend(self.take_free_slots(range));
+                Collect::Ready(slots)
+            }
+            collect => collect,
+        })
     }
 
     /// Lock every free slot of the pool, let [`queue::plan`] decide which are
@@ -1135,6 +1266,7 @@ impl Scheduler {
                 None => busy.push(index),
             }
         }
+        request.available(free.len() as u32);
         let indexes: Vec<u32> = free.iter().map(|(index, _)| *index).collect();
         let plan = queue::plan(
             &queue::with_entry(queued, me),
@@ -2134,6 +2266,7 @@ mod tests {
             kind: queue::Kind::Compile,
             spare: false,
             saved_for_tests: std::cell::Cell::new(0),
+            ..Request::new(queue::Kind::Compile, false)
         };
         let mut ticket = None;
         assert!(
@@ -4915,3 +5048,7 @@ mod tests {
         assert!(queued(cache).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler/evidence_tests.rs"]
+mod evidence_tests;

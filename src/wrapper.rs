@@ -2178,6 +2178,13 @@ fn run_cc_with_store(
     } = invocation;
     let start = *start;
     let invocation_start_ns = *invocation_start_ns;
+    let _cancel_event = SchedulerCancellationEvent {
+        config,
+        root: event_root,
+        crate_name,
+        start,
+    };
+
     let rebuilt_package = parsed.invocation_env.var("CARGO_PKG_NAME").ok();
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
@@ -3944,6 +3951,13 @@ fn run_parsed_rustc(
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(args);
+    let _cancel_event = SchedulerCancellationEvent {
+        config,
+        root: &event_root,
+        crate_name,
+        start,
+    };
+
     // What this invocation's keys record for its event. The keyed flow a
     // deferred compile re-enters continues the record its first key started.
     let mut key_record = precompiled
@@ -9342,6 +9356,31 @@ impl<'a> EventInputs<'a> {
     }
 }
 
+/// A cancelled scheduler wait can return before a compiler result exists.
+/// Retain its recorded evidence without changing that return or starting work.
+struct SchedulerCancellationEvent<'a> {
+    config: &'a Config,
+    root: &'a str,
+    crate_name: &'a str,
+    start: std::time::Instant,
+}
+
+impl Drop for SchedulerCancellationEvent<'_> {
+    fn drop(&mut self) {
+        if crate::opcounts::unlogged_scheduler_cancellation() {
+            log_event(
+                self.config,
+                EventInputs::new(
+                    self.root,
+                    self.crate_name,
+                    EventResult::Error,
+                    u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+            );
+        }
+    }
+}
+
 /// Build the event for `inputs` and append it to the event log.
 pub(crate) fn log_event(config: &Config, inputs: EventInputs<'_>) {
     let _trace = crate::phase_trace::phase("event_report");
@@ -9388,6 +9427,7 @@ pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
         tracing::debug!(crate_name = %event.crate_name, "could not record compiler event: {error:#}");
         return;
     }
+    crate::opcounts::mark_event_written();
     let _ = events::rotate_events_if_needed(
         &config.event_log_path(),
         config.event_log_max_size,
@@ -9535,7 +9575,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
             .then(|| cache_key.to_string()),
         rebuilt_path: rebuilt.primary,
         rebuilt_paths: rebuilt.paths,
-        schema: 26,
+        schema: 27,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -9554,6 +9594,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
             .unwrap_or(u32::MAX),
         flight_wait_ms: crate::opcounts::flight_wait_ms(),
         permit_wait_ms: crate::opcounts::permit_wait_ms(),
+        scheduler_decisions: crate::opcounts::scheduler_decisions(),
         store_output_blobs: store_put.output_blobs,
         store_duplicate_blobs: store_put.duplicate_blobs,
         store_new_blobs: store_put.new_blobs,

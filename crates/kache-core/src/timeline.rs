@@ -215,6 +215,9 @@ pub struct TimelineUnit {
     pub flight_wait_ms: u64,
     #[serde(default)]
     pub permit_wait_ms: u64,
+    /// Optional admission evidence. Schema 7 readers ignore this extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduler_decisions: Vec<crate::scheduler::SchedulerDecision>,
     #[serde(default)]
     pub compiler_runs: u32,
     /// Schema of the wrapper event this unit came from.
@@ -533,5 +536,52 @@ mod tests {
         assert!(record.units.is_empty());
         assert!(record.transfers.is_empty());
         assert_eq!(record.identity.source, IdentitySource::Absent);
+    }
+    #[test]
+    fn optional_scheduler_evidence_keeps_schema_seven_readers_compatible() {
+        use crate::scheduler::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
+        #[derive(Deserialize)]
+        struct OldUnit {
+            cache_key: String,
+            flight_wait_ms: u64,
+            permit_wait_ms: u64,
+        }
+        #[derive(Deserialize)]
+        struct OldTimeline {
+            schema: u32,
+            units: Vec<OldUnit>,
+        }
+        let record = BuildTimeline {
+            schema: BUILD_TIMELINE_SCHEMA,
+            units: vec![TimelineUnit {
+                cache_key: "k".into(),
+                flight_wait_ms: 3,
+                permit_wait_ms: 17,
+                scheduler_decisions: vec![SchedulerDecision {
+                    phase: SchedulerPhase::Capacity,
+                    outcome: SchedulerOutcome::Admitted,
+                    elapsed_ms: 17,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let raw = serde_json::to_vec(&record).unwrap();
+        let old: OldTimeline = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            old.schema, 7,
+            "the deployed service still admits this envelope"
+        );
+        assert_eq!(old.units[0].cache_key, "k");
+        assert_eq!(old.units[0].flight_wait_ms, 3);
+        assert_eq!(old.units[0].permit_wait_ms, 17);
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["units"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("scheduler_decisions");
+        let decoded: BuildTimeline = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.units[0].scheduler_decisions.is_empty());
     }
 }

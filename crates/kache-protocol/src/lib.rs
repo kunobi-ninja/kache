@@ -418,6 +418,12 @@ pub struct EventStatsResponse {
     pub errors: usize,
     pub total_elapsed_ms: u64,
     #[serde(default)]
+    pub total_flight_wait_ms: u64,
+    #[serde(default)]
+    pub total_permit_wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longest_scheduler_wait: Option<kache_core::scheduler::SchedulerWait>,
+    #[serde(default)]
     pub hit_elapsed_ms: u64,
     #[serde(default)]
     pub miss_elapsed_ms: u64,

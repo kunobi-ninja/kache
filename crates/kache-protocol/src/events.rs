@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+pub use kache_core::scheduler::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
 use serde::{Deserialize, Serialize};
 
 /// Coarse class of a free-form passthrough reason.
@@ -105,6 +106,7 @@ pub struct BuildEvent {
     /// 24 = per-variable hashes of compiler-reported environment inputs.
     /// 25 = reasons for compiled results that were not stored.
     /// 26 = successful compilation outputs and captured package identity.
+    /// 27 = recorded scheduler decisions and admission outcomes.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -175,6 +177,9 @@ pub struct BuildEvent {
     /// Schema 17.
     #[serde(default)]
     pub permit_wait_ms: u64,
+    /// Completed coordination attempts; absent in events before schema 27.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduler_decisions: Vec<SchedulerDecision>,
     /// Unique output blobs handled by store put (compiled outcomes only).
     #[serde(default)]
     pub store_output_blobs: u32,
@@ -588,6 +593,7 @@ impl BuildEvent {
             prediction_mismatches: 0,
             flight_wait_ms: 0,
             permit_wait_ms: 0,
+            scheduler_decisions: Vec::new(),
             store_output_blobs: 0,
             store_duplicate_blobs: 0,
             store_new_blobs: 0,

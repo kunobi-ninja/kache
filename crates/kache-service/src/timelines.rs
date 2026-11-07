@@ -772,6 +772,42 @@ mod tests {
     }
 
     #[test]
+    fn schema_seven_accepts_optional_scheduler_evidence_and_preserves_its_bytes() {
+        use kache_core::{
+            scheduler::{SchedulerDecision, SchedulerOutcome, SchedulerPhase},
+            timeline::TimelineUnit,
+        };
+        let record = BuildTimeline {
+            schema: 7,
+            client_record_id: "scheduler-extension".into(),
+            session_id: "s".into(),
+            units: vec![TimelineUnit {
+                cache_key: "k".into(),
+                scheduler_decisions: vec![SchedulerDecision {
+                    phase: SchedulerPhase::Capacity,
+                    outcome: SchedulerOutcome::TimeoutFallback,
+                    elapsed_ms: 30002,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let raw = serde_json::to_vec(&record).unwrap();
+        let (decoded, stored) =
+            decode_submission(Some("zstd"), &zstd(&raw), DEFAULT_MAX_DECODED_BYTES).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(stored, raw);
+        let mut future = serde_json::to_value(record).unwrap();
+        future["units"][0]["future_optional_admission_field"] = serde_json::json!({"unknown":true});
+        let raw = serde_json::to_vec(&future).unwrap();
+        let (decoded, stored) =
+            decode_submission(Some("zstd"), &zstd(&raw), DEFAULT_MAX_DECODED_BYTES).unwrap();
+        assert_eq!(decoded.schema, 7);
+        assert_eq!(stored, raw, "unrecognized optional fields survive storage");
+    }
+
+    #[test]
     fn decodes_a_zstd_record_and_returns_its_json() {
         let json = record_json(BUILD_TIMELINE_SCHEMA, "r1");
         let (record, decoded) =

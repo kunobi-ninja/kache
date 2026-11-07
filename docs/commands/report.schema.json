@@ -386,6 +386,23 @@
     }
   },
   "definitions": {
+    "SchedulerDecision": {
+      "type": "object",
+      "required": ["phase", "outcome", "elapsed_ms"],
+      "properties": {
+        "phase": { "type": "string", "enum": ["flight", "discovery", "capacity", "unknown"] },
+        "outcome": { "type": "string", "enum": ["admitted", "peer_completed", "recovery_admitted", "lease_covered", "cancelled", "unavailable", "timeout_fallback", "unknown"] },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "requested_slots": { "type": "integer", "minimum": 0, "description": "Largest slot request made during the attempt, including pressure headroom." },
+        "available_slots": { "type": "integer", "minimum": 0, "description": "Fewest free slots observed by an admission scan. Successful scans may stop once the request fits, so this is a lower bound." },
+        "pool_slots": { "type": "integer", "minimum": 1 },
+        "pressure": { "type": "string", "enum": ["calm", "warning", "critical", "unknown"], "description": "Strongest reading used during this completed attempt. Omitted when admission did not sample pressure or checking was disabled." },
+        "pressure_ceiling": { "type": "integer", "minimum": 1, "description": "Lowest admission ceiling observed during the attempt." },
+        "background": { "type": "boolean", "description": "Priority used to assign this request's queue rank." },
+        "queued_ms": { "type": "integer", "minimum": 0, "description": "Time since the request received its first queue ticket. Omitted if it never queued or the queue was unavailable." },
+        "recovery_slots": { "type": "integer", "minimum": 1 }
+      }
+    },
     "CrateDetail": {
       "type": "object",
       "required": [
@@ -461,6 +478,7 @@
         "lookup_ms": { "type": "integer", "minimum": 0 },
         "wait_ms": { "type": "integer", "minimum": 0, "description": "flight_wait_ms + permit_wait_ms. Zero for events written before schema 17." },
         "flight_wait_ms": { "type": "integer", "minimum": 0, "description": "Zero for events written before schema 17." },
+        "scheduler_decisions": { "type": "array", "items": { "$ref": "#/definitions/SchedulerDecision" }, "description": "Original recorded scheduler evidence. Omitted for older events and invocations with no scheduler coordination." },
         "permit_wait_ms": { "type": "integer", "minimum": 0, "description": "Zero for events written before schema 17." },
         "restore_ms": { "type": "integer", "minimum": 0 },
         "store_ms": { "type": "integer", "minimum": 0 },
@@ -624,6 +642,7 @@
         "lookup_ms": { "type": "integer", "minimum": 0 },
         "wait_ms": { "type": "integer", "minimum": 0, "description": "flight_wait_ms + permit_wait_ms." },
         "flight_wait_ms": { "type": "integer", "minimum": 0 },
+        "scheduler_decisions": { "type": "array", "items": { "$ref": "#/definitions/SchedulerDecision" }, "description": "Original recorded scheduler evidence. Omitted for older events and invocations with no scheduler coordination." },
         "permit_wait_ms": { "type": "integer", "minimum": 0 },
         "restore_ms": { "type": "integer", "minimum": 0 },
         "store_ms": { "type": "integer", "minimum": 0 },

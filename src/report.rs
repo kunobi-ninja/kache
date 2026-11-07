@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::daemon::{TransferDirection, TransferEvent};
 use crate::events::{self, BuildEvent, EventResult};
 use crate::since::SinceWindow;
+use kache_core::scheduler::{SchedulerDecision, SchedulerOutcome, SchedulerPhase, SchedulerWait};
 
 mod eviction_evidence;
 
@@ -902,6 +903,8 @@ pub struct TraceArgs {
     pub flight_wait_ms: u64,
     #[serde(default)]
     pub permit_wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduler_decisions: Vec<SchedulerDecision>,
     #[serde(default)]
     pub restore_ms: u64,
     #[serde(default)]
@@ -940,6 +943,8 @@ pub struct TracePhaseArgs {
     /// The slice this one nests in: the crate slice's name, or `key` for
     /// `dep-info`.
     pub parent: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scheduler_decisions: Vec<SchedulerDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1020,6 +1025,8 @@ pub struct CrateDetail {
     pub flight_wait_ms: u64,
     #[serde(default)]
     pub permit_wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduler_decisions: Vec<SchedulerDecision>,
     #[serde(default)]
     pub restore_ms: u64,
     #[serde(default)]
@@ -1254,6 +1261,19 @@ pub fn generate_report_with_filter(
         total_cacheable,
         total_hits,
     );
+    let mut costly_waits: Vec<_> = build_events
+        .iter()
+        .filter(|event| event.wait_ms() >= 1000)
+        .collect();
+    costly_waits.sort_by_key(|event| std::cmp::Reverse(event.wait_ms()));
+    suggestions.extend(costly_waits.into_iter().take(3).map(|event| {
+        scheduler_wait_note(&SchedulerWait {
+            crate_name: event.crate_name.clone(),
+            flight_wait_ms: event.flight_wait_ms,
+            permit_wait_ms: event.permit_wait_ms,
+            decisions: event.scheduler_decisions.clone(),
+        })
+    }));
     if let Some(alarm) = unexplained_suggestion(&build_events) {
         suggestions.push(alarm);
     }
@@ -1704,6 +1724,7 @@ fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
             wait_ms: event.wait_ms(),
             flight_wait_ms: event.flight_wait_ms,
             permit_wait_ms: event.permit_wait_ms,
+            scheduler_decisions: event.scheduler_decisions.clone(),
             restore_ms: event.restore_ms,
             store_ms: event.store_ms,
             unattributed_ms: event.unattributed_ms(),
@@ -1778,6 +1799,20 @@ impl<'a> PhaseLane<'a> {
                 phase: phase.to_string(),
                 phase_ms: ms,
                 parent: parent_name.to_string(),
+                scheduler_decisions: self
+                    .parent
+                    .args
+                    .scheduler_decisions
+                    .iter()
+                    .filter(|decision| {
+                        matches!(
+                            (phase, decision.phase),
+                            ("flight_wait", SchedulerPhase::Flight)
+                                | ("permit_wait", SchedulerPhase::Capacity)
+                        )
+                    })
+                    .cloned()
+                    .collect(),
             },
         })
     }
@@ -1809,7 +1844,13 @@ fn trace_phase_events(parent: &TraceEvent) -> Vec<TracePhaseEvent> {
         key_start_us,
     );
     lane.next("lookup", args.lookup_ms);
+    let wait_start_us = lane.cursor_us;
     lane.next("wait", args.wait_ms);
+    lane.nested("flight_wait", args.flight_wait_ms, "wait", wait_start_us);
+    let permit_start_us = wait_start_us.saturating_add(
+        i64::try_from(args.flight_wait_ms.saturating_mul(1000)).unwrap_or(i64::MAX),
+    );
+    lane.nested("permit_wait", args.permit_wait_ms, "wait", permit_start_us);
     // Overhead equals elapsed on a hit (the stored compile cost was not spent
     // here), so this is non-zero only when this process ran the compiler.
     lane.next("compile", args.elapsed_ms.saturating_sub(args.overhead_ms));
@@ -1854,6 +1895,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         wait_ms: e.wait_ms(),
         flight_wait_ms: e.flight_wait_ms,
         permit_wait_ms: e.permit_wait_ms,
+        scheduler_decisions: e.scheduler_decisions.clone(),
         restore_ms: e.restore_ms,
         store_ms: e.store_ms,
         unattributed_ms: e.unattributed_ms(),
@@ -2472,6 +2514,57 @@ fn rotation_cut_notice(max_size: u64, last_build: bool) -> String {
          the counts above are incomplete; raise [cache] event_log_max_size",
         bytesize::ByteSize(max_size)
     )
+}
+
+/// Describe only recorded history; this is never a claim about current pressure.
+pub(crate) fn scheduler_wait_note(wait: &SchedulerWait) -> String {
+    let mut note = format!(
+        "Recorded scheduler wait for `{}`: flight {}, capacity {}",
+        wait.crate_name,
+        crate::term::duration_ms(wait.flight_wait_ms),
+        crate::term::duration_ms(wait.permit_wait_ms)
+    );
+    if wait.decisions.is_empty() {
+        note.push_str("; outcome and cause unknown (no decision recorded)");
+    }
+    for decision in &wait.decisions {
+        let phase = match decision.phase {
+            SchedulerPhase::Flight => "flight",
+            SchedulerPhase::Discovery => "discovery",
+            SchedulerPhase::Capacity => "capacity",
+            SchedulerPhase::Unknown => "unknown phase",
+        };
+        let outcome = match decision.outcome {
+            SchedulerOutcome::Admitted => "admitted",
+            SchedulerOutcome::PeerCompleted => "peer released flight (recheck required)",
+            SchedulerOutcome::RecoveryAdmitted => "recovery admitted",
+            SchedulerOutcome::LeaseCovered => "covered by test lease",
+            SchedulerOutcome::Cancelled => "cancelled",
+            SchedulerOutcome::Unavailable => "scheduler unavailable",
+            SchedulerOutcome::TimeoutFallback => "timeout fallback",
+            SchedulerOutcome::Unknown => "unknown outcome",
+        };
+        note.push_str(&format!(
+            "; {phase}: {outcome} ({} ms)",
+            decision.elapsed_ms
+        ));
+        if let Some(requested) = decision.requested_slots {
+            note.push_str(&format!(", requested up to {requested} slots"));
+        }
+        if let Some(available) = decision.available_slots {
+            note.push_str(&format!(", least observed free {available}"));
+        }
+        if let Some(pressure) = decision.pressure {
+            let pressure = match pressure {
+                kache_core::scheduler::SchedulerPressure::Calm => "calm",
+                kache_core::scheduler::SchedulerPressure::Warning => "warning",
+                kache_core::scheduler::SchedulerPressure::Critical => "critical",
+                kache_core::scheduler::SchedulerPressure::Unknown => "unknown",
+            };
+            note.push_str(&format!(", observed pressure {pressure}"));
+        }
+    }
+    note
 }
 
 fn generate_suggestions(

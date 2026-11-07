@@ -25,8 +25,8 @@ jobs:
         include:
           - issue: '1859'
             base: bbfa892bb513df8a7079055b75a7f48449a2ae8d
-            head: e903c73448737ea885834c380c1c24fed4b59238
-            tree: bfc47360d2987e33386865780a45ee7ff0037cbd
+            head: a4085700b2c2083445a14840509ac14f6c3b09a2
+            tree: a2ca77dc09b9890e1a4fa26622a93074cba4870c
     defaults:
       run:
         shell: bash
@@ -114,6 +114,43 @@ jobs:
             printf 'rustup_toolchain=1.99.1\nrustc_path=%s\ncargo_path=%s\n' "$VALIDATION_RUSTC" "$VALIDATION_CARGO"
             printf 'rustc_identity=%s\ncargo_identity=%s\n' "$VALIDATION_EXPECTED_RUSTC" "$VALIDATION_EXPECTED_CARGO"
           } >> "$evidence/provenance.txt"
+          # Replay the surviving arithmetic mutation before the complete check.
+          # Require an assertion failure in the new regression, then restore
+          # the exact candidate bytes. A build failure does not count.
+          pack_source=src/remote_layout.rs
+          pack_backup="$evidence/remote_layout.rs.original"
+          cp "$pack_source" "$pack_backup"
+          restore_pack_source() { cp "$pack_backup" "$pack_source"; }
+          trap restore_pack_source EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('src/remote_layout.rs')
+          text = source.read_text()
+          original = '.saturating_add(file.name.len() as u64 * 2)'
+          assert text.count(original) == 1
+          source.write_text(text.replace(original, '.saturating_add(file.name.len() as u64 + 2)'))
+          PY
+          set +e
+          validation_env "$VALIDATION_CARGO" test -p kache --bin kache \
+            remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance \
+            -- --exact --nocapture 2>&1 | tee "$evidence/pack-bound-negative-control.log"
+          negative_status=("${PIPESTATUS[@]}")
+          set -e
+          restore_pack_source
+          trap - EXIT
+          cmp "$pack_source" "$pack_backup"
+          test "${negative_status[0]}" -eq 101
+          test "${negative_status[1]}" -eq 0
+          python3 - "$evidence" <<'PY'
+          from pathlib import Path
+          import json, sys
+          evidence = Path(sys.argv[1])
+          log = (evidence / 'pack-bound-negative-control.log').read_text()
+          assert 'test remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance ... FAILED' in log
+          assert 'assertion `left == right` failed' in log
+          assert 'test result: FAILED. 0 passed; 1 failed' in log
+          (evidence / 'negative-control.json').write_text(json.dumps({'mutation': 'replace * with + in pack_size_bound', 'exit': 101, 'assertion_failure': True, 'source_restored_byte_for_byte': True}) + '\n')
+          PY
           set +e
           validation_env "$VALIDATION_JUST" check 2>&1 | tee "$evidence/just-check.log"
           statuses=("${PIPESTATUS[@]}")

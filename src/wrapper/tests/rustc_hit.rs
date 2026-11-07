@@ -118,6 +118,254 @@ impl Fixture {
     }
 }
 
+fn shared_width_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    let mut argv = vec![fixture.args.rustc.display().to_string()];
+    argv.extend_from_slice(&fixture.args.all_args);
+    argv.extend([
+        "--cap-lints=allow".to_string(),
+        "--force-warn=unused_crate_dependencies".to_string(),
+        "--error-format=json".to_string(),
+        "--json=artifacts,future-incompat,unused-externs-silent".to_string(),
+    ]);
+    fixture.args = RustcArgs::parse(&argv).unwrap();
+    fixture
+}
+
+#[test]
+fn shared_width_entry_eligibility_requires_files_and_compatible_diagnostics() {
+    let mut fixture = shared_width_fixture();
+    assert!(!rustc_diagnostics::entry_usable(
+        &fixture.args,
+        &fixture.meta
+    ));
+    let ordinary = Fixture::new();
+    assert!(rustc_diagnostics::entry_usable(
+        &ordinary.args,
+        &fixture.meta
+    ));
+    fixture.meta.stdout.clear();
+    fixture.meta.stderr.clear();
+    assert!(rustc_diagnostics::entry_usable(
+        &fixture.args,
+        &fixture.meta
+    ));
+    fixture.meta.files.clear();
+    assert!(!rustc_diagnostics::entry_usable(
+        &fixture.args,
+        &fixture.meta
+    ));
+    assert!(!rustc_diagnostics::entry_usable(
+        &ordinary.args,
+        &fixture.meta
+    ));
+}
+
+#[test]
+fn shared_width_policy_miss_reacquires_the_scheduler_flight_after_contention() {
+    let _lock = crate::test_support::process_state_test_lock();
+    // The file-only predicate reproduces the old route: it hands back an
+    // unusable hit and drops the permit before the compiler runs.
+    for file_only in [true, false] {
+        let fixture = shared_width_fixture();
+        fixture.publish();
+        let cache = fixture.config.cache_dir.clone();
+        let mut holder = spawn_flight_holder(&cache, "foo", CACHE_KEY);
+        wait_flight_ready(&cache, &mut holder);
+        let config = fixture.config.clone();
+        let args = fixture.args.clone();
+        let waiter = std::thread::spawn(move || {
+            let store = Store::open(&config).unwrap();
+            admit_scheduler_miss(
+                &config,
+                &store,
+                CACHE_KEY,
+                FlightIdentity::rustc("foo", &["lib".to_string()], false),
+                "foo",
+                false,
+                |meta| {
+                    if file_only {
+                        cache_entry_has_files(meta)
+                    } else {
+                        rustc_diagnostics::entry_usable(&args, meta)
+                    }
+                },
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(cache.join("go"), b"go").unwrap();
+        let (guard, hit) = waiter.join().unwrap();
+        assert_eq!(hit.is_some(), file_only);
+        assert_eq!(guard.is_empty(), file_only);
+        assert!(holder.wait().unwrap().success());
+    }
+}
+
+#[test]
+fn shared_width_hits_reject_legacy_diagnostics_before_restoring_any_output() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = shared_width_fixture();
+    let out_dir = fixture.args.out_dir.as_ref().unwrap();
+    std::fs::create_dir_all(out_dir).unwrap();
+    let output = out_dir.join("libfoo.rmeta");
+    std::fs::write(&output, b"consumer output").unwrap();
+    let mut legacy = serde_json::to_value(&fixture.meta).unwrap();
+    legacy.as_object_mut().unwrap().remove("key_schema");
+    fixture.meta = serde_json::from_value(legacy).unwrap();
+    assert_eq!(fixture.meta.key_schema, 0);
+    for (stdout, stderr) in [
+        (
+            "",
+            r#"{"$message_type":"future_incompat","future_incompat_report":[{"diagnostic":{"rendered":"warning at an old width"}}]}"#,
+        ),
+        ("unexpected compiler output", ""),
+        ("", "{invalid JSON"),
+        ("", r#"{"$message_type":"unknown"}"#),
+    ] {
+        fixture.meta.stdout = stdout.to_string();
+        fixture.meta.stderr = stderr.to_string();
+        assert!(!fixture.context().accepts_diagnostics(&fixture.meta));
+        for result in [
+            EventResult::LocalHit,
+            EventResult::RemoteHit,
+            EventResult::PrefetchHit,
+        ] {
+            let error = fixture
+                .context()
+                .restore_and_finish(
+                    &fixture.store,
+                    &fixture.meta,
+                    result,
+                    CACHE_KEY,
+                    0,
+                    FileHashStats::default(),
+                    0,
+                    Some(&fixture.store),
+                    &fixture.key(),
+                    &key_record(),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("original terminal width"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"consumer output");
+            assert!(!out_dir.join("second.rmeta").exists());
+            assert!(!fixture.config.event_log_path().exists());
+            assert!(fixture.args.incremental.as_ref().unwrap().is_dir());
+            let identity = crate::cache_key::rustc_prediction_identity(&fixture.args).unwrap();
+            assert!(
+                fixture
+                    .store
+                    .file_hasher()
+                    .input_prediction(&identity)
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_width_concurrent_winner_is_validated_before_restore() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = shared_width_fixture();
+    fixture.meta.stdout.clear();
+    fixture.meta.stderr = r#"{"$message_type":"diagnostic","rendered":"old warning"}"#.to_string();
+    fixture.publish();
+    let BuildClaim::Committed(meta) = fixture.store.claim_build(CACHE_KEY).unwrap() else {
+        panic!("published concurrent entry must be visible");
+    };
+    assert!(!fixture.context().accepts_diagnostics(&meta));
+    let error = fixture
+        .context()
+        .restore_and_finish(
+            &fixture.store,
+            &meta,
+            EventResult::LocalHit,
+            CACHE_KEY,
+            0,
+            FileHashStats::default(),
+            0,
+            None,
+            &fixture.key(),
+            &key_record(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("original terminal width"));
+    assert!(!fixture.args.out_dir.as_ref().unwrap().exists());
+    assert!(!fixture.config.event_log_path().exists());
+}
+
+#[test]
+fn shared_width_safe_legacy_entry_still_restores() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = shared_width_fixture();
+    fixture.meta.key_schema = 0;
+    fixture.meta.stdout.clear();
+    fixture.meta.stderr = r#"{"$message_type":"unused_extern","lint_level":"force-warn","unused_extern_names":["dep"]}"#.to_string();
+    assert!(fixture.context().accepts_diagnostics(&fixture.meta));
+    fixture
+        .context()
+        .restore_and_finish(
+            &fixture.store,
+            &fixture.meta,
+            EventResult::LocalHit,
+            CACHE_KEY,
+            0,
+            FileHashStats::default(),
+            0,
+            None,
+            &fixture.key(),
+            &key_record(),
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read(fixture.args.out_dir.as_ref().unwrap().join("libfoo.rmeta")).unwrap(),
+        b"metadata",
+    );
+    assert_eq!(
+        events::read_events(&fixture.config.event_log_path())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn shared_width_remote_and_prefetch_unsafe_entries_are_policy_misses() {
+    let _lock = crate::test_support::process_state_test_lock();
+    for prefetched in [false, true] {
+        let mut fixture = shared_width_fixture();
+        fixture.config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        fixture.meta.stdout.clear();
+        fixture.meta.stderr =
+            r#"{"$message_type":"diagnostic","rendered":"old wrapping"}"#.to_string();
+        fixture.publish();
+        let daemon = RemoteCheckReplyDaemon::with_reply(
+            fixture.config.socket_path(),
+            serde_json::json!({"ok": true, "found": true, "prefetched": prefetched}),
+        );
+        assert!(
+            try_rustc_remote_hit(
+                &fixture.context(),
+                &fixture.store,
+                CACHE_KEY,
+                0,
+                FileHashStats::default(),
+                0,
+                true,
+                &fixture.key(),
+                &key_record(),
+            )
+            .is_none()
+        );
+        assert_eq!(daemon.request_count(), 1);
+        assert!(!fixture.args.out_dir.as_ref().unwrap().exists());
+        assert!(!fixture.config.event_log_path().exists());
+        assert!(fixture.args.incremental.as_ref().unwrap().exists());
+    }
+}
+
 // Run in a subprocess so assertions can observe the real compiler streams.
 #[test]
 #[ignore]

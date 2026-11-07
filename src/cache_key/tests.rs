@@ -12048,9 +12048,9 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
-    let base = key_of_flags(&flag_base(&source, &[]));
+    let base = key_of_flags(&diagnostic_flag_base(&source, &[]));
     assert!(
-        outputs_of_flags(&flag_base(&source, &[]))
+        outputs_of_flags(&diagnostic_flag_base(&source, &[]))
             .fields
             .unwrap()
             .contains_key("diagnostics"),
@@ -12063,19 +12063,37 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         ("--diagnostic-width", "80", "120"),
     ] {
         let attached = format!("{flag}={value}");
-        let first = key_of_flags(&flag_base(&source, &[&attached]));
-        let separated = key_of_flags(&flag_base(&source, &[flag, value]));
-        let different = key_of_flags(&flag_base(&source, &[flag, other]));
+        let first = key_of_flags(&diagnostic_flag_base(&source, &[&attached]));
+        let separated = key_of_flags(&diagnostic_flag_base(&source, &[flag, value]));
+        let different = key_of_flags(&diagnostic_flag_base(&source, &[flag, other]));
         assert_ne!(base, first, "{flag} changes cached diagnostics");
         assert_eq!(first, separated, "both spellings of {flag} agree");
         assert_ne!(first, different, "{flag} values must not collide");
         assert_ne!(
-            key_of_flags(&flag_base(&source, &[flag, value, flag, other])),
-            key_of_flags(&flag_base(&source, &[flag, other, flag, value])),
+            key_of_flags(&diagnostic_flag_base(&source, &[flag, value, flag, other])),
+            key_of_flags(&diagnostic_flag_base(&source, &[flag, other, flag, value])),
             "{flag} occurrence order must be preserved"
         );
     }
-    assert_eq!(base, key_of_flags(&flag_base(&source, &["--verbose"])));
+    assert_eq!(
+        base,
+        key_of_flags(&diagnostic_flag_base(&source, &["--verbose"]))
+    );
+}
+
+// Model Cargo library dependencies. Windows cdylib keys also probe and hash
+// the native MSVC linker and CRT libraries for every assertion.
+fn diagnostic_flag_base(source: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "mylib".to_string(),
+        source.to_string_lossy().to_string(),
+        "--crate-type".to_string(),
+        "rlib".to_string(),
+    ];
+    args.extend(extra.iter().map(|flag| flag.to_string()));
+    args
 }
 
 #[test]
@@ -12088,7 +12106,7 @@ fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
         let key = |extra: &[&str]| {
             let mut flags = cap.clone();
             flags.extend_from_slice(extra);
-            key_of_flags(&flag_base(&source, &flags))
+            key_of_flags(&diagnostic_flag_base(&source, &flags))
         };
         let base = key(&[]);
         for width in ["1", "80", "120", "65535"] {
@@ -12108,12 +12126,142 @@ fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
 }
 
 #[test]
+fn nightly_silent_unused_externs_share_terminal_and_piped_keys() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    for cap in [vec!["--cap-lints=allow"], vec!["--cap-lints", "allow"]] {
+        for forced in [
+            vec!["--force-warn=unused_crate_dependencies"],
+            vec!["--force-warn", "unused_crate_dependencies"],
+            vec!["--force-warn=unused-crate-dependencies"],
+            vec!["--force-warn", "unused-crate-dependencies"],
+        ] {
+            for json in [
+                vec!["--json=unused-externs-silent"],
+                vec![
+                    "--json",
+                    "diagnostic-rendered-ansi,artifacts,unused-externs-silent",
+                ],
+                vec![
+                    "--json=unused-externs-silent,diagnostic-short,diagnostic-unicode,future-incompat,timings",
+                ],
+            ] {
+                let mut flags = vec!["--error-format=json"];
+                flags.extend_from_slice(&cap);
+                flags.extend_from_slice(&forced);
+                flags.extend_from_slice(&json);
+                let piped = key_of_flags(&diagnostic_flag_base(&source, &flags));
+                for width in [
+                    vec!["--diagnostic-width=80"],
+                    vec!["--diagnostic-width", "120"],
+                ] {
+                    let mut terminal = flags.clone();
+                    terminal.extend_from_slice(&width);
+                    assert_eq!(
+                        piped,
+                        key_of_flags(&diagnostic_flag_base(&source, &terminal)),
+                        "{terminal:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nightly_silent_unused_externs_keep_observable_or_ambiguous_options_keyed() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    let cap = "--cap-lints=allow";
+    let forced = "--force-warn=unused_crate_dependencies";
+    let silent = "--json=unused-externs-silent";
+    let mut controls = vec![
+        vec![forced, silent],
+        vec!["--cap-lints=warn", forced, silent],
+        vec![cap, forced, silent, cap],
+        vec![cap, forced, silent, "--cap-lints"],
+        vec![cap, forced],
+        vec![cap, forced, "--json"],
+        vec![cap, forced, "--json="],
+        vec![cap, forced, "--json=artifacts"],
+        vec![cap, forced, "--json=unused-externs"],
+        vec![cap, forced, "--json=unused-externs-silent,unused-externs"],
+        vec![cap, forced, "--json=unused-externs,unused-externs-silent"],
+        vec![cap, forced, "--json=unused-externs-silent,"],
+        vec![cap, forced, "--json=unknown,unused-externs-silent"],
+        vec![cap, forced, "--json=unused-externs-silent-extra"],
+        vec![
+            cap,
+            forced,
+            "--json=unused-externs-silent,unused-externs-silent",
+        ],
+        vec![cap, forced, silent, silent],
+        vec![cap, forced, silent, "--json"],
+        vec![cap, forced, silent, "--json=artifacts"],
+        vec![cap, forced, silent, forced],
+        vec![
+            cap,
+            forced,
+            silent,
+            "--force-warn",
+            "unused-crate-dependencies",
+        ],
+        vec![cap, silent, "--force-warn"],
+        vec![cap, silent, "--force-warn="],
+    ];
+    for other in [
+        "--force-warn=unused",
+        "--force-warn=unused_variables",
+        "--force-warn=unused_crate_dependencies,unused_variables",
+    ] {
+        controls.push(vec![cap, silent, other]);
+        controls.push(vec![cap, forced, silent, other]);
+        controls.push(vec![cap, other, silent, forced]);
+    }
+    for flags in controls {
+        let key = |width: &[&str]| {
+            let mut all = width.to_vec();
+            all.extend_from_slice(&flags);
+            key_of_flags(&diagnostic_flag_base(&source, &all))
+        };
+        let piped = key(&[]);
+        let narrow = key(&["--diagnostic-width=80"]);
+        let wide = key(&["--diagnostic-width", "120"]);
+        assert_ne!(piped, narrow, "{flags:?}");
+        assert_ne!(narrow, wide, "{flags:?}");
+    }
+
+    let valid = [cap, forced, silent];
+    let piped = key_of_flags(&diagnostic_flag_base(&source, &valid));
+    for width in [
+        vec!["--diagnostic-width"],
+        vec!["--diagnostic-width="],
+        vec!["--diagnostic-width=garbage"],
+        vec!["--diagnostic-width=0"],
+        vec!["--diagnostic-width=65536"],
+        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
+    ] {
+        let mut flags = valid.to_vec();
+        flags.extend_from_slice(&width);
+        assert_ne!(
+            piped,
+            key_of_flags(&diagnostic_flag_base(&source, &flags)),
+            "{width:?}"
+        );
+    }
+}
+
+#[test]
 fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
-    let key = |flags: &[&str]| key_of_flags(&flag_base(&source, flags));
+    let key = |flags: &[&str]| key_of_flags(&diagnostic_flag_base(&source, flags));
     let capped = key(&["--cap-lints=allow"]);
     for retained in [
         vec!["--diagnostic-width"],

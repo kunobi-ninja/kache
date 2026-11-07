@@ -35,6 +35,7 @@ mod hit;
 use hit::HitCompletion;
 
 mod cc_diagnostics;
+mod rustc_diagnostics;
 
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
@@ -4507,7 +4508,7 @@ fn run_parsed_rustc(
                     crate_name
                 );
                 let _ = hit_store.remove_entry(&cache_key);
-            } else {
+            } else if hit_context.accepts_diagnostics(&meta) {
                 tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
                 match hit_context.restore_and_finish(
                     hit_store,
@@ -4707,7 +4708,7 @@ fn run_parsed_rustc(
             FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
             crate_name,
             args.invokes_linker(),
-            cache_entry_has_files,
+            |meta| rustc_diagnostics::entry_usable(args, meta),
         )
     } else {
         (MissGuard::empty(), None)
@@ -4739,7 +4740,9 @@ fn run_parsed_rustc(
     };
 
     let peer_committed = committed.is_some();
-    if let Some(meta) = committed.filter(|_| precompiled.is_none()) {
+    if let Some(meta) =
+        committed.filter(|meta| precompiled.is_none() && hit_context.accepts_diagnostics(meta))
+    {
         if let Err(e) = hit_context.restore_and_finish(
             &store,
             &meta,
@@ -4981,8 +4984,17 @@ fn run_parsed_rustc(
     // A Windows executable finds its `.pdb` by the GUID, age and name it
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
-    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
-        tracing::warn!("not caching {crate_name}: {reason}");
+    let width_dependent = (args.diagnostic_width_can_be_shared()
+        && !rustc_diagnostics::width_independent(&result.stdout, &result.stderr))
+    .then(|| "compiler diagnostics require their original terminal width".to_string());
+    let unsafe_output = unaudited.or(degraded).or(unpaired);
+    let warn = unsafe_output.is_some();
+    if let Some(reason) = unsafe_output.or(width_dependent) {
+        if warn {
+            tracing::warn!("not caching {crate_name}: {reason}");
+        } else {
+            tracing::debug!("not caching {crate_name}: {reason}");
+        }
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
             config,
@@ -6585,7 +6597,7 @@ fn adaptive_compile_before_key(
             false,
         );
         match stored {
-            Ok(Some(meta)) if cache_entry_has_files(&meta) => {
+            Ok(Some(meta)) if rustc_diagnostics::entry_usable(ctx.args, &meta) => {
                 hit_closure = Some((dep_info, tree_guard.clone()));
                 false
             }
@@ -6766,9 +6778,13 @@ fn compile_before_key(
                 return true;
             };
             let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
-            let stored = keyed
-                .ok()
-                .is_some_and(|keyed| ctx.store.get(&keyed.cache_key).ok().flatten().is_some());
+            let stored = keyed.ok().is_some_and(|keyed| {
+                ctx.store
+                    .get(&keyed.cache_key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|meta| rustc_diagnostics::entry_usable(args, &meta))
+            });
             if stored {
                 hit_closure = Some((dep_info, tree.clone()));
             }
@@ -7534,6 +7550,9 @@ fn try_rustc_remote_hit(
         hit.crate_name,
         NegativeReply::CheckConcurrentEntry,
     )?;
+    if !hit.accepts_diagnostics(&meta) {
+        return None;
+    }
     Some(hit.restore_and_finish(
         store,
         &meta,

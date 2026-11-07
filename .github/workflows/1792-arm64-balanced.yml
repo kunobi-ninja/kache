@@ -1,0 +1,82 @@
+name: Maintainer 1792 ARM64 diagnostic
+
+on:
+  push:
+    branches: [validation/1792-arm64-balanced-20261107]
+    paths:
+      - .github/workflows/1792-arm64-balanced.yml
+      - scripts/adoption/windows-1792-balanced.py
+      - scripts/adoption/test-windows-1792-balanced.py
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    # One initial branch publication, no reruns or subsequent candidate pushes.
+    if: github.repository == 'kunobi-ninja/kache' && github.event.created && github.run_attempt == 1
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_JOBS: "2"
+      NATIVE_HOST: aarch64-pc-windows-msvc
+      KACHE_SOURCE: a31c14b58e8a58f283e7af86ee982519ee0e72cc
+    steps:
+      - name: Set the global deadline and require a hosted ARM64 runner
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          if ($env:RUNNER_KIND -ne 'github-hosted' -or $env:PROCESSOR_ARCHITECTURE -ne 'ARM64') { throw 'Native hosted ARM64 runner required' }
+          "DIAGNOSTIC_STARTED=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/adoption
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: a31c14b58e8a58f283e7af86ee982519ee0e72cc
+          path: kache-source
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: nazar-pc/abundance
+          ref: 287cf9c6d266ce28d644bed050ce9a835f31fd80
+          path: workload
+          persist-credentials: false
+      - name: Build the pinned native release binaries
+        working-directory: kache-source
+        run: |
+          if ((git rev-parse HEAD) -ne $env:KACHE_SOURCE) { throw 'Wrong Kache source' }
+          rustup toolchain install "1.99.1-$env:NATIVE_HOST" --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Native toolchain unavailable' }
+          cargo "+1.99.1-$env:NATIVE_HOST" build --locked --release -p kache --bin kache --bin kache-engine
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $bin = Join-Path $env:RUNNER_TEMP '1792-pinned-bin'
+          New-Item -ItemType Directory -Path $bin -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath 'target/release/kache.exe','target/release/kache-engine.exe' -Destination $bin -ErrorAction Stop
+          # This checkout's completed build target is task-owned. Keep only binaries.
+          Remove-Item -LiteralPath 'target' -Recurse -Force -ErrorAction Stop
+      - name: Install and verify the pinned native workload toolchain
+        run: |
+          rustup toolchain install "nightly-2026-08-25-$env:NATIVE_HOST" --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Workload toolchain unavailable' }
+          $identity = rustc "+nightly-2026-08-25-$env:NATIVE_HOST" --version --verbose
+          if ($LASTEXITCODE -ne 0 -or $identity -notcontains "host: $env:NATIVE_HOST") { throw 'Wrong native workload host' }
+          if ((git -C workload rev-parse HEAD) -ne '287cf9c6d266ce28d644bed050ce9a835f31fd80') { throw 'Wrong workload source' }
+      - name: Run owned guards and the bounded diagnostic
+        run: |
+          python scripts/adoption/test-windows-1792-balanced.py
+          if ($LASTEXITCODE -ne 0) { throw 'Owned helper guards failed' }
+          python scripts/adoption/windows-1792-balanced.py --kache (Join-Path $env:RUNNER_TEMP '1792-pinned-bin/kache.exe') --workload (Join-Path $pwd 'workload') --output (Join-Path $env:RUNNER_TEMP '1792-arm64-evidence') --scratch (Join-Path $env:RUNNER_TEMP '1792-arm64-scratch') --started $env:DIAGNOSTIC_STARTED --helper-source $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic incomplete; inspect partial evidence' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: 1792-arm64-balanced
+          path: ${{ runner.temp }}/1792-arm64-evidence
+          retention-days: 7
+          if-no-files-found: warn

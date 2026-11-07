@@ -47,6 +47,30 @@ def identity(path):
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def executable_pair(frontend):
+    # Match kache_shims::engine_for: resolve the frontend first, then use its
+    # sibling engine. An engine beside a frontend symlink is not selected.
+    frontend = Path(frontend).resolve(strict=True)
+    engine = frontend.with_name("kache-engine").resolve(strict=True)
+    for path in (frontend, engine):
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValueError(f"benchmark executable is missing or not executable: {path}")
+    return {"frontend": identity(frontend), "engine": identity(engine)}
+
+
+def verify_pair(frontend, expected):
+    if executable_pair(frontend) != expected:
+        raise ValueError(f"benchmark executable pair changed: {frontend}")
+
+
+def pair_metadata(pairs):
+    return {
+        "base": pairs["base"]["frontend"], "base_engine": pairs["base"]["engine"],
+        "head": pairs["head"]["frontend"], "head_engine": pairs["head"]["engine"],
+        "identical_engine_bytes": pairs["base"]["engine"]["sha256"] == pairs["head"]["engine"]["sha256"],
+    }
+
+
 def snapshot(root):
     return {
         "memory_current_bytes": int(read(root / "memory.current")),
@@ -249,7 +273,8 @@ def summarize(samples, jobs, elapsed):
     }
 
 
-def run_batch(args, label, binary, sample_index, scenario):
+def run_batch(args, label, binary, sample_index, scenario, expected_pair):
+    verify_pair(binary, expected_pair)
     batch = args.output / f"{scenario}-{sample_index:02}-{label}"
     batch.mkdir()
     (batch / "kache.toml").write_text(
@@ -275,6 +300,7 @@ def run_batch(args, label, binary, sample_index, scenario):
     high_limits = HighLimits()
     abort = None
     started = time.monotonic()
+    measured_finished = None
     try:
         while True:
             elapsed = time.monotonic() - started
@@ -320,11 +346,14 @@ def run_batch(args, label, binary, sample_index, scenario):
             if abort or (not specifications and all("returncode" in job for job in jobs)):
                 break
             time.sleep(args.sample_interval_s)
+        measured_finished = time.monotonic()
+        if not abort:
+            verify_pair(binary, expected_pair)
     except BaseException as error:
         abort = f"interrupted: {type(error).__name__}: {error}"
         raise
     finally:
-        elapsed = time.monotonic() - started
+        elapsed = (measured_finished if measured_finished is not None else time.monotonic()) - started
         try:
             high_limits.stop()
             try:
@@ -347,6 +376,7 @@ def run_batch(args, label, binary, sample_index, scenario):
             for stream in logs:
                 stream.close()
             result = {"arm": label, "scenario": scenario, "sample": sample_index,
+                      "executables": expected_pair,
                       "abort": abort, "jobs": jobs, "unstarted_jobs": len(specifications),
                       "summary": summarize(samples, jobs, elapsed), "samples": samples}
             (batch / "result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -444,6 +474,7 @@ def main(argv=None):
         raise ValueError("insufficient host memory for the cap plus the stop floor")
     if not {"memory", "cpu", "pids"} <= set(read(args.cgroup_parent / "cgroup.controllers").split()):
         raise ValueError("parent must delegate memory, cpu and pids controllers")
+    pairs = {label: executable_pair(getattr(args, label)) for label in ("base", "head")}
     args.output.mkdir(parents=False)  # Never overwrite or clear a previous result.
     schedule = []
     rng = random.Random(args.seed)
@@ -458,8 +489,8 @@ def main(argv=None):
     metadata = {"version": 1, "measurement": "real_generated_rust_builds",
                 "platform": platform.platform(), "host_memory": host,
                 "affinity": sorted(os.sched_getaffinity(0)),
-                "instrument": identity(SCRIPT), "base": identity(args.base),
-                "head": identity(args.head), "control_patch": identity(args.control_patch),
+                "instrument": identity(SCRIPT), **pair_metadata(pairs),
+                "control_patch": identity(args.control_patch),
                 "base_revision": args.base_revision, "head_revision": args.head_revision,
                 "cargo": subprocess.check_output([str(args.cargo), "-V"], text=True).strip(),
                 "rustc": subprocess.check_output([str(args.rustc), "-Vv"], text=True).strip(),
@@ -474,7 +505,7 @@ def main(argv=None):
     results = []
     for scenario, sample, label in schedule:
         print(f"{scenario} sample {sample}: {label}", flush=True)
-        results.append(run_batch(args, label, getattr(args, label), sample, scenario))
+        results.append(run_batch(args, label, getattr(args, label), sample, scenario, pairs[label]))
         (args.output / "summary.json").write_text(json.dumps(
             [{key: value for key, value in result.items() if key != "samples"} for result in results],
             indent=2) + "\n")

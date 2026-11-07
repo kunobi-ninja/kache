@@ -352,9 +352,17 @@ in both arms and leaves bounded recovery unchanged. This isolates admission
 policy; it is not a binary from the historical release. The patch generator
 refuses unfamiliar source so a later refactor needs review.
 
-Build each checkout's `kache` binary separately before measurement. Do not
-compile Kache or run another workload during measurement. With binaries
-prepared and a delegated parent at `/sys/fs/cgroup/kache-pressure`, run:
+Build both the frontend and its sibling engine in each checkout before
+measurement. Use a separate target directory for each checkout:
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= \
+  cargo build --locked --release --bin kache --bin kache-engine
+```
+
+Keep each arm's `kache` and `kache-engine` together. Do not compile Kache or
+run another workload during measurement. With both pairs prepared and a
+delegated parent at `/sys/fs/cgroup/kache-pressure`, run:
 
 ```sh
 python3 scripts/bench-pressure.py \
@@ -385,7 +393,13 @@ it does not establish a headroom-based admission policy. The production
 controller still uses PSI and recorded compiler RSS weights. Available
 cgroup headroom remains diagnostic input.
 
-The harness records executable and patch hashes, source revisions, toolchain,
+The harness records the resolved frontend and sibling engine paths and hashes
+for each arm. It checks both files before creating workload state and at batch
+boundaries, outside the batch's elapsed time. Hashes identify the measured files; retain build receipts to tie
+them to the supplied source revision labels. Identical engine bytes are
+recorded explicitly and remain useful for smoke tests or negative controls.
+
+The receipt also records the patch hash, source revision labels, toolchain,
 CPU affinity, arm order and raw 200 ms samples. Its results distinguish:
 
 - Sampled aggregate compiler RSS, which can double-count shared pages, from

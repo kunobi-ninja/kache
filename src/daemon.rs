@@ -1796,7 +1796,7 @@ impl S3KeyCache {
 
 pub(crate) struct Daemon {
     config: Config,
-    store: OnceLock<Mutex<Store>>,
+    store: OnceLock<Arc<Mutex<Store>>>,
     /// Stores opened for `[cache.volumes]` shards. Main stays in `store`.
     shard_stores: Mutex<HashMap<PathBuf, Arc<Mutex<Store>>>>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
@@ -2379,13 +2379,13 @@ impl Daemon {
         }
     }
 
-    fn store_lock(&self) -> Result<&Mutex<Store>> {
+    fn store_lock(&self) -> Result<&Arc<Mutex<Store>>> {
         if let Some(store) = self.store.get() {
             return Ok(store);
         }
 
         let store = Store::open(&self.config)?;
-        let _ = self.store.set(Mutex::new(store));
+        let _ = self.store.set(Arc::new(Mutex::new(store)));
 
         self.store
             .get()
@@ -2423,84 +2423,78 @@ impl Daemon {
         ))
     }
 
-    fn with_import_store<T>(
-        &self,
-        cache_dir: &Path,
-        f: impl FnOnce(&Store) -> Result<T>,
-    ) -> Result<T> {
+    /// The store a restored entry for `cache_dir` is imported into: the main
+    /// store, or the volume shard the wrapper opened.
+    fn import_store_lock(&self, cache_dir: &Path) -> Result<Arc<Mutex<Store>>> {
         if remote_check_uses_main_store(cache_dir, &self.config.cache_dir) {
-            return self.with_store(f);
+            return self.store_lock().map(Arc::clone);
         }
-        let lock = self.shard_store_lock(cache_dir)?;
-        let guard = lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("daemon shard store mutex poisoned"))?;
-        f(&guard)
+        self.shard_store_lock(cache_dir)
     }
 
-    fn with_store_timed<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> (Result<T>, u64, u64) {
-        let store = match self.store_lock() {
-            Ok(store) => store,
+    /// Whether the import store for `cache_dir` holds a committed row for
+    /// `key`. A store that cannot be opened or locked does not hold it.
+    async fn import_store_contains(&self, cache_dir: &Path, key: &str) -> bool {
+        let key = key.to_owned();
+        self.with_import_store_timed(cache_dir, move |store| Ok(store.contains(&key)))
+            .await
+            .0
+            .unwrap_or(false)
+    }
+
+    /// Run `f` on the import store from tokio's blocking pool. Returns its
+    /// result, the milliseconds spent waiting for the store mutex, and the
+    /// milliseconds `f` took.
+    ///
+    /// Imports, stats, file hashing and garbage collection take this mutex. An
+    /// import also keeps it while SQLite waits, up to its busy timeout, for a
+    /// write lock that another connection holds: the publish worker or a
+    /// wrapper process. An async worker that waits for the mutex runs no other
+    /// task, so downloads scheduled on that worker can overrun their deadlines
+    /// and count as remote failures.
+    async fn with_import_store_timed<T: Send + 'static>(
+        &self,
+        cache_dir: &Path,
+        f: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> (Result<T>, u64, u64) {
+        let lock = match self.import_store_lock(cache_dir) {
+            Ok(lock) => lock,
             Err(error) => return (Err(error), 0, 0),
         };
-        let wait_started = Instant::now();
-        let guard = match store.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
+        let timed = tokio::task::spawn_blocking(move || {
+            let wait_started = Instant::now();
+            let Ok(guard) = lock.lock() else {
                 return (
                     Err(anyhow::anyhow!("daemon store mutex poisoned")),
                     wait_started.elapsed().as_millis() as u64,
                     0,
                 );
-            }
-        };
-        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
-        let import_started = Instant::now();
-        let result = f(&guard);
-        let import_ms = import_started.elapsed().as_millis() as u64;
-        (result, lock_wait_ms, import_ms)
-    }
-
-    fn with_import_store_timed<T>(
-        &self,
-        cache_dir: &Path,
-        f: impl FnOnce(&Store) -> Result<T>,
-    ) -> (Result<T>, u64, u64) {
-        if remote_check_uses_main_store(cache_dir, &self.config.cache_dir) {
-            return self.with_store_timed(f);
+            };
+            let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
+            let import_started = Instant::now();
+            let result = f(&guard);
+            let import_ms = import_started.elapsed().as_millis() as u64;
+            (result, lock_wait_ms, import_ms)
+        })
+        .await;
+        match timed {
+            Ok(timed) => timed,
+            Err(error) => (
+                Err(anyhow::anyhow!("daemon store task failed: {error}")),
+                0,
+                0,
+            ),
         }
-        let lock = match self.shard_store_lock(cache_dir) {
-            Ok(lock) => lock,
-            Err(error) => return (Err(error), 0, 0),
-        };
-        let wait_started = Instant::now();
-        let guard = match lock.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return (
-                    Err(anyhow::anyhow!("daemon shard store mutex poisoned")),
-                    wait_started.elapsed().as_millis() as u64,
-                    0,
-                );
-            }
-        };
-        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
-        let import_started = Instant::now();
-        let result = f(&guard);
-        let import_ms = import_started.elapsed().as_millis() as u64;
-        (result, lock_wait_ms, import_ms)
     }
 
     fn discard_uncommitted_packed_entries(
-        &self,
+        store: &Store,
         entries: &[crate::store::VerifiedRestoredEntry],
     ) -> Result<()> {
-        self.with_store(|store| {
-            for entry in entries {
-                store.discard_uncommitted_restored_entry(&entry.cache_key)?;
-            }
-            Ok(())
-        })
+        for entry in entries {
+            store.discard_uncommitted_restored_entry(&entry.cache_key)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
@@ -4241,9 +4235,7 @@ impl Daemon {
                     // `meta.json` is only a wake-up hint: extraction writes it
                     // before Store publication, and an import failure may leave
                     // residue. Only a committed Store row is a cache hit.
-                    let committed = self
-                        .with_import_store(&cache_dir, |store| Ok(store.contains(&req.key)))
-                        .unwrap_or(false);
+                    let committed = self.import_store_contains(&cache_dir, &req.key).await;
                     if committed {
                         let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
                         return Response::found_prefetched(true, was_prefetched);
@@ -4269,19 +4261,16 @@ impl Daemon {
         // Leader path: reached only with the claim held — either the first
         // claim above succeeded or this task won the re-claim. The claim is
         // released on every exit path below (incl. panic) by Drop, which also
-        // wakes all waiters.
-        let _dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
+        // wakes all waiters. After a download the import owns it, so the claim
+        // lasts until the import ends even if this request is cancelled.
+        let dl_guard = DownloadingGuard::new(self.downloading.clone(), req.key.clone());
 
         // The previous leader may have landed the entry between our
         // pre-re-claim meta.json check and its claim release. Re-check under
         // the claim we now hold so we don't destructively re-download over
         // the freshly published entry (#620, cross-family review finding —
         // the same re-check-under-claim defence the prefetch path uses).
-        if reclaimed
-            && self
-                .with_import_store(&cache_dir, |store| Ok(store.contains(&req.key)))
-                .unwrap_or(false)
-        {
+        if reclaimed && self.import_store_contains(&cache_dir, &req.key).await {
             let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
             return Response::found_prefetched(true, was_prefetched);
         }
@@ -4353,10 +4342,13 @@ impl Daemon {
                         .insert(req.key.clone(), Some(cn.as_str()))
                         .await;
                 }
+                let import_key = req.key.clone();
                 let (import_result, import_lock_wait_ms, import_ms) = self
-                    .with_import_store_timed(&cache_dir, |store| {
-                        store.import_restored_entry(&req.key)
-                    });
+                    .with_import_store_timed(&cache_dir, move |store| {
+                        let _claim = dl_guard;
+                        store.import_restored_entry(&import_key)
+                    })
+                    .await;
                 let import_ok = match import_result {
                     Ok(()) => true,
                     Err(e) => {
@@ -4949,10 +4941,17 @@ impl Daemon {
         let batch = verified
             .iter()
             .map(|(entry, _, _, _)| entry.restored.clone())
-            .collect::<Vec<_>>();
+            .collect::<Arc<[_]>>();
         if !batch.is_empty() {
             let import_start = Instant::now();
-            match self.with_store(|store| store.import_verified_restored_entries(&batch)) {
+            let import_batch = Arc::clone(&batch);
+            let imported_batch = self
+                .with_import_store_timed(&self.config.cache_dir, move |store| {
+                    store.import_verified_restored_entries(&import_batch)
+                })
+                .await
+                .0;
+            match imported_batch {
                 Ok(_) => {
                     let completed_at_ms = unix_time_ms();
                     let original_bytes = verified
@@ -5012,7 +5011,13 @@ impl Daemon {
                     }
                     // Strict flushing can fail after registration commits.
                     // Preserve those rows' metadata, including existing keys.
-                    if let Err(cleanup_error) = self.discard_uncommitted_packed_entries(&batch) {
+                    let cleanup = self
+                        .with_import_store_timed(&self.config.cache_dir, move |store| {
+                            Self::discard_uncommitted_packed_entries(store, &batch)
+                        })
+                        .await
+                        .0;
+                    if let Err(cleanup_error) = cleanup {
                         tracing::warn!("packed-prefetch residue cleanup failed: {cleanup_error:#}");
                     }
                 }
@@ -5556,8 +5561,10 @@ impl Daemon {
                         return;
                     }
                     // Released on every exit path below (including panic) by
-                    // Drop, which also wakes anyone parked on this key.
-                    let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    // Drop, which also wakes anyone parked on this key. After
+                    // a download the import owns it, so the claim lasts until
+                    // the import ends even if this task is cancelled.
+                    let dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
                     if d.prefetch_stopping.load(Ordering::Acquire) {
                         d.cancel_prefetch_plan(&origin);
                         d.prefetch_stats
@@ -5607,8 +5614,13 @@ impl Daemon {
                                     .insert(key.clone(), Some(crate_name.as_str()))
                                     .await;
                             }
-                            let (import_result, import_lock_wait_ms, import_ms) =
-                                d.with_store_timed(|store| store.import_restored_entry(&key));
+                            let import_key = key.clone();
+                            let (import_result, import_lock_wait_ms, import_ms) = d
+                                .with_import_store_timed(&d.config.cache_dir, move |store| {
+                                    let _claim = dl_guard;
+                                    store.import_restored_entry(&import_key)
+                                })
+                                .await;
                             let import_ok = match import_result {
                                 Ok(()) => true,
                                 Err(e) => {

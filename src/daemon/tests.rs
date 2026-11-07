@@ -9297,7 +9297,9 @@ fn packed_import_cleanup_preserves_committed_entries_after_a_strict_flush_failur
     )
     .unwrap();
     batch.push(residue);
-    daemon.discard_uncommitted_packed_entries(&batch).unwrap();
+    daemon
+        .with_store(|store| Daemon::discard_uncommitted_packed_entries(store, &batch))
+        .unwrap();
     assert!(!residue_dir.exists());
     for (entry, expected) in batch.iter().zip(metadata) {
         assert!(strict.contains(&entry.cache_key));
@@ -12099,11 +12101,7 @@ async fn direct_restore_fetches_one_pack_without_a_listing_manifest() {
         }
         assert!(daemon.downloading.read().await.is_empty());
         assert_eq!(daemon.negative_keys.len(), 0);
-        assert!(
-            daemon
-                .with_import_store(dir.path(), |store| Ok(store.contains(&req.key)))
-                .unwrap()
-        );
+        assert!(daemon.import_store_contains(dir.path(), &req.key).await);
     }
 }
 
@@ -12453,6 +12451,191 @@ async fn test_degraded_breaker_gates_the_download_path() {
         0,
         "a suppressed check is not a definitive miss"
     );
+}
+
+/// One worker, so a worker parked on the store mutex leaves no other worker
+/// to run the probe tasks of [`run_with_the_store_locked`].
+fn one_worker_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// What happened while `work` imported into a store whose mutex another
+/// thread held.
+struct LockedStoreRun<R> {
+    extracted: bool,
+    probes_run: usize,
+    finished_while_locked: bool,
+    result: R,
+}
+
+impl<R> LockedStoreRun<R> {
+    fn assert_waited_without_holding_a_worker(&self) {
+        assert!(self.extracted, "the download was never extracted");
+        assert_eq!(self.probes_run, 5, "the import held the only async worker");
+        assert!(
+            !self.finished_while_locked,
+            "the import must wait for the store mutex"
+        );
+    }
+}
+
+/// Lock the main store on another thread, run `work` on `runtime` and wait
+/// until it has extracted `entry_dir`. Then spawn five probe tasks one at a
+/// time and count those that run while the import waits for the mutex.
+fn run_with_the_store_locked<R: Send + 'static>(
+    runtime: &tokio::runtime::Runtime,
+    daemon: &Arc<Daemon>,
+    entry_dir: &Path,
+    work: impl std::future::Future<Output = R> + Send + 'static,
+) -> LockedStoreRun<R> {
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let busy = daemon.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = busy.store_lock().unwrap().lock().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let task = runtime.spawn(work);
+
+    // Extraction writes meta.json before the import asks for the store.
+    let meta = entry_dir.join("meta.json");
+    let extract_by = Instant::now() + Duration::from_secs(30);
+    while !meta.exists() && Instant::now() < extract_by {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let extracted = meta.exists();
+
+    let mut probes_run = 0;
+    for _ in 0..5 {
+        let (ran_tx, ran_rx) = mpsc::channel();
+        // A probe that only runs after the timeout finds no receiver.
+        runtime.spawn(async move {
+            let _ = ran_tx.send(());
+        });
+        if ran_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+            probes_run += 1;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Keep the store locked well past the 250 ms that callers expect the
+    // import to have waited, so a slow start of the import cannot shorten it.
+    std::thread::sleep(Duration::from_millis(500));
+    let finished_while_locked = task.is_finished();
+
+    // Release before the caller asserts: a worker still parked on the mutex
+    // would otherwise keep the runtime from shutting down.
+    drop(release_tx);
+    holder.join().unwrap();
+    let result = runtime.block_on(task).unwrap();
+    LockedStoreRun {
+        extracted,
+        probes_run,
+        finished_while_locked,
+        result,
+    }
+}
+
+#[test]
+fn demand_restore_waits_for_the_store_without_holding_an_async_worker() {
+    let runtime = one_worker_runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let req = check_request(dir.path(), "import-off-worker");
+    let backend = test_remote_backend();
+    runtime.block_on(put_test_object(
+        &backend,
+        &test_pack_object_key(&req.key, &req.crate_name),
+        &build_entry_pack(&req.key, &req.crate_name),
+    ));
+    let daemon = Arc::new(resilience_test_daemon(dir.path(), backend));
+
+    let checking = daemon.clone();
+    let check_req = req.clone();
+    let run = run_with_the_store_locked(&runtime, &daemon, Path::new(&req.entry_dir), async move {
+        checking.handle_remote_check(&check_req).await
+    });
+
+    run.assert_waited_without_holding_a_worker();
+    assert_eq!(run.result.found, Some(true));
+    assert!(
+        daemon
+            .with_store(|store| Ok(store.contains(&req.key)))
+            .unwrap()
+    );
+    let transfers = daemon.recent_transfers.lock().unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert!(
+        transfers[0].import_lock_wait_ms >= 250,
+        "the import waited while the store stayed locked: {}",
+        transfers[0].import_lock_wait_ms
+    );
+}
+
+#[test]
+fn packed_prefetch_import_waits_for_the_store_without_holding_an_async_worker() {
+    let runtime = one_worker_runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.remote_key_listing = true;
+    config.remote = Some(test_remote_config());
+    let remote = config.remote.clone().unwrap();
+    let backend = test_remote_backend();
+    let daemon = Arc::new(Daemon::new(config));
+    assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+    let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+    let context = PackPrefetchContext::from_deps(
+        crate::identity::host_target_triple(),
+        "linux/toolchain/release",
+        &deps,
+    )
+    .unwrap();
+    let key = test_cache_key("packed-import-off-worker");
+    let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+    runtime.block_on(seed_packed_catalog(
+        &backend,
+        &context,
+        vec![crate::remote_pack::PackInputEntry {
+            cache_key: key.clone(),
+            crate_name: "serde".into(),
+            meta_digest,
+            payload,
+        }],
+        None,
+    ));
+    let entry_dir = daemon.entry_dir_for(&key);
+    let candidates = vec![(key.clone(), "serde".to_string(), entry_dir.clone())];
+
+    let prefetching = daemon.clone();
+    let run = run_with_the_store_locked(&runtime, &daemon, &entry_dir, async move {
+        let v3 = prefetching.v3_remote().await.unwrap();
+        let origin = PrefetchOrigin::default();
+        let ranks = HashMap::new();
+        let sources = HashMap::new();
+        prefetching
+            .try_packed_prefetch(
+                &context,
+                v3,
+                &remote,
+                &candidates,
+                0,
+                &PackedAttribution {
+                    origin: &origin,
+                    ranks: &ranks,
+                    sources: &sources,
+                },
+            )
+            .await
+            .len()
+    });
+
+    run.assert_waited_without_holding_a_worker();
+    assert_eq!(run.result, 1);
+    assert!(daemon.with_store(|store| Ok(store.contains(&key))).unwrap());
 }
 
 #[tokio::test]

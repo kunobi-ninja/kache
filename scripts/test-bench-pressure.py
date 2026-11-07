@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -36,6 +37,80 @@ def sample():
 
 
 class PressureBenchTests(unittest.TestCase):
+    @staticmethod
+    def fake_pair(root, engine_bytes=b"fake engine; never execute"):
+        root.mkdir(parents=True, exist_ok=True)
+        frontend, engine = root / "kache", root / "kache-engine"
+        frontend.write_bytes(b"fake frontend; never execute")
+        engine.write_bytes(engine_bytes)
+        frontend.chmod(0o755)
+        engine.chmod(0o755)
+        return frontend, engine
+
+    @unittest.skipUnless(os.name == "posix", "Linux benchmark executable permissions")
+    def test_pair_uses_the_canonical_frontends_sibling_not_the_alias_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frontend, engine = self.fake_pair(root / "installed")
+            alias, decoy = self.fake_pair(root / "alias", b"wrong sibling")
+            alias.unlink()
+            alias.symlink_to(frontend)
+            with patch.object(bench.subprocess, "Popen", side_effect=AssertionError("must not execute fixtures")):
+                pair = bench.executable_pair(alias)
+            self.assertEqual(pair["frontend"]["path"], str(frontend.resolve()))
+            self.assertEqual(pair["engine"], bench.identity(engine))
+            self.assertNotEqual(pair["engine"]["sha256"], bench.identity(decoy)["sha256"])
+
+    @unittest.skipUnless(os.name == "posix", "Linux benchmark executable permissions")
+    def test_missing_engine_refuses_the_batch_before_creating_workload_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frontend, engine = self.fake_pair(root / "installed")
+            pair = bench.executable_pair(frontend)
+            engine.unlink()
+            output = root / "results"
+            output.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                bench.run_batch(SimpleNamespace(output=output), "base", frontend, 0, "calm", pair)
+            self.assertEqual(list(output.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "Linux benchmark executable permissions")
+    def test_nonexecutable_companion_is_rejected_without_running_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frontend, engine = self.fake_pair(Path(directory))
+            engine.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "not executable"):
+                bench.executable_pair(frontend)
+
+    @unittest.skipUnless(os.name == "posix", "Linux benchmark executable permissions")
+    def test_changed_engine_invalidates_the_record_before_creating_workload_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frontend, engine = self.fake_pair(root / "installed")
+            pair = bench.executable_pair(frontend)
+            engine.write_bytes(b"different engine after the receipt was captured")
+            output = root / "results"
+            output.mkdir()
+            with self.assertRaisesRegex(ValueError, "pair changed"):
+                bench.run_batch(SimpleNamespace(output=output), "base", frontend, 0, "calm", pair)
+            self.assertEqual(list(output.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "Linux benchmark executable permissions")
+    def test_metadata_identifies_both_engines_and_flags_identical_engine_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base, _ = self.fake_pair(root / "base")
+            head, engine = self.fake_pair(root / "head")
+            pairs = {"base": bench.executable_pair(base), "head": bench.executable_pair(head)}
+            metadata = bench.pair_metadata(pairs)
+            self.assertEqual(metadata["base_engine"], pairs["base"]["engine"])
+            self.assertEqual(metadata["head_engine"], pairs["head"]["engine"])
+            self.assertTrue(metadata["identical_engine_bytes"])
+            bench.verify_pair(head, pairs["head"])
+            engine.write_bytes(b"new policy engine")
+            pairs["head"] = bench.executable_pair(head)
+            self.assertFalse(bench.pair_metadata(pairs)["identical_engine_bytes"])
+
     @unittest.skipUnless(os.name == "posix", "writer helpers use process groups")
     def test_limit_writer_runs_outside_the_supervisor_and_updates_the_limit(self):
         with tempfile.TemporaryDirectory() as directory:

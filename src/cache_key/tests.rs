@@ -12108,6 +12108,136 @@ fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
 }
 
 #[test]
+fn nightly_silent_unused_externs_share_terminal_and_piped_keys() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    for cap in [vec!["--cap-lints=allow"], vec!["--cap-lints", "allow"]] {
+        for forced in [
+            vec!["--force-warn=unused_crate_dependencies"],
+            vec!["--force-warn", "unused_crate_dependencies"],
+            vec!["--force-warn=unused-crate-dependencies"],
+            vec!["--force-warn", "unused-crate-dependencies"],
+        ] {
+            for json in [
+                vec!["--json=unused-externs-silent"],
+                vec![
+                    "--json",
+                    "diagnostic-rendered-ansi,artifacts,unused-externs-silent",
+                ],
+                vec![
+                    "--json=unused-externs-silent,diagnostic-short,diagnostic-unicode,future-incompat,timings",
+                ],
+            ] {
+                let mut flags = vec!["--error-format=json"];
+                flags.extend_from_slice(&cap);
+                flags.extend_from_slice(&forced);
+                flags.extend_from_slice(&json);
+                let piped = key_of_flags(&flag_base(&source, &flags));
+                for width in [
+                    vec!["--diagnostic-width=80"],
+                    vec!["--diagnostic-width", "120"],
+                ] {
+                    let mut terminal = flags.clone();
+                    terminal.extend_from_slice(&width);
+                    assert_eq!(
+                        piped,
+                        key_of_flags(&flag_base(&source, &terminal)),
+                        "{terminal:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nightly_silent_unused_externs_keep_observable_or_ambiguous_options_keyed() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    let cap = "--cap-lints=allow";
+    let forced = "--force-warn=unused_crate_dependencies";
+    let silent = "--json=unused-externs-silent";
+    let mut controls = vec![
+        vec![forced, silent],
+        vec!["--cap-lints=warn", forced, silent],
+        vec![cap, forced, silent, cap],
+        vec![cap, forced, silent, "--cap-lints"],
+        vec![cap, forced],
+        vec![cap, forced, "--json"],
+        vec![cap, forced, "--json="],
+        vec![cap, forced, "--json=artifacts"],
+        vec![cap, forced, "--json=unused-externs"],
+        vec![cap, forced, "--json=unused-externs-silent,unused-externs"],
+        vec![cap, forced, "--json=unused-externs,unused-externs-silent"],
+        vec![cap, forced, "--json=unused-externs-silent,"],
+        vec![cap, forced, "--json=unknown,unused-externs-silent"],
+        vec![cap, forced, "--json=unused-externs-silent-extra"],
+        vec![
+            cap,
+            forced,
+            "--json=unused-externs-silent,unused-externs-silent",
+        ],
+        vec![cap, forced, silent, silent],
+        vec![cap, forced, silent, "--json"],
+        vec![cap, forced, silent, "--json=artifacts"],
+        vec![cap, forced, silent, forced],
+        vec![
+            cap,
+            forced,
+            silent,
+            "--force-warn",
+            "unused-crate-dependencies",
+        ],
+        vec![cap, silent, "--force-warn"],
+        vec![cap, silent, "--force-warn="],
+    ];
+    for other in [
+        "--force-warn=unused",
+        "--force-warn=unused_variables",
+        "--force-warn=unused_crate_dependencies,unused_variables",
+    ] {
+        controls.push(vec![cap, silent, other]);
+        controls.push(vec![cap, forced, silent, other]);
+        controls.push(vec![cap, other, silent, forced]);
+    }
+    for flags in controls {
+        let key = |width: &[&str]| {
+            let mut all = width.to_vec();
+            all.extend_from_slice(&flags);
+            key_of_flags(&flag_base(&source, &all))
+        };
+        let piped = key(&[]);
+        let narrow = key(&["--diagnostic-width=80"]);
+        let wide = key(&["--diagnostic-width", "120"]);
+        assert_ne!(piped, narrow, "{flags:?}");
+        assert_ne!(narrow, wide, "{flags:?}");
+    }
+
+    let valid = [cap, forced, silent];
+    let piped = key_of_flags(&flag_base(&source, &valid));
+    for width in [
+        vec!["--diagnostic-width"],
+        vec!["--diagnostic-width="],
+        vec!["--diagnostic-width=garbage"],
+        vec!["--diagnostic-width=0"],
+        vec!["--diagnostic-width=65536"],
+        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
+    ] {
+        let mut flags = valid.to_vec();
+        flags.extend_from_slice(&width);
+        assert_ne!(
+            piped,
+            key_of_flags(&flag_base(&source, &flags)),
+            "{width:?}"
+        );
+    }
+}
+
+#[test]
 fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();

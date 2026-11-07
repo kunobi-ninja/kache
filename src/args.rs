@@ -754,18 +754,37 @@ impl RustcArgs {
             .and_then(|flag| flag.strip_prefix("--diagnostic-width="))
             .and_then(|value| value.parse::<u16>().ok())
             .is_some_and(|columns| columns > 0);
-        let omit_width = valid_width && widths.next().is_none() && self.lints_silenced();
+        let omit_width =
+            valid_width && widths.next().is_none() && self.diagnostic_width_can_be_shared();
         self.diagnostic_flags
             .iter()
             .filter(move |flag| !omit_width || !flag.starts_with("--diagnostic-width="))
     }
 
-    fn lints_silenced(&self) -> bool {
+    /// Shared-width entries also validate their actual diagnostics before
+    /// storage and restoration: future-incompat reports can bypass lint caps.
+    pub(crate) fn diagnostic_width_can_be_shared(&self) -> bool {
         let mut cap = None;
+        let mut silent_forced_lint = false;
         let mut flags = self.outcome_lint_flags.iter();
         while let Some(flag) = flags.next() {
-            if flag == "--force-warn" || flag.starts_with("--force-warn=") {
-                return false;
+            let forced_lint = if flag == "--force-warn" {
+                Some(flags.next().map(String::as_str))
+            } else {
+                flag.strip_prefix("--force-warn=").map(Some)
+            };
+            if let Some(lint) = forced_lint {
+                if silent_forced_lint
+                    || !matches!(
+                        lint,
+                        Some("unused_crate_dependencies" | "unused-crate-dependencies")
+                    )
+                    || !self.unused_externs_silent()
+                {
+                    return false;
+                }
+                silent_forced_lint = true;
+                continue;
             }
             let value = if flag == "--cap-lints" {
                 flags.next().map(String::as_str)
@@ -783,6 +802,36 @@ impl RustcArgs {
             cap = value;
         }
         cap == Some("allow")
+    }
+
+    fn unused_externs_silent(&self) -> bool {
+        let mut json = self
+            .diagnostic_flags
+            .iter()
+            .filter(|flag| flag.as_str() == "--json" || flag.starts_with("--json="));
+        let Some(options) = json.next().and_then(|flag| flag.strip_prefix("--json=")) else {
+            return false;
+        };
+        if json.next().is_some() {
+            return false;
+        }
+        // Cargo's silent unused-extern record has no rendered diagnostic.
+        // Keep ambiguous, malformed and unknown configurations keyed.
+        let options: Vec<_> = options.split(',').collect();
+        options.contains(&"unused-externs-silent")
+            && options.iter().enumerate().all(|(index, option)| {
+                !options[..index].contains(option)
+                    && matches!(
+                        *option,
+                        "unused-externs-silent"
+                            | "diagnostic-short"
+                            | "diagnostic-unicode"
+                            | "diagnostic-rendered-ansi"
+                            | "artifacts"
+                            | "future-incompat"
+                            | "timings"
+                    )
+            })
     }
 
     /// Original compact argv. This differs from [`Self::all_args`] only after
@@ -1284,6 +1333,57 @@ mod tests {
             assert_eq!(parsed.all_args, forwarded);
             assert_eq!(parsed.diagnostic_flags, diagnostics);
             assert_eq!(forwarded, argv[1..]);
+        }
+    }
+
+    #[test]
+    fn nightly_diagnostic_flags_preserve_invocation_and_legacy_widthless_fields() {
+        let base = [
+            "rustc",
+            "lib.rs",
+            "--cap-lints=allow",
+            "--force-warn=unused_crate_dependencies",
+            "--error-format=json",
+            "--json=artifacts,unused-externs-silent",
+        ];
+        for width in [
+            vec![],
+            vec!["--diagnostic-width=80"],
+            vec!["--diagnostic-width", "120"],
+        ] {
+            let mut argv: Vec<String> = base.iter().map(|arg| arg.to_string()).collect();
+            argv.extend(width.iter().map(|arg| arg.to_string()));
+            let parsed = RustcArgs::parse(&argv).unwrap();
+            assert_eq!(parsed.all_args, argv[1..]);
+            assert_eq!(
+                parsed.outcome_lint_flags,
+                [
+                    "--cap-lints=allow",
+                    "--force-warn=unused_crate_dependencies"
+                ]
+            );
+            assert_eq!(
+                parsed
+                    .cache_key_diagnostic_flags()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [
+                    "--error-format=json",
+                    "--json=artifacts,unused-externs-silent"
+                ],
+            );
+            let mut expected = vec![
+                "--error-format=json",
+                "--json=artifacts,unused-externs-silent",
+            ];
+            if !width.is_empty() {
+                expected.push(if width.len() == 1 {
+                    "--diagnostic-width=80"
+                } else {
+                    "--diagnostic-width=120"
+                });
+            }
+            assert_eq!(parsed.diagnostic_flags, expected);
         }
     }
 

@@ -3,7 +3,7 @@ use super::{
     RustcCompiler, Store, clean_incremental_dir, record_input_prediction,
     restore_from_cache_with_memo_store,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::time::Instant;
 
 /// Invocation state shared by every Rust cache-hit path.
@@ -19,6 +19,10 @@ pub(super) struct RustcHitContext<'a> {
 }
 
 impl RustcHitContext<'_> {
+    pub(super) fn accepts_diagnostics(&self, meta: &EntryMeta) -> bool {
+        super::rustc_diagnostics::diagnostics_match(self.args, meta)
+    }
+
     /// Report a hit only after all artifacts restore successfully. Prediction
     /// records belong to the store used for key computation, which can differ
     /// from the store that supplied the artifacts after a volume-shard miss.
@@ -36,6 +40,9 @@ impl RustcHitContext<'_> {
         key: &crate::cache_key::KeyOutputs,
         key_record: &KeyEventRecord,
     ) -> Result<()> {
+        if !self.accepts_diagnostics(meta) {
+            bail!("cached Rust diagnostics require their original terminal width");
+        }
         let restore_start = Instant::now();
         restore_from_cache_with_memo_store(
             self.config,

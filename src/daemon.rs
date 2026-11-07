@@ -5195,7 +5195,8 @@ impl Daemon {
         while tasks.join_next().await.is_some() {}
 
         let pending_imports = self.import_tasks.active.load(Ordering::Acquire);
-        if pending_imports != 0 {
+        let imports_pending = pending_imports != 0;
+        if imports_pending {
             tracing::warn!(
                 pending_imports,
                 "blocking remote imports still running after prefetch drain"
@@ -5221,7 +5222,7 @@ impl Daemon {
         if let Some(mut plan) = plan {
             let incomplete = !receipts_complete
                 || timed_out
-                || pending_imports != 0
+                || imports_pending
                 || cancellations.overflowed
                 || cancellations.origins.iter().any(|origin| {
                     plan.session_id == origin.session_id
@@ -5230,7 +5231,7 @@ impl Daemon {
                 });
             plan.cancelled |= incomplete;
             let daemon = self.clone();
-            let reason = if timed_out || pending_imports != 0 {
+            let reason = if timed_out || imports_pending {
                 "shutdown_timeout"
             } else {
                 "shutdown"
@@ -5247,7 +5248,7 @@ impl Daemon {
                 tracing::warn!("shutdown summary write is still blocked on local I/O");
             }
         }
-        timed_out || pending_imports != 0
+        timed_out || imports_pending
     }
 
     /// Handle a prefetch request through an owned background coordinator.

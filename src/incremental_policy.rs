@@ -230,15 +230,14 @@ impl AdaptiveUnit {
     /// marks a unit someone may be editing.
     /// Eligible invocations must have a stable Cargo unit id and exactly:
     /// `<profile>/deps` (or the unit's own `out` in Cargo's per-unit layout)
-    /// plus `<profile>/incremental`, both absolute. A build script is not:
-    /// Cargo gives it no extra filename, so it has no unit id. A path package
-    /// that builds a `cdylib`, `dylib` or `staticlib` has no extra filename
-    /// either, but it is identified by its `-C metadata` hash instead.
+    /// plus `<profile>/incremental`, both absolute. Units Cargo gives no extra
+    /// filename are identified by `-C metadata` instead (see
+    /// [`unhashed_unit_id`]); build scripts stay out.
     pub(crate) fn eligible(args: &RustcArgs, policy_guard: &[u8]) -> Option<Self> {
         if !args.is_primary {
             return None;
         }
-        let unit_id = args.unit_id().or_else(|| unhashed_library_id(args))?;
+        let unit_id = args.unit_id().or_else(|| unhashed_unit_id(args))?;
         if !(8..=64).contains(&unit_id.len())
             || !unit_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -1014,14 +1013,21 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
     }
 }
 
-/// Unit id for a path package that builds a `cdylib`, `dylib` or `staticlib`.
-///
-/// Cargo gives these packages no `-C extra-filename`. Adaptive incremental mode
-/// ([`AdaptiveUnit::eligible`]) only needs a stable id for the unit, so their
-/// `-C metadata` hash is used instead. Build scripts have no extra filename
-/// either, but they build a `bin` and stay out of adaptive incremental mode.
-fn unhashed_library_id(args: &RustcArgs) -> Option<String> {
-    if !args.has_crate_type(|kind| matches!(kind, "cdylib" | "dylib" | "staticlib")) {
+/// The `-C metadata` hash of a unit Cargo gives no `-C extra-filename`: a
+/// `cdylib`, `dylib` or `staticlib`, and from Cargo 1.100 a `[[bin]]` or
+/// binary example. Build scripts are bins without an extra filename too.
+/// Cargo sets `CARGO_BIN_NAME` only for binaries, but an exported value is
+/// inherited by every unit, so it must also name this crate.
+fn unhashed_unit_id(args: &RustcArgs) -> Option<String> {
+    let library = args.has_crate_type(|kind| matches!(kind, "cdylib" | "dylib" | "staticlib"));
+    let binary = args.has_crate_type(|kind| kind == "bin")
+        && !args.has_crate_type(|kind| kind != "bin")
+        && args
+            .invocation_env()
+            .var_os("CARGO_BIN_NAME")
+            .and_then(|name| name.to_str().map(|name| name.replace('-', "_")))
+            .is_some_and(|name| args.crate_name.as_deref() == Some(name.as_str()));
+    if !library && !binary {
         return None;
     }
     args.get_codegen_opt("metadata").map(str::to_string)
@@ -1920,31 +1926,63 @@ mod tests {
         let incremental = profile.join("incremental");
         fs::create_dir_all(&out).unwrap();
         fs::create_dir(&incremental).unwrap();
-        let argv = |crate_name: &str, extra: &[&str]| {
+        let eligible = |crate_name: &str, extra: &[&str], bin_name: Option<&str>| {
             let mut argv: Vec<String> = vec![
                 "/toolchain/bin/rustc".into(),
                 "--crate-name".into(),
                 crate_name.into(),
-                "src/lib.rs".into(),
+                "src/main.rs".into(),
                 "--out-dir".into(),
                 out.to_string_lossy().into_owned(),
                 "-C".into(),
                 format!("incremental={}", incremental.display()),
             ];
             argv.extend(extra.iter().map(|arg| arg.to_string()));
-            RustcArgs::parse(&argv).unwrap()
+            let env = crate::invocation::InvocationEnv::from_parts(
+                bin_name.map(|name| ("CARGO_BIN_NAME", name)),
+                None,
+                None,
+                temp.path().to_path_buf(),
+            );
+            AdaptiveUnit::eligible(&RustcArgs::parse_for(&argv, &env).unwrap(), b"")
         };
-        let unit =
-            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), b"").unwrap();
+        let unit = eligible("sample", &["-Cextra-filename=-1234abcd"], None).unwrap();
         assert!(
             unit.unit_dir
                 .starts_with(profile.join("incremental.kache-auto")),
             "{}",
             unit.unit_dir.display()
         );
+
+        // Cargo 1.100 compiles a `[[bin]]` and a build script with the same
+        // flags: `--crate-type bin`, `-C metadata`, no extra filename.
+        let bin = ["--crate-type", "bin", "-Cmetadata=732051ce89cf3fe3"];
         assert!(
-            AdaptiveUnit::eligible(&argv("build_script_build", &[]), b"").is_none(),
-            "Cargo 1.100 compiles a build script with no extra filename"
+            eligible("sample", &bin, Some("sample")).is_some(),
+            "a [[bin]] is identified by -C metadata"
+        );
+        assert!(
+            eligible(
+                "sample",
+                &["--crate-type", "bin,bin", bin[2]],
+                Some("sample")
+            )
+            .is_some(),
+            "rustc deduplicates repeated crate types"
+        );
+        assert!(
+            eligible("build_script_build", &bin, Some("build-script-build")).is_some(),
+            "a [[bin]] may share a build script's crate name"
+        );
+        for inherited in [None, Some("outer")] {
+            assert!(
+                eligible("build_script_build", &bin, inherited).is_none(),
+                "a build script, even under an exported CARGO_BIN_NAME={inherited:?}"
+            );
+        }
+        assert!(
+            eligible("sample", &["--crate-type", "bin"], Some("sample")).is_none(),
+            "a bin without -C metadata has no unit id"
         );
     }
 

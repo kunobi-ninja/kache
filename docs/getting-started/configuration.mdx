@@ -661,7 +661,7 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; `0` disables this operation limit |
 | `KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS` | `cache.remote_upload_max_attempts` | `5` | Maximum attempts per background upload, including the first |
-| `KACHE_REMOTE_UPLOAD_MEMORY_BYTES` | `cache.remote_upload_memory_bytes` | `512MiB` | Buffered compressed upload pack budget; minimum `2KiB` |
+| `KACHE_REMOTE_UPLOAD_MEMORY_BYTES` | `cache.remote_upload_memory_bytes` | `1GiB` | Buffered compressed upload pack budget; minimum `2KiB` |
 | `KACHE_REMOTE_UPLOAD_TIMEOUT_SECS` | `cache.remote_upload_timeout_secs` | `300` | S3 upload response timeout in positive integer seconds |
 | `KACHE_DEMAND_TIMEOUT_SECS` | `cache.demand_timeout_secs` | `3` | End-to-end synchronous remote restore wait in positive integer seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
@@ -679,7 +679,12 @@ Demand timeouts accept integers from `1` through `4294967295` seconds. Zero does
 
 Background uploads retry transient failures up to `remote_upload_max_attempts` times, including the first attempt. Waiting for the write circuit breaker to recover does not spend an attempt. When the limit is reached, Kache warns and abandons the automatic upload. It retires the upload intent so the entry can be evicted; the local cached result remains available until GC removes it. Cancellation during shutdown preserves the intent for replay when the daemon restarts.
 
-`remote_upload_memory_bytes` reserves memory before compression and keeps it reserved until the last upload-body reference is dropped. Create-only writes and fallback writes share the same allocation. The budget covers compressed pack buffers, rather than the daemon's total RSS. Packs that exceed the budget stay local; increase the setting to upload them. Both TOML and `config set` accept units such as `512MiB` or `1GiB`:
+`remote_upload_memory_bytes` reserves memory before compression and keeps it reserved until the last upload-body reference is dropped. Create-only writes and fallback writes share the same allocation. The default `1GiB` budget is shared across uploads and covers compressed pack buffers. Other daemon allocations use additional memory. Packs that exceed the budget stay local; increase the setting to upload them. Both TOML and `config set` accept units such as `512MiB` or `1GiB`:
+
+```toml
+[cache]
+remote_upload_memory_bytes = "1GiB"
+```
 
 ```sh
 kache config set cache.remote_upload_memory_bytes 1GiB

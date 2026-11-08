@@ -1323,13 +1323,13 @@ fn upload_limits_default_and_follow_file_then_env_precedence() {
         assert_eq!(config.remote_upload_memory_bytes, bytes);
         assert_eq!(config.remote_upload_timeout_secs, timeout);
     };
-    assert_values(5, 536_870_912, 300);
+    assert_values(5, 1_073_741_824, 300);
     std::fs::write(
         &path,
-        "[cache]\nremote_upload_max_attempts = 7\nremote_upload_memory_bytes = \"1GiB\"\nremote_upload_timeout_secs = 90\n",
+        "[cache]\nremote_upload_max_attempts = 7\nremote_upload_memory_bytes = \"768MiB\"\nremote_upload_timeout_secs = 90\n",
     )
     .unwrap();
-    assert_values(7, 1_073_741_824, 90);
+    assert_values(7, 805_306_368, 90);
     {
         let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", "3");
         let _memory = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MEMORY_BYTES", "500MB");
@@ -1339,11 +1339,11 @@ fn upload_limits_default_and_follow_file_then_env_precedence() {
     for invalid in ["0", "-1", "4294967296", "many"] {
         let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", invalid);
         let _timeout = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS", invalid);
-        assert_values(7, 1_073_741_824, 90);
+        assert_values(7, 805_306_368, 90);
     }
     for invalid in ["0", "2047", "-1GB", "2frogs", "18446744073709551616B"] {
         let _memory = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MEMORY_BYTES", invalid);
-        assert_values(7, 1_073_741_824, 90);
+        assert_values(7, 805_306_368, 90);
     }
     {
         let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", "4294967295");
@@ -1389,7 +1389,7 @@ fn invalid_file_upload_limits_fall_back_without_discarding_other_valid_settings(
             .unwrap();
             let config = Config::load().unwrap();
             assert_eq!(config.remote_upload_max_attempts, 5);
-            assert_eq!(config.remote_upload_memory_bytes, 536_870_912);
+            assert_eq!(config.remote_upload_memory_bytes, 1_073_741_824);
             assert_eq!(config.remote_upload_timeout_secs, 300);
             assert_eq!(config.s3_concurrency, 9);
         }

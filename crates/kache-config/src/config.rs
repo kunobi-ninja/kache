@@ -83,7 +83,7 @@ pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 pub const DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS: u64 = 300;
 /// Limits for background uploads (kunobi-ninja/kache#1859).
 pub const DEFAULT_REMOTE_UPLOAD_MAX_ATTEMPTS: u32 = 5;
-pub const DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES: u64 = 512 << 20;
+pub const DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES: u64 = 1 << 30;
 pub const DEFAULT_REMOTE_UPLOAD_TIMEOUT_SECS: u64 = 300;
 
 /// The upload admission budget must be at least 2 KiB.
@@ -312,7 +312,7 @@ pub struct Config {
     /// Maximum background upload attempts, including the first (default 5).
     /// Exhaustion retires the upload intent and leaves the local entry for GC.
     pub remote_upload_max_attempts: u32,
-    /// Buffered compressed upload pack budget (default 512 MiB, minimum 2 KiB).
+    /// Buffered compressed upload pack budget (default 1 GiB, minimum 2 KiB).
     pub remote_upload_memory_bytes: u64,
     /// S3 upload response timeout in seconds (default 300). Reads retain their
     /// separate inactivity deadline; the daemon operation deadline still applies.

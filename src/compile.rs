@@ -19,6 +19,74 @@ pub enum IncrementalMode {
     },
 }
 
+/// Metadata can reach Cargo once the current attempt cannot be discarded.
+pub(crate) struct MetadataSink<'a> {
+    writer: &'a mut dyn Write,
+    ready: bool,
+    on_dep_info: Option<&'a mut dyn FnMut() -> bool>,
+    attempted: bool,
+}
+
+impl<'a> MetadataSink<'a> {
+    pub(crate) fn immediate(writer: &'a mut dyn Write) -> Self {
+        Self {
+            writer,
+            ready: true,
+            on_dep_info: None,
+            attempted: false,
+        }
+    }
+
+    pub(crate) fn after_dep_info(
+        writer: &'a mut dyn Write,
+        decide: &'a mut dyn FnMut() -> bool,
+    ) -> Self {
+        Self {
+            writer,
+            ready: false,
+            on_dep_info: Some(decide),
+            attempted: false,
+        }
+    }
+
+    fn dep_info_reported(&mut self) -> io::Result<()> {
+        if let Some(decide) = self.on_dep_info.as_deref_mut() {
+            let ready = decide();
+            if self.attempted && !ready {
+                return Err(io::Error::other(
+                    "dep-info no longer authorizes metadata already delivered",
+                ));
+            }
+            self.ready = ready;
+        }
+        Ok(())
+    }
+
+    /// A partial write or failed flush can still have notified Cargo.
+    pub(crate) fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|error| {
+            if self.attempted && !error.is::<MetadataMayBeVisible>() {
+                error.context(MetadataMayBeVisible)
+            } else {
+                error
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataMayBeVisible;
+
+impl std::fmt::Display for MetadataMayBeVisible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "rustc metadata may already have reached Cargo; cannot safely retry this compile",
+        )
+    }
+}
+
+impl std::error::Error for MetadataMayBeVisible {}
+
 /// Result of running rustc.
 pub struct CompileResult {
     pub exit_code: i32,
@@ -136,7 +204,7 @@ impl RustcResponseFile {
 
 /// Run rustc with the given arguments, capturing all outputs.
 ///
-/// A supplied `metadata_sink` receives metadata readiness messages immediately.
+/// A supplied `metadata_sink` receives readiness messages once its gate opens.
 /// Hidden verification compiles must leave it unset.
 ///
 /// `path_normalizer` provides the rule set for `--remap-path-prefix`
@@ -161,7 +229,7 @@ pub(crate) fn run_rustc(
     skip_remap: bool,
     path_normalizer: &crate::path_normalizer::PathNormalizer,
     incremental_mode: IncrementalMode,
-    metadata_sink: Option<&mut dyn Write>,
+    metadata_sink: Option<&mut MetadataSink<'_>>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<CompileResult> {
     let cwd = env
@@ -404,7 +472,8 @@ fn capture_rustc_output(
     stderr: impl Read,
     metadata_sink: Option<&mut dyn Write>,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
-    capture_rustc_output_with(child, stdout, stderr, metadata_sink, None)
+    let mut metadata_sink = metadata_sink.map(MetadataSink::immediate);
+    capture_rustc_output_with(child, stdout, stderr, metadata_sink.as_mut(), None)
 }
 
 /// Drain both pipes. `on_dep_info` is asked, when rustc reports its dep-info
@@ -413,11 +482,11 @@ fn capture_rustc_output_with(
     child: &mut Child,
     mut stdout: impl Read + Send,
     stderr: impl Read,
-    metadata_sink: Option<&mut dyn Write>,
+    mut metadata_sink: Option<&mut MetadataSink<'_>>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
     let child = std::sync::Mutex::new(child);
-    std::thread::scope(|scope| {
+    let captured = std::thread::scope(|scope| {
         let stdout = scope.spawn(|| {
             let mut bytes = Vec::new();
             let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
@@ -428,7 +497,7 @@ fn capture_rustc_output_with(
             }
             result
         });
-        let stderr = capture_rustc_stderr_with(stderr, metadata_sink, on_dep_info);
+        let stderr = capture_rustc_stderr_with(stderr, metadata_sink.as_deref_mut(), on_dep_info);
         if stderr.as_ref().is_err() || stderr.as_ref().is_ok_and(|captured| captured.stopped) {
             let _ = child.lock().unwrap().kill();
         }
@@ -436,13 +505,25 @@ fn capture_rustc_output_with(
         // Neither reader needs the child lock after joining. Holding it during
         // wait before this point could block a reader that needs to kill rustc.
         let status = child.lock().unwrap().wait();
-        let stdout = stdout.map_err(|_| anyhow::anyhow!("rustc stdout reader panicked"))?;
-        Ok((
-            status?,
-            stdout.context("reading rustc stdout")?,
-            stderr.context("reading rustc stderr")?,
-        ))
-    })
+        finish_rustc_output(status, stdout, stderr)
+    });
+    match metadata_sink {
+        Some(sink) => sink.finish(captured),
+        None => captured,
+    }
+}
+
+fn finish_rustc_output(
+    status: io::Result<ExitStatus>,
+    stdout: std::thread::Result<io::Result<Vec<u8>>>,
+    stderr: io::Result<CapturedStderr>,
+) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
+    let stdout = stdout.map_err(|_| anyhow::anyhow!("rustc stdout reader panicked"))?;
+    Ok((
+        status?,
+        stdout.context("reading rustc stdout")?,
+        stderr.context("reading rustc stderr")?,
+    ))
 }
 
 struct CapturedStderr {
@@ -458,12 +539,13 @@ fn capture_rustc_stderr(
     reader: impl Read,
     metadata_sink: Option<&mut dyn Write>,
 ) -> io::Result<CapturedStderr> {
-    capture_rustc_stderr_with(reader, metadata_sink, None)
+    let mut metadata_sink = metadata_sink.map(MetadataSink::immediate);
+    capture_rustc_stderr_with(reader, metadata_sink.as_mut(), None)
 }
 
 fn capture_rustc_stderr_with(
     reader: impl Read,
-    mut metadata_sink: Option<&mut dyn Write>,
+    mut metadata_sink: Option<&mut MetadataSink<'_>>,
     mut on_dep_info: Option<&mut dyn FnMut() -> bool>,
 ) -> io::Result<CapturedStderr> {
     let mut reader = BufReader::new(reader);
@@ -490,19 +572,35 @@ fn capture_rustc_stderr_with(
             .and_then(|emit| emit.as_str());
         // rustc writes dep-info right after expansion, long before metadata,
         // so nothing has reached Cargo yet when the caller decides.
-        if emit == Some("dep-info")
-            && let Some(decide) = on_dep_info.as_deref_mut()
-            && !decide()
-        {
-            captured.stopped = true;
-            return Ok(captured);
+        if emit == Some("dep-info") {
+            if let Some(decide) = on_dep_info.as_deref_mut()
+                && !decide()
+            {
+                if metadata_sink.as_ref().is_some_and(|sink| sink.attempted) {
+                    return Err(io::Error::other(
+                        "cannot stop rustc after metadata delivery was attempted",
+                    ));
+                }
+                captured.stopped = true;
+                return Ok(captured);
+            }
+            if let Some(sink) = metadata_sink.as_deref_mut() {
+                sink.dep_info_reported()?;
+            }
         }
         let metadata = emit == Some("metadata");
-        if metadata && let Some(sink) = metadata_sink.as_deref_mut() {
+        if metadata
+            && let Some(sink) = metadata_sink.as_deref_mut()
+            && sink.ready
+        {
             // A write/flush error may follow partial or complete delivery.
             // Replaying the line could corrupt JSON or duplicate notification;
             // treat sink errors as best-effort, like ordinary diagnostic replay.
-            let _ = sink.write_all(&line).and_then(|()| sink.flush());
+            sink.attempted = true;
+            let _ = sink
+                .writer
+                .write_all(&line)
+                .and_then(|()| sink.writer.flush());
         } else {
             captured.undelivered.extend_from_slice(&line);
         }
@@ -1047,7 +1145,7 @@ fi
                             false,
                             &normalizer,
                             IncrementalMode::Strip,
-                            Some(&mut metadata),
+                            Some(&mut MetadataSink::immediate(&mut metadata)),
                             None,
                         )
                         .unwrap();
@@ -1098,6 +1196,232 @@ fi
             // Wait for the child to be running before injecting the read error.
             self.0.read(output)?;
             Err(io::Error::other("injected pipe read failure"))
+        }
+    }
+
+    #[cfg(unix)]
+    struct ReadErrorAfter(Cursor<Vec<u8>>);
+
+    #[cfg(unix)]
+    impl Read for ReadErrorAfter {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.0.position() == self.0.get_ref().len() as u64 {
+                Err(io::Error::other("injected post-capture read failure"))
+            } else {
+                self.0.read(output)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_delivery_marks_read_errors_including_partial_write_uncertainty() {
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        for delivered in [false, true] {
+            for capacity in [0, metadata.len() / 2, metadata.len()] {
+                let mut child = Command::new("sh")
+                    .args(["-c", "exec sleep 30"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .invocation_spawn()
+                    .unwrap();
+                let stdout = child.stdout.take().unwrap();
+                let input = if delivered {
+                    [dep_info.as_slice(), metadata].concat()
+                } else {
+                    b"warning before dep-info\n".to_vec()
+                };
+                let mut writer = FailingMetadataWriter {
+                    output: Vec::new(),
+                    capacity,
+                };
+                let mut ready = || true;
+                let error = {
+                    let mut sink = MetadataSink::after_dep_info(&mut writer, &mut ready);
+                    let error = capture_rustc_output_with(
+                        &mut child,
+                        stdout,
+                        ReadErrorAfter(Cursor::new(input)),
+                        Some(&mut sink),
+                        None,
+                    )
+                    .err()
+                    .expect("read failure must remain a failure");
+                    assert_eq!(sink.attempted, delivered);
+                    error
+                };
+                assert_eq!(error.is::<MetadataMayBeVisible>(), delivered);
+                let message = format!("{error:#}");
+                assert!(message.contains("injected post-capture read failure"));
+                assert_eq!(message.contains("cannot safely retry"), delivered);
+                assert_eq!(
+                    writer.output,
+                    if delivered {
+                        &metadata[..capacity]
+                    } else {
+                        b""
+                    }
+                );
+                assert!(child.try_wait().unwrap().is_some(), "compiler was reaped");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_delivery_barrier_covers_wait_and_later_result_errors() {
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        for delivered in [false, true] {
+            let input = if delivered {
+                [dep_info.as_slice(), metadata].concat()
+            } else {
+                b"warning\n".to_vec()
+            };
+            let mut writer = Vec::new();
+            let mut ready = || true;
+            let mut sink = MetadataSink::after_dep_info(&mut writer, &mut ready);
+            let captured =
+                capture_rustc_stderr_with(input.as_slice(), Some(&mut sink), None).unwrap();
+            let completion = finish_rustc_output(
+                Err(io::Error::other("injected wait failure")),
+                Ok(Ok(Vec::new())),
+                Ok(captured),
+            );
+            let error = sink.finish(completion).err().expect("wait must fail");
+            assert_eq!(error.is::<MetadataMayBeVisible>(), delivered);
+            assert!(format!("{error:#}").contains("injected wait failure"));
+
+            let late = sink.finish(Err::<(), _>(anyhow::anyhow!("post-capture output failure")));
+            let error = sink.finish(late).unwrap_err();
+            assert_eq!(error.is::<MetadataMayBeVisible>(), delivered);
+            assert_eq!(
+                error
+                    .chain()
+                    .filter(|cause| cause.to_string().contains("cannot safely retry"))
+                    .count(),
+                usize::from(delivered),
+                "wrapping the full result must not duplicate the capture barrier"
+            );
+            assert_eq!(sink.finish(Ok(19)).unwrap(), 19);
+
+            let captured = capture_rustc_stderr(b"".as_slice(), None).unwrap();
+            let panic = finish_rustc_output(
+                Err(io::Error::other("unreached wait failure")),
+                Err(Box::new("injected stdout reader panic")),
+                Ok(captured),
+            );
+            let error = sink.finish(panic).err().expect("reader panic must fail");
+            assert_eq!(error.is::<MetadataMayBeVisible>(), delivered);
+            assert!(format!("{error:#}").contains("rustc stdout reader panicked"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dep_info_stop_after_metadata_delivery_is_an_error_not_a_cache_hit() {
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        for case in [
+            "immediate-out-of-order",
+            "gated-repeated",
+            "gated-unexposed",
+        ] {
+            let repeated = case == "gated-repeated";
+            let input = if repeated {
+                [dep_info.as_slice(), metadata, dep_info].concat()
+            } else {
+                [metadata.as_slice(), dep_info].concat()
+            };
+            let mut child = Command::new("sh")
+                .args(["-c", "exec sleep 30"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .invocation_spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut writer = Vec::new();
+            let mut ready = || true;
+            let mut sink = if case == "immediate-out-of-order" {
+                MetadataSink::immediate(&mut writer)
+            } else {
+                MetadataSink::after_dep_info(&mut writer, &mut ready)
+            };
+            let mut asked = 0;
+            let mut stop = || {
+                asked += 1;
+                repeated && asked == 1
+            };
+            let result = capture_rustc_output_with(
+                &mut child,
+                stdout,
+                input.as_slice(),
+                Some(&mut sink),
+                Some(&mut stop),
+            );
+            if case == "gated-unexposed" {
+                assert!(result.unwrap().2.stopped);
+                assert!(!sink.attempted);
+                assert!(writer.is_empty());
+            } else {
+                let error = result
+                    .err()
+                    .expect("a visible attempt cannot stop on a hit");
+                assert!(error.is::<MetadataMayBeVisible>());
+                assert!(format!("{error:#}").contains("cannot stop rustc after metadata"));
+                assert_eq!(writer, metadata);
+            }
+            assert!(child.try_wait().unwrap().is_some(), "compiler was reaped");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_authorization_cannot_be_revoked_after_delivery() {
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        let input = [dep_info.as_slice(), metadata, dep_info, metadata].concat();
+        for revoke in [false, true] {
+            let mut child = Command::new("sh")
+                .args(["-c", "exit 0"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .invocation_spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut writer = Vec::new();
+            let mut checked = 0;
+            let mut ready = || {
+                checked += 1;
+                !revoke || checked == 1
+            };
+            let result = capture_rustc_output_with(
+                &mut child,
+                stdout,
+                input.as_slice(),
+                Some(&mut MetadataSink::after_dep_info(&mut writer, &mut ready)),
+                None,
+            );
+            assert_eq!(checked, 2);
+            if revoke {
+                let error = result
+                    .err()
+                    .expect("a visible attempt cannot lose authorization");
+                assert!(error.is::<MetadataMayBeVisible>());
+                assert!(format!("{error:#}").contains("dep-info no longer authorizes"));
+                assert_eq!(writer, metadata);
+            } else {
+                assert!(result.unwrap().0.success());
+                assert_eq!(writer, [metadata.as_slice(), metadata].concat());
+            }
+            assert!(child.try_wait().unwrap().is_some());
         }
     }
 
@@ -1217,6 +1541,100 @@ fi
         assert_eq!(captured.artifacts.len(), 2);
     }
 
+    #[test]
+    fn tentative_metadata_waits_for_dep_info_then_streams_before_eof() {
+        let early = b"{\"$message_type\":\"artifact\",\"artifact\":\"early.rmeta\",\"emit\":\"metadata\"}\n";
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        let diagnostic = b"warning\n";
+        let input = [early.as_slice(), dep_info, metadata, diagnostic].concat();
+        let flushed = Rc::new(Cell::new(false));
+        let reader = MetadataReader {
+            input: Cursor::new(input.clone()),
+            flushed: flushed.clone(),
+        };
+        let mut writer = MetadataWriter {
+            output: Vec::new(),
+            flushed,
+        };
+        let mut asked = 0;
+        let mut ready = || {
+            asked += 1;
+            true
+        };
+        let captured = capture_rustc_stderr_with(
+            reader,
+            Some(&mut MetadataSink::after_dep_info(&mut writer, &mut ready)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(writer.output, metadata);
+        assert_eq!(captured.verbatim, input);
+        assert_eq!(
+            captured.undelivered,
+            [early.as_slice(), dep_info, diagnostic].concat()
+        );
+        assert!(!captured.stopped);
+    }
+
+    #[test]
+    fn tentative_metadata_stays_buffered_without_an_accepted_dep_info() {
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        for report_dep_info in [false, true] {
+            let input = if report_dep_info {
+                [dep_info.as_slice(), metadata].concat()
+            } else {
+                metadata.to_vec()
+            };
+            let mut sink = Vec::new();
+            let mut asked = 0;
+            let mut ready = || {
+                asked += 1;
+                false
+            };
+            let captured = capture_rustc_stderr_with(
+                input.as_slice(),
+                Some(&mut MetadataSink::after_dep_info(&mut sink, &mut ready)),
+                None,
+            )
+            .unwrap();
+            assert_eq!(asked, usize::from(report_dep_info));
+            assert!(sink.is_empty());
+            assert_eq!(captured.undelivered, input);
+            assert_eq!(captured.verbatim, input);
+        }
+    }
+
+    #[test]
+    fn stopping_a_tentative_attempt_never_opens_its_metadata_gate() {
+        let dep_info =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"foo.d\",\"emit\":\"dep-info\"}\n";
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        let input = [dep_info.as_slice(), metadata].concat();
+        let mut asked = false;
+        let mut ready = || {
+            asked = true;
+            true
+        };
+        let mut stop = || false;
+        let mut sink = Vec::new();
+        let captured = capture_rustc_stderr_with(
+            input.as_slice(),
+            Some(&mut MetadataSink::after_dep_info(&mut sink, &mut ready)),
+            Some(&mut stop),
+        )
+        .unwrap();
+        assert!(captured.stopped);
+        assert!(!asked);
+        assert!(sink.is_empty());
+        assert_eq!(captured.verbatim, dep_info);
+        assert!(captured.undelivered.is_empty());
+    }
+
     struct FailingMetadataWriter {
         output: Vec<u8>,
         capacity: usize,
@@ -1255,8 +1673,12 @@ fi
             };
             let mut sink = Vec::new();
             let mut reader = Cursor::new(&input);
-            let captured =
-                capture_rustc_stderr_with(&mut reader, Some(&mut sink), Some(&mut decide)).unwrap();
+            let captured = capture_rustc_stderr_with(
+                &mut reader,
+                Some(&mut MetadataSink::immediate(&mut sink)),
+                Some(&mut decide),
+            )
+            .unwrap();
             assert_eq!(asked, 1);
             assert_eq!(captured.stopped, !go_on);
             if go_on {

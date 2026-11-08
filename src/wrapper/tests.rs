@@ -3286,6 +3286,155 @@ fn bootstrap_retry_requires_fresh_dep_info_and_retires_discarded_outputs() {
     assert!(!discard_bootstrap_outputs(&artifacts));
 }
 
+#[test]
+fn adaptive_metadata_delivery_failure_retires_private_state_without_retry() {
+    let _lock = crate::test_support::process_state_test_lock();
+    for delivered in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let args = eligible_incremental_args(&temp, "tap_lib");
+        let config = test_config(temp.path().join("cache"));
+        let unit = managed_incremental_unit(&config, &args, || false).unwrap();
+        let lease = unit.try_immediate().unwrap();
+        let compiler_args = lease.compiler_args(&args);
+        let private = compiler_args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("incremental="))
+            .map(PathBuf::from)
+            .unwrap();
+        assert_ne!(Some(&private), args.incremental.as_ref());
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("partial-graph"), "incomplete").unwrap();
+        let error = anyhow::anyhow!("injected compiler IO failure");
+        let error = if delivered {
+            error.context(crate::compile::MetadataMayBeVisible)
+        } else {
+            error
+        }
+        .context("executing compiler");
+        let retried = std::cell::Cell::new(false);
+        let result = recover_adaptive_compile_error(lease, error, |error| {
+            assert!(!private.exists(), "retire private state before retrying");
+            assert!(!unit.has_policy_state());
+            assert!(!error.is::<crate::compile::MetadataMayBeVisible>());
+            retried.set(true);
+            Ok(23)
+        });
+        if delivered {
+            assert!(
+                result
+                    .unwrap_err()
+                    .is::<crate::compile::MetadataMayBeVisible>()
+            );
+        } else {
+            assert_eq!(result.unwrap(), 23);
+        }
+        assert_eq!(retried.get(), !delivered);
+        assert!(!private.exists(), "failed private graph must be retired");
+        assert!(
+            !unit.has_policy_state(),
+            "failed attempt must not remain active"
+        );
+        let next = unit
+            .try_immediate()
+            .expect("the failed lease released its lock");
+        assert!(!next.finish(CompileOutcome::Abnormal));
+    }
+}
+
+#[test]
+fn adaptive_hit_routing_cannot_ignore_visible_metadata_errors() {
+    let _lock = crate::test_support::process_state_test_lock();
+    for case in ["stopped", "pre-delivery-error", "visible-error"] {
+        let temp = tempfile::tempdir().unwrap();
+        let args = eligible_incremental_args(&temp, "tap_lib");
+        let config = test_config(temp.path().join("cache"));
+        let unit = managed_incremental_unit(&config, &args, || false).unwrap();
+        let lease = unit.try_immediate().unwrap();
+        let outcome = match case {
+            "stopped" => Ok(()),
+            "pre-delivery-error" => Err(anyhow::anyhow!("read failed before metadata")),
+            "visible-error" => Err(anyhow::anyhow!("read failed after metadata")
+                .context(crate::compile::MetadataMayBeVisible)),
+            _ => unreachable!(),
+        };
+        let restored = std::cell::Cell::new(false);
+        let result = finish_adaptive_attempt(lease, outcome, |_| {
+            assert!(
+                !unit.has_policy_state(),
+                "retire the lease before restoring"
+            );
+            restored.set(true);
+            Ok(0)
+        });
+        if case == "visible-error" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .is::<crate::compile::MetadataMayBeVisible>()
+            );
+            assert!(
+                !restored.get(),
+                "never reroute to a hit after visible failure"
+            );
+        } else {
+            assert_eq!(result.unwrap(), 0);
+            assert!(restored.get());
+        }
+        assert!(!unit.has_policy_state());
+    }
+}
+
+#[test]
+fn visible_metadata_errors_block_normal_hit_and_fallback_routing() {
+    for route in ["hit", "fallback"] {
+        for visible in [false, true] {
+            let error = anyhow::anyhow!("injected native compiler IO failure");
+            let error = if visible {
+                error.context(crate::compile::MetadataMayBeVisible)
+            } else {
+                error
+            }
+            .context("executing native compiler");
+            let resumed = std::cell::Cell::new(false);
+            let result = if route == "hit" {
+                resume_after_compile(Err::<(), _>(error), |_| {
+                    resumed.set(true);
+                    Ok(0)
+                })
+            } else {
+                recover_compile_error(error, |_| {
+                    resumed.set(true);
+                    Ok(23)
+                })
+            };
+            if visible {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .is::<crate::compile::MetadataMayBeVisible>()
+                );
+                assert!(!resumed.get(), "{route} must not replace visible outputs");
+            } else {
+                assert_eq!(result.unwrap(), if route == "hit" { 0 } else { 23 });
+                assert!(resumed.get());
+            }
+        }
+    }
+    let restored = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_after_compile(Ok(()), |_| {
+            restored.set(true);
+            Ok(0)
+        })
+        .unwrap(),
+        0
+    );
+    assert!(
+        restored.get(),
+        "a legitimate pre-metadata stop can restore a hit"
+    );
+}
+
 fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
     crate::store::EntryMeta {
         cache_key: "k".to_string(),

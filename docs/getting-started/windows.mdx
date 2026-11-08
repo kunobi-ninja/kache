@@ -74,6 +74,11 @@ incompatible access-token contexts and failed security queries. The trust option
 only permits the first case. Keep the full diagnostic when reporting a refused
 handoff; changing trust does not fix incompatible tokens.
 
+Source builds and the next release use the local engine after a client-side
+permission denial, without starting the daemon again. Requests the client cannot
+prepare for transfer also use this fallback. A missing or unavailable daemon
+still gets a startup attempt. Fallbacks cannot rerun the compiler after Commit.
+
 The logical `daemon.sock` path has no socket file on Windows. The daemon uses
 a named pipe derived from that path, including for file-hash requests. Check
 `kache daemon` to test reachability.

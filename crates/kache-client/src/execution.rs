@@ -42,11 +42,21 @@ impl Execution<'_> {
         socket: &Path,
         trusted_pipeline: bool,
     ) -> Result<Option<i32>> {
+        self.try_execute_with_recovery(socket, trusted_pipeline)
+            .map(kache_ipc::execution::Attempt::exit_code)
+    }
+
+    /// Retain startup eligibility so local-only requests do not restart a daemon.
+    pub fn try_execute_with_recovery(
+        &self,
+        socket: &Path,
+        trusted_pipeline: bool,
+    ) -> Result<kache_ipc::execution::Attempt> {
         let prepared = match self.prepare(trusted_pipeline) {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::debug!(%error, "compiler request cannot be transferred");
-                return Ok(None);
+                return Ok(kache_ipc::execution::Attempt::LocalOnly);
             }
         };
         #[cfg(unix)]
@@ -58,11 +68,11 @@ impl Execution<'_> {
             .collect::<Vec<_>>();
         #[cfg(unix)]
         {
-            kache_ipc::execution::try_execute(socket, &prepared.request, &descriptors)
+            kache_ipc::execution::try_execute_with_recovery(socket, &prepared.request, &descriptors)
         }
         #[cfg(windows)]
         {
-            kache_ipc::execution::try_execute(socket, &prepared.request)
+            kache_ipc::execution::try_execute_with_recovery(socket, &prepared.request)
         }
     }
 
@@ -142,6 +152,41 @@ impl Execution<'_> {
             #[cfg(unix)]
             jobserver,
         })
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn an_untransferable_invocation_does_not_request_daemon_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let files = (0..3)
+            .map(|_| tempfile::tempfile().unwrap())
+            .collect::<Vec<_>>();
+        let env = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            None,
+            None,
+            root.path().to_owned(),
+        );
+        let execution = Execution {
+            entry: ExecutionEntry::Original,
+            args: &["rustc".into(), "-vV".into()],
+            env: &env,
+            executable: &root.path().join("kache"),
+            started_at: Instant::now(),
+            files: &files,
+            terminal: false,
+            client_version: "fixture",
+        };
+        assert_eq!(
+            execution
+                .try_execute_with_recovery(&root.path().join("absent"), false)
+                .unwrap(),
+            kache_ipc::execution::Attempt::LocalOnly
+        );
     }
 }
 
@@ -352,6 +397,13 @@ mod tests {
         assert_eq!(
             execution.try_execute(&root.path().join("absent")).unwrap(),
             None
+        );
+        assert_eq!(
+            execution
+                .try_execute_with_recovery(&root.path().join("absent"), false)
+                .unwrap(),
+            kache_ipc::execution::Attempt::LocalOnly,
+            "starting a daemon cannot fix a request we could not prepare"
         );
     }
 }

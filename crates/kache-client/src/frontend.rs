@@ -61,18 +61,20 @@ pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
                     client_version: version,
                 };
                 let socket = config.socket_path();
-                if let Some(exit) =
-                    execution.try_execute_with_trust(&socket, config.trust_daemon_execution)?
-                {
+                let attempt =
+                    execution.try_execute_with_recovery(&socket, config.trust_daemon_execution)?;
+                if let Some(exit) = attempt.exit_code() {
                     return Ok(exit);
                 }
                 #[cfg(windows)]
-                if let Some(exit) = windows::try_bootstrap(
-                    &execution,
-                    &socket,
-                    config.disabled,
-                    config.trust_daemon_execution,
-                )? {
+                if let Some(exit) = attempt.recover_with(|| {
+                    windows::try_bootstrap(
+                        &execution,
+                        &socket,
+                        config.disabled,
+                        config.trust_daemon_execution,
+                    )
+                })? {
                     return Ok(exit);
                 }
             }

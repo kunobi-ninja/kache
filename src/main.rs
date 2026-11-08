@@ -1504,7 +1504,7 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
         if let Some(exit) = try_wrapper_daemon(
             daemon_attempted,
             || {
-                invocation::execution::try_execute_with_trust(
+                invocation::execution::try_execute_with_recovery(
                     &config.socket_path(),
                     args,
                     &context,
@@ -1517,7 +1517,7 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
                 if cfg!(test) || config.disabled {
                     Ok(false)
                 } else {
-                    daemon::start(&config).map(|_| true)
+                    daemon::start(&config).map(|outcome| outcome.is_ready())
                 }
             },
         )? {
@@ -1543,17 +1543,19 @@ fn frontend_completed_daemon_attempt(windows: bool, forwarded: bool) -> bool {
 #[cfg(any(unix, windows))]
 fn try_wrapper_daemon(
     already_attempted: bool,
-    mut execute: impl FnMut() -> Result<Option<i32>>,
+    mut execute: impl FnMut() -> Result<kache_ipc::execution::Attempt>,
     start: impl FnOnce() -> Result<bool>,
 ) -> Result<Option<i32>> {
     if already_attempted {
         return Ok(None);
     }
-    if let Some(exit) = execute()? {
-        return Ok(Some(exit));
+    match execute()? {
+        kache_ipc::execution::Attempt::Complete(exit) => return Ok(Some(exit)),
+        kache_ipc::execution::Attempt::LocalOnly => return Ok(None),
+        kache_ipc::execution::Attempt::Recoverable => {}
     }
     match start() {
-        Ok(true) => execute(),
+        Ok(true) => execute().map(kache_ipc::execution::Attempt::exit_code),
         Ok(false) => Ok(None),
         Err(error) => {
             tracing::debug!(%error, "compiler daemon did not start");
@@ -1908,7 +1910,7 @@ mod tests {
                 frontend_completed_daemon_attempt(windows, forwarded),
                 || {
                     attempts += 1;
-                    Ok(None)
+                    Ok(kache_ipc::execution::Attempt::Recoverable)
                 },
                 || {
                     starts += 1;
@@ -1933,7 +1935,7 @@ mod tests {
         let waited = Cell::new(Duration::ZERO);
         let execute = || {
             attempts.set(attempts.get() + 1);
-            Ok(None)
+            Ok(kache_ipc::execution::Attempt::Recoverable)
         };
         let start = || {
             starts.set(starts.get() + 1);
@@ -1964,15 +1966,41 @@ mod tests {
     #[test]
     fn daemon_handoff_preserves_warm_and_recovered_compiler_exit_codes() {
         assert_eq!(
-            try_wrapper_daemon(false, || Ok(Some(23)), || panic!("warm daemon")).unwrap(),
+            try_wrapper_daemon(
+                false,
+                || Ok(kache_ipc::execution::Attempt::Complete(23)),
+                || panic!("warm daemon")
+            )
+            .unwrap(),
             Some(23)
         );
-        let mut exits = [None, Some(17)].into_iter();
+        let mut exits = [
+            kache_ipc::execution::Attempt::Recoverable,
+            kache_ipc::execution::Attempt::Complete(17),
+        ]
+        .into_iter();
         assert_eq!(
             try_wrapper_daemon(false, || Ok(exits.next().unwrap()), || Ok(true)).unwrap(),
             Some(17)
         );
         assert!(exits.next().is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn local_only_handoff_does_not_start_or_retry_the_daemon() {
+        let mut attempts = 0;
+        let result = try_wrapper_daemon(
+            false,
+            || {
+                attempts += 1;
+                Ok(kache_ipc::execution::Attempt::LocalOnly)
+            },
+            || panic!("startup cannot change this invocation's security context"),
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(attempts, 1);
     }
 
     #[cfg(any(unix, windows))]
@@ -1986,7 +2014,7 @@ mod tests {
                 || {
                     attempts += 1;
                     if fail_after_start && attempts == 1 {
-                        Ok(None)
+                        Ok(kache_ipc::execution::Attempt::Recoverable)
                     } else {
                         anyhow::bail!("committed compiler disconnected")
                     }
@@ -2012,7 +2040,7 @@ mod tests {
                 false,
                 || {
                     attempts += 1;
-                    Ok(None)
+                    Ok(kache_ipc::execution::Attempt::Recoverable)
                 },
                 || {
                     if failed {

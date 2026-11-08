@@ -1103,6 +1103,7 @@ impl WindowsProbeEnvironment {
         &mut self,
         architecture: &str,
         env: &InvocationEnv,
+        hash_tool: &dyn Fn(&Path) -> Result<String>,
     ) -> Result<()> {
         let _trace = crate::phase_trace::phase("native_msvc_discovery");
         self.validate_discovery_probe()?;
@@ -1112,7 +1113,7 @@ impl WindowsProbeEnvironment {
             && (self.contains_var("VCINSTALLDIR")
                 || self.contains_var("VSTEL_MSBuildProjectFullPath"));
         if needs_architecture && let Some(compiler) = path_lookup(self, "cl.exe") {
-            let banner = run_windows_tool_for(WindowsTool::Cl, &compiler, &[], env)?;
+            let banner = run_windows_tool_for(WindowsTool::Cl, &compiler, &[], env, hash_tool)?;
             let selected = banner
                 .split(|character: char| !character.is_ascii_alphanumeric())
                 .filter_map(architecture_alias)
@@ -1196,6 +1197,7 @@ impl WindowsProbeEnvironment {
         &mut self,
         _architecture: &str,
         _env: &InvocationEnv,
+        _hash_tool: &dyn Fn(&Path) -> Result<String>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1931,6 +1933,8 @@ fn windows_tool_command_for(
 /// and the banner is only published when the two agree, so a toolchain
 /// swapped mid-probe can not file its banner under the other binary. Only a
 /// validated banner is memoised; a tool that fails validation runs again.
+/// The caller's file hasher may reuse a digest proved by the current file
+/// identity. It must check that identity on each call, including after a probe.
 ///
 /// The contract is "the banner is a function of the bytes and the command
 /// environment". That holds for Microsoft's `link.exe` and `cl.exe`, which
@@ -1943,9 +1947,10 @@ fn run_windows_tool_for(
     path: &Path,
     environment: &[(OsString, OsString)],
     env: &InvocationEnv,
+    hash_tool: &dyn Fn(&Path) -> Result<String>,
 ) -> Result<String> {
     let memo = crate::config::probe_memo_dir_for(env).ok();
-    run_windows_tool_in_for(memo.as_deref(), tool, path, environment, env)
+    run_windows_tool_in_for(memo.as_deref(), tool, path, environment, env, hash_tool)
 }
 
 /// [`run_windows_tool_for`] with the memo directory chosen by the caller;
@@ -1957,7 +1962,14 @@ fn run_windows_tool_in(
     path: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<String> {
-    run_windows_tool_in_for(memo_dir, tool, path, environment, &InvocationEnv::capture())
+    run_windows_tool_in_for(
+        memo_dir,
+        tool,
+        path,
+        environment,
+        &InvocationEnv::capture(),
+        &hash_file,
+    )
 }
 
 fn run_windows_tool_in_for(
@@ -1966,11 +1978,12 @@ fn run_windows_tool_in_for(
     path: &Path,
     environment: &[(OsString, OsString)],
     env: &InvocationEnv,
+    hash_tool: &dyn Fn(&Path) -> Result<String>,
 ) -> Result<String> {
     let _trace = crate::phase_trace::phase("native_msvc_banner");
     let digest = || {
         let _trace = crate::phase_trace::phase("native_msvc_banner_hash");
-        probe_memo::file_digest(path)
+        hash_tool(path).ok()
     };
     let before = (memo_dir.is_some() && memoises_banner(tool))
         .then(digest)
@@ -2705,7 +2718,7 @@ where
     environment.root_invocation_paths(env)?;
     environment.rustc_tool_dirs = rustc_tool_dirs.to_vec();
     environment.requested_default_libraries = requested_default_libraries.to_vec();
-    environment.augment_from_installed_msvc(target_architecture, env)?;
+    environment.augment_from_installed_msvc(target_architecture, env, &hash_runtime)?;
     environment.root_invocation_paths(env)?;
     let mut selected_linker = None;
     let mut identity = probe_windows_msvc_identity_with_runtime_hash(
@@ -2717,9 +2730,15 @@ where
             if matches!(tool, WindowsTool::Link | WindowsTool::LldLink) {
                 selected_linker = Some(path.to_path_buf());
             }
-            run_windows_tool_for(tool, path, environment.command_environment(tool, path), env)
+            run_windows_tool_for(
+                tool,
+                path,
+                environment.command_environment(tool, path),
+                env,
+                &hash_runtime,
+            )
         },
-        hash_runtime,
+        &hash_runtime,
         prepare_runtime,
     )?;
     if let Some(probe) = manifest {
@@ -4245,6 +4264,47 @@ esac
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_installed_msvc_banner_reuses_the_native_file_identity() {
+        let _lock = process_state_test_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let mut env = InvocationEnv::capture();
+        env.set("KACHE_CACHE_DIR", directory.path().join("cache"));
+        let architecture = windows_msvc_architecture(std::env::consts::ARCH).unwrap();
+        let mut environment = WindowsProbeEnvironment::from_invocation(&env).unwrap();
+        environment.root_invocation_paths(&env).unwrap();
+        environment
+            .augment_from_installed_msvc(architecture, &env, &hash_file)
+            .unwrap();
+        let compiler = environment
+            .compiler
+            .clone()
+            .or_else(|| path_lookup(&environment, "cl.exe"))
+            .expect("installed MSVC compiler");
+        let db = directory.path().join("index.db");
+        let memo = directory.path().join("banners");
+        let run = |hasher: &crate::cache_key::FileHasher<'_>| {
+            run_windows_tool_in_for(
+                Some(&memo),
+                WindowsTool::Cl,
+                &compiler,
+                environment.command_environment(WindowsTool::Cl, &compiler),
+                &env,
+                &|path| hasher.hash(path),
+            )
+            .unwrap()
+        };
+        let cold = crate::cache_key::FileHasher::persistent(&db);
+        let banner = run(&cold);
+        assert!(cold.stats().bytes_hashed > 0);
+        cold.flush_memo_as_if_settled();
+        let warm = crate::cache_key::FileHasher::persistent(&db);
+        assert_eq!(run(&warm), banner);
+        assert_eq!(warm.stats().bytes_hashed, 0);
+        assert_eq!(warm.stats().cache_hits, 1);
     }
 
     #[cfg(windows)]
@@ -6994,6 +7054,136 @@ esac
         );
         assert_eq!(entries(), before);
         let _ = (memo, memo_after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_windows_banner_reuses_guarded_file_hashes() {
+        let _lock = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let memo = dir.path().join("memo");
+        let db = dir.path().join("index.db");
+        let env = InvocationEnv::capture();
+        for (tool, name, banner) in [
+            (WindowsTool::Link, "link.exe", LINK_BANNER.to_string()),
+            (WindowsTool::Cl, "cl.exe", compiler_banner("x64")),
+        ] {
+            let path = dir.path().join(name);
+            let script = |banner: &str| {
+                // Exceed the persistent-hash threshold without starting a
+                // real MSVC tool. A warm banner must not reread these bytes.
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{banner}'\n#{}\n",
+                    "x".repeat(1 << 20)
+                )
+            };
+            kache_fs::testutil::write_executable(&path, script(&banner));
+            let cold = crate::cache_key::FileHasher::persistent(&db);
+            let run = |hasher: &crate::cache_key::FileHasher<'_>| {
+                run_windows_tool_in_for(Some(&memo), tool, &path, &[], &env, &|path| {
+                    hasher.hash(path)
+                })
+                .unwrap()
+            };
+            assert_eq!(run(&cold), banner);
+            assert!(cold.stats().bytes_hashed >= 1 << 20);
+            cold.flush_memo_as_if_settled();
+
+            let warm = crate::cache_key::FileHasher::persistent(&db);
+            assert_eq!(run(&warm), banner);
+            assert_eq!(warm.stats().bytes_hashed, 0);
+            assert_eq!(warm.stats().cache_hits, 1);
+
+            // A same-length replacement with the old mtime must still be
+            // hashed and probed, using the changed inode/change-time proof.
+            let previous_mtime =
+                filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+            let replacement = banner.replace("35207", "35208");
+            assert_ne!(replacement, banner);
+            assert_eq!(replacement.len(), banner.len());
+            kache_fs::testutil::write_executable(&path, script(&replacement));
+            filetime::set_file_mtime(&path, previous_mtime).unwrap();
+            let changed = crate::cache_key::FileHasher::persistent(&db);
+            assert_eq!(run(&changed), replacement);
+            assert!(changed.stats().bytes_hashed >= 1 << 20);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_banner_does_not_memoise_a_tool_changed_by_its_probe() {
+        let _lock = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let memo = dir.path().join("memo");
+        let path = dir.path().join("link.exe");
+        kache_fs::testutil::write_executable(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{LINK_BANNER}'\nprintf '\\n#changed\\n' >> \"$0\"\n#{}\n",
+                "x".repeat(1 << 20)
+            ),
+        );
+        let before = probe_memo::file_digest(&path).unwrap();
+        let (memo_path, _) = banner_memo(&memo, WindowsTool::Link, &path, &before, &[]);
+        let hasher = crate::cache_key::FileHasher::persistent(&dir.path().join("index.db"));
+        assert_eq!(hasher.hash(&path).unwrap(), before);
+        hasher.flush_memo_as_if_settled();
+        assert_eq!(
+            run_windows_tool_in_for(
+                Some(&memo),
+                WindowsTool::Link,
+                &path,
+                &[],
+                &InvocationEnv::capture(),
+                &|path| hasher.hash(path),
+            )
+            .unwrap(),
+            LINK_BANNER
+        );
+        assert_eq!(
+            hasher.stats().cache_hits,
+            1,
+            "the pre-probe digest was memoised"
+        );
+        assert_ne!(probe_memo::file_digest(&path).unwrap(), before);
+        assert!(
+            !memo_path.exists(),
+            "a changed tool must not publish its banner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_banner_can_run_when_its_hash_is_unavailable() {
+        let _lock = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("link.exe");
+        kache_fs::testutil::write_executable(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{LINK_BANNER}'\n"),
+        );
+        let memo = dir.path().join("memo");
+        let hash_calls = std::cell::Cell::new(0);
+        let failed_hash = |_: &Path| {
+            hash_calls.set(hash_calls.get() + 1);
+            anyhow::bail!("test hash unavailable")
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                run_windows_tool_in_for(
+                    Some(&memo),
+                    WindowsTool::Link,
+                    &path,
+                    &[],
+                    &InvocationEnv::capture(),
+                    &failed_hash,
+                )
+                .unwrap(),
+                LINK_BANNER
+            );
+        }
+        assert_eq!(hash_calls.get(), 2);
+        assert!(!memo.exists());
     }
 
     #[cfg(unix)]

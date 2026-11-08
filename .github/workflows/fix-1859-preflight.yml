@@ -117,6 +117,16 @@ jobs:
           # Replay the surviving arithmetic mutation before the complete check.
           # Require an assertion failure in the new regression, then restore
           # the exact candidate bytes. A build failure does not count.
+          validation_env "$VALIDATION_CARGO" test -p kache --lib \
+            remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance \
+            -- --exact --nocapture 2>&1 | tee "$evidence/pack-bound-positive-control.log"
+          python3 - "$evidence" <<'PY'
+          from pathlib import Path
+          import sys
+          log = (Path(sys.argv[1]) / 'pack-bound-positive-control.log').read_text()
+          assert 'test remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance ... ok' in log
+          assert 'test result: ok. 1 passed; 0 failed' in log
+          PY
           pack_source=src/remote_layout.rs
           pack_backup="$evidence/remote_layout.rs.original"
           cp "$pack_source" "$pack_backup"
@@ -131,7 +141,7 @@ jobs:
           source.write_text(text.replace(original, '.saturating_add(file.name.len() as u64 + 2)'))
           PY
           set +e
-          validation_env "$VALIDATION_CARGO" test -p kache --bin kache-engine \
+          validation_env "$VALIDATION_CARGO" test -p kache --lib \
             remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance \
             -- --exact --nocapture 2>&1 | tee "$evidence/pack-bound-negative-control.log"
           negative_status=("${PIPESTATUS[@]}")

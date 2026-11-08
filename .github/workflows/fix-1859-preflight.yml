@@ -131,7 +131,7 @@ jobs:
           source.write_text(text.replace(original, '.saturating_add(file.name.len() as u64 + 2)'))
           PY
           set +e
-          validation_env "$VALIDATION_CARGO" test -p kache --bin kache \
+          validation_env "$VALIDATION_CARGO" test -p kache --bin kache-engine \
             remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance \
             -- --exact --nocapture 2>&1 | tee "$evidence/pack-bound-negative-control.log"
           negative_status=("${PIPESTATUS[@]}")

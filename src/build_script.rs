@@ -19,13 +19,13 @@
 //! inputs match a recorded run. Otherwise it runs the real script and records
 //! the result.
 //!
-//! The inputs are the ones Cargo itself uses to decide whether a script must
+//! The inputs include the ones Cargo uses to decide whether a script must
 //! rerun: the script binary, the environment Cargo provides, and the
 //! `rerun-if-changed` / `rerun-if-env-changed` declarations the script made on
 //! its previous run. A script that declares nothing depends on its whole
-//! package directory, exactly as in Cargo. Serving a recorded run under those
-//! rules is no less correct than Cargo skipping the rerun, which is what it
-//! does with a warm target directory. A run is recorded in the local store
+//! package directory, exactly as in Cargo. Named link inputs outside target
+//! also key the run: a fresh home can lack libraries the previous run found
+//! or downloaded. A run is recorded in the local store
 //! and is never published to a remote. A local miss is restored from
 //! `readonly_store` when that store has the run; the read-only store is not
 //! written.
@@ -33,7 +33,8 @@
 //! The named files are the link search paths and `-L` flags in the script's
 //! stdout. A directory Cargo fills itself (`deps`, `incremental`, `build`,
 //! `.fingerprint`, `examples`) is not part of the run, and a path outside the
-//! target directory is left where it is. Those files share `OUT_DIR`'s size
+//! target directory is left where it is and its contents key the run. Those
+//! stored files share `OUT_DIR`'s size
 //! cap. When they do not fit, the run is not recorded and a later checkout
 //! runs the script.
 
@@ -51,6 +52,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) mod declarations;
+mod external;
 mod hermetic;
 pub(crate) mod inputs;
 mod outside;
@@ -98,8 +100,9 @@ const PREDICTION_PREFIX: &str = "build-script:";
 /// A v2 key could replay a search path in a sibling Cargo build unit without
 /// restoring its library. Version 3 refuses those runs unless a dependency
 /// handed down the path and keys the dependency contents. Version 4 keys
-/// modification times of declared inputs too.
-const ACTION_KIND: &[u8] = b"kache-build-script-action-v4";
+/// modification times of declared inputs too. Version 5 keys external native
+/// link inputs, which a fresh container may not have.
+const ACTION_KIND: &[u8] = b"kache-build-script-action-v5";
 /// Marks a script binary that writes into its inputs on every run.
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -908,6 +911,10 @@ struct Prediction {
     inputs: Vec<String>,
     /// Declared `rerun-if-env-changed` names.
     env: Vec<String>,
+    /// Named link inputs outside target are not restored; their contents must
+    /// still match before the script's output can be replayed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_link_inputs: Vec<String>,
     /// No declarations: the package directory is the input, as in Cargo.
     default_package: bool,
     /// Nothing under `OUT_DIR` spelled a machine-local root, so the result
@@ -937,6 +944,7 @@ fn recorded_prediction(
         version: PREDICTION_SCHEMA,
         inputs,
         env,
+        external_link_inputs: Vec::new(),
         default_package,
         // Read by kache versions that predate `embedded_roots`: they bind
         // anything but a result they could restore anywhere.
@@ -1689,6 +1697,12 @@ impl Run {
             )?;
             fold(&mut hasher, "state", state.as_bytes());
         }
+        external::fold_inputs(
+            &mut hasher,
+            &prediction.external_link_inputs,
+            &self.environment,
+            &file_hasher,
+        )?;
         // It changes the archives the script writes, so it is keyed where it
         // is set. Other hosts keep their existing keys.
         if cfg!(target_os = "macos")
@@ -1969,13 +1983,14 @@ impl Run {
             rewritten,
             embedded,
         } = self.environment.classify_outputs(files, staging.path())?;
-        let prediction = recorded_prediction(
+        let mut prediction = recorded_prediction(
             inputs,
             env,
             default_package,
             embedded,
             !rewritten.is_empty(),
         );
+        prediction.external_link_inputs = external::paths(stdout_text, &self.environment);
         let key_start = std::time::Instant::now();
         // Use the pre-execution tool bytes for the key. Recheck after output
         // staging so an edit or link retarget cannot label old outputs with a
@@ -4049,6 +4064,7 @@ mod tests {
             version: 1,
             inputs: vec!["${KACHE_MANIFEST_DIR}".to_string()],
             env: Vec::new(),
+            external_link_inputs: Vec::new(),
             default_package: true,
             portable_out_dir: true,
             embedded_roots: None,
@@ -4300,6 +4316,7 @@ mod tests {
             version: PREDICTION_SCHEMA,
             inputs: Vec::new(),
             env: Vec::new(),
+            external_link_inputs: Vec::new(),
             default_package: false,
             portable_out_dir,
             embedded_roots,
@@ -5322,6 +5339,9 @@ mod tests {
         std::fs::write(obj.join("librusty_v8.a"), archive).unwrap();
         std::fs::write(obj.join("note.txt"), format!("search={}\n", obj.display())).unwrap();
         std::fs::write(deps.join("libcargo.a"), b"not-ours").unwrap();
+        let system = dir.as_path().join("system/lib");
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("libsystem.a"), b"machine-local").unwrap();
         std::fs::write(a.environment.out_dir.join("marker.txt"), "marker").unwrap();
         #[cfg(unix)]
         {
@@ -5336,9 +5356,10 @@ mod tests {
             "cargo:rerun-if-changed=build.rs\n\
              cargo:rustc-link-search=native={}\n\
              cargo:rustc-link-search=native={}\n\
-             cargo:rustc-link-search=/usr/lib\n",
+             cargo:rustc-link-search={}\n",
             obj.display(),
             deps.display(),
+            system.display(),
         );
         let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         a.record(stdout.as_bytes(), b"", 5, after).unwrap();
@@ -5408,6 +5429,130 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "the executable bit comes back");
         }
+    }
+
+    #[test]
+    fn external_link_inputs_must_still_exist_with_the_recorded_contents() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let external = dir.as_path().join("home/.cache/ort/native");
+        std::fs::create_dir_all(&external).unwrap();
+        let library = external.join("libonnxruntime.a");
+        std::fs::write(&library, b"old").unwrap();
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\ncargo:rustc-link-search=native={}\ncargo:rustc-link-lib=static=onnxruntime\n",
+            external.display()
+        );
+        a.record(
+            stdout.as_bytes(),
+            b"",
+            5,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let prediction = b.prediction().unwrap().unwrap();
+        assert_eq!(
+            prediction.external_link_inputs,
+            vec![external.to_string_lossy()]
+        );
+        let key = b.action_key(&prediction).unwrap();
+        let meta = b
+            .store
+            .get(&key)
+            .unwrap()
+            .expect("unchanged native inputs can reuse the run");
+        assert!(
+            meta.files
+                .iter()
+                .all(|file| !file.name.contains("onnxruntime")),
+            "external libraries are not copied to the store"
+        );
+        b.restore(&meta).unwrap();
+        assert_eq!(std::fs::read(&library).unwrap(), b"old");
+        let miss = |why: &str| {
+            let next = b.action_key(&prediction).unwrap();
+            assert_ne!(next, key, "{why}");
+            assert!(
+                b.store.get(&next).unwrap().is_none(),
+                "{why}: the real script must run"
+            );
+            next
+        };
+        std::fs::remove_file(&library).unwrap();
+        let empty = miss("existing but empty search directory");
+        std::fs::remove_dir(&external).unwrap();
+        let absent = miss("fresh home without the external cache");
+        assert_ne!(empty, absent);
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(&library, b"new").unwrap();
+        miss("changed library bytes");
+        std::fs::write(&library, b"old").unwrap();
+        assert_eq!(b.action_key(&prediction).unwrap(), key);
+    }
+
+    #[test]
+    fn external_link_inputs_include_relative_searches_and_absolute_link_args() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (run, _) = two_targets(dir.as_path());
+        let library = dir.as_path().join("native/lib.a");
+        let local = run.environment.manifest_dir.join("local/lib");
+        let target = run.environment.out_dir.join("native");
+        let stdout = format!(
+            "cargo::rustc-link-search=native=local/lib\ncargo:rustc-link-arg={}\ncargo:rustc-flags=-Lnative={}\ncargo:rustc-link-search={}\ncargo:rustc-env=ORDINARY_TEXT=/not/a/link/input\n",
+            library.display(),
+            local.display(),
+            target.display()
+        );
+        let mut expected = vec![
+            run.environment.normalize_str(&library.to_string_lossy()),
+            run.environment.normalize_str(&local.to_string_lossy()),
+        ];
+        expected.sort();
+        assert_eq!(external::paths(&stdout, &run.environment), expected);
+    }
+
+    #[test]
+    fn older_external_link_runs_do_not_match_the_new_action_namespace() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (run, _) = two_targets(dir.as_path());
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let tools = ToolSnapshot::new();
+        let old = run
+            .action_key_as(b"kache-build-script-action-v4", &prediction, None, &tools)
+            .unwrap();
+        let json = serde_json::json!({"version": 1, "directories": [], "empty_files": [], "stdout": "cargo:rustc-link-search=/missing/native\n", "stderr": ""});
+        put_manifest(&run, &old, &json.to_string());
+        let current = run.action_key_with(&prediction, None, &tools).unwrap();
+        assert_ne!(current, old);
+        assert!(run.store.get(&old).unwrap().is_some());
+        assert!(run.store.get(&current).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_path_below_a_target_alias_is_keyed_when_it_resolves_outside_target() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (run, _) = two_targets(dir.as_path());
+        let external = dir.as_path().join("native/lib");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("native.a"), b"old").unwrap();
+        let target = run.environment.target_roots().next().unwrap();
+        let alias = target.join("external");
+        std::os::unix::fs::symlink(&external, &alias).unwrap();
+        let stdout = format!("cargo:rustc-link-search={}\n", alias.display());
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        prediction.external_link_inputs = external::paths(&stdout, &run.environment);
+        assert_eq!(
+            prediction.external_link_inputs,
+            vec![run.environment.normalize_str(&alias.to_string_lossy())]
+        );
+        let first = run.action_key(&prediction).unwrap();
+        std::fs::write(external.join("native.a"), b"new").unwrap();
+        assert_ne!(run.action_key(&prediction).unwrap(), first);
     }
 
     #[test]
@@ -5888,6 +6033,7 @@ mod tests {
             version: PREDICTION_SCHEMA,
             inputs: Vec::new(),
             env: Vec::new(),
+            external_link_inputs: Vec::new(),
             default_package: false,
             portable_out_dir: true,
             embedded_roots: None,
@@ -5926,6 +6072,7 @@ mod tests {
             version: PREDICTION_SCHEMA,
             inputs: Vec::new(),
             env: Vec::new(),
+            external_link_inputs: Vec::new(),
             default_package: false,
             portable_out_dir: true,
             embedded_roots: None,

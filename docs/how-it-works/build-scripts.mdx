@@ -143,6 +143,23 @@ reconstructed by replaying this script. Naming the Cargo `build` directory
 itself also refuses the run, because that directory has no single owner. Then Kache replays the recorded
 stdout and stderr with the current paths substituted.
 
+For link paths outside the target directory, Kache checks the contents of the
+named files or directories as part of the run's key. If a downloaded native
+library disappears, its directory becomes empty, or its bytes change, Kache
+runs the script again. This also applies when reading from a shared read-only
+store. External libraries stay where the script put them; Kache does not copy
+them into the cache.
+
+The external-input check inspects at most 1,024 entries and 64 MiB of file
+contents. Larger or unreadable trees leave the script run uncached. Put
+generated libraries under `OUT_DIR` when possible. Hermetic runs that name
+external link inputs use the regular run cache instead. Older run and hermetic
+entries use separate keys and cannot bypass these checks.
+
+Existing launchers keep their pinned engine after an upgrade. Stop builds and
+programs using the target, then run `kache doctor --repair-build-scripts target`
+to refresh those launchers with the upgraded engine.
+
 On Unix, links in `OUT_DIR` can point into the package directory, Cargo's
 `registry/src` or `git/checkouts` directories, or back into `OUT_DIR` by an
 absolute path. Kache records each resolved target as a root and a checked

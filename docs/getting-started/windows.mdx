@@ -100,9 +100,10 @@ kache config set cache.native_runtime_warmup false
 ```
 
 Ordinary runtime-library hashes reuse file-hash memos when NTFS supplies a file
-index and change time. A replaced library or an edit that restores its old
-modification time invalidates that memo. Other filesystems, or failed identity
-queries, keep caching artifacts but read runtime bytes on each key. Explicit
+index and change time. Source builds and the next release also use these memos
+for Microsoft `link.exe` and `cl.exe` banner digests. A replaced file or an edit
+that restores its old modification time invalidates the memo. Other filesystems,
+or failed identity queries, keep caching artifacts but read bytes on each key. Explicit
 `/DEFAULTLIB` requests still validate and hash the selected archive together.
 An unavailable or older daemon uses the synchronous path too.
 
@@ -114,8 +115,8 @@ cargo build
 ```
 
 The trace separates `native_msvc_discovery`, `native_msvc_banner_hash`,
-`native_msvc_banner_run`, and `native_msvc_runtime`. Ordinary runtime reads also
-contribute to file-hash byte counts; banner reads have their own spans. These
+`native_msvc_banner_run`, and `native_msvc_runtime`. Ordinary runtime and
+Microsoft tool-banner reads also contribute to file-hash byte counts. These
 intervals are needed to locate a cold-key delay. A small hash-byte count alone
 does not identify its cause. See [phase tracing](/docs/benchmarks) for scope and
 measurement overhead.

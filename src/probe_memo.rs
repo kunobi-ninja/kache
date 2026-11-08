@@ -40,6 +40,7 @@ impl Material {
 }
 
 /// Hex digest of a file's bytes, or `None` when it cannot be read.
+#[cfg(test)]
 pub(crate) fn file_digest(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())

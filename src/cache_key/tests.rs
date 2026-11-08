@@ -1541,12 +1541,24 @@ fn windows_defaultlib_fold_validates_the_selected_runtime_through_the_real_probe
     let request = ["-Clink-arg=/DEFAULTLIB:ucrt.lib"];
     let without_request = fold(&[]).unwrap();
     let cold = file_hasher.stats();
-    assert_eq!(cold.cache_misses, 3);
-    assert_eq!(cold.bytes_hashed, 140_000 + original.len() as u64);
+    let tool_bytes: u64 = ["cl.exe", "link.exe"]
+        .iter()
+        .map(|name| std::fs::metadata(tools.join(name)).unwrap().len())
+        .sum();
+    // Three runtime libraries plus each banner tool before/after its probe.
+    assert_eq!(cold.cache_misses, 7);
+    assert_eq!(
+        cold.bytes_hashed,
+        140_000 + original.len() as u64 + 2 * tool_bytes
+    );
     file_hasher.flush_memo_as_if_settled();
     assert_eq!(fold(&[]).unwrap(), without_request);
     assert_eq!(file_hasher.stats().cache_hits, 3);
-    assert_eq!(file_hasher.stats().bytes_hashed, cold.bytes_hashed);
+    // These tiny shell fixtures are below the persistent-hash threshold.
+    assert_eq!(
+        file_hasher.stats().bytes_hashed,
+        cold.bytes_hashed + tool_bytes
+    );
     let requested = fold(&request).unwrap();
     assert_eq!(requested.1, blake3::hash(&original).to_hex().to_string());
     assert_eq!(

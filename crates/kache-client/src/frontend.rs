@@ -67,14 +67,14 @@ pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
                     return Ok(exit);
                 }
                 #[cfg(windows)]
-                if attempt == kache_ipc::execution::Attempt::Recoverable
-                    && let Some(exit) = windows::try_bootstrap(
+                if let Some(exit) = attempt.recover_with(|| {
+                    windows::try_bootstrap(
                         &execution,
                         &socket,
                         config.disabled,
                         config.trust_daemon_execution,
-                    )?
-                {
+                    )
+                })? {
                     return Ok(exit);
                 }
             }

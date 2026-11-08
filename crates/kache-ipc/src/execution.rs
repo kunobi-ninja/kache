@@ -51,6 +51,19 @@ impl Attempt {
             Self::Recoverable | Self::LocalOnly => None,
         }
     }
+
+    /// Start or retry only a recoverable handoff. A completed or local-only
+    /// request must not evaluate the recovery operation.
+    pub fn recover_with(
+        self,
+        recover: impl FnOnce() -> Result<Option<i32>>,
+    ) -> Result<Option<i32>> {
+        if self == Self::Recoverable {
+            recover()
+        } else {
+            Ok(self.exit_code())
+        }
+    }
 }
 
 /// `None` permits local execution. An error means Commit may have reached the
@@ -289,6 +302,36 @@ fn read_reply(reader: &mut impl BufRead) -> Result<ExecutionReply> {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+
+    #[test]
+    fn recovery_runs_once_only_when_it_can_help() {
+        for (attempt, expected) in [
+            (Attempt::LocalOnly, None),
+            (Attempt::Complete(23), Some(23)),
+        ] {
+            assert_eq!(
+                attempt
+                    .recover_with(|| panic!("completed and local-only requests cannot recover"))
+                    .unwrap(),
+                expected
+            );
+        }
+        for recovered in [Some(17), None] {
+            let mut starts = 0;
+            let result = Attempt::Recoverable
+                .recover_with(|| {
+                    starts += 1;
+                    Ok(recovered)
+                })
+                .unwrap();
+            assert_eq!(starts, 1);
+            assert_eq!(result, recovered);
+        }
+        let error = Attempt::Recoverable
+            .recover_with(|| anyhow::bail!("committed retry disconnected"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "committed retry disconnected");
+    }
 
     #[test]
     fn precommit_permission_denial_requires_local_execution() {

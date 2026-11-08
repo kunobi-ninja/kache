@@ -24,9 +24,9 @@ jobs:
       matrix:
         include:
           - issue: '1859'
-            base: bbfa892bb513df8a7079055b75a7f48449a2ae8d
-            head: a4085700b2c2083445a14840509ac14f6c3b09a2
-            tree: a2ca77dc09b9890e1a4fa26622a93074cba4870c
+            base: d1cf91320bc231809cb8581cb5db98d7a742b0c4
+            head: f76d9c8e40bb329e479b526d0d09abc1b047ddeb
+            tree: 12edc0229925430a202cc19a57831e01606cb04d
     defaults:
       run:
         shell: bash
@@ -114,53 +114,50 @@ jobs:
             printf 'rustup_toolchain=1.99.1\nrustc_path=%s\ncargo_path=%s\n' "$VALIDATION_RUSTC" "$VALIDATION_CARGO"
             printf 'rustc_identity=%s\ncargo_identity=%s\n' "$VALIDATION_EXPECTED_RUSTC" "$VALIDATION_EXPECTED_CARGO"
           } >> "$evidence/provenance.txt"
-          # Replay the surviving arithmetic mutation before the complete check.
-          # Require an assertion failure in the new regression, then restore
-          # the exact candidate bytes. A build failure does not count.
-          validation_env "$VALIDATION_CARGO" test -p kache --lib \
-            remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance \
-            -- --exact --nocapture 2>&1 | tee "$evidence/pack-bound-positive-control.log"
-          python3 - "$evidence" <<'PY'
+          # Prove the new default and precedence tests, then restore the old
+          # 512 MiB default and require an assertion failure in the default test.
+          validation_env "$VALIDATION_CARGO" test -p kache-config --lib upload_limits \
+            -- --nocapture 2>&1 | tee "$evidence/upload-default-positive-control.log"
+          python3 - "$evidence" <<'PYCONTROL'
           from pathlib import Path
           import sys
-          log = (Path(sys.argv[1]) / 'pack-bound-positive-control.log').read_text()
-          assert 'test remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance ... ok' in log
-          assert 'test result: ok. 1 passed; 0 failed' in log
-          PY
-          pack_source=src/remote_layout.rs
-          pack_backup="$evidence/remote_layout.rs.original"
-          cp "$pack_source" "$pack_backup"
-          restore_pack_source() { cp "$pack_backup" "$pack_source"; }
-          trap restore_pack_source EXIT
-          python3 - <<'PY'
+          log = (Path(sys.argv[1]) / 'upload-default-positive-control.log').read_text()
+          assert 'test result: ok. 2 passed; 0 failed' in log
+          PYCONTROL
+          config_source=crates/kache-config/src/config.rs
+          config_backup="$evidence/config.rs.original"
+          cp "$config_source" "$config_backup"
+          restore_config_source() { cp "$config_backup" "$config_source"; }
+          trap restore_config_source EXIT
+          python3 - <<'PYCONTROL'
           from pathlib import Path
-          source = Path('src/remote_layout.rs')
+          source = Path('crates/kache-config/src/config.rs')
           text = source.read_text()
-          original = '.saturating_add(file.name.len() as u64 * 2)'
+          original = 'pub const DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES: u64 = 1 << 30;'
           assert text.count(original) == 1
-          source.write_text(text.replace(original, '.saturating_add(file.name.len() as u64 + 2)'))
-          PY
+          source.write_text(text.replace(original, 'pub const DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES: u64 = 512 << 20;'))
+          PYCONTROL
           set +e
-          validation_env "$VALIDATION_CARGO" test -p kache --lib \
-            remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance \
-            -- --exact --nocapture 2>&1 | tee "$evidence/pack-bound-negative-control.log"
+          validation_env "$VALIDATION_CARGO" test -p kache-config --lib \
+            config::tests::upload_limits_default_and_follow_file_then_env_precedence \
+            -- --exact --nocapture 2>&1 | tee "$evidence/upload-default-negative-control.log"
           negative_status=("${PIPESTATUS[@]}")
           set -e
-          restore_pack_source
+          restore_config_source
           trap - EXIT
-          cmp "$pack_source" "$pack_backup"
+          cmp "$config_source" "$config_backup"
           test "${negative_status[0]}" -eq 101
           test "${negative_status[1]}" -eq 0
-          python3 - "$evidence" <<'PY'
+          python3 - "$evidence" <<'PYCONTROL'
           from pathlib import Path
           import json, sys
           evidence = Path(sys.argv[1])
-          log = (evidence / 'pack-bound-negative-control.log').read_text()
-          assert 'test remote_layout::tests::upload_pack_memory_bound_includes_padding_and_long_name_allowance ... FAILED' in log
+          log = (evidence / 'upload-default-negative-control.log').read_text()
+          assert 'test config::tests::upload_limits_default_and_follow_file_then_env_precedence ... FAILED' in log
           assert 'assertion `left == right` failed' in log
           assert 'test result: FAILED. 0 passed; 1 failed' in log
-          (evidence / 'negative-control.json').write_text(json.dumps({'mutation': 'replace * with + in pack_size_bound', 'exit': 101, 'assertion_failure': True, 'source_restored_byte_for_byte': True}) + '\n')
-          PY
+          (evidence / 'negative-control.json').write_text(json.dumps({'mutation': 'restore old 512 MiB upload memory default', 'exit': 101, 'assertion_failure': True, 'source_restored_byte_for_byte': True}) + '\n')
+          PYCONTROL
           set +e
           validation_env "$VALIDATION_JUST" check 2>&1 | tee "$evidence/just-check.log"
           statuses=("${PIPESTATUS[@]}")

@@ -228,7 +228,7 @@ fn size_key(key: &str) -> Option<bool> {
         | "cache.event_log_max_size"
         | "cache.prefetch_max_bytes"
         | "cache.auto_recover_min_free_bytes" => Some(true),
-        "cache.restore_max_size" => Some(false),
+        "cache.restore_max_size" | "cache.remote_upload_memory_bytes" => Some(false),
         _ => None,
     }
 }
@@ -253,6 +253,11 @@ fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str
         if bytes == 0 && !allow_zero {
             bail!("{} must be greater than zero", keys.join("."));
         }
+        if keys == ["cache", "remote_upload_memory_bytes"]
+            && crate::config::checked_remote_upload_memory_bytes(bytes).is_none()
+        {
+            bail!("cache.remote_upload_memory_bytes must be at least 2KiB");
+        }
     }
     if keys == ["cache", "demand_timeout_secs"]
         && let Some(value) = replacement.as_ref()
@@ -264,6 +269,24 @@ fn change(document: &mut toml_edit::DocumentMut, keys: &[&str], raw: Option<&str
         if seconds.is_none() {
             bail!("cache.demand_timeout_secs must be positive integer seconds, at most 4294967295");
         }
+    }
+    if matches!(
+        keys,
+        [
+            "cache",
+            "remote_upload_max_attempts" | "remote_upload_timeout_secs"
+        ]
+    ) && let Some(value) = replacement.as_ref()
+        && value
+            .as_integer()
+            .and_then(|value| u64::try_from(value).ok())
+            .and_then(crate::config::checked_demand_timeout_secs)
+            .is_none()
+    {
+        bail!(
+            "{} must be a positive integer, at most 4294967295",
+            keys.join(".")
+        );
     }
     if replacement
         .as_ref()
@@ -317,6 +340,7 @@ mod tests {
             "prefetch_max_bytes",
             "auto_recover_min_free_bytes",
             "restore_max_size",
+            "remote_upload_memory_bytes",
         ] {
             let dotted = format!("cache.{key}");
             for raw in ["1.5 GiB", "500MB", "4096"] {
@@ -345,7 +369,7 @@ mod tests {
                 assert!(edit(&path, &dotted, Some(raw)).is_err(), "{dotted}={raw}");
                 assert_eq!(fs::read_to_string(&path).unwrap(), original);
             }
-            if key == "restore_max_size" {
+            if matches!(key, "restore_max_size" | "remote_upload_memory_bytes") {
                 assert!(edit(&path, &dotted, Some("0B")).is_err());
                 assert_eq!(fs::read_to_string(&path).unwrap(), original);
             } else {
@@ -357,6 +381,41 @@ mod tests {
             assert!(edit(&path, key, Some("1GiB")).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn upload_limit_edits_validate_ranges_and_preserve_the_file_on_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# Keep this comment\n[cache]\nlocal_only = true\n").unwrap();
+        for name in ["remote_upload_max_attempts", "remote_upload_timeout_secs"] {
+            let key = format!("cache.{name}");
+            for raw in ["1", "5", "4294967295"] {
+                edit(&path, &key, Some(raw)).unwrap();
+                let values: toml::Value =
+                    toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(values["cache"][name].as_integer(), raw.parse().ok());
+            }
+            let original = fs::read_to_string(&path).unwrap();
+            for raw in ["0", "-1", "4294967296", "1.5", "true", "\"5\"", "5s", "[]"] {
+                assert!(edit(&path, &key, Some(raw)).is_err(), "{key}={raw}");
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            }
+            edit(&path, &key, None).unwrap();
+        }
+        let memory_key = "cache.remote_upload_memory_bytes";
+        for raw in ["2KiB", "2048", "512MiB"] {
+            edit(&path, memory_key, Some(raw)).unwrap();
+        }
+        let original = fs::read_to_string(&path).unwrap();
+        for raw in ["0", "1", "2047", "2047B"] {
+            assert!(edit(&path, memory_key, Some(raw)).is_err(), "{raw}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        edit(&path, memory_key, None).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# Keep this comment"));
+        assert!(text.contains("local_only = true"));
     }
 
     #[test]

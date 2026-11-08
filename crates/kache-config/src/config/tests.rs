@@ -1308,6 +1308,99 @@ remote_negative_ttl_secs = 90
 }
 
 #[test]
+fn upload_limits_default_and_follow_file_then_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[cache]\n").unwrap();
+    let _config = set_kache_config_for_test(&path);
+    let _attempts = NamedEnvGuard::remove("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS");
+    let _memory = NamedEnvGuard::remove("KACHE_REMOTE_UPLOAD_MEMORY_BYTES");
+    let _timeout = NamedEnvGuard::remove("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS");
+    let assert_values = |attempts, bytes, timeout| {
+        let config = Config::load().unwrap();
+        assert_eq!(config.remote_upload_max_attempts, attempts);
+        assert_eq!(config.remote_upload_memory_bytes, bytes);
+        assert_eq!(config.remote_upload_timeout_secs, timeout);
+    };
+    assert_values(5, 536_870_912, 300);
+    std::fs::write(
+        &path,
+        "[cache]\nremote_upload_max_attempts = 7\nremote_upload_memory_bytes = \"1GiB\"\nremote_upload_timeout_secs = 90\n",
+    )
+    .unwrap();
+    assert_values(7, 1_073_741_824, 90);
+    {
+        let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", "3");
+        let _memory = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MEMORY_BYTES", "500MB");
+        let _timeout = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS", "600");
+        assert_values(3, 500_000_000, 600);
+    }
+    for invalid in ["0", "-1", "4294967296", "many"] {
+        let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", invalid);
+        let _timeout = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS", invalid);
+        assert_values(7, 1_073_741_824, 90);
+    }
+    for invalid in ["0", "2047", "-1GB", "2frogs", "18446744073709551616B"] {
+        let _memory = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MEMORY_BYTES", invalid);
+        assert_values(7, 1_073_741_824, 90);
+    }
+    {
+        let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", "4294967295");
+        let _memory = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MEMORY_BYTES", "2048");
+        let _timeout = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS", "4294967295");
+        assert_values(u32::MAX, 2048, 4_294_967_295);
+    }
+    std::fs::write(
+        &path,
+        "[cache]\nignore_env = true\nremote_upload_max_attempts = 7\nremote_upload_memory_bytes = 4096\nremote_upload_timeout_secs = 90\n",
+    )
+    .unwrap();
+    {
+        let _attempts = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS", "3");
+        let _memory = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_MEMORY_BYTES", "2GiB");
+        let _timeout = NamedEnvGuard::set("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS", "600");
+        assert_values(7, 4096, 90);
+    }
+    for name in [
+        "KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS",
+        "KACHE_REMOTE_UPLOAD_MEMORY_BYTES",
+        "KACHE_REMOTE_UPLOAD_TIMEOUT_SECS",
+    ] {
+        assert!(IGNORE_ENV_GATED_VARS.contains(&name));
+    }
+}
+
+#[test]
+fn invalid_file_upload_limits_fall_back_without_discarding_other_valid_settings() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _attempts = NamedEnvGuard::remove("KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS");
+    let _memory = NamedEnvGuard::remove("KACHE_REMOTE_UPLOAD_MEMORY_BYTES");
+    let _timeout = NamedEnvGuard::remove("KACHE_REMOTE_UPLOAD_TIMEOUT_SECS");
+    for memory in ["0B", "2047B", "no-size"] {
+        for timeout in [0, 4_294_967_296u64] {
+            std::fs::write(
+                &path,
+                format!("[cache]\nremote_upload_max_attempts = 0\nremote_upload_memory_bytes = {memory:?}\nremote_upload_timeout_secs = {timeout}\ns3_concurrency = 9\n"),
+            )
+            .unwrap();
+            let config = Config::load().unwrap();
+            assert_eq!(config.remote_upload_max_attempts, 5);
+            assert_eq!(config.remote_upload_memory_bytes, 536_870_912);
+            assert_eq!(config.remote_upload_timeout_secs, 300);
+            assert_eq!(config.s3_concurrency, 9);
+        }
+    }
+    assert_eq!(checked_remote_upload_memory_bytes(0), None);
+    assert_eq!(checked_remote_upload_memory_bytes(2047), None);
+    assert_eq!(checked_remote_upload_memory_bytes(2048), Some(2048));
+    assert_eq!(checked_remote_upload_memory_bytes(u64::MAX), Some(u64::MAX));
+}
+
+#[test]
 fn ignore_env_pins_prefetch_controls_to_the_file() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3248,6 +3341,9 @@ fn test_file_config_roundtrip() {
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,
+            remote_upload_max_attempts: None,
+            remote_upload_memory_bytes: None,
+            remote_upload_timeout_secs: None,
             demand_timeout_secs: None,
             remote_negative_ttl_secs: None,
             remote: Some(RemoteFileConfig {
@@ -3915,6 +4011,9 @@ fn test_config_store_dir() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -4008,6 +4107,9 @@ fn test_config_index_db_path() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -4097,6 +4199,9 @@ fn test_config_event_log_path() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -4205,6 +4310,9 @@ fn test_config_socket_path() {
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -4947,6 +5055,9 @@ fn test_save_and_load_file_config() {
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,
+            remote_upload_max_attempts: None,
+            remote_upload_memory_bytes: None,
+            remote_upload_timeout_secs: None,
             demand_timeout_secs: None,
             remote_negative_ttl_secs: None,
             remote: None,

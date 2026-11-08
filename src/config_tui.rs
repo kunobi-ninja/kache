@@ -2235,6 +2235,9 @@ mod tests {
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
                 remote_restore_timeout_secs: Some(180),
+                remote_upload_max_attempts: None,
+                remote_upload_memory_bytes: None,
+                remote_upload_timeout_secs: None,
                 demand_timeout_secs: Some(60),
                 remote_negative_ttl_secs: Some(45),
                 remote: Some(RemoteFileConfig {

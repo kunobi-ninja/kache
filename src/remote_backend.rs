@@ -170,9 +170,10 @@ pub trait RemoteBackend: Send + Sync {
     }
 
     /// Store `body` at `key`.
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()>;
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()>;
 
-    /// Store `body` only when `key` is absent, atomically.
+    /// Store `body` only when `key` is absent, atomically. Clones share the
+    /// allocation and any upload-memory reservation attached to its owner.
     ///
     /// Implementations must never emulate this with HEAD followed by PUT: that
     /// race would let two publishers overwrite an immutable transport object.
@@ -180,7 +181,7 @@ pub trait RemoteBackend: Send + Sync {
     async fn put_if_absent(
         &self,
         _key: &str,
-        _body: Vec<u8>,
+        _body: bytes::Bytes,
         _content_type: Option<&str>,
     ) -> Result<PutIfAbsentResult> {
         Ok(PutIfAbsentResult::Unsupported)
@@ -202,6 +203,7 @@ pub trait RemoteBackend: Send + Sync {
 /// OpenDAL-backed object transport.
 pub struct OpenDalBackend {
     operator: Operator,
+    write_operator: Option<Operator>,
     root_description: String,
     /// Canonical filesystem root, for the filesystem backend only. Present means
     /// "this backend writes real paths", which enables the extra key rules and the
@@ -224,6 +226,7 @@ impl OpenDalBackend {
     pub(crate) fn new(operator: Operator, root_description: String) -> Self {
         Self {
             operator,
+            write_operator: None,
             root_description,
             filesystem_root: None,
             download_memory: DOWNLOAD_MEMORY.clone(),
@@ -232,6 +235,10 @@ impl OpenDalBackend {
             refusal_may_be_absence: true,
             credentials: None,
         }
+    }
+
+    fn write_operator(&self) -> &Operator {
+        self.write_operator.as_ref().unwrap_or(&self.operator)
     }
 
     /// True for the first refused read only, so the explanation is logged once.
@@ -586,7 +593,7 @@ impl RemoteBackend for OpenDalBackend {
         if !supported {
             return Ok(ConditionalPut::Unsupported);
         }
-        let request = self.operator.write_with(key, body);
+        let request = self.write_operator().write_with(key, body);
         let request = match expected {
             Some(tag) => request.if_match(tag),
             None => request.if_not_exists(true),
@@ -604,10 +611,10 @@ impl RemoteBackend for OpenDalBackend {
         }
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.validate_key("PUT", key, false)?;
         self.verify_write_containment(key)?;
-        let request = self.operator.write_with(key, body);
+        let request = self.write_operator().write_with(key, body);
         let result = match content_type {
             Some(content_type) => request.content_type(content_type).await,
             None => request.await,
@@ -620,7 +627,7 @@ impl RemoteBackend for OpenDalBackend {
     async fn put_if_absent(
         &self,
         key: &str,
-        body: Vec<u8>,
+        body: bytes::Bytes,
         content_type: Option<&str>,
     ) -> Result<PutIfAbsentResult> {
         self.validate_key("CREATE", key, false)?;
@@ -628,7 +635,10 @@ impl RemoteBackend for OpenDalBackend {
         if !self.operator.info().capability().write_with_if_not_exists {
             return Ok(PutIfAbsentResult::Unsupported);
         }
-        let request = self.operator.write_with(key, body).if_not_exists(true);
+        let request = self
+            .write_operator()
+            .write_with(key, body)
+            .if_not_exists(true);
         let result = match content_type {
             Some(content_type) => request.content_type(content_type).await,
             None => request.await,
@@ -1116,10 +1126,25 @@ fn kache_s3_keys() -> Option<Credential> {
 
 /// The S3 backend, signing with `kache_keys` when given and otherwise with
 /// the credential chain.
+#[cfg(test)]
 fn s3_backend(
     config: &S3RemoteConfig,
     pool_idle_secs: u64,
     kache_keys: Option<Credential>,
+) -> Result<OpenDalBackend> {
+    s3_backend_with_upload_timeout(
+        config,
+        pool_idle_secs,
+        kache_keys,
+        crate::config::DEFAULT_REMOTE_UPLOAD_TIMEOUT_SECS,
+    )
+}
+
+fn s3_backend_with_upload_timeout(
+    config: &S3RemoteConfig,
+    pool_idle_secs: u64,
+    kache_keys: Option<Credential>,
+    upload_timeout_secs: u64,
 ) -> Result<OpenDalBackend> {
     let status = Arc::new(CredentialStatus::default());
     let credentials = KacheCredentialProvider::new(
@@ -1132,6 +1157,14 @@ fn s3_backend(
         create_s3_operator(config, pool_idle_secs, credentials)?,
         format!("s3://{}", config.bucket),
     );
+    // S3 sends response headers after receiving the upload body. Its read
+    // timer therefore needs the upload budget, not the download inactivity
+    // limit. Keep a separate transport so stalled reads still fail promptly.
+    backend.write_operator = Some(backend.operator.clone().with_context(s3_http_context(
+        config,
+        pool_idle_secs,
+        Duration::from_secs(upload_timeout_secs),
+    )?));
     backend.region = Some(config.region.clone());
     backend.credentials = Some(status);
     Ok(backend)
@@ -1142,33 +1175,7 @@ fn create_s3_operator(
     pool_idle_secs: u64,
     credentials: impl ProvideCredential<Credential = Credential>,
 ) -> Result<Operator> {
-    // reqwest is compiled with rustls-no-provider. Installing ring here keeps
-    // direct library/test callers safe; the operation is idempotent when
-    // another Kache HTTP client already installed it.
-    ensure_rustls_provider();
-    let mut client_builder = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
-        // `pool_idle_timeout` only reaps idle pooled connections; without these an
-        // endpoint that accepts a connection and then goes silent hangs the
-        // operation forever. On the rustc-wrapper path that is an apparently-hung build.
-        // The AWS SDK supplied a 3.1s connect timeout by default
-        // (aws-config's SDK_DEFAULT_CONNECT_TIMEOUT); keep parity and add a
-        // read-inactivity deadline. Deliberately NOT a total-request timeout,
-        // which would cap large artifact transfers on slow links.
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_INACTIVITY_TIMEOUT);
-
-    if let Some(user_agent) = config
-        .user_agent
-        .as_deref()
-        .filter(|ua| !ua.trim().is_empty())
-    {
-        client_builder = client_builder.user_agent(user_agent);
-    }
-
-    let client = client_builder.build().context("building S3 HTTP client")?;
-    let context = OperationContext::new()
-        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
+    let context = s3_http_context(config, pool_idle_secs, READ_INACTIVITY_TIMEOUT)?;
 
     let mut builder = S3::default()
         .bucket(&config.bucket)
@@ -1192,6 +1199,40 @@ fn create_s3_operator(
         .context("building OpenDAL S3 operator")?
         .with_context(context);
     Ok(without_retry_layer(operator))
+}
+
+fn s3_http_context(
+    config: &S3RemoteConfig,
+    pool_idle_secs: u64,
+    read_timeout: Duration,
+) -> Result<OperationContext> {
+    // reqwest is compiled with rustls-no-provider. Installing ring here keeps
+    // direct library/test callers safe; the operation is idempotent when
+    // another Kache HTTP client already installed it.
+    ensure_rustls_provider();
+    let mut client_builder = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        // `pool_idle_timeout` only reaps idle pooled connections; without these an
+        // endpoint that accepts a connection and then goes silent hangs the
+        // operation forever. On the rustc-wrapper path that is an apparently-hung build.
+        // The AWS SDK supplied a 3.1s connect timeout by default
+        // (aws-config's SDK_DEFAULT_CONNECT_TIMEOUT); keep parity and add a
+        // read-inactivity deadline. Deliberately NOT a total-request timeout,
+        // which would cap large artifact transfers on slow links.
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(read_timeout);
+
+    if let Some(user_agent) = config
+        .user_agent
+        .as_deref()
+        .filter(|ua| !ua.trim().is_empty())
+    {
+        client_builder = client_builder.user_agent(user_agent);
+    }
+
+    let client = client_builder.build().context("building S3 HTTP client")?;
+    Ok(OperationContext::new()
+        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client))))
 }
 
 /// Same-filesystem check for the staging directory.
@@ -1264,8 +1305,26 @@ pub async fn create_backend(
     remote: &RemoteConfig,
     pool_idle_secs: u64,
 ) -> Result<Arc<dyn RemoteBackend>> {
+    create_backend_with_upload_timeout(
+        remote,
+        pool_idle_secs,
+        crate::config::DEFAULT_REMOTE_UPLOAD_TIMEOUT_SECS,
+    )
+    .await
+}
+
+async fn create_backend_with_upload_timeout(
+    remote: &RemoteConfig,
+    pool_idle_secs: u64,
+    upload_timeout_secs: u64,
+) -> Result<Arc<dyn RemoteBackend>> {
     let backend = match &remote.backend {
-        RemoteBackendConfig::S3(config) => s3_backend(config, pool_idle_secs, kache_s3_keys())?,
+        RemoteBackendConfig::S3(config) => s3_backend_with_upload_timeout(
+            config,
+            pool_idle_secs,
+            kache_s3_keys(),
+            upload_timeout_secs,
+        )?,
         RemoteBackendConfig::Gcs(config) => {
             let mut backend = OpenDalBackend::new(
                 create_gcs_operator(config, pool_idle_secs)?,
@@ -1319,8 +1378,10 @@ pub async fn create_backend_for(
     remote: &RemoteConfig,
     pull_request_prefix: Option<&str>,
     pool_idle_secs: u64,
+    upload_timeout_secs: u64,
 ) -> Result<Arc<dyn RemoteBackend>> {
-    let backend = create_backend(remote, pool_idle_secs).await?;
+    let backend =
+        create_backend_with_upload_timeout(remote, pool_idle_secs, upload_timeout_secs).await?;
     Ok(match pull_request_prefix {
         Some(pull_request) => Arc::new(PullRequestBackend {
             inner: backend,
@@ -1416,7 +1477,7 @@ impl RemoteBackend for PullRequestBackend {
             .await
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         self.inner
             .put(&self.pull_request_key(key), body, content_type)
             .await
@@ -1425,7 +1486,7 @@ impl RemoteBackend for PullRequestBackend {
     async fn put_if_absent(
         &self,
         key: &str,
-        body: Vec<u8>,
+        body: bytes::Bytes,
         content_type: Option<&str>,
     ) -> Result<PutIfAbsentResult> {
         self.inner
@@ -1539,7 +1600,10 @@ mod tests {
     #[tokio::test]
     async fn get_into_flushes_a_file_and_reports_write_failures() {
         let backend = memory_backend();
-        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        backend
+            .put("key", (b"hello".to_vec()).into(), None)
+            .await
+            .unwrap();
         let mut file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
         let transfer = backend
             .get_into("key", Some(5), &mut file)
@@ -1577,8 +1641,14 @@ mod tests {
         let budget = Arc::new(DownloadMemory::new(10));
         first.download_memory = budget.clone();
         second.download_memory = budget;
-        first.put("key", b"hello".to_vec(), None).await.unwrap();
-        second.put("key", b"world".to_vec(), None).await.unwrap();
+        first
+            .put("key", (b"hello".to_vec()).into(), None)
+            .await
+            .unwrap();
+        second
+            .put("key", (b"world".to_vec()).into(), None)
+            .await
+            .unwrap();
         let body = first.get("key", Some(5 << 10)).await.unwrap().unwrap().body;
         let clone = body.clone();
         drop(body);
@@ -1604,7 +1674,10 @@ mod tests {
     #[tokio::test]
     async fn misses_and_failed_reads_release_download_memory() {
         let backend = memory_backend_with_download_budget(1);
-        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        backend
+            .put("key", (b"hello".to_vec()).into(), None)
+            .await
+            .unwrap();
         assert!(backend.get("absent", Some(5)).await.unwrap().is_none());
         assert!(backend.get("key", Some(4)).await.is_err());
         let object = tokio::time::timeout(Duration::from_secs(1), backend.get("key", Some(5)))
@@ -1618,7 +1691,10 @@ mod tests {
     #[tokio::test]
     async fn streaming_downloads_do_not_wait_for_buffered_memory() {
         let backend = memory_backend_with_download_budget(1);
-        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        backend
+            .put("key", (b"hello".to_vec()).into(), None)
+            .await
+            .unwrap();
         let buffered = backend.get("key", Some(5)).await.unwrap().unwrap();
         let mut file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
         let transfer = tokio::time::timeout(
@@ -1640,7 +1716,7 @@ mod tests {
         assert!(backend.get("nested/key", None).await.unwrap().is_none());
 
         backend
-            .put("nested/key", b"hello".to_vec(), Some("text/plain"))
+            .put("nested/key", (b"hello".to_vec()).into(), Some("text/plain"))
             .await
             .unwrap();
         assert!(backend.head("nested/key").await.unwrap());
@@ -1659,14 +1735,14 @@ mod tests {
 
         assert_eq!(
             backend
-                .put_if_absent("immutable/key", b"first".to_vec(), None)
+                .put_if_absent("immutable/key", b"first".to_vec().into(), None)
                 .await
                 .unwrap(),
             PutIfAbsentResult::Created
         );
         assert_eq!(
             backend
-                .put_if_absent("immutable/key", b"second".to_vec(), None)
+                .put_if_absent("immutable/key", b"second".to_vec().into(), None)
                 .await
                 .unwrap(),
             PutIfAbsentResult::AlreadyExists
@@ -1720,7 +1796,7 @@ mod tests {
         );
         assert_eq!(
             backend
-                .put_if_absent("artifacts/present", b"again".to_vec(), None)
+                .put_if_absent("artifacts/present", b"again".to_vec().into(), None)
                 .await
                 .unwrap(),
             PutIfAbsentResult::AlreadyExists
@@ -1755,10 +1831,10 @@ mod tests {
     async fn a_pull_request_job_writes_only_under_its_own_prefix() {
         let inner: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
         let view = pull_request_view(inner.clone());
-        view.put("artifacts/v3/packs/a", b"pr".to_vec(), None)
+        view.put("artifacts/v3/packs/a", (b"pr".to_vec()).into(), None)
             .await
             .unwrap();
-        view.put_if_absent("artifacts/v3/packs/b", b"pr".to_vec(), None)
+        view.put_if_absent("artifacts/v3/packs/b", b"pr".to_vec().into(), None)
             .await
             .unwrap();
         assert!(!inner.head("artifacts/v3/packs/a").await.unwrap());
@@ -1771,15 +1847,15 @@ mod tests {
     async fn a_pull_request_job_reads_the_base_prefix_first() {
         let inner: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
         inner
-            .put("artifacts/k/both", b"base".to_vec(), None)
+            .put("artifacts/k/both", (b"base".to_vec()).into(), None)
             .await
             .unwrap();
         inner
-            .put("artifacts-pr/k/both", b"pr".to_vec(), None)
+            .put("artifacts-pr/k/both", (b"pr".to_vec()).into(), None)
             .await
             .unwrap();
         inner
-            .put("artifacts-pr/k/pr-only", b"pr".to_vec(), None)
+            .put("artifacts-pr/k/pr-only", (b"pr".to_vec()).into(), None)
             .await
             .unwrap();
         let view = pull_request_view(inner);
@@ -1838,7 +1914,7 @@ mod tests {
         inner
             .put(
                 "artifacts/_manifests/id/t.json",
-                base_manifest.to_vec(),
+                (base_manifest.to_vec()).into(),
                 None,
             )
             .await
@@ -2013,7 +2089,10 @@ mod tests {
     #[tokio::test]
     async fn get_refuses_an_object_over_the_cap() {
         let backend = memory_backend();
-        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        backend
+            .put("key", (b"hello".to_vec()).into(), None)
+            .await
+            .unwrap();
 
         let error = backend
             .get("key", Some(1))
@@ -2042,7 +2121,7 @@ mod tests {
         backend
             .put(
                 "artifacts/v3/key",
-                b"shared".to_vec(),
+                (b"shared".to_vec()).into(),
                 Some("application/json"),
             )
             .await
@@ -2059,7 +2138,7 @@ mod tests {
         backend
             .put(
                 "artifacts/v3/key",
-                b"updated".to_vec(),
+                (b"updated".to_vec()).into(),
                 Some("application/json"),
             )
             .await
@@ -2105,7 +2184,9 @@ mod tests {
             let backend = backend.clone();
             let payload = payload.clone();
             writers.push(tokio::spawn(async move {
-                backend.put(key, payload, Some("application/zstd")).await
+                backend
+                    .put(key, (payload).into(), Some("application/zstd"))
+                    .await
             }));
         }
         // Read concurrently with the writers: any observation must be a whole
@@ -2161,19 +2242,19 @@ mod tests {
         let backend = create_backend(&remote, 30).await.unwrap();
 
         backend
-            .put("../escape", b"nope".to_vec(), None)
+            .put("../escape", (b"nope".to_vec()).into(), None)
             .await
             .expect_err("parent traversal must be rejected");
         backend
-            .put(r"..\escape", b"nope".to_vec(), None)
+            .put(r"..\escape", (b"nope".to_vec()).into(), None)
             .await
             .expect_err("Windows parent traversal must be rejected");
         backend
-            .put("/absolute", b"nope".to_vec(), None)
+            .put("/absolute", (b"nope".to_vec()).into(), None)
             .await
             .expect_err("absolute paths must be rejected");
         backend
-            .put("C:/escape", b"nope".to_vec(), None)
+            .put("C:/escape", (b"nope".to_vec()).into(), None)
             .await
             .expect_err("Windows drive prefixes must be rejected");
     }
@@ -2372,7 +2453,11 @@ mod tests {
         let backend = anonymous_s3_backend(&endpoint);
 
         backend
-            .put("key", b"hello".to_vec(), Some("application/octet-stream"))
+            .put(
+                "key",
+                (b"hello".to_vec()).into(),
+                Some("application/octet-stream"),
+            )
             .await
             .unwrap();
 
@@ -2398,14 +2483,14 @@ mod tests {
 
         assert_eq!(
             backend
-                .put_if_absent("immutable", b"first".to_vec(), None)
+                .put_if_absent("immutable", b"first".to_vec().into(), None)
                 .await
                 .unwrap(),
             PutIfAbsentResult::Created
         );
         assert_eq!(
             backend
-                .put_if_absent("immutable", b"second".to_vec(), None)
+                .put_if_absent("immutable", b"second".to_vec().into(), None)
                 .await
                 .unwrap(),
             PutIfAbsentResult::AlreadyExists
@@ -2437,7 +2522,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .put_if_absent("immutable", b"same".to_vec(), None)
+                .put_if_absent("immutable", b"same".to_vec().into(), None)
                 .await
                 .unwrap(),
             PutIfAbsentResult::AlreadyExists
@@ -2542,7 +2627,12 @@ mod tests {
             }))
         }
 
-        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        async fn put(
+            &self,
+            _key: &str,
+            _body: bytes::Bytes,
+            _content_type: Option<&str>,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -3013,7 +3103,7 @@ mod tests {
         let backend = create_backend(&remote, 30).await.unwrap();
 
         backend
-            .put("artifacts/v3/key", b"attacker".to_vec(), None)
+            .put("artifacts/v3/key", (b"attacker".to_vec()).into(), None)
             .await
             .expect_err("an existing symlinked destination must be refused");
         assert_eq!(
@@ -3084,7 +3174,7 @@ mod tests {
         let backend = create_backend(&remote, 30).await.unwrap();
 
         let error = backend
-            .put("artifacts/v3/key", b"escaped".to_vec(), None)
+            .put("artifacts/v3/key", (b"escaped".to_vec()).into(), None)
             .await
             .expect_err("writing through a symlink out of the root must be refused")
             .to_string();
@@ -3116,7 +3206,10 @@ mod tests {
             "artifacts/trailing ",   // ...and the trailing space
             "artifacts/ctrl\u{7f}x", // control characters
         ] {
-            backend.put(key, b"nope".to_vec(), None).await.unwrap_err();
+            backend
+                .put(key, (b"nope".to_vec()).into(), None)
+                .await
+                .unwrap_err();
         }
     }
 
@@ -3289,5 +3382,119 @@ mod tests {
             error.downcast_ref::<CredentialFailure>().is_none(),
             "{error:#}"
         );
+    }
+
+    async fn delayed_upload_response_server(
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (header_end, length) = loop {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0, "client must send the request headers");
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    assert!(headers.starts_with("PUT "));
+                    assert!(
+                        headers.contains("Credential=test/"),
+                        "write transport must retain its signing provider"
+                    );
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("user-agent: kache-upload-timeout-test")
+                    );
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end + 4, length);
+                }
+            };
+            let remaining = (header_end + length).saturating_sub(request.len());
+            socket.read_exact(&mut vec![0; remaining]).await.unwrap();
+            tokio::time::sleep(delay).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn s3_upload_response_timeout_is_configurable_and_does_not_change_reads() {
+        let (endpoint, server) = delayed_upload_response_server(Duration::from_millis(200)).await;
+        let config = S3RemoteConfig {
+            bucket: "test".into(),
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            profile: None,
+            user_agent: Some("kache-upload-timeout-test".into()),
+        };
+        let mut backend = s3_backend_with_upload_timeout(
+            &config,
+            30,
+            Some(Credential {
+                access_key_id: "test".into(),
+                secret_access_key: "test".into(),
+                session_token: None,
+                expires_in: None,
+            }),
+            2,
+        )
+        .unwrap();
+        // A short read timer would reject the delayed PUT response if writes
+        // accidentally reused the download transport.
+        backend.operator = backend
+            .operator
+            .clone()
+            .with_context(s3_http_context(&config, 30, Duration::from_millis(50)).unwrap());
+        assert_eq!(
+            backend
+                .put_if_absent("pack", Bytes::from_static(b"pack"), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::Created
+        );
+        server.await.unwrap();
+
+        let (endpoint, server) = delayed_upload_response_server(Duration::from_secs(2)).await;
+        let config = S3RemoteConfig {
+            endpoint: Some(endpoint),
+            ..config
+        };
+        let backend = s3_backend_with_upload_timeout(
+            &config,
+            30,
+            Some(Credential {
+                access_key_id: "test".into(),
+                secret_access_key: "test".into(),
+                session_token: None,
+                expires_in: None,
+            }),
+            1,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(1700),
+            backend.put_if_absent("pack", Bytes::from_static(b"pack"), None),
+        )
+        .await
+        .expect("configured one-second upload response deadline must fire");
+        assert!(
+            result.is_err(),
+            "a stalled upload must not disable its deadline"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }

@@ -1,4 +1,8 @@
+mod upload_memory;
+pub(crate) use upload_memory::UploadMemory;
+
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 pub(crate) use kache_format::{is_blob_hash, is_safe_artifact_name};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -43,6 +47,8 @@ struct V3Manifest {
 pub struct RemoteLayout<'a> {
     backend: &'a dyn RemoteBackend,
     remote: &'a RemoteConfig,
+    upload_memory: &'a UploadMemory,
+    upload_semaphore: Option<&'a tokio::sync::Semaphore>,
 }
 
 pub struct RemoteUploadResult {
@@ -81,7 +87,25 @@ struct ExpectedEntryBinding<'a> {
 
 impl<'a> RemoteLayout<'a> {
     pub fn new(backend: &'a dyn RemoteBackend, remote: &'a RemoteConfig) -> Self {
-        Self { backend, remote }
+        Self {
+            backend,
+            remote,
+            upload_memory: &upload_memory::DEFAULT_UPLOAD_MEMORY,
+            upload_semaphore: None,
+        }
+    }
+
+    pub(crate) fn with_upload_memory(mut self, memory: &'a UploadMemory) -> Self {
+        self.upload_memory = memory;
+        self
+    }
+
+    pub(crate) fn with_upload_semaphore(
+        mut self,
+        semaphore: Option<&'a tokio::sync::Semaphore>,
+    ) -> Self {
+        self.upload_semaphore = semaphore;
+        self
     }
 
     /// The input prediction row the remote holds for `identity`
@@ -113,7 +137,9 @@ impl<'a> RemoteLayout<'a> {
             return Ok(());
         };
         let key = v3_prediction_key(&self.remote.prefix, identity);
-        self.backend.put(&key, body, Some("application/json")).await
+        self.backend
+            .put(&key, (body).into(), Some("application/json"))
+            .await
     }
 
     pub async fn exists_entry(&self, cache_key: &str, crate_name: &str) -> Result<bool> {
@@ -251,21 +277,32 @@ impl<'a> RemoteLayout<'a> {
         let meta_content = std::fs::read_to_string(&meta_path).context("reading meta.json")?;
         let meta: EntryMeta = serde_json::from_str(&meta_content).context("parsing meta.json")?;
 
+        let memory = self
+            .upload_memory
+            .acquire(pack_size_bound(&meta, meta_content.len()))
+            .await?;
+        deadline_io_check(deadline, "upload memory admission")?;
         let compression_start = std::time::Instant::now();
-        let packed =
-            create_entry_pack_zstd_until(entry_dir, blobs_dir, &meta, compression_level, deadline)?;
+        let packed = create_entry_pack_zstd_with_limit(
+            entry_dir,
+            blobs_dir,
+            &meta,
+            compression_level,
+            deadline,
+            Some(memory.pack_limit()),
+        )?;
+        let packed = memory.body(packed);
         let compression_ms = compression_start.elapsed().as_millis() as u64;
         let pack_bytes = packed.len() as u64;
         let original_bytes =
             meta.files.iter().map(|f| f.size).sum::<u64>() + meta_content.len() as u64;
 
         let pack_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
-        let put_pack_start = std::time::Instant::now();
-        self.put_immutable(&pack_key, packed, None)
+        let mut network_ms = self
+            .put_immutable(&pack_key, packed, None)
             .await
             .context("uploading v3 pack")?;
         deadline_io_check(deadline, "pack PUT")?;
-        let mut network_ms = put_pack_start.elapsed().as_millis() as u64;
 
         let manifest = V3Manifest {
             version: V3_MANIFEST_VERSION,
@@ -280,12 +317,15 @@ impl<'a> RemoteLayout<'a> {
         let manifest_len = manifest_body.len() as u64;
         let manifest_key = v3_manifest_key(&self.remote.prefix, cache_key, crate_name);
 
-        let put_manifest_start = std::time::Instant::now();
-        self.put_immutable(&manifest_key, manifest_body, Some("application/json"))
+        network_ms += self
+            .put_immutable(
+                &manifest_key,
+                manifest_body.into(),
+                Some("application/json"),
+            )
             .await
             .context("uploading v3 manifest")?;
         deadline_io_check(deadline, "manifest PUT")?;
-        network_ms += put_manifest_start.elapsed().as_millis() as u64;
 
         Ok(RemoteUploadResult {
             format: "v3",
@@ -307,9 +347,21 @@ impl<'a> RemoteLayout<'a> {
     async fn put_immutable(
         &self,
         key: &str,
-        body: Vec<u8>,
+        body: Bytes,
         content_type: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        // Memory waiters must not occupy the shared network slots needed by
+        // demand restores. The pack has already acquired its byte reservation.
+        let _permit = match self.upload_semaphore {
+            Some(semaphore) => Some(
+                semaphore
+                    .acquire()
+                    .await
+                    .context("waiting for upload network permit")?,
+            ),
+            None => None,
+        };
+        let network_started = Instant::now();
         match self
             .backend
             .put_if_absent(key, body.clone(), content_type)
@@ -317,7 +369,8 @@ impl<'a> RemoteLayout<'a> {
         {
             PutIfAbsentResult::Created | PutIfAbsentResult::AlreadyExists => Ok(()),
             PutIfAbsentResult::Unsupported => self.backend.put(key, body, content_type).await,
-        }
+        }?;
+        Ok(network_started.elapsed().as_millis() as u64)
     }
 
     pub async fn list_keys(&self) -> Result<HashMap<String, String>> {
@@ -503,6 +556,7 @@ pub(crate) fn create_entry_pack_zstd(
     create_entry_pack_zstd_until(entry_dir, blobs_dir, meta, compression_level, None)
 }
 
+#[cfg(test)]
 fn create_entry_pack_zstd_until(
     entry_dir: &Path,
     blobs_dir: &Path,
@@ -510,9 +564,45 @@ fn create_entry_pack_zstd_until(
     compression_level: i32,
     deadline: Option<Instant>,
 ) -> Result<Vec<u8>> {
+    create_entry_pack_zstd_with_limit(
+        entry_dir,
+        blobs_dir,
+        meta,
+        compression_level,
+        deadline,
+        None,
+    )
+}
+
+fn pack_size_bound(meta: &EntryMeta, metadata_bytes: usize) -> u64 {
+    // Include tar padding, headers and GNU long names, then zstd's worst-case
+    // expansion. Oversized estimates reserve the whole budget, and the writer
+    // still enforces that reservation if the stored metadata underestimates.
+    let tar_bytes = meta
+        .files
+        .iter()
+        .fold(metadata_bytes as u64 + 4096, |size, file| {
+            size.saturating_add(file.size.div_ceil(512).saturating_mul(512))
+                .saturating_add(4096)
+                .saturating_add(file.name.len() as u64 * 2)
+        });
+    usize::try_from(tar_bytes)
+        .ok()
+        .map(|size| zstd::zstd_safe::compress_bound(size) as u64)
+        .unwrap_or(u64::MAX)
+}
+
+fn create_entry_pack_zstd_with_limit(
+    entry_dir: &Path,
+    blobs_dir: &Path,
+    meta: &EntryMeta,
+    compression_level: i32,
+    deadline: Option<Instant>,
+    limit: Option<usize>,
+) -> Result<Vec<u8>> {
     deadline_io_check(deadline, "upload compression")?;
     let output = DeadlineWriter {
-        inner: Vec::new(),
+        inner: upload_memory::PackBuffer::new(limit)?,
         deadline,
         stage: "upload compression",
     };
@@ -535,7 +625,7 @@ fn create_entry_pack_zstd_until(
     let encoder = archive.into_inner().context("finishing v3 tar archive")?;
     let output = encoder.finish().context("finishing v3 zstd compression")?;
     deadline_io_check(deadline, "upload compression")?;
-    Ok(output.inner)
+    Ok(output.inner.into_vec())
 }
 
 fn blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
@@ -854,6 +944,50 @@ pub(crate) mod tests {
     use std::time::Instant;
 
     #[test]
+    fn upload_pack_memory_bound_includes_padding_and_long_name_allowance() {
+        let mut meta = EntryMeta {
+            cache_key: String::new(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            rustc_version: None,
+            crate_name: String::new(),
+            crate_types: Vec::new(),
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        assert_eq!(
+            super::pack_size_bound(&meta, 1),
+            zstd::zstd_safe::compress_bound(4097) as u64
+        );
+        meta.files.push(CachedFile {
+            name: "abc".to_string(),
+            size: 1,
+            hash: String::new(),
+            executable: false,
+        });
+        assert_eq!(
+            super::pack_size_bound(&meta, 0),
+            zstd::zstd_safe::compress_bound(8710) as u64
+        );
+        meta.files[0].size = 512;
+        meta.files.push(CachedFile {
+            name: "longer".to_string(),
+            size: 513,
+            hash: String::new(),
+            executable: false,
+        });
+        assert_eq!(
+            super::pack_size_bound(&meta, 17),
+            zstd::zstd_safe::compress_bound(13859) as u64
+        );
+    }
+
+    #[test]
     fn v3_keys_follow_the_documented_layout() {
         // {prefix}/v3/manifests/{crate}/{key}.json and .../packs/{crate}/{key}.tar.zst
         assert_eq!(
@@ -1122,6 +1256,9 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_upload_max_attempts: 5,
+            remote_upload_memory_bytes: 536_870_912,
+            remote_upload_timeout_secs: 300,
             demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
@@ -1248,6 +1385,9 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_upload_max_attempts: 5,
+            remote_upload_memory_bytes: 536_870_912,
+            remote_upload_timeout_secs: 300,
             demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
@@ -1306,7 +1446,11 @@ pub(crate) mod tests {
         let backend = memory_backend();
         let mut remote = test_remote();
         backend
-            .put(&v3_pack_key(&remote.prefix, &key, "serde"), packed, None)
+            .put(
+                &v3_pack_key(&remote.prefix, &key, "serde"),
+                (packed).into(),
+                None,
+            )
             .await
             .unwrap();
         for (cap, stage) in [
@@ -1579,6 +1723,9 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_upload_max_attempts: 5,
+            remote_upload_memory_bytes: 536_870_912,
+            remote_upload_timeout_secs: 300,
             demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
@@ -1762,6 +1909,9 @@ pub(crate) mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_upload_max_attempts: 5,
+            remote_upload_memory_bytes: 536_870_912,
+            remote_upload_timeout_secs: 300,
             demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }
@@ -1836,7 +1986,7 @@ pub(crate) mod tests {
             backend
                 .put(
                     &v3_pack_key(&remote.prefix, requested_key, requested_crate),
-                    packed.clone(),
+                    (packed.clone()).into(),
                     None,
                 )
                 .await
@@ -1883,7 +2033,7 @@ pub(crate) mod tests {
         let key = "a".repeat(64);
         let object_key = v3_pack_key(&remote.prefix, &key, "serde");
         backend
-            .put(&object_key, b"invalid archive".to_vec(), None)
+            .put(&object_key, (b"invalid archive".to_vec()).into(), None)
             .await
             .unwrap();
         let mut observed = ObservedDownload::default();
@@ -1973,7 +2123,7 @@ pub(crate) mod tests {
             "artifacts/v3/manifests/serde/invalid-key.json".into(),
             v3_manifest_key(&remote.prefix, &"b".repeat(64), "tokio"),
         ] {
-            backend.put(&object, vec![], None).await.unwrap();
+            backend.put(&object, (vec![]).into(), None).await.unwrap();
         }
         let mut all = ObservedLists::default();
         assert_eq!(
@@ -2053,7 +2203,7 @@ pub(crate) mod tests {
         async fn put(
             &self,
             _key: &str,
-            _body: Vec<u8>,
+            _body: bytes::Bytes,
             _content_type: Option<&str>,
         ) -> anyhow::Result<()> {
             unreachable!("unexpected put")
@@ -2130,7 +2280,7 @@ pub(crate) mod tests {
         backend
             .put(
                 &v3_manifest_key(&remote.prefix, "key123", "foo"),
-                b"{}".to_vec(),
+                (b"{}".to_vec()).into(),
                 Some("application/json"),
             )
             .await
@@ -2160,7 +2310,11 @@ pub(crate) mod tests {
         let remote = test_remote();
         let backend = memory_backend();
         backend
-            .put(&v3_pack_key(&remote.prefix, "key123", "foo"), packed, None)
+            .put(
+                &v3_pack_key(&remote.prefix, "key123", "foo"),
+                (packed).into(),
+                None,
+            )
             .await
             .unwrap();
         let layout = RemoteLayout::new(&backend, &remote);
@@ -2216,11 +2370,11 @@ pub(crate) mod tests {
         let manifest_key = v3_manifest_key(&remote.prefix, "key123", "foo");
         // Stand-ins for what an earlier uploader stored under this key.
         backend
-            .put(&pack_key, b"first pack".to_vec(), None)
+            .put(&pack_key, (b"first pack".to_vec()).into(), None)
             .await
             .unwrap();
         backend
-            .put(&manifest_key, b"first manifest".to_vec(), None)
+            .put(&manifest_key, (b"first manifest".to_vec()).into(), None)
             .await
             .unwrap();
 
@@ -2254,7 +2408,7 @@ pub(crate) mod tests {
         let pack_key = v3_pack_key(&remote.prefix, "key123", "foo");
         let manifest_key = v3_manifest_key(&remote.prefix, "key123", "foo");
         backend
-            .put(&pack_key, b"orphan pack".to_vec(), None)
+            .put(&pack_key, (b"orphan pack".to_vec()).into(), None)
             .await
             .unwrap();
 
@@ -2296,7 +2450,7 @@ pub(crate) mod tests {
         async fn put(
             &self,
             key: &str,
-            _body: Vec<u8>,
+            _body: bytes::Bytes,
             _content_type: Option<&str>,
         ) -> anyhow::Result<()> {
             self.puts.lock().unwrap().push(key.to_string());
@@ -2376,7 +2530,7 @@ pub(crate) mod tests {
             // listing data and must not enter daemon knowledge caches.
             "artifacts/v3/manifests/serde/not-a-cache-key.json".to_string(),
         ] {
-            backend.put(&key, vec![], None).await.unwrap();
+            backend.put(&key, (vec![]).into(), None).await.unwrap();
         }
         let layout = RemoteLayout::new(&backend, &remote);
 
@@ -2420,7 +2574,7 @@ pub(crate) mod tests {
         let cache_key = "a".repeat(64);
         let key = v3_manifest_key(&remote.prefix, &cache_key, "foo");
         backend
-            .put(&key, b"{}".to_vec(), Some("application/json"))
+            .put(&key, (b"{}".to_vec()).into(), Some("application/json"))
             .await
             .expect("root-relative key must be accepted by the transport");
         let layout = RemoteLayout::new(&backend, &remote);
@@ -2444,7 +2598,7 @@ pub(crate) mod tests {
             // Listing only the requested crate prefixes must exclude this.
             format!("artifacts/v3/manifests/other/{key_c}.json"),
         ] {
-            backend.put(&key, vec![], None).await.unwrap();
+            backend.put(&key, (vec![]).into(), None).await.unwrap();
         }
         let layout = RemoteLayout::new(&backend, &remote);
 
@@ -2458,5 +2612,223 @@ pub(crate) mod tests {
         assert_eq!(keys.get(&key_a).map(String::as_str), Some("serde"));
         assert_eq!(keys.get(&key_b).map(String::as_str), Some("tokio"));
         assert_eq!(keys.len(), 2);
+    }
+
+    struct RetainingUploadBackend {
+        bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
+        block: bool,
+        fail: bool,
+        fallback: bool,
+        delay: std::time::Duration,
+    }
+
+    impl RetainingUploadBackend {
+        async fn retain(&self, key: &str, body: bytes::Bytes) -> anyhow::Result<()> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if key.ends_with(".tar.zst") {
+                self.bodies.lock().unwrap().push(body);
+                if self.block {
+                    std::future::pending::<()>().await;
+                }
+                if self.fail {
+                    anyhow::bail!("injected failed upload");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteBackend for RetainingUploadBackend {
+        async fn head(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn get(
+            &self,
+            _key: &str,
+            _max: Option<u64>,
+        ) -> anyhow::Result<Option<crate::remote_backend::GetObject>> {
+            Ok(None)
+        }
+        async fn put(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+            _content_type: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert!(self.fallback);
+            self.retain(key, body).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+            _content_type: Option<&str>,
+        ) -> anyhow::Result<crate::remote_backend::PutIfAbsentResult> {
+            if self.fallback {
+                return Ok(crate::remote_backend::PutIfAbsentResult::Unsupported);
+            }
+            self.retain(key, body).await?;
+            Ok(crate::remote_backend::PutIfAbsentResult::Created)
+        }
+        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn describe(&self, key: &str) -> String {
+            format!("retaining://{key}")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_failed_and_completed_uploads_keep_memory_until_transport_releases_body() {
+        use futures::{FutureExt, poll};
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        let blobs = store.blobs_dir();
+        for (fallback, block, fail) in [
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+        ] {
+            let memory = super::UploadMemory::new(4096);
+            let backend = RetainingUploadBackend {
+                bodies: std::sync::Mutex::new(Vec::new()),
+                block,
+                fail,
+                fallback,
+                delay: std::time::Duration::ZERO,
+            };
+            let network = tokio::sync::Semaphore::new(2);
+            let layout = RemoteLayout::new(&backend, &remote)
+                .with_upload_memory(&memory)
+                .with_upload_semaphore(Some(&network));
+            let mut upload =
+                Box::pin(layout.upload_entry_until("key123", "foo", &entry_dir, &blobs, 3, None));
+            if block {
+                assert!(poll!(&mut upload).is_pending());
+            } else {
+                let result = upload.as_mut().await;
+                assert_eq!(result.is_err(), fail);
+            }
+            assert_eq!(backend.bodies.lock().unwrap().len(), 1);
+            drop(upload);
+            assert_eq!(
+                network.available_permits(),
+                2,
+                "cancelled HTTP future releases network slot"
+            );
+            assert!(
+                memory.acquire(u64::MAX).now_or_never().is_none(),
+                "transport still owns the original reservation"
+            );
+            let mut queued =
+                Box::pin(layout.upload_entry_until("key123", "foo", &entry_dir, &blobs, 3, None));
+            assert!(
+                poll!(&mut queued).is_pending(),
+                "next upload must wait before allocating its pack"
+            );
+            assert_eq!(
+                network.available_permits(),
+                2,
+                "memory waiters must leave demand network slots free"
+            );
+            drop(queued);
+            backend.bodies.lock().unwrap().clear();
+            let reservation = memory.acquire(u64::MAX).now_or_never().unwrap().unwrap();
+            assert_eq!(reservation.pack_limit(), 4096);
+            drop(reservation);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_pack_fails_before_upload_and_releases_its_reservation() {
+        use futures::FutureExt;
+        let (_tmp, store, entry_dir) = populated_entry();
+        let path = entry_dir.join("meta.json");
+        let mut meta: EntryMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Unique pseudo-random diagnostics keep the compressed manifest larger
+        // than a2KiB pack budget, without a large fixture or network request.
+        let mut state = 1_u64;
+        let text: String = (0..8192)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                char::from(b'!' + ((state >> 32) % 90) as u8)
+            })
+            .collect();
+        meta.stderr = text;
+        std::fs::write(path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let remote = test_remote();
+        let memory = super::UploadMemory::new(2048);
+        let backend = RetainingUploadBackend {
+            bodies: std::sync::Mutex::new(Vec::new()),
+            block: false,
+            fail: false,
+            fallback: false,
+            delay: std::time::Duration::ZERO,
+        };
+        let layout = RemoteLayout::new(&backend, &remote).with_upload_memory(&memory);
+        let error = layout
+            .upload_entry_until("key123", "foo", &entry_dir, &store.blobs_dir(), 3, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("cache.remote_upload_memory_bytes"),
+            "{error:#}"
+        );
+        assert!(backend.bodies.lock().unwrap().is_empty());
+        let reservation = memory.acquire(u64::MAX).now_or_never().unwrap().unwrap();
+        assert_eq!(reservation.pack_limit(), 2048);
+    }
+
+    #[tokio::test]
+    async fn upload_network_time_excludes_waiting_for_a_network_slot() {
+        use futures::poll;
+        use std::time::Duration;
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        let memory = super::UploadMemory::new(4096);
+        let network = tokio::sync::Semaphore::new(0);
+        let backend = RetainingUploadBackend {
+            bodies: std::sync::Mutex::new(Vec::new()),
+            block: false,
+            fail: false,
+            fallback: false,
+            delay: Duration::from_millis(10),
+        };
+        let layout = RemoteLayout::new(&backend, &remote)
+            .with_upload_memory(&memory)
+            .with_upload_semaphore(Some(&network));
+        let blobs = store.blobs_dir();
+        let started = Instant::now();
+        let mut upload =
+            Box::pin(layout.upload_entry_until("key123", "foo", &entry_dir, &blobs, 3, None));
+        assert!(poll!(&mut upload).is_pending());
+        assert!(backend.bodies.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        network.add_permits(1);
+        let result = upload.await.unwrap();
+        let elapsed = started.elapsed().as_millis() as u64;
+        assert!(result.transfer.network_ms >= 10);
+        assert!(
+            elapsed.saturating_sub(result.transfer.network_ms) >= 70,
+            "network time must exclude admission: elapsed{elapsed}, network{}",
+            result.transfer.network_ms
+        );
+        assert_eq!(network.available_permits(), 1);
+        backend.bodies.lock().unwrap().clear();
+        network.close();
+        let error = layout
+            .upload_entry_until("key123", "foo", &entry_dir, &blobs, 3, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("waiting for upload network permit"));
+        assert!(backend.bodies.lock().unwrap().is_empty());
     }
 }

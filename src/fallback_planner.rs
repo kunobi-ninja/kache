@@ -454,7 +454,12 @@ mod tests {
             self.inner.get(key, max_bytes).await
         }
 
-        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+        async fn put(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+            content_type: Option<&str>,
+        ) -> Result<()> {
             self.inner.put(key, body, content_type).await
         }
 
@@ -579,6 +584,9 @@ mod tests {
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+            remote_upload_max_attempts: 5,
+            remote_upload_memory_bytes: 536_870_912,
+            remote_upload_timeout_secs: 300,
             demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
             remote_negative_ttl_secs: DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         }

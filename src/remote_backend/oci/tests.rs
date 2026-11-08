@@ -427,7 +427,11 @@ async fn warm_requests_skip_auth_discovery_and_listing_skips_manifests() {
     let registry = Registry::start().await;
     let backend = registry.backend();
     backend
-        .put("metadata/key", b"{}".to_vec(), Some("application/json"))
+        .put(
+            "metadata/key",
+            (b"{}".to_vec()).into(),
+            Some("application/json"),
+        )
         .await
         .unwrap();
     assert_eq!(registry.state.lock().unwrap().requests.len(), 6);
@@ -441,7 +445,10 @@ async fn warm_requests_skip_auth_discovery_and_listing_skips_manifests() {
             .contains("/manifests/")
     );
     registry.state.lock().unwrap().requests.clear();
-    backend.put("packs/new", vec![7; 1024], None).await.unwrap();
+    backend
+        .put("packs/new", (vec![7; 1024]).into(), None)
+        .await
+        .unwrap();
     assert_eq!(registry.state.lock().unwrap().requests.len(), 4);
     assert!(
         registry
@@ -457,7 +464,7 @@ async fn warm_requests_skip_auth_discovery_and_listing_skips_manifests() {
     assert_eq!(registry.state.lock().unwrap().requests.len(), 2);
     for i in 0..8 {
         backend
-            .put(&format!("packs/{i}"), vec![i; 1024], None)
+            .put(&format!("packs/{i}"), (vec![i; 1024]).into(), None)
             .await
             .unwrap();
     }
@@ -474,7 +481,10 @@ async fn warm_requests_skip_auth_discovery_and_listing_skips_manifests() {
             .all(|(method, path)| *method == Method::GET && path.ends_with("/tags/list"))
     );
     registry.state.lock().unwrap().requests.clear();
-    backend.put("packs/new", vec![7; 1024], None).await.unwrap();
+    backend
+        .put("packs/new", (vec![7; 1024]).into(), None)
+        .await
+        .unwrap();
     assert_eq!(registry.state.lock().unwrap().requests.len(), 2);
 }
 
@@ -485,7 +495,7 @@ async fn embedded_json_has_a_small_cap_and_is_verified_before_writing() {
     for size in [0, 16_384, 16_385] {
         let key = format!("metadata/{size}");
         backend
-            .put(&key, vec![b' '; size], Some("application/json"))
+            .put(&key, (vec![b' '; size]).into(), Some("application/json"))
             .await
             .unwrap();
         {
@@ -506,7 +516,7 @@ async fn embedded_json_has_a_small_cap_and_is_verified_before_writing() {
         );
     }
     backend
-        .put("bad", b"{}".to_vec(), Some("application/json"))
+        .put("bad", (b"{}".to_vec()).into(), Some("application/json"))
         .await
         .unwrap();
     let original = registry.state.lock().unwrap().manifests[&object_tag("bad")].clone();
@@ -556,7 +566,7 @@ async fn expired_tokens_refresh_once_and_parallel_reads_share_the_replacement() 
     )
     .unwrap();
     backend
-        .put("key", b"{}".to_vec(), Some("application/json"))
+        .put("key", (b"{}".to_vec()).into(), Some("application/json"))
         .await
         .unwrap();
     backend.get("key", Some(2)).await.unwrap().unwrap();
@@ -572,7 +582,7 @@ async fn expired_tokens_refresh_once_and_parallel_reads_share_the_replacement() 
     futures::future::join_all(reads).await;
     assert_eq!(registry.state.lock().unwrap().token_requests, 3);
     backend
-        .put("other", b"{}".to_vec(), Some("application/json"))
+        .put("other", (b"{}".to_vec()).into(), Some("application/json"))
         .await
         .unwrap();
     assert_eq!(registry.state.lock().unwrap().token_requests, 4);
@@ -590,18 +600,21 @@ async fn uploaded_digests_are_checked_and_external_uploads_do_not_receive_creden
     registry.state.lock().unwrap().bad_published_digest = true;
     assert!(
         backend
-            .put("key", b"hello".to_vec(), None)
+            .put("key", (b"hello".to_vec()).into(), None)
             .await
             .unwrap_err()
             .to_string()
             .contains("published digest mismatch")
     );
     registry.state.lock().unwrap().bad_published_digest = false;
-    backend.put("key", b"hello".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"hello".to_vec()).into(), None)
+        .await
+        .unwrap();
     registry.state.lock().unwrap().bad_published_digest = true;
     assert!(
         backend
-            .put("key", b"hello".to_vec(), None)
+            .put("key", (b"hello".to_vec()).into(), None)
             .await
             .unwrap_err()
             .to_string()
@@ -758,7 +771,7 @@ async fn objects_round_trip_over_oci_and_expose_their_artifact_format() {
         ("other/empty", b"".as_slice()),
     ] {
         backend
-            .put(key, data.to_vec(), Some("application/json"))
+            .put(key, (data.to_vec()).into(), Some("application/json"))
             .await
             .unwrap();
         assert!(backend.head(key).await.unwrap());
@@ -823,7 +836,7 @@ async fn conditionals_write_nothing_and_plain_put_replaces_metadata() {
     let backend = registry.backend();
     assert_eq!(
         backend
-            .put_if_absent("key", b"first".to_vec(), None)
+            .put_if_absent("key", b"first".to_vec().into(), None)
             .await
             .unwrap(),
         PutIfAbsentResult::Unsupported
@@ -836,7 +849,10 @@ async fn conditionals_write_nothing_and_plain_put_replaces_metadata() {
         ConditionalPut::Unsupported
     );
     assert!(registry.state.lock().unwrap().requests.is_empty());
-    backend.put("key", b"first".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"first".to_vec()).into(), None)
+        .await
+        .unwrap();
     let fetched = backend
         .get_versioned("key", Some(5))
         .await
@@ -852,7 +868,10 @@ async fn conditionals_write_nothing_and_plain_put_replaces_metadata() {
             .unwrap(),
         ConditionalPut::Unsupported
     );
-    backend.put("key", b"second".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"second".to_vec()).into(), None)
+        .await
+        .unwrap();
     assert_eq!(
         backend.get("key", Some(6)).await.unwrap().unwrap().body,
         "second"
@@ -863,7 +882,10 @@ async fn conditionals_write_nothing_and_plain_put_replaces_metadata() {
 async fn reads_enforce_advertised_and_streamed_sizes_and_verify_digests() {
     let registry = Registry::start().await;
     let backend = registry.backend();
-    backend.put("key", b"hello".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"hello".to_vec()).into(), None)
+        .await
+        .unwrap();
     let mut destination = Vec::new();
     let error = backend
         .get_into("key", Some(4), &mut destination)
@@ -910,7 +932,10 @@ async fn invalid_artifacts_and_pagination_are_rejected() {
     let registry = Registry::start().await;
     let backend = registry.backend();
     let key = "long/".repeat(30) + "key";
-    backend.put(&key, b"hello".to_vec(), None).await.unwrap();
+    backend
+        .put(&key, (b"hello".to_vec()).into(), None)
+        .await
+        .unwrap();
     let original = registry.state.lock().unwrap().manifests[&object_tag(&key)].clone();
     let edits: [fn(&mut OciImageManifest); 7] = [
         |manifest| manifest.schema_version = 1,
@@ -994,7 +1019,10 @@ async fn registry_auth_and_outages_remain_errors_and_empty_repositories_are_miss
         RegistryAuth::Basic("user".to_string(), "pass".to_string()),
     )
     .unwrap();
-    backend.put("key", b"private".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"private".to_vec()).into(), None)
+        .await
+        .unwrap();
     assert_eq!(
         backend.get("key", Some(7)).await.unwrap().unwrap().body,
         "private"
@@ -1198,7 +1226,10 @@ fn credential_files_are_loaded_without_reading_live_process_environment() {
 async fn registry_metadata_is_bounded_and_manifest_digests_are_verified() {
     let registry = Registry::start().await;
     let backend = registry.backend();
-    backend.put("key", b"hello".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"hello".to_vec()).into(), None)
+        .await
+        .unwrap();
     registry.state.lock().unwrap().bad_manifest_digest = true;
     assert!(
         backend
@@ -1262,7 +1293,10 @@ async fn bearer_credentials_are_sent_and_https_never_falls_back_to_http() {
     registry.state.lock().unwrap().authorization = Some("Bearer token".to_string());
     let backend =
         OciBackend::with_auth(&registry.config, RegistryAuth::Bearer("token".to_string())).unwrap();
-    backend.put("key", b"hello".to_vec(), None).await.unwrap();
+    backend
+        .put("key", (b"hello".to_vec()).into(), None)
+        .await
+        .unwrap();
     assert_eq!(
         backend.get("key", Some(5)).await.unwrap().unwrap().body,
         "hello"
@@ -1272,7 +1306,12 @@ async fn bearer_credentials_are_sent_and_https_never_falls_back_to_http() {
     config.insecure = false;
     let backend = OciBackend::with_auth(&config, RegistryAuth::Anonymous).unwrap();
     assert!(backend.head("key").await.is_err());
-    assert!(backend.put("key", b"hello".to_vec(), None).await.is_err());
+    assert!(
+        backend
+            .put("key", (b"hello".to_vec()).into(), None)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1345,7 +1384,10 @@ async fn cache_pack_upload_and_restore_use_the_existing_layout() {
 async fn legacy_objects_remain_readable_and_listing_deduplicates_versions() {
     let registry = Registry::start().await;
     let backend = registry.backend();
-    backend.put("old/key", b"old".to_vec(), None).await.unwrap();
+    backend
+        .put("old/key", (b"old".to_vec()).into(), None)
+        .await
+        .unwrap();
     {
         let mut state = registry.state.lock().unwrap();
         let body = state.manifests.remove(&object_tag("old/key")).unwrap();
@@ -1359,7 +1401,10 @@ async fn legacy_objects_remain_readable_and_listing_deduplicates_versions() {
     assert!(!backend.head("absent").await.unwrap());
     assert!(backend.get("absent", Some(3)).await.unwrap().is_none());
     assert_eq!(backend.list("old/").await.unwrap(), ["old/key"]);
-    backend.put("old/key", b"new".to_vec(), None).await.unwrap();
+    backend
+        .put("old/key", (b"new".to_vec()).into(), None)
+        .await
+        .unwrap();
     assert_eq!(
         backend.get("old/key", Some(3)).await.unwrap().unwrap().body,
         "new"
@@ -1412,7 +1457,7 @@ async fn docker_credentials_are_reloaded_when_a_daemons_auth_expires() {
         )
         .unwrap();
         backend
-            .put("key", b"{}".to_vec(), Some("application/json"))
+            .put("key", (b"{}".to_vec()).into(), Some("application/json"))
             .await
             .unwrap();
         assert_eq!(
@@ -1439,7 +1484,7 @@ async fn docker_credentials_are_reloaded_when_a_daemons_auth_expires() {
             "{}"
         );
         backend
-            .put("other", b"{}".to_vec(), Some("application/json"))
+            .put("other", (b"{}".to_vec()).into(), Some("application/json"))
             .await
             .unwrap();
         assert!(backend.head("other").await.unwrap());
@@ -1532,7 +1577,7 @@ async fn credentials_follow_the_daemons_startup_environment() {
         }
         let backend = OciBackend::new(&registry.config).await.unwrap();
         backend
-            .put("key", b"{}".to_vec(), Some("application/json"))
+            .put("key", (b"{}".to_vec()).into(), Some("application/json"))
             .await
             .unwrap();
         assert_eq!(
@@ -1554,7 +1599,7 @@ async fn credentials_follow_the_daemons_startup_environment() {
                 "{}"
             );
             backend
-                .put("other", b"{}".to_vec(), Some("application/json"))
+                .put("other", (b"{}".to_vec()).into(), Some("application/json"))
                 .await
                 .unwrap();
             assert_eq!(registry.state.lock().unwrap().token_requests, 4);
@@ -1671,7 +1716,7 @@ async fn failed_manifest_publication_cannot_report_a_successful_upload() {
     registry.state.lock().unwrap().manifest_status = Some(503);
     let error = registry
         .backend()
-        .put("key", b"payload".to_vec(), None)
+        .put("key", (b"payload".to_vec()).into(), None)
         .await
         .unwrap_err();
     assert_eq!(classify_remote_error(&error), RemoteErrorClass::Transient);

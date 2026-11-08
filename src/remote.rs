@@ -368,7 +368,7 @@ async fn publish_merged(
             ),
             ConditionalPut::Unsupported => {
                 return backend
-                    .put(object_key, body, Some("application/json"))
+                    .put(object_key, (body).into(), Some("application/json"))
                     .await
                     .with_context(|| format!("uploading {kind}"));
             }
@@ -552,7 +552,11 @@ mod tests {
         let backend = crate::remote_backend::memory_backend();
         let body = serde_json::to_vec(&sample_manifest()).unwrap();
         backend
-            .put("prefix/_manifests/key.json", body, Some("application/json"))
+            .put(
+                "prefix/_manifests/key.json",
+                (body).into(),
+                Some("application/json"),
+            )
             .await
             .unwrap();
 
@@ -594,7 +598,7 @@ mod tests {
         backend
             .put(
                 &shard_object_key("prefix", "ns", "hash"),
-                serde_json::to_vec(&shard).unwrap(),
+                (serde_json::to_vec(&shard).unwrap()).into(),
                 Some("application/json"),
             )
             .await
@@ -937,8 +941,16 @@ mod tests {
                 .expect("scripted answer")
         }
 
-        async fn put(&self, _key: &str, body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
-            self.writes.lock().unwrap().push((Write::Plain, body));
+        async fn put(
+            &self,
+            _key: &str,
+            body: bytes::Bytes,
+            _content_type: Option<&str>,
+        ) -> Result<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((Write::Plain, body.to_vec()));
             Ok(())
         }
 
@@ -1369,7 +1381,7 @@ mod tests {
             let (backend, key) = (backend.clone(), key.clone());
             async move {
                 backend
-                    .put_if_absent(&key, body.to_vec(), None)
+                    .put_if_absent(&key, body.to_vec().into(), None)
                     .await
                     .unwrap()
             }
@@ -1430,6 +1442,11 @@ mod tests {
             crate::remote_resilience::RemoteErrorClass::Authentication,
             "a refused LIST is what stops the daemon listing: {listing:#}"
         );
-        assert!(reader.put(&missing, b"x".to_vec(), None).await.is_err());
+        assert!(
+            reader
+                .put(&missing, (b"x".to_vec()).into(), None)
+                .await
+                .is_err()
+        );
     }
 }

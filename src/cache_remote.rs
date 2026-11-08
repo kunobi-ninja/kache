@@ -101,15 +101,36 @@ pub trait V3Prefetch: Send + Sync {
 pub struct V3Remote {
     backend: Arc<dyn RemoteBackend>,
     remote: RemoteConfig,
+    upload_memory: Arc<crate::remote_layout::UploadMemory>,
+    upload_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl V3Remote {
     pub fn new(backend: Arc<dyn RemoteBackend>, remote: RemoteConfig) -> Self {
-        Self { backend, remote }
+        Self {
+            backend,
+            remote,
+            upload_semaphore: None,
+            upload_memory: Arc::new(crate::remote_layout::UploadMemory::new(
+                crate::config::DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES,
+            )),
+        }
+    }
+
+    pub(crate) fn with_upload_memory(mut self, bytes: u64) -> Self {
+        self.upload_memory = Arc::new(crate::remote_layout::UploadMemory::new(bytes));
+        self
+    }
+
+    pub(crate) fn with_upload_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.upload_semaphore = Some(semaphore);
+        self
     }
 
     fn layout(&self) -> RemoteLayout<'_> {
         RemoteLayout::new(self.backend.as_ref(), &self.remote)
+            .with_upload_memory(&self.upload_memory)
+            .with_upload_semaphore(self.upload_semaphore.as_deref())
     }
 }
 
@@ -292,7 +313,7 @@ mod tests {
         backend
             .put(
                 "artifacts/v3/manifests/foo/key123.json",
-                b"{}".to_vec(),
+                (b"{}".to_vec()).into(),
                 Some("application/json"),
             )
             .await
@@ -313,7 +334,7 @@ mod tests {
             backend
                 .put(
                     &format!("artifacts/v3/manifests/{crate_name}/{key}.json"),
-                    b"{}".to_vec(),
+                    (b"{}".to_vec()).into(),
                     Some("application/json"),
                 )
                 .await
@@ -385,7 +406,7 @@ mod tests {
         let prefix = remote.catalog_prefix(&selector).unwrap();
         let key = format!("{prefix}{:020}-{}.json", 1, digest("catalog"));
         backend
-            .put(&key, b"catalog".to_vec(), Some("application/json"))
+            .put(&key, (b"catalog".to_vec()).into(), Some("application/json"))
             .await
             .unwrap();
         let listed = remote.list_prefetch_objects(&prefix).await.unwrap();

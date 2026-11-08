@@ -528,7 +528,7 @@ impl RemoteBackend for OciBackend {
         }))
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
         validate_key(key)?;
         let layer = ImageLayer::new(
             body,

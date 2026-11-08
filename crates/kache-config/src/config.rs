@@ -81,6 +81,16 @@ pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 /// remembering a per-key definitive 404 for the same period introduces no new
 /// staleness class.
 pub const DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS: u64 = 300;
+/// Limits for background uploads (kunobi-ninja/kache#1859).
+pub const DEFAULT_REMOTE_UPLOAD_MAX_ATTEMPTS: u32 = 5;
+pub const DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES: u64 = 512 << 20;
+pub const DEFAULT_REMOTE_UPLOAD_TIMEOUT_SECS: u64 = 300;
+
+/// The upload admission budget must be at least 2 KiB.
+pub fn checked_remote_upload_memory_bytes(bytes: u64) -> Option<u64> {
+    (bytes >= 2048).then_some(bytes)
+}
+
 /// Default end-to-end synchronous restore wait, independently configurable.
 pub const DEFAULT_DEMAND_TIMEOUT_SECS: u64 = 3;
 
@@ -299,6 +309,14 @@ pub struct Config {
     /// `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` or
     /// `[cache] remote_restore_timeout_secs`.
     pub remote_restore_timeout_secs: u64,
+    /// Maximum background upload attempts, including the first (default 5).
+    /// Exhaustion retires the upload intent and leaves the local entry for GC.
+    pub remote_upload_max_attempts: u32,
+    /// Buffered compressed upload pack budget (default 512 MiB, minimum 2 KiB).
+    pub remote_upload_memory_bytes: u64,
+    /// S3 upload response timeout in seconds (default 300). Reads retain their
+    /// separate inactivity deadline; the daemon operation deadline still applies.
+    pub remote_upload_timeout_secs: u64,
     /// Maximum synchronous wrapper demand wait, in seconds (default 3).
     /// Set on both peers and restart the daemon to allow a longer restore.
     /// Invalid zero or out-of-range values fall back to the file or default.
@@ -1064,6 +1082,13 @@ pub struct CacheFileConfig {
     pub s3_pool_idle_secs: Option<u64>,
     /// Restore deadline. See [`Config::remote_restore_timeout_secs`].
     pub remote_restore_timeout_secs: Option<u64>,
+    /// Background upload attempt limit. See [`Config::remote_upload_max_attempts`].
+    pub remote_upload_max_attempts: Option<u32>,
+    /// Buffered upload memory. See [`Config::remote_upload_memory_bytes`].
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
+    pub remote_upload_memory_bytes: Option<String>,
+    /// S3 upload response timeout. See [`Config::remote_upload_timeout_secs`].
+    pub remote_upload_timeout_secs: Option<u64>,
     /// Synchronous demand deadline. See [`Config::demand_timeout_secs`].
     pub demand_timeout_secs: Option<u64>,
     /// Negative-result TTL. See [`Config::remote_negative_ttl_secs`].
@@ -1408,6 +1433,9 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PULL_REQUEST_PREFIX",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
+    "KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS",
+    "KACHE_REMOTE_UPLOAD_MEMORY_BYTES",
+    "KACHE_REMOTE_UPLOAD_TIMEOUT_SECS",
     "KACHE_DEMAND_TIMEOUT_SECS",
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
     "KACHE_MIN_STORE_COMPILE_MS",
@@ -1513,6 +1541,18 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
         "cache.remote_restore_timeout_secs",
+    ),
+    (
+        "KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS",
+        "cache.remote_upload_max_attempts",
+    ),
+    (
+        "KACHE_REMOTE_UPLOAD_MEMORY_BYTES",
+        "cache.remote_upload_memory_bytes",
+    ),
+    (
+        "KACHE_REMOTE_UPLOAD_TIMEOUT_SECS",
+        "cache.remote_upload_timeout_secs",
     ),
     ("KACHE_DEMAND_TIMEOUT_SECS", "cache.demand_timeout_secs"),
     (
@@ -2084,6 +2124,86 @@ impl Config {
                 })
                 .unwrap_or(DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS);
 
+        let remote_upload_max_attempts = env_or_ignored_for(
+            invocation,
+            "KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|value| {
+            let parsed = value.parse::<u32>().ok().filter(|attempts| *attempts != 0);
+            if parsed.is_none() {
+                tracing::warn!("ignoring invalid KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS; expected a positive attempt count");
+            }
+            parsed
+        })
+        .or_else(|| {
+            let value = file_config.as_ref().ok()?.cache.as_ref()?.remote_upload_max_attempts?;
+            if value == 0 {
+                tracing::warn!("ignoring invalid cache.remote_upload_max_attempts; expected a positive attempt count");
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .unwrap_or(DEFAULT_REMOTE_UPLOAD_MAX_ATTEMPTS);
+
+        let remote_upload_memory_bytes = env_or_ignored_for(
+            invocation,
+            "KACHE_REMOTE_UPLOAD_MEMORY_BYTES",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|value| {
+            let parsed = parse_size(&value).and_then(checked_remote_upload_memory_bytes);
+            if parsed.is_none() {
+                tracing::warn!(
+                    "ignoring invalid KACHE_REMOTE_UPLOAD_MEMORY_BYTES; expected at least 2KiB"
+                );
+            }
+            parsed
+        })
+        .or_else(|| {
+            let value = file_config
+                .as_ref()
+                .ok()?
+                .cache
+                .as_ref()?
+                .remote_upload_memory_bytes
+                .as_deref()?;
+            let parsed = parse_size(value).and_then(checked_remote_upload_memory_bytes);
+            if parsed.is_none() {
+                tracing::warn!(
+                    "ignoring invalid cache.remote_upload_memory_bytes; expected at least 2KiB"
+                );
+            }
+            parsed
+        })
+        .unwrap_or(DEFAULT_REMOTE_UPLOAD_MEMORY_BYTES);
+
+        let remote_upload_timeout_secs = env_or_ignored_for(
+            invocation,
+            "KACHE_REMOTE_UPLOAD_TIMEOUT_SECS",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|value| {
+            let parsed = value.parse().ok().and_then(checked_demand_timeout_secs);
+            if parsed.is_none() {
+                tracing::warn!("ignoring invalid KACHE_REMOTE_UPLOAD_TIMEOUT_SECS; expected positive finite seconds");
+            }
+            parsed
+        })
+        .or_else(|| {
+            let value = file_config.as_ref().ok()?.cache.as_ref()?.remote_upload_timeout_secs?;
+            let parsed = checked_demand_timeout_secs(value);
+            if parsed.is_none() {
+                tracing::warn!("ignoring invalid cache.remote_upload_timeout_secs; expected positive finite seconds");
+            }
+            parsed
+        })
+        .unwrap_or(DEFAULT_REMOTE_UPLOAD_TIMEOUT_SECS);
+
         let demand_timeout_secs = env_or_ignored_for(
             invocation,
             "KACHE_DEMAND_TIMEOUT_SECS",
@@ -2537,6 +2657,9 @@ impl Config {
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             remote_restore_timeout_secs,
+            remote_upload_max_attempts,
+            remote_upload_memory_bytes,
+            remote_upload_timeout_secs,
             demand_timeout_secs,
             remote_negative_ttl_secs,
             fallback,

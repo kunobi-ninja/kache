@@ -34,6 +34,25 @@ use unix::Connection;
 #[cfg(unix)]
 mod unix_client;
 
+/// A failed handoff can require local execution without a daemon restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    Complete(i32),
+    /// A missing, stale or unavailable daemon may be recoverable by starting it.
+    Recoverable,
+    /// This invocation cannot delegate under its current process context.
+    LocalOnly,
+}
+
+impl Attempt {
+    pub fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Complete(exit) => Some(exit),
+            Self::Recoverable | Self::LocalOnly => None,
+        }
+    }
+}
+
 /// `None` permits local execution. An error means Commit may have reached the
 /// daemon and the caller must not run the compiler again.
 pub fn try_execute(
@@ -41,18 +60,47 @@ pub fn try_execute(
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Option<i32>> {
+    try_execute_with_recovery(
+        socket,
+        request,
+        #[cfg(unix)]
+        descriptors,
+    )
+    .map(Attempt::exit_code)
+}
+
+/// As [`try_execute`], retaining whether startup can help before local fallback.
+pub fn try_execute_with_recovery(
+    socket: &Path,
+    request: &ExecutionRequest,
+    #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
+) -> Result<Attempt> {
     let mut committed = false;
-    match exchange(
+    let result = exchange(
         socket,
         request,
         #[cfg(unix)]
         descriptors,
         &mut committed,
-    ) {
-        Ok(exit) => Ok(Some(exit)),
+    );
+    finish_attempt(result, committed)
+}
+
+fn finish_attempt(result: Result<i32>, committed: bool) -> Result<Attempt> {
+    match result {
+        Ok(exit) => Ok(Attempt::Complete(exit)),
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
-            Ok(None)
+            let denied = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            });
+            Ok(if denied {
+                Attempt::LocalOnly
+            } else {
+                Attempt::Recoverable
+            })
         }
         Err(error) => Err(error.context(
             "daemon compilation did not complete; the compiler will not be run again locally",
@@ -236,6 +284,58 @@ fn read_reply(reader: &mut impl BufRead) -> Result<ExecutionReply> {
         "incomplete compiler execution response"
     );
     Ok(serde_json::from_slice(&frame)?)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn precommit_permission_denial_requires_local_execution() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let error = anyhow::Error::from(error).context("checking daemon process security");
+        assert_eq!(
+            finish_attempt(Err(error), false).unwrap(),
+            Attempt::LocalOnly
+        );
+    }
+
+    #[test]
+    fn absent_busy_or_stale_daemon_still_allows_recovery() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert_eq!(
+                finish_attempt(Err(std::io::Error::from(kind).into()), false).unwrap(),
+                Attempt::Recoverable
+            );
+        }
+        assert_eq!(
+            finish_attempt(
+                Err(anyhow::anyhow!("unsupported execution protocol")),
+                false
+            )
+            .unwrap(),
+            Attempt::Recoverable
+        );
+    }
+
+    #[test]
+    fn committed_errors_cannot_become_recoverable_or_local_fallback() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = finish_attempt(Err(std::io::Error::from(kind).into()), true).unwrap_err();
+            assert!(error.to_string().contains("will not be run again locally"));
+        }
+        assert_eq!(finish_attempt(Ok(17), true).unwrap(), Attempt::Complete(17));
+        assert_eq!(Attempt::Complete(17).exit_code(), Some(17));
+        assert_eq!(Attempt::Recoverable.exit_code(), None);
+        assert_eq!(Attempt::LocalOnly.exit_code(), None);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -995,6 +1095,11 @@ mod windows_tests {
             "{error:#}"
         );
         assert_eq!(try_execute(&socket, &request(root.path())).unwrap(), None);
+        assert_eq!(
+            try_execute_with_recovery(&socket, &request(root.path())).unwrap(),
+            Attempt::LocalOnly,
+            "restarting cannot make this weaker daemon's context compatible"
+        );
         std::fs::write(root.path().join("done"), b"done").unwrap();
         while child.0.try_wait().unwrap().is_none() {
             assert!(

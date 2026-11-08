@@ -179,6 +179,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn invalid_external_inventory_is_rejected_before_hashing_other_inputs() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("lib.a");
+        std::fs::write(&library, vec![b'x'; 70_000]).unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"file").unwrap();
+        let invalid = file.join("lib.a");
+        assert_eq!(
+            std::fs::symlink_metadata(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory,
+            "the fixture must fail metadata lookup rather than look absent"
+        );
+
+        // An acyclic chain must hit the depth bound, not eventually exhaust
+        // the entry count. Every hop is inspected without following the rest.
+        for index in (0..65).rev() {
+            let next = if index == 64 {
+                library.clone()
+            } else {
+                dir.path().join(format!("link-{}", index + 1))
+            };
+            std::os::unix::fs::symlink(next, dir.path().join(format!("link-{index}"))).unwrap();
+        }
+        for (index, invalid) in [invalid, dir.path().join("link-0")].into_iter().enumerate() {
+            let environment = Environment {
+                out_dir: dir.path().join("out"),
+                manifest_dir: dir.path().to_path_buf(),
+                target: None,
+                ownership_roots: Vec::new(),
+                mappings: Vec::new(),
+                spellings: Vec::new(),
+                base_dirs: Vec::new(),
+                dependency_roots: Vec::new(),
+            };
+            let hasher = crate::cache_key::FileHasher::persistent(
+                &dir.path().join(format!("index-{index}.db")),
+            );
+            let inputs = vec![
+                library.to_string_lossy().into_owned(),
+                invalid.to_string_lossy().into_owned(),
+            ];
+            let error = fold_inputs(&mut blake3::Hasher::new(), &inputs, &environment, &hasher)
+                .unwrap_err();
+            assert_eq!(
+                hasher.stats().bytes_hashed,
+                0,
+                "a failed metadata inventory must stop before reading library bytes: {}",
+                invalid.display()
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("external build-script link input")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn external_inventory_follows_links_and_refuses_cycles_or_special_files() {
         let dir = tempfile::tempdir().unwrap();
         let library = dir.path().join("lib.a");

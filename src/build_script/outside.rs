@@ -7,7 +7,8 @@
 //! tree and writes it back before that stdout is replayed.
 //!
 //! Directories Cargo fills itself are not part of the run. A path outside the
-//! target directory is left where it is. The files share `OUT_DIR`'s size cap;
+//! target directory is left where it is and keyed by [`super::external`].
+//! The stored files share `OUT_DIR`'s size cap;
 //! when they do not fit, nothing is recorded.
 
 use crate::store::{EntryMeta, Store, link};
@@ -433,7 +434,7 @@ pub(super) fn dependency_inputs(roots: &[PathBuf]) -> Vec<PathBuf> {
     inputs
 }
 
-fn path_aliases(path: &Path) -> Vec<PathBuf> {
+pub(super) fn path_aliases(path: &Path) -> Vec<PathBuf> {
     let mut aliases: Vec<_> = normalize_lexical(path).into_iter().collect();
     if let Some(canonical) = canonical_with_missing_suffix(path)
         && !aliases.contains(&canonical)
@@ -446,7 +447,7 @@ fn path_aliases(path: &Path) -> Vec<PathBuf> {
 /// A missing library below an existing symlink still belongs to the unit
 /// that symlink resolves into. Keep the missing suffix without inventing a
 /// new spelling for the existing prefix.
-fn canonical_with_missing_suffix(path: &Path) -> Option<PathBuf> {
+pub(super) fn canonical_with_missing_suffix(path: &Path) -> Option<PathBuf> {
     let mut ancestor = path.to_path_buf();
     let mut missing = Vec::new();
     loop {
@@ -580,7 +581,7 @@ fn build_unit(relative: &Path, target_name: Option<&OsStr>) -> Option<PathBuf> {
 /// Search paths and linker inputs a script printed. Kinds (`native=`, …) are
 /// stripped only when they are one of Cargo's link kinds; anything else is
 /// part of the path. `-L` is read from `rustc-link-arg*` and `rustc-flags`.
-fn named_output_paths(stdout: &str) -> Vec<String> {
+pub(super) fn named_output_paths(stdout: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in stdout.lines() {
         let Some(directive) = line

@@ -223,6 +223,11 @@ pub(super) fn run(
     argv: &[OsString],
     prediction: &Prediction,
 ) -> Result<Option<i32>> {
+    // External link inputs are verified by the regular run cache. A sealed
+    // OUT_DIR alone cannot establish that they are still available.
+    if !prediction.external_link_inputs.is_empty() {
+        return Ok(None);
+    }
     if !crate::out_dir_alias::host_allows(cfg!(unix), crate::out_dir_alias::effective_uid()) {
         return Ok(None);
     }
@@ -333,7 +338,12 @@ fn validate_link_paths(
         .push((sandbox.out_dir.clone(), "${KACHE_OUT_DIR}"));
     seen.mappings
         .push((sandbox.root.clone(), super::TARGET_DIR_PLACEHOLDER));
-    super::outside::validate_named_paths(stdout, &seen)
+    super::outside::validate_named_paths(stdout, &seen)?;
+    anyhow::ensure!(
+        super::external::paths(stdout, &seen).is_empty(),
+        "hermetic build script names external link inputs"
+    );
+    Ok(())
 }
 
 /// Folds the variables the script declared with `rerun-if-env-changed`.
@@ -363,7 +373,7 @@ fn fold_declared_env(
 /// the sandbox repeats it.
 pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v3");
+    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v4");
     fold(
         &mut hasher,
         "key_version",
@@ -884,6 +894,17 @@ mod tests {
             validate_link_paths(&run.environment, &sandbox, &stdout).unwrap();
             run.environment.dependency_roots.clear();
         }
+        let external = directory.path().join("native/lib");
+        std::fs::create_dir_all(&external).unwrap();
+        let record = Record {
+            version: RECORD_VERSION,
+            stdout: format!("cargo:rustc-link-search={}\n", external.display()),
+            stderr: String::new(),
+        };
+        let error = restore(&run, &sandbox, &record, &key, 0).unwrap_err();
+        assert!(error.to_string().contains("external link inputs"));
+        assert!(std::fs::symlink_metadata(&out_dir).unwrap().is_dir());
+        assert_eq!(std::fs::read(out_dir.join("untouched")).unwrap(), b"keep");
     }
 
     #[test]

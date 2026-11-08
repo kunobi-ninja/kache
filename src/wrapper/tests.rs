@@ -613,7 +613,9 @@ fn a_package_keyed_without_its_files_is_reported_once_a_session() {
 #[test]
 #[cfg(unix)]
 fn maybe_trigger_prefetch_refuses_symlinked_build_session() {
+    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::TempDir::new().unwrap();
+    let _isolated = isolate_daemon_autostart(temp.path());
     let target = temp.path().join("target_file");
     std::fs::write(&target, "target content").unwrap();
 
@@ -7106,9 +7108,13 @@ fn seed_cc_object_entry(store: &Store, cache_key: &str, dir: &Path) {
         .unwrap();
 }
 
-/// Keep auto-start from `send_upload_job` off the developer's daemon.
-/// Persist uses the test `Config`; daemon spawn reloads `KACHE_CONFIG`.
-fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard) {
+/// Keep auto-start from `send_upload_job` and `send_build_started` off the
+/// developer's daemon. Persist uses the test `Config`; daemon spawn reloads
+/// `KACHE_CONFIG` (`start_daemon_background` loads the process's config, not
+/// the one passed in), so without this a test whose hint finds no daemon at
+/// its own socket health-checks, and may replace, the user's.
+/// `KACHE_SOCKET_PATH` is read even under `ignore_env`, so it goes too.
+fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard, TestEnvGuard) {
     let config_path = dir.join("isolated-kache.toml");
     let cache_dir = dir.join("isolated-cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -7134,6 +7140,7 @@ fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard) {
             "KACHE_CACHE_DIR",
             cache_dir.to_str().expect("utf-8 isolated cache path"),
         ),
+        TestEnvGuard::remove("KACHE_SOCKET_PATH"),
     )
 }
 
@@ -11035,6 +11042,7 @@ fn session_markers_are_job_scoped_when_store_is_shared() {
 fn remote_prefetch_creates_a_fresh_marker_in_the_job_runtime() {
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
+    let _isolated = isolate_daemon_autostart(dir.path());
     let workspace = dir.path().join("workspace");
     let source = workspace.join("src/lib.rs");
     let out_dir = workspace.join("target/debug/deps");
@@ -11360,6 +11368,7 @@ fn a_failed_discovery_backs_off_and_a_success_clears_it() {
     // marker, between calls.
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::TempDir::new().unwrap();
+    let _isolated = isolate_daemon_autostart(dir.path());
     let mut config = test_config(dir.path().to_path_buf());
     let mut args = rustc_args(&["rustc", "foo.rs"]);
     args.out_dir = Some(dir.path().join("target/debug/deps"));

@@ -661,12 +661,19 @@ fn non_utf8_cargo_argument_passes_through_without_cli_panic() {
     let fake_cargo = dir.path().join("cargo");
     kache_fs::testutil::write_executable(&fake_cargo, "#!/bin/sh\nexit 0\n");
 
-    let output = Command::new(KACHE_BIN)
-        .args(["cargo", "--", "build"])
-        .arg(OsString::from_vec(vec![b'f', b'o', 0x80]))
-        .env("KACHE_REAL_CARGO", &fake_cargo)
-        .output()
-        .unwrap();
+    // Hermetic: the proxy leases the store's target-use lock while Cargo
+    // runs, and the developer's own store must never be the one it locks.
+    let cache = dir.path().join("cache");
+    let output = hermetic_command(
+        KACHE_BIN,
+        &cache,
+        Some(&common::isolated_config_path(&cache)),
+    )
+    .args(["cargo", "--", "build"])
+    .arg(OsString::from_vec(vec![b'f', b'o', 0x80]))
+    .env("KACHE_REAL_CARGO", &fake_cargo)
+    .output()
+    .unwrap();
 
     assert!(
         output.status.success(),
@@ -685,12 +692,19 @@ fn non_utf8_wrapper_argument_fails_closed_before_compiler_execution() {
         format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
     );
 
-    let output = Command::new(KACHE_BIN)
-        .arg(&fake_rustc)
-        .arg(OsString::from_vec(vec![b's', b'r', b'c', b'/', 0x80]))
-        .env("RUSTC", &fake_rustc)
-        .output()
-        .unwrap();
+    // Hermetic: the client asks a daemon to compile, and the developer's
+    // own (their config's socket) must never be the one it reaches.
+    let cache = dir.path().join("cache");
+    let output = hermetic_command(
+        KACHE_BIN,
+        &cache,
+        Some(&common::isolated_config_path(&cache)),
+    )
+    .arg(&fake_rustc)
+    .arg(OsString::from_vec(vec![b's', b'r', b'c', b'/', 0x80]))
+    .env("RUSTC", &fake_rustc)
+    .output()
+    .unwrap();
 
     assert!(!output.status.success());
     assert!(!sentinel.exists(), "unsafe compiler fallback was executed");

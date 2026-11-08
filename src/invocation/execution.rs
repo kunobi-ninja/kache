@@ -13,18 +13,29 @@ pub(crate) fn try_execute(
     try_execute_with_trust(socket, args, context, false)
 }
 
+#[cfg(all(test, unix))]
 pub(crate) fn try_execute_with_trust(
     socket: &Path,
     args: &[String],
     context: &InvocationContext,
     trusted_pipeline: bool,
 ) -> Result<Option<i32>> {
+    try_execute_with_recovery(socket, args, context, trusted_pipeline)
+        .map(kache_ipc::execution::Attempt::exit_code)
+}
+
+pub(crate) fn try_execute_with_recovery(
+    socket: &Path,
+    args: &[String],
+    context: &InvocationContext,
+    trusted_pipeline: bool,
+) -> Result<kache_ipc::execution::Attempt> {
     #[cfg(unix)]
     let (files, terminal) = match context.io.transfer_files() {
         Ok(files) => files,
         Err(error) => {
             tracing::debug!(%error, "compiler streams cannot be transferred");
-            return Ok(None);
+            return Ok(kache_ipc::execution::Attempt::LocalOnly);
         }
     };
     #[cfg(windows)]
@@ -33,7 +44,7 @@ pub(crate) fn try_execute_with_trust(
         Ok(path) => path,
         Err(error) => {
             tracing::debug!(%error, "compiler client executable cannot be resolved");
-            return Ok(None);
+            return Ok(kache_ipc::execution::Attempt::LocalOnly);
         }
     };
     let args = args
@@ -50,5 +61,5 @@ pub(crate) fn try_execute_with_trust(
         terminal,
         client_version: crate::VERSION,
     }
-    .try_execute_with_trust(socket, trusted_pipeline)
+    .try_execute_with_recovery(socket, trusted_pipeline)
 }

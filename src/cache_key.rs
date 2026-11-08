@@ -9926,7 +9926,7 @@ pub(crate) fn parse_dep_info(dep_info: &str) -> Vec<std::path::PathBuf> {
 /// (env!()-as-value pattern; see `path_is_only_used_for_includes`). Doing the
 /// substitution here would erase the information `compute_cache_key`
 /// needs to make that distinction.
-fn parse_env_dep_info(dep_info: &str) -> Vec<(String, Option<String>)> {
+pub(crate) fn parse_env_dep_info(dep_info: &str) -> Vec<(String, Option<String>)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {

@@ -258,13 +258,7 @@ impl RustcCompiler {
             },
             Some(true),
             LinkLane::Passthrough,
-            // An injected bootstrap attempt may be retried with the caller's
-            // environment. Do not expose diagnostics from a discarded attempt.
-            if self.incremental_bootstrap {
-                None
-            } else {
-                Some(&mut stderr)
-            },
+            Some(&mut stderr),
             on_dep_info,
         )
     }
@@ -306,7 +300,26 @@ impl RustcCompiler {
         } else {
             Cow::Owned([all_args, injected.as_slice()].concat())
         };
-        compile::run_rustc(
+        // The wrapper clears stale dep-info before injecting bootstrap. A
+        // reported, readable dep-info file can then prove this attempt did
+        // not observe it and therefore will not be discarded for a retry.
+        let mut metadata_ready = || bootstrap_metadata_ready(parsed);
+        let mut metadata_sink = match metadata_sink {
+            Some(sink)
+                if matches!(
+                    incremental_mode,
+                    compile::IncrementalMode::PreserveIsolated { bootstrap: true }
+                ) =>
+            {
+                Some(compile::MetadataSink::after_dep_info(
+                    sink,
+                    &mut metadata_ready,
+                ))
+            }
+            Some(sink) => Some(compile::MetadataSink::immediate(sink)),
+            None => None,
+        };
+        let result = compile::run_rustc(
             &self.invocation_env,
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),
@@ -321,10 +334,31 @@ impl RustcCompiler {
             skip_remap,
             &path_normalizer,
             incremental_mode,
-            metadata_sink,
+            metadata_sink.as_mut(),
             on_dep_info,
-        )
+        );
+        // Capture can succeed before a later output-discovery error. Keep
+        // the same retry barrier around the complete compiler result.
+        match metadata_sink {
+            Some(sink) => sink.finish(result),
+            None => result,
+        }
     }
+}
+
+fn bootstrap_metadata_ready(parsed: &RustcArgs) -> bool {
+    let Some(path) = parsed.dep_info_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    // The key parser falls back to the source root for empty/malformed
+    // dep-info. That fallback cannot authorize exposing a tentative attempt.
+    !crate::cache_key::parse_dep_info(&content).is_empty()
+        && !crate::cache_key::parse_env_dep_info(&content)
+            .iter()
+            .any(|(name, _)| name == "RUSTC_BOOTSTRAP")
 }
 
 impl Compiler for RustcCompiler {
@@ -711,6 +745,180 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn bootstrap_metadata_requires_readable_nonempty_dep_info_without_an_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            std::iter::empty::<(&str, &str)>(),
+            Some(dir.path().to_path_buf()),
+            None,
+            dir.path().to_path_buf(),
+        );
+        let compiler = RustcCompiler::new_for(&env);
+        let parsed = compiler
+            .parse(&s(&[
+                "rustc",
+                "source.rs",
+                "--crate-name=foo",
+                "--out-dir",
+                ".",
+                "--emit=dep-info,metadata",
+            ]))
+            .unwrap();
+        let dep_info = parsed.dep_info_path().unwrap();
+        assert!(!bootstrap_metadata_ready(&parsed), "missing dep-info");
+        for (content, ready) in [
+            ("", false),
+            ("malformed dep-info\n", false),
+            ("foo.rmeta: \n", false),
+            ("foo.rmeta: source.rs\n", true),
+            ("foo.rmeta: source.rs\n# env-dep:RUSTC_BOOTSTRAP=1\n", false),
+            ("foo.rmeta: source.rs\n# env-dep:RUSTC_BOOTSTRAP\n", false),
+            ("foo.rmeta: source.rs\n# env-dep:OTHER=1\n", true),
+            (
+                "foo.rmeta: source.rs\n# env-dep:RUSTC_BOOTSTRAP_EXTRA=1\n",
+                true,
+            ),
+        ] {
+            std::fs::write(&dep_info, content).unwrap();
+            assert_eq!(bootstrap_metadata_ready(&parsed), ready, "{content:?}");
+        }
+        std::fs::write(&dep_info, b"foo.rmeta: source.rs\n\xff").unwrap();
+        assert!(!bootstrap_metadata_ready(&parsed), "non-UTF8 dep-info");
+        std::fs::remove_file(&dep_info).unwrap();
+        std::fs::create_dir(&dep_info).unwrap();
+        assert!(
+            !bootstrap_metadata_ready(&parsed),
+            "dep-info is a directory"
+        );
+        let no_dep_info = compiler
+            .parse(&s(&["rustc", "source.rs", "--emit=metadata"]))
+            .unwrap();
+        assert!(!bootstrap_metadata_ready(&no_dep_info));
+    }
+
+    /// The fake compiler waits for Cargo's channel to receive metadata before
+    /// exiting. Buffering until exit makes an otherwise valid attempt fail.
+    #[cfg(unix)]
+    #[test]
+    fn incremental_metadata_streams_only_after_the_bootstrap_gate_is_safe() {
+        use crate::invocation::io::{InvocationIo, InvocationIoScope};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let rustc = root.join("fixture-rustc");
+        std::fs::create_dir(root.join("out")).unwrap();
+        std::fs::write(root.join("source.rs"), "pub fn f() {}\n").unwrap();
+        kache_fs::testutil::write_executable(
+            &rustc,
+            r##"#!/bin/sh
+set -eu
+case "$1" in
+  --version|-vV) printf 'rustc 1.99.1\nhost: aarch64-apple-darwin\n'; exit 0 ;;
+  --print) exit 1 ;;
+esac
+printf 'out/libfoo.rmeta: source.rs\n' > out/foo.d
+if test "$OBSERVE_BOOTSTRAP" = yes; then
+  printf '# env-dep:RUSTC_BOOTSTRAP=%s\n' "${RUSTC_BOOTSTRAP-unset}" >> out/foo.d
+fi
+if test "$REPORT_DEP_INFO" = yes; then
+  printf '{"$message_type":"artifact","artifact":"out/foo.d","emit":"dep-info"}\n' >&2
+fi
+printf '' > out/libfoo.rmeta
+printf '{"$message_type":"artifact","artifact":"out/libfoo.rmeta","emit":"metadata"}\n' >&2
+if test "$EXPECT_STREAM" = yes; then
+  attempts=0
+  until grep -q '"emit":"metadata"' delivered; do
+    attempts=$((attempts + 1))
+    if test "$attempts" -ge 500; then
+      printf 'metadata was buffered until compiler exit\n' >&2
+      exit 17
+    fi
+    sleep 0.01
+  done
+fi
+printf 'compiler warning\n' >&2
+"##,
+        );
+        let base = crate::invocation::InvocationEnv::from_parts(
+            [("PATH", "/usr/bin:/bin")],
+            Some(root.clone()),
+            None,
+            root.clone(),
+        );
+        for lane in ["portable", "cold", "adaptive"] {
+            for (injected, observes, reports, expect_stream) in [
+                (true, false, true, true),
+                (true, true, true, false),
+                (true, false, false, false),
+                (false, true, false, true),
+            ] {
+                let mut env = base.clone();
+                env.set("KACHE_CACHE_DIR", root.join("cache"));
+                env.set("OBSERVE_BOOTSTRAP", if observes { "yes" } else { "no" });
+                env.set("REPORT_DEP_INFO", if reports { "yes" } else { "no" });
+                env.set("EXPECT_STREAM", if expect_stream { "yes" } else { "no" });
+                if !injected {
+                    env.set("RUSTC_BOOTSTRAP", "caller");
+                }
+                let compiler = RustcCompiler::new_for(&env).with_incremental_bootstrap(injected);
+                let parsed = compiler
+                    .parse(&[
+                        rustc.to_string_lossy().into_owned(),
+                        "source.rs".into(),
+                        "--crate-name=foo".into(),
+                        "--crate-type=rlib".into(),
+                        "--out-dir".into(),
+                        "out".into(),
+                        "--emit=dep-info,metadata".into(),
+                    ])
+                    .unwrap();
+                let io = InvocationIo::from_files(
+                    std::fs::File::open("/dev/null").unwrap(),
+                    std::fs::File::create(root.join("stdout")).unwrap(),
+                    std::fs::File::create(root.join("delivered")).unwrap(),
+                    None,
+                );
+                let _scope = InvocationIoScope::enter(io);
+                let mut continue_compile = || true;
+                let result = match lane {
+                    "portable" => compiler
+                        .execute_passthrough_preserving_incremental(&parsed, &parsed.all_args),
+                    "cold" => compiler.execute_portable_incremental(
+                        &parsed,
+                        &parsed.all_args,
+                        Some(&mut continue_compile),
+                    ),
+                    "adaptive" => {
+                        compiler.execute_preserving_incremental(&parsed, &parsed.all_args)
+                    }
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert_eq!(result.exit_code, 0, "{lane}: {}", result.stderr);
+                let delivered = std::fs::read_to_string(root.join("delivered")).unwrap();
+                assert_eq!(
+                    delivered.contains("\"emit\":\"metadata\""),
+                    expect_stream,
+                    "{lane}: {delivered}"
+                );
+                assert!(!delivered.contains("compiler warning"));
+                assert_eq!(
+                    result.pending_stderr().contains("\"emit\":\"metadata\""),
+                    !expect_stream
+                );
+                assert!(result.pending_stderr().contains("compiler warning"));
+                if observes {
+                    let dep_info = std::fs::read_to_string(root.join("out/foo.d")).unwrap();
+                    assert!(dep_info.contains(if injected {
+                        "# env-dep:RUSTC_BOOTSTRAP=1"
+                    } else {
+                        "# env-dep:RUSTC_BOOTSTRAP=caller"
+                    }));
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

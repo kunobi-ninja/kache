@@ -4811,15 +4811,17 @@ fn run_parsed_rustc(
             // configured fallback wrapper still gets a chance and the user sees the
             // real compiler error rather than a kache anyhow chain.
             Err(e) => {
-                return passthrough_with_event(
-                    config,
-                    args,
-                    crate_name,
-                    &event_root,
-                    start,
-                    format!("compiler spawn failed: {e}"),
-                    key_record,
-                );
+                return recover_compile_error(e, |e| {
+                    passthrough_with_event(
+                        config,
+                        args,
+                        crate_name,
+                        &event_root,
+                        start,
+                        format!("compiler spawn failed: {e}"),
+                        key_record,
+                    )
+                });
             }
         },
     };
@@ -6658,9 +6660,9 @@ fn adaptive_compile_before_key(
                 &mut on_dep_info,
             );
         } else {
-            executed = Err(anyhow::anyhow!(
+            executed = executed.and(Err(anyhow::anyhow!(
                 "cannot retire bootstrap-observing private state"
-            ));
+            )));
         }
     }
     if hit_closure.is_none()
@@ -6675,36 +6677,38 @@ fn adaptive_compile_before_key(
     }
     drop(permit);
     if let Some((dep_info, tree)) = hit_closure {
-        let _ = lease.finish(CompileOutcome::Abnormal);
-        crate::cache_key::provide_dep_info(dep_info, tree);
-        return run_parsed_rustc(
-            ctx.config,
-            ctx.compiler,
-            ctx.args,
-            ctx.start,
-            ctx.invocation_start_ns,
-            ctx.extra_inputs,
-            ctx.extra_inputs_hash_stats,
-            ctx.extra_inputs_too_new,
-            ctx.extra_inputs_key_ms,
-            guard_inputs,
-            Some(ctx.build_script_inputs),
-            None,
-        );
+        return finish_adaptive_attempt(lease, executed, |_| {
+            crate::cache_key::provide_dep_info(dep_info, tree);
+            run_parsed_rustc(
+                ctx.config,
+                ctx.compiler,
+                ctx.args,
+                ctx.start,
+                ctx.invocation_start_ns,
+                ctx.extra_inputs,
+                ctx.extra_inputs_hash_stats,
+                ctx.extra_inputs_too_new,
+                ctx.extra_inputs_key_ms,
+                guard_inputs,
+                Some(ctx.build_script_inputs),
+                None,
+            )
+        });
     }
     let result = match executed {
         Ok(result) => result,
         Err(error) => {
-            let _ = lease.finish(CompileOutcome::Abnormal);
-            return passthrough_with_event(
-                ctx.config,
-                ctx.args,
-                ctx.crate_name,
-                ctx.event_root,
-                ctx.start,
-                format!("adaptive compiler spawn failed: {error}"),
-                key_record,
-            );
+            return recover_adaptive_compile_error(lease, error, |error| {
+                passthrough_with_event(
+                    ctx.config,
+                    ctx.args,
+                    ctx.crate_name,
+                    ctx.event_root,
+                    ctx.start,
+                    format!("adaptive compiler spawn failed: {error}"),
+                    key_record,
+                )
+            });
         }
     };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
@@ -6813,37 +6817,41 @@ fn compile_before_key(
     }
     drop(miss_guard);
     if let Some((dep_info, tree)) = hit_closure {
-        // Stopped before anything reached Cargo. Key again from the
-        // closure the compile wrote, and restore like any hit.
-        tracing::debug!("{crate_name}: stored entry found while compiling; restoring it");
-        crate::cache_key::provide_dep_info(dep_info, tree);
-        return run_parsed_rustc(
-            config,
-            compiler,
-            args,
-            start,
-            invocation_start_ns,
-            extra_inputs,
-            extra_inputs_hash_stats,
-            extra_inputs_too_new,
-            extra_inputs_key_ms,
-            guard_inputs,
-            Some(ctx.build_script_inputs),
-            None,
-        );
+        return resume_after_compile(executed, |_| {
+            // A stop before metadata can key again from this closure and
+            // restore a hit. A delivery-marked error cannot reroute here.
+            tracing::debug!("{crate_name}: stored entry found while compiling; restoring it");
+            crate::cache_key::provide_dep_info(dep_info, tree);
+            run_parsed_rustc(
+                config,
+                compiler,
+                args,
+                start,
+                invocation_start_ns,
+                extra_inputs,
+                extra_inputs_hash_stats,
+                extra_inputs_too_new,
+                extra_inputs_key_ms,
+                guard_inputs,
+                Some(ctx.build_script_inputs),
+                None,
+            )
+        });
     }
     let result = match executed {
         Ok(result) => result,
         Err(e) => {
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                ctx.event_root,
-                start,
-                format!("compiler spawn failed: {e}"),
-                key_record,
-            );
+            return recover_compile_error(e, |e| {
+                passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    ctx.event_root,
+                    start,
+                    format!("compiler spawn failed: {e}"),
+                    key_record,
+                )
+            });
         }
     };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
@@ -8438,6 +8446,44 @@ fn clear_incremental_bootstrap_dep_info(args: &RustcArgs) -> bool {
     }
 }
 
+/// Never recover or restore a hit over outputs Cargo may already be using.
+fn resume_after_compile<T>(
+    result: Result<T>,
+    continue_after: impl FnOnce(Result<T>) -> Result<i32>,
+) -> Result<i32> {
+    match result {
+        Err(error) if error.is::<crate::compile::MetadataMayBeVisible>() => Err(error),
+        result => continue_after(result),
+    }
+}
+
+/// Retire private state before restoring a hit or recovering a failed attempt.
+fn finish_adaptive_attempt<T>(
+    lease: Lease,
+    result: Result<T>,
+    continue_after: impl FnOnce(Result<T>) -> Result<i32>,
+) -> Result<i32> {
+    let _ = lease.finish(CompileOutcome::Abnormal);
+    resume_after_compile(result, continue_after)
+}
+
+fn recover_compile_error(
+    error: anyhow::Error,
+    fallback: impl FnOnce(anyhow::Error) -> Result<i32>,
+) -> Result<i32> {
+    resume_after_compile(Err::<(), _>(error), |result| fallback(result.unwrap_err()))
+}
+
+fn recover_adaptive_compile_error(
+    lease: Lease,
+    error: anyhow::Error,
+    fallback: impl FnOnce(anyhow::Error) -> Result<i32>,
+) -> Result<i32> {
+    finish_adaptive_attempt(lease, Err::<(), _>(error), |result| {
+        fallback(result.unwrap_err())
+    })
+}
+
 fn discard_bootstrap_outputs(outputs: &ArtifactSet) -> bool {
     for artifact in outputs.outputs() {
         if let Err(error) = std::fs::remove_file(&artifact.path)
@@ -8627,18 +8673,20 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let result = match compile {
         Ok(result) => result,
         Err(error) => {
-            // rustc never ran, or a pipe failure made kache kill it mid-session.
-            let _ = lease.finish(CompileOutcome::Abnormal);
-            tracing::warn!("adaptive incremental compiler spawn failed for {crate_name}: {error}");
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                root,
-                start,
-                format!("adaptive compiler spawn failed: {error}"),
-                key_record,
-            );
+            return recover_adaptive_compile_error(lease, error, |error| {
+                tracing::warn!(
+                    "adaptive incremental compiler spawn failed for {crate_name}: {error}"
+                );
+                passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    root,
+                    start,
+                    format!("adaptive compiler spawn failed: {error}"),
+                    key_record,
+                )
+            });
         }
     };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;

@@ -1,0 +1,127 @@
+name: Windows top-five qualification
+
+# Prepared for a coordinator-owned validation branch. Publication activates CI.
+# Replace CANDIDATE_SHA with the reviewed combined candidate before publication.
+on:
+  push:
+    branches: [validation/windows-top5-20261108]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-top5-qualification
+  cancel-in-progress: false
+
+env:
+  CANDIDATE_SHA: a4592cf7f4a02f4a79281d07905bc454030b7dfa
+  WORKLOAD_SHA: 287cf9c6d266ce28d644bed050ce9a835f31fd80
+
+jobs:
+  build:
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - runner: windows-2025
+            arch: x64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require an exact candidate
+        run: '[[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Build the candidate without a compiler cache
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTC_WORKSPACE_WRAPPER: ""
+          RUSTFLAGS: -C target-feature=+crt-static
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal
+          rustc +"$channel" -vV
+          cargo +"$channel" build --locked --release --target "$TARGET" \
+            --bin kache --bin kache-engine --bin kache-clang-cl --bin kache-cl
+          mkdir candidate
+          for binary in kache kache-engine kache-clang-cl kache-cl; do
+            cp "target/$TARGET/release/$binary.exe" candidate/
+          done
+          printf '%s\n' "$CANDIDATE_SHA" > candidate/source-sha.txt
+          (cd candidate && sha256sum ./*.exe > SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-candidate-${{ matrix.arch }}
+          path: candidate/
+          retention-days: 7
+          if-no-files-found: error
+
+  replay:
+    needs: build
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+        cache_executables: ["true", "false"]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-candidate-${{ matrix.runner == 'windows-11-arm' && 'arm64' || 'x64' }}
+          path: candidate
+      - name: Verify candidate provenance
+        run: |
+          set -euo pipefail
+          test "$(cat candidate/source-sha.txt)" = "$CANDIDATE_SHA"
+          (cd candidate && sha256sum -c SHA256SUMS)
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: nazar-pc/abundance
+          ref: ${{ env.WORKLOAD_SHA }}
+          path: workload
+          persist-credentials: false
+      - name: Replay the reported LTO workload
+        env:
+          CACHE_EXECUTABLES: ${{ matrix.cache_executables }}
+          EXPECTED_ARCH: ${{ matrix.runner == 'windows-11-arm' && 'aarch64' || 'x86_64' }}
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ""
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: ""
+        run: bash harness/scripts/validation/windows-abundance-replay.sh
+      - name: Stop task daemons
+        if: always()
+        run: |
+          for config in evidence/config-*.toml; do
+            test -f "$config" || continue
+            KACHE_CONFIG="$(cygpath -w "$config")" candidate/kache.exe daemon stop || true
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-replay-${{ matrix.runner }}-executables-${{ matrix.cache_executables }}
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error

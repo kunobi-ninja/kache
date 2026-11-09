@@ -1713,7 +1713,9 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
 /// reach a no-op. On Linux, `UTIME_NOW` resolves in the kernel through the
 /// same timestamp source as writes (fs/utimes.c -> inode current-time), so
 /// the restored file's mtime is >= everything written before it and <=
-/// everything written after it — exactly the ordering cargo needs. That is a
+/// everything written after it — exactly the ordering cargo needs. ZFS dates
+/// writes with its own clock, so there the stamp is sampled from a sibling
+/// write instead ([`kache_fs::mtime_written_now`]). That is a
 /// verified kernel property on local Linux filesystems only: macOS resolves
 /// `UTIME_NOW` in libsyscall via `gettimeofday` (microseconds, empirically
 /// green in the e2e suite on APFS but not the same mechanism), and network /
@@ -1767,17 +1769,17 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
         }
 
         // atime is left untouched (UTIME_OMIT); mtime gets the write clock.
+        let file = std::fs::File::from(fd);
+        let written = kache_fs::mtime_written_now(&file, path)
+            .with_context(|| format!("sampling write clock next to {}", path.display()))?;
         let times = [
             libc::timespec {
                 tv_sec: 0,
                 tv_nsec: libc::UTIME_OMIT,
             },
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_NOW,
-            },
+            written,
         ];
-        if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
+        if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("updating mtime of {}", path.display()));
         }

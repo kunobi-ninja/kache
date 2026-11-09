@@ -19,9 +19,111 @@ pub fn sample_write_clock(path: &Path) -> io::Result<SystemTime> {
     fs::metadata(&probe)?.modified()
 }
 
+/// The modification time that dates the open file `file` at `path` as
+/// written now, for `futimens`: `UTIME_NOW`, which on Linux resolves through
+/// the same timestamp source as writes, except on ZFS.
+///
+/// ZFS stamps writes with its own coarse clock, while Linux 6.13 and later
+/// can resolve `UTIME_NOW` to a finer time that another busy filesystem
+/// pushed ahead. A restored file could then read as newer than a build
+/// script's `output` Cargo writes next, and Cargo would rebuild dependents.
+/// There the time comes from a sibling write instead ([`sample_write_clock`]),
+/// which can only sit before later writes.
+#[cfg(unix)]
+pub fn mtime_written_now(file: &fs::File, path: &Path) -> io::Result<libc::timespec> {
+    mtime_written_now_on(path, stamps_own_clock(file))
+}
+
+#[cfg(unix)]
+fn mtime_written_now_on(path: &Path, own_clock: bool) -> io::Result<libc::timespec> {
+    if !own_clock {
+        return Ok(libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        });
+    }
+    let sampled = sample_write_clock(path)?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(libc::timespec {
+        tv_sec: sampled.as_secs() as libc::time_t,
+        tv_nsec: sampled.subsec_nanos() as libc::c_long,
+    })
+}
+
+/// Whether `file` is on a filesystem that dates writes with a clock other
+/// than the one `UTIME_NOW` reads: ZFS on Linux.
+#[cfg(unix)]
+fn stamps_own_clock(file: &fs::File) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stats) } != 0 {
+            // Unknown: sampling is right on every filesystem, only slower.
+            return true;
+        }
+        // `f_type`'s type differs between libcs; see `volume::probe_linux`.
+        #[allow(clippy::unnecessary_cast)]
+        let magic = stats.f_type as i64;
+        is_zfs_magic(magic)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        false
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_zfs_magic(magic: i64) -> bool {
+    magic == 0x2FC1_2FC1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_zfs_dates_writes_with_its_own_clock() {
+        assert!(is_zfs_magic(0x2FC1_2FC1));
+        for other in [0xEF53, 0x9123_683E, 0x5846_5342, 0x0102_1994] {
+            assert!(!is_zfs_magic(other));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_dated_no_later_than_writes_that_follow() {
+        let root = crate::testutil::TempDir::new("written-now");
+        let target = root.path().join("output");
+        fs::write(&target, b"restored").unwrap();
+        let file = fs::File::open(&target).unwrap();
+        let mtime = mtime_written_now(&file, &target).unwrap();
+        if stamps_own_clock(&file) {
+            assert_ne!(mtime.tv_nsec, libc::UTIME_NOW);
+        } else {
+            assert_eq!(mtime.tv_nsec, libc::UTIME_NOW);
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+
+        // Sampled from a sibling write: never after a write that follows.
+        let sampled = mtime_written_now_on(&target, true).unwrap();
+        assert_ne!(sampled.tv_nsec, libc::UTIME_NOW);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        let later = root.path().join("later");
+        fs::write(&later, b"written after").unwrap();
+        let written = fs::metadata(&later)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(
+            (sampled.tv_sec as u64, sampled.tv_nsec as u32)
+                <= (written.as_secs(), written.subsec_nanos())
+        );
+    }
     #[test]
     fn sampling_preserves_target_bytes_cleans_probes_and_uses_the_volume_clock() {
         let root = crate::testutil::TempDir::new("write-clock");

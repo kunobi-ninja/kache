@@ -191,10 +191,7 @@ pub(super) fn touch(path: &Path) -> io::Result<()> {
             tv_sec: 0,
             tv_nsec: libc::UTIME_OMIT,
         },
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_NOW,
-        },
+        kache_fs::mtime_written_now(&file, path)?,
     ];
     if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());

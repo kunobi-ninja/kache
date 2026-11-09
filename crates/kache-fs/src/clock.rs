@@ -19,9 +19,9 @@ pub fn sample_write_clock(path: &Path) -> io::Result<SystemTime> {
     fs::metadata(&probe)?.modified()
 }
 
-/// The modification time that dates the open file `file` at `path` as
-/// written now, for `futimens`: `UTIME_NOW`, which on Linux resolves through
-/// the same timestamp source as writes, except on ZFS.
+/// The modification time that dates the file at `path` as written now,
+/// for `futimens`: `UTIME_NOW`, which on Linux resolves through the same
+/// timestamp source as writes, except on ZFS.
 ///
 /// ZFS stamps writes with its own coarse clock, while Linux 6.13 and later
 /// can resolve `UTIME_NOW` to a finer time that another busy filesystem
@@ -30,8 +30,9 @@ pub fn sample_write_clock(path: &Path) -> io::Result<SystemTime> {
 /// There the time comes from a sibling write instead ([`sample_write_clock`]),
 /// which can only sit before later writes.
 #[cfg(unix)]
-pub fn mtime_written_now(file: &fs::File, path: &Path) -> io::Result<libc::timespec> {
-    mtime_written_now_on(path, stamps_own_clock(file))
+pub fn mtime_written_now(path: &Path) -> io::Result<libc::timespec> {
+    let own_clock = cfg!(target_os = "linux") && dates_writes_itself(crate::volume::fs_magic(path));
+    mtime_written_now_on(path, own_clock)
 }
 
 #[cfg(unix)]
@@ -51,33 +52,12 @@ fn mtime_written_now_on(path: &Path, own_clock: bool) -> io::Result<libc::timesp
     })
 }
 
-/// Whether `file` is on a filesystem that dates writes with a clock other
-/// than the one `UTIME_NOW` reads: ZFS on Linux.
-#[cfg(unix)]
-fn stamps_own_clock(file: &fs::File) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stats) } != 0 {
-            // Unknown: sampling is right on every filesystem, only slower.
-            return true;
-        }
-        // `f_type`'s type differs between libcs; see `volume::probe_linux`.
-        #[allow(clippy::unnecessary_cast)]
-        let magic = stats.f_type as i64;
-        is_zfs_magic(magic)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file;
-        false
-    }
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn is_zfs_magic(magic: i64) -> bool {
-    magic == 0x2FC1_2FC1
+/// Whether a Linux filesystem with this superblock `magic` dates writes with
+/// a clock other than the one `UTIME_NOW` reads: ZFS, or one kache could not
+/// identify, where sampling is right too, only slower.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dates_writes_itself(magic: Option<i64>) -> bool {
+    magic.is_none_or(|magic| magic == crate::volume::ZFS_MAGIC)
 }
 
 #[cfg(test)]
@@ -86,9 +66,10 @@ mod tests {
 
     #[test]
     fn only_zfs_dates_writes_with_its_own_clock() {
-        assert!(is_zfs_magic(0x2FC1_2FC1));
+        assert!(dates_writes_itself(Some(0x2FC1_2FC1)));
+        assert!(dates_writes_itself(None));
         for other in [0xEF53, 0x9123_683E, 0x5846_5342, 0x0102_1994] {
-            assert!(!is_zfs_magic(other));
+            assert!(!dates_writes_itself(Some(other)));
         }
     }
 
@@ -98,11 +79,8 @@ mod tests {
         let root = crate::testutil::TempDir::new("written-now");
         let target = root.path().join("output");
         fs::write(&target, b"restored").unwrap();
-        let file = fs::File::open(&target).unwrap();
-        let mtime = mtime_written_now(&file, &target).unwrap();
-        if stamps_own_clock(&file) {
-            assert_ne!(mtime.tv_nsec, libc::UTIME_NOW);
-        } else {
+        let mtime = mtime_written_now(&target).unwrap();
+        if crate::volume::fs_magic(&target) != Some(crate::volume::ZFS_MAGIC) {
             assert_eq!(mtime.tv_nsec, libc::UTIME_NOW);
         }
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);

@@ -1891,6 +1891,21 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_input_prediction_removes_only_that_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        cache.put_input_prediction("own", 1, None, "a").unwrap();
+        cache.put_input_prediction("shared", 1, None, "b").unwrap();
+        cache.delete_input_prediction("own").unwrap();
+        cache.delete_input_prediction("absent").unwrap();
+        assert_eq!(cache.get_input_prediction("own").unwrap(), None);
+        assert_eq!(
+            cache.get_input_prediction("shared").unwrap(),
+            Some((1, "b".into()))
+        );
+    }
+
+    #[test]
     fn input_prediction_preserves_the_callers_schema_and_opaque_payload() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");

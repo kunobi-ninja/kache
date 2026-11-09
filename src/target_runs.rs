@@ -77,25 +77,25 @@ fn run_time(path: &Path, metadata: &std::fs::Metadata) -> Option<i64> {
     (accessed > modified).then(|| accessed.unix_seconds())
 }
 
-#[cfg(unix)]
+/// One body for every platform, so the Linux mutation lane builds all of it.
 fn is_program(path: &Path, metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    metadata.permissions().mode() & 0o111 != 0 && metadata.nlink() <= 2 && !is_library(path)
-}
-
-#[cfg(not(unix))]
-fn is_program(path: &Path, _metadata: &std::fs::Metadata) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-}
-
-#[cfg_attr(not(unix), allow(dead_code))]
-fn is_library(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| {
+    let library = path.extension().is_some_and(|extension| {
         ["so", "dylib", "dll"]
             .iter()
             .any(|library| extension.eq_ignore_ascii_case(library))
-    })
+    });
+    #[cfg(unix)]
+    let runnable = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        metadata.permissions().mode() & 0o111 != 0 && metadata.nlink() <= 2
+    };
+    #[cfg(not(unix))]
+    let runnable = {
+        let _ = metadata;
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    };
+    runnable && !library
 }
 
 /// `idle` seconds since a build used a target, shortened to the time since

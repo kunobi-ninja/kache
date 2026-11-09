@@ -1770,7 +1770,7 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
 
         // atime is left untouched (UTIME_OMIT); mtime gets the write clock.
         let file = std::fs::File::from(fd);
-        let written = kache_fs::mtime_written_now(&file, path)
+        let written = kache_fs::mtime_written_now(path)
             .with_context(|| format!("sampling write clock next to {}", path.display()))?;
         let times = [
             libc::timespec {

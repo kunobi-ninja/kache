@@ -515,12 +515,17 @@ pub(crate) enum Support {
 
 /// [`Support`] in `dir`, which must exist.
 pub(crate) fn support(dir: &Path) -> Support {
-    let local = match crate::cache_fs::classify(&crate::cache_fs::probe(dir)) {
+    let verdict = crate::cache_fs::classify(&crate::cache_fs::probe(dir));
+    support_from(locality(&verdict), || probe_reads(dir))
+}
+
+/// Whether a filesystem is local: `None` when kache cannot tell.
+fn locality(verdict: &crate::cache_fs::CacheFsVerdict) -> Option<bool> {
+    match verdict {
         crate::cache_fs::CacheFsVerdict::Local => Some(true),
         crate::cache_fs::CacheFsVerdict::Unknown => None,
-        _ => Some(false),
-    };
-    support_from(local, || probe_reads(dir))
+        crate::cache_fs::CacheFsVerdict::NotLocal { .. } => Some(false),
+    }
 }
 
 fn support_from(local: Option<bool>, reads: impl FnOnce() -> std::io::Result<bool>) -> Support {
@@ -1730,6 +1735,17 @@ mod tests {
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn locality_keeps_an_unknown_filesystem_unknown() {
+        use crate::cache_fs::CacheFsVerdict;
+        assert_eq!(locality(&CacheFsVerdict::Local), Some(true));
+        assert_eq!(locality(&CacheFsVerdict::Unknown), None);
+        let remote = CacheFsVerdict::NotLocal {
+            name: "nfs".to_string(),
+        };
+        assert_eq!(locality(&remote), Some(false));
     }
 
     #[test]

@@ -2836,12 +2836,39 @@ mod tests {
         assert!(!old.exists());
         assert_eq!(archive_segments(&log).len(), 2);
 
-        let none = ArchiveLimits {
-            days: 0,
-            max_bytes: 512 << 20,
-        };
-        archive_dropped_events(&log, &[line(1).as_str()], now, none).unwrap();
-        assert!(archive_segments(&log).is_empty());
+        // Either limit at zero keeps nothing, not even events from this
+        // second, which an age-based prune alone would keep.
+        for none in [
+            ArchiveLimits {
+                days: 0,
+                max_bytes: 512 << 20,
+            },
+            ArchiveLimits {
+                days: 8,
+                max_bytes: 0,
+            },
+        ] {
+            let mut event = test_event("c", EventResult::Miss, 1, 1, 1, "k");
+            event.ts = now;
+            let current = serde_json::to_string(&event).unwrap() + "\n";
+            archive_dropped_events(&log, &[current.as_str()], now, none).unwrap();
+            assert!(archive_segments(&log).is_empty(), "{none:?}");
+        }
+    }
+
+    #[test]
+    fn archive_limits_come_from_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().to_path_buf());
+        config.event_archive_days = 30;
+        config.event_archive_max_size = 2 << 30;
+        assert_eq!(
+            ArchiveLimits::from_config(&config),
+            ArchiveLimits {
+                days: 30,
+                max_bytes: 2 << 30
+            }
+        );
     }
 
     #[test]

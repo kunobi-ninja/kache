@@ -17,7 +17,7 @@ The exact set depends on the invocation. It can include:
 - source and included file contents discovered through dep-info
 - code-generation flags, rustflags, and requested emit kinds
 - lint levels and `--check-cfg` values (`-A`, `-W`, `-D`, `-F`, `--force-warn`, `--cap-lints`), in order, because they decide whether a compile succeeds
-- diagnostic presentation flags (`--error-format`, `--json`, `--color`, `--diagnostic-width`), in order, because a hit replays the stored diagnostics
+- diagnostic presentation flags (`--error-format`, `--json`, `--color`), in order, because a hit replays the stored diagnostics. A terminal width is handled separately, as described below
 - `-Z` flags, `RUSTC_BOOTSTRAP` when set, `--sysroot`, and the `CARGO_CFG_*` variables
 - the library of a codegen backend selected by name, or a backend dylib passed as a path when `cache.trust_codegen_backends` allows it, by content
 - other rustc flags Kache does not model, with paths normalized (`KACHE_LOG=warn` names them)
@@ -66,25 +66,27 @@ Incremental directory names and harmless local path spellings are excluded or no
 
 Changing diagnostic presentation can cause a miss even when the artifact bytes would match. Builds with the same diagnostic flags still share entries. The diagnostic-key update also causes existing rustc entries to miss once, including invocations without explicit presentation flags.
 
-Dependencies with a single `--cap-lints=allow` share entries across terminal
-widths and piped builds when no lint can render a warning. This includes nightly
-Cargo's `--force-warn=unused_crate_dependencies` with
-`--json=...,unused-externs-silent`, which reports unused dependencies without
-rendering a warning. Both lint spellings (`_` and `-`) and separated option
-values are supported.
+Cargo passes `--diagnostic-width` only when stderr is a terminal. Kache leaves a
+single width between 1 and 65,535 columns out of the key and forwards it
+unchanged to rustc, so a crate built in a terminal, after a resize, and through
+a pipe by an editor, agent or script computes the same key.
 
-Kache excludes a single terminal width between 1 and 65,535 columns from those
-keys and forwards it unchanged to rustc. Other diagnostic and lint options remain
-keyed. Other forced lints, non-silent `unused-externs`, uncapped warnings, and
-malformed or repeated width or lint-cap options retain the width. The nightly
-exception also keeps repeated forced lints and malformed, repeated or unknown
-JSON options keyed. Invocations without an explicit width keep their existing keys.
+A compile whose output is the same at every width is stored under that key and
+shared by all of them. This covers crates without warnings and dependencies
+whose lints are capped, including nightly Cargo's silent unused-dependency
+report. Only empty output and known JSON records without rendered text count.
+Compiler stdout, rendered warnings, a `future-incompat` report containing
+warnings, and unknown or truncated diagnostics do not.
 
-Before storing or restoring a shared-width entry, Kache checks its recorded
-diagnostics, including entries from older versions. Only empty output and known
-JSON records without rendered warnings can share widths. A `future-incompat`
-report containing warnings, compiler stdout, or unknown or truncated diagnostics
-prevents shared-width caching. Rustc runs with its requested width.
+When a terminal build renders warnings, Kache stores it under a second key
+derived from the first key and the width. A later build at that width hits it
+and replays the warnings exactly as rustc rendered them. Another width compiles
+once and stores its own entry. A piped build stores its warnings under the
+shared key, which terminal builds use only when its output is width-free.
+
+Malformed or repeated width options stay in the key, so a cached success cannot
+hide rustc's error about them. After upgrading, crates that warn at a terminal
+width miss once. Piped builds and capped dependencies keep their keys.
 
 Explicit per-kind Rust output destinations, such as `--emit=metadata=custom.rmeta`, pass through to rustc so it writes the requested file. Emit kinds without destinations still use the cache. This fix changes Rust cache keys, so existing Rust entries miss once after upgrading.
 

@@ -742,96 +742,29 @@ impl RustcArgs {
         })
     }
 
-    /// Exclude one valid terminal width when lint warnings are silenced.
-    /// Preserve malformed and repeated options so a
-    /// cached success cannot hide rustc's argument errors.
-    pub(crate) fn cache_key_diagnostic_flags(&self) -> impl Iterator<Item = &String> {
+    /// The terminal width the cache key omits: one valid `--diagnostic-width`.
+    /// Malformed and repeated options stay keyed so a cached success cannot
+    /// hide rustc's argument errors.
+    pub(crate) fn omitted_diagnostic_width(&self) -> Option<u16> {
         let mut widths = self.diagnostic_flags.iter().filter(|flag| {
             flag.as_str() == "--diagnostic-width" || flag.starts_with("--diagnostic-width=")
         });
-        let valid_width = widths
-            .next()
-            .and_then(|flag| flag.strip_prefix("--diagnostic-width="))
-            .and_then(|value| value.parse::<u16>().ok())
-            .is_some_and(|columns| columns > 0);
-        let omit_width =
-            valid_width && widths.next().is_none() && self.diagnostic_width_can_be_shared();
+        let columns = widths
+            .next()?
+            .strip_prefix("--diagnostic-width=")?
+            .parse::<u16>()
+            .ok()
+            .filter(|columns| *columns > 0)?;
+        widths.next().is_none().then_some(columns)
+    }
+
+    /// Diagnostic flags as the cache key folds them, without the omitted
+    /// terminal width.
+    pub(crate) fn cache_key_diagnostic_flags(&self) -> impl Iterator<Item = &String> {
+        let omit_width = self.omitted_diagnostic_width().is_some();
         self.diagnostic_flags
             .iter()
             .filter(move |flag| !omit_width || !flag.starts_with("--diagnostic-width="))
-    }
-
-    /// Shared-width entries also validate their actual diagnostics before
-    /// storage and restoration: future-incompat reports can bypass lint caps.
-    pub(crate) fn diagnostic_width_can_be_shared(&self) -> bool {
-        let mut cap = None;
-        let mut silent_forced_lint = false;
-        let mut flags = self.outcome_lint_flags.iter();
-        while let Some(flag) = flags.next() {
-            let forced_lint = if flag == "--force-warn" {
-                Some(flags.next().map(String::as_str))
-            } else {
-                flag.strip_prefix("--force-warn=").map(Some)
-            };
-            if let Some(lint) = forced_lint {
-                if silent_forced_lint
-                    || !matches!(
-                        lint,
-                        Some("unused_crate_dependencies" | "unused-crate-dependencies")
-                    )
-                    || !self.unused_externs_silent()
-                {
-                    return false;
-                }
-                silent_forced_lint = true;
-                continue;
-            }
-            let value = if flag == "--cap-lints" {
-                flags.next().map(String::as_str)
-            } else if let Some(value) = flag.strip_prefix("--cap-lints=") {
-                Some(value)
-            } else {
-                if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&flag.as_str()) {
-                    let _ = flags.next();
-                }
-                continue;
-            };
-            if cap.is_some() {
-                return false;
-            }
-            cap = value;
-        }
-        cap == Some("allow")
-    }
-
-    fn unused_externs_silent(&self) -> bool {
-        let mut json = self
-            .diagnostic_flags
-            .iter()
-            .filter(|flag| flag.as_str() == "--json" || flag.starts_with("--json="));
-        let Some(options) = json.next().and_then(|flag| flag.strip_prefix("--json=")) else {
-            return false;
-        };
-        if json.next().is_some() {
-            return false;
-        }
-        // Cargo's silent unused-extern record has no rendered diagnostic.
-        // Keep ambiguous, malformed and unknown configurations keyed.
-        let options: Vec<_> = options.split(',').collect();
-        options.contains(&"unused-externs-silent")
-            && options.iter().enumerate().all(|(index, option)| {
-                !options[..index].contains(option)
-                    && matches!(
-                        *option,
-                        "unused-externs-silent"
-                            | "diagnostic-short"
-                            | "diagnostic-unicode"
-                            | "diagnostic-rendered-ansi"
-                            | "artifacts"
-                            | "future-incompat"
-                            | "timings"
-                    )
-            })
     }
 
     /// Original compact argv. This differs from [`Self::all_args`] only after
@@ -1327,26 +1260,55 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 mod tests {
     #[test]
     fn key_diagnostic_flags_preserve_forwarded_arguments() {
+        // Lints that can warn share the width-free key too.
+        for lints in [vec![], vec!["--cap-lints=allow"], vec!["-D", "warnings"]] {
+            for width in [
+                vec!["--diagnostic-width=80"],
+                vec!["--diagnostic-width", "80"],
+            ] {
+                let mut argv = vec!["rustc", "lib.rs", "--color=never"];
+                argv.extend(lints.iter().copied());
+                argv.extend(width);
+                let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
+                let parsed = RustcArgs::parse(&argv).unwrap();
+                let forwarded = parsed.all_args.clone();
+                let diagnostics = parsed.diagnostic_flags.clone();
+                assert_eq!(parsed.omitted_diagnostic_width(), Some(80));
+                assert_eq!(
+                    parsed
+                        .cache_key_diagnostic_flags()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    ["--color=never"]
+                );
+                assert_eq!(parsed.all_args, forwarded);
+                assert_eq!(parsed.diagnostic_flags, diagnostics);
+                assert_eq!(forwarded, argv[1..]);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_or_repeated_diagnostic_widths_stay_keyed() {
         for width in [
-            vec!["--diagnostic-width=80"],
-            vec!["--diagnostic-width", "80"],
+            vec![],
+            vec!["--diagnostic-width"],
+            vec!["--diagnostic-width="],
+            vec!["--diagnostic-width=wide"],
+            vec!["--diagnostic-width=0"],
+            vec!["--diagnostic-width=65536"],
+            vec!["--diagnostic-width=80", "--diagnostic-width=120"],
         ] {
-            let mut argv = vec!["rustc", "lib.rs", "--cap-lints=allow", "--color=never"];
-            argv.extend(width);
+            let mut argv = vec!["rustc", "lib.rs"];
+            argv.extend(width.iter().copied());
             let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
             let parsed = RustcArgs::parse(&argv).unwrap();
-            let forwarded = parsed.all_args.clone();
-            let diagnostics = parsed.diagnostic_flags.clone();
+            assert_eq!(parsed.omitted_diagnostic_width(), None, "{width:?}");
             assert_eq!(
-                parsed
-                    .cache_key_diagnostic_flags()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-                ["--color=never"]
+                parsed.cache_key_diagnostic_flags().collect::<Vec<_>>(),
+                parsed.diagnostic_flags.iter().collect::<Vec<_>>(),
+                "{width:?}"
             );
-            assert_eq!(parsed.all_args, forwarded);
-            assert_eq!(parsed.diagnostic_flags, diagnostics);
-            assert_eq!(forwarded, argv[1..]);
         }
     }
 

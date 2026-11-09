@@ -321,8 +321,9 @@ pub struct BuildEvent {
     /// of each key input group (compiler, args, sources, env_deps, externs,
     /// link, env_cfg, remap, crate), computed as a tee of the exact bytes the
     /// final key hashes. Powers `explain_miss` — diffing two events' maps
-    /// names which input group changed. Empty for cc compiles and
-    /// passthroughs.
+    /// names which input group changed. A Rust entry stored for one terminal
+    /// width adds `diagnostic_width`, the width in columns. Empty for cc
+    /// compiles and passthroughs.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub key_fields: std::collections::BTreeMap<String, String>,
     /// Normalized environment-input hashes under `explain_miss`. `None`

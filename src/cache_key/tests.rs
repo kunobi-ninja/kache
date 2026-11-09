@@ -12186,7 +12186,6 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         ("--error-format", "json", "human"),
         ("--json", "artifacts", "diagnostic-rendered-ansi"),
         ("--color", "always", "never"),
-        ("--diagnostic-width", "80", "120"),
     ] {
         let attached = format!("{flag}={value}");
         let first = key_of_flags(&diagnostic_flag_base(&source, &[&attached]));
@@ -12204,6 +12203,13 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     assert_eq!(
         base,
         key_of_flags(&diagnostic_flag_base(&source, &["--verbose"]))
+    );
+    // The wrapper keys one valid width itself; repeated widths keep their order.
+    let widths = |flags: &[&str]| key_of_flags(&diagnostic_flag_base(&source, flags));
+    assert_eq!(base, widths(&["--diagnostic-width=80"]));
+    assert_ne!(
+        widths(&["--diagnostic-width=80", "--diagnostic-width=120"]),
+        widths(&["--diagnostic-width=120", "--diagnostic-width=80"])
     );
 }
 
@@ -12297,98 +12303,33 @@ fn nightly_silent_unused_externs_share_terminal_and_piped_keys() {
 }
 
 #[test]
-fn nightly_silent_unused_externs_keep_observable_or_ambiguous_options_keyed() {
-    let _lock = key_test_lock();
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("lib.rs");
-    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
-    let cap = "--cap-lints=allow";
-    let forced = "--force-warn=unused_crate_dependencies";
-    let silent = "--json=unused-externs-silent";
-    let mut controls = vec![
-        vec![forced, silent],
-        vec!["--cap-lints=warn", forced, silent],
-        vec![cap, forced, silent, cap],
-        vec![cap, forced, silent, "--cap-lints"],
-        vec![cap, forced],
-        vec![cap, forced, "--json"],
-        vec![cap, forced, "--json="],
-        vec![cap, forced, "--json=artifacts"],
-        vec![cap, forced, "--json=unused-externs"],
-        vec![cap, forced, "--json=unused-externs-silent,unused-externs"],
-        vec![cap, forced, "--json=unused-externs,unused-externs-silent"],
-        vec![cap, forced, "--json=unused-externs-silent,"],
-        vec![cap, forced, "--json=unknown,unused-externs-silent"],
-        vec![cap, forced, "--json=unused-externs-silent-extra"],
-        vec![
-            cap,
-            forced,
-            "--json=unused-externs-silent,unused-externs-silent",
-        ],
-        vec![cap, forced, silent, silent],
-        vec![cap, forced, silent, "--json"],
-        vec![cap, forced, silent, "--json=artifacts"],
-        vec![cap, forced, silent, forced],
-        vec![
-            cap,
-            forced,
-            silent,
-            "--force-warn",
-            "unused-crate-dependencies",
-        ],
-        vec![cap, silent, "--force-warn"],
-        vec![cap, silent, "--force-warn="],
-    ];
-    for other in [
-        "--force-warn=unused",
-        "--force-warn=unused_variables",
-        "--force-warn=unused_crate_dependencies,unused_variables",
-    ] {
-        controls.push(vec![cap, silent, other]);
-        controls.push(vec![cap, forced, silent, other]);
-        controls.push(vec![cap, other, silent, forced]);
-    }
-    for flags in controls {
-        let key = |width: &[&str]| {
-            let mut all = width.to_vec();
-            all.extend_from_slice(&flags);
-            key_of_flags(&diagnostic_flag_base(&source, &all))
-        };
-        let piped = key(&[]);
-        let narrow = key(&["--diagnostic-width=80"]);
-        let wide = key(&["--diagnostic-width", "120"]);
-        assert_ne!(piped, narrow, "{flags:?}");
-        assert_ne!(narrow, wide, "{flags:?}");
-    }
-
-    let valid = [cap, forced, silent];
-    let piped = key_of_flags(&diagnostic_flag_base(&source, &valid));
-    for width in [
-        vec!["--diagnostic-width"],
-        vec!["--diagnostic-width="],
-        vec!["--diagnostic-width=garbage"],
-        vec!["--diagnostic-width=0"],
-        vec!["--diagnostic-width=65536"],
-        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
-    ] {
-        let mut flags = valid.to_vec();
-        flags.extend_from_slice(&width);
-        assert_ne!(
-            piped,
-            key_of_flags(&diagnostic_flag_base(&source, &flags)),
-            "{width:?}"
-        );
-    }
-}
-
-#[test]
-fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
+fn every_lint_configuration_shares_one_valid_width_but_not_malformed_ones() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
     let key = |flags: &[&str]| key_of_flags(&diagnostic_flag_base(&source, flags));
-    let capped = key(&["--cap-lints=allow"]);
+    // Lints that can warn render width-dependent output. The wrapper stores
+    // that under a width key, so the shared key still omits the width.
+    for lint_flags in [
+        vec![],
+        vec!["--cap-lints=warn"],
+        vec!["--cap-lints=allow", "--force-warn=unused"],
+        vec!["--cap-lints=allow", "-D", "warnings"],
+        vec!["--check-cfg", "--cap-lints=allow"],
+        vec!["--error-format=json", "--json=unused-externs"],
+    ] {
+        let piped = key(&lint_flags);
+        for width in [
+            vec!["--diagnostic-width=80"],
+            vec!["--diagnostic-width", "120"],
+        ] {
+            let mut terminal = lint_flags.clone();
+            terminal.extend_from_slice(&width);
+            assert_eq!(piped, key(&terminal), "{terminal:?}");
+        }
+    }
+    let piped = key(&[]);
     for retained in [
         vec!["--diagnostic-width"],
         vec!["--diagnostic-width="],
@@ -12398,36 +12339,7 @@ fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
         vec!["--diagnostic-width=80", "--diagnostic-width=120"],
         vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
     ] {
-        let mut flags = vec!["--cap-lints=allow"];
-        flags.extend_from_slice(&retained);
-        assert_ne!(capped, key(&flags), "{retained:?}");
-    }
-    for lint_flags in [
-        vec![],
-        vec!["--cap-lints=warn"],
-        vec!["--cap-lints=allow", "--cap-lints", "warn"],
-        vec!["--cap-lints", "allow", "--cap-lints=warn"],
-        vec!["--cap-lints=warn", "--cap-lints", "allow"],
-        vec!["--cap-lints", "warn", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints"],
-        vec!["--cap-lints=allow", "--force-warn=unused"],
-        vec!["--force-warn", "unused", "--cap-lints=allow"],
-        vec!["--check-cfg", "--cap-lints=allow"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        let mut wide = lint_flags.clone();
-        wide.push("--diagnostic-width=120");
-        assert_ne!(key(&narrow), key(&wide), "{lint_flags:?}");
-    }
-    for lint_flags in [
-        vec!["--cap-lints=allow", "-W", "unused"],
-        vec!["--cap-lints=allow", "-D", "warnings"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        assert_eq!(key(&lint_flags), key(&narrow), "{lint_flags:?}");
+        assert_ne!(piped, key(&retained), "{retained:?}");
     }
 }
 

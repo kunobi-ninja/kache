@@ -427,6 +427,15 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
+    /// Delete the prediction stored for `identity`, if any.
+    pub fn delete_input_prediction(&self, identity: &str) -> rusqlite::Result<()> {
+        self.db().execute(
+            "DELETE FROM input_predictions WHERE identity = ?1",
+            params![identity],
+        )?;
+        Ok(())
+    }
+
     /// Delete predictions no build has read or recorded for
     /// [`INPUT_PREDICTION_RETENTION_SECS`]. Run from the GC sweep and
     /// `doctor --repair`. Freed pages go to the freelist; index compaction

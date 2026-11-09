@@ -4803,7 +4803,7 @@ fn evict_waits_for_a_competing_writer_and_still_evicts() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let (store, config) = store_with_one_evictable_entry(dir.path(), "contended");
+    let (mut store, config) = store_with_one_evictable_entry(dir.path(), "contended");
     store.db.busy_handler(Some(wait_for_lock)).unwrap();
     // The wrapper that spawned the auto-GC worker is still writing its
     // own durability flag when the worker starts evicting.

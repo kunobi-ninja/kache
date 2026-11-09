@@ -805,8 +805,30 @@ mod tests {
     #[test]
     fn incremental_metadata_streams_only_after_the_bootstrap_gate_is_safe() {
         use crate::invocation::io::{InvocationIo, InvocationIoScope};
+        // Nix supplies these tools outside the host's bin directories.
+        let (grep, sleep) = {
+            let _lock = crate::test_support::process_state_test_lock();
+            let env = crate::invocation::InvocationEnv::capture();
+            let tool = |name| {
+                env.resolve_program(Path::new(name))
+                    .unwrap_or_else(|| panic!("{name} on the test PATH"))
+            };
+            (tool("grep"), tool("sleep"))
+        };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        // Keep host directories out so a hardcoded PATH fails here too.
+        let tools = root.join("native tools");
+        std::fs::create_dir(&tools).unwrap();
+        std::os::unix::fs::symlink(sleep, tools.join("sleep")).unwrap();
+        let grep_used = root.join("grep-used");
+        kache_fs::testutil::write_executable(
+            &tools.join("grep"),
+            r#"#!/bin/sh
+printf x >> "$KACHE_FIXTURE_GREP_USED"
+exec "$KACHE_FIXTURE_GREP" "$@"
+"#,
+        );
         let rustc = root.join("fixture-rustc");
         std::fs::create_dir(root.join("out")).unwrap();
         std::fs::write(root.join("source.rs"), "pub fn f() {}\n").unwrap();
@@ -842,7 +864,14 @@ printf 'compiler warning\n' >&2
 "##,
         );
         let base = crate::invocation::InvocationEnv::from_parts(
-            [("PATH", "/usr/bin:/bin")],
+            [
+                ("PATH", tools.into_os_string()),
+                ("KACHE_FIXTURE_GREP", grep.into_os_string()),
+                (
+                    "KACHE_FIXTURE_GREP_USED",
+                    grep_used.clone().into_os_string(),
+                ),
+            ],
             Some(root.clone()),
             None,
             root.clone(),
@@ -919,6 +948,10 @@ printf 'compiler warning\n' >&2
                 }
             }
         }
+        assert!(
+            grep_used.exists(),
+            "the fixture must use its invocation PATH"
+        );
     }
 
     #[cfg(unix)]

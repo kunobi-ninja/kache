@@ -36,9 +36,9 @@
 //! build_script_hermetic = true` (see [`crate::config::Config::build_script_hermetic`]).
 
 use super::{
-    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, fold_dependency_inputs,
-    modified_since, package_exclusions, parse_declarations, real_command, replay, run_input_state,
-    target_dir_for, zero_ar_date,
+    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, declared_input_files, declared_input_state,
+    fold, fold_dependency_inputs, modified_since, package_exclusions, parse_declarations,
+    real_command, replay, target_dir_for, zero_ar_date,
 };
 use crate::compiler_store::StoreHashExt as _;
 use crate::events::EventResult;
@@ -413,12 +413,11 @@ pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Re
         } else {
             Vec::new()
         };
-        let state = run_input_state(
+        let state = declared_input_state(
             &path,
             &excluded,
             &file_hasher,
             &mut budget,
-            0,
             prediction.default_package,
         )?;
         fold(&mut hasher, "state", state.as_bytes());
@@ -603,9 +602,11 @@ fn attempt(
         } else {
             Vec::new()
         };
-        if modified_since(&path, &excluded, started)? {
-            tracing::debug!("a declared input changed while the hermetic script ran");
-            return Ok(None);
+        for file in declared_input_files(&path, prediction.default_package)? {
+            if modified_since(&file, &excluded, started)? {
+                tracing::debug!("a declared input changed while the hermetic script ran");
+                return Ok(None);
+            }
         }
     }
     if let Some(escape) = escape(sandbox)? {

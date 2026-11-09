@@ -138,6 +138,47 @@ pub(super) fn input_state_as(
     input_state_with_walk(path, &walk, file_hasher, budget, symlink_depth, text)
 }
 
+/// [`run_input_state`] of an input a prediction declares. One in a Git
+/// directory is read where Git keeps it, and also keyed with the commit HEAD
+/// names (see [`super::git`]).
+pub(super) fn declared_input_state(
+    path: &Path,
+    excluded: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    default_package: bool,
+) -> Result<String> {
+    let git = if default_package {
+        None
+    } else {
+        super::git::resolve(path)?
+    };
+    let Some(git) = git else {
+        return run_input_state(path, excluded, file_hasher, budget, 0, default_package);
+    };
+    let state = run_input_state(&git.path, excluded, file_hasher, budget, 0, false)?;
+    Ok(format!("{state}\ngit:{}", git.head))
+}
+
+/// The files whose writes during a run would change a declared input's
+/// state: the path itself, or for one in a Git directory, where Git keeps it
+/// and the files HEAD resolves through.
+pub(super) fn declared_input_files(path: &Path, default_package: bool) -> Result<Vec<PathBuf>> {
+    let git = if default_package {
+        None
+    } else {
+        super::git::resolve(path)?
+    };
+    Ok(match git {
+        Some(git) => {
+            let mut files = git.read;
+            files.push(git.path);
+            files
+        }
+        None => vec![path.to_path_buf()],
+    })
+}
+
 /// Declared inputs also carry observable modification times. The implicit
 /// package dependency follows Cargo's file list and omits directory times.
 pub(super) fn run_input_state(

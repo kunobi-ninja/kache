@@ -35,6 +35,7 @@
 //! |---------------------|-----------------|------------------------|
 //! | workspace root      | `<WORKSPACE>`   | per-checkout location  |
 //! | `$CARGO_TARGET_DIR` | `<TARGET>`      | per-user / per-job dir |
+//! | Cargo profile dir   | `<PROFILE>`     | `debug`, `release`, a custom name (source paths only) |
 //! | `$CARGO_HOME`       | `<CARGO_HOME>`  | usually `~/.cargo`     |
 //! | `$RUSTUP_HOME`      | `<RUSTUP_HOME>` | usually `~/.rustup`    |
 //! | `$HOME`             | `<HOME>`        | per-user               |
@@ -117,6 +118,10 @@
 
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
+
+/// Key sentinel for Cargo's profile directory; see
+/// [`PathNormalizer::with_profile_dir`].
+const PROFILE_SENTINEL: &str = "<PROFILE>";
 
 /// One canonicalized prefix plus the two things it maps to: a stable
 /// `key_sentinel` for cache-key inputs, and a resolvable `flag_target`
@@ -414,6 +419,37 @@ impl PathNormalizer {
         self
     }
 
+    /// Add Cargo's profile directory for this unit:
+    /// `<target>/[<triple>/]<profile>`, derived from `--out-dir`.
+    ///
+    /// Custom profiles that inherit `dev` compile identically, and Cargo gives
+    /// their units the same metadata hash, but each profile has its own
+    /// directory. A crate that `include!`s a file from `OUT_DIR` then reports
+    /// that file under `<profile>/build/...`, and rustc bakes the spelling
+    /// into `file!()` and debug info. Mapping the whole profile directory to
+    /// one `<PROFILE>` root, in the key and in the remap target alike, lets
+    /// such a crate share one entry across profiles and target directories.
+    ///
+    /// The rule outranks every other root, so it wins in both the source
+    /// identity and rustc's last-match-wins remap even under a configured base
+    /// dir. [`Self::normalize`] skips it: search paths and env values are not
+    /// remapped by rustc and keep the identity they had.
+    pub(crate) fn with_profile_dir(mut self, profile_dir: Option<&Path>) -> Self {
+        let Some(profile_dir) = profile_dir else {
+            return self;
+        };
+        push_path_rule_aliases(
+            &mut self.rules,
+            &mut self.source_restore_roots,
+            profile_dir,
+            PROFILE_SENTINEL,
+            PROFILE_SENTINEL,
+        );
+        let mut seen = std::collections::HashSet::new();
+        self.rules.retain(|rule| seen.insert(rule.prefix.clone()));
+        self
+    }
+
     /// Add the validated `[paths].base_dirs` rule set.
     ///
     /// Entries are sorted by their lexical spelling before sentinel assignment,
@@ -525,6 +561,7 @@ impl PathNormalizer {
     pub(crate) fn depinfo_source_roots(&self) -> Vec<ConfiguredSourceRoot> {
         let mut groups = self.configured_source_root_groups.clone();
         for source_sentinel in [
+            PROFILE_SENTINEL,
             "<CWD>",
             "<WORKSPACE>",
             "<TARGET>",
@@ -759,7 +796,7 @@ impl PathNormalizer {
     pub fn normalize<S: AsRef<str>>(&self, s: S) -> String {
         let mut out: String = s.as_ref().nfc().collect();
         for rule in &self.rules {
-            if rule.prefix.is_empty() {
+            if rule.prefix.is_empty() || rule.key_sentinel == PROFILE_SENTINEL {
                 continue;
             }
             out = if configured_base_dir_index(&rule.key_sentinel).is_some() {
@@ -908,16 +945,24 @@ fn follows_windows_drive_prefix(input: &str, start: usize) -> bool {
 /// dep's CWD is more specific than `$CARGO_HOME` yet `<CARGO_HOME>` must win so
 /// the dep resolves to crates.io (see [`PathNormalizer::remap_args`]).
 ///
-/// High rank (wins) → low: configured `<BASE_DIR_N>` > `<RUST_SRC>` >
+/// High rank (wins) → low: `<PROFILE>` > configured `<BASE_DIR_N>` > `<RUST_SRC>` >
 /// `<CARGO_HOME>` > `<BASE_DIR>` > `<WORKSPACE>` > `<TARGET>` >
 /// `<RUSTUP_HOME>` > `<HOME>`/Windows-user-dirs > `<TMPDIR>`. Explicit roots
 /// lead so their key and artifact mappings select the same winner. `<TARGET>`
 /// below `<WORKSPACE>` means the default `target/` (which
 /// sits inside the workspace) maps under `/proc/self/cwd/target/...` — still
 /// kernel-resolvable — while an out-of-workspace `$CARGO_TARGET_DIR` (matched by
-/// `<TARGET>` alone) maps to `/kache/target`. This ordering only affects
+/// `<TARGET>` alone) maps to `/kache/target`. Paths inside the unit's profile
+/// directory (`OUT_DIR` sources among them) map to `/kache/profile` whichever
+/// root holds it. This ordering only affects
 /// injected debug-info spellings; the cache-key `normalize()` side is unaffected.
 fn flag_emit_rank(key_sentinel: &str) -> u8 {
+    if key_sentinel == PROFILE_SENTINEL {
+        // Cargo's profile directory sits inside the target, workspace or a
+        // configured root, never around one. Winning everywhere keeps the
+        // profile name out of both the key and the remapped spelling.
+        return 9;
+    }
     if configured_base_dir_index(key_sentinel).is_some() {
         // Explicit configured roots win on both the key side and the emitted
         // rustc side. Keeping those winners aligned prevents identical keys
@@ -1088,6 +1133,7 @@ fn depinfo_sentinel_for_source(source_sentinel: &str) -> Option<String> {
     }
     Some(
         match source_sentinel {
+            PROFILE_SENTINEL => crate::link::DEPINFO_PROFILE_SENTINEL,
             "<CWD>" => "__kache_cwd__/",
             "<WORKSPACE>" => "__kache_workspace__/",
             "<TARGET>" => "__kache_target_rule__/",
@@ -1120,6 +1166,7 @@ fn flag_target_for(key_sentinel: &str) -> String {
         "<WORKSPACE>" => workspace_flag_target().to_string(),
         "<BASE_DIR>" => "/kache/base-dir".to_string(),
         "<TARGET>" => "/kache/target".to_string(),
+        PROFILE_SENTINEL => "/kache/profile".to_string(),
         "<CARGO_HOME>" => "/kache/.cargo".to_string(),
         "<RUSTUP_HOME>" => "/kache/rustup".to_string(),
         "<HOME>" => "/kache/home".to_string(),
@@ -3109,6 +3156,46 @@ mod tests {
         );
     }
 
+    // Custom profiles that inherit `dev` build in their own directory. A
+    // generated source there must key and remap without the profile name,
+    // even inside the workspace, the target and a configured base dir.
+    #[test]
+    fn profile_dir_owns_generated_sources_in_key_and_remap() {
+        let dir = TempDir::new().unwrap();
+        let workspace = PathBuf::from(canonical_string(dir.path()).unwrap());
+        let workspace_str = workspace.to_str().unwrap().to_string();
+        let target = workspace.join("target");
+        let mut identities = Vec::new();
+        for profile in ["debug", "alt"] {
+            let profile_dir = target.join(profile);
+            let source = profile_dir.join("build/serde-0123456789abcdef/out/private.rs");
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            let normalizer = pn_with_rules(vec![(&workspace_str, "<WORKSPACE>")])
+                .with_target_dir(Some(&target))
+                .with_profile_dir(Some(&profile_dir))
+                .with_base_dirs(std::slice::from_ref(&workspace_str));
+            let rest = source.strip_prefix(&profile_dir).unwrap().to_str().unwrap();
+
+            let identity = normalizer.source_path_identity(&source).unwrap();
+            assert_eq!(identity, format!("<PROFILE>/{rest}").into_bytes());
+            identities.push(identity);
+            let source = source.to_str().unwrap();
+            let remapped = apply_last_match(&normalizer.remap_args(), source);
+            assert_eq!(
+                remapped.strip_suffix(rest),
+                Some(format!("/kache/profile{}", std::path::MAIN_SEPARATOR).as_str())
+            );
+            // Search paths and env values are not remapped and keep their
+            // identity.
+            assert!(normalizer.normalize(source).contains(profile));
+
+            let roots = normalizer.depinfo_source_roots();
+            assert_eq!(roots[0].root, profile_dir);
+            assert_eq!(roots[0].depinfo_sentinel, "__kache_profile__/");
+        }
+        assert_eq!(identities[0], identities[1]);
+    }
+
     #[test]
     fn legacy_base_dir_is_a_complete_owner_and_rejects_empty_or_root() {
         let dir = TempDir::new().unwrap();
@@ -3241,6 +3328,7 @@ mod tests {
         // the portable rewrite, so the stored `.d` keeps a live local path and
         // a relocated hit validates against the donor's tree.
         let mapped = [
+            ("<PROFILE>", "__kache_profile__/"),
             ("<CWD>", "__kache_cwd__/"),
             ("<WORKSPACE>", "__kache_workspace__/"),
             ("<TARGET>", "__kache_target_rule__/"),

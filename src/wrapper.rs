@@ -3815,6 +3815,7 @@ fn resolve_located_build_script_inputs(
                 args.invocation_env(),
             )
             .with_target_dir(args.target_dir().as_deref())
+            .with_profile_dir(args.profile_dir().as_deref())
             .with_base_dirs(&config.base_dirs)
         });
         crate::cache_key::source_path_identity(path, normalizer)
@@ -5076,6 +5077,7 @@ fn run_parsed_rustc(
         config,
         depinfo_workspace_dir,
         depinfo_anchor.as_deref(),
+        args.profile_dir().as_deref(),
         args.invocation_env(),
     );
 
@@ -5693,10 +5695,12 @@ fn configured_rustc_depinfo_roots(
     config: &Config,
     workspace_root: Option<&Path>,
     target_dir: Option<&Path>,
+    profile_dir: Option<&Path>,
     env: &crate::invocation::InvocationEnv,
 ) -> Vec<(PathBuf, String, u8)> {
     crate::path_normalizer::PathNormalizer::from_invocation(workspace_root, env)
         .with_target_dir(target_dir)
+        .with_profile_dir(profile_dir)
         .with_base_dirs(&config.base_dirs)
         .depinfo_source_roots()
         .into_iter()
@@ -7372,6 +7376,7 @@ fn compute_rustc_cache_key(
         args.invocation_env(),
     )
     .with_target_dir(args.target_dir().as_deref())
+    .with_profile_dir(args.profile_dir().as_deref())
     .with_base_dirs(&config.base_dirs)
     .with_path_only_env_vars(config.path_only_env_vars.clone())
     .with_rust_src_rule(
@@ -7989,6 +7994,7 @@ fn restore_from_cache_with_memo_store(
         config,
         depinfo_workspace_dir,
         cargo_target_dir.as_deref(),
+        args.profile_dir().as_deref(),
         args.invocation_env(),
     );
 

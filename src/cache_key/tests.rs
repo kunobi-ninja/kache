@@ -21065,6 +21065,8 @@ mod build_script_target_paths {
         workspace: PathBuf,
         source: PathBuf,
         invocation: InvocationEnv,
+        /// Cargo profile directory name `key` compiles under.
+        profile: &'static str,
     }
 
     impl Unit {
@@ -21092,11 +21094,18 @@ mod build_script_target_paths {
                 workspace,
                 source,
                 invocation,
+                profile: "debug",
             }
         }
 
         fn out_dir(target: &Path) -> PathBuf {
-            let out = target.join("debug/build/foo-sys-0123456789abcdef/out");
+            Self::out_dir_in(target, "debug")
+        }
+
+        fn out_dir_in(target: &Path, profile: &str) -> PathBuf {
+            let out = target
+                .join(profile)
+                .join("build/foo-sys-0123456789abcdef/out");
             std::fs::create_dir_all(&out).unwrap();
             std::fs::write(
                 out.join("libfoo.a"),
@@ -21137,7 +21146,12 @@ mod build_script_target_paths {
             if let Some(target) = target {
                 argv.extend([
                     "--out-dir".into(),
-                    target.join("debug/deps").to_str().unwrap().into(),
+                    target
+                        .join(self.profile)
+                        .join("deps")
+                        .to_str()
+                        .unwrap()
+                        .into(),
                 ]);
             }
             for spec in search {
@@ -21162,7 +21176,8 @@ mod build_script_target_paths {
                 None,
             );
             let normalizer = PathNormalizer::from_invocation(Some(&self.workspace), &invocation)
-                .with_target_dir(args.target_dir().as_deref());
+                .with_target_dir(args.target_dir().as_deref())
+                .with_profile_dir(args.profile_dir().as_deref());
             let (key, outputs) = compute_cache_key_with_outputs(
                 &args,
                 &FileHasher::new().with_invocation_env(&invocation),
@@ -21378,7 +21393,7 @@ mod build_script_target_paths {
     }
 
     #[test]
-    fn generated_source_file_macro_keeps_the_compiler_visible_target_name() {
+    fn generated_source_identity_follows_the_remapped_spelling() {
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let unit = Unit::new(dir.path());
@@ -21411,16 +21426,65 @@ mod build_script_target_paths {
                 )
             });
             let [a, b] = keys;
-            assert_ne!(
-                a.0, b.0,
-                "file!() exposes the generated source's remapped spelling"
-            );
+            if extra.is_empty() {
+                // Both spell the source `/kache/profile/build/...`.
+                assert_eq!(a.0, b.0, "file!() is the same in both target dirs");
+                continue;
+            }
+            assert_ne!(a.0, b.0, "{extra:?} bakes the real source path");
             assert_ne!(
                 a.1.fields.unwrap()["sources"],
                 b.1.fields.unwrap()["sources"],
                 "OUT_DIR env folding cannot hide a source-path collision"
             );
         }
+    }
+
+    // `[profile.alt] inherits = "dev"` builds the same unit in `target/alt`
+    // with the same Cargo metadata hash. Its generated source and bundled
+    // archive are the same, so the key is too.
+    #[test]
+    fn generated_sources_share_a_key_across_cargo_profiles() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut unit = Unit::new(dir.path());
+        std::fs::write(
+            &unit.source,
+            "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));",
+        )
+        .unwrap();
+        let target = unit.workspace.join("target");
+        let mut key = |profile: &'static str, body: &str, extra: &[&str]| {
+            unit.profile = profile;
+            let out = Unit::out_dir_in(&target, profile);
+            let generated = out.join("gen.rs");
+            std::fs::write(&generated, body).unwrap();
+            unit.key(
+                Some(&target),
+                Some(&out),
+                &[native(&out)],
+                "rlib",
+                extra,
+                Some(&generated),
+            )
+        };
+        let body = "pub fn generated() -> &'static str { file!() }";
+        let debug = key("debug", body, &[]);
+        let alt = key("alt", body, &[]);
+        assert_eq!(
+            debug.0, alt.0,
+            "the profile name reaches neither key nor bytes"
+        );
+
+        let edited = key("alt", "pub fn generated() -> u8 { 2 }", &[]);
+        assert_ne!(debug.0, edited.0, "generated contents stay keyed");
+
+        let unremapped = ["-Cinstrument-coverage"];
+        assert_ne!(
+            key("debug", body, &unremapped).0,
+            key("alt", body, &unremapped).0,
+            "an unremapped build bakes the profile directory"
+        );
     }
 
     #[cfg(unix)]

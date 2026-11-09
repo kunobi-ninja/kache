@@ -222,6 +222,8 @@ Kache maps known roots to stable sentinels before hashing and asks the compiler 
 
 Common mappings include the workspace, Cargo home, Rustup home, temporary directory, target directory, and configured base directories. Add a missing root with `KACHE_BASE_DIR` or `paths.base_dirs`.
 
+Source files under Cargo's profile directory, such as the code a build script generates in `OUT_DIR`, appear as `/kache/profile/...` in compiled output, and their key identity leaves out the profile name. A custom profile that inherits `dev` and changes nothing compiles the same crates as `dev`, so it reuses their entries, including crates that `include!` generated code.
+
 Do not choose an overly broad base directory. Normalization merges path identities, so two different inputs must not map to the same sentinel.
 
 Disable Rust path normalization for a local profiling or debugging session:
@@ -237,17 +239,14 @@ Coverage-instrumented Rust builds use real paths and a separate, path-local key 
 Crates that trybuild builds under `target/tests/trybuild/` get the same treatment. trybuild passes `--cfg trybuild` to every one of them. It compares rustc's rendered diagnostics against the checked-in `.stderr` snapshots after substituting the real crate, workspace, and registry directories, so a remapped path such as `/kache/home/...` or `/proc/self/cwd/...` would fail every snapshot. Those units still cache, keyed by the real paths their output records. A registry dependency trybuild builds, if it has no build script, is keyed by its path under the Cargo home, so worktrees on one machine share it. The test crates trybuild generates are keyed by their directory under the target directory.
 
 An explicit `-L native=` directory inside a unit's own `OUT_DIR` can share an
-`rlib` key across target directory names. Kache retains its path below the
-target directory and hashes the native archives, including their member names,
+`rlib` key across target directory and profile names. Kache retains its path
+below the profile directory and hashes the native archives, including their member names,
 timestamps and contents. Archives whose digest retains their path can still
 miss after relocation. This applies only when Rust path normalization is on,
 the search path and `OUT_DIR` are absolute, and the resolved search directory
 stays inside that `OUT_DIR`. Native links, test binaries, `staticlib` outputs,
 metadata-only outputs, and bare, `all=` or `framework=` search paths keep their existing path
-identity, as do coverage, trybuild and normalization opt-out builds. Generated
-Rust sources also keep the path identity the compiler
-emits: `file!()`, caller locations and debug information can expose the target
-directory name.
+identity, as do coverage, trybuild and normalization opt-out builds.
 
 ## Debugger source maps
 
@@ -262,6 +261,8 @@ settings set target.source-map /kache/workspace /absolute/path/to/checkout
 ```
 
 Linux workspace paths use `/proc/self/cwd` when possible, so running the debugger from the workspace root usually resolves them directly.
+
+Generated sources under Cargo's profile directory appear under `/kache/profile` on every platform. Map that prefix to the profile you debug, for example `set substitute-path /kache/profile /absolute/path/to/target/debug`.
 
 Crates from the registry or Git appear under `/kache/.cargo` on every platform. Map that prefix to your Cargo home the same way, for example `set substitute-path /kache/.cargo /absolute/path/to/.cargo`, to step into them.
 

@@ -1009,6 +1009,20 @@ impl RustcArgs {
         self.resolve_invocation_path(&self.target_dir_from_args()?)
     }
 
+    /// Cargo's profile directory for this unit, `<target>/[<triple>/]<profile>`,
+    /// from `--out-dir`, which path normalization remaps as one root. `None`
+    /// outside Cargo's layout, when it is not inside [`Self::target_dir`], or
+    /// when the unit is not remapped and bakes the real path anyway.
+    pub(crate) fn profile_dir(&self) -> Option<PathBuf> {
+        if self.skip_path_remap() {
+            return None;
+        }
+        let target = self.target_dir()?;
+        let profile = crate::cargo_layout::profile_dir(self.out_dir.as_deref()?)?;
+        let profile = self.resolve_invocation_path(&profile)?;
+        (profile != target && profile.starts_with(&target)).then_some(profile)
+    }
+
     pub(crate) fn invocation_env(&self) -> &crate::invocation::InvocationEnv {
         &self.invocation_env
     }
@@ -2969,6 +2983,56 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(args.target_dir(), Some(layout_path("/work/proj/target")));
+    }
+
+    #[test]
+    fn profile_dir_is_the_units_profile_in_every_layout() {
+        let profile = |target: Option<&str>, out_dir: &str, extra: &[&str]| {
+            RustcArgs {
+                target: target.map(str::to_string),
+                out_dir: Some(layout_path(out_dir)),
+                codegen_opts: extra.iter().map(|opt| (opt.to_string(), None)).collect(),
+                ..Default::default()
+            }
+            .profile_dir()
+        };
+        let alt = Some(layout_path("/work/proj/target/alt"));
+        assert_eq!(profile(None, "/work/proj/target/alt/deps", &[]), alt);
+        // A legacy build-script compile anchors `target_dir` at the profile
+        // already, so there is nothing inside it to add.
+        assert_eq!(
+            profile(
+                None,
+                "/work/proj/target/alt/build/serde-0123456789abcdef",
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            profile(
+                None,
+                "/work/proj/target/alt/build/serde/0123456789abcdef/out",
+                &[]
+            ),
+            alt
+        );
+        let triple = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            profile(
+                Some(triple),
+                "/work/proj/target/x86_64-unknown-linux-gnu/alt/deps",
+                &[]
+            ),
+            Some(layout_path(
+                "/work/proj/target/x86_64-unknown-linux-gnu/alt"
+            ))
+        );
+        assert_eq!(profile(None, "/tmp/out", &[]), None, "not Cargo's layout");
+        assert_eq!(
+            profile(None, "/work/proj/target/alt/deps", &["instrument-coverage"]),
+            None,
+            "an unremapped unit bakes the real path"
+        );
     }
 
     #[test]

@@ -1847,6 +1847,9 @@ const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
 const DEPINFO_CWD_SENTINEL: &str = "__kache_cwd__/";
 const DEPINFO_WORKSPACE_SENTINEL: &str = "__kache_workspace__/";
 const DEPINFO_TARGET_SENTINEL: &str = "__kache_target_rule__/";
+/// Cargo's profile directory for the unit, `<target>/[<triple>/]<profile>`.
+/// It lies inside the target, so it is relativized before the target is.
+pub const DEPINFO_PROFILE_SENTINEL: &str = "__kache_profile__/";
 
 /// rustc's `# env-dep:NAME=value` records carry their own escape grammar:
 /// backslash is written `\\` (and newline/CR as `\n`/`\r`), and cargo's
@@ -2000,6 +2003,18 @@ pub fn rewrite_rustc_depinfo_content_with_configured_roots(
             ))
         });
         let target_rewritten = rewrite_rustc_depinfo_targets(content, target_dir, mode);
+        // A generated source under the unit's profile directory moves with
+        // the consumer's profile, which can differ from the producer's
+        // (`debug` against a custom profile that inherits `dev`).
+        let (profile_roots, roots): (Vec<_>, Vec<_>) = roots
+            .into_iter()
+            .partition(|(_, sentinel, ..)| sentinel == DEPINFO_PROFILE_SENTINEL);
+        let target_rewritten =
+            profile_roots
+                .into_iter()
+                .fold(target_rewritten, |rewritten, (root, sentinel, ..)| {
+                    rewrite_depinfo_content_with_exact_sentinel(&rewritten, &root, &sentinel, mode)
+                });
         // Dependencies generated beneath Cargo's effective target directory
         // must move with that target even when it lives inside the workspace.
         // Otherwise the higher-ranked WORKSPACE source rule captures
@@ -4176,6 +4191,54 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
             restored,
             "/external-b/target/debug/deps/demo.d: \
 /external-b/target/debug/build/demo/out/generated.rs\n"
+        );
+    }
+
+    /// A unit hit across Cargo profiles (`debug`, then a custom profile that
+    /// inherits `dev`) must watch the generated source in its own profile.
+    #[test]
+    fn generated_source_moves_to_the_consumer_profile() {
+        let workspace = PathBuf::from("/work");
+        let target = workspace.join("target");
+        let target_sentinel = DEPINFO_TARGET_SENTINEL.to_string();
+        let profile_sentinel = DEPINFO_PROFILE_SENTINEL.to_string();
+        let roots = |profile: &str| {
+            [
+                (target.join(profile), profile_sentinel.clone(), 9),
+                (workspace.clone(), DEPINFO_WORKSPACE_SENTINEL.to_string(), 4),
+                (target.clone(), target_sentinel.clone(), 3),
+            ]
+        };
+        let input = "/work/target/debug/deps/serde_core.d: \
+/work/src/lib.rs \
+/work/target/debug/build/serde_core-fe75/out/private.rs\n";
+
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            input,
+            &target,
+            &workspace,
+            Some(&workspace),
+            &roots("debug"),
+            DepInfoMode::Relativize,
+        );
+        assert_eq!(
+            stored,
+            "__kache_root__/debug/deps/serde_core.d: \
+__kache_workspace__/src/lib.rs \
+__kache_profile__/build/serde_core-fe75/out/private.rs\n"
+        );
+
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            &target,
+            &workspace,
+            Some(&workspace),
+            &roots("alt"),
+            DepInfoMode::Expand,
+        );
+        assert!(
+            restored.ends_with(" /work/target/alt/build/serde_core-fe75/out/private.rs\n"),
+            "{restored}"
         );
     }
 

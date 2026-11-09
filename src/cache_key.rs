@@ -272,6 +272,16 @@ mod apple_install_name;
 // the client's PATH), and its content hash is folded. A linker that cannot be
 // placed fails closed to passthrough. Every native Linux link key changes.
 //
+// v34: source paths inside the unit's Cargo profile directory,
+// `<target>/[<triple>/]<profile>`, key as `<PROFILE>` and remap to
+// `/kache/profile`. Custom profiles that inherit `dev` compile identically and
+// share Cargo's metadata hash, but a crate that `include!`s from `OUT_DIR`
+// kept the profile name in its source identity and in `file!()` and debug
+// info, so it and everything downstream missed under the other profile.
+// Dep-info stores those sources against the profile root, and an rlib's
+// `-L native=` directory in its own `OUT_DIR` is keyed below the profile
+// directory instead of the target directory.
+//
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or `OUT_DIR` sits under it. Those are
 // the paths rustc writes into the rmeta; `--out-dir` reaches dep-info, which
@@ -1829,14 +1839,16 @@ fn out_dir_native_search_identity(
     if args.is_test || !args.emits_rlib() || args.links_native_closure() || args.skip_path_remap() {
         return None;
     }
-    let target = args.target_dir()?;
+    // Below the profile directory when Cargo's layout names one, so a custom
+    // profile shares the key; the search path itself is never baked.
+    let root = args.profile_dir().or_else(|| args.target_dir())?;
     let out_dir = Path::new(out_dir?);
     if !out_dir.is_absolute() {
         return None;
     }
-    // target_dir is resolved against the invocation, so this prefix match
+    // The root is resolved against the invocation, so this prefix match
     // also requires an absolute search path.
-    let rest = path.strip_prefix(&target).ok()?;
+    let rest = path.strip_prefix(&root).ok()?;
     if rest.as_os_str().is_empty()
         || rest
             .components()

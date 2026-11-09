@@ -2695,7 +2695,8 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
         None,
         base.clone(),
     );
-    let roots = configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target), &env);
+    let roots =
+        configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target), None, &env);
 
     let found = |root: &Path, sentinel: &str| {
         roots

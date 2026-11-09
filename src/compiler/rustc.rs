@@ -281,6 +281,7 @@ impl RustcCompiler {
             &self.invocation_env,
         )
         .with_target_dir(parsed.target_dir().as_deref())
+        .with_profile_dir(parsed.profile_dir().as_deref())
         .with_base_dirs(&self.base_dirs)
         .with_rust_src_rule(
             crate::cache_key::get_rustc_sysroot_for(parsed, &self.invocation_env).as_deref(),

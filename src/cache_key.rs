@@ -3080,15 +3080,32 @@ fn resolve_key_inputs(
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
             let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
-            owns_flight = flight.lock.is_some();
-            *file_hasher.discovery_flight.borrow_mut() = flight.lock;
+            let mut lock = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The
             // tree is digested again: the owner's record carries the digest
             // from before its compile, and the tree may have changed since.
             if flight.waited {
                 prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
+                // The owner left nothing this process can use, typically a
+                // record of another checkout's tree. Owning the flight would
+                // queue every later checkout behind this compile too, one
+                // compile at a time. Release it and key the way a peer
+                // without the flight does: a peer with the same key still
+                // waits on the compile flight and restores the entry.
+                if let Err(reason) = &prediction
+                    && lock.take().is_some()
+                {
+                    crate::phase_trace::decision("discovery_flight", "released");
+                    tracing::debug!(
+                        "[key:{}] discovery flight released: the owner's result is unusable here ({})",
+                        crate_name,
+                        reason.as_str()
+                    );
+                }
             }
+            owns_flight = lock.is_some();
+            *file_hasher.discovery_flight.borrow_mut() = lock;
         }
         match prediction {
             Ok(dep_info) => {

@@ -6214,6 +6214,120 @@ fn a_flight_waiter_digests_the_tree_again() {
     assert_eq!(tree.map(|guard| guard.digest), Some(now));
 }
 
+/// Checkouts of one workspace share a unit's discovery flight. A checkout
+/// whose tree differs from the owner's cannot use the owner's record, and
+/// must not keep the flight through its own compile: every other checkout
+/// would then wait for that compile too, one checkout at a time. A checkout
+/// with the owner's tree still waits for the owner and uses its record.
+#[test]
+fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let db = base.path().join("index.db");
+    let flights = base.path().join("cache");
+    let checkout = |name: &str, source: &str| {
+        let (root, args) = workspace_invocation(base.path(), name, "kt");
+        write_file(&root.join("kt/src/lib.rs"), source);
+        let manifest = root.join("kt");
+        let env = client_invocation(
+            &root,
+            &[
+                ("CARGO_MANIFEST_DIR", Some(manifest.as_os_str())),
+                ("OUT_DIR", None),
+            ],
+        );
+        let args = reparse_for_client(&args, &env);
+        (root, env, args)
+    };
+    let hasher = |env: &InvocationEnv| {
+        FileHasher::persistent(&db)
+            .with_invocation_env(env)
+            .with_input_predictions(true)
+            .with_prediction_flights(Some(flights.clone()))
+    };
+    let resolve = |args: &RustcArgs, hasher: &FileHasher<'_>| {
+        set_defer_discovery(true);
+        set_compile_while_keying(true);
+        let mut outputs = KeyOutputs::default();
+        let result = resolve_key_inputs(args, hasher, "kt", &KeyEnv::default(), &mut outputs);
+        set_compile_while_keying(false);
+        set_defer_discovery(false);
+        (result, outputs)
+    };
+
+    // The first checkout owns the flight and compiles before keying.
+    let (root, env, args) = checkout("a", "pub fn value() -> u32 { 1 }\n");
+    let owner = hasher(&env);
+    let (deferred, outputs) = resolve(&args, &owner);
+    assert!(deferred.unwrap_err().is::<DeferredDiscovery>());
+    // What its compile records, under its own tree.
+    let tree = outputs
+        .tree_guard
+        .expect("a workspace unit is guarded")
+        .digest;
+    let vars: Vec<_> = env.vars_os().collect();
+    let roots = workspace_roots(&args, &vars).unwrap();
+    let identity = workspace_prediction_identity(&args, vars, &roots).unwrap();
+    let closure = DepInfo {
+        source_files: vec![root.join("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let record = workspace_portable_prediction(&closure, &roots, Some(&tree)).unwrap();
+
+    let (started, ready) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let wait = |name: &'static str, source: &'static str| {
+            let started = started.clone();
+            scope.spawn(move || {
+                let (root, env, args) = checkout(name, source);
+                let hasher = hasher(&env);
+                started.send(()).unwrap();
+                let (result, outputs) = resolve(&args, &hasher);
+                let deferred = result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<DeferredDiscovery>());
+                let held = hasher.take_discovery_flight().is_some();
+                (
+                    root,
+                    result.ok().flatten(),
+                    outputs.used_prediction,
+                    deferred,
+                    held,
+                )
+            })
+        };
+        let other_tree = wait("b", "pub fn value() -> u32 { 2 }\n");
+        let same_tree = wait("c", "pub fn value() -> u32 { 1 }\n");
+        ready.recv().unwrap();
+        ready.recv().unwrap();
+        // Let both find no record and the flight held, so each join is a
+        // real wait. The owner then publishes and releases.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        owner.record_portable_prediction(&identity, Some("kt"), &record);
+        drop(owner.take_discovery_flight());
+
+        let (_, inputs, predicted, deferred, held) = other_tree.join().unwrap();
+        assert!(
+            !deferred && !held,
+            "another tree keys without the flight instead of compiling under it"
+        );
+        assert!(!predicted);
+        assert!(inputs.is_some(), "the pre-pass found the closure");
+
+        let (root, inputs, predicted, deferred, held) = same_tree.join().unwrap();
+        assert!(!deferred);
+        assert!(predicted, "the owner's tree uses the owner's record");
+        assert!(held, "and keeps the flight until it publishes");
+        assert_eq!(
+            inputs.map(|inputs| inputs.source_files),
+            Some(vec![root.join("kt/src/lib.rs")])
+        );
+    });
+}
+
 /// This checkout's rows keep the guard while it covers the closure. They are
 /// never relocated, so a generated file naming the checkout costs nothing
 /// here, though it keeps the row for other checkouts out.

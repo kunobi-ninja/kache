@@ -4198,13 +4198,19 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
     /// inherits `dev`) must watch the generated source in its own profile.
     #[test]
     fn generated_source_moves_to_the_consumer_profile() {
+        // Literal `/` spellings, so the roots match the dep-info text on
+        // every platform.
         let workspace = PathBuf::from("/work");
-        let target = workspace.join("target");
+        let target = PathBuf::from("/work/target");
         let target_sentinel = DEPINFO_TARGET_SENTINEL.to_string();
         let profile_sentinel = DEPINFO_PROFILE_SENTINEL.to_string();
         let roots = |profile: &str| {
             [
-                (target.join(profile), profile_sentinel.clone(), 9),
+                (
+                    PathBuf::from(format!("/work/target/{profile}")),
+                    profile_sentinel.clone(),
+                    9,
+                ),
                 (workspace.clone(), DEPINFO_WORKSPACE_SENTINEL.to_string(), 4),
                 (target.clone(), target_sentinel.clone(), 3),
             ]

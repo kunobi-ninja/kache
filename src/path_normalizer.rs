@@ -2341,6 +2341,32 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_roots_ignore_a_restore_root_no_rule_owns() {
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.path().join("checkout").to_str().unwrap().to_string();
+        let n = PathNormalizer {
+            rules: vec![Rule {
+                prefix: prefix.clone(),
+                key_sentinel: "<WORKSPACE>".to_string(),
+                source_sentinel: "<WORKSPACE>".to_string(),
+                flag_target: workspace_flag_target().to_string(),
+            }],
+            configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: vec![("<WORKSPACE>".to_string(), dir.path().join("elsewhere"))],
+            path_only_env_vars: Vec::new(),
+        };
+        assert_eq!(
+            n.diagnostic_roots(),
+            vec![DiagnosticRoot {
+                target: workspace_flag_target().to_string(),
+                root: prefix,
+                per_crate: true,
+            }]
+        );
+    }
+
+    #[test]
     fn diagnostic_roots_skip_a_base_dir_for_another_os() {
         // A shared config can name a root for another OS. On Windows `/work`
         // is relative to the current drive, so its files could seem to exist.

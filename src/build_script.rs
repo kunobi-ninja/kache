@@ -4773,7 +4773,9 @@ mod tests {
         assert_ne!(key(&run, &in_registry), before, "a file's time");
         stamp(&registry.join("blake3.c"), 1_700_000_000);
         assert_eq!(key(&run, &in_registry), before);
-        std::fs::write(registry.join("blake3.c"), "next").unwrap();
+        // Another length: detecting a same-size rewrite with a restored time
+        // relies on the change time, which only the Unix tests cover.
+        std::fs::write(registry.join("blake3.c"), "changed").unwrap();
         stamp(&registry.join("blake3.c"), 1_700_000_000);
         assert_ne!(key(&run, &in_registry), before, "a file's content");
 

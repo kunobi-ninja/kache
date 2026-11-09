@@ -809,7 +809,9 @@ mod tests {
         assert_ne!(key(), before, "a file's time is keyed");
         filetime::set_file_mtime(&input, old).unwrap();
         assert_eq!(key(), before);
-        write(&input, "next");
+        // Another length: detecting a same-size rewrite with a restored time
+        // relies on the change time, which only the Unix tests cover.
+        write(&input, "changed");
         filetime::set_file_mtime(&input, old).unwrap();
         assert_ne!(key(), before, "a file's content is keyed");
     }

@@ -5,20 +5,22 @@
 //! cannot open them. The rewrite here applies only to the text shown to the
 //! user. Stored diagnostics keep the remapped form so entries stay portable.
 
-use crate::path_normalizer::DiagnosticRoot;
+use crate::path_normalizer::{DiagnosticRoot, may_contain_remapped_path};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::LazyCell;
+use std::ops::Range;
 use std::path::Path;
 
 /// Maps a remapped file name back to a real file of this invocation.
 pub(crate) struct Resolver<'a> {
-    roots: &'a [DiagnosticRoot],
+    roots: Vec<DiagnosticRoot>,
     /// Whether a real file is one of the compiled crate's own sources.
     own_source: &'a dyn Fn(&Path) -> bool,
 }
 
 impl<'a> Resolver<'a> {
-    pub(crate) fn new(roots: &'a [DiagnosticRoot], own_source: &'a dyn Fn(&Path) -> bool) -> Self {
+    pub(crate) fn new(roots: Vec<DiagnosticRoot>, own_source: &'a dyn Fn(&Path) -> bool) -> Self {
         Self { roots, own_source }
     }
 
@@ -51,12 +53,22 @@ impl<'a> Resolver<'a> {
 
 /// Restore real files in rustc stderr. JSON lines are rewritten only in
 /// diagnostic records; any other line is treated as human-readable output.
-pub(crate) fn restore<'a>(stderr: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
+/// The resolver is built only once a line may show a remapped path.
+pub(crate) fn restore<'a, 'r>(
+    stderr: &'a str,
+    resolver: impl FnOnce() -> Resolver<'r>,
+) -> Cow<'a, str> {
+    let resolver = LazyCell::new(resolver);
     let mut restored = String::new();
     let mut changed = false;
     for line in stderr.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
-        if let Cow::Owned(new) = restore_line(body, resolver) {
+        let new = match classify(body) {
+            Some(Line::Json) => restore_json_strings(body, &resolver),
+            Some(Line::Text) => restore_location(body, &resolver),
+            None => Cow::Borrowed(body),
+        };
+        if let Cow::Owned(new) = new {
             changed = true;
             restored.push_str(&new);
             restored.push_str(&line[body.len()..]);
@@ -71,20 +83,24 @@ pub(crate) fn restore<'a>(stderr: &'a str, resolver: &Resolver<'_>) -> Cow<'a, s
     }
 }
 
-fn restore_line<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
-    if !resolver
-        .roots
-        .iter()
-        .any(|root| line.contains(root.target.as_str()))
-    {
-        return Cow::Borrowed(line);
+/// A stderr line that may show a remapped path.
+enum Line {
+    /// A JSON diagnostic record.
+    Json,
+    /// Human-readable output.
+    Text,
+}
+
+fn classify(line: &str) -> Option<Line> {
+    if !may_contain_remapped_path(line) {
+        return None;
     }
     let Ok(record) = serde_json::from_str::<Value>(line) else {
-        return restore_location(line, resolver);
+        return Some(Line::Text);
     };
     match record.get("$message_type").and_then(Value::as_str) {
-        Some("diagnostic" | "future_incompat") => restore_json_strings(line, resolver),
-        _ => Cow::Borrowed(line),
+        Some("diagnostic" | "future_incompat") => Some(Line::Json),
+        _ => None,
     }
 }
 
@@ -92,35 +108,50 @@ fn restore_line<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
 /// JSON line. Every other byte is kept, so key order and formatting stay as
 /// rustc wrote them. Messages are left alone: they can quote source text.
 fn restore_json_strings<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
-    let bytes = line.as_bytes();
     let mut restored = String::new();
     let mut copied = 0;
+    for (key, value) in keyed_strings(line) {
+        if let Some(new) = restore_json_value(key, &line[value.clone()], resolver) {
+            restored.push_str(&line[copied..value.start]);
+            restored.push_str(&new);
+            copied = value.end;
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(line);
+    }
+    restored.push_str(&line[copied..]);
+    Cow::Owned(restored)
+}
+
+/// Each string that is the value of a key in a JSON line: the quoted key
+/// and the byte range of the quoted value.
+fn keyed_strings(line: &str) -> Vec<(&str, Range<usize>)> {
+    let mut strings = Vec::new();
     // The last string token, and the key whose value comes next.
     let mut last_string = None;
     let mut key = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-                i = (i + 1).min(bytes.len());
-                let token = &line[start..i];
+    // Where the string being read opened, and whether its next byte is escaped.
+    let mut open = None;
+    let mut escaped = false;
+    for (i, byte) in line.bytes().enumerate() {
+        if let Some(start) = open {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                open = None;
+                let token = start..i + 1;
                 match key.take() {
-                    Some(name) => {
-                        if let Some(value) = restore_json_value(name, token, resolver) {
-                            restored.push_str(&line[copied..start]);
-                            restored.push_str(&value);
-                            copied = i;
-                        }
-                    }
-                    None => last_string = Some(token),
+                    Some(name) => strings.push((name, token)),
+                    None => last_string = Some(&line[token]),
                 }
-                continue;
             }
+            continue;
+        }
+        match byte {
+            b'"' => open = Some(i),
             b':' => key = last_string.take(),
             byte if byte.is_ascii_whitespace() => {}
             _ => {
@@ -128,13 +159,8 @@ fn restore_json_strings<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, s
                 last_string = None;
             }
         }
-        i += 1;
     }
-    if copied == 0 {
-        return Cow::Borrowed(line);
-    }
-    restored.push_str(&line[copied..]);
-    Cow::Owned(restored)
+    strings
 }
 
 fn restore_json_value(key: &str, token: &str, resolver: &Resolver<'_>) -> Option<String> {
@@ -168,36 +194,38 @@ fn restore_json_value(key: &str, token: &str, resolver: &Resolver<'_>) -> Option
 /// file name up to `:line:col` is resolved, the same input as that span's
 /// `file_name`, so both resolve alike.
 fn restore_location<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
-    let mut start = skip_layout(line, 0);
-    if line[start..].starts_with("-->") || line[start..].starts_with(":::") {
-        start = skip_layout(line, start + 3);
+    let mut file = skip_layout(line);
+    if let Some(rest) = file
+        .strip_prefix("-->")
+        .or_else(|| file.strip_prefix(":::"))
+    {
+        file = skip_layout(rest);
     }
-    let Some(end) = position_suffix(&line[start..]).map(|end| start + end) else {
+    let Some(end) = position_suffix(file) else {
         return Cow::Borrowed(line);
     };
-    match resolver.resolve(&line[start..end]) {
-        Some(real) => Cow::Owned(format!("{}{real}{}", &line[..start], &line[end..])),
+    match resolver.resolve(&file[..end]) {
+        Some(real) => {
+            let start = line.len() - file.len();
+            Cow::Owned(format!("{}{real}{}", &line[..start], &file[end..]))
+        }
         None => Cow::Borrowed(line),
     }
 }
 
-/// Skip whitespace and terminal color sequences from byte `i`.
-fn skip_layout(line: &str, mut i: usize) -> usize {
-    loop {
-        let rest = &line[i..];
-        i += rest.len() - rest.trim_start().len();
-        let color = line[i..].strip_prefix("\x1b[").and_then(|sequence| {
-            let end = sequence.find('m')?;
-            sequence[..end]
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b';')
-                .then_some(end)
-        });
-        match color {
-            Some(end) => i += end + 3,
-            None => return i,
-        }
+/// `text` after leading whitespace and terminal color sequences.
+fn skip_layout(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while let Some((params, after)) = rest
+        .strip_prefix("\x1b[")
+        .and_then(|seq| seq.split_once('m'))
+        && params
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b';')
+    {
+        rest = after.trim_start();
     }
+    rest
 }
 
 /// Where the file name ends: at the first `:line:col` that ends a location.

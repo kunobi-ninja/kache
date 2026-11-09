@@ -1,4 +1,4 @@
-use super::{Resolver, restore};
+use super::{Resolver, position_suffix, restore};
 use crate::path_normalizer::DiagnosticRoot;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -72,7 +72,7 @@ fn restore_with<'a>(
     roots: &[DiagnosticRoot],
     own: impl Fn(&Path) -> bool,
 ) -> Cow<'a, str> {
-    restore(stderr, &Resolver::new(roots, &own))
+    restore(stderr, || Resolver::new(roots.to_vec(), &own))
 }
 
 fn restore_all<'a>(stderr: &'a str, roots: &[DiagnosticRoot]) -> Cow<'a, str> {
@@ -180,6 +180,56 @@ fn leaves_records_that_are_not_diagnostics_untouched() {
         restore_all(&stderr, &fixture.roots()),
         Cow::Borrowed(_)
     ));
+}
+
+#[test]
+fn restores_json_with_whitespace_between_tokens() {
+    let fixture = Fixture::new();
+    let record = |file: &str| {
+        format!(
+            r#"{{ "$message_type" : "diagnostic", "spans" : [ {{ "file_name" : {} }} ] }}"#,
+            Value::from(file)
+        )
+    };
+    assert_eq!(
+        restore_all(&record(REGISTRY), &fixture.roots()),
+        record(&fixture.real(REGISTRY))
+    );
+}
+
+#[test]
+fn builds_no_resolver_for_output_without_remapped_paths() {
+    // Building the roots can query rustc for its sysroot. An artifact
+    // record names a real output path, which can contain `/kache/` in a
+    // checkout of that name, and is never rewritten either.
+    let artifact = json!({
+        "$message_type": "artifact",
+        "artifact": "/home/kache/target/debug/deps/libapp.rmeta",
+        "emit": "metadata",
+    });
+    let stderr = format!("{artifact}\nwarning: unused variable\n --> src/main.rs:1:5\n");
+    let restored = restore(&stderr, || -> Resolver<'static> {
+        panic!("built a resolver for {stderr:?}")
+    });
+    assert!(matches!(restored, Cow::Borrowed(_)));
+}
+
+#[test]
+fn position_suffix_finds_the_line_and_column_that_end_a_location() {
+    for (text, end) in [
+        ("a.rs:3:4", Some(4)),
+        ("a.rs:3:4: warning: unused", Some(4)),
+        ("a.rs:3:4\x1b[0m", Some(4)),
+        // A colon needs a line number after it,
+        ("a::1:2.rs:3:4", Some(9)),
+        // a column,
+        ("a:1 b.rs:3:4", Some(8)),
+        ("a.rs:3:", None),
+        // and the location must end there.
+        ("a:1:2b.rs:3:4", Some(9)),
+    ] {
+        assert_eq!(position_suffix(text), end, "{text}");
+    }
 }
 
 #[test]

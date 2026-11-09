@@ -861,7 +861,8 @@ impl PathNormalizer {
         let rules: Vec<&Rule> = self
             .rules
             .iter()
-            .filter(|rule| !rule.prefix.is_empty() && is_native_configured_path(&rule.prefix))
+            // An empty prefix is not native either.
+            .filter(|rule| is_native_configured_path(&rule.prefix))
             .collect();
         let mut sources: Vec<&str> = Vec::new();
         for rule in &rules {
@@ -2295,6 +2296,65 @@ mod tests {
             };
             assert!(roots.contains(&expected), "{expected:?} in {roots:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_roots_keep_the_given_spelling_of_a_symlinked_root() {
+        // The canonical alias is longer, so it is the first rule of its root.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for name in [
+            "member",
+            "cargo",
+            "workspace-checkout-real",
+            "base-dir-real",
+        ] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("workspace-checkout-real"), root.join("ws")).unwrap();
+        std::os::unix::fs::symlink(root.join("base-dir-real"), root.join("base")).unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("CARGO_HOME", root.join("cargo").into_os_string())],
+            Some(root.join("member")),
+            None,
+            root.join("tmp"),
+        );
+        let base = root.join("base").to_str().unwrap().to_string();
+        let n = PathNormalizer::from_invocation(Some(&root.join("ws")), &env)
+            .with_base_dirs(std::slice::from_ref(&base));
+        let roots = n.diagnostic_roots();
+        for expected in [
+            DiagnosticRoot {
+                target: workspace_flag_target().to_string(),
+                root: root.join("ws").to_str().unwrap().to_string(),
+                per_crate: true,
+            },
+            DiagnosticRoot {
+                target: configured_base_dir_target(0),
+                root: base,
+                per_crate: false,
+            },
+        ] {
+            assert!(roots.contains(&expected), "{expected:?} in {roots:?}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_roots_skip_a_base_dir_for_another_os() {
+        // A shared config can name a root for another OS. On Windows `/work`
+        // is relative to the current drive, so its files could seem to exist.
+        let foreign = if cfg!(windows) { "/work" } else { r"C:\work" };
+        let n = PathNormalizer {
+            rules: Vec::new(),
+            configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
+            path_only_env_vars: Vec::new(),
+        }
+        .with_base_dirs(&[foreign.to_string()]);
+        assert!(n.raw_prefixes().any(|prefix| prefix == foreign));
+        assert_eq!(n.diagnostic_roots(), Vec::new());
     }
 
     // ── Windows-shape variants ──────────────────────────────────

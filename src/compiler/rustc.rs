@@ -289,12 +289,12 @@ impl RustcCompiler {
         parsed: &RustcArgs,
         stderr: &'a str,
     ) -> Cow<'a, str> {
-        if parsed.skip_path_remap() || !may_show_remapped_path(stderr) {
+        if parsed.skip_path_remap() {
             return Cow::Borrowed(stderr);
         }
         restore_diagnostic_paths(
             stderr,
-            &self.path_normalizer(parsed),
+            || self.path_normalizer(parsed).diagnostic_roots(),
             parsed,
             &self.invocation_env,
         )
@@ -366,7 +366,7 @@ impl RustcCompiler {
             if !skip_remap
                 && let Cow::Owned(stderr) = restore_diagnostic_paths(
                     result.pending_stderr(),
-                    &path_normalizer,
+                    || path_normalizer.diagnostic_roots(),
                     parsed,
                     &self.invocation_env,
                 )
@@ -384,26 +384,23 @@ impl RustcCompiler {
     }
 }
 
+/// `roots` runs only once a line may show a remapped path, so a cache hit
+/// with plain output never builds them.
 fn restore_diagnostic_paths<'a>(
     stderr: &'a str,
-    path_normalizer: &crate::path_normalizer::PathNormalizer,
+    roots: impl FnOnce() -> Vec<crate::path_normalizer::DiagnosticRoot>,
     parsed: &RustcArgs,
     env: &crate::invocation::InvocationEnv,
 ) -> Cow<'a, str> {
-    if !may_show_remapped_path(stderr) {
-        return Cow::Borrowed(stderr);
-    }
     let sources = std::cell::OnceCell::new();
     let own_source = |file: &std::path::Path| {
         let sources = sources.get_or_init(|| own_sources(parsed, env));
         file.canonicalize()
             .is_ok_and(|file| sources.contains(&file))
     };
-    let roots = path_normalizer.diagnostic_roots();
-    diagnostic_paths::restore(
-        stderr,
-        &diagnostic_paths::Resolver::new(&roots, &own_source),
-    )
+    diagnostic_paths::restore(stderr, || {
+        diagnostic_paths::Resolver::new(roots(), &own_source)
+    })
 }
 
 /// The compiled crate's own source files, from the dep-info rustc wrote.
@@ -423,15 +420,6 @@ fn own_sources(
         .filter_map(|path| env.resolve(&path))
         .filter_map(|path| path.canonicalize().ok())
         .collect()
-}
-
-/// Skip building the roots for the common case. Artifact records name real
-/// output paths, which can contain `/kache/` in a checkout of that name.
-fn may_show_remapped_path(stderr: &str) -> bool {
-    stderr.lines().any(|line| {
-        !line.starts_with(r#"{"$message_type":"artifact""#)
-            && crate::path_normalizer::may_contain_remapped_path(line)
-    })
 }
 
 fn bootstrap_metadata_ready(parsed: &RustcArgs) -> bool {

@@ -2244,7 +2244,7 @@ mod tests {
         }
         let rust_src = root.join("sysroot/lib/rustlib/src/rust");
         fs::create_dir_all(&rust_src).unwrap();
-        fs::create_dir(root.join("target/debug")).unwrap();
+        fs::create_dir(root.join("target").join("debug")).unwrap();
         let env = crate::invocation::InvocationEnv::from_parts(
             [
                 ("CARGO_HOME", root.join("cargo").into_os_string()),
@@ -2256,7 +2256,7 @@ mod tests {
         );
         let base = root.join("base").to_str().unwrap().to_string();
         let n = PathNormalizer::from_invocation(Some(&root.join("workspace")), &env)
-            .with_profile_dir(Some(&root.join("target/debug")))
+            .with_profile_dir(Some(&root.join("target").join("debug")))
             .with_base_dirs(std::slice::from_ref(&base))
             .with_rust_src_rule(Some(&root.join("sysroot")), Some("abc"));
         let roots = n.diagnostic_roots();
@@ -2274,7 +2274,15 @@ mod tests {
         for (target, root, per_crate) in [
             ("/kache/.cargo", cargo, false),
             ("/kache/target", lexical("target"), false),
-            ("/kache/profile", lexical("target/debug"), false),
+            (
+                "/kache/profile",
+                root.join("target")
+                    .join("debug")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                false,
+            ),
             ("/kache/base-dir-0", base.clone(), false),
             ("/rustc/abc", canonical_string(&rust_src).unwrap(), false),
             (workspace_flag_target(), lexical("member"), true),

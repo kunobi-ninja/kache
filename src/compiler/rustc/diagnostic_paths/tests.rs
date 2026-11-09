@@ -56,6 +56,12 @@ fn root(target: &str, root: &str, per_crate: bool) -> DiagnosticRoot {
     }
 }
 
+/// `path` as it appears inside a JSON string (Windows backslashes doubled).
+fn json_text(path: &str) -> String {
+    let quoted = serde_json::to_string(path).unwrap();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 fn touch(path: &str) {
     std::fs::create_dir_all(Path::new(path).parent().unwrap()).unwrap();
     std::fs::write(path, "").unwrap();
@@ -253,7 +259,7 @@ fn leaves_another_crates_per_crate_file_remapped() {
     let own = fixture.real(WORKSPACE);
     assert_eq!(
         restore_with(&record, &roots, |file| file == Path::new(&own)),
-        record.replace(WORKSPACE, &own)
+        record.replace(WORKSPACE, &json_text(&own))
     );
 }
 
@@ -282,7 +288,7 @@ fn shared_target_resolves_file_name_and_location_alike() {
     let real = format!("{workspace}/shared dir/gen.rs");
     assert_eq!(
         restore_all(&record, &roots),
-        record.replace(virtual_file, &real)
+        record.replace(virtual_file, &json_text(&real))
     );
 }
 

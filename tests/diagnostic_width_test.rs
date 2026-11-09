@@ -65,6 +65,8 @@ fn compile_with_log(
         .arg(project.join("lib.rs"))
         .args(flags)
         .env("KACHE_LOG", log)
+        // Windows runners lack copy-on-write; the advice would join stderr.
+        .env("KACHE_STORAGE_LAYOUT_ADVICE", "0")
         .current_dir(project);
     if !flags
         .iter()

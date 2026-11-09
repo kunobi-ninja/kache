@@ -852,6 +852,66 @@ impl PathNormalizer {
             .map(|r| format!("--remap-path-prefix={}={}", r.prefix, r.flag_target))
             .collect()
     }
+
+    /// `(remap target, real root)` pairs that put this invocation's paths
+    /// back into the rustc diagnostics a user sees, in rustc's remap
+    /// precedence. One target can stand for several roots: the cwd and the
+    /// workspace root both map to the workspace target.
+    pub(crate) fn diagnostic_roots(&self) -> Vec<(String, String)> {
+        let rules: Vec<&Rule> = self
+            .rules
+            .iter()
+            .filter(|rule| !rule.prefix.is_empty() && is_native_configured_path(&rule.prefix))
+            .collect();
+        let mut sources: Vec<&str> = Vec::new();
+        for rule in &rules {
+            if !sources.contains(&rule.source_sentinel.as_str()) {
+                sources.push(&rule.source_sentinel);
+            }
+        }
+        let mut roots: Vec<(u8, usize, String, String)> = sources
+            .into_iter()
+            .map(|source| {
+                let owned: Vec<&Rule> = rules
+                    .iter()
+                    .copied()
+                    .filter(|rule| rule.source_sentinel == source)
+                    .collect();
+                // Prefer the spelling the user gave over a canonical alias.
+                let designated = self
+                    .source_restore_roots
+                    .iter()
+                    .find(|(sentinel, _)| sentinel == source)
+                    .map(|(_, root)| root)
+                    .or_else(|| {
+                        self.configured_source_root_groups
+                            .iter()
+                            .find(|group| group.key_sentinel == source)
+                            .map(|group| &group.restore_root)
+                    })
+                    .and_then(|root| root.to_str())
+                    .filter(|root| owned.iter().any(|rule| rule.prefix == *root));
+                let longest = owned.iter().map(|rule| rule.prefix.len()).max();
+                (
+                    flag_emit_rank(&owned[0].key_sentinel),
+                    longest.unwrap_or_default(),
+                    owned[0].flag_target.clone(),
+                    designated.unwrap_or(&owned[0].prefix).to_string(),
+                )
+            })
+            .collect();
+        roots.sort_by_key(|(rank, longest, _, _)| std::cmp::Reverse((*rank, *longest)));
+        roots
+            .into_iter()
+            .map(|(_, _, target, root)| (target, root))
+            .collect()
+    }
+}
+
+/// Whether `text` may hold a path rewritten by [`PathNormalizer::remap_args`].
+/// A cheap check before building [`PathNormalizer::diagnostic_roots`].
+pub(crate) fn may_contain_remapped_path(text: &str) -> bool {
+    text.contains("/kache/") || text.contains("/rustc/") || text.contains(workspace_flag_target())
 }
 
 /// Replace an absolute configured root only at path-component boundaries.
@@ -2162,6 +2222,59 @@ mod tests {
             path_only_env_vars: Vec::new(),
         };
         assert!(n.remap_args().is_empty());
+    }
+
+    #[test]
+    fn diagnostic_roots_invert_every_remap_target() {
+        let dir = TempDir::new().unwrap();
+        // Lexical, possibly non-canonical (`/var` on macOS) spellings.
+        let root = dir.path().to_path_buf();
+        for name in ["member", "workspace", "cargo", "target", "base"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        let rust_src = root.join("sysroot/lib/rustlib/src/rust");
+        fs::create_dir_all(&rust_src).unwrap();
+        fs::create_dir(root.join("target/debug")).unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [
+                ("CARGO_HOME", root.join("cargo").into_os_string()),
+                ("CARGO_TARGET_DIR", root.join("target").into_os_string()),
+            ],
+            Some(root.join("member")),
+            None,
+            root.join("tmp"),
+        );
+        let base = root.join("base").to_str().unwrap().to_string();
+        let n = PathNormalizer::from_invocation(Some(&root.join("workspace")), &env)
+            .with_profile_dir(Some(&root.join("target/debug")))
+            .with_base_dirs(std::slice::from_ref(&base))
+            .with_rust_src_rule(Some(&root.join("sysroot")), Some("abc"));
+        let roots = n.diagnostic_roots();
+
+        for arg in n.remap_args() {
+            let (_, target) = arg.rsplit_once('=').unwrap();
+            assert!(
+                may_contain_remapped_path(&format!("{target}/a.rs")),
+                "{arg}"
+            );
+            assert!(roots.iter().any(|(t, _)| t == target), "{arg}");
+        }
+        let lexical = |name: &str| root.join(name).to_str().unwrap().to_string();
+        let cargo = canonical_string(&root.join("cargo")).unwrap();
+        for (target, real) in [
+            ("/kache/.cargo", cargo),
+            ("/kache/target", lexical("target")),
+            ("/kache/profile", lexical("target/debug")),
+            ("/kache/base-dir-0", base.clone()),
+            ("/rustc/abc", canonical_string(&rust_src).unwrap()),
+            (workspace_flag_target(), lexical("member")),
+            (workspace_flag_target(), lexical("workspace")),
+        ] {
+            assert!(
+                roots.contains(&(target.to_string(), real.clone())),
+                "{target} -> {real} in {roots:?}"
+            );
+        }
     }
 
     // ── Windows-shape variants ──────────────────────────────────

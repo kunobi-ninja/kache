@@ -4,6 +4,7 @@ use super::{
     restore_from_cache_with_memo_store,
 };
 use anyhow::{Result, bail};
+use std::borrow::Cow;
 use std::time::Instant;
 
 /// Invocation state shared by every Rust cache-hit path.
@@ -54,6 +55,20 @@ impl RustcHitContext<'_> {
             self.extra_inputs,
         )?;
         let restore_ms = restore_start.elapsed().as_millis() as u64;
+        let shown;
+        let meta = match self
+            .compiler
+            .diagnostics_for_display(self.args, &meta.stderr)
+        {
+            Cow::Borrowed(_) => meta,
+            Cow::Owned(stderr) => {
+                shown = EntryMeta {
+                    stderr,
+                    ..meta.clone()
+                };
+                &shown
+            }
+        };
         HitCompletion {
             event_root: self.event_root,
             crate_name: self.crate_name,

@@ -112,6 +112,8 @@ pub(crate) fn reason(config: &Config, orphaned: bool, idle_secs: i64) -> Option<
 /// Seconds since a build last used `tracked` at `now`: since the build that
 /// recorded it, or for a target found only through Git, since kache began
 /// watching it with no build using it (see [`crate::unit_prune::unused_since`]).
+/// A program it built that ran since counts as a use
+/// ([`crate::target_runs`]).
 /// A watch counts only on a local filesystem, when it began after this
 /// directory was found, so a replaced directory starts over, and while a rule
 /// watches discovered targets, so a record left from an earlier watch does
@@ -125,9 +127,18 @@ pub(crate) fn idle_secs(config: &Config, tracked: &TrackedTargetRoot, now: i64) 
             return None;
         }
         let unused = crate::unit_prune::unused_since(&config.cache_dir, &tracked.path);
-        return watched_idle(tracked, now, unused);
+        return watched_idle(tracked, now, unused).map(|idle| since_run(tracked, idle, now));
     }
-    Some(now.saturating_sub(tracked.last_seen).max(0))
+    Some(since_run(
+        tracked,
+        now.saturating_sub(tracked.last_seen).max(0),
+        now,
+    ))
+}
+
+/// `idle`, shortened when a program `tracked` built ran more recently.
+fn since_run(tracked: &TrackedTargetRoot, idle: i64, now: i64) -> i64 {
+    crate::target_runs::idle_since_run(idle, crate::target_runs::last_run(&tracked.path), now)
 }
 
 /// Whether a periodic check at `now` should run: cleanup is on, an hour has
@@ -578,7 +589,7 @@ fn observed_idle_at(
 ) -> Option<i64> {
     let local = watch_counts(crate::cache_fs::probe(&tracked.path).is_local);
     let has_units = !crate::unit_prune::profiles(&tracked.path).is_empty();
-    observed_idle(tracked, now, unused, local, has_units)
+    observed_idle(tracked, now, unused, local, has_units).map(|idle| since_run(tracked, idle, now))
 }
 
 /// Seconds since `unused`, the arming no build has used `tracked` since; for
@@ -951,6 +962,41 @@ mod tests {
             vec![(target.clone(), Reason::Idle)]
         );
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_program_run_since_the_last_build_keeps_an_idle_target() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let config = config(cache.path(), false, 1);
+        let store = Store::open(&config).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "project");
+        age_target(&store, &target, 3 * 86_400);
+        let app = target
+            .join("debug")
+            .join(if cfg!(windows) { "app.exe" } else { "app" });
+        std::fs::write(&app, b"program").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let now = unix_now_secs();
+        let at = |secs_ago: u64| filetime::FileTime::from_unix_time((now - secs_ago) as i64, 0);
+        filetime::set_file_times(&app, at(3_600), at(3 * 86_400)).unwrap();
+        let tracked = root_of(&store, &target);
+        assert_eq!(idle_secs(&config, &tracked, now as i64), Some(0));
+        assert_eq!(plan(&config, &tracked, now).remove, None);
+        assert!(sweep(&config, now).unwrap().removed.is_empty());
+
+        // A run shows up to a day late, so it keeps the target a day longer.
+        filetime::set_file_times(&app, at(2 * 86_400 - 60), at(3 * 86_400)).unwrap();
+        assert!(sweep(&config, now).unwrap().removed.is_empty());
+        filetime::set_file_times(&app, at(2 * 86_400 + 60), at(3 * 86_400)).unwrap();
+        assert_eq!(
+            sweep(&config, now).unwrap().removed,
+            vec![(target.clone(), Reason::Idle)]
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

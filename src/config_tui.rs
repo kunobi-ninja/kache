@@ -2221,6 +2221,8 @@ mod tests {
                 ]),
                 event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
+                event_archive_days: None,
+                event_archive_max_size: None,
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
                 prefetch_enabled: Some(false),

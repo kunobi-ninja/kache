@@ -226,6 +226,7 @@ fn size_key(key: &str) -> Option<bool> {
     match key {
         "cache.local_max_size"
         | "cache.event_log_max_size"
+        | "cache.event_archive_max_size"
         | "cache.prefetch_max_bytes"
         | "cache.auto_recover_min_free_bytes" => Some(true),
         "cache.restore_max_size" | "cache.remote_upload_memory_bytes" => Some(false),
@@ -337,6 +338,7 @@ mod tests {
         for key in [
             "local_max_size",
             "event_log_max_size",
+            "event_archive_max_size",
             "prefetch_max_bytes",
             "auto_recover_min_free_bytes",
             "restore_max_size",

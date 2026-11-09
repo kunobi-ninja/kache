@@ -17,14 +17,48 @@ fn rotation_keeps_events_when_the_ledger_is_busy_then_retries() {
         lock.unlock().unwrap();
     });
     let size = before.len() as u64;
-    assert!(rotate_events_if_needed(&path, size, 1, dir.path()).is_ok());
-    assert!(rotate_events_if_needed(&path, size + 1, 1, dir.path()).is_ok());
-    assert!(rotate_events_if_needed(&path, 1, 1, dir.path()).is_err());
+    assert!(
+        rotate_events_if_needed(
+            &path,
+            size,
+            1,
+            dir.path(),
+            crate::events::ArchiveLimits::default()
+        )
+        .is_ok()
+    );
+    assert!(
+        rotate_events_if_needed(
+            &path,
+            size + 1,
+            1,
+            dir.path(),
+            crate::events::ArchiveLimits::default()
+        )
+        .is_ok()
+    );
+    assert!(
+        rotate_events_if_needed(
+            &path,
+            1,
+            1,
+            dir.path(),
+            crate::events::ArchiveLimits::default()
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(read(dir.path()).is_none());
     drop(release_tx);
     holder.join().unwrap();
-    rotate_events_if_needed(&path, 1, 1, dir.path()).unwrap();
+    rotate_events_if_needed(
+        &path,
+        1,
+        1,
+        dir.path(),
+        crate::events::ArchiveLimits::default(),
+    )
+    .unwrap();
     let retained = read_events(&path).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].compile_time_ms, 2);
@@ -68,6 +102,7 @@ fn log_and_rotate(config: &Config, events: &[BuildEvent], max_size: u64, keep_li
             max_size,
             keep_lines,
             &config.cache_dir,
+            crate::events::ArchiveLimits::default(),
         )
         .unwrap();
     }
@@ -188,6 +223,7 @@ fn a_session_tail_kept_by_rotation_is_not_folded() {
         line_len * 64,
         5,
         &config.cache_dir,
+        crate::events::ArchiveLimits::default(),
     )
     .unwrap();
 

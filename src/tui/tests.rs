@@ -169,6 +169,8 @@ fn test_config() -> Config {
         unstable: Default::default(),
         event_log_max_size: 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,

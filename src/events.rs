@@ -467,13 +467,35 @@ fn segment_stats_onto(
     Ok(stats)
 }
 
-/// How long archived events are kept: past the 24 h every windowed command
-/// uses by default, and a week for `--since 7d`.
-const EVENT_ARCHIVE_MAX_AGE_SECS: i64 = 8 * 24 * 3600;
+/// How much of the event archive is kept: `[cache] event_archive_days` and
+/// `[cache] event_archive_max_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveLimits {
+    pub days: u64,
+    pub max_bytes: u64,
+}
 
-/// The most the archive holds, compressed. Build events compress about
-/// tenfold, so a busy machine's week fits; past this the oldest segments go.
-const EVENT_ARCHIVE_MAX_BYTES: u64 = 512 << 20;
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            days: crate::config::DEFAULT_EVENT_ARCHIVE_DAYS,
+            max_bytes: crate::config::DEFAULT_EVENT_ARCHIVE_MAX_SIZE,
+        }
+    }
+}
+
+impl ArchiveLimits {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            days: config.event_archive_days,
+            max_bytes: config.event_archive_max_size,
+        }
+    }
+
+    fn max_age_secs(self) -> i64 {
+        i64::try_from(self.days.saturating_mul(24 * 3600)).unwrap_or(i64::MAX)
+    }
+}
 
 /// The directory beside the event log that holds the events rotations moved
 /// out of it: `events.jsonl` keeps them in `events.jsonl.archive/`.
@@ -554,13 +576,18 @@ fn read_segment(path: &Path) -> Result<impl Iterator<Item = Result<BuildEvent>>>
 /// only what was left in the log: at 64 MiB, a busy machine's last few hours
 /// of a 24 h window). One zstd segment per rotation, written whole and
 /// renamed into place so readers never see half of one; then segments older
-/// than [`EVENT_ARCHIVE_MAX_AGE_SECS`] go, and the oldest beyond
-/// [`EVENT_ARCHIVE_MAX_BYTES`].
+/// than `limits` allow go, and the oldest beyond its size. With no days or
+/// no bytes allowed, nothing is archived and old segments go.
 fn archive_dropped_events(
     event_log_path: &Path,
     dropped: &[&str],
     now: DateTime<Utc>,
+    limits: ArchiveLimits,
 ) -> Result<()> {
+    if limits.days == 0 || limits.max_bytes == 0 {
+        prune_event_archive(event_log_path, now, 0, 0);
+        return Ok(());
+    }
     #[derive(Deserialize)]
     struct TsOnly {
         ts: DateTime<Utc>,
@@ -584,12 +611,7 @@ fn archive_dropped_events(
     );
     crate::atomic::atomic_replace(&dir.join(name), &compressed)
         .context("writing an event archive segment")?;
-    prune_event_archive(
-        event_log_path,
-        now,
-        EVENT_ARCHIVE_MAX_AGE_SECS,
-        EVENT_ARCHIVE_MAX_BYTES,
-    );
+    prune_event_archive(event_log_path, now, limits.max_age_secs(), limits.max_bytes);
     Ok(())
 }
 
@@ -1087,6 +1109,7 @@ pub fn rotate_events_if_needed(
     max_size: u64,
     keep_lines: usize,
     cache_dir: &Path,
+    archive: ArchiveLimits,
 ) -> Result<()> {
     if !matches!(fs::metadata(event_log_path), Ok(meta) if meta.len() > max_size) {
         return Ok(());
@@ -1101,7 +1124,7 @@ pub fn rotate_events_if_needed(
         "event log",
         LogLock::Build,
         |dropped| {
-            if let Err(e) = archive_dropped_events(event_log_path, dropped, Utc::now()) {
+            if let Err(e) = archive_dropped_events(event_log_path, dropped, Utc::now(), archive) {
                 tracing::warn!("archiving rotated events: {e:#}");
             }
             fold(dropped)
@@ -2234,7 +2257,8 @@ mod tests {
             let mut event = test_event(&format!("c{i}"), EventResult::Miss, 1, 1, 1, "k");
             event.ts = start + chrono::Duration::minutes(i * 15);
             log_event(&log_path, &event).unwrap();
-            rotate_events_if_needed(&log_path, 2048, 3, dir.path()).unwrap();
+            rotate_events_if_needed(&log_path, 2048, 3, dir.path(), ArchiveLimits::default())
+                .unwrap();
         }
         let live = read_events(&log_path).unwrap();
         assert!(
@@ -2286,7 +2310,7 @@ mod tests {
         let mut event = test_event("kept", EventResult::Miss, 1, 1, 1, "k");
         event.ts = now - chrono::Duration::hours(2);
         let line = serde_json::to_string(&event).unwrap() + "\n";
-        archive_dropped_events(&log_path, &[line.as_str()], now).unwrap();
+        archive_dropped_events(&log_path, &[line.as_str()], now, ArchiveLimits::default()).unwrap();
 
         let events = read_events_since(&log_path, now - chrono::Duration::hours(24)).unwrap();
         assert_eq!(events.len(), 1);
@@ -2323,7 +2347,13 @@ mod tests {
     fn archiving_lines_without_events_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
-        archive_dropped_events(&log_path, &["not json\n"], Utc::now()).unwrap();
+        archive_dropped_events(
+            &log_path,
+            &["not json\n"],
+            Utc::now(),
+            ArchiveLimits::default(),
+        )
+        .unwrap();
         assert!(!event_archive_dir(&log_path).exists());
     }
 
@@ -2342,7 +2372,7 @@ mod tests {
             })
             .collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        archive_dropped_events(&log_path, &refs, now).unwrap();
+        archive_dropped_events(&log_path, &refs, now, ArchiveLimits::default()).unwrap();
         let segments = archive_segments(&log_path);
         assert_eq!(segments.len(), 1);
         assert_eq!(
@@ -2433,8 +2463,8 @@ mod tests {
         prune_event_archive(
             &log_path,
             now,
-            EVENT_ARCHIVE_MAX_AGE_SECS,
-            EVENT_ARCHIVE_MAX_BYTES,
+            ArchiveLimits::default().max_age_secs(),
+            ArchiveLimits::default().max_bytes,
         );
         assert!(!nine_days.exists());
         assert!(eight_days.exists() && week.exists() && hour.exists());
@@ -2455,7 +2485,8 @@ mod tests {
                     test_event(&format!("c{i}"), EventResult::Miss, 1, 2, i as u64, "k");
                 event.ts = start + chrono::Duration::minutes(i * 10);
                 log_event(&log_path, &event).unwrap();
-                rotate_events_if_needed(&log_path, 2048, 2, dir.path()).unwrap();
+                rotate_events_if_needed(&log_path, 2048, 2, dir.path(), ArchiveLimits::default())
+                    .unwrap();
             }
         };
         let check = |since: DateTime<Utc>| {
@@ -2507,7 +2538,7 @@ mod tests {
                 line(EventResult::Miss, since + chrono::Duration::minutes(30)),
             ];
             let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-            archive_dropped_events(&log_path, &refs, now).unwrap();
+            archive_dropped_events(&log_path, &refs, now, ArchiveLimits::default()).unwrap();
         }
         assert_eq!(archive_segments(&log_path).len(), 2);
         let stats = event_stats_since(&log_path, since).unwrap();
@@ -2531,7 +2562,7 @@ mod tests {
                 })
                 .collect();
             let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-            archive_dropped_events(&log_path, &refs, now).unwrap();
+            archive_dropped_events(&log_path, &refs, now, ArchiveLimits::default()).unwrap();
         };
         let mut memo = Vec::new();
         archive_misses(1);
@@ -2576,7 +2607,7 @@ mod tests {
             let mut event = test_event("archived", EventResult::Miss, 1, 2, 3, "k");
             event.ts = now - chrono::Duration::hours(age);
             let line = serde_json::to_string(&event).unwrap() + "\n";
-            archive_dropped_events(&log, &[&line], now).unwrap();
+            archive_dropped_events(&log, &[&line], now, ArchiveLimits::default()).unwrap();
         }
         let segments = archive_segments(&log);
         assert_eq!(segments.len(), 2);
@@ -2615,7 +2646,7 @@ mod tests {
         let mut event = test_event("memo", EventResult::Miss, 1, 2, 3, "k");
         event.ts = now - chrono::Duration::hours(1);
         let line = serde_json::to_string(&event).unwrap() + "\n";
-        archive_dropped_events(&log, &[&line], now).unwrap();
+        archive_dropped_events(&log, &[&line], now, ArchiveLimits::default()).unwrap();
         let segments = archive_segments(&log);
         let memo = std::sync::Mutex::new(Vec::new());
         assert_eq!(
@@ -2673,7 +2704,7 @@ mod tests {
         let mut event = test_event("retry", EventResult::Miss, 1, 2, 3, "k");
         event.ts = now - chrono::Duration::hours(1);
         let line = serde_json::to_string(&event).unwrap() + "\n";
-        archive_dropped_events(&log, &[&line], now).unwrap();
+        archive_dropped_events(&log, &[&line], now, ArchiveLimits::default()).unwrap();
         let segments = archive_segments(&log);
         let path = &segments[0].path;
         let complete = fs::read(path).unwrap();
@@ -2737,7 +2768,7 @@ mod tests {
             let mut event = test_event("bounded", EventResult::Miss, 1, 2, 3, "k");
             event.ts = now - chrono::Duration::hours(1);
             let line = serde_json::to_string(&event).unwrap() + "\n";
-            archive_dropped_events(&log, &[&line], now).unwrap();
+            archive_dropped_events(&log, &[&line], now, ArchiveLimits::default()).unwrap();
             assert_eq!(
                 inside_segments_stats(&mut memo, event_archive_dir(&log), &archive_segments(&log))
                     .misses,
@@ -2765,7 +2796,51 @@ mod tests {
         fs::write(&path, b"1234").unwrap();
         prune_event_archive(&log, now, 10, 3);
         assert!(!path.exists());
-        assert_eq!(EVENT_ARCHIVE_MAX_BYTES, 536_870_912);
+        assert_eq!(
+            ArchiveLimits::default(),
+            ArchiveLimits {
+                days: 8,
+                max_bytes: 536_870_912
+            }
+        );
+    }
+
+    /// `[cache] event_archive_days` decides how long rotated events stay,
+    /// and `0` keeps none of them.
+    #[test]
+    fn archive_keeps_events_for_the_configured_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log);
+        fs::create_dir_all(&archive).unwrap();
+        let now = Utc::now();
+        let two_days = (now - chrono::Duration::days(2)).timestamp();
+        let old = archive.join(format!("{two_days:011}-{two_days:011}-1-1.jsonl.zst"));
+        let line = |hours| {
+            let mut event = test_event("c", EventResult::Miss, 1, 1, 1, "k");
+            event.ts = now - chrono::Duration::hours(hours);
+            serde_json::to_string(&event).unwrap() + "\n"
+        };
+
+        fs::write(&old, b"x").unwrap();
+        archive_dropped_events(&log, &[line(1).as_str()], now, ArchiveLimits::default()).unwrap();
+        assert!(old.exists(), "the default keeps 8 days");
+        let one_day = ArchiveLimits {
+            days: 1,
+            max_bytes: 512 << 20,
+        };
+        // A later rotation, so its segment gets its own name.
+        let later = now + chrono::Duration::seconds(1);
+        archive_dropped_events(&log, &[line(1).as_str()], later, one_day).unwrap();
+        assert!(!old.exists());
+        assert_eq!(archive_segments(&log).len(), 2);
+
+        let none = ArchiveLimits {
+            days: 0,
+            max_bytes: 512 << 20,
+        };
+        archive_dropped_events(&log, &[line(1).as_str()], now, none).unwrap();
+        assert!(archive_segments(&log).is_empty());
     }
 
     #[test]

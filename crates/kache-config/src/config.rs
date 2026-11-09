@@ -143,6 +143,14 @@ fn absolutize_volume_path(path: &Path) -> PathBuf {
 /// 20,000 of the usual 1.4 KB (kunobi-ninja/kache#1209).
 pub const DEFAULT_EVENT_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Default `[cache] event_archive_days`: past the 24 h every windowed command
+/// uses by default, and a week for `--since 7d`.
+pub const DEFAULT_EVENT_ARCHIVE_DAYS: u64 = 8;
+
+/// Default `[cache] event_archive_max_size`. Build events compress about
+/// tenfold, so a busy machine's week fits.
+pub const DEFAULT_EVENT_ARCHIVE_MAX_SIZE: u64 = 512 << 20;
+
 /// Maximum bytes downloaded or unpacked for one restored entry or debug bundle.
 pub const DEFAULT_RESTORE_MAX_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -229,6 +237,12 @@ pub struct Config {
     pub unstable: bool,
     pub event_log_max_size: u64,
     pub event_log_keep_lines: usize,
+    /// Days the events a log rotation drops stay in `events.jsonl.archive/`
+    /// (default 8; `0` keeps no archive). `[cache] event_archive_days`.
+    pub event_archive_days: u64,
+    /// The most the event archive holds, compressed (default 512 MiB); the
+    /// oldest segments go first. `[cache] event_archive_max_size`.
+    pub event_archive_max_size: u64,
     /// Zstd compression level (1-19, default 3). Lower = faster, higher = smaller.
     pub compression_level: i32,
     /// Max concurrent S3 operations (default 16).
@@ -1065,6 +1079,9 @@ pub struct CacheFileConfig {
     #[serde(default, deserialize_with = "crate::size::optional_text")]
     pub event_log_max_size: Option<String>,
     pub event_log_keep_lines: Option<usize>,
+    pub event_archive_days: Option<u64>,
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
+    pub event_archive_max_size: Option<String>,
     pub compression_level: Option<i32>,
     pub s3_concurrency: Option<u32>,
     pub prefetch_enabled: Option<bool>,
@@ -1953,6 +1970,21 @@ impl Config {
             .and_then(|c| c.event_log_keep_lines)
             .unwrap_or(1000);
 
+        let event_archive_days = file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.event_archive_days)
+            .unwrap_or(DEFAULT_EVENT_ARCHIVE_DAYS);
+
+        let event_archive_max_size = file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.event_archive_max_size.as_ref())
+            .and_then(|s| parse_size_checked(s, "[cache] event_archive_max_size"))
+            .unwrap_or(DEFAULT_EVENT_ARCHIVE_MAX_SIZE);
+
         let compression_level =
             env_or_ignored_for(invocation, "KACHE_COMPRESSION_LEVEL", ignore_env)
                 .ok()
@@ -2644,6 +2676,8 @@ impl Config {
             .transpose()?,
             event_log_max_size,
             event_log_keep_lines,
+            event_archive_days,
+            event_archive_max_size,
             compression_level,
             s3_concurrency,
             prefetch_enabled,

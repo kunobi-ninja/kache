@@ -1634,6 +1634,8 @@ pub(super) fn test_config(dir: &Path) -> Config {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -17358,7 +17360,14 @@ fn daemon_stats_include_rotated_events() {
         events::log_event(&log, &hit).unwrap();
     }
     let max_size = std::fs::metadata(&log).unwrap().len() / 2;
-    events::rotate_events_if_needed(&log, max_size, 1, &config.cache_dir).unwrap();
+    events::rotate_events_if_needed(
+        &log,
+        max_size,
+        1,
+        &config.cache_dir,
+        events::ArchiveLimits::default(),
+    )
+    .unwrap();
     assert!(events::read_events(&log).unwrap().len() < 12);
     let miss = events::BuildEvent::new_for_test("live", events::EventResult::Miss);
     events::log_event(&log, &miss).unwrap();

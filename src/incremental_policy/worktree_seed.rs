@@ -33,6 +33,8 @@ impl Lease {
         enabled: bool,
     ) -> Vec<String> {
         self.worktree_seed_key = None;
+        // An import stays this lease's, through a later preparation that
+        // finds the state already there.
         self.worktree_bootstrap = false;
         let isolated = self.compiler_args(args);
         if !enabled || args.inner_rustc.is_some() || path_exists(&self.bootstrap_env_marker()) {
@@ -110,6 +112,7 @@ impl Lease {
             for donor_profile in donor_profiles {
                 if import(&self.unit, donor_profile, &key) {
                     tracing::debug!(donor = %donor_profile.display(), "imported worktree incremental seed");
+                    self.worktree_seed_donor = Some(donor_profile.clone());
                     break;
                 }
             }
@@ -121,6 +124,11 @@ impl Lease {
 
     pub(crate) fn worktree_bootstrap(&self) -> bool {
         self.worktree_bootstrap
+    }
+
+    /// The other checkout's profile whose incremental state was imported.
+    pub(crate) fn worktree_seed_donor(&self) -> Option<&Path> {
+        self.worktree_seed_donor.as_deref()
     }
 
     pub(crate) fn worktree_portable(&self) -> bool {
@@ -139,6 +147,7 @@ impl Lease {
     /// Remember the refusal so later edits need no speculative attempt.
     pub(crate) fn decline_worktree_bootstrap(&mut self) -> bool {
         self.worktree_seed_key = None;
+        self.worktree_seed_donor = None;
         self.worktree_bootstrap = false;
         let Ok(mut marker) = tempfile::NamedTempFile::new_in(&self.unit.unit_dir) else {
             return false;
@@ -1145,6 +1154,48 @@ mod tests {
             }
             assert!(!lease.worktree_bootstrap());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lease_names_the_checkout_it_imported_state_from() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let _cache =
+            crate::config::tests::set_env_for_test("KACHE_CACHE_DIR", Some(root.as_os_str()));
+        let compiler = root.join("rustc-mock");
+        kache_fs::testutil::write_executable(
+            &compiler,
+            "#!/bin/sh\nprintf 'rustc test compiler\\n'\n",
+        );
+        let (mut args, _) = fixture(&root.join("receiver"));
+        args.rustc = compiler.clone();
+        let receiver = AdaptiveUnit::eligible(&args, b"guard").unwrap();
+        let mut lease = receiver.try_immediate().unwrap();
+        lease.kind = LeaseKind::Seed;
+        lease.worktree_compiler_args_from(&args, &[], true);
+        let key = lease
+            .worktree_seed_key
+            .clone()
+            .expect("a portable invocation");
+        assert_eq!(lease.worktree_seed_donor(), None);
+
+        let (mut donor_args, _) = fixture(&root.join("donor"));
+        donor_args.rustc = compiler;
+        let donor = AdaptiveUnit::eligible(&donor_args, b"guard").unwrap();
+        let donor_lease = donor.try_immediate().unwrap();
+        fs::write(donor.rustc_dir.join("graph"), b"complete").unwrap();
+        publish(&donor, Some(&key));
+        assert!(donor_lease.finish(CompileOutcome::Success));
+        let profile = root.join("donor/target/debug");
+        let missing = root.join("gone/target/debug");
+        lease.worktree_compiler_args_from(&args, &[missing, profile.clone()], true);
+        assert_eq!(lease.worktree_seed_donor(), Some(profile.as_path()));
+
+        // Preparing the lease again imports nothing and keeps its donor.
+        lease.worktree_compiler_args_from(&args, &[], true);
+        assert_eq!(lease.worktree_seed_donor(), Some(profile.as_path()));
     }
 
     #[test]

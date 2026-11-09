@@ -451,7 +451,7 @@ Without a crate, `explain` reads the latest recorded build and says why it misse
 
 The report shows the Kache versions that recorded the build alongside the installed version. "Earlier Kache bugs" separates recognized failures from releases before a known fix. The old prediction-metadata migration failure was fixed in v2.0.0-rc.3: Kache rebuilds those predictions and keeps compiled cache entries. There is no need to clear the cache. The same failure recorded by RC.3 or later remains a normal error, as do records whose producer version is unknown.
 
-`kache explain --all` keeps the full retained history and shows the producer version for each invocation. JSON preserves the original reasons, adds `version` to individual records, and marks recognized older failures with `fixed_in`.
+`kache explain --all` keeps the full retained history and shows the producer version for each invocation. JSON preserves the original reasons, adds `version` to individual records, and marks recognized older failures with `fixed_in`. A compile seeded from another checkout's incremental state names that checkout's Cargo profile directory, as `incremental_seed` in JSON.
 
 The report ends with the command that explains the costliest crate, and the one that writes the build's timeline as a Perfetto trace. `--root` limits it to builds of one tree. It exits 0; the hidden `kache diff` prints the miss counts and unexplained shares of the two builds and exits 1 when either grew, for scripts that gate on that. `kache why-miss` is the same command under its earlier name.
 

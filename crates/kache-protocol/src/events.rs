@@ -271,6 +271,10 @@ pub struct BuildEvent {
     /// Why a successful compile did not publish an entry. Empty in older logs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub skip_reason: String,
+    /// The Cargo profile directory of another checkout whose incremental
+    /// state seeded this compile. Empty when none did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_seed: String,
     /// Why `Store::put` failed, when the compiler ran and produced outputs that
     /// were then not cached (kunobi-ninja/kache#629).
     ///
@@ -619,6 +623,7 @@ impl BuildEvent {
             skip_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
+            incremental_seed: String::new(),
             daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),

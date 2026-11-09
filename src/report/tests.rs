@@ -541,6 +541,7 @@ fn test_event(
         skip_reason: String::new(),
         store_error: String::new(),
         store_handed_off: false,
+        incremental_seed: String::new(),
         daemon_store_ms: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
@@ -4133,6 +4134,7 @@ fn test_push_bypass_tables_renders_reasons_and_slowest() {
             fixed_in: None,
             version: String::new(),
             fallback_attempt: None,
+            incremental_seed: String::new(),
             crate_name: "foo".to_string(),
             root: String::new(),
             package: String::new(),
@@ -4613,6 +4615,7 @@ fn text_timing_and_bypass_sections_hide_a_zero() {
     report.bypass.slowest.push(BypassDetail {
         fixed_in: None,
         version: String::new(),
+        incremental_seed: String::new(),
         crate_name: "slow".to_string(),
         root: String::new(),
         package: String::new(),
@@ -5275,4 +5278,20 @@ fn report_names_the_three_costliest_waits_from_all_events() {
     for (note, expected) in notes.iter().zip(["wait_4000", "wait_3000", "wait_2000"]) {
         assert!(note.contains(expected), "{note}");
     }
+}
+
+#[test]
+fn a_seeded_compile_names_the_checkout_its_state_came_from() {
+    let mut event = test_event("app", EventResult::Passthrough, 900, 900, 0, "");
+    event.passthrough_reason = "automatic worktree seed".to_string();
+    event.incremental_seed = "/work/main/target/debug".to_string();
+    let detail = to_bypass_detail(&event);
+    assert_eq!(detail.incremental_seed, "/work/main/target/debug");
+    assert_eq!(
+        bypass_detail_words(&detail, "seeded".to_string()),
+        "seeded; seeded from /work/main/target/debug"
+    );
+    event.incremental_seed.clear();
+    let detail = to_bypass_detail(&event);
+    assert_eq!(bypass_detail_words(&detail, "seeded".to_string()), "seeded");
 }

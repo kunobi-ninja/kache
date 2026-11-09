@@ -6820,6 +6820,7 @@ fn adaptive_compile_before_key(
     );
     after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
     let _ = lease.finish(outcome);
     let cache_key = observed.as_ref().map_or("", |(key, _)| key.as_str());
     log_event(
@@ -6839,6 +6840,7 @@ fn adaptive_compile_before_key(
         .keyed(cache_key, key_ms, key_hash_stats)
         .lookup_ms(lookup_ms)
         .passthrough_reason("adaptive seed".to_owned())
+        .incremental_seed(seeded_from.as_deref())
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -8802,6 +8804,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     );
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
     let kept = lease.finish(outcome);
     tracing::debug!(
         ?kind,
@@ -8825,6 +8828,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         .keyed(cache_key, key_ms, key_hash_stats)
         .lookup_ms(lookup_ms)
         .passthrough_reason(reason)
+        .incremental_seed(seeded_from.as_deref())
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -9323,6 +9327,7 @@ pub(crate) struct EventInputs<'a> {
     store_put: StorePutResult,
     passthrough_reason: String,
     skip_reason: String,
+    incremental_seed: String,
     object_output: String,
     package: String,
     store_error: String,
@@ -9357,6 +9362,7 @@ impl<'a> EventInputs<'a> {
             store_put: StorePutResult::default(),
             passthrough_reason: String::new(),
             skip_reason: String::new(),
+            incremental_seed: String::new(),
             object_output: String::new(),
             package: String::new(),
             store_error: String::new(),
@@ -9470,6 +9476,12 @@ impl<'a> EventInputs<'a> {
 
     pub(crate) fn passthrough_reason(mut self, reason: String) -> Self {
         self.passthrough_reason = reason;
+        self
+    }
+
+    /// The other checkout's profile whose incremental state seeded the compile.
+    pub(crate) fn incremental_seed(mut self, donor: Option<&Path>) -> Self {
+        self.incremental_seed = donor.map_or_else(String::new, |donor| donor.display().to_string());
         self
     }
 
@@ -9655,6 +9667,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_put,
         passthrough_reason,
         skip_reason,
+        incremental_seed,
         object_output,
         package,
         store_error,
@@ -9780,6 +9793,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         restore_copy_other_bytes: crate::opcounts::restore_copy_other_bytes(),
         passthrough_reason,
         skip_reason,
+        incremental_seed,
         miss_reason,
         object_output,
         package,

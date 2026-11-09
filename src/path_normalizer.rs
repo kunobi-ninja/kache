@@ -853,11 +853,11 @@ impl PathNormalizer {
             .collect()
     }
 
-    /// `(remap target, real root)` pairs that put this invocation's paths
+    /// Remap targets with the real roots that put this invocation's paths
     /// back into the rustc diagnostics a user sees, in rustc's remap
     /// precedence. One target can stand for several roots: the cwd and the
     /// workspace root both map to the workspace target.
-    pub(crate) fn diagnostic_roots(&self) -> Vec<(String, String)> {
+    pub(crate) fn diagnostic_roots(&self) -> Vec<DiagnosticRoot> {
         let rules: Vec<&Rule> = self
             .rules
             .iter()
@@ -869,7 +869,7 @@ impl PathNormalizer {
                 sources.push(&rule.source_sentinel);
             }
         }
-        let mut roots: Vec<(u8, usize, String, String)> = sources
+        let mut roots: Vec<(u8, usize, DiagnosticRoot)> = sources
             .into_iter()
             .map(|source| {
                 let owned: Vec<&Rule> = rules
@@ -895,17 +895,27 @@ impl PathNormalizer {
                 (
                     flag_emit_rank(&owned[0].key_sentinel),
                     longest.unwrap_or_default(),
-                    owned[0].flag_target.clone(),
-                    designated.unwrap_or(&owned[0].prefix).to_string(),
+                    DiagnosticRoot {
+                        target: owned[0].flag_target.clone(),
+                        root: designated.unwrap_or(&owned[0].prefix).to_string(),
+                        per_crate: matches!(source, "<CWD>" | "<WORKSPACE>"),
+                    },
                 )
             })
             .collect();
-        roots.sort_by_key(|(rank, longest, _, _)| std::cmp::Reverse((*rank, *longest)));
-        roots
-            .into_iter()
-            .map(|(_, _, target, root)| (target, root))
-            .collect()
+        roots.sort_by_key(|(rank, longest, _)| std::cmp::Reverse((*rank, *longest)));
+        roots.into_iter().map(|(_, _, root)| root).collect()
     }
+}
+
+/// A remap target and one real root it stands for in this invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticRoot {
+    pub target: String,
+    pub root: String,
+    /// The root depends on the crate being compiled (its cwd or workspace),
+    /// so another crate's file can carry the same target.
+    pub per_crate: bool,
 }
 
 /// Whether `text` may hold a path rewritten by [`PathNormalizer::remap_args`].
@@ -2257,23 +2267,25 @@ mod tests {
                 may_contain_remapped_path(&format!("{target}/a.rs")),
                 "{arg}"
             );
-            assert!(roots.iter().any(|(t, _)| t == target), "{arg}");
+            assert!(roots.iter().any(|root| root.target == target), "{arg}");
         }
         let lexical = |name: &str| root.join(name).to_str().unwrap().to_string();
         let cargo = canonical_string(&root.join("cargo")).unwrap();
-        for (target, real) in [
-            ("/kache/.cargo", cargo),
-            ("/kache/target", lexical("target")),
-            ("/kache/profile", lexical("target/debug")),
-            ("/kache/base-dir-0", base.clone()),
-            ("/rustc/abc", canonical_string(&rust_src).unwrap()),
-            (workspace_flag_target(), lexical("member")),
-            (workspace_flag_target(), lexical("workspace")),
+        for (target, root, per_crate) in [
+            ("/kache/.cargo", cargo, false),
+            ("/kache/target", lexical("target"), false),
+            ("/kache/profile", lexical("target/debug"), false),
+            ("/kache/base-dir-0", base.clone(), false),
+            ("/rustc/abc", canonical_string(&rust_src).unwrap(), false),
+            (workspace_flag_target(), lexical("member"), true),
+            (workspace_flag_target(), lexical("workspace"), true),
         ] {
-            assert!(
-                roots.contains(&(target.to_string(), real.clone())),
-                "{target} -> {real} in {roots:?}"
-            );
+            let expected = DiagnosticRoot {
+                target: target.to_string(),
+                root,
+                per_crate,
+            };
+            assert!(roots.contains(&expected), "{expected:?} in {roots:?}");
         }
     }
 

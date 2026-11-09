@@ -5,22 +5,58 @@
 //! cannot open them. The rewrite here applies only to the text shown to the
 //! user. Stored diagnostics keep the remapped form so entries stay portable.
 
+use crate::path_normalizer::DiagnosticRoot;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::path::Path;
 
-/// Restore real roots in rustc stderr. `roots` holds `(remap target, real
-/// root)` pairs in remap precedence. JSON lines are rewritten only in
-/// diagnostic records; any other line is treated as human-readable output.
-pub(crate) fn restore<'a>(stderr: &'a str, roots: &[(String, String)]) -> Cow<'a, str> {
-    if roots.is_empty() {
-        return Cow::Borrowed(stderr);
+/// Maps a remapped file name back to a real file of this invocation.
+pub(crate) struct Resolver<'a> {
+    roots: &'a [DiagnosticRoot],
+    /// Whether a real file is one of the compiled crate's own sources.
+    own_source: &'a dyn Fn(&Path) -> bool,
+}
+
+impl<'a> Resolver<'a> {
+    pub(crate) fn new(roots: &'a [DiagnosticRoot], own_source: &'a dyn Fn(&Path) -> bool) -> Self {
+        Self { roots, own_source }
     }
+
+    /// The real file behind `path`, or `None` to leave it remapped. The file
+    /// must exist. Under a per-crate root it must also be a source of this
+    /// crate: a dependency compiled from another directory maps its own
+    /// files to the same target, and the same relative path can exist here.
+    /// Such a dependency's file stays remapped.
+    fn resolve(&self, path: &str) -> Option<String> {
+        let target = &self
+            .roots
+            .iter()
+            .find(|root| {
+                path.strip_prefix(root.target.as_str())
+                    .is_some_and(|rest| rest.starts_with(['/', '\\']))
+            })?
+            .target;
+        let rest = &path[target.len()..];
+        self.roots
+            .iter()
+            .filter(|root| root.target == *target)
+            .map(|root| (root, join(&root.root, rest)))
+            .find(|(root, real)| {
+                let real = Path::new(real);
+                real.is_file() && (!root.per_crate || (self.own_source)(real))
+            })
+            .map(|(_, real)| real)
+    }
+}
+
+/// Restore real files in rustc stderr. JSON lines are rewritten only in
+/// diagnostic records; any other line is treated as human-readable output.
+pub(crate) fn restore<'a>(stderr: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
     let mut restored = String::new();
     let mut changed = false;
     for line in stderr.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
-        if let Cow::Owned(new) = restore_line(body, roots) {
+        if let Cow::Owned(new) = restore_line(body, resolver) {
             changed = true;
             restored.push_str(&new);
             restored.push_str(&line[body.len()..]);
@@ -35,26 +71,27 @@ pub(crate) fn restore<'a>(stderr: &'a str, roots: &[(String, String)]) -> Cow<'a
     }
 }
 
-fn restore_line<'a>(line: &'a str, roots: &[(String, String)]) -> Cow<'a, str> {
-    if !roots
+fn restore_line<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
+    if !resolver
+        .roots
         .iter()
-        .any(|(target, _)| line.contains(target.as_str()))
+        .any(|root| line.contains(root.target.as_str()))
     {
         return Cow::Borrowed(line);
     }
     let Ok(record) = serde_json::from_str::<Value>(line) else {
-        return restore_text(line, roots);
+        return restore_location(line, resolver);
     };
     match record.get("$message_type").and_then(Value::as_str) {
-        Some("diagnostic" | "future_incompat") => restore_json_strings(line, roots),
+        Some("diagnostic" | "future_incompat") => restore_json_strings(line, resolver),
         _ => Cow::Borrowed(line),
     }
 }
 
-/// Rewrite the string values of `file_name`, `message` and `rendered` keys
-/// in a valid JSON line. Every other byte is kept, so key order and
-/// formatting stay as rustc wrote them.
-fn restore_json_strings<'a>(line: &'a str, roots: &[(String, String)]) -> Cow<'a, str> {
+/// Rewrite the string values of `file_name` and `rendered` keys in a valid
+/// JSON line. Every other byte is kept, so key order and formatting stay as
+/// rustc wrote them. Messages are left alone: they can quote source text.
+fn restore_json_strings<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
     let bytes = line.as_bytes();
     let mut restored = String::new();
     let mut copied = 0;
@@ -74,7 +111,7 @@ fn restore_json_strings<'a>(line: &'a str, roots: &[(String, String)]) -> Cow<'a
                 let token = &line[start..i];
                 match key.take() {
                     Some(name) => {
-                        if let Some(value) = restore_json_value(name, token, roots) {
+                        if let Some(value) = restore_json_value(name, token, resolver) {
                             restored.push_str(&line[copied..start]);
                             restored.push_str(&value);
                             copied = i;
@@ -100,102 +137,87 @@ fn restore_json_strings<'a>(line: &'a str, roots: &[(String, String)]) -> Cow<'a
     Cow::Owned(restored)
 }
 
-fn restore_json_value(key: &str, token: &str, roots: &[(String, String)]) -> Option<String> {
-    let restore = match key {
-        r#""file_name""# => restore_path,
-        r#""message""# | r#""rendered""# => restore_text,
+fn restore_json_value(key: &str, token: &str, resolver: &Resolver<'_>) -> Option<String> {
+    let file_name = match key {
+        r#""file_name""# => true,
+        r#""rendered""# => false,
         _ => return None,
     };
     let value: String = serde_json::from_str(token).ok()?;
-    match restore(&value, roots) {
-        Cow::Owned(value) => serde_json::to_string(&value).ok(),
-        Cow::Borrowed(_) => None,
+    let restored = if file_name {
+        resolver.resolve(&value)?
+    } else {
+        let mut restored = String::new();
+        let mut changed = false;
+        for line in value.split_inclusive('\n') {
+            let new = restore_location(line, resolver);
+            changed |= matches!(new, Cow::Owned(_));
+            restored.push_str(&new);
+        }
+        if !changed {
+            return None;
+        }
+        restored
+    };
+    serde_json::to_string(&restored).ok()
+}
+
+/// Rewrite the file on a location line: rustc's `--> file:line:col` and
+/// `::: file:line:col`, or a short-format `file:line:col: message`. Source
+/// excerpts follow a line-number gutter, so they never match. The whole
+/// file name up to `:line:col` is resolved, the same input as that span's
+/// `file_name`, so both resolve alike.
+fn restore_location<'a>(line: &'a str, resolver: &Resolver<'_>) -> Cow<'a, str> {
+    let mut start = skip_layout(line, 0);
+    if line[start..].starts_with("-->") || line[start..].starts_with(":::") {
+        start = skip_layout(line, start + 3);
+    }
+    let Some(end) = position_suffix(&line[start..]).map(|end| start + end) else {
+        return Cow::Borrowed(line);
+    };
+    match resolver.resolve(&line[start..end]) {
+        Some(real) => Cow::Owned(format!("{}{real}{}", &line[..start], &line[end..])),
+        None => Cow::Borrowed(line),
     }
 }
 
-/// A span's file name: a whole path that may start with a target.
-fn restore_path<'a>(file: &'a str, roots: &[(String, String)]) -> Cow<'a, str> {
-    let Some((target, _)) = roots.iter().find(|(target, _)| {
-        file.strip_prefix(target.as_str())
-            .is_some_and(|rest| rest.starts_with(['/', '\\']))
-    }) else {
-        return Cow::Borrowed(file);
-    };
-    let rest = &file[target.len()..];
-    Cow::Owned(join(real_root(target, rest, roots), rest))
-}
-
-/// Rewrite targets that start a path in free text: at the start, after
-/// whitespace, an opening quote or bracket, or a terminal color sequence.
-fn restore_text<'a>(text: &'a str, roots: &[(String, String)]) -> Cow<'a, str> {
-    let mut found = Vec::new();
-    for (target, _) in roots {
-        for (start, _) in text.match_indices(target.as_str()) {
-            let end = start + target.len();
-            if text[end..].starts_with(['/', '\\']) && starts_path(&text[..start]) {
-                found.push((start, end, target));
-            }
+/// Skip whitespace and terminal color sequences from byte `i`.
+fn skip_layout(line: &str, mut i: usize) -> usize {
+    loop {
+        let rest = &line[i..];
+        i += rest.len() - rest.trim_start().len();
+        let color = line[i..].strip_prefix("\x1b[").and_then(|sequence| {
+            let end = sequence.find('m')?;
+            sequence[..end]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b';')
+                .then_some(end)
+        });
+        match color {
+            Some(end) => i += end + 3,
+            None => return i,
         }
     }
-    if found.is_empty() {
-        return Cow::Borrowed(text);
-    }
-    found.sort_by_key(|(start, ..)| *start);
-    let mut restored = String::with_capacity(text.len());
-    let mut copied = 0;
-    for (start, end, target) in found {
-        if start < copied {
-            continue;
-        }
-        let rest = &text[end..];
-        let rest = &rest[..rest
-            .find(|c: char| c.is_whitespace() || ":\x1b`'\")]>,".contains(c))
-            .unwrap_or(rest.len())];
-        restored.push_str(&text[copied..start]);
-        restored.push_str(trim_root(real_root(target, rest, roots)));
-        copied = end;
-    }
-    restored.push_str(&text[copied..]);
-    Cow::Owned(restored)
 }
 
-fn starts_path(before: &str) -> bool {
-    let Some(last) = before.chars().next_back() else {
-        return true;
-    };
-    if last.is_whitespace() || "`'\"([<=".contains(last) {
-        return true;
-    }
-    before
-        .strip_suffix('m')
-        .and_then(|before| before.rsplit_once("\x1b["))
-        .is_some_and(|(_, params)| params.bytes().all(|b| b.is_ascii_digit() || b == b';'))
-}
-
-/// When one target stands for several roots, pick the one where the file
-/// exists. Fall back to the highest-precedence root.
-fn real_root<'a>(target: &str, rest: &str, roots: &'a [(String, String)]) -> &'a str {
-    let candidates: Vec<&str> = roots
-        .iter()
-        .filter(|(candidate, _)| candidate == target)
-        .map(|(_, real)| real.as_str())
-        .collect();
-    match candidates.as_slice() {
-        [only] => only,
-        _ => candidates
-            .iter()
-            .copied()
-            .find(|real| Path::new(&join(real, rest)).exists())
-            .unwrap_or(candidates[0]),
-    }
-}
-
-fn trim_root(root: &str) -> &str {
-    root.trim_end_matches(['/', '\\'])
+/// Where the file name ends: at the first `:line:col` that ends a location.
+fn position_suffix(text: &str) -> Option<usize> {
+    let digits = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
+    text.match_indices(':').map(|(at, _)| at).find(|&at| {
+        let rest = &text[at + 1..];
+        let line = digits(rest);
+        line > 0
+            && rest[line..].strip_prefix(':').is_some_and(|rest| {
+                let column = digits(rest);
+                column > 0
+                    && (rest.len() == column
+                        || rest[column..].starts_with([':', ' ', '\x1b', '\r', '\n']))
+            })
+    })
 }
 
 fn join(root: &str, rest: &str) -> String {
-    format!("{}{rest}", trim_root(root))
+    format!("{}{rest}", root.trim_end_matches(['/', '\\']))
 }
 
 #[cfg(test)]

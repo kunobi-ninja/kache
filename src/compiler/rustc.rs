@@ -292,7 +292,12 @@ impl RustcCompiler {
         if parsed.skip_path_remap() || !may_show_remapped_path(stderr) {
             return Cow::Borrowed(stderr);
         }
-        restore_diagnostic_paths(stderr, &self.path_normalizer(parsed))
+        restore_diagnostic_paths(
+            stderr,
+            &self.path_normalizer(parsed),
+            parsed,
+            &self.invocation_env,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -359,8 +364,12 @@ impl RustcCompiler {
         );
         let result = result.map(|mut result| {
             if !skip_remap
-                && let Cow::Owned(stderr) =
-                    restore_diagnostic_paths(result.pending_stderr(), &path_normalizer)
+                && let Cow::Owned(stderr) = restore_diagnostic_paths(
+                    result.pending_stderr(),
+                    &path_normalizer,
+                    parsed,
+                    &self.invocation_env,
+                )
             {
                 result.pending_stderr = Some(stderr);
             }
@@ -378,11 +387,42 @@ impl RustcCompiler {
 fn restore_diagnostic_paths<'a>(
     stderr: &'a str,
     path_normalizer: &crate::path_normalizer::PathNormalizer,
+    parsed: &RustcArgs,
+    env: &crate::invocation::InvocationEnv,
 ) -> Cow<'a, str> {
     if !may_show_remapped_path(stderr) {
         return Cow::Borrowed(stderr);
     }
-    diagnostic_paths::restore(stderr, &path_normalizer.diagnostic_roots())
+    let sources = std::cell::OnceCell::new();
+    let own_source = |file: &std::path::Path| {
+        let sources = sources.get_or_init(|| own_sources(parsed, env));
+        file.canonicalize()
+            .is_ok_and(|file| sources.contains(&file))
+    };
+    let roots = path_normalizer.diagnostic_roots();
+    diagnostic_paths::restore(
+        stderr,
+        &diagnostic_paths::Resolver::new(&roots, &own_source),
+    )
+}
+
+/// The compiled crate's own source files, from the dep-info rustc wrote.
+fn own_sources(
+    parsed: &RustcArgs,
+    env: &crate::invocation::InvocationEnv,
+) -> std::collections::HashSet<PathBuf> {
+    let Some(dep_info) = parsed
+        .dep_info_path()
+        .and_then(|path| env.resolve(&path))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+    else {
+        return Default::default();
+    };
+    crate::cache_key::parse_dep_info(&dep_info)
+        .into_iter()
+        .filter_map(|path| env.resolve(&path))
+        .filter_map(|path| path.canonicalize().ok())
+        .collect()
 }
 
 /// Skip building the roots for the common case. Artifact records name real

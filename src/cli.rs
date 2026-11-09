@@ -8164,6 +8164,11 @@ pub fn doctor(
             &std::env::temp_dir(),
         ));
         checks.push(doctor_index_quarantines(cfg));
+        checks.extend(doctor_storage::unit_pruning_check(
+            cfg.auto_clean_unused_units_days,
+            cfg.target_liveness,
+            cargo_output_dir().as_deref(),
+        ));
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {
             checks.push(Check {

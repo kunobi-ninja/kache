@@ -109,6 +109,83 @@ fn disk_check(
     }
 }
 
+/// Whether unused build units can be removed from the build directory: the
+/// daemon skips a filesystem that does not record reads without a word.
+/// With `target_liveness` on, units go by recorded Cargo commands instead,
+/// which need no access times.
+pub(super) fn unit_pruning_check(
+    days: u64,
+    target_liveness: bool,
+    build: Option<&Path>,
+) -> Option<Check> {
+    if days == 0 {
+        return None;
+    }
+    if target_liveness {
+        return Some(Check {
+            label: "Unit pruning",
+            pass: true,
+            detail: format!(
+                "build units unused for {days} days go by recorded Cargo commands, which only builds through `kache cargo` or the Cargo shim record"
+            ),
+            fix: None,
+        });
+    }
+    let dir = super::closest_existing(build?.to_owned())?;
+    let support = crate::unit_prune::support(&dir);
+    Some(unit_pruning_result(days, &dir, support))
+}
+
+fn unit_pruning_result(days: u64, dir: &Path, support: crate::unit_prune::Support) -> Check {
+    use crate::unit_prune::Support;
+    let shown = crate::link_probe::shown_path(dir);
+    let (pass, detail, fix) = match support {
+        Support::Works => (
+            true,
+            format!("build units unused for {days} days are removed from {shown}"),
+            None,
+        ),
+        Support::ReadsHidden => (
+            // Windows updates last-access times too coarsely for the probe,
+            // and no mount option changes that.
+            cfg!(windows),
+            format!(
+                "{shown} does not record file reads, so build units no build uses are never removed"
+            ),
+            Some(if cfg!(windows) {
+                "remove old build units with `cargo clean`, or set `[cache] target_liveness = true` and build through `kache cargo` or the Cargo shim to remove them by recorded commands".to_string()
+            } else if cfg!(target_os = "macos") {
+                "remove `noatime` from this volume's mount options, or set `[cache] target_liveness = true` and build through `kache cargo` or the Cargo shim to remove units by recorded commands".to_string()
+            } else {
+                "mount this volume with `relatime` instead of `noatime`, or set `[cache] target_liveness = true` and build through `kache cargo` or the Cargo shim to remove units by recorded commands".to_string()
+            }),
+        ),
+        Support::NotLocal => (
+            true,
+            format!("{shown} is not on a local filesystem, so its build units are never removed"),
+            None,
+        ),
+        Support::LocalityUnknown => (
+            true,
+            format!(
+                "kache cannot tell whether {shown} is on a local filesystem, so its build units are never removed"
+            ),
+            None,
+        ),
+        Support::Unknown(error) => (
+            false,
+            format!("could not tell whether {shown} records file reads: {error}"),
+            None,
+        ),
+    };
+    Check {
+        label: "Unit pruning",
+        pass,
+        detail,
+        fix,
+    }
+}
+
 fn access_check(cache_dir: &Path, index: &Path) -> Check {
     let result = probe_access(cache_dir, index);
     let pass = result.is_ok();
@@ -233,6 +310,56 @@ fn display_limit(limit: libc::rlim_t) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn unit_pruning_names_a_build_directory_that_hides_reads() {
+        use crate::unit_prune::Support;
+        let dir = Path::new("/work/target");
+        let works = unit_pruning_result(30, dir, Support::Works);
+        assert!(works.pass, "{}", works.detail);
+        assert!(works.detail.contains("30 days"), "{}", works.detail);
+
+        let hidden = unit_pruning_result(30, dir, Support::ReadsHidden);
+        assert_eq!(hidden.pass, cfg!(windows));
+        assert!(hidden.detail.contains("never removed"), "{}", hidden.detail);
+        let fix = hidden.fix.expect("a way out");
+        assert!(fix.contains("target_liveness"), "{fix}");
+        assert_eq!(fix.contains("noatime"), !cfg!(windows), "{fix}");
+        assert_eq!(
+            fix.contains("relatime"),
+            cfg!(not(any(windows, target_os = "macos"))),
+            "{fix}"
+        );
+
+        let unknown = unit_pruning_result(
+            30,
+            dir,
+            Support::Unknown(std::io::ErrorKind::StorageFull.into()),
+        );
+        assert!(!unknown.pass);
+        assert!(unit_pruning_result(30, dir, Support::NotLocal).pass);
+        let unknown = unit_pruning_result(30, dir, Support::LocalityUnknown);
+        assert!(unknown.detail.contains("cannot tell"), "{}", unknown.detail);
+    }
+
+    #[test]
+    fn unit_pruning_check_is_absent_when_disabled_or_without_a_build_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(unit_pruning_check(0, false, Some(dir.path())).is_none());
+        assert!(unit_pruning_check(30, false, None).is_none());
+        let receipts = unit_pruning_check(30, true, Some(dir.path())).unwrap();
+        assert!(
+            receipts.pass,
+            "recorded Cargo commands need no access times"
+        );
+        assert!(
+            receipts.detail.contains("kache cargo"),
+            "{}",
+            receipts.detail
+        );
+        let check = unit_pruning_check(30, false, Some(&dir.path().join("target"))).unwrap();
+        assert_eq!(check.label, "Unit pruning");
+    }
 
     #[test]
     fn index_mode_reports_the_configured_and_effective_policy() {

@@ -140,6 +140,10 @@ pub(super) fn input_state_as(
 
 /// Declared inputs also carry observable modification times. The implicit
 /// package dependency follows Cargo's file list and omits directory times.
+/// So does an input in Cargo's registry sources or Git checkouts: Cargo
+/// stamps every directory it unpacks there with the time of the unpack and
+/// never changes a package there afterwards, so a directory's time differs
+/// in every fresh Cargo home. File contents and file times are still keyed.
 pub(super) fn run_input_state(
     path: &Path,
     excluded: &[PathBuf],
@@ -147,10 +151,11 @@ pub(super) fn run_input_state(
     budget: &mut usize,
     symlink_depth: usize,
     default_package: bool,
+    in_cargo_source_cache: bool,
 ) -> Result<String> {
     let walk = Walk {
         excluded,
-        input_times: if default_package {
+        input_times: if default_package || in_cargo_source_cache {
             InputTimes::Files
         } else {
             InputTimes::FilesAndDirectories
@@ -636,7 +641,7 @@ mod tests {
                 .unwrap();
         };
         let content = || input_state(&file, &[], &hasher, &mut 10, 0).unwrap();
-        let run = || run_input_state(&file, &[], &hasher, &mut 10, 0, false).unwrap();
+        let run = || run_input_state(&file, &[], &hasher, &mut 10, 0, false, false).unwrap();
         stamp(1_700_000_000, 100);
         let original = run();
         let content_key = content();
@@ -707,8 +712,10 @@ mod tests {
         filetime::set_file_mtime(&package, old).unwrap();
         let excluded = [package.join("target"), package.join(".git")];
         let hasher = crate::cache_key::FileHasher::new();
-        let implicit = || run_input_state(&package, &excluded, &hasher, &mut 20, 0, true).unwrap();
-        let explicit = || run_input_state(&package, &[], &hasher, &mut 20, 0, false).unwrap();
+        let implicit =
+            || run_input_state(&package, &excluded, &hasher, &mut 20, 0, true, false).unwrap();
+        let explicit =
+            || run_input_state(&package, &[], &hasher, &mut 20, 0, false, false).unwrap();
         let before = implicit();
         let explicit_before = explicit();
         filetime::set_file_mtime(&package, newer).unwrap();
@@ -721,6 +728,36 @@ mod tests {
         assert_eq!(implicit(), before);
         filetime::set_file_mtime(&input, newer).unwrap();
         assert_ne!(implicit(), before);
+    }
+
+    /// Cargo stamps the directories it unpacks into its source caches with
+    /// the time of the unpack; a declared directory there keeps only the
+    /// contents and times of its files.
+    #[test]
+    fn declared_inputs_in_cargo_source_caches_ignore_directory_times() {
+        let temp = tempfile::tempdir().unwrap();
+        let declared = temp.path().join("c");
+        let nested = declared.join("include");
+        let input = nested.join("blake3.h");
+        write(&input, "same");
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let newer = filetime::FileTime::from_unix_time(1_700_000_001, 0);
+        for path in [&input, &nested, &declared] {
+            filetime::set_file_mtime(path, old).unwrap();
+        }
+        let hasher = crate::cache_key::FileHasher::new();
+        let key = || run_input_state(&declared, &[], &hasher, &mut 20, 0, false, true).unwrap();
+        let before = key();
+        filetime::set_file_mtime(&declared, newer).unwrap();
+        filetime::set_file_mtime(&nested, newer).unwrap();
+        assert_eq!(key(), before, "directory times are left out");
+        filetime::set_file_mtime(&input, newer).unwrap();
+        assert_ne!(key(), before, "a file's time is keyed");
+        filetime::set_file_mtime(&input, old).unwrap();
+        assert_eq!(key(), before);
+        write(&input, "next");
+        filetime::set_file_mtime(&input, old).unwrap();
+        assert_ne!(key(), before, "a file's content is keyed");
     }
 
     #[test]
@@ -804,7 +841,7 @@ mod tests {
         filetime::set_file_mtime(&file, old).unwrap();
         filetime::set_symlink_file_times(&link, old, old).unwrap();
         let hasher = crate::cache_key::FileHasher::new();
-        let key = || run_input_state(&link, &[], &hasher, &mut 10, 0, false).unwrap();
+        let key = || run_input_state(&link, &[], &hasher, &mut 10, 0, false, false).unwrap();
         let before = key();
         filetime::set_file_mtime(&file, newer).unwrap();
         assert_ne!(key(), before);
@@ -827,7 +864,7 @@ mod tests {
             filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_700_000_001, 0))
                 .unwrap();
         })));
-        let result = run_input_state(&file, &[], &hasher, &mut 10, 0, false);
+        let result = run_input_state(&file, &[], &hasher, &mut 10, 0, false, false);
         crate::cache_key::set_before_read(None);
         assert!(
             result

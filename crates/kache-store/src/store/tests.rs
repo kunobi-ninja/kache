@@ -2362,7 +2362,7 @@ fn strict_flush_serializes_the_windows_readonly_open_window() {
     let cache_key = put_entry(&holder, dir.path(), 92, "pending", bytes);
     let blob = holder.blob_path(blake3::hash(bytes).to_hex().as_str());
     config.deferred_durability = false;
-    let flusher = Store::open(&config).unwrap();
+    let mut flusher = Store::open(&config).unwrap();
     let permissions = fs::metadata(&blob).unwrap().permissions();
     assert!(permissions.readonly());
 

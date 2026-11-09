@@ -31,17 +31,23 @@ pub(super) fn resolve(declared: &Path) -> Result<Option<GitInput>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    // The files read to find the Git directory count as inputs too: a `.git`
+    // file pointed elsewhere during a run must fail the run's input check.
+    let mut read = Vec::new();
     let (git_dir, linked) = if metadata.is_dir() {
         (dot_git, false)
     } else if metadata.is_file() {
         match linked_git_dir(&dot_git)? {
-            Some(git_dir) => (git_dir, true),
+            Some(git_dir) => {
+                read.push(dot_git);
+                (git_dir, true)
+            }
             None => return Ok(None),
         }
     } else {
         return Ok(None);
     };
-    let common_dir = common_dir(&git_dir)?;
+    let common_dir = common_dir(&git_dir, &mut read)?;
     anyhow::ensure!(
         !common_dir.join("reftable").exists(),
         "{} keeps its refs in a reftable",
@@ -61,7 +67,6 @@ pub(super) fn resolve(declared: &Path) -> Result<Option<GitInput>> {
             common_dir.join(&rest)
         }
     };
-    let mut read = Vec::new();
     let head = head_state(&git_dir, &common_dir, &mut read)
         .with_context(|| format!("resolving HEAD in {}", git_dir.display()))?;
     Ok(Some(GitInput { path, head, read }))
@@ -96,9 +101,13 @@ fn linked_git_dir(dot_git: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Where the refs shared by every worktree live.
-fn common_dir(git_dir: &Path) -> Result<PathBuf> {
-    match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(named) => Ok(git_dir.join(named.trim())),
+fn common_dir(git_dir: &Path, read: &mut Vec<PathBuf>) -> Result<PathBuf> {
+    let named_by = git_dir.join("commondir");
+    match std::fs::read_to_string(&named_by) {
+        Ok(named) => {
+            read.push(named_by);
+            Ok(git_dir.join(named.trim()))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
         Err(error) => Err(error.into()),
     }
@@ -211,6 +220,10 @@ mod tests {
             own.join("../../refs/heads/other")
         );
         assert_eq!(resolve(&wt.join(".git")).unwrap().unwrap().path, own);
+        // Retargeting `.git` or `commondir` during a run must be noticed.
+        let read = resolve(&wt.join(".git/HEAD")).unwrap().unwrap().read;
+        assert!(read.contains(&wt.join(".git")), "{read:?}");
+        assert!(read.contains(&own.join("commondir")), "{read:?}");
     }
 
     #[test]

@@ -157,7 +157,15 @@ pub(super) fn declared_input_state(
         return run_input_state(path, excluded, file_hasher, budget, 0, default_package);
     };
     let state = run_input_state(&git.path, excluded, file_hasher, budget, 0, false)?;
-    Ok(format!("{state}\ngit:{}", git.head))
+    // What the script sees at the declared path itself: `.git` turning from
+    // a directory into a file changes what reading `.git/HEAD` returns.
+    let declared = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => "dir",
+        Ok(metadata) if metadata.is_file() => "file",
+        Ok(_) => "other",
+        Err(_) => "unreadable",
+    };
+    Ok(format!("{state}\ngit:{}\ndeclared:{declared}", git.head))
 }
 
 /// The files whose writes during a run would change a declared input's

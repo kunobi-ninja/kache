@@ -4396,7 +4396,19 @@ mod tests {
         prediction.inputs = vec!["${KACHE_MANIFEST_DIR}/.git/HEAD".to_string()];
         let key = run.action_key(&prediction).unwrap();
         std::fs::write(package.join(".git/refs/heads/main"), "2222\n").unwrap();
-        assert_ne!(key, run.action_key(&prediction).unwrap());
+        let committed = run.action_key(&prediction).unwrap();
+        assert_ne!(key, committed);
+
+        // `git init --separate-git-dir`: HEAD keeps its bytes and time, but
+        // the script reading `.git/HEAD` now gets "not a directory".
+        let separate = dir.as_path().join("separate.git");
+        std::fs::rename(package.join(".git"), &separate).unwrap();
+        std::fs::write(
+            package.join(".git"),
+            format!("gitdir: {}\n", separate.display()),
+        )
+        .unwrap();
+        assert_ne!(committed, run.action_key(&prediction).unwrap());
     }
 
     /// In a linked worktree `.git` is a file naming the worktree's Git

@@ -379,6 +379,35 @@ fn width_waiter_waits_past_a_rendered_shared_entry_for_its_own() {
 }
 
 #[test]
+fn a_waiter_whose_peer_stored_another_width_claims_the_build() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let fixture = shared_width_fixture();
+    let held = fixture.store.try_lock(CACHE_KEY).unwrap().unwrap();
+    let config = fixture.config.clone();
+    let other_width = rustc_diagnostics::EntryKey::for_width(CACHE_KEY, 200).key;
+    let meta = fixture.meta.clone();
+    let peer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let store = Store::open(&config).unwrap();
+        let entry_dir = store.entry_dir(&other_width);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&other_width);
+        drop(held);
+    });
+    // Nothing this width can use: it compiles, and must hold the lock to
+    // store its own entry instead of compiling uncached.
+    let (lock, hit) = wait_then_claim_rustc(&fixture.store, &fixture.args, CACHE_KEY);
+    assert!(hit.is_none());
+    assert!(lock.is_some(), "the waiter must claim the build");
+    peer.join().unwrap();
+}
+
+#[test]
 fn shared_width_safe_legacy_entry_still_restores() {
     let _lock = crate::test_support::process_state_test_lock();
     let mut fixture = shared_width_fixture();

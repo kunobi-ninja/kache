@@ -1299,6 +1299,27 @@ fn wait_for_rustc_peer(
     })
 }
 
+/// After a peer held the build lock: its entry when this invocation can use
+/// it, else the lock, so this compile is stored. A peer at another terminal
+/// width that printed warnings stores only its own width's entry.
+fn wait_then_claim_rustc(
+    store: &Store,
+    args: &RustcArgs,
+    cache_key: &str,
+) -> (
+    Option<crate::store::KeyLock>,
+    Option<(rustc_diagnostics::EntryKey, EntryMeta)>,
+) {
+    if let Some(hit) = wait_for_rustc_peer(store, args, cache_key) {
+        return (None, Some(hit));
+    }
+    match claim_rustc_build(store, args, cache_key) {
+        Ok(RustcClaim::Acquired(lock)) => (Some(lock), None),
+        Ok(RustcClaim::Committed(key, meta)) => (None, Some((key, *meta))),
+        Ok(RustcClaim::Contended) | Err(_) => (None, None),
+    }
+}
+
 /// Where a wrapper invocation's clock starts.
 ///
 /// When `main` pinned the process start, `elapsed_ms` is anchored there so the
@@ -4830,7 +4851,7 @@ fn run_parsed_rustc(
             Ok(RustcClaim::Contended) => {
                 // Another process is building this key — wait for it
                 tracing::debug!("waiting for {} to be built by another process", crate_name);
-                (None, wait_for_rustc_peer(&store, args, &cache_key))
+                wait_then_claim_rustc(&store, args, &cache_key)
             }
         }
     };

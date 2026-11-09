@@ -26,7 +26,7 @@ impl EntryKey {
         }
     }
 
-    fn for_width(shared: &str, columns: u16) -> Self {
+    pub(super) fn for_width(shared: &str, columns: u16) -> Self {
         Self {
             key: width_key(shared, columns),
             width: Some(columns),

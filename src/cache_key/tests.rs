@@ -3336,7 +3336,14 @@ fn unremapped_identity_folds_the_snapshot_cwd() {
     let fold = |cwd: Option<&str>| {
         let mut hasher = blake3::Hasher::new();
         let env = KeyEnv::from_parts([] as [(&str, &str); 0], cwd.map(PathBuf::from));
-        fold_unremapped_path_identity(&mut hasher, &args, &PathNormalizer::empty(), &env);
+        fold_unremapped_path_identity(
+            &mut hasher,
+            &args,
+            &PathNormalizer::empty(),
+            &env,
+            &[],
+            false,
+        );
         hasher.finalize()
     };
     assert_ne!(fold(Some("/work/a")), fold(Some("/work/b")));
@@ -3344,9 +3351,14 @@ fn unremapped_identity_folds_the_snapshot_cwd() {
     assert_eq!(fold(Some("/work/a")), fold(Some("/work/a")));
 }
 
-fn hash_unremapped(args: &RustcArgs, normalizer: &PathNormalizer, env: &KeyEnv) -> blake3::Hash {
+fn hash_unremapped(
+    args: &RustcArgs,
+    normalizer: &PathNormalizer,
+    env: &KeyEnv,
+    sources: &[PathBuf],
+) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
-    fold_unremapped_path_identity(&mut hasher, args, normalizer, env);
+    fold_unremapped_path_identity(&mut hasher, args, normalizer, env, sources, false);
     hasher.finalize()
 }
 
@@ -3383,8 +3395,14 @@ fn trybuild_folds_only_prefixes_the_artifact_reaches() {
     .unwrap();
     assert!(trybuild.is_trybuild_unit());
     let env = KeyEnv::from_parts([] as [(&str, &str); 0], Some(registry.clone()));
+    let sources = [source.clone()];
     let shared = |target: &std::path::Path| {
-        hash_unremapped(&trybuild, &normalizer_for(target, &registry), &env)
+        hash_unremapped(
+            &trybuild,
+            &normalizer_for(target, &registry),
+            &env,
+            &sources,
+        )
     };
     assert_eq!(
         shared(&target_a),
@@ -3396,7 +3414,13 @@ fn trybuild_folds_only_prefixes_the_artifact_reaches() {
     let out_b = target_b.join("debug/build/dep/out");
     let with_out = |out: &std::path::Path, target: &std::path::Path| {
         let env = KeyEnv::from_parts([("OUT_DIR", out.to_str().unwrap())], Some(registry.clone()));
-        hash_unremapped(&trybuild, &normalizer_for(target, &registry), &env)
+        let included = [source.clone(), out.join("generated.rs")];
+        hash_unremapped(
+            &trybuild,
+            &normalizer_for(target, &registry),
+            &env,
+            &included,
+        )
     };
     assert_ne!(
         with_out(&out_a, &target_a),
@@ -3414,7 +3438,12 @@ fn trybuild_folds_only_prefixes_the_artifact_reaches() {
     assert!(coverage.skip_path_remap());
     assert!(!coverage.is_trybuild_unit());
     let covered = |target: &std::path::Path| {
-        hash_unremapped(&coverage, &normalizer_for(target, &registry), &env)
+        hash_unremapped(
+            &coverage,
+            &normalizer_for(target, &registry),
+            &env,
+            &sources,
+        )
     };
     assert_ne!(
         covered(&target_a),
@@ -3438,6 +3467,8 @@ fn trybuild_artifact_paths_join_a_relative_source_and_ignore_an_empty_out_dir() 
             [] as [(&str, &str); 0],
             Some(std::path::PathBuf::from("/registry/dep")),
         ),
+        &[],
+        false,
     );
     assert!(
         joined
@@ -3466,12 +3497,94 @@ fn trybuild_artifact_paths_join_a_relative_source_and_ignore_an_empty_out_dir() 
             [("OUT_DIR", "")],
             Some(std::path::PathBuf::from("/somewhere/else")),
         ),
+        &[],
+        true,
     );
     assert!(
         kept.iter()
             .any(|path| path == std::path::Path::new("/registry/dep/src/lib.rs"))
     );
     assert_eq!(kept.len(), 2, "an empty OUT_DIR is not a path");
+}
+
+/// Cargo sets `OUT_DIR` for every crate with a build script, but a trybuild
+/// rmeta records it only when the compile reads from it: a generated source
+/// in dep-info, or an env dep that keeps an `OUT_DIR` path.
+#[test]
+fn trybuild_keys_out_dir_only_when_the_compile_reads_it() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = dir.path().join("registry/src/dep-hash");
+    std::fs::create_dir_all(registry.join("src")).unwrap();
+    let registry = registry.canonicalize().unwrap();
+    let source = registry.join("src/lib.rs");
+    std::fs::write(&source, "pub fn f() {}").unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-name".into(),
+        "dep".into(),
+        "--cfg".into(),
+        "trybuild".into(),
+        source.display().to_string(),
+    ])
+    .unwrap();
+    assert!(args.is_trybuild_unit());
+
+    let target = |checkout: &str| {
+        let target = dir.path().join(checkout).join("target");
+        let out_dir = target.join("debug/build/dep-hash/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("gen.rs"), "pub fn g() {}").unwrap();
+        (
+            target.canonicalize().unwrap(),
+            out_dir.canonicalize().unwrap(),
+        )
+    };
+    let (target_a, out_a) = target("wt-a");
+    let (target_b, out_b) = target("wt-b");
+    let key = |target: &Path, out_dir: &Path, generated: bool, env_deps: &[&str]| {
+        let mut source_files = vec![source.clone()];
+        if generated {
+            source_files.push(out_dir.join("gen.rs"));
+        }
+        provide_dep_info(
+            DepInfo {
+                source_files,
+                env_deps: env_deps
+                    .iter()
+                    .map(|var| (var.to_string(), Some(out_dir.to_str().unwrap().to_string())))
+                    .collect(),
+            },
+            None,
+        );
+        let env = KeyEnv::from_parts([("OUT_DIR", out_dir)], Some(registry.clone()));
+        let (key, outputs) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new(),
+            &normalizer_for(target, &registry),
+            &env,
+        );
+        (key.unwrap(), outputs.fields.unwrap()["remap"].clone())
+    };
+
+    let (key_a, remap_a) = key(&target_a, &out_a, false, &[]);
+    let (key_b, remap_b) = key(&target_b, &out_b, false, &[]);
+    assert_eq!(
+        remap_a, remap_b,
+        "an OUT_DIR the compile never reads stays out of the remap group"
+    );
+    assert_eq!(key_a, key_b, "two target dirs share the unit");
+
+    assert_ne!(
+        key(&target_a, &out_a, true, &[]).1,
+        key(&target_b, &out_b, true, &[]).1,
+        "an included file under OUT_DIR is recorded in the rmeta"
+    );
+    assert_ne!(
+        key(&target_a, &out_a, false, &["OUT_DIR"]).1,
+        key(&target_b, &out_b, false, &["OUT_DIR"]).1,
+        "an OUT_DIR env dep kept as a value is recorded in the rmeta"
+    );
 }
 
 #[test]

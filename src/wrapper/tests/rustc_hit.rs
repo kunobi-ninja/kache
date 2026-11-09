@@ -379,6 +379,20 @@ fn width_waiter_waits_past_a_rendered_shared_entry_for_its_own() {
 }
 
 #[test]
+fn a_claim_evicts_an_entry_without_files_and_builds() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = Fixture::new();
+    fixture.meta.files.clear();
+    fixture.publish();
+    let RustcClaim::Acquired(_lock) =
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+    else {
+        panic!("an entry without files cannot be restored");
+    };
+    assert!(fixture.store.get(CACHE_KEY).unwrap().is_none());
+}
+
+#[test]
 fn a_waiter_whose_peer_stored_another_width_claims_the_build() {
     let _lock = crate::test_support::process_state_test_lock();
     let fixture = shared_width_fixture();

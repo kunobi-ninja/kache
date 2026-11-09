@@ -162,7 +162,8 @@ fn head_state(git_dir: &Path, common_dir: &Path, read: &mut Vec<PathBuf>) -> Res
 fn packed_commit<'a>(packed: &'a str, name: &str) -> Option<&'a str> {
     packed
         .lines()
-        .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+        // Peeled `^<commit>` lines have no space, so they never match.
+        .filter(|line| !line.starts_with('#'))
         .find_map(|line| {
             let (commit, entry) = line.split_once(' ')?;
             (entry.trim() == name).then_some(commit)
@@ -244,6 +245,42 @@ mod tests {
         write(&main.join(".git/HEAD"), "5555\n");
         let input = resolve(&main.join(".git/HEAD")).unwrap().unwrap();
         assert_eq!(input.head, "5555\n5555");
+    }
+
+    #[test]
+    fn missing_git_files_read_as_absent_and_unreadable_ones_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, wt) = repository(dir.path());
+        let common = main.join(".git");
+
+        // No packed-refs at all: a branch with no commit is unborn.
+        std::fs::remove_file(common.join("packed-refs")).unwrap();
+        write(&common.join("HEAD"), "ref: refs/heads/none\n");
+        let input = resolve(&main.join(".git/HEAD")).unwrap().unwrap();
+        assert_eq!(input.head, "ref: refs/heads/none\nunborn");
+
+        // Present but unreadable: refuse rather than key a guess.
+        std::fs::create_dir(common.join("packed-refs")).unwrap();
+        assert!(resolve(&main.join(".git/HEAD")).is_err());
+        let own = common.join("worktrees/wt");
+        std::fs::remove_file(own.join("commondir")).unwrap();
+        std::fs::create_dir(own.join("commondir")).unwrap();
+        assert!(resolve(&wt.join(".git/HEAD")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_path_under_a_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("file"), "");
+        assert!(resolve(&dir.path().join("file/.git/HEAD")).is_err());
+    }
+
+    #[test]
+    fn packed_refs_comments_never_name_a_commit() {
+        let packed = "# refs/heads/main\n2222 refs/heads/main\n^3333\n";
+        assert_eq!(packed_commit(packed, "refs/heads/main"), Some("2222"));
+        assert_eq!(packed_commit(packed, "refs/heads/other"), None);
     }
 
     #[test]

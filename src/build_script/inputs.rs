@@ -159,13 +159,18 @@ pub(super) fn declared_input_state(
     let state = run_input_state(&git.path, excluded, file_hasher, budget, 0, false)?;
     // What the script sees at the declared path itself: `.git` turning from
     // a directory into a file changes what reading `.git/HEAD` returns.
-    let declared = match std::fs::symlink_metadata(path) {
+    let declared = path_kind(path);
+    Ok(format!("{state}\ngit:{}\ndeclared:{declared}", git.head))
+}
+
+/// What `path` itself is, without following a final symlink.
+fn path_kind(path: &Path) -> &'static str {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => "dir",
         Ok(metadata) if metadata.is_file() => "file",
         Ok(_) => "other",
         Err(_) => "unreadable",
-    };
-    Ok(format!("{state}\ngit:{}\ndeclared:{declared}", git.head))
+    }
 }
 
 /// The files whose writes during a run would change a declared input's
@@ -1333,5 +1338,21 @@ mod tests {
         // The tree, `a`, `a/f.txt`, `b`, and `a` with `f.txt` again through
         // `b`: a walk is inside `a` only while it walks `a`.
         assert_eq!(100 - budget, 6);
+    }
+
+    #[test]
+    fn path_kind_tells_directories_files_and_the_rest_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(path_kind(dir.path()), "dir");
+        assert_eq!(path_kind(&file), "file");
+        assert_eq!(path_kind(&dir.path().join("missing")), "unreadable");
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            assert_eq!(path_kind(&link), "other");
+        }
     }
 }

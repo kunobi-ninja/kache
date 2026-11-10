@@ -638,19 +638,28 @@ pub(crate) fn manages_instance_until(
         // Keep the existing platform defaults. A caller-selected XDG file is
         // ambiguous without a manager-specific environment probe.
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        if std::env::var_os("XDG_CONFIG_HOME")
-            .is_some_and(|path| PathBuf::from(path) != home.join(".config"))
-        {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let host = std::env::var_os("KACHE_HOST_CONFIG");
+        if unknown_non_linux_environment(&home, xdg.as_deref(), host.as_deref()) {
             return Ok(false);
         }
         configured_instance_matches(
             &config.socket_path(),
             crate::config::default_cache_dir(),
-            crate::config::host_config_path()
-                .into_iter()
+            std::iter::once(PathBuf::from(crate::config::HOST_CONFIG_PATH))
                 .chain(std::iter::once(crate::config::config_file_path())),
         )
     }
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn unknown_non_linux_environment(
+    home: &Path,
+    xdg: Option<&std::ffi::OsStr>,
+    host: Option<&std::ffi::OsStr>,
+) -> bool {
+    xdg.is_some_and(|path| Path::new(path) != home.join(".config"))
+        || host.is_some_and(|path| !path.is_empty())
 }
 
 /// Where a daemon started for this instance writes the error that stops it
@@ -1357,6 +1366,29 @@ pub fn log() -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn private_host_and_xdg_overrides_do_not_prove_non_linux_ownership() {
+        use std::ffi::OsStr;
+        let home = Path::new("/home/alice");
+        let normal = home.join(".config");
+        assert!(!unknown_non_linux_environment(home, None, None));
+        assert!(!unknown_non_linux_environment(
+            home,
+            Some(normal.as_os_str()),
+            Some(OsStr::new(""))
+        ));
+        assert!(unknown_non_linux_environment(
+            home,
+            Some(OsStr::new("/private/config")),
+            None
+        ));
+        assert!(unknown_non_linux_environment(
+            home,
+            None,
+            Some(OsStr::new("/private/host.toml"))
+        ));
+    }
 
     fn write_service_file(path: &Path, exe: &Path) {
         if cfg!(target_os = "macos") {

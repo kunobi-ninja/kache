@@ -31,7 +31,8 @@ pub(super) fn socket(unit: &Path, deadline: Instant) -> Option<PathBuf> {
 }
 
 // Anonymous files avoid pipe backpressure and never persist an environment dump.
-// Output is bounded and is neither logged nor included in an error message.
+// Readback is bounded. Oversized producers are stopped at the next wait poll;
+// neither their output nor their environment is logged or returned as an error.
 fn query(arguments: &[&str], deadline: Instant) -> Option<String> {
     if Instant::now() >= deadline {
         return None;
@@ -45,7 +46,16 @@ fn query(arguments: &[&str], deadline: Instant) -> Option<String> {
         .spawn()
         .ok()?;
     let mut child = kunobi_daemon::Candidate::new(child);
-    let status = kunobi_daemon::readiness::wait_until(deadline, |_| child.try_wait()).ok()??;
+    let status = kunobi_daemon::readiness::wait_until(deadline, |_| {
+        if output.metadata()?.len() > 65_536 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "service query output exceeds limit",
+            ));
+        }
+        child.try_wait()
+    })
+    .ok()??;
     if !status.success() {
         return None;
     }

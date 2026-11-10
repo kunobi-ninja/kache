@@ -3615,6 +3615,24 @@ fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
     let cwd = root.join("registry/pkg");
     let out = root.join("work/target/build/dep/out");
     let relative_out = PathBuf::from("../../work/target/build/dep/out");
+    // PathBuf::join removes parents after a Windows verbatim prefix.
+    let join_spelled = |base: &Path, suffix: &Path| {
+        let mut spelling = base.as_os_str().to_os_string();
+        for component in suffix.components() {
+            spelling.push(std::path::MAIN_SEPARATOR_STR);
+            spelling.push(component.as_os_str());
+        }
+        PathBuf::from(spelling)
+    };
+    let spelled_out = join_spelled(&cwd, &relative_out);
+    let spelled_source = join_spelled(&out, Path::new("../outside/gen.rs"));
+    assert!(spelled_source.starts_with(&out));
+    for path in [&spelled_out, &spelled_source] {
+        assert!(
+            path.components()
+                .any(|component| component == std::path::Component::ParentDir)
+        );
+    }
     let args = RustcArgs::parse(&[
         "rustc".into(),
         "--cfg".into(),
@@ -3640,7 +3658,7 @@ fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
         (
             "absolute OUT_DIR with parent components",
             Some(cwd.as_path()),
-            cwd.join(&relative_out),
+            spelled_out,
             out.join("gen.rs"),
             true,
         ),
@@ -3662,7 +3680,7 @@ fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
             "an emitted spelling still names OUT_DIR before a parent component",
             Some(cwd.as_path()),
             out.clone(),
-            out.join("../outside/gen.rs"),
+            spelled_source,
             true,
         ),
         (
@@ -3690,11 +3708,11 @@ fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
         if let Some(cwd) = cwd {
             std::fs::create_dir_all(cwd).unwrap();
         }
-        let resolved_out = joined_under(cwd, &out_dir);
+        let resolved_out = collapse_lexical(&joined_under(cwd, &out_dir));
         if resolved_out.is_absolute() {
             std::fs::create_dir_all(&resolved_out).unwrap();
         }
-        let resolved_source = joined_under(cwd, &source);
+        let resolved_source = collapse_lexical(&joined_under(cwd, &source));
         if resolved_source.is_absolute() {
             std::fs::create_dir_all(resolved_source.parent().unwrap()).unwrap();
             std::fs::write(&resolved_source, "pub fn generated() {}\n").unwrap();
@@ -3709,6 +3727,38 @@ fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
             kept,
             "{label}"
         );
+    }
+}
+
+#[test]
+fn trybuild_unknown_cwd_retains_existing_relative_path_guards() {
+    let _lock = key_test_lock();
+    let cwd = std::env::current_dir().unwrap();
+    let dir = tempfile::tempdir_in(&cwd).unwrap();
+    let relative_root = dir.path().strip_prefix(&cwd).unwrap();
+    let out = dir.path().join("out");
+    let source = dir.path().join("outside.rs");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--cfg=trybuild".into(),
+        source.display().to_string(),
+    ])
+    .unwrap();
+    for (label, out_dir, source) in [
+        ("relative OUT_DIR", relative_root.join("out"), source),
+        ("relative source", out, relative_root.join("outside.rs")),
+    ] {
+        let canonical_out = std::fs::canonicalize(&out_dir).unwrap();
+        let canonical_source = std::fs::canonicalize(&source).unwrap();
+        assert!(
+            !canonical_source.starts_with(&canonical_out),
+            "{label}: filesystem containment must not mask the unknown anchor"
+        );
+        let env = KeyEnv::from_parts([("OUT_DIR", out_dir.as_os_str())], None);
+        let reached = trybuild_paths_in_the_artifact(&args, &env, &[source], false);
+        assert!(reached.contains(&out_dir), "{label}");
     }
 }
 

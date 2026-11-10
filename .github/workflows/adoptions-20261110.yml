@@ -65,7 +65,8 @@ jobs:
 
   nix-staging:
     name: Nix staging PR1866
-    needs: check
+    # PR1866 already passed just check in run42796448370/job129762745657.
+    # Its independent Nix build must not wait for PR1862 fixture validation.
     if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
     runs-on: ubuntu-latest
     timeout-minutes: 75

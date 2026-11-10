@@ -3374,6 +3374,7 @@ fn normalizer_for(target: &std::path::Path, base: &std::path::Path) -> PathNorma
 /// a target nothing in the compile reaches.
 #[test]
 fn trybuild_folds_only_prefixes_the_artifact_reaches() {
+    let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let registry = dir.path().join("registry/src/dep-hash");
     std::fs::create_dir_all(registry.join("src")).unwrap();
@@ -3386,13 +3387,14 @@ fn trybuild_folds_only_prefixes_the_artifact_reaches() {
     let target_b = target_b.canonicalize().unwrap();
     let source = registry.join("src/lib.rs");
 
-    let trybuild = RustcArgs::parse(&[
+    let mut trybuild = RustcArgs::parse(&[
         "rustc".into(),
         "--cfg".into(),
         "trybuild".into(),
         source.display().to_string(),
     ])
     .unwrap();
+    trybuild.path_normalize_disabled = false;
     assert!(trybuild.is_trybuild_unit());
     let env = KeyEnv::from_parts([] as [(&str, &str); 0], Some(registry.clone()));
     let sources = [source.clone()];
@@ -3428,13 +3430,14 @@ fn trybuild_folds_only_prefixes_the_artifact_reaches() {
         "OUT_DIR is inside the rmeta, so its prefix stays"
     );
 
-    let coverage = RustcArgs::parse(&[
+    let mut coverage = RustcArgs::parse(&[
         "rustc".into(),
         "-C".into(),
         "instrument-coverage".into(),
         source.display().to_string(),
     ])
     .unwrap();
+    coverage.path_normalize_disabled = false;
     assert!(coverage.skip_path_remap());
     assert!(!coverage.is_trybuild_unit());
     let covered = |target: &std::path::Path| {
@@ -3449,6 +3452,22 @@ fn trybuild_folds_only_prefixes_the_artifact_reaches() {
         covered(&target_a),
         covered(&target_b),
         "coverage still folds a target prefix the compile does not reach"
+    );
+
+    let hash_for = |args: &RustcArgs, target: &Path| {
+        hash_unremapped(args, &normalizer_for(target, &registry), &env, &sources)
+    };
+    coverage.cfgs.push("trybuild".into());
+    assert_ne!(
+        hash_for(&coverage, &target_a),
+        hash_for(&coverage, &target_b),
+        "trybuild does not relax coverage's path-local key"
+    );
+    trybuild.path_normalize_disabled = true;
+    assert_ne!(
+        hash_for(&trybuild, &target_a),
+        hash_for(&trybuild, &target_b),
+        "trybuild does not relax an explicit path-normalization opt-out"
     );
 }
 
@@ -3519,7 +3538,7 @@ fn trybuild_keys_out_dir_only_when_the_compile_reads_it() {
     let registry = registry.canonicalize().unwrap();
     let source = registry.join("src/lib.rs");
     std::fs::write(&source, "pub fn f() {}").unwrap();
-    let args = RustcArgs::parse(&[
+    let mut args = RustcArgs::parse(&[
         "rustc".into(),
         "--crate-name".into(),
         "dep".into(),
@@ -3528,6 +3547,7 @@ fn trybuild_keys_out_dir_only_when_the_compile_reads_it() {
         source.display().to_string(),
     ])
     .unwrap();
+    args.path_normalize_disabled = false;
     assert!(args.is_trybuild_unit());
 
     let target = |checkout: &str| {
@@ -3585,6 +3605,122 @@ fn trybuild_keys_out_dir_only_when_the_compile_reads_it() {
         key(&target_b, &out_b, false, &["OUT_DIR"]).1,
         "an OUT_DIR env dep kept as a value is recorded in the rmeta"
     );
+}
+
+#[test]
+fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cwd = root.join("registry/pkg");
+    let out = root.join("work/target/build/dep/out");
+    let relative_out = PathBuf::from("../../work/target/build/dep/out");
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--cfg".into(),
+        "trybuild".into(),
+        "src/lib.rs".into(),
+    ])
+    .unwrap();
+    for (label, cwd, out_dir, source, kept) in [
+        (
+            "relative source with parent components",
+            Some(cwd.as_path()),
+            out.clone(),
+            relative_out.join("gen.rs"),
+            true,
+        ),
+        (
+            "relative OUT_DIR with parent components",
+            Some(cwd.as_path()),
+            relative_out.clone(),
+            out.join("gen.rs"),
+            true,
+        ),
+        (
+            "absolute OUT_DIR with parent components",
+            Some(cwd.as_path()),
+            cwd.join(&relative_out),
+            out.join("gen.rs"),
+            true,
+        ),
+        (
+            "relative source below the invocation cwd",
+            Some(cwd.as_path()),
+            cwd.join("generated"),
+            PathBuf::from("generated/gen.rs"),
+            true,
+        ),
+        (
+            "sibling directory is not OUT_DIR",
+            Some(cwd.as_path()),
+            out.clone(),
+            relative_out.with_file_name("out-other").join("gen.rs"),
+            false,
+        ),
+        (
+            "an emitted spelling still names OUT_DIR before a parent component",
+            Some(cwd.as_path()),
+            out.clone(),
+            out.join("../outside/gen.rs"),
+            true,
+        ),
+        (
+            "unknown cwd cannot disprove a relative source belongs to OUT_DIR",
+            None,
+            out.clone(),
+            PathBuf::from("generated/gen.rs"),
+            true,
+        ),
+        (
+            "unknown cwd does not affect absolute unrelated sources",
+            None,
+            out.clone(),
+            root.join("other/gen.rs"),
+            false,
+        ),
+        (
+            "unknown cwd cannot anchor a relative OUT_DIR",
+            None,
+            PathBuf::from("generated"),
+            root.join("other/gen.rs"),
+            true,
+        ),
+    ] {
+        let env = KeyEnv::from_parts(
+            [("OUT_DIR", out_dir.as_os_str())],
+            cwd.map(Path::to_path_buf),
+        );
+        let reached = trybuild_paths_in_the_artifact(&args, &env, &[source], false);
+        assert_eq!(reached.contains(&joined_under(cwd, &out_dir)), kept, "{label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trybuild_out_dir_ownership_preserves_native_path_components() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cwd = root.join("registry/pkg");
+    let args = RustcArgs::parse(&["rustc".into(), "src/lib.rs".into()]).unwrap();
+    let non_utf8 = std::ffi::OsString::from_vec(b"out-\xff".to_vec());
+    for (out, relative) in [
+        (
+            root.join("work/out"),
+            PathBuf::from(r"../../work/out/..\literal/gen.rs"),
+        ),
+        (
+            root.join("work").join(&non_utf8),
+            PathBuf::from("../../work").join(non_utf8).join("gen.rs"),
+        ),
+    ] {
+        let env = KeyEnv::from_parts([("OUT_DIR", out.as_os_str())], Some(cwd.clone()));
+        let reached = trybuild_paths_in_the_artifact(&args, &env, &[relative], false);
+        assert!(reached.contains(&out), "native path {}", out.display());
+    }
 }
 
 #[test]

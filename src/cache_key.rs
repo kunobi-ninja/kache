@@ -4300,7 +4300,10 @@ fn fold_unremapped_path_identity<H: KeyFold>(
     }
     // Sort so the fold is order-stable regardless of rule-construction order.
     let mut prefixes: Vec<&str> = path_normalizer.raw_prefixes().collect();
-    if args.is_trybuild_unit() {
+    if args.is_trybuild_unit()
+        && !args.has_coverage_instrumentation()
+        && !args.path_normalize_disabled
+    {
         let reached = trybuild_paths_in_the_artifact(args, env, sources, bakes_out_dir);
         prefixes.retain(|prefix| reached.iter().any(|path| path_is_under(path, prefix)));
     }
@@ -4332,7 +4335,20 @@ fn trybuild_paths_in_the_artifact(
     }
     if let Some(out_dir) = env.var_os("OUT_DIR").filter(|value| !value.is_empty()) {
         let out_dir = joined_under(env.cwd(), Path::new(&out_dir));
-        if bakes_out_dir || sources.iter().any(|source| path_is_under(source, &out_dir)) {
+        let owner = collapse_lexical(&out_dir);
+        if bakes_out_dir
+            || sources.iter().any(|source| {
+                // Dep-info preserves relative paths and parent components.
+                // Resolve only containment; keep the original OUT_DIR below.
+                let source = joined_under(env.cwd(), source);
+                // A raw spelling can be embedded even if `..` resolves outside.
+                // Without absolute anchors, retain the previous guard too.
+                path_is_under(&source, &out_dir)
+                    || !source.is_absolute()
+                    || !out_dir.is_absolute()
+                    || path_is_under(&collapse_lexical(&source), &owner)
+            })
+        {
             paths.push(out_dir);
         }
     }

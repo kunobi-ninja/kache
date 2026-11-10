@@ -283,11 +283,12 @@ mod apple_install_name;
 // directory instead of the target directory.
 //
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
-// working directory, the crate source, or `OUT_DIR` sits under it. Those are
-// the paths rustc writes into the rmeta; `--out-dir` reaches dep-info, which
-// restore already rewrites. Coverage and `KACHE_RUSTC_PATH_NORMALIZE=0` still
-// fold every prefix. Only the trybuild `remap:none` bytes change, so a
-// previous trybuild entry misses and every other key stays valid.
+// working directory, the crate source, or an `OUT_DIR` the compile reads from
+// sits under it. Those are the paths rustc writes into the rmeta; `--out-dir`
+// reaches dep-info, which restore already rewrites. Coverage and
+// `KACHE_RUSTC_PATH_NORMALIZE=0` still fold every prefix. Only the trybuild
+// `remap:none` bytes change, so a previous trybuild entry misses and every
+// other key stays valid.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -4176,7 +4177,17 @@ fn compute_key_into(
         // coverage). Fold the raw local prefixes that would have been remapped so
         // the key is path-local, matching the cc `KACHE_CC_PATH_NORMALIZE=0`
         // "keys become path-literal" contract.
-        fold_unremapped_path_identity(&mut hasher, args, path_normalizer, env);
+        let sources = dep_info
+            .as_ref()
+            .map_or(&[][..], |dep_info| &dep_info.source_files[..]);
+        fold_unremapped_path_identity(
+            &mut hasher,
+            args,
+            path_normalizer,
+            env,
+            sources,
+            out.bakes_out_dir,
+        );
         "none".to_string()
     } else {
         hasher.update(b"remap:multi-prefix\n");
@@ -4256,16 +4267,20 @@ fn complete_key(env: &KeyEnv, key: String) -> Result<String> {
 /// the package directory and the source file, not `--out-dir`. Folding the
 /// per-worktree target prefix anyway made those dependencies miss in every
 /// checkout. A trybuild unit therefore folds a prefix only when the working
-/// directory, the source, or `OUT_DIR` is under it. A build script that
-/// `include!`s `OUT_DIR` writes that absolute path into the rmeta, so the
-/// prefix that holds `OUT_DIR` stays. Coverage and the normalize opt-out keep
-/// folding every prefix: their artifacts carry the paths the profraw and the
-/// debugger look up.
+/// directory, the source, or an `OUT_DIR` the compile reads is under it.
+/// Cargo sets `OUT_DIR` for every crate with a build script, but the rmeta
+/// records that path only when the crate reads from it: a dep-info `sources`
+/// file under it (an `include!`d generated file), or an env dep that keeps an
+/// `OUT_DIR` path as its value (`bakes_out_dir`). Coverage and the normalize
+/// opt-out keep folding every prefix: their artifacts carry the paths the
+/// profraw and the debugger look up.
 fn fold_unremapped_path_identity<H: KeyFold>(
     hasher: &mut H,
     args: &RustcArgs,
     path_normalizer: &PathNormalizer,
     env: &KeyEnv,
+    sources: &[PathBuf],
+    bakes_out_dir: bool,
 ) {
     hasher.update(b"unremapped_path_identity:v1\n");
 
@@ -4285,8 +4300,11 @@ fn fold_unremapped_path_identity<H: KeyFold>(
     }
     // Sort so the fold is order-stable regardless of rule-construction order.
     let mut prefixes: Vec<&str> = path_normalizer.raw_prefixes().collect();
-    if args.is_trybuild_unit() {
-        let reached = trybuild_paths_in_the_artifact(args, env);
+    if args.is_trybuild_unit()
+        && !args.has_coverage_instrumentation()
+        && !args.path_normalize_disabled
+    {
+        let reached = trybuild_paths_in_the_artifact(args, env, sources, bakes_out_dir);
         prefixes.retain(|prefix| reached.iter().any(|path| path_is_under(path, prefix)));
     }
     prefixes.sort_unstable();
@@ -4300,7 +4318,14 @@ fn fold_unremapped_path_identity<H: KeyFold>(
 ///
 /// A relative source or `OUT_DIR` is resolved against the working directory,
 /// which is where rustc records it. An empty `OUT_DIR` is not a path.
-fn trybuild_paths_in_the_artifact(args: &RustcArgs, env: &KeyEnv) -> Vec<PathBuf> {
+/// `OUT_DIR` counts only when one of the dep-info `sources` is under it or
+/// `bakes_out_dir` says an env dep keeps it.
+fn trybuild_paths_in_the_artifact(
+    args: &RustcArgs,
+    env: &KeyEnv,
+    sources: &[PathBuf],
+    bakes_out_dir: bool,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(cwd) = env.cwd() {
         paths.push(cwd.to_path_buf());
@@ -4309,7 +4334,31 @@ fn trybuild_paths_in_the_artifact(args: &RustcArgs, env: &KeyEnv) -> Vec<PathBuf
         paths.push(joined_under(env.cwd(), source));
     }
     if let Some(out_dir) = env.var_os("OUT_DIR").filter(|value| !value.is_empty()) {
-        paths.push(joined_under(env.cwd(), Path::new(&out_dir)));
+        let out_dir = joined_under(env.cwd(), Path::new(&out_dir));
+        let owner = collapse_lexical(&out_dir);
+        let canonical_owner = OnceCell::new();
+        if bakes_out_dir
+            || sources.iter().any(|source| {
+                // Dep-info preserves relative paths and parent components.
+                // Resolve only containment; keep the original OUT_DIR below.
+                let source = joined_under(env.cwd(), source);
+                // A raw spelling can be embedded even if `..` resolves outside.
+                // Without absolute anchors, retain the previous guard too.
+                path_is_under(&source, &out_dir)
+                    || !source.is_absolute()
+                    || !out_dir.is_absolute()
+                    || path_is_under(&collapse_lexical(&source), &owner)
+                    // Normalization knows canonical aliases, such as macOS's
+                    // /var and /private/var. Preserve their raw guard too.
+                    || match canonical_owner.get_or_init(|| std::fs::canonicalize(&out_dir)) {
+                        Ok(owner) => std::fs::canonicalize(&source)
+                            .map_or(true, |source| path_is_under(&source, owner)),
+                        Err(_) => true,
+                    }
+            })
+        {
+            paths.push(out_dir);
+        }
     }
     paths
 }
@@ -4324,7 +4373,7 @@ fn joined_under(cwd: Option<&Path>, path: &Path) -> PathBuf {
     }
 }
 
-fn path_is_under(path: &Path, prefix: &str) -> bool {
+fn path_is_under(path: &Path, prefix: impl AsRef<Path>) -> bool {
     path.starts_with(prefix)
 }
 
@@ -6682,7 +6731,8 @@ fn compute_static_lib_hash_for(
 /// breaking call sites. Future candidates: `target_json_hash`, timing metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepInfo {
-    /// All source files the crate depends on (sorted, absolute paths).
+    /// All source files the crate depends on, as spelled in dep-info.
+    /// Paths may be relative to the invocation's working directory.
     /// Includes the crate root, module files, `include!()` targets, etc.
     pub source_files: Vec<std::path::PathBuf>,
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).

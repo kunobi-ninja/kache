@@ -1,4 +1,12 @@
-//! Resolve only a verified, ordinary Kache user unit. No manager writes occur.
+//! Resolve only a verified Kache user unit. No manager writes occur.
+//!
+//! The instance a unit's daemon serves follows from its environment and
+//! working directory. A unit may carry other settings, in its file or in
+//! drop-ins (`UMask=`, `Nice=`, `TimeoutStopSec=`), and a drop-in may wrap
+//! `kache daemon run` (`setpriv`). Such a unit is still the login service:
+//! declining it would start a second daemon outside the manager. A wrapper is
+//! trusted to keep the manager's environment; set variables with
+//! `Environment=`, which is verified.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
@@ -8,10 +16,6 @@ use std::time::Instant;
 
 pub(super) fn socket(unit: &Path, deadline: Instant) -> Option<PathBuf> {
     let executable = super::parse_exe_from_service_file(unit)?;
-    let text = std::fs::read_to_string(unit).ok()?;
-    if !ordinary_unit(&text, &executable) {
-        return None;
-    }
     let properties = query(
         &[
             "--user",
@@ -19,13 +23,13 @@ pub(super) fn socket(unit: &Path, deadline: Instant) -> Option<PathBuf> {
             "show",
             super::UNIT_NAME,
             "--all",
-            "--property=FragmentPath,DropInPaths,NeedDaemonReload,Environment,EnvironmentFiles,UnsetEnvironment,WorkingDirectory,ExecStart",
+            "--property=FragmentPath,NeedDaemonReload,Environment,EnvironmentFiles,UnsetEnvironment,WorkingDirectory,ExecStart",
         ],
         deadline,
     )?;
     let environment = query(&["--user", "--no-pager", "show-environment"], deadline)?;
     let (variables, home) = manager_environment(&environment)?;
-    if !ordinary_loaded_unit(unit, &executable, &properties, &home) {
+    if !verified_loaded_unit(unit, &executable, &properties, &home) {
         return None;
     }
     socket_for(variables, home)
@@ -73,53 +77,17 @@ fn output_exceeds_limit(byte_count: u64) -> bool {
     byte_count > 65_536
 }
 
-fn ordinary_unit(text: &str, executable: &Path) -> bool {
-    if !executable.is_absolute() {
-        return false;
-    }
-    let command = format!("{} daemon run", executable.display());
-    let mut section = "";
-    let mut starts = 0;
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = &line[1..line.len() - 1];
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return false;
-        };
-        let known = match (section, key) {
-            ("Unit", "Description" | "After") | ("Install", "WantedBy") => true,
-            ("Service", "Type") => value == "simple",
-            ("Service", "Restart") => value == "on-failure",
-            ("Service", "RestartSec") => value == "5s",
-            ("Service", "Environment") => value == "KACHE_LOG=kache=info",
-            ("Service", "ExecStart") => {
-                starts += 1;
-                value == command
-            }
-            _ => false,
-        };
-        if !known {
-            return false;
-        }
-    }
-    starts == 1
-}
-
 // `home` is the manager's HOME: a user manager runs a unit without its own
 // WorkingDirectory= in that home and reports it as `!<home>`.
-fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str, home: &Path) -> bool {
+fn verified_loaded_unit(unit: &Path, executable: &Path, text: &str, home: &Path) -> bool {
     let Some(properties) = assignments(text) else {
         return false;
     };
-    let empty = ["DropInPaths", "EnvironmentFiles", "UnsetEnvironment"];
-    if !empty
-        .iter()
-        .all(|key| properties.get(*key).is_some_and(String::is_empty))
+    let empty = ["EnvironmentFiles", "UnsetEnvironment"];
+    if !executable.is_absolute()
+        || !empty
+            .iter()
+            .all(|key| properties.get(*key).is_some_and(String::is_empty))
         || !properties
             .get("WorkingDirectory")
             .is_some_and(|v| v.is_empty() || v.strip_prefix('!').map(Path::new) == Some(home))
@@ -139,12 +107,20 @@ fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str, home: &Path)
     let Some(start) = properties.get("ExecStart") else {
         return false;
     };
-    let prefix = format!(
-        "{{ path={} ; argv[]={} daemon run ; ",
-        executable.display(),
-        executable.display()
-    );
-    start.starts_with(&prefix) && start.ends_with(" }") && start.matches("argv[]=").count() == 1
+    // `{ path=<program> ; argv[]=<words> ; ... }`: the words end in Kache's
+    // own command, alone or after a wrapper.
+    let command = format!("{} daemon run", executable.display());
+    let Some(argv) = start
+        .strip_prefix("{ path=")
+        .and_then(|rest| rest.split_once(" ; argv[]="))
+        .and_then(|(_, rest)| rest.split_once(" ; "))
+        .map(|(argv, _)| argv)
+    else {
+        return false;
+    };
+    (argv == command || argv.ends_with(&format!(" {command}")))
+        && start.ends_with(" }")
+        && start.matches("argv[]=").count() == 1
 }
 
 fn assignments(text: &str) -> Option<BTreeMap<String, String>> {
@@ -319,27 +295,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ordinary_units_allow_blank_lines_and_both_comment_styles() {
-        let executable = Path::new("/opt/kache");
-        for ignored in ["", "# a comment", "; another comment"] {
-            let text = format!("[Service]\n{ignored}\nExecStart=/opt/kache daemon run\n");
-            assert!(ordinary_unit(&text, executable), "{ignored:?}");
-        }
-    }
-
-    #[test]
-    fn both_unit_section_delimiters_must_match() {
-        let executable = Path::new("/opt/kache");
-        for malformed in ["[Service}", "{Service]"] {
-            let text = format!("{malformed}\nExecStart=/opt/kache daemon run\n");
-            assert!(!ordinary_unit(&text, executable), "{malformed:?}");
-        }
-    }
-
     fn properties(unit: &Path, exe: &Path) -> String {
         format!(
-            "FragmentPath={}\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=KACHE_LOG=kache=info\nEnvironmentFiles=\nUnsetEnvironment=\nWorkingDirectory=\nExecStart={{ path={} ; argv[]={} daemon run ; ignore_errors=no ; }}\n",
+            "FragmentPath={}\nNeedDaemonReload=no\nEnvironment=KACHE_LOG=kache=info\nEnvironmentFiles=\nUnsetEnvironment=\nWorkingDirectory=\nExecStart={{ path={} ; argv[]={} daemon run ; ignore_errors=no ; }}\n",
             unit.display(),
             exe.display(),
             exe.display()
@@ -351,27 +309,31 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let unit = root.path().join("kache.service");
         let exe = Path::new("/opt/kache");
-        let text = format!("[Service]\nExecStart={} daemon run\n", exe.display());
-        std::fs::write(&unit, &text).unwrap();
-        assert!(ordinary_unit(&text, exe));
-        assert!(!ordinary_unit(&text, Path::new("relative")));
-        assert!(!ordinary_unit(
-            &text.replace(" daemon run", " other run"),
-            exe
-        ));
-        assert!(!ordinary_unit(
-            &(text.clone() + "Environment=KACHE_CONFIG=/other\n"),
-            exe
-        ));
+        std::fs::write(&unit, "[Service]\nExecStart=/opt/kache daemon run\n").unwrap();
         let home = Path::new("/home/someone");
         let valid = properties(&unit, exe);
-        assert!(ordinary_loaded_unit(&unit, exe, &valid, home));
-        // A user manager reports its default working directory, the home.
-        let default_directory =
-            valid.replace("WorkingDirectory=\n", "WorkingDirectory=!/home/someone\n");
-        assert!(ordinary_loaded_unit(&unit, exe, &default_directory, home));
+        assert!(verified_loaded_unit(&unit, exe, &valid, home));
+        assert!(!verified_loaded_unit(
+            &unit,
+            Path::new("relative"),
+            &valid,
+            home
+        ));
         for (old, new) in [
-            ("DropInPaths=\n", "DropInPaths=/custom.conf\n"),
+            // A user manager reports its default working directory, the home.
+            ("WorkingDirectory=\n", "WorkingDirectory=!/home/someone\n"),
+            // Drop-ins and a wrapper keep the manager's environment.
+            (
+                "{ path=/opt/kache ; argv[]=/opt/kache",
+                "{ path=/usr/bin/setpriv ; argv[]=/usr/bin/setpriv --inh-caps=-all /opt/kache",
+            ),
+        ] {
+            assert!(
+                verified_loaded_unit(&unit, exe, &valid.replace(old, new), home),
+                "{new}"
+            );
+        }
+        for (old, new) in [
             ("NeedDaemonReload=no", "NeedDaemonReload=yes"),
             (
                 "Environment=KACHE_LOG=kache=info",
@@ -382,19 +344,27 @@ mod tests {
             ("WorkingDirectory=\n", "WorkingDirectory=/other\n"),
             ("WorkingDirectory=\n", "WorkingDirectory=!/home/other\n"),
             ("argv[]=/opt/kache daemon run", "argv[]=/bin/sh -c command"),
+            (
+                "argv[]=/opt/kache daemon run",
+                "argv[]=/opt/kache other run",
+            ),
+            (
+                "argv[]=/opt/kache daemon run",
+                "argv[]=/other/opt/kache daemon run",
+            ),
         ] {
             assert!(
-                !ordinary_loaded_unit(&unit, exe, &valid.replace(old, new), home),
+                !verified_loaded_unit(&unit, exe, &valid.replace(old, new), home),
                 "{new}"
             );
         }
-        assert!(!ordinary_loaded_unit(
+        assert!(!verified_loaded_unit(
             &root.path().join("other"),
             exe,
             &valid,
             home
         ));
-        assert!(!ordinary_loaded_unit(&unit, exe, "", home));
+        assert!(!verified_loaded_unit(&unit, exe, "", home));
         assert!(assignments("X=a\nX=b\n").is_none());
     }
 }

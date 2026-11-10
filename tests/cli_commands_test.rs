@@ -3234,10 +3234,12 @@ fn systemd_probe_script() -> &'static str {
       exit 0 ;;
     show)
       unit="$HOME/.config/systemd/user/kache.service"
-      exe=$(sed -n 's/^ExecStart=//p' "$unit" | sed 's/ daemon run$//')
-      printf 'FragmentPath=%s\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\n' "$unit"
+      start=$(cat "$unit" "$unit.d"/*.conf 2>/dev/null | sed -n 's/^ExecStart=//p' | tail -n 1)
+      drop_ins=$(ls "$unit.d"/*.conf 2>/dev/null | tr '\n' ' ')
+      printf 'FragmentPath=%s\nDropInPaths=%s\n' "$unit" "${drop_ins% }"
+      printf 'NeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\n'
       printf 'WorkingDirectory=!%s\n' "$HOME"
-      printf 'ExecStart={ path=%s ; argv[]=%s daemon run ; ignore_errors=no ; }\n' "$exe" "$exe"
+      printf 'ExecStart={ path=%s ; argv[]=%s ; ignore_errors=no ; }\n' "${start%% *}" "$start"
       exit 0 ;;
   esac
 fi
@@ -3247,15 +3249,36 @@ fi
 #[cfg(target_os = "linux")]
 #[test]
 fn daemon_start_distinguishes_manager_xdg_from_private_home_cache() {
-    for (global_xdg, private_home_cache) in [(false, false), (true, false), (true, true)] {
+    for (global_xdg, private_home_cache, customised) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+        (true, true, true),
+    ] {
         let e = env();
         let unit = e.home.join(".config/systemd/user/kache.service");
         std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        // A customised unit keeps the daemon's environment: a setting in the
+        // unit, and a drop-in that wraps the command.
+        let umask = if customised { "UMask=0002\n" } else { "" };
         std::fs::write(
             &unit,
-            format!("[Service]\nExecStart={KACHE_BIN} daemon run\n"),
+            format!("[Service]\nExecStart={KACHE_BIN} daemon run\n{umask}"),
         )
         .unwrap();
+        if customised {
+            let drop_ins = e.home.join(".config/systemd/user/kache.service.d");
+            std::fs::create_dir_all(&drop_ins).unwrap();
+            std::fs::write(
+                drop_ins.join("override.conf"),
+                format!(
+                    "[Service]\nNice=10\nTimeoutStopSec=720\nExecStart=\nExecStart=/usr/bin/setpriv --inh-caps=-all {KACHE_BIN} daemon run\n"
+                ),
+            )
+            .unwrap();
+        }
         let xdg = e.home.join("manager-cache");
         let manager_store = if global_xdg {
             xdg.join("kache")
@@ -3321,7 +3344,7 @@ exit 0
         assert_eq!(
             calls.exists(),
             !private_home_cache,
-            "global={global_xdg}, private={private_home_cache}"
+            "global={global_xdg}, private={private_home_cache}, customised={customised}"
         );
         if !private_home_cache {
             let state: serde_json::Value = serde_json::from_slice(&state.unwrap()).unwrap();

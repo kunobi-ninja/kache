@@ -20,9 +20,9 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
-        include: [{"pr": 1862, "head": "ae603539c791df6ff42ef981a88a1cdddc666dc4", "tree": "1566dee6fc701fbc33af66b1acedab1404d25673"}]
+        include: [{"pr": 1862, "head": "ae603539c791df6ff42ef981a88a1cdddc666dc4", "tree": "1566dee6fc701fbc33af66b1acedab1404d25673"}, {"pr": 1876, "head": "61d9cdcb081f0a752757a048b2de663dd683d207", "tree": "f2f3c6a81a9b35790d879ef79b30241152fd06b1"}]
     env:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"

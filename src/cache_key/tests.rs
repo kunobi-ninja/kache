@@ -23762,3 +23762,84 @@ fn a_small_windows_source_is_hashed_from_the_memo_in_the_next_process() {
     assert_ne!(edited.hash(&source).unwrap(), hash);
     assert_eq!(edited.stats().cache_misses, 1);
 }
+
+/// A crate that embeds a folder with rust-embed (the canonical
+/// `\\?\C:\…\a.svg`) and also includes each file through
+/// `concat!(env!("CARGO_MANIFEST_DIR"), "/…/a.svg")` (`C:\…/a.svg`) names it
+/// twice on Windows: the file is read once and both spellings get its hash.
+#[cfg(windows)]
+#[test]
+fn a_windows_file_named_twice_in_one_closure_is_read_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("icons").join("bot.svg");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"<svg/>").unwrap();
+    let changed = dir.path().join("icons").join("changed.svg");
+    std::fs::write(&changed, b"<svg/>").unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let spellings = |name: &str| {
+        let verbatim = std::fs::canonicalize(dir.path().join("icons").join(name)).unwrap();
+        let plain = PathBuf::from(format!(
+            "{}/icons/{name}",
+            root.to_str().unwrap().trim_start_matches(r"\\?\")
+        ));
+        assert_ne!(verbatim, plain, "two spellings of one file");
+        (verbatim, plain)
+    };
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"));
+    // Only a settled stamp carries a hash to another spelling, as for a memo
+    // row: a file written just now is read under each spelling.
+    let fresh = dir.path().join("icons").join("fresh.svg");
+    std::fs::write(&fresh, b"<svg/>").unwrap();
+    let (fresh_verbatim, fresh_plain) = spellings("fresh.svg");
+    hasher.hash(&fresh_verbatim).unwrap();
+    hasher.hash(&fresh_plain).unwrap();
+    assert_eq!(
+        hasher.stats().cache_misses,
+        2,
+        "an unsettled stamp carries no hash"
+    );
+    // Std cannot set NTFS's change time back, so wait the settling out.
+    std::thread::sleep(std::time::Duration::from_nanos(
+        u64::try_from(HASH_SETTLE_NS).unwrap() + 100_000_000,
+    ));
+    let (verbatim, plain) = spellings("bot.svg");
+    let first = hasher.hash(&verbatim).unwrap();
+    assert_eq!(hasher.hash(&plain).unwrap(), first);
+    assert_eq!(
+        hasher.stats().cache_misses,
+        3,
+        "the second spelling reuses the first read"
+    );
+    // Each spelling keeps a stamp under its own path, which the env-use scan
+    // and the checks after the compile stat again: the first one's would
+    // read as a changed file there.
+    for spelling in [&verbatim, &plain] {
+        let recent = hasher
+            .recent_hashes
+            .borrow()
+            .get(spelling)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            recent.fingerprint,
+            Some(FileFingerprint::from_path(spelling).unwrap())
+        );
+    }
+    hasher
+        .env_dep_use(&plain, "OUT_DIR")
+        .expect("the second spelling scans as unchanged");
+    // Another file is still read.
+    let other = dir.path().join("icons").join("other.svg");
+    std::fs::write(&other, b"<svg/>").unwrap();
+    hasher.hash(&other).unwrap();
+    assert_eq!(hasher.stats().cache_misses, 4);
+    // A file written after its first spelling was read is read again under
+    // the second, which gets the new contents' hash.
+    let (changed_verbatim, changed_plain) = spellings("changed.svg");
+    let before = hasher.hash(&changed_verbatim).unwrap();
+    std::fs::write(&changed, b"<svg></svg>").unwrap();
+    let after = hasher.hash(&changed_plain).unwrap();
+    assert_ne!(after, before, "the second spelling reads the new contents");
+    assert_eq!(hasher.stats().cache_misses, 6);
+}

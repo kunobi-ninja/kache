@@ -10,6 +10,9 @@ const LEGACY_PLIST_NAME: &str = "com.zondax.kache.plist";
 const UNIT_NAME: &str = "kache.service";
 const TASK_NAME: &str = "kache-daemon";
 
+#[cfg(target_os = "linux")]
+mod systemd_environment;
+
 // ── Path helpers ─────────────────────────────────────────────────
 
 fn plist_path() -> PathBuf {
@@ -603,19 +606,56 @@ fn task_scheduler_installed() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn ownership_probe_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_millis(500)
+}
+
 /// Whether the installed login service owns this configured runtime instance.
-/// Login services load user/host configuration, not a build's KACHE_* overrides.
-pub(crate) fn manages_instance(config: &crate::config::Config) -> Result<bool> {
-    if !service_file_path().is_some_and(|path| path.is_file()) {
+/// The manager's environment can differ from a build's in either direction.
+/// Failed or unsupported ownership probes start the requested instance directly.
+pub(crate) fn manages_instance_until(
+    config: &crate::config::Config,
+    deadline: std::time::Instant,
+) -> Result<bool> {
+    let Some(service) = service_file_path().filter(|path| path.is_file()) else {
         return Ok(false);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let budget = deadline.min(ownership_probe_deadline());
+        let Some(socket) = systemd_environment::socket(&service, budget) else {
+            return Ok(false);
+        };
+        Ok(canonical_or_original(&config.socket_path()) == canonical_or_original(&socket))
     }
-    configured_instance_matches(
-        &config.socket_path(),
-        crate::config::default_cache_dir(),
-        crate::config::host_config_path()
-            .into_iter()
-            .chain(std::iter::once(crate::config::config_file_path())),
-    )
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (service, deadline);
+        // Keep the existing platform defaults. A caller-selected XDG file is
+        // ambiguous without a manager-specific environment probe.
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let host = std::env::var_os("KACHE_HOST_CONFIG");
+        if unknown_non_linux_environment(&home, xdg.as_deref(), host.as_deref()) {
+            return Ok(false);
+        }
+        configured_instance_matches(
+            &config.socket_path(),
+            crate::config::default_cache_dir(),
+            std::iter::once(PathBuf::from(crate::config::HOST_CONFIG_PATH))
+                .chain(std::iter::once(crate::config::config_file_path())),
+        )
+    }
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn unknown_non_linux_environment(
+    home: &Path,
+    xdg: Option<&std::ffi::OsStr>,
+    host: Option<&std::ffi::OsStr>,
+) -> bool {
+    xdg.is_some_and(|path| Path::new(path) != home.join(".config"))
+        || host.is_some_and(|path| !path.is_empty())
 }
 
 /// Where a daemon started for this instance writes the error that stops it
@@ -655,7 +695,7 @@ impl std::fmt::Display for StartupLog {
 
 pub(crate) fn startup_log(config: &crate::config::Config) -> StartupLog {
     startup_log_for(
-        manages_instance(config).unwrap_or(false),
+        manages_instance_until(config, ownership_probe_deadline()).unwrap_or(false),
         config.socket_path().with_extension("log"),
     )
 }
@@ -676,6 +716,7 @@ fn startup_log_for(managed: bool, runtime_log: PathBuf) -> StartupLog {
     }
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 fn configured_instance_matches(
     requested_socket: &Path,
     mut store: PathBuf,
@@ -1322,6 +1363,29 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn private_host_and_xdg_overrides_do_not_prove_non_linux_ownership() {
+        use std::ffi::OsStr;
+        let home = Path::new("/home/alice");
+        let normal = home.join(".config");
+        assert!(!unknown_non_linux_environment(home, None, None));
+        assert!(!unknown_non_linux_environment(
+            home,
+            Some(normal.as_os_str()),
+            Some(OsStr::new(""))
+        ));
+        assert!(unknown_non_linux_environment(
+            home,
+            Some(OsStr::new("/private/config")),
+            None
+        ));
+        assert!(unknown_non_linux_environment(
+            home,
+            None,
+            Some(OsStr::new("/private/host.toml"))
+        ));
+    }
+
     fn write_service_file(path: &Path, exe: &Path) {
         if cfg!(target_os = "macos") {
             let content = format!(
@@ -1476,6 +1540,47 @@ mod tests {
             error
                 .to_string()
                 .contains("reading login service configuration")
+        );
+    }
+
+    /// A private build file must not be mistaken for an independently selected
+    /// service file. The manager's HOME defaults are explicit fixture inputs.
+    #[test]
+    fn a_private_xdg_config_is_not_the_login_services() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let private = root.path().join("rig");
+        let private_runtime = private.join("runtime");
+        let private_config = private.join("xdg/kache/config.toml");
+        std::fs::create_dir_all(private_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &private_config,
+            format!(
+                "[cache]\nruntime_dir = {:?}\n",
+                private_runtime.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let socket = private_runtime.join("daemon.sock");
+
+        let service_config = home.join(".config/kache/config.toml");
+        let service_store = home.join("service-store");
+        assert!(
+            !configured_instance_matches(&socket, service_store.clone(), [service_config]).unwrap(),
+            "the private instance is not the service's"
+        );
+        // The mistake this replaces: the private file read as the service's.
+        assert!(
+            configured_instance_matches(&socket, service_store.clone(), [private_config]).unwrap()
+        );
+        // The user's own instance stays the service's.
+        assert!(
+            configured_instance_matches(
+                &service_store.join("daemon.sock"),
+                service_store,
+                [home.join(".config/kache/config.toml")]
+            )
+            .unwrap()
         );
     }
 

@@ -18,6 +18,8 @@ Use `KACHE_LOG=kache=debug kache daemon run` for foreground debugging. Stop the 
 
 When an installed service manages this cache, `start`, `restart` and automatic starts start the service instead of spawning a process. On macOS, Kache loads the job with `launchctl bootstrap` if launchd no longer has it.
 
+An installed service uses its manager's environment, which can differ from a build's XDG and `KACHE_*` settings. If Kache cannot verify which instance a service would start, it starts the requested instance directly. This includes unrecognized systemd units or drop-ins, a manager inspection that exceeds its startup budget, and nondefault `XDG_CONFIG_HOME` or `KACHE_HOST_CONFIG` paths on macOS or Windows.
+
 The service restarts the daemon only when it fails. After `kache daemon stop`, an idle timeout or a config change, the daemon exits cleanly and stays stopped until something starts it through the service, such as the next cache-enabled compiler invocation, `kache stats`, `kache monitor` or `kache daemon start`. V2 uses the daemon for local compiler pipelines too; a remote is not required to start it.
 
 Every daemon, and every other `kache` command, appends info-level lines to a diagnostic log: `~/Library/Logs/kache/kache.log` on macOS, and `kache.log` in the default cache directory elsewhere (`~/.cache/kache/kache.log` on Linux, `%LOCALAPPDATA%\kache\kache.log` on Windows). The log stays there when `cache.local_store` or `KACHE_CACHE_DIR` moves the store. `KACHE_LOG_FILE` changes its filter. A daemon that Kache starts without the service also writes its stderr to `<runtime_dir>/daemon.log`: warnings, errors and the reason a start failed.

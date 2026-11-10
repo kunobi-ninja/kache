@@ -111,6 +111,20 @@ pub(crate) struct DiscoveryFlight {
     pub(crate) waited: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static DISCOVERY_WAIT_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Notify this thread's test after the first attempt found the flight held.
+#[cfg(test)]
+pub(crate) fn observe_next_discovery_wait_for_test(notify: std::sync::mpsc::Sender<()>) {
+    DISCOVERY_WAIT_OBSERVER.with(|observer| {
+        assert!(observer.borrow_mut().replace(notify).is_none());
+    });
+}
+
 /// Coalesce dependency discovery before taking a compile flight, a permit or
 /// a cache-key lock. The holder keeps this guard through prediction publish.
 /// Errors and timeout leave the ordinary key/compile path available.
@@ -157,6 +171,12 @@ fn acquire_discovery(
     if let Some(lock) = acquire_within(path, Duration::ZERO, Duration::ZERO)? {
         return Ok((Some(lock), false));
     }
+    #[cfg(test)]
+    DISCOVERY_WAIT_OBSERVER.with(|observer| {
+        if let Some(notify) = observer.borrow_mut().take() {
+            let _ = notify.send(());
+        }
+    });
     Ok((acquire_within(path, timeout, poll)?, true))
 }
 
@@ -3766,10 +3786,12 @@ mod tests {
         assert!(lock.is_none());
         assert!(waited, "a timed-out join waited");
         let waiter_path = path.clone();
+        let (notify, waiting) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
+            observe_next_discovery_wait_for_test(notify);
             let (guard, waited) = acquire_discovery(
                 &waiter_path,
-                Duration::from_secs(5),
+                Duration::from_secs(30),
                 Duration::from_millis(2),
             )
             .unwrap();
@@ -3780,11 +3802,10 @@ mod tests {
                 b"ready"
             );
         });
-        // Let the waiter's first attempt find the flight held, so its join
-        // is a real wait rather than an immediate acquisition.
-        std::thread::sleep(Duration::from_millis(30));
+        let observed_wait = waiting.recv_timeout(Duration::from_secs(10));
         fs::write(path.with_extension("published"), b"ready").unwrap();
         drop(owner);
+        observed_wait.expect("the waiter must observe the held discovery flight");
         waiter.join().unwrap();
         assert!(
             acquire_within(&path, Duration::ZERO, Duration::ZERO)

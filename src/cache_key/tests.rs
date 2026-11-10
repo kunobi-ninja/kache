@@ -6659,16 +6659,24 @@ fn a_flight_waiter_digests_the_tree_again() {
 }
 
 /// Checkouts of one workspace share a unit's discovery flight. A checkout
-/// whose tree differs from the owner's cannot use the owner's record, and
-/// must not keep the flight through its own compile: every other checkout
-/// would then wait for that compile too, one checkout at a time. A checkout
-/// with the owner's tree still waits for the owner and uses its record.
+/// whose tree differs from the owner's cannot use the owner's record: it
+/// neither waits for the owner's whole compile nor takes the flight, but
+/// keys without it once the short grace for a small unit has passed. When
+/// the owner releases within the grace, the other tree takes the flight,
+/// finds the owner's record unusable and releases it rather than keeping it
+/// through its own compile. A checkout with the owner's tree still waits for
+/// the owner and uses its record.
 #[test]
-fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
+fn a_checkout_on_another_tree_keys_without_waiting_for_the_owner() {
     let _lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
     }
+    another_tree_joins_the_flight(false);
+    another_tree_joins_the_flight(true);
+}
+
+fn another_tree_joins_the_flight(release_within_grace: bool) {
     let base = tempfile::tempdir().unwrap();
     let db = base.path().join("index.db");
     let flights = base.path().join("cache");
@@ -6721,15 +6729,18 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
     };
     let record = workspace_portable_prediction(&closure, &roots, Some(&tree)).unwrap();
 
+    let released = std::sync::atomic::AtomicBool::new(false);
     let (waiting, observed) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let wait = |name: &'static str, source: &'static str| {
             let waiting = waiting.clone();
+            let released = &released;
             scope.spawn(move || {
                 let (root, env, args) = checkout(name, source);
                 let hasher = hasher(&env);
                 crate::scheduler::observe_next_discovery_wait_for_test(waiting);
                 let (result, outputs) = resolve(&args, &hasher);
+                let before_release = !released.load(std::sync::atomic::Ordering::SeqCst);
                 let deferred = result
                     .as_ref()
                     .is_err_and(|error| error.is::<DeferredDiscovery>());
@@ -6740,31 +6751,54 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
                     outputs.used_prediction,
                     deferred,
                     held,
+                    before_release,
                 )
             })
         };
         let other_tree = wait("b", "pub fn value() -> u32 { 2 }\n");
-        let same_tree = wait("c", "pub fn value() -> u32 { 1 }\n");
+        // Within the grace, the owner releases as soon as the other tree
+        // waits: a second checkout's set-up could outlast the grace.
+        let same_tree = (!release_within_grace).then(|| wait("c", "pub fn value() -> u32 { 1 }\n"));
         // Publish only after each waiter has found no usable record and
         // failed its first lock attempt. Starting a thread proves neither.
-        let both_waiting = observed
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .and_then(|()| observed.recv_timeout(std::time::Duration::from_secs(30)));
+        let waiters = if release_within_grace { 1 } else { 2 };
+        let all_waiting = (0..waiters)
+            .try_for_each(|_| observed.recv_timeout(std::time::Duration::from_secs(30)));
+        // Another tree's wait ends after the grace. Bounded here: a waiter
+        // that kept waiting would sit until the owner releases.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !release_within_grace
+            && !other_tree.is_finished()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         owner.record_portable_prediction(&identity, Some("kt"), &record);
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
         drop(owner.take_discovery_flight());
         // Release before asserting so a failed handshake cannot leave the
         // scoped workers blocked behind the owner's lock during unwinding.
-        both_waiting.expect("both checkouts must observe the held discovery flight");
+        all_waiting.expect("each checkout must observe the held discovery flight");
 
-        let (_, inputs, predicted, deferred, held) = other_tree.join().unwrap();
+        let (_, inputs, predicted, deferred, held, before_release) = other_tree.join().unwrap();
+        assert_eq!(
+            before_release, !release_within_grace,
+            "another tree does not wait for the owner's whole compile, \
+             and takes the flight when the owner releases within the grace"
+        );
         assert!(
             !deferred && !held,
-            "another tree keys without the flight instead of compiling under it"
+            "another tree keys without the flight instead of compiling under it \
+             (released within the grace: {release_within_grace})"
         );
         assert!(!predicted);
         assert!(inputs.is_some(), "the pre-pass found the closure");
 
-        let (root, inputs, predicted, deferred, held) = same_tree.join().unwrap();
+        let Some(same_tree) = same_tree else {
+            return;
+        };
+        let (root, inputs, predicted, deferred, held, before_release) = same_tree.join().unwrap();
+        assert!(!before_release, "the owner's tree waits for the owner");
         assert!(!deferred);
         assert!(predicted, "the owner's tree uses the owner's record");
         assert!(held, "and keeps the flight until it publishes");

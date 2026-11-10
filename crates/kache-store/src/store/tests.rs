@@ -15945,3 +15945,43 @@ fn a_quick_tombstone_prune_deletes_its_rows_in_one_transaction() {
     );
     assert_eq!(store.tombstone_stats().unwrap().0, 0);
 }
+
+/// A holder's note sits beside its lock file, readable while the lock is
+/// held (Windows refuses reads of a locked range), and goes with the holder.
+/// A note a killed holder left is replaced by the next holder's, or removed
+/// when the next holder has none.
+#[test]
+fn a_lock_note_is_readable_while_held_and_goes_with_its_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flight");
+    let mut lock = StoreLock::try_acquire(&path).unwrap().expect("unheld");
+    assert_eq!(StoreLock::held_note(&path), None, "no note yet");
+    lock.mark_note(Some("tree-a"));
+    assert_eq!(StoreLock::held_note(&path).as_deref(), Some("tree-a"));
+    drop(lock);
+    assert_eq!(
+        StoreLock::held_note(&path),
+        None,
+        "the note goes with its holder"
+    );
+
+    std::fs::write(path.with_extension("note"), "left by a killed holder").unwrap();
+    let mut lock = StoreLock::try_acquire(&path).unwrap().expect("unheld");
+    lock.mark_note(Some("tree-b"));
+    assert_eq!(StoreLock::held_note(&path).as_deref(), Some("tree-b"));
+    drop(lock);
+    std::fs::write(path.with_extension("note"), "left by a killed holder").unwrap();
+    let mut lock = StoreLock::try_acquire(&path).unwrap().expect("unheld");
+    lock.mark_note(None);
+    assert_eq!(
+        StoreLock::held_note(&path),
+        None,
+        "a holder without a note removes a stale one"
+    );
+    std::fs::write(path.with_extension("note"), "").unwrap();
+    assert_eq!(
+        StoreLock::held_note(&path),
+        None,
+        "an empty note reads as none"
+    );
+}

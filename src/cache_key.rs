@@ -3770,7 +3770,9 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
+            let tree = out.tree_guard.as_ref().map(|guard| guard.digest.as_str());
+            let flight =
+                crate::scheduler::join_discovery_flight_of_tree(cache_dir, &identity, tree);
             let mut lock = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The
@@ -3782,8 +3784,9 @@ fn resolve_key_inputs(
                 // record of another checkout's tree. Owning the flight would
                 // queue every later checkout behind this compile too, one
                 // compile at a time. Release it and key the way a peer
-                // without the flight does: a peer with the same key still
-                // waits on the compile flight and restores the entry.
+                // without the flight does: a peer with the same key restores
+                // the entry once it is stored (a holder that compiles before
+                // keying holds no compile flight to wait on).
                 if let Err(reason) = &prediction
                     && lock.take().is_some()
                 {

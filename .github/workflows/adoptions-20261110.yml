@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        include: [{"pr": 1862, "head": "e623416c375aa9de595251fa49d722e6fe410da3", "tree": "c15aa421bbb95ea4831bfcdd1fe1dbbf422774c6"}, {"pr": 1866, "head": "2e573c619464ad2fbd5a015e495462defe7be949", "tree": "4fb130c9915545e2cfc7c90667ecb50ef62c7595"}, {"pr": 1876, "head": "61d9cdcb081f0a752757a048b2de663dd683d207", "tree": "f2f3c6a81a9b35790d879ef79b30241152fd06b1"}, {"pr": 1877, "head": "1fc0cfd8412b8326e7346db675359710ee5d6f36", "tree": "c5d6d227762c8e2ed5638b56dd86d0814f799498"}]
+        include: [{"pr": 1862, "head": "ae603539c791df6ff42ef981a88a1cdddc666dc4", "tree": "1566dee6fc701fbc33af66b1acedab1404d25673"}]
     env:
       RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"

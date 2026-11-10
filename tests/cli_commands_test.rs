@@ -3235,7 +3235,8 @@ fn systemd_probe_script() -> &'static str {
     show)
       unit="$HOME/.config/systemd/user/kache.service"
       exe=$(sed -n 's/^ExecStart=//p' "$unit" | sed 's/ daemon run$//')
-      printf 'FragmentPath=%s\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\nWorkingDirectory=\n' "$unit"
+      printf 'FragmentPath=%s\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\n' "$unit"
+      printf 'WorkingDirectory=!%s\n' "$HOME"
       printf 'ExecStart={ path=%s ; argv[]=%s daemon run ; ignore_errors=no ; }\n' "$exe" "$exe"
       exit 0 ;;
   esac

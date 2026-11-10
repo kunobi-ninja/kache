@@ -3687,12 +3687,28 @@ fn trybuild_out_dir_ownership_resolves_relative_dep_info_paths() {
             true,
         ),
     ] {
+        if let Some(cwd) = cwd {
+            std::fs::create_dir_all(cwd).unwrap();
+        }
+        let resolved_out = joined_under(cwd, &out_dir);
+        if resolved_out.is_absolute() {
+            std::fs::create_dir_all(&resolved_out).unwrap();
+        }
+        let resolved_source = joined_under(cwd, &source);
+        if resolved_source.is_absolute() {
+            std::fs::create_dir_all(resolved_source.parent().unwrap()).unwrap();
+            std::fs::write(&resolved_source, "pub fn generated() {}\n").unwrap();
+        }
         let env = KeyEnv::from_parts(
             [("OUT_DIR", out_dir.as_os_str())],
             cwd.map(Path::to_path_buf),
         );
         let reached = trybuild_paths_in_the_artifact(&args, &env, &[source], false);
-        assert_eq!(reached.contains(&joined_under(cwd, &out_dir)), kept, "{label}");
+        assert_eq!(
+            reached.contains(&joined_under(cwd, &out_dir)),
+            kept,
+            "{label}"
+        );
     }
 }
 
@@ -3720,6 +3736,109 @@ fn trybuild_out_dir_ownership_preserves_native_path_components() {
         let env = KeyEnv::from_parts([("OUT_DIR", out.as_os_str())], Some(cwd.clone()));
         let reached = trybuild_paths_in_the_artifact(&args, &env, &[relative], false);
         assert!(reached.contains(&out), "native path {}", out.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trybuild_keys_keep_out_dir_when_dep_info_uses_a_canonical_alias() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let canonical = root.join("canonical");
+    let alias = root.join("alias");
+    std::fs::create_dir_all(&canonical).unwrap();
+    std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+    let registry = root.join("registry/dep");
+    std::fs::create_dir_all(registry.join("src")).unwrap();
+    let source = registry.join("src/lib.rs");
+    std::fs::write(
+        &source,
+        r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+    )
+    .unwrap();
+    let mut args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-name=dep".into(),
+        "--crate-type=rlib".into(),
+        "--emit=metadata".into(),
+        "--cfg=trybuild".into(),
+        source.display().to_string(),
+    ])
+    .unwrap();
+    args.path_normalize_disabled = false;
+    let key = |worktree: &str| {
+        let target = alias.join(worktree).join("target");
+        let out = target.join("debug/build/dep/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("generated.rs"), "pub fn generated() {}\n").unwrap();
+        let included = std::fs::canonicalize(&out).unwrap().join("generated.rs");
+        assert!(!included.starts_with(&out), "the spellings must differ");
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone(), included],
+                env_deps: vec![("OUT_DIR".into(), Some(out.display().to_string()))],
+            },
+            None,
+        );
+        let env = KeyEnv::from_parts([("OUT_DIR", out.as_os_str())], Some(registry.clone()));
+        let (key, outputs) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new(),
+            &normalizer_for(&target, &registry),
+            &env,
+        );
+        assert!(!outputs.bakes_out_dir, "OUT_DIR only locates an include");
+        (key.unwrap(), outputs.fields.unwrap())
+    };
+    let (key_a, fields_a) = key("wt-a");
+    let (key_b, fields_b) = key("wt-b");
+    assert_eq!(fields_a["sources"], fields_b["sources"]);
+    assert_eq!(fields_a["env_deps"], fields_b["env_deps"]);
+    assert_ne!(fields_a["remap"], fields_b["remap"]);
+    assert_ne!(
+        key_a, key_b,
+        "canonical aliases must not erase the raw guard"
+    );
+}
+
+#[test]
+fn trybuild_out_dir_canonical_errors_keep_the_raw_prefix() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let registry = root.join("registry/dep");
+    std::fs::create_dir_all(&registry).unwrap();
+    let source = registry.join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let mut args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--cfg=trybuild".into(),
+        source.display().to_string(),
+    ])
+    .unwrap();
+    args.path_normalize_disabled = false;
+    for missing_out in [true, false] {
+        let identity = |worktree: &str| {
+            let target = root.join(worktree).join("target");
+            let out = target.join(if missing_out { "missing-out" } else { "out" });
+            std::fs::create_dir_all(&target).unwrap();
+            if !missing_out {
+                std::fs::create_dir_all(&out).unwrap();
+            }
+            let input = if missing_out {
+                source.clone()
+            } else {
+                registry.join("missing-source.rs")
+            };
+            let env = KeyEnv::from_parts([("OUT_DIR", out.as_os_str())], Some(registry.clone()));
+            hash_unremapped(&args, &normalizer_for(&target, &registry), &env, &[input])
+        };
+        assert_ne!(
+            identity("wt-a"),
+            identity("wt-b"),
+            "missing_out={missing_out}"
+        );
     }
 }
 

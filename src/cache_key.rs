@@ -4336,6 +4336,7 @@ fn trybuild_paths_in_the_artifact(
     if let Some(out_dir) = env.var_os("OUT_DIR").filter(|value| !value.is_empty()) {
         let out_dir = joined_under(env.cwd(), Path::new(&out_dir));
         let owner = collapse_lexical(&out_dir);
+        let canonical_owner = OnceCell::new();
         if bakes_out_dir
             || sources.iter().any(|source| {
                 // Dep-info preserves relative paths and parent components.
@@ -4347,6 +4348,13 @@ fn trybuild_paths_in_the_artifact(
                     || !source.is_absolute()
                     || !out_dir.is_absolute()
                     || path_is_under(&collapse_lexical(&source), &owner)
+                    // Normalization knows canonical aliases, such as macOS's
+                    // /var and /private/var. Preserve their raw guard too.
+                    || match canonical_owner.get_or_init(|| std::fs::canonicalize(&out_dir)) {
+                        Ok(owner) => std::fs::canonicalize(&source)
+                            .map_or(true, |source| path_is_under(&source, owner)),
+                        Err(_) => true,
+                    }
             })
         {
             paths.push(out_dir);
@@ -6723,7 +6731,8 @@ fn compute_static_lib_hash_for(
 /// breaking call sites. Future candidates: `target_json_hash`, timing metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepInfo {
-    /// All source files the crate depends on (sorted, absolute paths).
+    /// All source files the crate depends on, as spelled in dep-info.
+    /// Paths may be relative to the invocation's working directory.
     /// Includes the crate root, module files, `include!()` targets, etc.
     pub source_files: Vec<std::path::PathBuf>,
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).

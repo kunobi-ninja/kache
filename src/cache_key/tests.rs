@@ -23721,3 +23721,31 @@ fn a_compile_record_belongs_to_one_crate_and_source() {
     assert_eq!(compiled_remaps(&other_crate), None);
     assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
 }
+
+/// On Windows a small source's hash is memoised too: the next process
+/// takes it from the memo by the file's stamp, without reading the file.
+#[cfg(windows)]
+#[test]
+fn a_small_windows_source_is_hashed_from_the_memo_in_the_next_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let db = dir.path().join("index.db");
+    let first = FileHasher::persistent(&db);
+    let hash = first.hash(&source).unwrap();
+    first.flush_memo_as_if_settled();
+    assert_eq!(first.stats().cache_misses, 1);
+    let next = FileHasher::persistent(&db);
+    assert_eq!(next.hash(&source).unwrap(), hash);
+    assert_eq!(
+        (next.stats().cache_hits, next.stats().cache_misses),
+        (1, 0),
+        "the memo row answers"
+    );
+    // An edit changes the stamp: the file is read again. It changes the
+    // size too, so it can't share the first write's timestamp tick unseen.
+    std::fs::write(&source, "pub fn gg() {}\n").unwrap();
+    let edited = FileHasher::persistent(&db);
+    assert_ne!(edited.hash(&source).unwrap(), hash);
+    assert_eq!(edited.stats().cache_misses, 1);
+}

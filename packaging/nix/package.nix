@@ -3,7 +3,10 @@
   rustPlatform,
   cacert,
   coreutils,
+  pkg-config,
+  sqlite,
   stdenv,
+  zstd,
   bashInteractive,
   zsh,
 }:
@@ -41,6 +44,15 @@ rustPlatform.buildRustPackage {
   cargoTestFlags = [
     "-p"
     "kache"
+  ];
+
+  # nixpkgs' cargo setup hook sets ZSTD_SYS_USE_PKG_CONFIG and
+  # LIBSQLITE3_SYS_USE_PKG_CONFIG, so zstd-sys and libsqlite3-sys link the
+  # system libraries through pkg-config instead of building bundled copies.
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [
+    sqlite
+    zstd
   ];
 
   nativeCheckInputs = [

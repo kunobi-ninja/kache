@@ -6695,14 +6695,14 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
     };
     let record = workspace_portable_prediction(&closure, &roots, Some(&tree)).unwrap();
 
-    let (started, ready) = std::sync::mpsc::channel();
+    let (waiting, observed) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let wait = |name: &'static str, source: &'static str| {
-            let started = started.clone();
+            let waiting = waiting.clone();
             scope.spawn(move || {
                 let (root, env, args) = checkout(name, source);
                 let hasher = hasher(&env);
-                started.send(()).unwrap();
+                crate::scheduler::observe_next_discovery_wait_for_test(waiting);
                 let (result, outputs) = resolve(&args, &hasher);
                 let deferred = result
                     .as_ref()
@@ -6719,13 +6719,16 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
         };
         let other_tree = wait("b", "pub fn value() -> u32 { 2 }\n");
         let same_tree = wait("c", "pub fn value() -> u32 { 1 }\n");
-        ready.recv().unwrap();
-        ready.recv().unwrap();
-        // Let both find no record and the flight held, so each join is a
-        // real wait. The owner then publishes and releases.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Publish only after each waiter has found no usable record and
+        // failed its first lock attempt. Starting a thread proves neither.
+        let both_waiting = observed
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .and_then(|()| observed.recv_timeout(std::time::Duration::from_secs(30)));
         owner.record_portable_prediction(&identity, Some("kt"), &record);
         drop(owner.take_discovery_flight());
+        // Release before asserting so a failed handshake cannot leave the
+        // scoped workers blocked behind the owner's lock during unwinding.
+        both_waiting.expect("both checkouts must observe the held discovery flight");
 
         let (_, inputs, predicted, deferred, held) = other_tree.join().unwrap();
         assert!(

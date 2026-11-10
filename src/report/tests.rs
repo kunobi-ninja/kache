@@ -541,6 +541,7 @@ fn test_event(
         skip_reason: String::new(),
         store_error: String::new(),
         store_handed_off: false,
+        incremental_seed: String::new(),
         daemon_store_ms: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
@@ -703,6 +704,8 @@ fn write_test_events(dir: &std::path::Path) -> Config {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -2205,6 +2208,8 @@ fn test_missing_transfer_data() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -2321,6 +2326,8 @@ fn test_suggestion_high_miss_share() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -2436,6 +2443,8 @@ fn test_suggestion_high_hit_overhead() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -2552,6 +2561,8 @@ fn test_suggestion_network_download_failures_and_fanout() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -2673,6 +2684,8 @@ fn test_suggestion_network_latency_thresholds() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -3197,6 +3210,8 @@ fn test_empty_report() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -3694,6 +3709,8 @@ fn report_counts_each_download_transfer_format() {
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
@@ -4117,6 +4134,7 @@ fn test_push_bypass_tables_renders_reasons_and_slowest() {
             fixed_in: None,
             version: String::new(),
             fallback_attempt: None,
+            incremental_seed: String::new(),
             crate_name: "foo".to_string(),
             root: String::new(),
             package: String::new(),
@@ -4597,6 +4615,7 @@ fn text_timing_and_bypass_sections_hide_a_zero() {
     report.bypass.slowest.push(BypassDetail {
         fixed_in: None,
         version: String::new(),
+        incremental_seed: String::new(),
         crate_name: "slow".to_string(),
         root: String::new(),
         package: String::new(),
@@ -5031,7 +5050,14 @@ fn a_windowed_report_counts_archived_events_without_claiming_they_are_lost() {
         events::log_event(&log, &hit).unwrap();
     }
     config.event_log_max_size = std::fs::metadata(&log).unwrap().len() / 2;
-    events::rotate_events_if_needed(&log, config.event_log_max_size, 5, &config.cache_dir).unwrap();
+    events::rotate_events_if_needed(
+        &log,
+        config.event_log_max_size,
+        5,
+        &config.cache_dir,
+        events::ArchiveLimits::from_config(&config),
+    )
+    .unwrap();
     assert!(events::read_events(&log).unwrap().len() < 40);
 
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
@@ -5252,4 +5278,20 @@ fn report_names_the_three_costliest_waits_from_all_events() {
     for (note, expected) in notes.iter().zip(["wait_4000", "wait_3000", "wait_2000"]) {
         assert!(note.contains(expected), "{note}");
     }
+}
+
+#[test]
+fn a_seeded_compile_names_the_checkout_its_state_came_from() {
+    let mut event = test_event("app", EventResult::Passthrough, 900, 900, 0, "");
+    event.passthrough_reason = "automatic worktree seed".to_string();
+    event.incremental_seed = "/work/main/target/debug".to_string();
+    let detail = to_bypass_detail(&event);
+    assert_eq!(detail.incremental_seed, "/work/main/target/debug");
+    assert_eq!(
+        bypass_detail_words(&detail, "seeded".to_string()),
+        "seeded; seeded from /work/main/target/debug"
+    );
+    event.incremental_seed.clear();
+    let detail = to_bypass_detail(&event);
+    assert_eq!(bypass_detail_words(&detail, "seeded".to_string()), "seeded");
 }

@@ -48,6 +48,8 @@ Each receiver gets independent files or copy-on-write clones, never writable
 hardlinks to the donor. Compiler feature probing and bootstrap behavior are
 documented in
 [Incremental seeds between worktrees](/docs/getting-started/mutation-testing#incremental-seeds-between-worktrees).
+`kache explain --all` and `kache report` name the Cargo profile directory
+each seeded compile imported from.
 
 These settings have separate purposes. Disabling `seed_incremental` stops donor
 imports but keeps target-local adaptive compilation. Disabling

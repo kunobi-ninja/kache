@@ -271,6 +271,10 @@ pub struct BuildEvent {
     /// Why a successful compile did not publish an entry. Empty in older logs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub skip_reason: String,
+    /// The Cargo profile directory of another checkout whose incremental
+    /// state seeded this compile. Empty when none did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_seed: String,
     /// Why `Store::put` failed, when the compiler ran and produced outputs that
     /// were then not cached (kunobi-ninja/kache#629).
     ///
@@ -321,8 +325,9 @@ pub struct BuildEvent {
     /// of each key input group (compiler, args, sources, env_deps, externs,
     /// link, env_cfg, remap, crate), computed as a tee of the exact bytes the
     /// final key hashes. Powers `explain_miss` — diffing two events' maps
-    /// names which input group changed. Empty for cc compiles and
-    /// passthroughs.
+    /// names which input group changed. A Rust entry stored for one terminal
+    /// width adds `diagnostic_width`, the width in columns. Empty for cc
+    /// compiles and passthroughs.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub key_fields: std::collections::BTreeMap<String, String>,
     /// Normalized environment-input hashes under `explain_miss`. `None`
@@ -618,6 +623,7 @@ impl BuildEvent {
             skip_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
+            incremental_seed: String::new(),
             daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),

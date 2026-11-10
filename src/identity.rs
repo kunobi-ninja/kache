@@ -20,11 +20,21 @@ pub fn lockfile_digest(path: &Path) -> Option<String> {
     lockfile_bytes_digest(&std::fs::read(path).ok()?)
 }
 
+/// Reads CRLF line endings as LF: a Windows checkout with `core.autocrlf` has
+/// CRLF on disk, while `git show` returns the committed LF bytes, and both
+/// must name the same lockfile.
 fn lockfile_bytes_digest(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
-    let hex = blake3::hash(bytes).to_hex();
+    let mut hasher = blake3::Hasher::new();
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        match line.strip_suffix(b"\r\n") {
+            Some(body) => hasher.update(body).update(b"\n"),
+            None => hasher.update(line),
+        };
+    }
+    let hex = hasher.finalize().to_hex();
     Some(hex[..LOCK_DIGEST_HEX].to_string())
 }
 
@@ -343,6 +353,27 @@ mod tests {
             Some("release")
         );
         assert!(profile_between(&target, Path::new("/elsewhere/debug/deps"), false).is_none());
+    }
+
+    #[test]
+    fn a_crlf_checkout_names_the_same_lockfile_as_its_git_history() {
+        let committed = b"version = 4\n\n[[package]]\nname = \"a\"\n";
+        let windows = b"version = 4\r\n\r\n[[package]]\r\nname = \"a\"\r\n";
+        assert_eq!(
+            lockfile_bytes_digest(windows),
+            lockfile_bytes_digest(committed)
+        );
+        // Unchanged for LF files, so existing keys stay valid.
+        assert_eq!(
+            lockfile_bytes_digest(committed).unwrap(),
+            blake3::hash(committed).to_hex()[..LOCK_DIGEST_HEX]
+        );
+        // A lone CR is content, not a line ending.
+        assert_ne!(
+            lockfile_bytes_digest(b"a\rb\n"),
+            lockfile_bytes_digest(b"ab\n")
+        );
+        assert_ne!(lockfile_bytes_digest(b"a\r"), lockfile_bytes_digest(b"a"));
     }
 
     #[test]

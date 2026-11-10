@@ -492,9 +492,12 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
                 term::home_path(Path::new(&entry.root)),
                 entry.result.clone(),
                 term::duration_ms(entry.elapsed_ms),
-                entry.fixed_in.as_deref().map_or_else(
-                    || tui_sessions::passthrough_words(&entry.reason),
-                    tui_sessions::fixed_bug_words,
+                crate::report::bypass_detail_words(
+                    entry,
+                    entry.fixed_in.as_deref().map_or_else(
+                        || tui_sessions::passthrough_words(&entry.reason),
+                        tui_sessions::fixed_bug_words,
+                    ),
                 ),
             ]
         })

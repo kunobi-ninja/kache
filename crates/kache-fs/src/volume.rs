@@ -313,6 +313,27 @@ fn statfs_total_bytes_linux(stat: &libc::statfs) -> Option<u64> {
     disk_bytes(linux_fragment_bytes(frsize, bsize), stat.f_blocks)
 }
 
+/// ZFS's superblock magic on Linux.
+#[cfg_attr(not(all(unix, feature = "staging")), allow(dead_code))]
+pub(crate) const ZFS_MAGIC: i64 = magic::ZFS;
+
+/// The superblock magic of the Linux filesystem holding `path`; `None`
+/// elsewhere or when `statfs` fails.
+#[cfg_attr(not(all(unix, feature = "staging")), allow(dead_code))]
+pub(crate) fn fs_magic(path: &Path) -> Option<i64> {
+    #[cfg(target_os = "linux")]
+    {
+        // `f_type`'s type differs between libcs; see `probe_linux`.
+        #[allow(clippy::unnecessary_cast)]
+        statfs_of(path).map(|stat| stat.f_type as i64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn statfs_of(path: &Path) -> Option<libc::statfs> {
     use std::ffi::CString;
@@ -459,6 +480,20 @@ fn probe_unsupported(_path: &Path) -> FsProbe {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fs_magic_reads_the_superblock_on_linux_only() {
+        let dir = std::env::temp_dir();
+        #[cfg(target_os = "linux")]
+        {
+            #[allow(clippy::unnecessary_cast)]
+            let expected = super::statfs_of(&dir).map(|stat| stat.f_type as i64);
+            assert!(expected.is_some());
+            assert_eq!(super::fs_magic(&dir), expected);
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(super::fs_magic(&dir), None);
+    }
+
     use super::*;
 
     #[cfg(any(unix, windows))]

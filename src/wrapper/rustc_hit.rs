@@ -1,9 +1,11 @@
+use super::rustc_diagnostics::EntryKey;
 use super::{
     Config, EntryMeta, EventResult, FileHashStats, HitCompletion, KeyEventRecord, RustcArgs,
     RustcCompiler, Store, clean_incremental_dir, record_input_prediction,
     restore_from_cache_with_memo_store,
 };
 use anyhow::{Result, bail};
+use std::borrow::Cow;
 use std::time::Instant;
 
 /// Invocation state shared by every Rust cache-hit path.
@@ -19,8 +21,8 @@ pub(super) struct RustcHitContext<'a> {
 }
 
 impl RustcHitContext<'_> {
-    pub(super) fn accepts_diagnostics(&self, meta: &EntryMeta) -> bool {
-        super::rustc_diagnostics::diagnostics_match(self.args, meta)
+    pub(super) fn accepts_diagnostics(&self, key: &EntryKey, meta: &EntryMeta) -> bool {
+        super::rustc_diagnostics::diagnostics_match(self.args, key, meta)
     }
 
     /// Report a hit only after all artifacts restore successfully. Prediction
@@ -32,15 +34,15 @@ impl RustcHitContext<'_> {
         store: &Store,
         meta: &EntryMeta,
         result: EventResult,
-        cache_key: &str,
+        key: &EntryKey,
         key_ms: u64,
         key_hash_stats: FileHashStats,
         lookup_ms: u64,
         prediction_store: Option<&Store>,
-        key: &crate::cache_key::KeyOutputs,
+        key_outputs: &crate::cache_key::KeyOutputs,
         key_record: &KeyEventRecord,
     ) -> Result<()> {
-        if !self.accepts_diagnostics(meta) {
+        if !self.accepts_diagnostics(key, meta) {
             bail!("cached Rust diagnostics require their original terminal width");
         }
         let restore_start = Instant::now();
@@ -54,21 +56,37 @@ impl RustcHitContext<'_> {
             self.extra_inputs,
         )?;
         let restore_ms = restore_start.elapsed().as_millis() as u64;
+        let shown;
+        let meta = match self
+            .compiler
+            .diagnostics_for_display(self.args, &meta.stderr)
+        {
+            Cow::Borrowed(_) => meta,
+            Cow::Owned(stderr) => {
+                shown = EntryMeta {
+                    stderr,
+                    ..meta.clone()
+                };
+                &shown
+            }
+        };
+        let mut key_record = key_record.clone();
+        key_record.note_entry_key(key);
         HitCompletion {
             event_root: self.event_root,
             crate_name: self.crate_name,
             result,
-            cache_key,
+            cache_key: &key.key,
             start: self.start,
             key_ms,
             key_hash_stats,
             lookup_ms,
             restore_ms,
-            key_record: key_record.clone(),
+            key_record,
             object_output: String::new(),
         }
         .report(self.config, meta);
-        record_input_prediction(self.config, prediction_store, self.args, true, key);
+        record_input_prediction(self.config, prediction_store, self.args, true, key_outputs);
         clean_incremental_dir(self.config, self.args);
         Ok(())
     }

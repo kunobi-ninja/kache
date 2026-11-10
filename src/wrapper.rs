@@ -1202,6 +1202,21 @@ fn admit_scheduler_miss(
     is_link: bool,
     entry_ok: impl Fn(&EntryMeta) -> bool,
 ) -> (MissGuard, Option<EntryMeta>) {
+    admit_scheduler_miss_with(config, cache_key, identity, crate_name, is_link, || {
+        take_recheck_hit(store, cache_key, &entry_ok)
+    })
+}
+
+/// [`admit_scheduler_miss`] with the caller's own re-check, for a hit that
+/// may sit under another key than the flight's.
+fn admit_scheduler_miss_with<T>(
+    config: &Config,
+    cache_key: &str,
+    identity: FlightIdentity,
+    crate_name: &str,
+    is_link: bool,
+    mut recheck: impl FnMut() -> Option<T>,
+) -> (MissGuard, Option<T>) {
     if !config.scheduler {
         return (MissGuard::empty(), None);
     }
@@ -1216,12 +1231,92 @@ fn admit_scheduler_miss(
             config.test_lease.as_deref(),
         ) {
             scheduler::BeginMiss::Recheck => {
-                if let Some(meta) = take_recheck_hit(store, cache_key, &entry_ok) {
-                    return (MissGuard::empty(), Some(meta));
+                if let Some(hit) = recheck() {
+                    return (MissGuard::empty(), Some(hit));
                 }
             }
             scheduler::BeginMiss::Compile(guard) => return (guard, None),
         }
+    }
+}
+
+/// [`BuildClaim`] for a Rust key, whose entry may be under the shared key or
+/// this invocation's width key.
+enum RustcClaim {
+    Acquired(crate::store::KeyLock),
+    Committed(rustc_diagnostics::EntryKey, Box<EntryMeta>),
+    Contended,
+}
+
+/// [`Store::claim_build`] for Rust. The shared key's lock covers both keys,
+/// and an entry this invocation cannot use leaves the lock to it, so a width
+/// that misses still stores its own entry.
+fn claim_rustc_build(store: &Store, args: &RustcArgs, cache_key: &str) -> Result<RustcClaim> {
+    let Some(lock) = store.try_lock(cache_key)? else {
+        return Ok(RustcClaim::Contended);
+    };
+    for entry_key in rustc_diagnostics::lookup_keys(args, cache_key) {
+        match store.get(&entry_key.key)? {
+            Some(meta) if meta.files.is_empty() => {
+                tracing::warn!(
+                    "cache entry {} has no files, evicting before build",
+                    entry_key.key
+                );
+                store.remove_entry(&entry_key.key)?;
+            }
+            Some(meta) if rustc_diagnostics::diagnostics_match(args, &entry_key, &meta) => {
+                return Ok(RustcClaim::Committed(entry_key, Box::new(meta)));
+            }
+            _ => {}
+        }
+    }
+    Ok(RustcClaim::Acquired(lock))
+}
+
+/// The entry a peer holding the shared key's lock left for this invocation.
+/// It may land under this width's key, and the shared key may already hold
+/// an entry this width cannot use, so wait for the lock itself rather than
+/// for any shared entry.
+fn wait_for_rustc_peer(
+    store: &Store,
+    args: &RustcArgs,
+    cache_key: &str,
+) -> Option<(rustc_diagnostics::EntryKey, EntryMeta)> {
+    let usable = || {
+        rustc_diagnostics::usable_entry(store, args, cache_key)
+            .ok()
+            .flatten()
+    };
+    usable().or_else(|| {
+        crate::invocation::wait_for_committed(
+            store,
+            cache_key,
+            Some(crate::store::BUILD_LOCK_TIMEOUT),
+        )
+        .is_ok()
+        .then(usable)
+        .flatten()
+    })
+}
+
+/// After a peer held the build lock: its entry when this invocation can use
+/// it, else the lock, so this compile is stored. A peer at another terminal
+/// width that printed warnings stores only its own width's entry.
+fn wait_then_claim_rustc(
+    store: &Store,
+    args: &RustcArgs,
+    cache_key: &str,
+) -> (
+    Option<crate::store::KeyLock>,
+    Option<(rustc_diagnostics::EntryKey, EntryMeta)>,
+) {
+    if let Some(hit) = wait_for_rustc_peer(store, args, cache_key) {
+        return (None, Some(hit));
+    }
+    match claim_rustc_build(store, args, cache_key) {
+        Ok(RustcClaim::Acquired(lock)) => (Some(lock), None),
+        Ok(RustcClaim::Committed(key, meta)) => (None, Some((key, *meta))),
+        Ok(RustcClaim::Contended) | Err(_) => (None, None),
     }
 }
 
@@ -3815,6 +3910,7 @@ fn resolve_located_build_script_inputs(
                 args.invocation_env(),
             )
             .with_target_dir(args.target_dir().as_deref())
+            .with_profile_dir(args.profile_dir().as_deref())
             .with_base_dirs(&config.base_dirs)
         });
         crate::cache_key::source_path_identity(path, normalizer)
@@ -4501,34 +4597,40 @@ fn run_parsed_rustc(
     // `Some(stop_on_hit)` once the miss is to compile before its key.
     let mut compile_then_key = None;
     while precompiled.is_none() {
-        // 1. Check local store (volume shard, then main)
-        let lookup_start = std::time::Instant::now();
-        let lookup_result =
-            lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
-                lookup_local_entry(&store, &fallback_stores, &cache_key)
-            });
-        lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
-
+        // 1. Check local store (volume shard, then main), under the shared
+        // key and then the key for this terminal width.
         // A closure that came from a record is already recorded; re-writing it on
         // every hit would be a database write per compile for no new information.
         // A re-derivation is the opposite case: its closure is what the record
         // should have said, so writing it is what repairs a stale row.
-
-        if let Some((hit_store, meta)) = lookup_result {
+        for entry_key in rustc_diagnostics::lookup_keys(args, &cache_key) {
+            let lookup_start = std::time::Instant::now();
+            let lookup_result =
+                lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
+                    lookup_local_entry(&store, &fallback_stores, &entry_key.key)
+                });
+            lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
+            let Some((hit_store, meta)) = lookup_result else {
+                continue;
+            };
             // Safety: skip entries with no cached files (poisoned by earlier bugs)
             if meta.files.is_empty() {
                 tracing::warn!(
                     "cache entry for {} has no files, evicting and recompiling",
                     crate_name
                 );
-                let _ = hit_store.remove_entry(&cache_key);
-            } else if hit_context.accepts_diagnostics(&meta) {
-                tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
+                let _ = hit_store.remove_entry(&entry_key.key);
+            } else if hit_context.accepts_diagnostics(&entry_key, &meta) {
+                tracing::debug!(
+                    "local cache hit for {} ({})",
+                    crate_name,
+                    &entry_key.key[..16]
+                );
                 match hit_context.restore_and_finish(
                     hit_store,
                     &meta,
                     EventResult::LocalHit,
-                    &cache_key,
+                    &entry_key,
                     key_ms,
                     key_hash_stats,
                     lookup_ms,
@@ -4714,25 +4816,30 @@ fn run_parsed_rustc(
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then
     // claim the key and re-check under the build lock.
+    // The flight and build lock are the shared key's: one compile serves every
+    // terminal width when its output does not depend on the width.
     let (miss_guard, scheduled_hit) = if precompiled.is_none() {
-        admit_scheduler_miss(
+        admit_scheduler_miss_with(
             config,
-            &store,
             &cache_key,
             FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
             crate_name,
             args.invokes_linker(),
-            |meta| rustc_diagnostics::entry_usable(args, meta),
+            || {
+                rustc_diagnostics::usable_entry(&store, args, &cache_key)
+                    .ok()
+                    .flatten()
+            },
         )
     } else {
         (MissGuard::empty(), None)
     };
-    let (lock, committed) = if let Some(meta) = scheduled_hit {
-        (None, Some(meta))
+    let (lock, committed) = if let Some(hit) = scheduled_hit {
+        (None, Some(hit))
     } else {
-        match store.claim_build(&cache_key) {
-            Ok(BuildClaim::Acquired(lock)) => (Some(lock), None),
-            Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
+        match claim_rustc_build(&store, args, &cache_key) {
+            Ok(RustcClaim::Acquired(lock)) => (Some(lock), None),
+            Ok(RustcClaim::Committed(key, meta)) => (None, Some((key, *meta))),
             Err(e) => {
                 tracing::warn!(
                     "claiming build for {} failed: {} — recompiling",
@@ -4741,27 +4848,21 @@ fn run_parsed_rustc(
                 );
                 (None, None)
             }
-            Ok(BuildClaim::Contended) => {
+            Ok(RustcClaim::Contended) => {
                 // Another process is building this key — wait for it
                 tracing::debug!("waiting for {} to be built by another process", crate_name);
-                let committed = crate::invocation::wait_for_committed(&store, &cache_key, None)
-                    .unwrap_or(false)
-                    .then(|| store.get(&cache_key).ok().flatten())
-                    .flatten();
-                (None, committed)
+                wait_then_claim_rustc(&store, args, &cache_key)
             }
         }
     };
 
     let peer_committed = committed.is_some();
-    if let Some(meta) =
-        committed.filter(|meta| precompiled.is_none() && hit_context.accepts_diagnostics(meta))
-    {
+    if let Some((entry_key, meta)) = committed.filter(|_| precompiled.is_none()) {
         if let Err(e) = hit_context.restore_and_finish(
             &store,
             &meta,
             EventResult::LocalHit,
-            &cache_key,
+            &entry_key,
             key_ms,
             key_hash_stats,
             lookup_ms,
@@ -5000,17 +5101,8 @@ fn run_parsed_rustc(
     // A Windows executable finds its `.pdb` by the GUID, age and name it
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
-    let width_dependent = (args.diagnostic_width_can_be_shared()
-        && !rustc_diagnostics::width_independent(&result.stdout, &result.stderr))
-    .then(|| "compiler diagnostics require their original terminal width".to_string());
-    let unsafe_output = unaudited.or(degraded).or(unpaired);
-    let warn = unsafe_output.is_some();
-    if let Some(reason) = unsafe_output.or(width_dependent) {
-        if warn {
-            tracing::warn!("not caching {crate_name}: {reason}");
-        } else {
-            tracing::debug!("not caching {crate_name}: {reason}");
-        }
+    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
+        tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
             config,
@@ -5026,6 +5118,11 @@ fn run_parsed_rustc(
         drop(lock);
         return Ok(result.exit_code);
     }
+
+    // Rendered diagnostics from a terminal-width invocation go under that
+    // width's key; everything else under the shared key.
+    let entry_key = rustc_diagnostics::store_key(args, &cache_key, &result.stdout, &result.stderr);
+    key_record.note_entry_key(&entry_key);
 
     // Put-side admission control: the compile already ran and its outputs are
     // in place; a configured threshold may decline local retention. A writable
@@ -5044,7 +5141,7 @@ fn run_parsed_rustc(
                 .rebuilt_observed(rebuilt.clone())
                 .skip_reason("admission-threshold")
                 .compile_time_ms(compile_time_ms)
-                .keyed(&cache_key, key_ms, key_hash_stats)
+                .keyed(&entry_key.key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
                 .key_record(key_record),
         );
@@ -5076,6 +5173,7 @@ fn run_parsed_rustc(
         config,
         depinfo_workspace_dir,
         depinfo_anchor.as_deref(),
+        args.profile_dir().as_deref(),
         args.invocation_env(),
     );
 
@@ -5163,7 +5261,7 @@ fn run_parsed_rustc(
                     .rebuilt_observed(rebuilt.clone())
                     .skip_reason(format!("artifact-staging: {error:#}"))
                     .compile_time_ms(compile_time_ms)
-                    .keyed(&cache_key, key_ms, key_hash_stats)
+                    .keyed(&entry_key.key, key_ms, key_hash_stats)
                     .lookup_ms(lookup_ms)
                     .key_record(key_record),
             );
@@ -5192,7 +5290,7 @@ fn run_parsed_rustc(
                 .rebuilt_observed(rebuilt.clone())
                 .skip_reason(compiled_without_lock_reason(peer_committed))
                 .compile_time_ms(compile_time_ms)
-                .keyed(&cache_key, key_ms, key_hash_stats)
+                .keyed(&entry_key.key, key_ms, key_hash_stats)
                 .lookup_ms(lookup_ms)
                 .key_record(key_record),
         );
@@ -5213,7 +5311,7 @@ fn run_parsed_rustc(
         .and_then(|version| version.lines().next())
         .and_then(|line| line.strip_prefix("rustc "));
     let put = store.put_rustc_with_compile_time(
-        &cache_key,
+        &entry_key.key,
         crate_name,
         &args.crate_types,
         &args.features,
@@ -5233,14 +5331,14 @@ fn run_parsed_rustc(
         Ok(result) => {
             store_put = result;
             if let Some(unit) = args.get_codegen_opt("metadata")
-                && let Err(e) = store.record_entry_unit(&cache_key, unit)
+                && let Err(e) = store.record_entry_unit(&entry_key.key, unit)
             {
                 tracing::debug!("recording the unit of {crate_name}'s entry failed: {e}");
             }
             // A large executable just stored is the next build's restore.
             if stores_prestage_candidate(&prepared_store.files)
                 && let Some(output_dir) = rustc_output_dir(args)
-                && let Some(meta) = store.stored_meta(&cache_key)
+                && let Some(meta) = store.stored_meta(&entry_key.key)
             {
                 let shared = shared_inode_loadable(
                     args,
@@ -5248,7 +5346,7 @@ fn run_parsed_rustc(
                 );
                 remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
             }
-            flush_or_hand_off_durability(config, &store, &cache_key);
+            flush_or_hand_off_durability(config, &store, &entry_key.key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
         // unit re-compiling on every build while the aggregate hit rate barely
@@ -5268,7 +5366,7 @@ fn run_parsed_rustc(
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     // 6. Queue remote publication through the shared durable upload path.
-    maybe_enqueue_upload(config, &store, &cache_key, crate_name, true);
+    maybe_enqueue_upload(config, &store, &entry_key.key, crate_name, true);
 
     record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
 
@@ -5284,7 +5382,7 @@ fn run_parsed_rustc(
             .rebuilt_observed(rebuilt)
             .compile_time_ms(compile_time_ms)
             .size(size)
-            .keyed(&cache_key, key_ms, key_hash_stats)
+            .keyed(&entry_key.key, key_ms, key_hash_stats)
             .lookup_ms(lookup_ms)
             .store_ms(store_ms)
             .store_put(store_put)
@@ -5693,10 +5791,12 @@ fn configured_rustc_depinfo_roots(
     config: &Config,
     workspace_root: Option<&Path>,
     target_dir: Option<&Path>,
+    profile_dir: Option<&Path>,
     env: &crate::invocation::InvocationEnv,
 ) -> Vec<(PathBuf, String, u8)> {
     crate::path_normalizer::PathNormalizer::from_invocation(workspace_root, env)
         .with_target_dir(target_dir)
+        .with_profile_dir(profile_dir)
         .with_base_dirs(&config.base_dirs)
         .depinfo_source_roots()
         .into_iter()
@@ -6602,7 +6702,7 @@ fn adaptive_compile_before_key(
             return true;
         };
         let lookup_start = std::time::Instant::now();
-        let stored = ctx.store.get(&keyed.cache_key);
+        let stored = rustc_diagnostics::usable_entry(ctx.store, ctx.args, &keyed.cache_key);
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
         (key_ms, key_hash_stats, _) = combine_key_measurements(
             key_ms,
@@ -6613,11 +6713,11 @@ fn adaptive_compile_before_key(
             false,
         );
         match stored {
-            Ok(Some(meta)) if rustc_diagnostics::entry_usable(ctx.args, &meta) => {
+            Ok(Some(_)) => {
                 hit_closure = Some((dep_info, tree_guard.clone()));
                 false
             }
-            Ok(_) => {
+            Ok(None) => {
                 if let Some(fields) = &keyed.outputs.fields {
                     observed = Some((keyed.cache_key, fields.clone()));
                 }
@@ -6720,6 +6820,7 @@ fn adaptive_compile_before_key(
     );
     after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
     let _ = lease.finish(outcome);
     let cache_key = observed.as_ref().map_or("", |(key, _)| key.as_str());
     log_event(
@@ -6739,6 +6840,7 @@ fn adaptive_compile_before_key(
         .keyed(cache_key, key_ms, key_hash_stats)
         .lookup_ms(lookup_ms)
         .passthrough_reason("adaptive seed".to_owned())
+        .incremental_seed(seeded_from.as_deref())
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -6797,11 +6899,8 @@ fn compile_before_key(
             };
             let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
             let stored = keyed.ok().is_some_and(|keyed| {
-                ctx.store
-                    .get(&keyed.cache_key)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|meta| rustc_diagnostics::entry_usable(args, &meta))
+                rustc_diagnostics::usable_entry(ctx.store, args, &keyed.cache_key)
+                    .is_ok_and(|entry| entry.is_some())
             });
             if stored {
                 hit_closure = Some((dep_info, tree.clone()));
@@ -7372,6 +7471,7 @@ fn compute_rustc_cache_key(
         args.invocation_env(),
     )
     .with_target_dir(args.target_dir().as_deref())
+    .with_profile_dir(args.profile_dir().as_deref())
     .with_base_dirs(&config.base_dirs)
     .with_path_only_env_vars(config.path_only_env_vars.clone())
     .with_rust_src_rule(
@@ -7565,28 +7665,33 @@ fn try_rustc_remote_hit(
     key: &crate::cache_key::KeyOutputs,
     key_record: &KeyEventRecord,
 ) -> Option<Result<()>> {
-    let (meta, result) = acquire_entry(
-        hit.config,
-        store,
-        cache_key,
-        hit.crate_name,
-        NegativeReply::CheckConcurrentEntry,
-    )?;
-    if !hit.accepts_diagnostics(&meta) {
-        return None;
+    for entry_key in rustc_diagnostics::lookup_keys(hit.args, cache_key) {
+        let Some((meta, result)) = acquire_entry(
+            hit.config,
+            store,
+            &entry_key.key,
+            hit.crate_name,
+            NegativeReply::CheckConcurrentEntry,
+        ) else {
+            continue;
+        };
+        if !hit.accepts_diagnostics(&entry_key, &meta) {
+            continue;
+        }
+        return Some(hit.restore_and_finish(
+            store,
+            &meta,
+            result,
+            &entry_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            record_closure.then_some(store),
+            key,
+            key_record,
+        ));
     }
-    Some(hit.restore_and_finish(
-        store,
-        &meta,
-        result,
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        lookup_ms,
-        record_closure.then_some(store),
-        key,
-        key_record,
-    ))
+    None
 }
 
 /// Tell the file-hash memo what these just-restored artifacts hash to
@@ -7989,6 +8094,7 @@ fn restore_from_cache_with_memo_store(
         config,
         depinfo_workspace_dir,
         cargo_target_dir.as_deref(),
+        args.profile_dir().as_deref(),
         args.invocation_env(),
     );
 
@@ -8698,6 +8804,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     );
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
+    let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
     let kept = lease.finish(outcome);
     tracing::debug!(
         ?kind,
@@ -8721,6 +8828,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         .keyed(cache_key, key_ms, key_hash_stats)
         .lookup_ms(lookup_ms)
         .passthrough_reason(reason)
+        .incremental_seed(seeded_from.as_deref())
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -9219,6 +9327,7 @@ pub(crate) struct EventInputs<'a> {
     store_put: StorePutResult,
     passthrough_reason: String,
     skip_reason: String,
+    incremental_seed: String,
     object_output: String,
     package: String,
     store_error: String,
@@ -9253,6 +9362,7 @@ impl<'a> EventInputs<'a> {
             store_put: StorePutResult::default(),
             passthrough_reason: String::new(),
             skip_reason: String::new(),
+            incremental_seed: String::new(),
             object_output: String::new(),
             package: String::new(),
             store_error: String::new(),
@@ -9369,6 +9479,12 @@ impl<'a> EventInputs<'a> {
         self
     }
 
+    /// The other checkout's profile whose incremental state seeded the compile.
+    pub(crate) fn incremental_seed(mut self, donor: Option<&Path>) -> Self {
+        self.incremental_seed = donor.map_or_else(String::new, |donor| donor.display().to_string());
+        self
+    }
+
     pub(crate) fn skip_reason(mut self, reason: impl Into<String>) -> Self {
         self.skip_reason = reason.into();
         self
@@ -9481,6 +9597,7 @@ pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
         config.event_log_max_size,
         config.event_log_keep_lines,
         &config.cache_dir,
+        events::ArchiveLimits::from_config(config),
     );
     let _ = events::rotate_transfers_if_needed(
         &config.transfer_log_path(),
@@ -9520,6 +9637,14 @@ impl KeyEventRecord {
         self.extern_units = outputs.extern_units.clone();
         self.unit_id = outputs.unit_id.clone();
     }
+
+    /// Name the terminal width an entry key was derived for, so a miss
+    /// explained against a hit at another width says what changed.
+    fn note_entry_key(&mut self, key: &rustc_diagnostics::EntryKey) {
+        if let (Some(columns), Some(fields)) = (key.width, self.fields.as_mut()) {
+            fields.insert("diagnostic_width".to_string(), columns.to_string());
+        }
+    }
 }
 
 /// The event for one invocation, built from its measurements and this
@@ -9542,6 +9667,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_put,
         passthrough_reason,
         skip_reason,
+        incremental_seed,
         object_output,
         package,
         store_error,
@@ -9667,6 +9793,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         restore_copy_other_bytes: crate::opcounts::restore_copy_other_bytes(),
         passthrough_reason,
         skip_reason,
+        incremental_seed,
         miss_reason,
         object_output,
         package,

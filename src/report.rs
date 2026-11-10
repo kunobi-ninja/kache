@@ -839,6 +839,10 @@ pub struct BypassDetail {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_attempt: Option<crate::fallback::Attempt>,
+    /// The other checkout's Cargo profile whose incremental state seeded
+    /// this compile.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_seed: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2089,6 +2093,7 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
         route: bypass_route(e).to_string(),
         reason: bypass_reason(e),
         fallback_attempt: e.fallback_attempt.clone(),
+        incremental_seed: e.incremental_seed.clone(),
         start_time,
         end_time,
         start_unix_ms,
@@ -2111,6 +2116,18 @@ fn bypass_detail_reason(detail: &BypassDetail) -> String {
         ),
         None => reason,
     }
+}
+
+/// Why `detail` was not cached, in words, and where its incremental state
+/// came from when another checkout seeded it.
+pub(crate) fn bypass_detail_words(detail: &BypassDetail, words: String) -> String {
+    if detail.incremental_seed.is_empty() {
+        return words;
+    }
+    format!(
+        "{words}; seeded from {}",
+        crate::term::home_path(std::path::Path::new(&detail.incremental_seed))
+    )
 }
 
 fn bypass_reason_words(reason: &BypassReason) -> String {
@@ -2961,7 +2978,7 @@ fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
                 detail.route,
                 crate::term::duration_ms(detail.elapsed_ms),
                 format_exit_code(detail.exit_code),
-                markdown_cell(&bypass_detail_reason(detail)),
+                markdown_cell(&bypass_detail_words(detail, bypass_detail_reason(detail))),
             ));
         }
     }
@@ -4497,7 +4514,10 @@ pub fn format_text(report: &BuildReport) -> String {
                         detail.crate_name.clone(),
                         term::duration_ms(detail.elapsed_ms),
                         format_exit_code(detail.exit_code),
-                        uncached_reason_words(&bypass_detail_reason(detail)),
+                        bypass_detail_words(
+                            detail,
+                            uncached_reason_words(&bypass_detail_reason(detail)),
+                        ),
                     ]
                 })
                 .collect();

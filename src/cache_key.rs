@@ -272,6 +272,16 @@ mod apple_install_name;
 // the client's PATH), and its content hash is folded. A linker that cannot be
 // placed fails closed to passthrough. Every native Linux link key changes.
 //
+// v34: source paths inside the unit's Cargo profile directory,
+// `<target>/[<triple>/]<profile>`, key as `<PROFILE>` and remap to
+// `/kache/profile`. Custom profiles that inherit `dev` compile identically and
+// share Cargo's metadata hash, but a crate that `include!`s from `OUT_DIR`
+// kept the profile name in its source identity and in `file!()` and debug
+// info, so it and everything downstream missed under the other profile.
+// Dep-info stores those sources against the profile root, and an rlib's
+// `-L native=` directory in its own `OUT_DIR` is keyed below the profile
+// directory instead of the target directory.
+//
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or `OUT_DIR` sits under it. Those are
 // the paths rustc writes into the rmeta; `--out-dir` reaches dep-info, which
@@ -1829,14 +1839,16 @@ fn out_dir_native_search_identity(
     if args.is_test || !args.emits_rlib() || args.links_native_closure() || args.skip_path_remap() {
         return None;
     }
-    let target = args.target_dir()?;
+    // Below the profile directory when Cargo's layout names one, so a custom
+    // profile shares the key; the search path itself is never baked.
+    let root = args.profile_dir().or_else(|| args.target_dir())?;
     let out_dir = Path::new(out_dir?);
     if !out_dir.is_absolute() {
         return None;
     }
-    // target_dir is resolved against the invocation, so this prefix match
+    // The root is resolved against the invocation, so this prefix match
     // also requires an absolute search path.
-    let rest = path.strip_prefix(&target).ok()?;
+    let rest = path.strip_prefix(&root).ok()?;
     if rest.as_os_str().is_empty()
         || rest
             .components()
@@ -3080,15 +3092,32 @@ fn resolve_key_inputs(
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
             let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
-            owns_flight = flight.lock.is_some();
-            *file_hasher.discovery_flight.borrow_mut() = flight.lock;
+            let mut lock = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The
             // tree is digested again: the owner's record carries the digest
             // from before its compile, and the tree may have changed since.
             if flight.waited {
                 prediction = predicted_key_inputs(args, file_hasher, &mut out.tree_guard);
+                // The owner left nothing this process can use, typically a
+                // record of another checkout's tree. Owning the flight would
+                // queue every later checkout behind this compile too, one
+                // compile at a time. Release it and key the way a peer
+                // without the flight does: a peer with the same key still
+                // waits on the compile flight and restores the entry.
+                if let Err(reason) = &prediction
+                    && lock.take().is_some()
+                {
+                    crate::phase_trace::decision("discovery_flight", "released");
+                    tracing::debug!(
+                        "[key:{}] discovery flight released: the owner's result is unusable here ({})",
+                        crate_name,
+                        reason.as_str()
+                    );
+                }
             }
+            owns_flight = lock.is_some();
+            *file_hasher.discovery_flight.borrow_mut() = lock;
         }
         match prediction {
             Ok(dep_info) => {

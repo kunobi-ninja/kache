@@ -193,7 +193,16 @@ mod tests {
         });
         let event = BuildEvent::new_for_test("next", EventResult::Miss);
         assert!(log_event_for_build(&path, &event).is_err());
-        assert!(rotate_events_if_needed(&path, 1, 1, dir.path()).is_err());
+        assert!(
+            rotate_events_if_needed(
+                &path,
+                1,
+                1,
+                dir.path(),
+                crate::events::ArchiveLimits::default()
+            )
+            .is_err()
+        );
         assert!(rotate_transfers_if_needed(&path, 1, 1).is_err());
         assert_eq!(fs::read(&path).unwrap(), line("original"));
         drop(release_tx);

@@ -499,6 +499,48 @@ fn shows_reads(target_dir: &Path) -> std::io::Result<bool> {
     can_prune(local, || probe_reads(target_dir))
 }
 
+/// Whether [`prune`] can work in a directory, as `kache doctor` reports it.
+#[derive(Debug)]
+pub(crate) enum Support {
+    Works,
+    /// Not a local filesystem, where Cargo does not lock build directories.
+    NotLocal,
+    /// A filesystem kache does not know to be local, so it is left alone.
+    LocalityUnknown,
+    /// Reads do not move access times there (`noatime`, for one).
+    ReadsHidden,
+    /// The probe could not run, as on a full volume.
+    Unknown(std::io::Error),
+}
+
+/// [`Support`] in `dir`, which must exist.
+pub(crate) fn support(dir: &Path) -> Support {
+    let verdict = crate::cache_fs::classify(&crate::cache_fs::probe(dir));
+    support_from(locality(&verdict), || probe_reads(dir))
+}
+
+/// Whether a filesystem is local: `None` when kache cannot tell.
+fn locality(verdict: &crate::cache_fs::CacheFsVerdict) -> Option<bool> {
+    match verdict {
+        crate::cache_fs::CacheFsVerdict::Local => Some(true),
+        crate::cache_fs::CacheFsVerdict::Unknown => None,
+        crate::cache_fs::CacheFsVerdict::NotLocal { .. } => Some(false),
+    }
+}
+
+fn support_from(local: Option<bool>, reads: impl FnOnce() -> std::io::Result<bool>) -> Support {
+    match local {
+        Some(true) => {}
+        Some(false) => return Support::NotLocal,
+        None => return Support::LocalityUnknown,
+    }
+    match reads() {
+        Ok(true) => Support::Works,
+        Ok(false) => Support::ReadsHidden,
+        Err(error) => Support::Unknown(error),
+    }
+}
+
 /// Pruning needs a local filesystem, where Cargo locks its build
 /// directories, that also shows reads. `reads` is only asked when local.
 fn can_prune(local: bool, reads: impl FnOnce() -> std::io::Result<bool>) -> std::io::Result<bool> {
@@ -1693,5 +1735,46 @@ mod tests {
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn locality_keeps_an_unknown_filesystem_unknown() {
+        use crate::cache_fs::CacheFsVerdict;
+        assert_eq!(locality(&CacheFsVerdict::Local), Some(true));
+        assert_eq!(locality(&CacheFsVerdict::Unknown), None);
+        let remote = CacheFsVerdict::NotLocal {
+            name: "nfs".to_string(),
+        };
+        assert_eq!(locality(&remote), Some(false));
+    }
+
+    #[test]
+    fn support_tells_why_pruning_cannot_work() {
+        let asked = std::cell::Cell::new(false);
+        let support = support_from(Some(false), || {
+            asked.set(true);
+            Ok(true)
+        });
+        assert!(matches!(support, Support::NotLocal));
+        assert!(matches!(
+            support_from(None, || {
+                asked.set(true);
+                Ok(true)
+            }),
+            Support::LocalityUnknown
+        ));
+        assert!(!asked.get(), "only a local filesystem is probed");
+        assert!(matches!(
+            support_from(Some(true), || Ok(true)),
+            Support::Works
+        ));
+        assert!(matches!(
+            support_from(Some(true), || Ok(false)),
+            Support::ReadsHidden
+        ));
+        assert!(matches!(
+            support_from(Some(true), || Err(std::io::ErrorKind::StorageFull.into())),
+            Support::Unknown(_)
+        ));
     }
 }

@@ -3,6 +3,10 @@ use std::time::{Duration, Instant};
 
 const CACHE_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+fn shared_key() -> rustc_diagnostics::EntryKey {
+    rustc_diagnostics::EntryKey::shared(CACHE_KEY)
+}
+
 /// A key record whose group digests an event can be checked for.
 fn key_record() -> KeyEventRecord {
     let mut record = KeyEventRecord::default();
@@ -107,14 +111,18 @@ impl Fixture {
     }
 
     fn publish(&self) {
-        let entry_dir = self.store.entry_dir(CACHE_KEY);
+        self.publish_under(CACHE_KEY);
+    }
+
+    fn publish_under(&self, key: &str) {
+        let entry_dir = self.store.entry_dir(key);
         std::fs::create_dir_all(&entry_dir).unwrap();
         std::fs::write(
             entry_dir.join("meta.json"),
             serde_json::to_vec(&self.meta).unwrap(),
         )
         .unwrap();
-        self.store.insert_entry_row_for_test(CACHE_KEY);
+        self.store.insert_entry_row_for_test(key);
     }
 }
 
@@ -123,42 +131,44 @@ fn shared_width_fixture() -> Fixture {
     let mut argv = vec![fixture.args.rustc.display().to_string()];
     argv.extend_from_slice(&fixture.args.all_args);
     argv.extend([
-        "--cap-lints=allow".to_string(),
-        "--force-warn=unused_crate_dependencies".to_string(),
         "--error-format=json".to_string(),
-        "--json=artifacts,future-incompat,unused-externs-silent".to_string(),
+        "--json=artifacts,future-incompat".to_string(),
+        "--diagnostic-width=80".to_string(),
     ]);
     fixture.args = RustcArgs::parse(&argv).unwrap();
     fixture
 }
 
+fn width_key() -> rustc_diagnostics::EntryKey {
+    rustc_diagnostics::lookup_keys(&shared_width_fixture().args, CACHE_KEY)
+        .pop()
+        .filter(|key| key.width == Some(80))
+        .unwrap()
+}
+
 #[test]
 fn shared_width_entry_eligibility_requires_files_and_compatible_diagnostics() {
     let mut fixture = shared_width_fixture();
-    assert!(!rustc_diagnostics::entry_usable(
-        &fixture.args,
-        &fixture.meta
-    ));
+    let usable = |args: &RustcArgs, key: &rustc_diagnostics::EntryKey, meta: &EntryMeta| {
+        rustc_diagnostics::entry_usable(args, key, meta)
+    };
     let ordinary = Fixture::new();
-    assert!(rustc_diagnostics::entry_usable(
-        &ordinary.args,
-        &fixture.meta
-    ));
+    // Rendered output: only the width's own key, or an invocation without a
+    // width, may replay it.
+    assert!(!usable(&fixture.args, &shared_key(), &fixture.meta));
+    assert!(usable(&fixture.args, &width_key(), &fixture.meta));
+    assert!(usable(&ordinary.args, &shared_key(), &fixture.meta));
     fixture.meta.stdout.clear();
     fixture.meta.stderr.clear();
-    assert!(rustc_diagnostics::entry_usable(
-        &fixture.args,
-        &fixture.meta
-    ));
+    assert!(usable(&fixture.args, &shared_key(), &fixture.meta));
     fixture.meta.files.clear();
-    assert!(!rustc_diagnostics::entry_usable(
-        &fixture.args,
-        &fixture.meta
-    ));
-    assert!(!rustc_diagnostics::entry_usable(
-        &ordinary.args,
-        &fixture.meta
-    ));
+    for (args, key) in [
+        (&fixture.args, shared_key()),
+        (&fixture.args, width_key()),
+        (&ordinary.args, shared_key()),
+    ] {
+        assert!(!usable(args, &key, &fixture.meta));
+    }
 }
 
 #[test]
@@ -187,7 +197,7 @@ fn shared_width_policy_miss_reacquires_the_scheduler_flight_after_contention() {
                     if file_only {
                         cache_entry_has_files(meta)
                     } else {
-                        rustc_diagnostics::entry_usable(&args, meta)
+                        rustc_diagnostics::entry_usable(&args, &shared_key(), meta)
                     }
                 },
             )
@@ -224,7 +234,11 @@ fn shared_width_hits_reject_legacy_diagnostics_before_restoring_any_output() {
     ] {
         fixture.meta.stdout = stdout.to_string();
         fixture.meta.stderr = stderr.to_string();
-        assert!(!fixture.context().accepts_diagnostics(&fixture.meta));
+        assert!(
+            !fixture
+                .context()
+                .accepts_diagnostics(&shared_key(), &fixture.meta)
+        );
         for result in [
             EventResult::LocalHit,
             EventResult::RemoteHit,
@@ -236,7 +250,7 @@ fn shared_width_hits_reject_legacy_diagnostics_before_restoring_any_output() {
                     &fixture.store,
                     &fixture.meta,
                     result,
-                    CACHE_KEY,
+                    &shared_key(),
                     0,
                     FileHashStats::default(),
                     0,
@@ -275,14 +289,14 @@ fn shared_width_concurrent_winner_is_validated_before_restore() {
     let BuildClaim::Committed(meta) = fixture.store.claim_build(CACHE_KEY).unwrap() else {
         panic!("published concurrent entry must be visible");
     };
-    assert!(!fixture.context().accepts_diagnostics(&meta));
+    assert!(!fixture.context().accepts_diagnostics(&shared_key(), &meta));
     let error = fixture
         .context()
         .restore_and_finish(
             &fixture.store,
             &meta,
             EventResult::LocalHit,
-            CACHE_KEY,
+            &shared_key(),
             0,
             FileHashStats::default(),
             0,
@@ -297,20 +311,135 @@ fn shared_width_concurrent_winner_is_validated_before_restore() {
 }
 
 #[test]
+fn width_claim_keeps_the_lock_past_a_rendered_shared_entry() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = shared_width_fixture();
+    fixture.meta.stdout.clear();
+    fixture.meta.stderr =
+        r#"{"$message_type":"diagnostic","rendered":"piped warning"}"#.to_string();
+    fixture.publish();
+    // A piped compile's rendered entry cannot serve this width, so this
+    // invocation compiles and must own the lock to store its own entry.
+    let RustcClaim::Acquired(lock) =
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+    else {
+        panic!("a width must claim past a rendered shared entry");
+    };
+    drop(lock);
+    let piped = Fixture::new();
+    let RustcClaim::Committed(key, _) =
+        claim_rustc_build(&fixture.store, &piped.args, CACHE_KEY).unwrap()
+    else {
+        panic!("a piped compile must use the piped entry");
+    };
+    assert_eq!(key, shared_key());
+
+    fixture.publish_under(&width_key().key);
+    let RustcClaim::Committed(key, _) =
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+    else {
+        panic!("a peer's entry for this width must be found");
+    };
+    assert_eq!(key, width_key());
+    let (key, _) = rustc_diagnostics::usable_entry(&fixture.store, &fixture.args, CACHE_KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(key, width_key());
+}
+
+#[test]
+fn width_waiter_waits_past_a_rendered_shared_entry_for_its_own() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = shared_width_fixture();
+    fixture.meta.stdout.clear();
+    fixture.meta.stderr =
+        r#"{"$message_type":"diagnostic","rendered":"piped warning"}"#.to_string();
+    fixture.publish();
+    let held = fixture.store.try_lock(CACHE_KEY).unwrap().unwrap();
+    let config = fixture.config.clone();
+    let width = width_key().key;
+    let meta = fixture.meta.clone();
+    let peer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let store = Store::open(&config).unwrap();
+        let entry_dir = store.entry_dir(&width);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&width);
+        drop(held);
+    });
+    let (key, _) = wait_for_rustc_peer(&fixture.store, &fixture.args, CACHE_KEY)
+        .expect("the peer's entry for this width");
+    assert_eq!(key, width_key());
+    peer.join().unwrap();
+}
+
+#[test]
+fn a_claim_evicts_an_entry_without_files_and_builds() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let mut fixture = Fixture::new();
+    fixture.meta.files.clear();
+    fixture.publish();
+    let RustcClaim::Acquired(_lock) =
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+    else {
+        panic!("an entry without files cannot be restored");
+    };
+    assert!(fixture.store.get(CACHE_KEY).unwrap().is_none());
+}
+
+#[test]
+fn a_waiter_whose_peer_stored_another_width_claims_the_build() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let fixture = shared_width_fixture();
+    let held = fixture.store.try_lock(CACHE_KEY).unwrap().unwrap();
+    let config = fixture.config.clone();
+    let other_width = rustc_diagnostics::EntryKey::for_width(CACHE_KEY, 200).key;
+    let meta = fixture.meta.clone();
+    let peer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let store = Store::open(&config).unwrap();
+        let entry_dir = store.entry_dir(&other_width);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        store.insert_entry_row_for_test(&other_width);
+        drop(held);
+    });
+    // Nothing this width can use: it compiles, and must hold the lock to
+    // store its own entry instead of compiling uncached.
+    let (lock, hit) = wait_then_claim_rustc(&fixture.store, &fixture.args, CACHE_KEY);
+    assert!(hit.is_none());
+    assert!(lock.is_some(), "the waiter must claim the build");
+    peer.join().unwrap();
+}
+
+#[test]
 fn shared_width_safe_legacy_entry_still_restores() {
     let _lock = crate::test_support::process_state_test_lock();
     let mut fixture = shared_width_fixture();
     fixture.meta.key_schema = 0;
     fixture.meta.stdout.clear();
     fixture.meta.stderr = r#"{"$message_type":"unused_extern","lint_level":"force-warn","unused_extern_names":["dep"]}"#.to_string();
-    assert!(fixture.context().accepts_diagnostics(&fixture.meta));
+    assert!(
+        fixture
+            .context()
+            .accepts_diagnostics(&shared_key(), &fixture.meta)
+    );
     fixture
         .context()
         .restore_and_finish(
             &fixture.store,
             &fixture.meta,
             EventResult::LocalHit,
-            CACHE_KEY,
+            &shared_key(),
             0,
             FileHashStats::default(),
             0,
@@ -359,7 +488,8 @@ fn shared_width_remote_and_prefetch_unsafe_entries_are_policy_misses() {
             )
             .is_none()
         );
-        assert_eq!(daemon.request_count(), 1);
+        // The shared key, then this width's key, which holds nothing.
+        assert_eq!(daemon.request_count(), 2);
         assert!(!fixture.args.out_dir.as_ref().unwrap().exists());
         assert!(!fixture.config.event_log_path().exists());
         assert!(fixture.args.incremental.as_ref().unwrap().exists());
@@ -385,7 +515,7 @@ fn completion_child() {
         &fixture.store,
         &fixture.meta,
         result,
-        CACHE_KEY,
+        &shared_key(),
         41,
         FileHashStats {
             cache_hits: 3,
@@ -511,7 +641,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
             &fallback,
             &fixture.meta,
             EventResult::LocalHit,
-            CACHE_KEY,
+            &shared_key(),
             0,
             FileHashStats::default(),
             0,
@@ -538,7 +668,7 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
             &fallback,
             &fixture.meta,
             EventResult::LocalHit,
-            CACHE_KEY,
+            &shared_key(),
             0,
             FileHashStats::default(),
             0,
@@ -681,7 +811,7 @@ fn readonly_hit_records_restored_output_hashes_in_the_primary_store() {
         &readonly,
         &meta,
         EventResult::LocalHit,
-        CACHE_KEY,
+        &shared_key(),
         0,
         FileHashStats::default(),
         0,
@@ -752,7 +882,7 @@ fn incomplete_or_mismatched_executable_pairs_never_publish_a_hit() {
                     &fixture.store,
                     &fixture.meta,
                     result,
-                    CACHE_KEY,
+                    &shared_key(),
                     0,
                     FileHashStats::default(),
                     0,
@@ -847,7 +977,7 @@ fn unidentifiable_executable_entries_evict_only_the_writable_source() {
                         source,
                         &fixture.meta,
                         result,
-                        CACHE_KEY,
+                        &shared_key(),
                         0,
                         FileHashStats::default(),
                         0,

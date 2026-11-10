@@ -19,6 +19,8 @@ use super::{
     classify_by_filename,
 };
 
+mod diagnostic_paths;
+
 pub const RUSTC_ID: CompilerId = CompilerId::new("rustc");
 pub const ADAPTER: CompilerAdapter = CompilerAdapter::new(RUSTC_ID, "Rust compiler", |args, _| {
     RustcCompiler::recognizes(args)
@@ -263,6 +265,41 @@ impl RustcCompiler {
         )
     }
 
+    /// The rules rustc's `--remap-path-prefix` flags come from. The
+    /// invocation and key must use the same path-normalization rules.
+    fn path_normalizer(&self, parsed: &RustcArgs) -> crate::path_normalizer::PathNormalizer {
+        crate::path_normalizer::PathNormalizer::from_invocation(
+            parsed.path_normalization_root(),
+            &self.invocation_env,
+        )
+        .with_target_dir(parsed.target_dir().as_deref())
+        .with_profile_dir(parsed.profile_dir().as_deref())
+        .with_base_dirs(&self.base_dirs)
+        .with_rust_src_rule(
+            crate::cache_key::get_rustc_sysroot_for(parsed, &self.invocation_env).as_deref(),
+            crate::cache_key::get_rustc_commit_hash_for(&parsed.rustc, &self.invocation_env)
+                .as_deref(),
+        )
+    }
+
+    /// Cached rustc stderr as this invocation shows it: remapped roots are
+    /// replaced by real ones. The stored text is not changed.
+    pub(crate) fn diagnostics_for_display<'a>(
+        &self,
+        parsed: &RustcArgs,
+        stderr: &'a str,
+    ) -> Cow<'a, str> {
+        if parsed.skip_path_remap() {
+            return Cow::Borrowed(stderr);
+        }
+        restore_diagnostic_paths(
+            stderr,
+            || self.path_normalizer(parsed).diagnostic_roots(),
+            parsed,
+            &self.invocation_env,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_with_args(
         &self,
@@ -274,19 +311,7 @@ impl RustcCompiler {
         metadata_sink: Option<&mut dyn std::io::Write>,
         on_dep_info: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<CompileResult> {
-        // The invocation and key must use the same path-normalization rules.
-        let workspace_root = parsed.path_normalization_root();
-        let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
-            workspace_root,
-            &self.invocation_env,
-        )
-        .with_target_dir(parsed.target_dir().as_deref())
-        .with_base_dirs(&self.base_dirs)
-        .with_rust_src_rule(
-            crate::cache_key::get_rustc_sysroot_for(parsed, &self.invocation_env).as_deref(),
-            crate::cache_key::get_rustc_commit_hash_for(&parsed.rustc, &self.invocation_env)
-                .as_deref(),
-        );
+        let path_normalizer = self.path_normalizer(parsed);
         let skip_remap = skip_remap_override.unwrap_or_else(|| parsed.skip_path_remap());
         let injected: Vec<String> = [
             macos_oso_prefix_flag(parsed, all_args, lane),
@@ -337,6 +362,19 @@ impl RustcCompiler {
             metadata_sink.as_mut(),
             on_dep_info,
         );
+        let result = result.map(|mut result| {
+            if !skip_remap
+                && let Cow::Owned(stderr) = restore_diagnostic_paths(
+                    result.pending_stderr(),
+                    || path_normalizer.diagnostic_roots(),
+                    parsed,
+                    &self.invocation_env,
+                )
+            {
+                result.pending_stderr = Some(stderr);
+            }
+            result
+        });
         // Capture can succeed before a later output-discovery error. Keep
         // the same retry barrier around the complete compiler result.
         match metadata_sink {
@@ -344,6 +382,44 @@ impl RustcCompiler {
             None => result,
         }
     }
+}
+
+/// `roots` runs only once a line may show a remapped path, so a cache hit
+/// with plain output never builds them.
+fn restore_diagnostic_paths<'a>(
+    stderr: &'a str,
+    roots: impl FnOnce() -> Vec<crate::path_normalizer::DiagnosticRoot>,
+    parsed: &RustcArgs,
+    env: &crate::invocation::InvocationEnv,
+) -> Cow<'a, str> {
+    let sources = std::cell::OnceCell::new();
+    let own_source = |file: &std::path::Path| {
+        let sources = sources.get_or_init(|| own_sources(parsed, env));
+        file.canonicalize()
+            .is_ok_and(|file| sources.contains(&file))
+    };
+    diagnostic_paths::restore(stderr, || {
+        diagnostic_paths::Resolver::new(roots(), &own_source)
+    })
+}
+
+/// The compiled crate's own source files, from the dep-info rustc wrote.
+fn own_sources(
+    parsed: &RustcArgs,
+    env: &crate::invocation::InvocationEnv,
+) -> std::collections::HashSet<PathBuf> {
+    let Some(dep_info) = parsed
+        .dep_info_path()
+        .and_then(|path| env.resolve(&path))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+    else {
+        return Default::default();
+    };
+    crate::cache_key::parse_dep_info(&dep_info)
+        .into_iter()
+        .filter_map(|path| env.resolve(&path))
+        .filter_map(|path| path.canonicalize().ok())
+        .collect()
 }
 
 fn bootstrap_metadata_ready(parsed: &RustcArgs) -> bool {

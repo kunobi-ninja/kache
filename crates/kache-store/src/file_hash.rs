@@ -427,6 +427,15 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
+    /// Delete the prediction stored for `identity`, if any.
+    pub fn delete_input_prediction(&self, identity: &str) -> rusqlite::Result<()> {
+        self.db().execute(
+            "DELETE FROM input_predictions WHERE identity = ?1",
+            params![identity],
+        )?;
+        Ok(())
+    }
+
     /// Delete predictions no build has read or recorded for
     /// [`INPUT_PREDICTION_RETENTION_SECS`]. Run from the GC sweep and
     /// `doctor --repair`. Freed pages go to the freelist; index compaction
@@ -1879,6 +1888,21 @@ mod tests {
         };
         assert_eq!(tables("source_env_runtime_uses"), 0);
         assert_eq!(tables("source_env_dep_uses"), 1);
+    }
+
+    #[test]
+    fn deleting_an_input_prediction_removes_only_that_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        cache.put_input_prediction("own", 1, None, "a").unwrap();
+        cache.put_input_prediction("shared", 1, None, "b").unwrap();
+        cache.delete_input_prediction("own").unwrap();
+        cache.delete_input_prediction("absent").unwrap();
+        assert_eq!(cache.get_input_prediction("own").unwrap(), None);
+        assert_eq!(
+            cache.get_input_prediction("shared").unwrap(),
+            Some((1, "b".into()))
+        );
     }
 
     #[test]

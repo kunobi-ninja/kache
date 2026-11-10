@@ -53,6 +53,7 @@ use std::process::Command;
 
 pub(crate) mod declarations;
 mod external;
+mod git;
 mod hermetic;
 pub(crate) mod inputs;
 mod outside;
@@ -66,7 +67,7 @@ use rooted_links::RootedSymlink;
 use declarations::parse_declarations;
 #[cfg(test)]
 use inputs::input_state;
-use inputs::{TREE_MEMO_DIR, input_state_as, run_input_state};
+use inputs::{TREE_MEMO_DIR, declared_input_files, declared_input_state, input_state_as};
 #[cfg(all(test, unix))]
 use inputs::{tree_digest_memo, tree_stamp};
 
@@ -674,7 +675,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     let prediction = match local_prediction {
         Some(prediction) => Some(prediction),
         None => match &readonly {
-            Some(store) => stored_prediction(store, &run.identity())?,
+            Some(store) => run.prediction_in(store)?,
             None => None,
         },
     };
@@ -930,6 +931,18 @@ struct Prediction {
     /// and are written back with this run's roots.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrites_text: bool,
+}
+
+impl Prediction {
+    /// Whether it declares a path no root maps, which can name the checkout
+    /// that recorded it, such as a linked worktree's Git directory. Its key
+    /// binds to that package, so it can replay a run only there.
+    fn names_its_checkout(&self) -> bool {
+        self.inputs
+            .iter()
+            .chain(&self.external_link_inputs)
+            .any(|path| Path::new(path).is_absolute())
+    }
 }
 
 /// The prediction a run records, given where its outputs name roots.
@@ -1575,18 +1588,52 @@ impl Run {
         format!("{PREDICTION_PREFIX}{}", hasher.finalize().to_hex())
     }
 
-    fn prediction(&self) -> Result<Option<Prediction>> {
-        stored_prediction(&self.store, &self.identity())
+    /// Where this package's own prediction goes when it names the checkout
+    /// that recorded it ([`Prediction::names_its_checkout`]).
+    fn checkout_identity(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        fold(&mut hasher, "prediction", self.identity().as_bytes());
+        fold(
+            &mut hasher,
+            "manifest_dir",
+            self.environment.manifest_dir.as_os_str().as_encoded_bytes(),
+        );
+        format!("{PREDICTION_PREFIX}{}", hasher.finalize().to_hex())
     }
 
+    /// This package's own prediction, else the one every checkout shares.
+    fn prediction(&self) -> Result<Option<Prediction>> {
+        self.prediction_in(&self.store)
+    }
+
+    /// [`Self::prediction`] as `store` holds it.
+    fn prediction_in(&self, store: &Store) -> Result<Option<Prediction>> {
+        match stored_prediction(store, &self.checkout_identity())? {
+            Some(prediction) => Ok(Some(prediction)),
+            None => stored_prediction(store, &self.identity()),
+        }
+    }
+
+    /// Record `prediction` where the next run looks. One that names this
+    /// checkout keys only here, so it goes to this package's own slot:
+    /// written to the shared one, two worktrees would replace each other's
+    /// and miss in turn.
     fn record_prediction(&self, prediction: &Prediction) -> Result<()> {
         let json = serde_json::to_string(prediction)?;
-        self.store.file_hash_cache().put_input_prediction(
-            &self.identity(),
-            PREDICTION_SCHEMA,
-            Some(CRATE_NAME),
-            &json,
-        )?;
+        let cache = self.store.file_hash_cache();
+        let checkout = self.checkout_identity();
+        if prediction.names_its_checkout() {
+            cache.put_input_prediction(&checkout, PREDICTION_SCHEMA, Some(CRATE_NAME), &json)?;
+        } else {
+            // An older one of this package's own would win the next lookup.
+            cache.delete_input_prediction(&checkout)?;
+            cache.put_input_prediction(
+                &self.identity(),
+                PREDICTION_SCHEMA,
+                Some(CRATE_NAME),
+                &json,
+            )?;
+        }
         Ok(())
     }
 
@@ -1687,12 +1734,11 @@ impl Run {
             } else {
                 Vec::new()
             };
-            let state = run_input_state(
+            let state = declared_input_state(
                 &path,
                 &excluded,
                 &file_hasher,
                 &mut budget,
-                0,
                 prediction.default_package,
             )?;
             fold(&mut hasher, "state", state.as_bytes());
@@ -1957,8 +2003,10 @@ impl Run {
             } else {
                 Vec::new()
             };
-            if modified_since(&path, &excluded, started)? {
-                return Err(InputsChanged.into());
+            for file in declared_input_files(&path, default_package)? {
+                if modified_since(&file, &excluded, started)? {
+                    return Err(InputsChanged.into());
+                }
             }
         }
         let OutDirContents {
@@ -4370,6 +4418,128 @@ mod tests {
         assert_eq!(key, b.action_key(&prediction).unwrap());
         std::fs::write(b.environment.manifest_dir.join("input.h"), "changed input").unwrap();
         assert_ne!(key, b.action_key(&prediction).unwrap());
+    }
+
+    /// Two worktrees of one package whose script declares its checkout's own
+    /// Git directory: each keeps its own prediction, so neither replaces the
+    /// other's and both hit on their next build.
+    #[test]
+    fn checkouts_keep_their_own_prediction_when_it_names_them() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run_in = |package: &str| {
+            let package = dir.as_path().join(package);
+            std::fs::create_dir_all(&package).unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "aaaa".to_string(),
+                environment: environment(&dir.as_path().join(format!("{package:?}-out")), &package),
+                start: std::time::Instant::now(),
+            }
+        };
+        let a = run_in("a");
+        let b = run_in("b");
+        let declaring = |run: &Run| {
+            let mut prediction = prediction_with(Some(Vec::new()), true);
+            prediction.inputs = vec![
+                run.environment
+                    .manifest_dir
+                    .join("gitdir/HEAD")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            ];
+            prediction
+        };
+        a.record_prediction(&declaring(&a)).unwrap();
+        b.record_prediction(&declaring(&b)).unwrap();
+        assert_eq!(a.prediction().unwrap(), Some(declaring(&a)));
+        assert_eq!(b.prediction().unwrap(), Some(declaring(&b)));
+
+        // A portable prediction is shared, so a new checkout starts with it.
+        let mut portable = prediction_with(Some(Vec::new()), true);
+        portable.inputs = vec!["${KACHE_MANIFEST_DIR}/build.rs".to_string()];
+        assert!(!portable.names_its_checkout());
+        assert!(declaring(&a).names_its_checkout());
+        a.record_prediction(&portable).unwrap();
+        assert_eq!(run_in("c").prediction().unwrap(), Some(portable.clone()));
+        assert_eq!(a.prediction().unwrap(), Some(portable), "its own goes");
+        assert_eq!(b.prediction().unwrap(), Some(declaring(&b)));
+    }
+
+    /// A script that watches `.git/HEAD` and embeds the commit. The ref file
+    /// holding the commit is not declared, and a commit leaves HEAD as it was.
+    #[test]
+    fn a_new_commit_on_the_same_branch_changes_a_git_input_key() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let package = dir.as_path().join("pkg");
+        std::fs::create_dir_all(package.join(".git/refs/heads")).unwrap();
+        std::fs::write(package.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(package.join(".git/refs/heads/main"), "1111\n").unwrap();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&dir.as_path().join("out"), &package),
+            start: std::time::Instant::now(),
+        };
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        prediction.inputs = vec!["${KACHE_MANIFEST_DIR}/.git/HEAD".to_string()];
+        let key = run.action_key(&prediction).unwrap();
+        std::fs::write(package.join(".git/refs/heads/main"), "2222\n").unwrap();
+        let committed = run.action_key(&prediction).unwrap();
+        assert_ne!(key, committed);
+
+        // `git init --separate-git-dir`: HEAD keeps its bytes and time, but
+        // the script reading `.git/HEAD` now gets "not a directory".
+        let separate = dir.as_path().join("separate.git");
+        std::fs::rename(package.join(".git"), &separate).unwrap();
+        std::fs::write(
+            package.join(".git"),
+            format!("gitdir: {}\n", separate.display()),
+        )
+        .unwrap();
+        assert_ne!(committed, run.action_key(&prediction).unwrap());
+    }
+
+    /// In a linked worktree `.git` is a file naming the worktree's Git
+    /// directory. Cargo sees `.git/HEAD` as missing and reruns the script on
+    /// every build; kache records the run and keys it on the commit there.
+    #[test]
+    fn a_linked_worktree_records_a_git_input_keyed_on_its_commit() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let common = dir.as_path().join("main/.git");
+        let own = common.join("worktrees/wt");
+        std::fs::create_dir_all(common.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(common.join("refs/heads/topic"), "1111\n").unwrap();
+        std::fs::write(own.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        std::fs::write(own.join("commondir"), "../..\n").unwrap();
+        let package = dir.as_path().join("wt");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join(".git"), format!("gitdir: {}\n", own.display())).unwrap();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&dir.as_path().join("out"), &package),
+            start: std::time::Instant::now(),
+        };
+        std::fs::create_dir_all(&run.environment.out_dir).unwrap();
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        run.record(b"cargo:rerun-if-changed=.git/HEAD\n", b"", 5, after)
+            .unwrap();
+        let prediction = run.prediction().unwrap().unwrap();
+        let key = run.action_key(&prediction).unwrap();
+        assert!(run.store.get(&key).unwrap().is_some());
+        std::fs::write(common.join("refs/heads/topic"), "2222\n").unwrap();
+        assert_ne!(key, run.action_key(&prediction).unwrap());
     }
 
     /// A result whose objects name registry sources restores in another

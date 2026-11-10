@@ -1713,7 +1713,9 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
 /// reach a no-op. On Linux, `UTIME_NOW` resolves in the kernel through the
 /// same timestamp source as writes (fs/utimes.c -> inode current-time), so
 /// the restored file's mtime is >= everything written before it and <=
-/// everything written after it — exactly the ordering cargo needs. That is a
+/// everything written after it — exactly the ordering cargo needs. ZFS dates
+/// writes with its own clock, so there the stamp is sampled from a sibling
+/// write instead ([`kache_fs::mtime_written_now`]). That is a
 /// verified kernel property on local Linux filesystems only: macOS resolves
 /// `UTIME_NOW` in libsyscall via `gettimeofday` (microseconds, empirically
 /// green in the e2e suite on APFS but not the same mechanism), and network /
@@ -1767,17 +1769,17 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
         }
 
         // atime is left untouched (UTIME_OMIT); mtime gets the write clock.
+        let file = std::fs::File::from(fd);
+        let written = kache_fs::mtime_written_now(path)
+            .with_context(|| format!("sampling write clock next to {}", path.display()))?;
         let times = [
             libc::timespec {
                 tv_sec: 0,
                 tv_nsec: libc::UTIME_OMIT,
             },
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_NOW,
-            },
+            written,
         ];
-        if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
+        if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("updating mtime of {}", path.display()));
         }
@@ -1847,6 +1849,9 @@ const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
 const DEPINFO_CWD_SENTINEL: &str = "__kache_cwd__/";
 const DEPINFO_WORKSPACE_SENTINEL: &str = "__kache_workspace__/";
 const DEPINFO_TARGET_SENTINEL: &str = "__kache_target_rule__/";
+/// Cargo's profile directory for the unit, `<target>/[<triple>/]<profile>`.
+/// It lies inside the target, so it is relativized before the target is.
+pub const DEPINFO_PROFILE_SENTINEL: &str = "__kache_profile__/";
 
 /// rustc's `# env-dep:NAME=value` records carry their own escape grammar:
 /// backslash is written `\\` (and newline/CR as `\n`/`\r`), and cargo's
@@ -2000,6 +2005,18 @@ pub fn rewrite_rustc_depinfo_content_with_configured_roots(
             ))
         });
         let target_rewritten = rewrite_rustc_depinfo_targets(content, target_dir, mode);
+        // A generated source under the unit's profile directory moves with
+        // the consumer's profile, which can differ from the producer's
+        // (`debug` against a custom profile that inherits `dev`).
+        let (profile_roots, roots): (Vec<_>, Vec<_>) = roots
+            .into_iter()
+            .partition(|(_, sentinel, ..)| sentinel == DEPINFO_PROFILE_SENTINEL);
+        let target_rewritten =
+            profile_roots
+                .into_iter()
+                .fold(target_rewritten, |rewritten, (root, sentinel, ..)| {
+                    rewrite_depinfo_content_with_exact_sentinel(&rewritten, &root, &sentinel, mode)
+                });
         // Dependencies generated beneath Cargo's effective target directory
         // must move with that target even when it lives inside the workspace.
         // Otherwise the higher-ranked WORKSPACE source rule captures
@@ -4176,6 +4193,60 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
             restored,
             "/external-b/target/debug/deps/demo.d: \
 /external-b/target/debug/build/demo/out/generated.rs\n"
+        );
+    }
+
+    /// A unit hit across Cargo profiles (`debug`, then a custom profile that
+    /// inherits `dev`) must watch the generated source in its own profile.
+    #[test]
+    fn generated_source_moves_to_the_consumer_profile() {
+        // Literal `/` spellings, so the roots match the dep-info text on
+        // every platform.
+        let workspace = PathBuf::from("/work");
+        let target = PathBuf::from("/work/target");
+        let target_sentinel = DEPINFO_TARGET_SENTINEL.to_string();
+        let profile_sentinel = DEPINFO_PROFILE_SENTINEL.to_string();
+        let roots = |profile: &str| {
+            [
+                (
+                    PathBuf::from(format!("/work/target/{profile}")),
+                    profile_sentinel.clone(),
+                    9,
+                ),
+                (workspace.clone(), DEPINFO_WORKSPACE_SENTINEL.to_string(), 4),
+                (target.clone(), target_sentinel.clone(), 3),
+            ]
+        };
+        let input = "/work/target/debug/deps/serde_core.d: \
+/work/src/lib.rs \
+/work/target/debug/build/serde_core-fe75/out/private.rs\n";
+
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            input,
+            &target,
+            &workspace,
+            Some(&workspace),
+            &roots("debug"),
+            DepInfoMode::Relativize,
+        );
+        assert_eq!(
+            stored,
+            "__kache_root__/debug/deps/serde_core.d: \
+__kache_workspace__/src/lib.rs \
+__kache_profile__/build/serde_core-fe75/out/private.rs\n"
+        );
+
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            &target,
+            &workspace,
+            Some(&workspace),
+            &roots("alt"),
+            DepInfoMode::Expand,
+        );
+        assert!(
+            restored.ends_with(" /work/target/alt/build/serde_core-fe75/out/private.rs\n"),
+            "{restored}"
         );
     }
 

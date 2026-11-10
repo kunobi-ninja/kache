@@ -1,4 +1,5 @@
-//! Terminal width can be shared only when rustc cannot emit lint warnings.
+//! The cache key omits the terminal width. Output that renders the same at
+//! every width shares one entry; rendered diagnostics get one per width.
 
 use serde_json::Value;
 use std::fs;
@@ -64,6 +65,8 @@ fn compile_with_log(
         .arg(project.join("lib.rs"))
         .args(flags)
         .env("KACHE_LOG", log)
+        // Windows runners lack copy-on-write; the advice would join stderr.
+        .env("KACHE_STORAGE_LAYOUT_ADVICE", "0")
         .current_dir(project);
     if !flags
         .iter()
@@ -312,7 +315,107 @@ fn warm_nightly_cache_replays_silent_unused_externs_across_widths() {
 }
 
 #[test]
-fn nightly_future_incompat_reports_are_recompiled_with_the_requested_width() {
+fn workspace_warnings_keep_an_entry_per_width_and_clean_crates_share_one() {
+    build_kache();
+    let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
+    let project = fixture.path();
+    let cache = project.join("cache");
+    write_config(&cache);
+    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
+    fs::write(
+        project.join("lib.rs"),
+        format!(
+            "pub fn answer() -> u32 {{ let unused = \"{}\"; 42 }}\n",
+            "x".repeat(180)
+        ),
+    )
+    .unwrap();
+    let widths = [
+        vec!["--diagnostic-width=80"],
+        vec!["--diagnostic-width", "120"],
+        vec![],
+        vec!["--diagnostic-width=80"],
+    ];
+    let mut rendered = Vec::new();
+    for flags in &widths {
+        let direct = compile(project, &cache, false, flags);
+        assert!(direct.status.success(), "{direct:?}");
+        assert!(String::from_utf8_lossy(&direct.stderr).contains("unused variable"));
+        for _ in 0..2 {
+            let cached = compile(project, &cache, true, flags);
+            assert!(cached.status.success(), "{cached:?}");
+            assert_eq!(
+                diagnostics(&cached, project),
+                diagnostics(&direct, project),
+                "{flags:?}"
+            );
+        }
+        rendered.push(direct.stderr);
+    }
+    assert_ne!(
+        rendered[0], rendered[1],
+        "fixture must exercise width rendering"
+    );
+    assert_ne!(
+        rendered[1], rendered[2],
+        "fixture must exercise width rendering"
+    );
+    let warned = events(&cache, "width_fixture");
+    // Each new width compiles once (storing the same artifacts again), then
+    // hits. Returning to a width finds its entry again.
+    let results: Vec<_> = warned
+        .iter()
+        .map(|event| match event["result"].as_str() {
+            Some("dup") => "miss",
+            other => other.unwrap(),
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "miss",
+            "local_hit",
+            "miss",
+            "local_hit",
+            "miss",
+            "local_hit",
+            "local_hit",
+            "local_hit",
+        ],
+    );
+    let keys: Vec<_> = warned.iter().map(|event| &event["cache_key"]).collect();
+    for pair in keys.chunks(2) {
+        assert_eq!(pair[0], pair[1]);
+    }
+    assert_ne!(keys[0], keys[2]);
+    assert_ne!(keys[0], keys[4]);
+    assert_ne!(keys[2], keys[4]);
+    assert_eq!(keys[0], keys[6]);
+
+    fs::write(project.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    for flags in &widths {
+        let cached = compile(project, &cache, true, flags);
+        assert!(cached.status.success(), "{cached:?}");
+        assert!(cached.stderr.is_empty(), "{cached:?}");
+    }
+    let clean = &events(&cache, "width_fixture")[warned.len()..];
+    assert_eq!(clean.len(), widths.len());
+    assert_eq!(clean[0]["result"], "miss");
+    for event in &clean[1..] {
+        assert_eq!(event["result"], "local_hit");
+        assert_eq!(event["cache_key"], clean[0]["cache_key"]);
+    }
+
+    // A width key names its width, so an explained miss can say what moved.
+    let width_field = |event: &Value| event["key_fields"]["diagnostic_width"].clone();
+    assert_eq!(width_field(&warned[1]), "80");
+    assert_eq!(width_field(&warned[3]), "120");
+    assert_eq!(width_field(&warned[5]), Value::Null);
+    assert!(clean.iter().all(|event| width_field(event).is_null()));
+}
+
+#[test]
+fn nightly_future_incompat_reports_replay_at_the_requested_width() {
     build_kache();
     let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
@@ -350,18 +453,21 @@ fn nightly_future_incompat_reports_are_recompiled_with_the_requested_width() {
     assert_ne!(rendered[1], rendered[2]);
     let recorded = events(&cache, "width_fixture");
     assert_eq!(recorded.len(), 6);
-    for event in &recorded {
-        assert_eq!(event["result"], "skipped");
-        assert_eq!(
-            event["skip_reason"],
-            "compiler diagnostics require their original terminal width"
+    for (index, pair) in recorded.chunks(2).enumerate() {
+        // Later widths store the same artifacts again.
+        assert!(
+            matches!(pair[0]["result"].as_str(), Some("miss" | "dup")),
+            "{index}: {pair:?}"
         );
-        assert_eq!(event["cache_key"], recorded[0]["cache_key"]);
+        assert_eq!(pair[1]["result"], "local_hit", "{index}");
+        assert_eq!(pair[0]["cache_key"], pair[1]["cache_key"], "{index}");
     }
+    assert_ne!(recorded[0]["cache_key"], recorded[2]["cache_key"]);
+    assert_ne!(recorded[2]["cache_key"], recorded[4]["cache_key"]);
 }
 
 #[test]
-fn legacy_width_sensitive_metadata_is_a_policy_miss_without_restore_warnings() {
+fn legacy_width_sensitive_metadata_is_recompiled_without_restore_warnings() {
     build_kache();
     let fixture = tempfile::tempdir_in(common::scratch_dir()).unwrap();
     let project = fixture.path();
@@ -395,11 +501,21 @@ fn legacy_width_sensitive_metadata_is_a_policy_miss_without_restore_warnings() {
     assert_eq!(cached.stderr, direct.stderr);
     let recorded = events(&cache, "width_fixture");
     assert_eq!(recorded.len(), 2);
-    assert_eq!(recorded[1]["result"], "skipped");
+    // The width-free result replaces the unusable shared entry.
+    assert!(matches!(
+        recorded[1]["result"].as_str(),
+        Some("miss" | "dup")
+    ));
+    assert_eq!(recorded[1]["cache_key"], recorded[0]["cache_key"]);
+    assert!(
+        !fs::read_to_string(&meta_path)
+            .unwrap()
+            .contains("obsolete wrapped warning")
+    );
     assert!(
         !recorded[1]["skip_reason"]
             .as_str()
-            .unwrap()
+            .unwrap_or("")
             .contains("restore")
     );
     assert!(

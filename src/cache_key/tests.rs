@@ -6214,6 +6214,120 @@ fn a_flight_waiter_digests_the_tree_again() {
     assert_eq!(tree.map(|guard| guard.digest), Some(now));
 }
 
+/// Checkouts of one workspace share a unit's discovery flight. A checkout
+/// whose tree differs from the owner's cannot use the owner's record, and
+/// must not keep the flight through its own compile: every other checkout
+/// would then wait for that compile too, one checkout at a time. A checkout
+/// with the owner's tree still waits for the owner and uses its record.
+#[test]
+fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let db = base.path().join("index.db");
+    let flights = base.path().join("cache");
+    let checkout = |name: &str, source: &str| {
+        let (root, args) = workspace_invocation(base.path(), name, "kt");
+        write_file(&root.join("kt/src/lib.rs"), source);
+        let manifest = root.join("kt");
+        let env = client_invocation(
+            &root,
+            &[
+                ("CARGO_MANIFEST_DIR", Some(manifest.as_os_str())),
+                ("OUT_DIR", None),
+            ],
+        );
+        let args = reparse_for_client(&args, &env);
+        (root, env, args)
+    };
+    let hasher = |env: &InvocationEnv| {
+        FileHasher::persistent(&db)
+            .with_invocation_env(env)
+            .with_input_predictions(true)
+            .with_prediction_flights(Some(flights.clone()))
+    };
+    let resolve = |args: &RustcArgs, hasher: &FileHasher<'_>| {
+        set_defer_discovery(true);
+        set_compile_while_keying(true);
+        let mut outputs = KeyOutputs::default();
+        let result = resolve_key_inputs(args, hasher, "kt", &KeyEnv::default(), &mut outputs);
+        set_compile_while_keying(false);
+        set_defer_discovery(false);
+        (result, outputs)
+    };
+
+    // The first checkout owns the flight and compiles before keying.
+    let (root, env, args) = checkout("a", "pub fn value() -> u32 { 1 }\n");
+    let owner = hasher(&env);
+    let (deferred, outputs) = resolve(&args, &owner);
+    assert!(deferred.unwrap_err().is::<DeferredDiscovery>());
+    // What its compile records, under its own tree.
+    let tree = outputs
+        .tree_guard
+        .expect("a workspace unit is guarded")
+        .digest;
+    let vars: Vec<_> = env.vars_os().collect();
+    let roots = workspace_roots(&args, &vars).unwrap();
+    let identity = workspace_prediction_identity(&args, vars, &roots).unwrap();
+    let closure = DepInfo {
+        source_files: vec![root.join("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let record = workspace_portable_prediction(&closure, &roots, Some(&tree)).unwrap();
+
+    let (started, ready) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let wait = |name: &'static str, source: &'static str| {
+            let started = started.clone();
+            scope.spawn(move || {
+                let (root, env, args) = checkout(name, source);
+                let hasher = hasher(&env);
+                started.send(()).unwrap();
+                let (result, outputs) = resolve(&args, &hasher);
+                let deferred = result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<DeferredDiscovery>());
+                let held = hasher.take_discovery_flight().is_some();
+                (
+                    root,
+                    result.ok().flatten(),
+                    outputs.used_prediction,
+                    deferred,
+                    held,
+                )
+            })
+        };
+        let other_tree = wait("b", "pub fn value() -> u32 { 2 }\n");
+        let same_tree = wait("c", "pub fn value() -> u32 { 1 }\n");
+        ready.recv().unwrap();
+        ready.recv().unwrap();
+        // Let both find no record and the flight held, so each join is a
+        // real wait. The owner then publishes and releases.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        owner.record_portable_prediction(&identity, Some("kt"), &record);
+        drop(owner.take_discovery_flight());
+
+        let (_, inputs, predicted, deferred, held) = other_tree.join().unwrap();
+        assert!(
+            !deferred && !held,
+            "another tree keys without the flight instead of compiling under it"
+        );
+        assert!(!predicted);
+        assert!(inputs.is_some(), "the pre-pass found the closure");
+
+        let (root, inputs, predicted, deferred, held) = same_tree.join().unwrap();
+        assert!(!deferred);
+        assert!(predicted, "the owner's tree uses the owner's record");
+        assert!(held, "and keeps the flight until it publishes");
+        assert_eq!(
+            inputs.map(|inputs| inputs.source_files),
+            Some(vec![root.join("kt/src/lib.rs")])
+        );
+    });
+}
+
 /// This checkout's rows keep the guard while it covers the closure. They are
 /// never relocated, so a generated file naming the checkout costs nothing
 /// here, though it keeps the row for other checkouts out.
@@ -12072,7 +12186,6 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         ("--error-format", "json", "human"),
         ("--json", "artifacts", "diagnostic-rendered-ansi"),
         ("--color", "always", "never"),
-        ("--diagnostic-width", "80", "120"),
     ] {
         let attached = format!("{flag}={value}");
         let first = key_of_flags(&diagnostic_flag_base(&source, &[&attached]));
@@ -12090,6 +12203,13 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     assert_eq!(
         base,
         key_of_flags(&diagnostic_flag_base(&source, &["--verbose"]))
+    );
+    // The wrapper keys one valid width itself; repeated widths keep their order.
+    let widths = |flags: &[&str]| key_of_flags(&diagnostic_flag_base(&source, flags));
+    assert_eq!(base, widths(&["--diagnostic-width=80"]));
+    assert_ne!(
+        widths(&["--diagnostic-width=80", "--diagnostic-width=120"]),
+        widths(&["--diagnostic-width=120", "--diagnostic-width=80"])
     );
 }
 
@@ -12183,98 +12303,33 @@ fn nightly_silent_unused_externs_share_terminal_and_piped_keys() {
 }
 
 #[test]
-fn nightly_silent_unused_externs_keep_observable_or_ambiguous_options_keyed() {
-    let _lock = key_test_lock();
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("lib.rs");
-    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
-    let cap = "--cap-lints=allow";
-    let forced = "--force-warn=unused_crate_dependencies";
-    let silent = "--json=unused-externs-silent";
-    let mut controls = vec![
-        vec![forced, silent],
-        vec!["--cap-lints=warn", forced, silent],
-        vec![cap, forced, silent, cap],
-        vec![cap, forced, silent, "--cap-lints"],
-        vec![cap, forced],
-        vec![cap, forced, "--json"],
-        vec![cap, forced, "--json="],
-        vec![cap, forced, "--json=artifacts"],
-        vec![cap, forced, "--json=unused-externs"],
-        vec![cap, forced, "--json=unused-externs-silent,unused-externs"],
-        vec![cap, forced, "--json=unused-externs,unused-externs-silent"],
-        vec![cap, forced, "--json=unused-externs-silent,"],
-        vec![cap, forced, "--json=unknown,unused-externs-silent"],
-        vec![cap, forced, "--json=unused-externs-silent-extra"],
-        vec![
-            cap,
-            forced,
-            "--json=unused-externs-silent,unused-externs-silent",
-        ],
-        vec![cap, forced, silent, silent],
-        vec![cap, forced, silent, "--json"],
-        vec![cap, forced, silent, "--json=artifacts"],
-        vec![cap, forced, silent, forced],
-        vec![
-            cap,
-            forced,
-            silent,
-            "--force-warn",
-            "unused-crate-dependencies",
-        ],
-        vec![cap, silent, "--force-warn"],
-        vec![cap, silent, "--force-warn="],
-    ];
-    for other in [
-        "--force-warn=unused",
-        "--force-warn=unused_variables",
-        "--force-warn=unused_crate_dependencies,unused_variables",
-    ] {
-        controls.push(vec![cap, silent, other]);
-        controls.push(vec![cap, forced, silent, other]);
-        controls.push(vec![cap, other, silent, forced]);
-    }
-    for flags in controls {
-        let key = |width: &[&str]| {
-            let mut all = width.to_vec();
-            all.extend_from_slice(&flags);
-            key_of_flags(&diagnostic_flag_base(&source, &all))
-        };
-        let piped = key(&[]);
-        let narrow = key(&["--diagnostic-width=80"]);
-        let wide = key(&["--diagnostic-width", "120"]);
-        assert_ne!(piped, narrow, "{flags:?}");
-        assert_ne!(narrow, wide, "{flags:?}");
-    }
-
-    let valid = [cap, forced, silent];
-    let piped = key_of_flags(&diagnostic_flag_base(&source, &valid));
-    for width in [
-        vec!["--diagnostic-width"],
-        vec!["--diagnostic-width="],
-        vec!["--diagnostic-width=garbage"],
-        vec!["--diagnostic-width=0"],
-        vec!["--diagnostic-width=65536"],
-        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
-    ] {
-        let mut flags = valid.to_vec();
-        flags.extend_from_slice(&width);
-        assert_ne!(
-            piped,
-            key_of_flags(&diagnostic_flag_base(&source, &flags)),
-            "{width:?}"
-        );
-    }
-}
-
-#[test]
-fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
+fn every_lint_configuration_shares_one_valid_width_but_not_malformed_ones() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
     let key = |flags: &[&str]| key_of_flags(&diagnostic_flag_base(&source, flags));
-    let capped = key(&["--cap-lints=allow"]);
+    // Lints that can warn render width-dependent output. The wrapper stores
+    // that under a width key, so the shared key still omits the width.
+    for lint_flags in [
+        vec![],
+        vec!["--cap-lints=warn"],
+        vec!["--cap-lints=allow", "--force-warn=unused"],
+        vec!["--cap-lints=allow", "-D", "warnings"],
+        vec!["--check-cfg", "--cap-lints=allow"],
+        vec!["--error-format=json", "--json=unused-externs"],
+    ] {
+        let piped = key(&lint_flags);
+        for width in [
+            vec!["--diagnostic-width=80"],
+            vec!["--diagnostic-width", "120"],
+        ] {
+            let mut terminal = lint_flags.clone();
+            terminal.extend_from_slice(&width);
+            assert_eq!(piped, key(&terminal), "{terminal:?}");
+        }
+    }
+    let piped = key(&[]);
     for retained in [
         vec!["--diagnostic-width"],
         vec!["--diagnostic-width="],
@@ -12284,36 +12339,7 @@ fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
         vec!["--diagnostic-width=80", "--diagnostic-width=120"],
         vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
     ] {
-        let mut flags = vec!["--cap-lints=allow"];
-        flags.extend_from_slice(&retained);
-        assert_ne!(capped, key(&flags), "{retained:?}");
-    }
-    for lint_flags in [
-        vec![],
-        vec!["--cap-lints=warn"],
-        vec!["--cap-lints=allow", "--cap-lints", "warn"],
-        vec!["--cap-lints", "allow", "--cap-lints=warn"],
-        vec!["--cap-lints=warn", "--cap-lints", "allow"],
-        vec!["--cap-lints", "warn", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints"],
-        vec!["--cap-lints=allow", "--force-warn=unused"],
-        vec!["--force-warn", "unused", "--cap-lints=allow"],
-        vec!["--check-cfg", "--cap-lints=allow"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        let mut wide = lint_flags.clone();
-        wide.push("--diagnostic-width=120");
-        assert_ne!(key(&narrow), key(&wide), "{lint_flags:?}");
-    }
-    for lint_flags in [
-        vec!["--cap-lints=allow", "-W", "unused"],
-        vec!["--cap-lints=allow", "-D", "warnings"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        assert_eq!(key(&lint_flags), key(&narrow), "{lint_flags:?}");
+        assert_ne!(piped, key(&retained), "{retained:?}");
     }
 }
 
@@ -20951,6 +20977,8 @@ mod build_script_target_paths {
         workspace: PathBuf,
         source: PathBuf,
         invocation: InvocationEnv,
+        /// Cargo profile directory name `key` compiles under.
+        profile: &'static str,
     }
 
     impl Unit {
@@ -20978,11 +21006,18 @@ mod build_script_target_paths {
                 workspace,
                 source,
                 invocation,
+                profile: "debug",
             }
         }
 
         fn out_dir(target: &Path) -> PathBuf {
-            let out = target.join("debug/build/foo-sys-0123456789abcdef/out");
+            Self::out_dir_in(target, "debug")
+        }
+
+        fn out_dir_in(target: &Path, profile: &str) -> PathBuf {
+            let out = target
+                .join(profile)
+                .join("build/foo-sys-0123456789abcdef/out");
             std::fs::create_dir_all(&out).unwrap();
             std::fs::write(
                 out.join("libfoo.a"),
@@ -21023,7 +21058,12 @@ mod build_script_target_paths {
             if let Some(target) = target {
                 argv.extend([
                     "--out-dir".into(),
-                    target.join("debug/deps").to_str().unwrap().into(),
+                    target
+                        .join(self.profile)
+                        .join("deps")
+                        .to_str()
+                        .unwrap()
+                        .into(),
                 ]);
             }
             for spec in search {
@@ -21048,7 +21088,8 @@ mod build_script_target_paths {
                 None,
             );
             let normalizer = PathNormalizer::from_invocation(Some(&self.workspace), &invocation)
-                .with_target_dir(args.target_dir().as_deref());
+                .with_target_dir(args.target_dir().as_deref())
+                .with_profile_dir(args.profile_dir().as_deref());
             let (key, outputs) = compute_cache_key_with_outputs(
                 &args,
                 &FileHasher::new().with_invocation_env(&invocation),
@@ -21264,7 +21305,7 @@ mod build_script_target_paths {
     }
 
     #[test]
-    fn generated_source_file_macro_keeps_the_compiler_visible_target_name() {
+    fn generated_source_identity_follows_the_remapped_spelling() {
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let unit = Unit::new(dir.path());
@@ -21297,16 +21338,65 @@ mod build_script_target_paths {
                 )
             });
             let [a, b] = keys;
-            assert_ne!(
-                a.0, b.0,
-                "file!() exposes the generated source's remapped spelling"
-            );
+            if extra.is_empty() {
+                // Both spell the source `/kache/profile/build/...`.
+                assert_eq!(a.0, b.0, "file!() is the same in both target dirs");
+                continue;
+            }
+            assert_ne!(a.0, b.0, "{extra:?} bakes the real source path");
             assert_ne!(
                 a.1.fields.unwrap()["sources"],
                 b.1.fields.unwrap()["sources"],
                 "OUT_DIR env folding cannot hide a source-path collision"
             );
         }
+    }
+
+    // `[profile.alt] inherits = "dev"` builds the same unit in `target/alt`
+    // with the same Cargo metadata hash. Its generated source and bundled
+    // archive are the same, so the key is too.
+    #[test]
+    fn generated_sources_share_a_key_across_cargo_profiles() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut unit = Unit::new(dir.path());
+        std::fs::write(
+            &unit.source,
+            "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));",
+        )
+        .unwrap();
+        let target = unit.workspace.join("target");
+        let mut key = |profile: &'static str, body: &str, extra: &[&str]| {
+            unit.profile = profile;
+            let out = Unit::out_dir_in(&target, profile);
+            let generated = out.join("gen.rs");
+            std::fs::write(&generated, body).unwrap();
+            unit.key(
+                Some(&target),
+                Some(&out),
+                &[native(&out)],
+                "rlib",
+                extra,
+                Some(&generated),
+            )
+        };
+        let body = "pub fn generated() -> &'static str { file!() }";
+        let debug = key("debug", body, &[]);
+        let alt = key("alt", body, &[]);
+        assert_eq!(
+            debug.0, alt.0,
+            "the profile name reaches neither key nor bytes"
+        );
+
+        let edited = key("alt", "pub fn generated() -> u8 { 2 }", &[]);
+        assert_ne!(debug.0, edited.0, "generated contents stay keyed");
+
+        let unremapped = ["-Cinstrument-coverage"];
+        assert_ne!(
+            key("debug", body, &unremapped).0,
+            key("alt", body, &unremapped).0,
+            "an unremapped build bakes the profile directory"
+        );
     }
 
     #[cfg(unix)]

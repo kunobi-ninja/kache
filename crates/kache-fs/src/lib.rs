@@ -19,6 +19,8 @@ pub use capacity::{InodeUsage, VolumeId, VolumeStats, volume_stats};
 
 #[cfg(feature = "staging")]
 mod clock;
+#[cfg(all(feature = "staging", unix))]
+pub use clock::mtime_written_now;
 #[cfg(feature = "staging")]
 pub use clock::sample_write_clock;
 

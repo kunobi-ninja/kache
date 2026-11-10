@@ -1053,7 +1053,9 @@ impl FileHashCache<'_> {
     /// blake3. Lets a caller holding a coarse lock (the daemon's `Mutex<Store>`)
     /// release it before the expensive file read and re-take it only for the
     /// short record (#281). Mirrors `FileHasher::hash`'s fingerprint + min-size +
-    /// cache-get logic exactly, so the cache key is identical.
+    /// cache-get logic, so the cache key is identical. The floor here is
+    /// always `MIN_PERSISTED_HASH_BYTES`: the smaller key inputs that
+    /// `FileHasher::hash` memoises on Windows are looked up in process.
     pub fn lookup_cached(&self, path: &Path) -> FileHashLookup {
         let cache = self;
         let fingerprint = match FileFingerprint::from_path(path) {
@@ -1098,8 +1100,8 @@ impl FileHashCache<'_> {
     /// path here instead would pair the new file's fingerprint with the old
     /// file's hash.
     ///
-    /// Honors the same size floor as `FileHasher::hash`, which would not consult
-    /// the memo for a smaller file anyway.
+    /// Honors `MIN_PERSISTED_HASH_BYTES`, the floor `FileHasher::hash` keeps
+    /// for every file off Windows; a smaller file is just not recorded here.
     pub fn record_verified(&self, fingerprint: &FileFingerprint, hash: &str) {
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
             return;

@@ -8350,6 +8350,21 @@ struct RecentHash {
     fingerprint: Option<FileFingerprint>,
 }
 
+/// The smallest key input whose hash [`FileHasher::hash`] memoises (other
+/// reads, such as a tree guard's, keep [`MIN_PERSISTED_HASH_BYTES`]). Off
+/// Windows a small file is read about as fast as its memo row is looked up,
+/// so only files of [`MIN_PERSISTED_HASH_BYTES`] and more get rows. On
+/// Windows every key input with a strong stamp does: reading one opens it
+/// for its data, which an antivirus filter may scan, while the stamp the
+/// memo needs comes from an attribute-only open. A warm build of a
+/// 1,200-unit desktop app read about 20,500 small sources per build on a 4
+/// vCPU Windows 11 VM.
+const SOURCE_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
+    0
+} else {
+    MIN_PERSISTED_HASH_BYTES
+};
+
 /// [`hash_file`], for a read that follows a stat of the same file.
 fn read_file_hash(path: &Path) -> Result<String> {
     #[cfg(test)]
@@ -10016,7 +10031,12 @@ impl<'db> FileHasher<'db> {
             self.note_too_new(fingerprint);
         }
 
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+        let memo_floor = if keyed {
+            SOURCE_MEMO_MIN_BYTES
+        } else {
+            MIN_PERSISTED_HASH_BYTES
+        };
+        if fingerprint.size < memo_floor
             || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
         {
             let hash = read_file_hash(path)?;
@@ -10249,8 +10269,8 @@ impl<'db> FileHasher<'db> {
         };
         self.note_too_new(&fingerprint);
 
-        // Small libs skip the persistent cache (same policy as `hash`); the
-        // archive read is cheap and not worth a row.
+        // Small libs skip the persistent cache (the floor `hash` keeps off
+        // Windows); the archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES
             || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))

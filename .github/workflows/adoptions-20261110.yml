@@ -1,0 +1,111 @@
+name: Adoption preflight November 10
+
+on:
+  push:
+    branches: [validation/adoptions-20261110]
+    paths: [.github/workflows/adoptions-20261110.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adoption-preflight-20261110
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: just check PR${{ matrix.pr }}
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: [{"pr": 1862, "head": "e623416c375aa9de595251fa49d722e6fe410da3", "tree": "c15aa421bbb95ea4831bfcdd1fe1dbbf422774c6"}, {"pr": 1866, "head": "2e573c619464ad2fbd5a015e495462defe7be949", "tree": "4fb130c9915545e2cfc7c90667ecb50ef62c7595"}, {"pr": 1876, "head": "61d9cdcb081f0a752757a048b2de663dd683d207", "tree": "f2f3c6a81a9b35790d879ef79b30241152fd06b1"}, {"pr": 1877, "head": "1fc0cfd8412b8326e7346db675359710ee5d6f36", "tree": "c5d6d227762c8e2ed5638b56dd86d0814f799498"}]
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      EXPECTED_HEAD: ${{ matrix.head }}
+      EXPECTED_TREE: ${{ matrix.tree }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ matrix.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned candidate
+        run: |
+          mkdir -p "$RUNNER_TEMP/adoption-evidence"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          git log -1 --format='%H%n%T%n%an <%ae>%n%cn <%ce>' | tee "$RUNNER_TEMP/adoption-evidence/candidate.txt"
+          printf '%s\n' "$RUNNER_NAME" "$RUNNER_ENVIRONMENT" "$RUNNER_OS" > "$RUNNER_TEMP/adoption-evidence/runner.txt"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          install: true
+          version: 2026.6.9
+          cache: false
+      - name: Run required pre-publication checks
+        run: just check 2>&1 | tee "$RUNNER_TEMP/adoption-evidence/just-check.log"
+      - name: Check documentation and configuration references
+        if: matrix.pr != 1866
+        run: bash scripts/check-docs.sh 2>&1 | tee "$RUNNER_TEMP/adoption-evidence/check-docs.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: adoption-${{ matrix.pr }}-${{ matrix.head }}
+          path: ${{ runner.temp }}/adoption-evidence/
+          retention-days: 7
+
+  nix-staging:
+    name: Nix staging PR1866
+    needs: check
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      RUSTC_WRAPPER: ""
+      NIXPKGS_REV: 8f05ab1f86d469bb691afba70a71aff3ac3d5d10
+      EXPECTED_HEAD: 2e573c619464ad2fbd5a015e495462defe7be949
+      EXPECTED_TREE: 4fb130c9915545e2cfc7c90667ecb50ef62c7595
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: 2e573c619464ad2fbd5a015e495462defe7be949
+          persist-credentials: false
+      - name: Verify pinned candidate
+        run: |
+          mkdir -p "$RUNNER_TEMP/adoption-evidence"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          git log -1 --format='%H%n%T%n%an <%ae>%n%cn <%ce>' > "$RUNNER_TEMP/adoption-evidence/candidate.txt"
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        timeout-minutes: 10
+      - name: Evaluate supported Nix systems with staging hook
+        run: nix flake check --all-systems --no-build --no-write-lock-file --override-input nixpkgs "github:NixOS/nixpkgs/$NIXPKGS_REV" 2>&1 | tee "$RUNNER_TEMP/adoption-evidence/nix-eval.log"
+      - name: Build existing flake checks with staging hook
+        run: nix flake check --keep-going --print-build-logs --no-write-lock-file --override-input nixpkgs "github:NixOS/nixpkgs/$NIXPKGS_REV" 2>&1 | tee "$RUNNER_TEMP/adoption-evidence/nix-build.log"
+      - name: Record system library versions and runtime closure
+        run: |
+          nix eval --raw "github:NixOS/nixpkgs/$NIXPKGS_REV#legacyPackages.x86_64-linux.sqlite.version" > "$RUNNER_TEMP/adoption-evidence/sqlite-version.txt"
+          nix eval --raw "github:NixOS/nixpkgs/$NIXPKGS_REV#legacyPackages.x86_64-linux.zstd.version" > "$RUNNER_TEMP/adoption-evidence/zstd-version.txt"
+          package=$(nix build --no-link --print-out-paths --no-write-lock-file --override-input nixpkgs "github:NixOS/nixpkgs/$NIXPKGS_REV" .#packages.x86_64-linux.default)
+          nix-store --query --requisites "$package" > "$RUNNER_TEMP/adoption-evidence/runtime-closure.txt"
+          test "$(cat "$RUNNER_TEMP/adoption-evidence/sqlite-version.txt")" = 3.54.0
+          grep -E '/[^/]*-sqlite-3[.]54[.]0($|-)' "$RUNNER_TEMP/adoption-evidence/runtime-closure.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: adoption-1866-nix-staging
+          path: ${{ runner.temp }}/adoption-evidence/
+          retention-days: 7

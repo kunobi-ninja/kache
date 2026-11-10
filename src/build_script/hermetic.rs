@@ -419,7 +419,8 @@ pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Re
             &file_hasher,
             &mut budget,
             prediction.default_package,
-            run.environment.in_cargo_source_cache(&path),
+            &run.environment,
+            run.config.build_script_omit_cargo_source_dir_mtime,
         )?;
         fold(&mut hasher, "state", state.as_bytes());
     }

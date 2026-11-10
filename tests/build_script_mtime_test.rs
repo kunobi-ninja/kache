@@ -422,7 +422,13 @@ fn a_fresh_unpack_in_the_cargo_home_keeps_the_script_run() {
     let cargo_home = root.join("home");
     let data = registry_fixture(&source, &cargo_home).join("data");
     let cache = root.join("cache");
-    configure(&cache);
+    let config = configure(&cache);
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("{text}build_script_omit_cargo_source_dir_mtime=true\n"),
+    )
+    .unwrap();
     let _daemon = DaemonGuard::new(kache_binary(), &cache);
     let home = Some(cargo_home.as_path());
     let old = OLD.to_string();
@@ -435,4 +441,62 @@ fn a_fresh_unpack_in_the_cargo_home_keeps_the_script_run() {
     let new = (OLD + 60).to_string();
     let changed = build_in_home(&source, &root.join("t2"), &cache, false, false, &new, home);
     assert_eq!(script(&changed)["result"], "miss");
+}
+
+/// An explicit declaration may observe the directory's own timestamp.
+/// Fresh files with unchanged contents do not make that observation equal.
+fn assert_explicit_cargo_source_directory_keeps_its_observed_time(hermetic: bool) {
+    build_kache();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let cargo_home = root.join("home");
+    let package = registry_fixture(&source, &cargo_home);
+    std::fs::write(
+        package.join("build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=data");
+    let modified = std::fs::metadata("data").unwrap().modified().unwrap();
+    let seconds = modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    println!("cargo:rustc-env=INPUT_VALUE={seconds}");
+}
+"#,
+    )
+    .unwrap();
+    let data = package.join("data");
+    timestamp(&data, OLD);
+    let cache = root.join("cache");
+    configure(&cache);
+    let _daemon = DaemonGuard::new(kache_binary(), &cache);
+    let home = Some(cargo_home.as_path());
+    build_in_home(
+        &source,
+        &root.join("t0"),
+        &cache,
+        hermetic,
+        false,
+        &OLD.to_string(),
+        home,
+    );
+    timestamp(&data, OLD + 60);
+    let changed = build_in_home(
+        &source,
+        &root.join("t1"),
+        &cache,
+        hermetic,
+        false,
+        &(OLD + 60).to_string(),
+        home,
+    );
+    assert_eq!(script(&changed)["result"], "miss");
+}
+
+#[test]
+fn an_explicit_cargo_source_directory_keeps_its_observed_time_by_default() {
+    assert_explicit_cargo_source_directory_keeps_its_observed_time(false);
+}
+
+#[test]
+fn a_hermetic_cargo_source_directory_keeps_its_observed_time_by_default() {
+    assert_explicit_cargo_source_directory_keeps_its_observed_time(true);
 }

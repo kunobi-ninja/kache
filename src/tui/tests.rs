@@ -140,6 +140,7 @@ fn test_config() -> Config {
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_omit_cargo_source_dir_mtime: false,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,

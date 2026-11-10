@@ -50,6 +50,9 @@ pub(crate) struct Walk<'a> {
     /// Build-script runs can observe modification times. Rust compilation
     /// inputs keep their content-only policy.
     pub(crate) input_times: InputTimes,
+    /// A declared Cargo source tree omits its own directory times. A link
+    /// may leave that tree, so its referent keeps full timestamp tracking.
+    pub(crate) strict_symlink_times: bool,
     /// Paths left out wherever they appear.
     pub(crate) excluded: &'a [PathBuf],
     /// Also leave out VCS metadata and directories holding Cargo's
@@ -147,6 +150,8 @@ pub(super) fn declared_input_state(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     budget: &mut usize,
     default_package: bool,
+    environment: &Environment,
+    omit_cargo_source_dir_mtime: bool,
 ) -> Result<String> {
     let git = if default_package {
         None
@@ -154,9 +159,25 @@ pub(super) fn declared_input_state(
         super::git::resolve(path)?
     };
     let Some(git) = git else {
-        return run_input_state(path, excluded, file_hasher, budget, 0, default_package);
+        return run_input_state(
+            path,
+            excluded,
+            file_hasher,
+            budget,
+            0,
+            default_package,
+            omit_cargo_source_dir_mtime && environment.in_cargo_source_cache(path),
+        );
     };
-    let state = run_input_state(&git.path, excluded, file_hasher, budget, 0, false)?;
+    let state = run_input_state(
+        &git.path,
+        excluded,
+        file_hasher,
+        budget,
+        0,
+        false,
+        omit_cargo_source_dir_mtime && environment.in_cargo_source_cache(&git.path),
+    )?;
     // What the script sees at the declared path itself: `.git` turning from
     // a directory into a file changes what reading `.git/HEAD` returns.
     let declared = path_kind(path);
@@ -194,10 +215,9 @@ pub(super) fn declared_input_files(path: &Path, default_package: bool) -> Result
 
 /// Declared inputs also carry observable modification times. The implicit
 /// package dependency follows Cargo's file list and omits directory times.
-/// So does an input in Cargo's registry sources or Git checkouts: Cargo
-/// stamps every directory it unpacks there with the time of the unpack and
-/// never changes a package there afterwards, so a directory's time differs
-/// in every fresh Cargo home. File contents and file times are still keyed.
+/// An explicitly enabled source-cache policy can omit directory times too:
+/// Cargo stamps unpacked directories with the time of the unpack. Files and
+/// their times remain keyed, and symlink referents retain directory times.
 pub(super) fn run_input_state(
     path: &Path,
     excluded: &[PathBuf],
@@ -214,6 +234,7 @@ pub(super) fn run_input_state(
         } else {
             InputTimes::FilesAndDirectories
         },
+        strict_symlink_times: in_cargo_source_cache,
         ..Walk::default()
     };
     input_state_with_walk(path, &walk, file_hasher, budget, symlink_depth, None)
@@ -322,12 +343,20 @@ fn walked_state(
         } else {
             path.parent().unwrap_or(Path::new("")).join(&target)
         };
+        let followed = Walk {
+            input_times: if walk.strict_symlink_times {
+                InputTimes::FilesAndDirectories
+            } else {
+                walk.input_times
+            },
+            ..*walk
+        };
         let referent = if walk.unreachable_entries && within.holds(&resolved) {
             "cycle".to_string()
         } else {
             walked_state(
                 &resolved,
-                walk,
+                &followed,
                 file_hasher,
                 budget,
                 symlink_depth + 1,
@@ -628,6 +657,9 @@ fn tree_memo_path(path: &Path, walk: &Walk<'_>, text: Option<&Environment>) -> P
         InputTimes::Files => fold(&mut hasher, "input_times", b"files-v1"),
         InputTimes::FilesAndDirectories => fold(&mut hasher, "input_times", b"all-v1"),
     }
+    if walk.strict_symlink_times {
+        fold(&mut hasher, "symlink_times", b"all-v1");
+    }
     if let Some(environment) = text {
         for (root, placeholder) in environment.roots() {
             fold(
@@ -752,6 +784,35 @@ mod tests {
         filetime::set_file_mtime(&root, filetime::FileTime::from_unix_time(1_700_000_002, 0))
             .unwrap();
         assert_ne!(digest(&timestamped), before);
+    }
+
+    #[test]
+    fn source_cache_walks_do_not_reuse_the_implicit_package_memo() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        let cache = temp.path().join("cache");
+        write(&root.join("input"), "same");
+        let legacy = Walk {
+            input_times: InputTimes::Files,
+            memo: Some((&cache, "shared")),
+            ..Walk::default()
+        };
+        let opt_in = Walk {
+            strict_symlink_times: true,
+            ..legacy
+        };
+        let hasher = crate::cache_key::FileHasher::new();
+        let digest = state_in(&root, &legacy, &hasher, &mut 10).unwrap();
+        let stamp = tree_stamp_in(&root, &legacy, 10).unwrap();
+        record_tree_digest_memo(&root, &legacy, None, &stamp.digest, &digest);
+        assert_eq!(
+            tree_digest_memo_in(&root, &legacy, None, &stamp.digest),
+            Some(digest),
+        );
+        assert_eq!(
+            tree_digest_memo_in(&root, &opt_in, None, &stamp.digest),
+            None
+        );
     }
 
     #[test]

@@ -23,11 +23,12 @@ pub(super) fn socket(unit: &Path, deadline: Instant) -> Option<PathBuf> {
         ],
         deadline,
     )?;
-    if !ordinary_loaded_unit(unit, &executable, &properties) {
+    let environment = query(&["--user", "--no-pager", "show-environment"], deadline)?;
+    let (variables, home) = manager_environment(&environment)?;
+    if !ordinary_loaded_unit(unit, &executable, &properties, &home) {
         return None;
     }
-    let environment = query(&["--user", "--no-pager", "show-environment"], deadline)?;
-    configured_socket(&environment)
+    socket_for(variables, home)
 }
 
 // Anonymous files avoid pipe backpressure and never persist an environment dump.
@@ -109,19 +110,19 @@ fn ordinary_unit(text: &str, executable: &Path) -> bool {
     starts == 1
 }
 
-fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str) -> bool {
+// `home` is the manager's HOME: a user manager runs a unit without its own
+// WorkingDirectory= in that home and reports it as `!<home>`.
+fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str, home: &Path) -> bool {
     let Some(properties) = assignments(text) else {
         return false;
     };
-    let empty = [
-        "DropInPaths",
-        "EnvironmentFiles",
-        "UnsetEnvironment",
-        "WorkingDirectory",
-    ];
+    let empty = ["DropInPaths", "EnvironmentFiles", "UnsetEnvironment"];
     if !empty
         .iter()
         .all(|key| properties.get(*key).is_some_and(String::is_empty))
+        || !properties
+            .get("WorkingDirectory")
+            .is_some_and(|v| v.is_empty() || v.strip_prefix('!').map(Path::new) == Some(home))
         || properties.get("NeedDaemonReload").map(String::as_str) != Some("no")
         || !properties
             .get("Environment")
@@ -157,7 +158,13 @@ fn assignments(text: &str) -> Option<BTreeMap<String, String>> {
     Some(result)
 }
 
+#[cfg(test)]
 fn configured_socket(text: &str) -> Option<PathBuf> {
+    let (variables, home) = manager_environment(text)?;
+    socket_for(variables, home)
+}
+
+fn manager_environment(text: &str) -> Option<(BTreeMap<String, String>, PathBuf)> {
     let mut variables = BTreeMap::new();
     for line in text.lines() {
         let word = shell_word(line)?;
@@ -173,6 +180,10 @@ fn configured_socket(text: &str) -> Option<PathBuf> {
     if !home.is_absolute() {
         return None;
     }
+    Some((variables, home))
+}
+
+fn socket_for(variables: BTreeMap<String, String>, home: PathBuf) -> Option<PathBuf> {
     let environment = kache_config::InvocationEnv::from_parts(
         variables,
         Some(home.clone()),
@@ -352,8 +363,13 @@ mod tests {
             &(text.clone() + "Environment=KACHE_CONFIG=/other\n"),
             exe
         ));
+        let home = Path::new("/home/someone");
         let valid = properties(&unit, exe);
-        assert!(ordinary_loaded_unit(&unit, exe, &valid));
+        assert!(ordinary_loaded_unit(&unit, exe, &valid, home));
+        // A user manager reports its default working directory, the home.
+        let default_directory =
+            valid.replace("WorkingDirectory=\n", "WorkingDirectory=!/home/someone\n");
+        assert!(ordinary_loaded_unit(&unit, exe, &default_directory, home));
         for (old, new) in [
             ("DropInPaths=\n", "DropInPaths=/custom.conf\n"),
             ("NeedDaemonReload=no", "NeedDaemonReload=yes"),
@@ -364,19 +380,21 @@ mod tests {
             ("EnvironmentFiles=\n", "EnvironmentFiles=/other\n"),
             ("UnsetEnvironment=\n", "UnsetEnvironment=HOME\n"),
             ("WorkingDirectory=\n", "WorkingDirectory=/other\n"),
+            ("WorkingDirectory=\n", "WorkingDirectory=!/home/other\n"),
             ("argv[]=/opt/kache daemon run", "argv[]=/bin/sh -c command"),
         ] {
             assert!(
-                !ordinary_loaded_unit(&unit, exe, &valid.replace(old, new)),
-                "{old}"
+                !ordinary_loaded_unit(&unit, exe, &valid.replace(old, new), home),
+                "{new}"
             );
         }
         assert!(!ordinary_loaded_unit(
             &root.path().join("other"),
             exe,
-            &valid
+            &valid,
+            home
         ));
-        assert!(!ordinary_loaded_unit(&unit, exe, ""));
+        assert!(!ordinary_loaded_unit(&unit, exe, "", home));
         assert!(assignments("X=a\nX=b\n").is_none());
     }
 }

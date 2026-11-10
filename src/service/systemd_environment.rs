@@ -246,23 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn the_manager_snapshot_supplies_config_overrides_and_path_expansions() {
+    fn the_manager_snapshot_supplies_config_overrides_and_home_expansion() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path();
         let file = home.join("chosen.toml");
-        std::fs::write(&file, "[cache]\nruntime_dir = '$INSTANCE_ROOT/runtime'\n").unwrap();
-        let instance = home.join("manager-instance");
-        let text = manager(
-            home,
-            &format!(
-                "KACHE_CONFIG={}\nINSTANCE_ROOT={}\n",
-                file.display(),
-                instance.display()
-            ),
-        );
+        std::fs::write(
+            &file,
+            "[cache]\nruntime_dir = '~/manager-instance/runtime'\n",
+        )
+        .unwrap();
+        let text = manager(home, "KACHE_CONFIG=~/chosen.toml\n");
         assert_eq!(
             configured_socket(&text).unwrap(),
-            instance.join("runtime/daemon.sock")
+            home.join("manager-instance/runtime/daemon.sock")
         );
     }
 

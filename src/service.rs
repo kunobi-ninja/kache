@@ -606,16 +606,13 @@ fn task_scheduler_installed() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn ownership_probe_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_millis(500)
+}
+
 /// Whether the installed login service owns this configured runtime instance.
 /// The manager's environment can differ from a build's in either direction.
 /// Failed or unsupported ownership probes start the requested instance directly.
-pub(crate) fn manages_instance(config: &crate::config::Config) -> Result<bool> {
-    manages_instance_until(
-        config,
-        std::time::Instant::now() + std::time::Duration::from_millis(500),
-    )
-}
-
 pub(crate) fn manages_instance_until(
     config: &crate::config::Config,
     deadline: std::time::Instant,
@@ -625,8 +622,7 @@ pub(crate) fn manages_instance_until(
     };
     #[cfg(target_os = "linux")]
     {
-        let budget =
-            deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        let budget = deadline.min(ownership_probe_deadline());
         let Some(socket) = systemd_environment::socket(&service, budget) else {
             return Ok(false);
         };
@@ -699,7 +695,7 @@ impl std::fmt::Display for StartupLog {
 
 pub(crate) fn startup_log(config: &crate::config::Config) -> StartupLog {
     startup_log_for(
-        manages_instance(config).unwrap_or(false),
+        manages_instance_until(config, ownership_probe_deadline()).unwrap_or(false),
         config.socket_path().with_extension("log"),
     )
 }

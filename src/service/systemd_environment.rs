@@ -47,7 +47,7 @@ fn query(arguments: &[&str], deadline: Instant) -> Option<String> {
         .ok()?;
     let mut child = kunobi_daemon::Candidate::new(child);
     let status = kunobi_daemon::readiness::wait_until(deadline, |_| {
-        if output.metadata()?.len() > 65_536 {
+        if output_exceeds_limit(output.metadata()?.len()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "service query output exceeds limit",
@@ -62,10 +62,14 @@ fn query(arguments: &[&str], deadline: Instant) -> Option<String> {
     output.rewind().ok()?;
     let mut bytes = Vec::new();
     output.take(65_537).read_to_end(&mut bytes).ok()?;
-    if bytes.len() > 65_536 {
+    if output_exceeds_limit(bytes.len() as u64) {
         return None;
     }
     String::from_utf8(bytes).ok()
+}
+
+fn output_exceeds_limit(byte_count: u64) -> bool {
+    byte_count > 65_536
 }
 
 fn ordinary_unit(text: &str, executable: &Path) -> bool {
@@ -211,6 +215,14 @@ fn shell_word(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn query_output_accepts_exactly_64_kib_and_refuses_more() {
+        assert!(!output_exceeds_limit(0));
+        assert!(!output_exceeds_limit(65_535));
+        assert!(!output_exceeds_limit(65_536));
+        assert!(output_exceeds_limit(65_537));
+    }
+
     fn manager(home: &Path, extra: &str) -> String {
         format!("HOME={}\nKACHE_HOST_CONFIG=\n{extra}", home.display())
     }
@@ -285,6 +297,32 @@ mod tests {
             "X=trailing\\",
         ] {
             assert!(shell_word(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn empty_and_invalid_environment_names_do_not_prove_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        for invalid in ["=value\n", "BAD-NAME=value\n"] {
+            assert!(configured_socket(&manager(root.path(), invalid)).is_none());
+        }
+    }
+
+    #[test]
+    fn ordinary_units_allow_blank_lines_and_both_comment_styles() {
+        let executable = Path::new("/opt/kache");
+        for ignored in ["", "# a comment", "; another comment"] {
+            let text = format!("[Service]\n{ignored}\nExecStart=/opt/kache daemon run\n");
+            assert!(ordinary_unit(&text, executable), "{ignored:?}");
+        }
+    }
+
+    #[test]
+    fn both_unit_section_delimiters_must_match() {
+        let executable = Path::new("/opt/kache");
+        for malformed in ["[Service}", "{Service]"] {
+            let text = format!("{malformed}\nExecStart=/opt/kache daemon run\n");
+            assert!(!ordinary_unit(&text, executable), "{malformed:?}");
         }
     }
 

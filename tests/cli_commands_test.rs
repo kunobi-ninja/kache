@@ -2930,6 +2930,12 @@ case " $* " in
 esac
 exit 0
 "#;
+        #[cfg(target_os = "linux")]
+        let script = format!(
+            "#!/bin/sh\n{}{}",
+            systemd_probe_script(),
+            script.strip_prefix("#!/bin/sh\n").unwrap()
+        );
         kache_fs::testutil::write_executable(&bin.join(tool), script);
         kache_fs::testutil::write_executable(&bin.join("loginctl"), "#!/bin/sh\nexit 0\n");
         let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
@@ -3000,7 +3006,12 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         )
     };
     std::fs::create_dir_all(service_file.parent().unwrap()).unwrap();
-    std::fs::write(service_file, "installed test service").unwrap();
+    let definition = if cfg!(target_os = "linux") {
+        format!("[Service]\nExecStart={KACHE_BIN} daemon run\n")
+    } else {
+        "installed test service".to_owned()
+    };
+    std::fs::write(service_file, definition).unwrap();
     // The installed manager owns the user-configured instance. A per-command
     // cache override alone must not redirect that service to another cache.
     let user_config = e.home.join(".config/kache/config.toml");
@@ -3013,9 +3024,15 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     let bin = e.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let manager = bin.join(tool);
+    #[cfg(target_os = "linux")]
+    let probe = systemd_probe_script();
+    #[cfg(not(target_os = "linux"))]
+    let probe = "";
     kache_fs::testutil::write_executable(
         &manager,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$KACHE_TEST_SERVICE_ARGS\"\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n",
+        format!(
+            "#!/bin/sh\n{probe}printf '%s\\n' \"$@\" > \"$KACHE_TEST_SERVICE_ARGS\"\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n"
+        ),
     );
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -3069,7 +3086,11 @@ fn a_private_xdg_config_starts_its_own_daemon_beside_the_login_service() {
     let e = env();
     let unit = e.home.join(".config/systemd/user/kache.service");
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-    std::fs::write(&unit, "installed test service").unwrap();
+    std::fs::write(
+        &unit,
+        format!("[Service]\nExecStart={KACHE_BIN} daemon run\n"),
+    )
+    .unwrap();
     let xdg = e.home.join("rig/xdg");
     std::fs::create_dir_all(xdg.join("kache")).unwrap();
     std::fs::write(
@@ -3184,11 +3205,133 @@ fn fake_systemd_path(dir: &Path, script: &str) -> std::ffi::OsString {
     std::fs::create_dir_all(dir).unwrap();
     for (name, body) in [("systemctl", script), ("loginctl", "exit 0")] {
         let tool = dir.join(name);
-        kache_fs::testutil::write_executable(&tool, format!("#!/bin/sh\n{body}\n"));
+        let probe = if name == "systemctl" {
+            systemd_probe_script()
+        } else {
+            ""
+        };
+        kache_fs::testutil::write_executable(&tool, format!("#!/bin/sh\n{probe}{body}\n"));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path)))
         .unwrap()
+}
+
+/// The read-only systemd responses are independent of the build's XDG and
+/// KACHE routing overrides. Remaining calls reach each test's manager script.
+#[cfg(target_os = "linux")]
+fn systemd_probe_script() -> &'static str {
+    r#"if [ "$1" = --user ] && [ "$2" = --no-pager ]; then
+  case "$3" in
+    show-environment)
+      printf 'HOME=%s\nKACHE_HOST_CONFIG=\n' "$HOME"
+      if [ "${KACHE_TEST_MANAGER_XDG_CACHE_HOME+x}" = x ]; then
+        printf 'XDG_CACHE_HOME=%s\n' "$KACHE_TEST_MANAGER_XDG_CACHE_HOME"
+      fi
+      if [ "${KACHE_TEST_MANAGER_XDG_CONFIG_HOME+x}" = x ]; then
+        printf 'XDG_CONFIG_HOME=%s\n' "$KACHE_TEST_MANAGER_XDG_CONFIG_HOME"
+      fi
+      exit 0 ;;
+    show)
+      unit="$HOME/.config/systemd/user/kache.service"
+      exe=$(sed -n 's/^ExecStart=//p' "$unit" | sed 's/ daemon run$//')
+      printf 'FragmentPath=%s\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\nWorkingDirectory=\n' "$unit"
+      printf 'ExecStart={ path=%s ; argv[]=%s daemon run ; ignore_errors=no ; }\n' "$exe" "$exe"
+      exit 0 ;;
+  esac
+fi
+"#
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_start_distinguishes_manager_xdg_from_private_home_cache() {
+    for (global_xdg, private_home_cache) in [(false, false), (true, false), (true, true)] {
+        let e = env();
+        let unit = e.home.join(".config/systemd/user/kache.service");
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(
+            &unit,
+            format!("[Service]\nExecStart={KACHE_BIN} daemon run\n"),
+        )
+        .unwrap();
+        let xdg = e.home.join("manager-cache");
+        let manager_store = if global_xdg {
+            xdg.join("kache")
+        } else {
+            e.home.join(".cache/kache")
+        };
+        let requested = if private_home_cache {
+            e.home.join(".cache/kache")
+        } else {
+            manager_store.clone()
+        };
+        let calls = e.home.join("manager.calls");
+        let path = fake_systemd_path(
+            &e.home.join("bin"),
+            r#"
+printf 'start\n' >> "$KACHE_TEST_MANAGER_CALLS"
+unset KACHE_CONFIG KACHE_CACHE_DIR KACHE_RUNTIME_DIR XDG_CONFIG_HOME XDG_CACHE_HOME
+if [ "${KACHE_TEST_MANAGER_XDG_CACHE_HOME+x}" = x ]; then
+  XDG_CACHE_HOME="$KACHE_TEST_MANAGER_XDG_CACHE_HOME"
+  export XDG_CACHE_HOME
+fi
+cd "$HOME" || exit 1
+"$KACHE_TEST_BIN" daemon run >/dev/null 2>&1 &
+echo $! > "$KACHE_TEST_MANAGER_PID"
+exit 0
+"#,
+        );
+        let mut start = e.cmd();
+        start
+            .args(["daemon", "start"])
+            .env_remove("KACHE_CONFIG")
+            .env_remove("KACHE_CACHE_DIR")
+            .env_remove("KACHE_RUNTIME_DIR")
+            .env_remove("XDG_CACHE_HOME")
+            .env("PATH", path)
+            .env("KACHE_TEST_BIN", KACHE_BIN)
+            .env("KACHE_TEST_MANAGER_CALLS", &calls)
+            .env("KACHE_TEST_MANAGER_PID", e.home.join("manager.pid"))
+            .timeout(std::time::Duration::from_secs(30));
+        if global_xdg {
+            start
+                .env("XDG_CACHE_HOME", &xdg)
+                .env("KACHE_TEST_MANAGER_XDG_CACHE_HOME", &xdg);
+        }
+        if private_home_cache {
+            start
+                .env("KACHE_CACHE_DIR", &requested)
+                .env("KACHE_RUNTIME_DIR", &requested);
+        }
+        let output = start.output().unwrap();
+        let state = std::fs::read(requested.join("daemon.state.json"));
+        // Both possible instances are task-owned; clean them even on failure.
+        for store in [&requested, &manager_store] {
+            e.cmd()
+                .args(["daemon", "stop"])
+                .env("KACHE_CACHE_DIR", store)
+                .env("KACHE_RUNTIME_DIR", store)
+                .output()
+                .unwrap();
+        }
+        assert!(output.status.success(), "{output:?}");
+        assert!(state.is_ok(), "requested instance did not become ready");
+        assert_eq!(
+            calls.exists(),
+            !private_home_cache,
+            "global={global_xdg}, private={private_home_cache}"
+        );
+        if !private_home_cache {
+            let state: serde_json::Value = serde_json::from_slice(&state.unwrap()).unwrap();
+            let pid: u32 = std::fs::read_to_string(e.home.join("manager.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(state["pid"], pid);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -253,7 +253,11 @@ impl Driver for KacheReplacement<'_> {
                     ObservedOwner::Ready(_) | ObservedOwner::Pending => return Ok(Progress::Done),
                     ObservedOwner::AbsentOrOutdated => {}
                 }
-                if crate::service::manages_instance(config)? {
+                let managed = crate::service::manages_instance_until(config, deadline)?;
+                if Instant::now() >= deadline {
+                    return Ok(Progress::Pending);
+                }
+                if managed {
                     anyhow::ensure!(
                         crate::service::kickstart(deadline)?,
                         "installed service disappeared during replacement"

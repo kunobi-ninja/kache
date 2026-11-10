@@ -656,6 +656,12 @@ pub struct Config {
     /// Off by default. Set via `KACHE_BUILD_SCRIPT_HERMETIC=1`/`=true` or
     /// `[cache] build_script_hermetic = true`.
     pub build_script_hermetic: bool,
+    /// Omit directory mtimes for declared inputs in Cargo's source caches.
+    /// Off by default: enable only when scripts do not read those times.
+    /// Files and symlink referents retain their timestamp checks.
+    /// `KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME` or
+    /// `[cache] build_script_omit_cargo_source_dir_mtime`.
+    pub build_script_omit_cargo_source_dir_mtime: bool,
     /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
     /// default), a cache hit restored by COPY because the storage *layout*
     /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
@@ -1045,6 +1051,8 @@ pub struct CacheFileConfig {
     pub seed_new_targets: Option<bool>,
     /// See [`Config::build_script_hermetic`].
     pub build_script_hermetic: Option<bool>,
+    /// See [`Config::build_script_omit_cargo_source_dir_mtime`].
+    pub build_script_omit_cargo_source_dir_mtime: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
     pub gc_evict_shared: Option<bool>,
     /// Held bytes count toward `max_size`. See [`Config::held_bytes_budget`].
@@ -1498,6 +1506,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
+    "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
@@ -1654,6 +1663,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
+    (
+        "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
+        "cache.build_script_omit_cargo_source_dir_mtime",
+    ),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
     ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
@@ -2495,6 +2508,8 @@ impl Config {
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
+        let build_script_omit_cargo_source_dir_mtime =
+            Self::build_script_omit_cargo_source_dir_mtime_enabled_for(invocation, &file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled_for(invocation, &file_config);
         let held_bytes_budget = Self::held_bytes_budget_for(invocation, &file_config);
         let storage_layout_advice =
@@ -2639,6 +2654,7 @@ impl Config {
             auto_clean_unused_units_days,
             seed_new_targets,
             build_script_hermetic,
+            build_script_omit_cargo_source_dir_mtime,
             gc_evict_shared,
             held_bytes_budget,
             storage_layout_advice,
@@ -3569,6 +3585,28 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.build_script_hermetic)
+            .unwrap_or(false)
+    }
+
+    /// Source-directory timestamp omission needs its own explicit opt-in;
+    /// neither unstable mode nor hermetic runs enable it.
+    fn build_script_omit_cargo_source_dir_mtime_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(value) = env_or_ignored_for(
+            invocation,
+            "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
+            ignore_env,
+        ) {
+            return value == "1" || value == "true";
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|config| config.cache.as_ref())
+            .and_then(|cache| cache.build_script_omit_cargo_source_dir_mtime)
             .unwrap_or(false)
     }
 

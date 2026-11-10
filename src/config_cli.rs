@@ -331,6 +331,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_directory_time_omission_is_a_typed_editable_boolean() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let dotted = "cache.build_script_omit_cargo_source_dir_mtime";
+        for (text, expected) in [("true", true), ("false", false)] {
+            edit(&path, dotted, Some(text)).unwrap();
+            let document = read_document(&path).unwrap();
+            let values: toml::Value = toml::from_str(&document.to_string()).unwrap();
+            assert_eq!(
+                lookup(&values, &key_parts(dotted).unwrap())
+                    .unwrap()
+                    .as_bool(),
+                Some(expected)
+            );
+            let typed: crate::config::FileConfig = toml::from_str(&document.to_string()).unwrap();
+            assert_eq!(
+                typed
+                    .cache
+                    .unwrap()
+                    .build_script_omit_cargo_source_dir_mtime,
+                Some(expected)
+            );
+        }
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(edit(&path, dotted, Some("1")).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        edit(&path, dotted, None).unwrap();
+        let values: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(lookup(&values, &key_parts(dotted).unwrap()).is_none());
+    }
+
+    #[test]
     fn size_edits_accept_units_and_integer_bytes_without_changing_other_keys() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.toml");

@@ -1106,6 +1106,24 @@ impl Environment {
         })
     }
 
+    /// Whether `path` is in the registry sources or Git checkouts of this
+    /// run's Cargo home. Resolve both the input and the source roots so a
+    /// lexical prefix, parent traversal or link into a workspace grants no
+    /// directory-time exemption.
+    fn in_cargo_source_cache(&self, path: &Path) -> bool {
+        let Ok(path) = path.canonicalize() else {
+            return false;
+        };
+        self.mappings.iter().any(|(root, placeholder)| {
+            *placeholder == "${KACHE_CARGO_HOME}"
+                && ["registry/src", "git/checkouts"].iter().any(|suffix| {
+                    root.join(suffix)
+                        .canonicalize()
+                        .is_ok_and(|source| path.starts_with(source))
+                })
+        })
+    }
+
     /// All Cargo target views used by ownership guards. Derived canonical
     /// views need not share the spelling layout used for text substitution.
     fn target_roots(&self) -> impl Iterator<Item = &Path> {
@@ -1740,6 +1758,8 @@ impl Run {
                 &file_hasher,
                 &mut budget,
                 prediction.default_package,
+                &self.environment,
+                self.config.build_script_omit_cargo_source_dir_mtime,
             )?;
             fold(&mut hasher, "state", state.as_bytes());
         }
@@ -4690,6 +4710,322 @@ mod tests {
         }
         assert_eq!(regular_a, regular_b, "the regular key maps the target away");
         assert_ne!(hermetic_a, hermetic_b, "the script reads each spelling");
+    }
+
+    /// Only the registry sources and Git checkouts of the Cargo home count,
+    /// in either spelling of the home, and the same names below another root
+    /// do not.
+    #[test]
+    fn cargo_source_caches_are_the_registry_sources_and_git_checkouts_of_the_cargo_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, cargo_home) = (dir.path().join("target"), dir.path().join("cargo"));
+        let environment = checkout_environment(&target, &cargo_home);
+        for path in [
+            cargo_home.join("registry/src/index/x-1.0.0/c"),
+            cargo_home.join("git/checkouts/x-1/0123abc/c"),
+            cargo_home.join("registry/index/index/x"),
+            cargo_home.join("registry/cache/index/x.crate"),
+            cargo_home.join("git/db/x-1"),
+            cargo_home.join("config-dir"),
+            cargo_home.join("outside"),
+            target.join("registry/src/x"),
+            target.join("git/checkouts/x"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let cached = |path: PathBuf| environment.in_cargo_source_cache(&path);
+        assert!(cached(cargo_home.join("registry/src/index/x-1.0.0/c")));
+        assert!(cached(cargo_home.join("git/checkouts/x-1/0123abc/c")));
+        // The temporary directory on macOS is below `/var`, which resolves
+        // to `/private/var`; Cargo can spell a package either way.
+        let canonical = cargo_home.canonicalize().unwrap();
+        assert!(cached(canonical.join("registry/src/index/x-1.0.0/c")));
+        assert!(cached(canonical.join("git/checkouts/x-1/0123abc/c")));
+        assert!(!cached(cargo_home.join("registry/index/index/x")));
+        assert!(!cached(cargo_home.join("registry/cache/index/x.crate")));
+        assert!(!cached(cargo_home.join("git/db/x-1")));
+        assert!(!cached(cargo_home.join("config-dir")));
+        assert!(!cached(target.join("debug/build/x-1/out")));
+        assert!(!cached(target.join("registry/src/x")));
+        assert!(!cached(target.join("git/checkouts/x")));
+        assert!(!cached(cargo_home.join("registry/src/../../outside")));
+        assert!(!cached(cargo_home.join("registry/src/missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_source_cache_classification_follows_the_actual_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo");
+        let environment = checkout_environment(&dir.path().join("target"), &cargo_home);
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("include")).unwrap();
+        let escape = environment.manifest_dir.join("escape");
+        std::os::unix::fs::symlink(&workspace, &escape).unwrap();
+        assert!(!environment.in_cargo_source_cache(&escape));
+        assert!(!environment.in_cargo_source_cache(&escape.join("include")));
+        let alias = dir.path().join("source-alias");
+        std::os::unix::fs::symlink(&environment.manifest_dir, &alias).unwrap();
+        assert!(environment.in_cargo_source_cache(&alias));
+    }
+
+    /// Cargo stamps each directory it unpacks into its registry sources with
+    /// the time of the unpack. `key` must leave the time of a directory
+    /// declared there out and keep its files' contents and times, and keep
+    /// the time of a directory declared outside the Cargo home.
+    fn assert_cargo_source_cache_directory_times(key: &dyn Fn(&Run, &Prediction) -> String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.build_script_omit_cargo_source_dir_mtime = true;
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.path().join("target"),
+                &dir.path().join("cargo"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let stamp = |path: &Path, seconds| {
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+        };
+        let registry = run.environment.manifest_dir.join("c");
+        let workspace = dir.path().join("workspace/c");
+        for declared in [&registry, &workspace] {
+            std::fs::create_dir_all(declared).unwrap();
+            std::fs::write(declared.join("blake3.c"), "same").unwrap();
+            stamp(&declared.join("blake3.c"), 1_700_000_000);
+            stamp(declared, 1_700_000_000);
+        }
+        let declaring = |input: String| {
+            let mut prediction = prediction_with(Some(Vec::new()), true);
+            prediction.inputs = vec![input];
+            prediction
+        };
+        let in_registry = declaring("${KACHE_MANIFEST_DIR}/c".to_string());
+        let in_workspace = declaring(workspace.to_string_lossy().into_owned());
+
+        let before = key(&run, &in_registry);
+        stamp(&registry, 1_700_000_060);
+        assert_eq!(key(&run, &in_registry), before, "the time of the unpack");
+        stamp(&registry.join("blake3.c"), 1_700_000_060);
+        assert_ne!(key(&run, &in_registry), before, "a file's time");
+        stamp(&registry.join("blake3.c"), 1_700_000_000);
+        assert_eq!(key(&run, &in_registry), before);
+        // Another length: detecting a same-size rewrite with a restored time
+        // relies on the change time, which only the Unix tests cover.
+        std::fs::write(registry.join("blake3.c"), "changed").unwrap();
+        stamp(&registry.join("blake3.c"), 1_700_000_000);
+        assert_ne!(key(&run, &in_registry), before, "a file's content");
+
+        let before = key(&run, &in_workspace);
+        stamp(&workspace, 1_700_000_060);
+        assert_ne!(
+            key(&run, &in_workspace),
+            before,
+            "a workspace directory's time"
+        );
+    }
+
+    #[test]
+    fn a_declared_directory_in_a_cargo_source_cache_is_keyed_without_its_time() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_cargo_source_cache_directory_times(&|run, prediction| {
+            run.action_key(prediction).unwrap()
+        });
+    }
+
+    #[test]
+    fn a_hermetic_key_leaves_out_directory_times_in_cargo_source_caches() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_cargo_source_cache_directory_times(&|run, prediction| {
+            hermetic::key(run, prediction, Path::new("debug/build/x-1/out")).unwrap()
+        });
+    }
+
+    #[cfg(unix)]
+    fn assert_cargo_source_symlink_times(key: &dyn Fn(&Run, &Prediction) -> String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.build_script_omit_cargo_source_dir_mtime = true;
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.path().join("target"),
+                &dir.path().join("cargo"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let data = run.environment.manifest_dir.join("data");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("input.h"), "same").unwrap();
+        std::os::unix::fs::symlink(&workspace, data.join("include")).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let newer = filetime::FileTime::from_unix_time(1_700_000_060, 0);
+        for path in [&data, &workspace, &workspace.join("input.h")] {
+            filetime::set_file_mtime(path, old).unwrap();
+        }
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        prediction.inputs = vec!["${KACHE_MANIFEST_DIR}/data".to_string()];
+        let before = key(&run, &prediction);
+        filetime::set_file_mtime(&data, newer).unwrap();
+        assert_eq!(
+            key(&run, &prediction),
+            before,
+            "the source directory's time"
+        );
+        filetime::set_file_mtime(&workspace, newer).unwrap();
+        assert_ne!(
+            key(&run, &prediction),
+            before,
+            "the linked directory's time"
+        );
+        filetime::set_file_mtime(&workspace, old).unwrap();
+        assert_eq!(key(&run, &prediction), before);
+        std::fs::write(workspace.join("input.h"), "changed bytes").unwrap();
+        filetime::set_file_mtime(workspace.join("input.h"), old).unwrap();
+        assert_ne!(key(&run, &prediction), before, "the linked file's contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_source_cache_keys_track_linked_directory_times() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_cargo_source_symlink_times(&|run, prediction| run.action_key(prediction).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_cargo_source_cache_keys_track_linked_directory_times() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_cargo_source_symlink_times(&|run, prediction| {
+            hermetic::key(run, prediction, Path::new("debug/build/x-1/out")).unwrap()
+        });
+    }
+
+    fn assert_resolved_git_directory_times(key: &dyn Fn(&Run, &Prediction) -> String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.build_script_omit_cargo_source_dir_mtime = true;
+        let cargo_home = dir.path().join("cargo");
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(&dir.path().join("target"), &cargo_home),
+            start: std::time::Instant::now(),
+        };
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        prediction.inputs = vec!["${KACHE_MANIFEST_DIR}/.git".to_string()];
+        for (git_dir, cached) in [
+            (dir.path().join("external-git"), false),
+            (cargo_home.join("git/checkouts/x-1/revision/.git"), true),
+        ] {
+            std::fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+            std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(git_dir.join("refs/heads/main"), "a".repeat(40)).unwrap();
+            std::fs::write(
+                run.environment.manifest_dir.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+            filetime::set_file_mtime(
+                &git_dir,
+                filetime::FileTime::from_unix_time(1_700_000_000, 0),
+            )
+            .unwrap();
+            let before = key(&run, &prediction);
+            filetime::set_file_mtime(
+                &git_dir,
+                filetime::FileTime::from_unix_time(1_700_000_060, 0),
+            )
+            .unwrap();
+            assert_eq!(
+                key(&run, &prediction) == before,
+                cached,
+                "{}",
+                git_dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn git_input_directory_times_follow_the_resolved_cargo_source_location() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_resolved_git_directory_times(&|run, prediction| run.action_key(prediction).unwrap());
+    }
+
+    #[test]
+    fn hermetic_git_input_directory_times_follow_the_resolved_cargo_source_location() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_resolved_git_directory_times(&|run, prediction| {
+            hermetic::key(run, prediction, Path::new("debug/build/x-1/out")).unwrap()
+        });
+    }
+
+    fn assert_cargo_source_time_policy_switching(key: &dyn Fn(&Run, &Prediction) -> String) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let mut run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(
+                &dir.path().join("target"),
+                &dir.path().join("cargo"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let data = run.environment.manifest_dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("input"), "same").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let newer = filetime::FileTime::from_unix_time(1_700_000_060, 0);
+        filetime::set_file_mtime(&data, old).unwrap();
+        let mut prediction = prediction_with(Some(Vec::new()), true);
+        prediction.inputs = vec!["${KACHE_MANIFEST_DIR}/data".to_string()];
+        let strict = key(&run, &prediction);
+        filetime::set_file_mtime(&data, newer).unwrap();
+        assert_ne!(
+            key(&run, &prediction),
+            strict,
+            "the default keeps directory times"
+        );
+        run.config.build_script_omit_cargo_source_dir_mtime = true;
+        let omitted = key(&run, &prediction);
+        assert_ne!(
+            omitted, strict,
+            "the opt-in cannot select a timestamped entry"
+        );
+        filetime::set_file_mtime(&data, old).unwrap();
+        assert_eq!(key(&run, &prediction), omitted);
+        run.config.build_script_omit_cargo_source_dir_mtime = false;
+        assert_eq!(
+            key(&run, &prediction),
+            strict,
+            "turning it off restores the strict key"
+        );
+    }
+
+    #[test]
+    fn cargo_source_directory_time_omission_requires_opt_in_and_keeps_keys_separate() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_cargo_source_time_policy_switching(&|run, prediction| {
+            run.action_key(prediction).unwrap()
+        });
+    }
+
+    #[test]
+    fn hermetic_cargo_source_directory_time_omission_requires_the_same_opt_in() {
+        let _lock = crate::test_support::process_state_test_lock();
+        assert_cargo_source_time_policy_switching(&|run, prediction| {
+            hermetic::key(run, prediction, Path::new("debug/build/x-1/out")).unwrap()
+        });
     }
 
     /// libgit2-sys reads libz-sys's `OUT_DIR` through `DEP_Z_ROOT`, and

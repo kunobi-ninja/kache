@@ -66,11 +66,33 @@ fn build(
     report_mtime: bool,
     expected: &str,
 ) -> Vec<serde_json::Value> {
+    build_in_home(
+        source,
+        target,
+        cache,
+        hermetic,
+        report_mtime,
+        expected,
+        None,
+    )
+}
+
+/// [`build`], with `CARGO_HOME` set to `cargo_home` when there is one.
+fn build_in_home(
+    source: &Path,
+    target: &Path,
+    cache: &Path,
+    hermetic: bool,
+    report_mtime: bool,
+    expected: &str,
+    cargo_home: Option<&Path>,
+) -> Vec<serde_json::Value> {
     let events = cache.join("events.jsonl");
     let before = std::fs::read_to_string(&events).unwrap_or_default().len();
     let output = hermetic_command("cargo", cache, Some(&isolated_config_path(cache)))
         .args(["build", "--offline", "--quiet"])
         .current_dir(source)
+        .envs(cargo_home.map(|home| ("CARGO_HOME", home)))
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
@@ -338,4 +360,143 @@ fn implicit_package_reuse_survives_directory_and_cargo_marker_changes() {
     timestamp(&source.join("data/input.txt"), OLD + 60);
     let events = build(&source, &root.join("t3"), &cache, false, false, "constant");
     assert_eq!(script(&events)["result"], "miss");
+}
+
+/// A workspace whose dependency sits where Cargo unpacks registry packages
+/// in `cargo_home`. Its build script declares its `data` directory and
+/// reports the time of the file in it. Returns the dependency's directory.
+fn registry_fixture(source: &Path, cargo_home: &Path) -> PathBuf {
+    let package = cargo_home.join("registry/src/index.crates.io-1949cf8c6b5b557f/mtime_dep-1.0.0");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::create_dir_all(package.join("data")).unwrap();
+    std::fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname='mtime_dep'\nversion='1.0.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=data");
+    let modified = std::fs::metadata("data/input.txt").unwrap().modified().unwrap();
+    let seconds = modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    println!("cargo:rustc-env=INPUT_VALUE={seconds}");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("src/lib.rs"),
+        "pub const VALUE: &str = env!(\"INPUT_VALUE\");\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("data/input.txt"), "identical bytes\n").unwrap();
+    timestamp(&package.join("data/input.txt"), OLD);
+    timestamp(&package.join("data"), OLD);
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(
+        source.join("Cargo.toml"),
+        format!(
+            "[package]\nname='mtime_probe'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nmtime_dep={{path='{}'}}\n[workspace]\n",
+            package.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("src/main.rs"),
+        "fn main() { println!(\"{}\", mtime_dep::VALUE); }\n",
+    )
+    .unwrap();
+    package
+}
+
+/// Cargo unpacks a registry package with the file times of its archive and
+/// stamps every directory with the time of the unpack, so a fresh Cargo home
+/// gives a declared directory there a new time over the same files.
+#[test]
+fn a_fresh_unpack_in_the_cargo_home_keeps_the_script_run() {
+    build_kache();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let cargo_home = root.join("home");
+    let data = registry_fixture(&source, &cargo_home).join("data");
+    let cache = root.join("cache");
+    let config = configure(&cache);
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("{text}build_script_omit_cargo_source_dir_mtime=true\n"),
+    )
+    .unwrap();
+    let _daemon = DaemonGuard::new(kache_binary(), &cache);
+    let home = Some(cargo_home.as_path());
+    let old = OLD.to_string();
+    build_in_home(&source, &root.join("t0"), &cache, false, false, &old, home);
+    timestamp(&data, OLD + 60);
+    let unpacked = build_in_home(&source, &root.join("t1"), &cache, false, false, &old, home);
+    assert_eq!(script(&unpacked)["result"], "local_hit");
+
+    timestamp(&data.join("input.txt"), OLD + 60);
+    let new = (OLD + 60).to_string();
+    let changed = build_in_home(&source, &root.join("t2"), &cache, false, false, &new, home);
+    assert_eq!(script(&changed)["result"], "miss");
+}
+
+/// An explicit declaration may observe the directory's own timestamp.
+/// Fresh files with unchanged contents do not make that observation equal.
+fn assert_explicit_cargo_source_directory_keeps_its_observed_time(hermetic: bool) {
+    build_kache();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let cargo_home = root.join("home");
+    let package = registry_fixture(&source, &cargo_home);
+    std::fs::write(
+        package.join("build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=data");
+    let modified = std::fs::metadata("data").unwrap().modified().unwrap();
+    let seconds = modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    println!("cargo:rustc-env=INPUT_VALUE={seconds}");
+}
+"#,
+    )
+    .unwrap();
+    let data = package.join("data");
+    timestamp(&data, OLD);
+    let cache = root.join("cache");
+    configure(&cache);
+    let _daemon = DaemonGuard::new(kache_binary(), &cache);
+    let home = Some(cargo_home.as_path());
+    build_in_home(
+        &source,
+        &root.join("t0"),
+        &cache,
+        hermetic,
+        false,
+        &OLD.to_string(),
+        home,
+    );
+    timestamp(&data, OLD + 60);
+    let changed = build_in_home(
+        &source,
+        &root.join("t1"),
+        &cache,
+        hermetic,
+        false,
+        &(OLD + 60).to_string(),
+        home,
+    );
+    assert_eq!(script(&changed)["result"], "miss");
+}
+
+#[test]
+fn an_explicit_cargo_source_directory_keeps_its_observed_time_by_default() {
+    assert_explicit_cargo_source_directory_keeps_its_observed_time(false);
+}
+
+#[test]
+fn a_hermetic_cargo_source_directory_keeps_its_observed_time_by_default() {
+    assert_explicit_cargo_source_directory_keeps_its_observed_time(true);
 }

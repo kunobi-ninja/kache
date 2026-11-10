@@ -90,8 +90,10 @@ is restored only when all of these match:
   `cargo:rerun-if-changed`, including directory entries and symlink referents
   (a directory is digested recursively; the digest of a directory whose
   entries' sizes and timestamps are unchanged is reused from a memo, so a
-  vendored C library costs one stat walk per run). A script that declares
-  nothing depends on its whole package directory, as in Cargo. An absolute
+  vendored C library costs one stat walk per run). An explicit opt-in can
+  omit directory modification times in Cargo's source caches (see below).
+  A script that declares nothing
+  depends on its whole package directory, as in Cargo. An absolute
   declaration outside the mapped package, target and Cargo home roots also
   binds the run to its package directory. Such runs can be reused across
   target directories in one checkout. Use a package-relative declaration
@@ -116,6 +118,29 @@ The implicit package input tracks file times and ignores directory times,
 so creating an excluded `target` directory does not invalidate a run.
 Hermetic runs check the same declared input times. Older run entries use
 separate keys and cannot satisfy these checks.
+
+Cargo unpacks registry files with their archive timestamps and gives
+directories the time of the unpack. If your scripts do not read directory
+timestamps, you can reuse more runs after a fresh unpack:
+
+```sh
+kache config set --project cache.build_script_omit_cargo_source_dir_mtime true
+```
+
+The TOML setting is `[cache] build_script_omit_cargo_source_dir_mtime = true`;
+the environment override is `KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME=1`.
+It is **off by default**, including in hermetic and unstable modes. It omits
+directory times only for inputs resolved inside this Cargo home's
+`registry/src` or `git/checkouts`. File contents, file times, directory
+entries and symlink times stay keyed. Symlink referents keep directory
+times too, and a `.git` declaration uses the location Git resolves it to.
+
+Kache does not detect whether a script reads directory timestamps. Enabling
+this setting for a script that embeds one can replay its old output after
+a fresh unpack. Keep it off for those scripts. Git checkouts also give files
+new timestamps, which this setting retains, so it does not promise reuse
+across fresh Git checkouts. Turn it off with the same command and `false`.
+Runs keyed with directory times cannot use a run keyed without them.
 
 Two settings let more runs match across checkouts. A keyed variable that uses
 `KACHE_BASE_DIR` as the source of a path prefix map

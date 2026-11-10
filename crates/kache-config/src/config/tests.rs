@@ -3311,6 +3311,7 @@ fn test_file_config_roundtrip() {
             auto_clean_unused_units_days: None,
             seed_new_targets: None,
             build_script_hermetic: None,
+            build_script_omit_cargo_source_dir_mtime: None,
             gc_evict_shared: None,
             count_held_in_max_size: None,
             storage_layout_advice: None,
@@ -3981,6 +3982,7 @@ fn test_config_store_dir() {
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_omit_cargo_source_dir_mtime: false,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4079,6 +4081,7 @@ fn test_config_index_db_path() {
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_omit_cargo_source_dir_mtime: false,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4173,6 +4176,7 @@ fn test_config_event_log_path() {
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_omit_cargo_source_dir_mtime: false,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -4286,6 +4290,7 @@ fn test_config_socket_path() {
         auto_clean_unused_units_days: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_omit_cargo_source_dir_mtime: false,
         gc_evict_shared: false,
         held_bytes_budget: Default::default(),
         storage_layout_advice: true,
@@ -5035,6 +5040,7 @@ fn test_save_and_load_file_config() {
             auto_clean_unused_units_days: None,
             seed_new_targets: None,
             build_script_hermetic: None,
+            build_script_omit_cargo_source_dir_mtime: None,
             gc_evict_shared: None,
             count_held_in_max_size: None,
             storage_layout_advice: None,
@@ -6644,6 +6650,71 @@ fn blaze_requires_explicit_opt_in_and_honors_the_selected_file() {
     assert!(!load(&[("KACHE_BLAZE", "0")]));
     std::fs::write(&path, "[cache]\nblaze=true\nignore_env=true\n").unwrap();
     assert!(load(&[("KACHE_BLAZE", "false")]));
+}
+
+#[test]
+fn cargo_source_directory_time_omission_requires_its_own_explicit_opt_in() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join(".kache.toml");
+    let load = |extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            (
+                "KACHE_CONFIG".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ),
+            ("KACHE_HOST_CONFIG".into(), String::new()),
+        ];
+        vars.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        let invocation = InvocationEnv::from_parts(
+            vars,
+            Some(root.path().into()),
+            Some(root.path().into()),
+            root.path().into(),
+        );
+        Config::load_for(&invocation)
+            .unwrap()
+            .build_script_omit_cargo_source_dir_mtime
+    };
+    assert!(!load(&[]));
+    std::fs::write(
+        &path,
+        "[cache]\nunstable=true\nbuild_script_hermetic=true\n",
+    )
+    .unwrap();
+    assert!(!load(&[]));
+    let env = "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME";
+    for (value, expected) in [
+        ("1", true),
+        ("true", true),
+        ("0", false),
+        ("false", false),
+        ("yes", false),
+    ] {
+        assert_eq!(load(&[(env, value)]), expected, "{value}");
+    }
+    std::fs::write(
+        &path,
+        "[cache]\nbuild_script_omit_cargo_source_dir_mtime=true\n",
+    )
+    .unwrap();
+    assert!(load(&[]));
+    assert!(!load(&[(env, "0")]));
+    std::fs::write(
+        &path,
+        "[cache]\nbuild_script_omit_cargo_source_dir_mtime=false\n",
+    )
+    .unwrap();
+    assert!(load(&[(env, "true")]));
+    std::fs::write(
+        &path,
+        "[cache]\nignore_env=true\nbuild_script_omit_cargo_source_dir_mtime=true\n",
+    )
+    .unwrap();
+    assert!(load(&[(env, "0")]));
 }
 
 #[test]

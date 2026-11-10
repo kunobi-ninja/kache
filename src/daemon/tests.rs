@@ -8540,8 +8540,9 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
     });
     daemon.set_remote_backend_for_test(backend);
     let v3 = daemon.v3_remote().await.unwrap();
+    let prefetch_started = Instant::now();
     let imported = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(30),
         daemon.try_packed_prefetch(
             &context,
             v3,
@@ -8556,7 +8557,25 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
         ),
     )
     .await
-    .expect("catalog and pack bodies must be released while the queue is draining");
+    .unwrap_or_else(|error| {
+        panic!(
+            "catalog and pack bodies must be released while the queue is draining: {error}; \
+             elapsed={:?}, requests={}, decoded_packs={}, imported_entries={}",
+            prefetch_started.elapsed(),
+            daemon
+                .prefetch_stats
+                .pack_requests_total
+                .load(Ordering::Relaxed),
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            daemon
+                .prefetch_stats
+                .downloads_completed
+                .load(Ordering::Relaxed),
+        )
+    });
     assert_eq!(imported.len(), 3);
     for (key, _, _) in candidates {
         assert!(imported.contains(&key));

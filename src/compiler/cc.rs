@@ -4997,7 +4997,9 @@ fn cc_memo_env_is_keyed(name: &OsStr) -> bool {
 ///    key names: keyed from a memo stamp or a mapped hash taken from a racy
 ///    read, or from an input saved before a key-first compile read it.
 /// 4: older entries replay compiler diagnostics with the producer's paths.
-const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:4\n";
+/// 5: older memo validation could pair a header's availability with another
+///    header's probe, allowing an object to be stored under a stale key.
+const CC_ARTIFACT_SCHEMA: &[u8] = b"cc_artifact_schema:5\n";
 
 /// The schema of [`cc_preprocess_memo_key`].
 ///

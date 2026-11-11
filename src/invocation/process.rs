@@ -10,6 +10,11 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(windows)]
 mod windows;
 
+// waitid's required flags occupy disjoint bits, so their sum is the exact
+// immutable mask for observing exits without blocking or reaping the leader.
+#[cfg(unix)]
+const PROBE_WAIT_OPTIONS: libc::c_int = libc::WEXITED + libc::WNOHANG + libc::WNOWAIT;
+
 #[derive(Clone, Default)]
 pub(crate) struct Cancellation(Arc<Request>);
 
@@ -231,6 +236,66 @@ impl Child {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         running.wait(false)
+    }
+
+    /// Finish a local diagnostic probe, stopping its process tree before
+    /// releasing the leader's identity. Normal compiler waits keep their
+    /// existing lifetime semantics.
+    pub(crate) fn try_wait_probe(&mut self) -> io::Result<Option<ExitStatus>> {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !running.controlled {
+            return Err(io::Error::other(
+                "probe requires an owned process group or job",
+            ));
+        }
+        #[cfg(unix)]
+        if running.child.remote() {
+            return Err(io::Error::other("probe requires a local child"));
+        }
+        if running.status.is_some() {
+            return Ok(running.status);
+        }
+        #[cfg(unix)]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    PROBE_WAIT_OPTIONS,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            // The leader is still unreaped, so its process-group ID cannot
+            // have been reused. This also stops children holding capture files.
+            crate::platform::kill_process_group(self.pid);
+            running.wait(false)
+        }
+        #[cfg(windows)]
+        {
+            let status = running.wait(false)?;
+            if status.is_some()
+                && let Some(tree) = &running.tree
+            {
+                tree.kill()?;
+            }
+            Ok(status)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::other(
+                "owned diagnostic probes are unsupported on this platform",
+            ))
+        }
     }
 
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -556,6 +621,77 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]).env("PATH", env!("PATH"));
         command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_wait_rejects_children_without_owned_process_groups() {
+        let mut child = shell("exit 0").invocation_spawn().unwrap();
+        let error = child.try_wait_probe().unwrap_err();
+        assert!(error.to_string().contains("owned process group or job"));
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_wait_options_have_only_the_required_disjoint_flags() {
+        assert_eq!(libc::WEXITED & libc::WNOHANG, 0);
+        assert_eq!(libc::WEXITED & libc::WNOWAIT, 0);
+        assert_eq!(libc::WNOHANG & libc::WNOWAIT, 0);
+        assert_eq!(
+            PROBE_WAIT_OPTIONS,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "stdin-gated child with its own deadline for probe wait tests"]
+    fn probe_wait_child_fixture() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            let _ = tx.send(line);
+        });
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(5));
+        std::process::exit(if finished.is_ok_and(|line| line == "finish\n") {
+            7
+        } else {
+            93
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_wait_preserves_pending_and_repeated_completed_status() {
+        use std::io::Write;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "invocation::process::tests::probe_wait_child_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.invocation_spawn_in_group().unwrap();
+        assert!(child.try_wait_probe().unwrap().is_none());
+        child.stdin.take().unwrap().write_all(b"finish\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait_probe().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "probe did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(child.try_wait_probe().unwrap(), Some(status));
+        assert_eq!(child.wait().unwrap(), status);
     }
 
     #[cfg(unix)]

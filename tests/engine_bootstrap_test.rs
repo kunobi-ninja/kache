@@ -129,16 +129,40 @@ fn a_renamed_frontend_installs_shims_to_its_original_image() {
     let fixture = Fixture::new();
     let frontend = fixture.renamed_frontend();
     let shims = fixture.root.path().join("shims");
+    // This tests the image used for links, independently of any ambient Rust
+    // installation. env_clear + a fake HOME cannot use rustup's default home.
+    let tools = fixture.root.path().join("tools");
+    let probes = fixture.root.path().join("version-probes");
+    std::fs::create_dir(&tools).unwrap();
+    for tool in ["cargo", "rustdoc"] {
+        kache_fs::testutil::write_executable(
+            &tools.join(tool),
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 23\nprintf '{tool}:--version\\n' >> \"$IDENTITY_VERSION_PROBES\"\nprintf '{tool} 1.99.0\\n'\n"
+            ),
+        );
+    }
     let (_, status) = fixture.run(
         fixture
             .command(frontend.to_str().unwrap())
+            .env("PATH", &tools)
+            .env("IDENTITY_VERSION_PROBES", &probes)
             .args(["init", "--shims"])
             .arg(&shims)
             .arg("--canonical-only"),
     );
     let stdout = std::fs::read(fixture.root.path().join("stdout")).unwrap();
     let stderr = std::fs::read(fixture.root.path().join("stderr")).unwrap();
-    assert!(status.success(), "{stdout:?} {stderr:?}");
+    assert!(
+        status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let recorded = std::fs::read_to_string(probes).unwrap();
+    let mut recorded = recorded.lines().collect::<Vec<_>>();
+    recorded.sort_unstable();
+    assert_eq!(recorded, ["cargo:--version", "rustdoc:--version"]);
     let original = frontend.canonicalize().unwrap();
     for name in kache_shims::farm::SHIM_NAMES {
         let shim = shims.join(name);

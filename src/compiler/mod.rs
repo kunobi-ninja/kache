@@ -2264,6 +2264,67 @@ pub(crate) mod shim {
         resolve_real_compiler_on(name, &dirs, self_exe.as_deref())
     }
 
+    pub(crate) fn real_tool_override(name: &str) -> Option<&'static str> {
+        let name = super::strip_windows_exe_suffix(name);
+        if name.eq_ignore_ascii_case("cargo") {
+            Some("KACHE_REAL_CARGO")
+        } else if name.eq_ignore_ascii_case("rustdoc") {
+            Some("KACHE_REAL_RUSTDOC")
+        } else {
+            None
+        }
+    }
+
+    /// Select a shim's tool without changing a rustup proxy's invocation name.
+    /// Diagnostics use this same snapshot-based selection as the runtime shim.
+    pub(crate) fn real_tool_for(
+        name: &str,
+        env: &super::InvocationEnv,
+        executable: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String> {
+        let selected = real_tool_override(name)
+            .and_then(|key| env.var_os(key))
+            .or_else(|| {
+                if name == "cargo" {
+                    crate::blaze::returning_cargo(env)
+                } else {
+                    None
+                }
+            });
+        let path = if let Some(selected) = selected {
+            env.resolve_program(Path::new(&selected))
+                .and_then(|path| env.resolve(&path))
+                .ok_or_else(|| format!("cannot resolve the selected {name} program {selected:?}"))?
+        } else {
+            let paths = env.var_os("PATH").unwrap_or_default();
+            let dirs = std::env::split_paths(&paths)
+                .filter_map(|path| env.resolve(&path))
+                .collect::<Vec<_>>();
+            let Some(path) = resolve_real_compiler_on(name, &dirs, executable) else {
+                return Ok(None);
+            };
+            path
+        };
+        let resolved = std::fs::canonicalize(&path).map_err(|error| {
+            format!("cannot resolve selected {name} {}: {error}", path.display())
+        })?;
+        let current = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok());
+        let frontend = executable.and_then(|path| path.canonicalize().ok());
+        if current.as_ref() == Some(&resolved)
+            || farm::resolves_to_kache(&path, frontend.as_deref(), &|p| p.canonicalize().ok())
+            || path.parent().is_some_and(farm::has_marker)
+        {
+            return Err(format!(
+                "the selected {name} program {} points back to a Kache shim; set {} to the real tool",
+                path.display(),
+                real_tool_override(name).unwrap_or("the tool path"),
+            ));
+        }
+        Ok(Some(path))
+    }
+
     /// Whether a real `name`, not a kache shim, is in the directories of `path`.
     #[cfg(unix)]
     pub(crate) fn real_compiler_on(path: &std::ffi::OsStr, name: &str) -> bool {
@@ -2387,7 +2448,15 @@ pub(crate) mod shim {
         let paths = std::env::split_paths(&paths)
             .filter_map(|path| env.resolve(&path))
             .collect::<Vec<_>>();
-        let Some(real) = resolve_real_compiler_on(name, &paths, executable) else {
+        let real = if super::rustdoc::RustdocCompiler::recognizes(argv) {
+            match real_tool_for(name, env, executable) {
+                Ok(real) => real,
+                Err(error) => return Some(Err(error)),
+            }
+        } else {
+            resolve_real_compiler_on(name, &paths, executable)
+        };
+        let Some(real) = real else {
             let message = match launcher_driver {
                 Some("cl") => {
                     "`kache-cl` found no real `cl` compiler on PATH. Open a Visual Studio \
@@ -2425,6 +2494,153 @@ pub(crate) mod shim {
 mod shim_tests {
     use super::shim::*;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    #[test]
+    fn default_rust_tool_paths_reject_the_current_engine_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let current = std::env::current_exe().unwrap();
+        let frontend = root.join("separate-frontend");
+        std::fs::write(&frontend, "frontend identity fixture").unwrap();
+        let fallback = root.join("fallback");
+        std::fs::create_dir(&fallback).unwrap();
+        let path = std::env::join_paths([&root, &fallback]).unwrap();
+        let env = super::InvocationEnv::from_parts(
+            [("PATH", path)],
+            Some(root.clone()),
+            None,
+            root.clone(),
+        );
+        for name in ["cargo", "rustdoc"] {
+            // Only inspect this link. Executing it would run the test binary
+            // as a tool, which is exactly the invalid selection being rejected.
+            std::os::unix::fs::symlink(&current, root.join(name)).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let other = fallback.join(name);
+            std::fs::write(&other, "fallback tool fixture").unwrap();
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let error = real_tool_for(name, &env, Some(&frontend)).unwrap_err();
+            assert!(error.contains("points back"), "{error}");
+            assert!(error.contains(real_tool_override(name).unwrap()), "{error}");
+            std::fs::remove_file(root.join(name)).unwrap();
+            std::fs::remove_file(other).unwrap();
+            assert_eq!(real_tool_for(name, &env, Some(&frontend)).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn rust_tool_overrides_use_the_snapshot_and_reject_shims_without_falling_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let toolchain = root.join("real tools");
+        let shims = root.join("shims");
+        std::fs::create_dir(&toolchain).unwrap();
+        std::fs::create_dir(&shims).unwrap();
+        kache_shims::farm::write_marker(&shims).unwrap();
+        let tool = |dir: &Path, name: &str| {
+            let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::write(&path, "first-party tool fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        let path = std::env::join_paths([&shims, &toolchain]).unwrap();
+        let routed_cargo = tool(&toolchain, "routed-cargo");
+        for name in ["cargo", "rustdoc"] {
+            let real = tool(&toolchain, name);
+            let shim = tool(&shims, name);
+            let override_key = real_tool_override(name).unwrap();
+            let snapshot = |selected: Option<&Path>| {
+                let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+                    vec![("PATH".into(), path.clone())];
+                if let Some(selected) = selected {
+                    vars.push((override_key.into(), selected.as_os_str().to_owned()));
+                }
+                super::InvocationEnv::from_parts(vars, Some(root.clone()), None, root.clone())
+            };
+            assert_eq!(
+                real_tool_for(name, &snapshot(None), None).unwrap(),
+                Some(real.clone())
+            );
+            assert_eq!(
+                real_tool_for(name, &snapshot(Some(&real)), None).unwrap(),
+                Some(real.clone())
+            );
+            let mut routed = snapshot(None);
+            routed.set("KACHE_BLAZE_ROUTED", "1");
+            routed.set("CARGO", shims.join("cargo"));
+            routed.set("KACHE_BLAZE_CARGO_SHIM", shims.join("cargo"));
+            routed.set("KACHE_BLAZE_REAL_CARGO", routed_cargo.as_os_str());
+            assert_eq!(
+                real_tool_for(name, &routed, None).unwrap(),
+                Some(if name == "cargo" {
+                    routed_cargo.clone()
+                } else {
+                    real.clone()
+                })
+            );
+            routed.set(override_key, real.as_os_str());
+            assert_eq!(
+                real_tool_for(name, &routed, None).unwrap(),
+                Some(real.clone())
+            );
+            let relative_path = super::InvocationEnv::from_parts(
+                [("PATH", "real tools"), (override_key, name)],
+                Some(root.clone()),
+                None,
+                root.clone(),
+            );
+            assert_eq!(
+                real_tool_for(name, &relative_path, None).unwrap(),
+                Some(real.clone())
+            );
+            assert!(
+                real_tool_for(name, &snapshot(Some(&shim)), None)
+                    .unwrap_err()
+                    .contains(override_key)
+            );
+            assert!(
+                real_tool_for(name, &snapshot(Some(&root.join("missing"))), None)
+                    .unwrap_err()
+                    .contains("cannot resolve")
+            );
+            assert!(
+                real_tool_for(name, &snapshot(Some(&real)), Some(&real))
+                    .unwrap_err()
+                    .contains("points back")
+            );
+            // Cargo/rustdoc proxies inspect their invoked basename. Keep the
+            // symlink path instead of replacing it with the shared proxy binary.
+            #[cfg(unix)]
+            {
+                let proxy = toolchain.join(format!("proxy-for-{name}"));
+                std::fs::rename(&real, &proxy).unwrap();
+                std::os::unix::fs::symlink(&proxy, &real).unwrap();
+                assert_eq!(
+                    real_tool_for(name, &snapshot(Some(&real)), None).unwrap(),
+                    Some(real.clone())
+                );
+                assert_eq!(
+                    real_tool_for(name, &snapshot(None), None).unwrap(),
+                    Some(real.clone())
+                );
+            }
+            if name == "rustdoc" {
+                let env = snapshot(Some(&real));
+                for alias in ["rustdoc", "rustdoc.exe", "RUSTDOC.EXE"] {
+                    let argv = vec![alias.to_string(), "--version".to_string()];
+                    let rewritten = wrapper_args_for(&argv, &env, None).unwrap().unwrap();
+                    assert_eq!(rewritten, [real.to_str().unwrap(), "--version"]);
+                }
+            }
+        }
+        assert_eq!(real_tool_override("cc"), None);
+        assert_eq!(real_tool_override("CARGO.EXE"), Some("KACHE_REAL_CARGO"));
+    }
 
     #[test]
     fn native_launchers_resolve_the_selected_driver_in_the_clients_path() {

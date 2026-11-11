@@ -451,16 +451,15 @@ mod tests {
         .unwrap();
         let manager = root.join("manager");
         let path = std::env::join_paths([manager.clone(), shims.clone()]).unwrap();
-        let env = InvocationEnv::from_parts(
-            [
-                ("PATH", path.clone()),
-                ("KEEP", "yes".into()),
-                ("path", "case-sensitive-value".into()),
-            ],
+        let mut env = InvocationEnv::from_parts(
+            [("PATH", path.clone()), ("KEEP", "yes".into())],
             Some(root.clone()),
             Some(root.clone()),
             root.clone(),
         );
+        if cfg!(not(windows)) {
+            env.set("path", "case-sensitive-value");
+        }
         assert!(shim_on_path("cargo", &env, None));
         assert!(!shim_on_path("rustdoc", &env, None));
         // With no Rust tool behind the farm, C/C++ setup remains valid.
@@ -501,6 +500,8 @@ mod tests {
         assert_eq!(projected.var("KEEP").unwrap(), "yes");
         #[cfg(not(windows))]
         assert_eq!(projected.var("path").unwrap(), "case-sensitive-value");
+        #[cfg(windows)]
+        assert_eq!(projected.var_os("path"), projected.var_os("PATH"));
         assert_eq!(
             std::env::split_paths(&projected.var_os("PATH").unwrap()).collect::<Vec<_>>(),
             [root.join("custom shims"), manager, shims]

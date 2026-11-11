@@ -2291,17 +2291,20 @@ pub(crate) mod shim {
                     None
                 }
             });
-        let Some(selected) = selected else {
+        let path = if let Some(selected) = selected {
+            env.resolve_program(Path::new(&selected))
+                .and_then(|path| env.resolve(&path))
+                .ok_or_else(|| format!("cannot resolve the selected {name} program {selected:?}"))?
+        } else {
             let paths = env.var_os("PATH").unwrap_or_default();
             let dirs = std::env::split_paths(&paths)
                 .filter_map(|path| env.resolve(&path))
                 .collect::<Vec<_>>();
-            return Ok(resolve_real_compiler_on(name, &dirs, executable));
+            let Some(path) = resolve_real_compiler_on(name, &dirs, executable) else {
+                return Ok(None);
+            };
+            path
         };
-        let path = env
-            .resolve_program(Path::new(&selected))
-            .and_then(|path| env.resolve(&path))
-            .ok_or_else(|| format!("cannot resolve the selected {name} program {selected:?}"))?;
         let resolved = std::fs::canonicalize(&path).map_err(|error| {
             format!("cannot resolve selected {name} {}: {error}", path.display())
         })?;
@@ -2492,6 +2495,40 @@ mod shim_tests {
     use super::shim::*;
     use std::path::{Path, PathBuf};
 
+    #[cfg(unix)]
+    #[test]
+    fn default_rust_tool_paths_reject_the_current_engine_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let current = std::env::current_exe().unwrap();
+        let frontend = root.join("separate-frontend");
+        std::fs::write(&frontend, "frontend identity fixture").unwrap();
+        let fallback = root.join("fallback");
+        std::fs::create_dir(&fallback).unwrap();
+        let path = std::env::join_paths([&root, &fallback]).unwrap();
+        let env = super::InvocationEnv::from_parts(
+            [("PATH", path)],
+            Some(root.clone()),
+            None,
+            root.clone(),
+        );
+        for name in ["cargo", "rustdoc"] {
+            // Only inspect this link. Executing it would run the test binary
+            // as a tool, which is exactly the invalid selection being rejected.
+            std::os::unix::fs::symlink(&current, root.join(name)).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let other = fallback.join(name);
+            std::fs::write(&other, "fallback tool fixture").unwrap();
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let error = real_tool_for(name, &env, Some(&frontend)).unwrap_err();
+            assert!(error.contains("points back"), "{error}");
+            assert!(error.contains(real_tool_override(name).unwrap()), "{error}");
+            std::fs::remove_file(root.join(name)).unwrap();
+            std::fs::remove_file(other).unwrap();
+            assert_eq!(real_tool_for(name, &env, Some(&frontend)).unwrap(), None);
+        }
+    }
+
     #[test]
     fn rust_tool_overrides_use_the_snapshot_and_reject_shims_without_falling_back() {
         let temp = tempfile::tempdir().unwrap();
@@ -2585,6 +2622,10 @@ mod shim_tests {
                 std::os::unix::fs::symlink(&proxy, &real).unwrap();
                 assert_eq!(
                     real_tool_for(name, &snapshot(Some(&real)), None).unwrap(),
+                    Some(real.clone())
+                );
+                assert_eq!(
+                    real_tool_for(name, &snapshot(None), None).unwrap(),
                     Some(real.clone())
                 );
             }

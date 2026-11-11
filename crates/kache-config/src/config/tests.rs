@@ -152,6 +152,53 @@ fn demand_timeout_file_values_keep_invalid_waits_bounded() {
 
 #[test]
 fn ignored_override_warnings_use_only_client_keys_and_never_their_values() {
+    const CHILD: &str = "KACHE_TEST_IGNORED_OVERRIDE_WARNINGS_CHILD";
+    let _lock = config_path_lock();
+    if std::env::var_os(CHILD).is_none() {
+        // Another test thread can register this shared callsite without a
+        // subscriber and cache that decision. Isolate the capture from other
+        // Config loads while keeping the warning and privacy assertions below.
+        let stdout = tempfile::tempfile().unwrap();
+        let stderr = tempfile::tempfile().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::ignored_override_warnings_use_only_client_keys_and_never_their_values",
+                "--nocapture",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_clear()
+            .envs(std::env::vars_os())
+            .env(CHILD, "1")
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("isolated warning capture timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        use std::io::{Read, Seek};
+        let read = |mut file: std::fs::File| {
+            file.rewind().unwrap();
+            let mut text = String::new();
+            file.read_to_string(&mut text).unwrap();
+            text
+        };
+        let stdout = read(stdout);
+        let stderr = read(stderr);
+        assert!(status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}\n{stderr}");
+        return;
+    }
     use std::sync::{Arc, Mutex};
     use tracing::{Event, Metadata, Subscriber, span};
 

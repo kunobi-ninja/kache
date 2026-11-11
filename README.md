@@ -17,10 +17,10 @@ Built by [Kunobi][kunobi-brand].
 
 ## Install
 
-Install Kache v2.0.0 and enable it for your build tools:
+Install Kache v2.1.0 and enable it for your build tools:
 
 ```bash
-cargo install kache --locked --version 2.0.0
+cargo install kache --locked --version 2.1.0
 kache init
 kache doctor --probe
 ```
@@ -30,7 +30,7 @@ optional and off by default.
 
 If you use RC.2 with an older cache index, upgrade. RC.3 and later rebuild
 incompatible prediction metadata and keep compiled entries.
-[Choose a version or upgrade an existing installation →](https://kunobi.ninja/docs/kache/getting-started/upgrade-v2)
+[Choose a version or upgrade an existing installation →](https://ninja.kunobi.com/docs/kache/getting-started/upgrade-v2)
 
 `kache init` shows the changes before applying them. It configures Cargo's compiler
 wrapper and the background service. On Unix it also sets up Cargo and C/C++
@@ -42,7 +42,7 @@ Then use Cargo as usual in your project. Kache caches eligible compiler work
 automatically.
 
 Cargo installation needs Rust 1.95 or newer. Prefer a prebuilt package?
-[Homebrew, APT, AUR, Windows packages, mise, and Nix →](https://kunobi.ninja/docs/kache/getting-started/installation)
+[Homebrew, APT, AUR, Windows packages, mise, and Nix →](https://ninja.kunobi.com/docs/kache/getting-started/installation)
 
 V2 installs `kache` and its matching `kache-engine` companion. Keep both when
 copying an installation into a container or managing release archives yourself.
@@ -51,12 +51,12 @@ copying an installation into a container or managing release archives yourself.
 
 | Workflow | Start here |
 | --- | --- |
-| Upgrade from 1.x, including the paired binaries and daemon | [Upgrade guide](https://kunobi.ninja/docs/kache/getting-started/upgrade-v2) |
-| Reuse artifacts and private incremental state across worktrees | [Worktrees](https://kunobi.ninja/docs/kache/getting-started/worktrees) |
-| Inspect one build, its misses, and work Kache did not cache | [Monitor](https://kunobi.ninja/docs/kache/monitor) · [Troubleshooting](https://kunobi.ninja/docs/kache/getting-started/troubleshooting) |
-| Manage storage, cleanup, and configuration files | [Storage and cleanup](https://kunobi.ninja/docs/kache/getting-started/storage) · [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration) |
-| Understand the client, engine, and concurrent daemon pipelines | [Architecture](https://kunobi.ninja/docs/kache/how-it-works/architecture) |
-| Opt into local Blaze routing | [Blaze](https://kunobi.ninja/docs/kache/getting-started/blaze) |
+| Upgrade from 1.x, including the paired binaries and daemon | [Upgrade guide](https://ninja.kunobi.com/docs/kache/getting-started/upgrade-v2) |
+| Reuse artifacts and private incremental state across worktrees | [Worktrees](https://ninja.kunobi.com/docs/kache/getting-started/worktrees) |
+| Inspect one build, its misses, and work Kache did not cache | [Monitor](https://ninja.kunobi.com/docs/kache/monitor) · [Troubleshooting](https://ninja.kunobi.com/docs/kache/getting-started/troubleshooting) |
+| Manage storage, cleanup, and configuration files | [Storage and cleanup](https://ninja.kunobi.com/docs/kache/getting-started/storage) · [Configuration](https://ninja.kunobi.com/docs/kache/getting-started/configuration) |
+| Understand the client, engine, and concurrent daemon pipelines | [Architecture](https://ninja.kunobi.com/docs/kache/how-it-works/architecture) |
+| Opt into local Blaze routing | [Blaze](https://ninja.kunobi.com/docs/kache/getting-started/blaze) |
 
 ## See it reuse a build
 
@@ -119,7 +119,7 @@ It defaults to off and supports Linux and Apple silicon macOS. Installing Blaze
 after init works; the shim checks PATH for each eligible command. CI, release
 builds and explicit profiles stay on Cargo. Blaze has its own compiler/cache;
 compatible dependency work can still use Kache. See the
-[Blaze guide](https://kunobi.ninja/docs/kache/getting-started/blaze) for activation,
+[Blaze guide](https://ninja.kunobi.com/docs/kache/getting-started/blaze) for activation,
 fallback behavior, worktrees, and the project-config selection rules.
 
 ## Watch a build and explain a miss
@@ -144,7 +144,7 @@ before the next build; this cannot reconstruct details from earlier builds.
 
 [View the still image](assets/monitor-9dd7cee8.png).
 
-[See the current dashboard and controls →](https://kunobi.ninja/docs/kache/monitor)
+[See the current dashboard and controls →](https://ninja.kunobi.com/docs/kache/monitor)
 
 ## Add it to CI
 
@@ -153,7 +153,7 @@ Install your Rust toolchain, then add the official action before your build:
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
   with:
-    version: v2.0.0
+    version: v2.1.0
 - run: cargo build --locked
 ```
 
@@ -176,12 +176,12 @@ For remote storage, credentials, and pull-request policy, follow the [CI guide][
 | I want to… | Guide |
 | --- | --- |
 | Confirm my first cache hits | [Quick start][first-reuse] |
-| Cache Make, CMake, or CUDA builds | [C/C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp) · [CUDA](https://kunobi.ninja/docs/kache/getting-started/cuda) |
-| Share a cache between machines | [Remote cache](https://kunobi.ninja/docs/kache/remote-cache/overview) |
-| Change storage limits or build policy | [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration) |
-| Investigate unexpected misses | [Troubleshooting](https://kunobi.ninja/docs/kache/getting-started/troubleshooting) |
-| Understand cache keys and correctness | [How it works](https://kunobi.ninja/docs/kache/how-it-works/architecture) |
-| Look up a command or flag | [Command reference](https://kunobi.ninja/docs/kache/commands/reference) |
+| Cache Make, CMake, or CUDA builds | [C/C++](https://ninja.kunobi.com/docs/kache/getting-started/c-cpp) · [CUDA](https://ninja.kunobi.com/docs/kache/getting-started/cuda) |
+| Share a cache between machines | [Remote cache](https://ninja.kunobi.com/docs/kache/remote-cache/overview) |
+| Change storage limits or build policy | [Configuration](https://ninja.kunobi.com/docs/kache/getting-started/configuration) |
+| Investigate unexpected misses | [Troubleshooting](https://ninja.kunobi.com/docs/kache/getting-started/troubleshooting) |
+| Understand cache keys and correctness | [How it works](https://ninja.kunobi.com/docs/kache/how-it-works/architecture) |
+| Look up a command or flag | [Command reference](https://ninja.kunobi.com/docs/kache/commands/reference) |
 
 ## Help improve Kache
 
@@ -191,14 +191,14 @@ or read [CONTRIBUTING.md](.github/CONTRIBUTING.md) to contribute.
 
 Licensed under [Apache 2.0](LICENSE).
 
-[docs-badge]: https://kunobi.ninja/docs/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=docs_badge
+[docs-badge]: https://ninja.kunobi.com/docs/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=docs_badge
 [kunobi-brand]: https://kunobi.ninja/?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=brand
-[nav-benchmarks]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_benchmarks
-[nav-comparison]: https://kunobi.ninja/docs/kache/getting-started/comparison?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_comparison
-[nav-ci]: https://kunobi.ninja/docs/kache/remote-cache/ci?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_ci
+[nav-benchmarks]: https://ninja.kunobi.com/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_benchmarks
+[nav-comparison]: https://ninja.kunobi.com/docs/kache/getting-started/comparison?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_comparison
+[nav-ci]: https://ninja.kunobi.com/docs/kache/remote-cache/ci?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_ci
 [hero-image]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=hero_image
 [storage-chart]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_chart
 [storage-report]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_report
-[benchmark-guide]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=benchmark_guide
-[first-reuse]: https://kunobi.ninja/docs/kache/getting-started/quick-start?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=first_reuse
+[benchmark-guide]: https://ninja.kunobi.com/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=benchmark_guide
+[first-reuse]: https://ninja.kunobi.com/docs/kache/getting-started/quick-start?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=first_reuse
 [kunobi-desktop]: https://kunobi.ninja/product/desktop?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=desktop

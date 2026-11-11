@@ -105,7 +105,7 @@ not to inject bootstrap for that unit. Genuine compile errors remain errors.
 A proc macro using untracked environment reads can still observe the child
 override; disable seeding if that distinction matters to your macro.
 
-Source builds and the next release let Cargo start dependent crates as soon as
+Since v2.1.0, these private compilations let Cargo start dependent crates as soon as
 metadata is ready, once fresh dep-info confirms the source did not read the
 override. Attempts that might be retried keep their metadata buffered.
 

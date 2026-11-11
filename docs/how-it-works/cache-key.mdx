@@ -55,7 +55,7 @@ The PE's mapped CodeView address and raw file pointer must identify the same byt
 
 Windows executable keys use a separate pairing-admission field, so older EXE-only entries cannot win local, remote or concurrent lookups. Linked executables for custom targets, or an explicit target with `RUST_TARGET_PATH` set, use that field conservatively because their file format is not inferred from the target name. Those entries miss once after upgrading; libraries and known non-Windows executable targets without that custom-target ambiguity retain their keys. Cached pairs are checked again before any output is restored.
 
-On main, a reported Windows DLL also stores existing sibling import/export
+Since v2.1.0, a reported Windows DLL also stores existing sibling import/export
 artifacts with that DLL's name (`foo.dll.lib`, `foo.dll.exp`, or `foo.dll.a`).
 Missing sidecars are omitted. Cargo builds do not scan the directory or collect
 another crate's import library.
@@ -218,10 +218,11 @@ whose input a build step rewrites right before every compile is therefore not
 cached. A record whose files changed is rediscovered with the preprocessor,
 which yields the same key.
 
-Source builds and the next release fix reuse of unchanged C/C++ header inputs.
+Since v2.1.0, unchanged C/C++ header inputs reuse their recorded keys.
 Existing C/C++ objects miss once after upgrading because older memo validation
-could accept a stale key. Recorded input sets remain usable. This fix keeps
-Rust keys unchanged; old objects expire through normal cache cleanup.
+could accept a stale key. Recorded input sets remain usable. The C/C++ recipe fix does not change Rust
+keys. V2.1.0 also advances the shared key version from 33 to 34, so existing
+Rust entries miss once. Old entries expire through normal cache cleanup.
 
 ## Path normalization
 

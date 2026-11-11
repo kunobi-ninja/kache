@@ -8060,6 +8060,19 @@ pub fn doctor(
         detail: doc_class.to_string(),
         fix: rustdoc_doctor_fix(doc_pass),
     });
+    checks.extend(
+        crate::shim_diagnostics::inspect(
+            &crate::invocation::InvocationEnv::capture(),
+            rustdoc_path_ok,
+        )
+        .into_iter()
+        .map(|check| Check {
+            label: check.label,
+            pass: check.pass,
+            detail: check.detail,
+            fix: check.fix,
+        }),
+    );
 
     // 3a. The kache config file. One that does not parse is ignored
     // everywhere, so every command runs on defaults.
@@ -11772,6 +11785,7 @@ fn init_compiler_setup(
         }
         apply_shell_edits(&edits, created)?;
     }
+    crate::shim_diagnostics::validate_init(&shim_dir)?;
     if crate::compiler::shim::live_shim_status().is_active() {
         println!("  ✓ Cargo target protection and C/C++ caching: active");
         Ok(false)

@@ -131,13 +131,13 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
 /// Environment variable kache's Cargo shim sets on the Cargo it runs. The
 /// value counts the kache Cargo shims above the process that reads it. No
 /// cache key reads it, and the probe and cc memos and target receipts leave
-/// out every `KACHE_*` variable.
-const CARGO_SHIM_DEPTH_ENV: &str = "KACHE_CARGO_SHIM_DEPTH";
+/// this counter out of their environment digests.
+pub(crate) const CARGO_SHIM_DEPTH_ENV: &str = "KACHE_CARGO_SHIM_DEPTH";
 
 /// How many kache Cargo shims may run one inside the other before the chain
 /// is taken to be a loop. Real nesting stays small: an xtask or a build
 /// script that runs `cargo` adds one level.
-const MAX_CARGO_SHIMS_ABOVE: u32 = 8;
+pub(crate) const MAX_CARGO_SHIMS_ABOVE: u32 = 8;
 
 /// How many kache Cargo shims sit above this process, from the value of
 /// [`CARGO_SHIM_DEPTH_ENV`]. Absent means none. A value that is not a number
@@ -308,9 +308,19 @@ fn cargo_command_label<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> String 
 }
 
 fn real_cargo_program(shimmed: bool) -> Result<PathBuf> {
+    if shimmed {
+        let env = crate::invocation::InvocationEnv::capture();
+        return crate::compiler::shim::real_tool_for(
+            "cargo",
+            &env,
+            crate::platform::frontend_executable().ok().as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?
+        .context("finding Cargo behind the kache shim");
+    }
     let program = std::env::var_os("KACHE_REAL_CARGO")
         .or_else(|| crate::blaze::returning_cargo(&crate::invocation::InvocationEnv::capture()))
-        .or_else(|| (!shimmed).then(|| std::env::var_os("CARGO")).flatten())
+        .or_else(|| std::env::var_os("CARGO"))
         .or_else(|| {
             crate::compiler::shim::resolve_real_compiler_from_env("cargo")
                 .map(PathBuf::into_os_string)

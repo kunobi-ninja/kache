@@ -28,6 +28,12 @@ and prints the path and `build.rustdoc` setting to add manually. Setup continues
 manual setup, point `build.rustdoc` at the `rustdoc` shim yourself; see
 [Installation](/docs/getting-started/installation#nix).
 
+Doctor also checks the tool behind the link under "rustdoc shim chain". If a
+version manager forwards back to Kache, activate Rust for the project or set
+`KACHE_REAL_RUSTDOC` to the real tool, such as `$HOME/.cargo/bin/rustdoc` for
+rustup. See [Compiler shims](/docs/commands/reference#compiler-shims) for both
+Cargo and rustdoc overrides.
+
 Then build documentation:
 
 ```bash

@@ -565,7 +565,8 @@ fn environment_digest_from(
         .into_iter()
         .filter(|(k, _)| {
             let k = k.to_string_lossy();
-            (!k.starts_with("KACHE_") || k == "KACHE_REAL_CARGO")
+            (!k.starts_with("KACHE_")
+                || matches!(k.as_ref(), "KACHE_REAL_CARGO" | "KACHE_REAL_RUSTDOC"))
                 && !matches!(
                     k.as_ref(),
                     "PWD" | "OLDPWD" | "SHLVL" | "_" | "TERM" | "COLORTERM"
@@ -695,6 +696,7 @@ fn source_snapshot(workspace: &Path, target: &Path, cache: &Path) -> Result<Snap
         ("CARGO", Some("cargo")),
         ("RUSTC", Some("rustc")),
         ("KACHE_REAL_CARGO", None),
+        ("KACHE_REAL_RUSTDOC", None),
     ] {
         let Some(program) = std::env::var(variable)
             .ok()
@@ -1521,6 +1523,10 @@ mod tests {
         assert_ne!(
             stable,
             digest(&[("PATH", "/toolchain"), ("KACHE_REAL_CARGO", "/cargo-b")])
+        );
+        assert_ne!(
+            digest(&[("KACHE_REAL_RUSTDOC", "/rustdoc-a")]),
+            digest(&[("KACHE_REAL_RUSTDOC", "/rustdoc-b")])
         );
         assert_ne!(
             stable,

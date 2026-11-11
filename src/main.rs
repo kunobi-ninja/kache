@@ -72,6 +72,7 @@ mod savings;
 mod scheduler;
 mod service;
 mod shards;
+mod shim_diagnostics;
 mod since;
 mod windows_manifest;
 // Both callers (`clean`'s classifier and `compute_link_stats`) are `cfg(unix)`,
@@ -1188,20 +1189,28 @@ fn next_wrapper_depth(above: u32) -> u32 {
 /// Stop a chain of nested wrappers that only a loop could produce.
 ///
 /// Shim resolution skips every PATH entry it can identify as kache, so a
-/// loop that still gets here runs through shims it cannot identify: a farm
-/// of copies with no marker. Nothing left on PATH is known to be the real
+/// loop that still gets here can run through a version manager's fallback
+/// or copies with no marker. Nothing left on PATH is known to be the real
 /// compiler, so skipping ahead could pick the wrong one. Failing names the
 /// cause, where the loop would otherwise start processes without end.
 fn check_wrapper_depth(above: u32, compiler: Option<&str>) -> Result<()> {
     if above < MAX_WRAPPERS_ABOVE {
         return Ok(());
     }
+    let rustdoc = compiler
+        .and_then(compiler::command_basename)
+        .map(compiler::strip_windows_exe_suffix)
+        .is_some_and(|name| name.eq_ignore_ascii_case("rustdoc"));
+    let advice = if rustdoc {
+        "Activate Rust in the version manager, or set KACHE_REAL_RUSTDOC to the real rustdoc executable."
+    } else {
+        "Activate its toolchain or remove its directory from PATH. If a directory contains only Kache shims, create an empty `.kache-shims` file in it so Kache skips it. Do not mark a version manager's directory."
+    };
     anyhow::bail!(
         "kache is running inside {above} other kache wrappers to run `{}`, so two \
-         compiler shims are running each other in a loop. Another kache install's shim \
-         directory is on PATH and holds copies that kache cannot tell apart from a \
-         compiler. Remove that directory from PATH, or create an empty `.kache-shims` \
-         file in it so every kache skips it.",
+         compiler shims are running each other in a loop. That program may be another \
+         tool's shim which falls back to Kache when it does not manage the toolchain. \
+         {advice}",
         compiler.unwrap_or("?")
     )
 }
@@ -1802,7 +1811,8 @@ fn install_shims(
         let path = std::env::var_os("PATH").unwrap_or_default();
         compiler::shim::names_on_path(&path, from_path)
     };
-    cli::install_shims_named(&dir, force, &extra)
+    cli::install_shims_named(&dir, force, &extra)?;
+    shim_diagnostics::validate_init(&dir)
 }
 
 /// Shims are Unix-only (symlinks); the Windows `.exe` shim story differs
@@ -2666,8 +2676,22 @@ mod tests {
             .to_string();
         assert!(err.contains("/copies/cc"), "{err}");
         assert!(err.contains("loop"), "{err}");
+        assert!(err.contains("does not manage the toolchain"), "{err}");
         assert!(err.contains(".kache-shims"), "{err}");
-        assert!(check_wrapper_depth(MAX_WRAPPERS_ABOVE + 1, None).is_err());
+        assert!(err.contains("only Kache shims"), "{err}");
+        assert!(err.contains("Do not mark a version manager"), "{err}");
+        assert!(!err.contains("KACHE_REAL_RUSTDOC"), "{err}");
+        for tool in ["rustdoc", "/manager/rustdoc", "C:\\manager\\RUSTDOC.EXE"] {
+            let err = check_wrapper_depth(8, Some(tool)).unwrap_err().to_string();
+            assert!(err.contains(tool), "{err}");
+            assert!(err.contains("KACHE_REAL_RUSTDOC"), "{err}");
+            assert!(!err.contains(".kache-shims"), "{err}");
+        }
+        let unknown = check_wrapper_depth(MAX_WRAPPERS_ABOVE + 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains(".kache-shims"), "{unknown}");
+        assert!(!unknown.contains("KACHE_REAL_RUSTDOC"), "{unknown}");
     }
 
     #[test]

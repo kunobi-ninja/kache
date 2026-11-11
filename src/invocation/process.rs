@@ -233,6 +233,66 @@ impl Child {
         running.wait(false)
     }
 
+    /// Finish a local diagnostic probe, stopping its process tree before
+    /// releasing the leader's identity. Normal compiler waits keep their
+    /// existing lifetime semantics.
+    pub(crate) fn try_wait_probe(&mut self) -> io::Result<Option<ExitStatus>> {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !running.controlled {
+            return Err(io::Error::other(
+                "probe requires an owned process group or job",
+            ));
+        }
+        #[cfg(unix)]
+        if running.child.remote() {
+            return Err(io::Error::other("probe requires a local child"));
+        }
+        if running.status.is_some() {
+            return Ok(running.status);
+        }
+        #[cfg(unix)]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            // The leader is still unreaped, so its process-group ID cannot
+            // have been reused. This also stops children holding capture files.
+            crate::platform::kill_process_group(self.pid);
+            running.wait(false)
+        }
+        #[cfg(windows)]
+        {
+            let status = running.wait(false)?;
+            if status.is_some()
+                && let Some(tree) = &running.tree
+            {
+                tree.kill()?;
+            }
+            Ok(status)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::other(
+                "owned diagnostic probes are unsupported on this platform",
+            ))
+        }
+    }
+
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
         // Match Child::wait: a child waiting for stdin must see EOF.
         drop(self.stdin.take());
@@ -556,6 +616,37 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]).env("PATH", env!("PATH"));
         command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_wait_rejects_children_without_owned_process_groups() {
+        let mut child = shell("exit 0").invocation_spawn().unwrap();
+        let error = child.try_wait_probe().unwrap_err();
+        assert!(error.to_string().contains("owned process group or job"));
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_wait_preserves_pending_and_repeated_completed_status() {
+        use std::io::Write;
+        let mut command = shell("read answer; [ \"$answer\" = finish ]; exit 7");
+        command.stdin(Stdio::piped());
+        let mut child = command.invocation_spawn_in_group().unwrap();
+        assert!(child.try_wait_probe().unwrap().is_none());
+        child.stdin.take().unwrap().write_all(b"finish\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait_probe().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "probe did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(child.try_wait_probe().unwrap(), Some(status));
+        assert_eq!(child.wait().unwrap(), status);
     }
 
     #[cfg(unix)]

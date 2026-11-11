@@ -4037,7 +4037,10 @@ fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
     run()
         .failure()
         .stderr(predicates::str::contains("loop"))
-        .stderr(predicates::str::contains(".kache-shims"));
+        .stderr(predicates::str::contains(".kache-shims"))
+        .stderr(predicates::str::contains("only Kache shims"))
+        .stderr(predicates::str::contains("Do not mark a version manager"))
+        .stderr(predicates::str::contains("KACHE_REAL_RUSTDOC").not());
 
     std::fs::write(scripts.join(".kache-shims"), "").unwrap();
     run()

@@ -218,6 +218,11 @@ whose input a build step rewrites right before every compile is therefore not
 cached. A record whose files changed is rediscovered with the preprocessor,
 which yields the same key.
 
+Source builds and the next release fix reuse of unchanged C/C++ header inputs.
+Existing C/C++ objects miss once after upgrading because older memo validation
+could accept a stale key. Recorded input sets remain usable. This fix keeps
+Rust keys unchanged; old objects expire through normal cache cleanup.
+
 ## Path normalization
 
 Kache maps known roots to stable sentinels before hashing and asks the compiler to emit matching remapped paths. This allows equivalent worktrees and runners to share entries.

@@ -475,13 +475,11 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
     assert_ne!(key(&["-ffp-contract=off"], &warm), baseline);
 }
 
-/// Entries stored before the input race fixes can hold an object built from
-/// other bytes than their key names, so no key of this release may be the
-/// one those builds computed under artifact schema 2. Unix only: the key
-/// runs the stand-in compiler, a shell script.
+/// Keys before the input-race, diagnostics and resolution-validation fixes
+/// use incompatible artifact recipes. Unix only: the key runs a shell fixture.
 #[cfg(unix)]
 #[test]
-fn a_key_from_before_the_input_race_fixes_is_never_todays() {
+fn a_cc_key_never_uses_an_older_artifact_schema() {
     // The key reads the current directory and env through the prefix maps.
     let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -518,7 +516,11 @@ fn a_key_from_before_the_input_race_fixes_is_never_todays() {
         today,
         key(compiler.cache_key_with(&parsed, &ctx, CcKeyDiscovery::Expansion))
     );
-    for old_schema in [b"cc_artifact_schema:2\n", b"cc_artifact_schema:3\n"] {
+    for old_schema in [
+        b"cc_artifact_schema:2\n",
+        b"cc_artifact_schema:3\n",
+        b"cc_artifact_schema:4\n",
+    ] {
         let before =
             key(compiler.cache_key_under(old_schema, &parsed, &ctx, CcKeyDiscovery::Expansion));
         assert_ne!(today, before);
@@ -7480,6 +7482,218 @@ fn probed_header_moves_the_key(parsed: &CcArgs, inputs: &[PathBuf], header: &Pat
     let after = digest_cc_include_shadowing(parsed, inputs).unwrap();
     fs::remove_file(header).unwrap();
     before != after
+}
+
+#[cfg(unix)]
+fn resolution_order_fixture(root: &Path) -> (CcArgs, Vec<PathBuf>) {
+    let source = root.join("unit.c");
+    fs::write(&source, "#include \"a/probe.h\"\n#include \"b/probe.h\"\n").unwrap();
+    let mut inputs = vec![source];
+    for name in ["a", "b"] {
+        let directory = root.join(name);
+        fs::create_dir(&directory).unwrap();
+        let header = directory.join("probe.h");
+        fs::write(&header, "#if __has_include(\"optional.h\")\n#endif\n").unwrap();
+        inputs.push(header);
+    }
+    fs::write(root.join("a/optional.h"), "/* present */\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let parsed = CcArgs::parse_for(&s(&["cc", "-c", "unit.c", "-o", "unit.o"]), &env).unwrap();
+    (parsed, inputs)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_cc_memo_survives_database_input_order_without_rewriting() {
+    use kache_store::file_hash::FileHashCache;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (mut parsed, inputs) = resolution_order_fixture(&root);
+    let program = root.join("cc");
+    let preprocess_log = root.join("preprocess.log");
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) exit 0 ;;
+esac
+for arg do
+    if [ "$arg" = -E ]; then
+        printf 'preprocess\n' >> "$CC_PREPROCESS_LOG"
+        exit 1
+    fi
+done
+exit 0
+"#,
+    );
+    parsed.program = program.to_string_lossy().into_owned();
+    parsed
+        .invocation_env
+        .set("CC_PREPROCESS_LOG", &preprocess_log);
+    let env = parsed.invocation_env.clone();
+    let compiler = CcCompiler::new().with_invocation_env(&env);
+    let maps = cc_prefix_maps(&parsed, &[]);
+    let cache = FileHashCache::open(&root.join("index.db")).unwrap();
+    let new_hasher =
+        || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(cache.db()), &env);
+    let fingerprints = new_hasher()
+        .cc_preprocess_fingerprints(
+            &inputs
+                .iter()
+                .map(|path| (cc_mapped_path(path, &maps), path.clone()))
+                .collect::<Vec<_>>(),
+            &cc_prefix_maps_key(&maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .unwrap();
+    let mut reverse = fingerprints.clone();
+    reverse.reverse();
+    cache
+        .put_cc_preprocess_memo_inputs("earlier-unit", &"1".repeat(64), &reverse)
+        .unwrap();
+
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let cache_dir = root.join("cache");
+    let key = |discovery| -> Result<String> {
+        match compiler.cache_key_with(
+            &parsed,
+            &KeyCtx {
+                invocation_env: &env,
+                file_hasher: &new_hasher(),
+                path_normalizer: &normalizer,
+                cache_dir: &cache_dir,
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+                build_script_inputs_digest: None,
+            },
+            discovery,
+        )? {
+            CcKeyOutcome::Key(key) => Ok(key),
+            CcKeyOutcome::Deferred(_) => panic!("a recorded read set must produce a key"),
+        }
+    };
+    let cold = key(CcKeyDiscovery::Captured(CcCapturedInputs {
+        fingerprints,
+        path_bound: false,
+        inputs_changed: false,
+    }))
+    .unwrap();
+    assert!(
+        !preprocess_log.exists(),
+        "a captured read set must not preprocess"
+    );
+    let memo_key = cc_preprocess_memo_key(&parsed, &maps, "fixture gcc 1.0").unwrap();
+    compiler.commit_preprocess_memo(&new_hasher());
+    let id_order = cache
+        .db()
+        .prepare(
+            "SELECT i.name FROM cc_memo_input_refs r JOIN cc_memo_inputs i ON i.id = r.input_id \
+             JOIN cc_preprocess_memos m ON m.id = r.memo_id WHERE m.memo_key = ?1 ORDER BY r.input_id",
+        )
+        .unwrap()
+        .query_map([&memo_key], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        id_order,
+        reverse
+            .iter()
+            .map(|input| input.name.clone())
+            .collect::<Vec<_>>()
+    );
+    cache
+        .db()
+        .execute_batch(
+            "CREATE TABLE memo_writes (count INTEGER); INSERT INTO memo_writes VALUES (0);",
+        )
+        .unwrap();
+    for table in [
+        "cc_preprocess_memos",
+        "cc_memo_inputs",
+        "cc_memo_input_refs",
+    ] {
+        for action in ["INSERT", "UPDATE", "DELETE"] {
+            cache.db().execute_batch(&format!(
+                "CREATE TRIGGER count_{table}_{action} AFTER {action} ON {table} BEGIN UPDATE memo_writes SET count = count + 1; END;"
+            )).unwrap();
+        }
+    }
+    // With the old ID order, B's true and A's false look like the recorded
+    // A-true/B-false proof. This first lookup must reject that stale key.
+    fs::remove_file(root.join("a/optional.h")).unwrap();
+    fs::write(root.join("b/optional.h"), "/* moved */\n").unwrap();
+    let stored = cache.get_cc_preprocess_memo(&memo_key).unwrap().unwrap();
+    let proof_hasher = new_hasher();
+    let (stored_hash, resolved_inputs) = proof_hasher
+        .cc_preprocess_memo_lookup(
+            &memo_key,
+            |name| cc_unmapped_path_candidates(name, &maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .expect("all recorded inputs still match after an availability-only change");
+    assert_eq!(stored.preprocessed_hash, stored_hash);
+    let names = cc_shadowing_names(&parsed, &resolved_inputs, &proof_hasher).unwrap();
+    let recomputed = digest_cc_shadowing_names(&parsed, &names).unwrap();
+    let expected = stored_hash.split_once('@').unwrap().1;
+    eprintln!(
+        "memo fixture: stored_names={:?}; global_id_names={id_order:?}; expected={expected}; recomputed={recomputed}",
+        stored
+            .inputs
+            .iter()
+            .map(|input| &input.name)
+            .collect::<Vec<_>>()
+    );
+    let swapped = key(CcKeyDiscovery::Expansion);
+    assert!(
+        swapped.is_err(),
+        "probe swap reused {:?}, original {cold}; final store guard still matches: {}",
+        swapped.as_ref().ok(),
+        compiler.include_dir_names_still_match(&parsed),
+    );
+    assert!(!fs::read_to_string(&preprocess_log).unwrap().is_empty());
+    fs::remove_file(root.join("b/optional.h")).unwrap();
+    fs::write(root.join("a/optional.h"), "/* restored */\n").unwrap();
+    fs::remove_file(&preprocess_log).unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(key(CcKeyDiscovery::Expansion).unwrap(), cold);
+        assert!(compiler.pending_preprocess_memo.borrow().is_none());
+        compiler.commit_preprocess_memo(&new_hasher());
+    }
+    assert!(!preprocess_log.exists(), "warm lookups must not preprocess");
+    assert_eq!(
+        cache
+            .db()
+            .query_row("SELECT count FROM memo_writes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    fs::write(root.join("b/optional.h"), "/* now present */\n").unwrap();
+    assert!(
+        key(CcKeyDiscovery::Expansion).is_err(),
+        "a newly available header must require preprocessing"
+    );
+    let after_availability = fs::read_to_string(&preprocess_log).unwrap().lines().count();
+    assert!(after_availability > 0);
+    fs::remove_file(root.join("b/optional.h")).unwrap();
+    assert_eq!(key(CcKeyDiscovery::Expansion).unwrap(), cold);
+    fs::write(root.join("a/probe.h"), "#define CHANGED 1\n").unwrap();
+    assert!(
+        key(CcKeyDiscovery::Expansion).is_err(),
+        "changed input bytes must reject the memo"
+    );
+    assert!(fs::read_to_string(&preprocess_log).unwrap().lines().count() > after_availability);
 }
 
 /// The bug: a header that `__has_include` found absent was never read, so

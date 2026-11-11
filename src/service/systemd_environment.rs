@@ -23,11 +23,12 @@ pub(super) fn socket(unit: &Path, deadline: Instant) -> Option<PathBuf> {
         ],
         deadline,
     )?;
-    if !ordinary_loaded_unit(unit, &executable, &properties) {
+    let environment = query(&["--user", "--no-pager", "show-environment"], deadline)?;
+    let (variables, home) = manager_environment(&environment)?;
+    if !ordinary_loaded_unit(unit, &executable, &properties, &home) {
         return None;
     }
-    let environment = query(&["--user", "--no-pager", "show-environment"], deadline)?;
-    configured_socket(&environment)
+    socket_for(variables, home)
 }
 
 // Anonymous files avoid pipe backpressure and never persist an environment dump.
@@ -109,19 +110,19 @@ fn ordinary_unit(text: &str, executable: &Path) -> bool {
     starts == 1
 }
 
-fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str) -> bool {
+// Match the reported directory to the manager's HOME. The `!` prefix allows
+// a missing directory, so manager_environment also checks that HOME exists.
+fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str, home: &Path) -> bool {
     let Some(properties) = assignments(text) else {
         return false;
     };
-    let empty = [
-        "DropInPaths",
-        "EnvironmentFiles",
-        "UnsetEnvironment",
-        "WorkingDirectory",
-    ];
+    let empty = ["DropInPaths", "EnvironmentFiles", "UnsetEnvironment"];
     if !empty
         .iter()
         .all(|key| properties.get(*key).is_some_and(String::is_empty))
+        || !properties
+            .get("WorkingDirectory")
+            .is_some_and(|v| v.is_empty() || v.strip_prefix('!').map(Path::new) == Some(home))
         || properties.get("NeedDaemonReload").map(String::as_str) != Some("no")
         || !properties
             .get("Environment")
@@ -157,7 +158,13 @@ fn assignments(text: &str) -> Option<BTreeMap<String, String>> {
     Some(result)
 }
 
+#[cfg(test)]
 fn configured_socket(text: &str) -> Option<PathBuf> {
+    let (variables, home) = manager_environment(text)?;
+    socket_for(variables, home)
+}
+
+fn manager_environment(text: &str) -> Option<(BTreeMap<String, String>, PathBuf)> {
     let mut variables = BTreeMap::new();
     for line in text.lines() {
         let word = shell_word(line)?;
@@ -170,9 +177,13 @@ fn configured_socket(text: &str) -> Option<PathBuf> {
         }
     }
     let home = PathBuf::from(variables.get("HOME")?);
-    if !home.is_absolute() {
+    if !home.is_absolute() || !home.is_dir() {
         return None;
     }
+    Some((variables, home))
+}
+
+fn socket_for(variables: BTreeMap<String, String>, home: PathBuf) -> Option<PathBuf> {
     let environment = kache_config::InvocationEnv::from_parts(
         variables,
         Some(home.clone()),
@@ -275,10 +286,43 @@ mod tests {
     }
 
     #[test]
+    fn the_managers_home_is_the_cwd_for_a_relative_config_override() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("manager-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("chosen.toml"),
+            "[cache]\nruntime_dir = '~/manager-runtime'\n",
+        )
+        .unwrap();
+        let text = manager(&home, "KACHE_CONFIG=chosen.toml\n");
+        let (_, parsed_home) = manager_environment(&text).unwrap();
+        assert_eq!(parsed_home, home);
+        assert_eq!(
+            configured_socket(&text).unwrap(),
+            home.join("manager-runtime/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_nondirectory_manager_home_does_not_prove_the_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        for home in [&missing, &file] {
+            assert!(manager_environment(&manager(home, "")).is_none());
+        }
+        assert!(manager_environment("HOME=.\n").is_none());
+        assert!(manager_environment(&manager(root.path(), "")).is_some());
+    }
+
+    #[test]
     fn unsupported_or_ambiguous_environment_is_not_guessed() {
         for text in [
             "",
             "HOME=relative\n",
+            "HOME=.\n",
             "HOME=/a\nHOME=/b\n",
             "HOME=$(command)\n",
             "HOME='unterminated\n",
@@ -352,8 +396,13 @@ mod tests {
             &(text.clone() + "Environment=KACHE_CONFIG=/other\n"),
             exe
         ));
+        let home = Path::new("/home/someone");
         let valid = properties(&unit, exe);
-        assert!(ordinary_loaded_unit(&unit, exe, &valid));
+        assert!(ordinary_loaded_unit(&unit, exe, &valid, home));
+        // A user manager reports its default working directory, the home.
+        let default_directory =
+            valid.replace("WorkingDirectory=\n", "WorkingDirectory=!/home/someone\n");
+        assert!(ordinary_loaded_unit(&unit, exe, &default_directory, home));
         for (old, new) in [
             ("DropInPaths=\n", "DropInPaths=/custom.conf\n"),
             ("NeedDaemonReload=no", "NeedDaemonReload=yes"),
@@ -364,19 +413,67 @@ mod tests {
             ("EnvironmentFiles=\n", "EnvironmentFiles=/other\n"),
             ("UnsetEnvironment=\n", "UnsetEnvironment=HOME\n"),
             ("WorkingDirectory=\n", "WorkingDirectory=/other\n"),
+            ("WorkingDirectory=\n", "WorkingDirectory=!/home/other\n"),
             ("argv[]=/opt/kache daemon run", "argv[]=/bin/sh -c command"),
         ] {
             assert!(
-                !ordinary_loaded_unit(&unit, exe, &valid.replace(old, new)),
-                "{old}"
+                !ordinary_loaded_unit(&unit, exe, &valid.replace(old, new), home),
+                "{new}"
             );
         }
         assert!(!ordinary_loaded_unit(
             &root.path().join("other"),
             exe,
-            &valid
+            &valid,
+            home
         ));
-        assert!(!ordinary_loaded_unit(&unit, exe, ""));
+        assert!(!ordinary_loaded_unit(&unit, exe, "", home));
         assert!(assignments("X=a\nX=b\n").is_none());
+    }
+
+    #[test]
+    fn the_reported_directory_must_match_the_managers_home() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("kache.service");
+        let exe = Path::new("/opt/kache");
+        let home = root.path().join("manager-home");
+        let build_home = root.path().join("build-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&build_home).unwrap();
+        let text = properties(&unit, exe).replace(
+            "WorkingDirectory=\n",
+            &format!("WorkingDirectory=!{}\n", home.display()),
+        );
+        assert!(ordinary_loaded_unit(&unit, exe, &text, &home));
+        assert!(!ordinary_loaded_unit(&unit, exe, &text, &build_home));
+        let missing_property = text
+            .lines()
+            .filter(|line| !line.starts_with("WorkingDirectory="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!ordinary_loaded_unit(&unit, exe, &missing_property, &home));
+    }
+
+    #[test]
+    fn loaded_commands_cannot_hide_an_environment_wrapper_or_another_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("kache.service");
+        let exe = Path::new("/opt/kache");
+        let original = "{ path=/opt/kache ; argv[]=/opt/kache daemon run ; ignore_errors=no ; }";
+        for replacement in [
+            "{ path=/usr/bin/env ; argv[]=/usr/bin/env KACHE_CONFIG=/other /opt/kache daemon run ; ignore_errors=no ; }",
+            "{ path=/usr/bin/env ; argv[]=/opt/kache daemon run ; ignore_errors=no ; }",
+            "{ path=/other/kache ; argv[]=/opt/kache daemon run ; ignore_errors=no ; }",
+            "{ path=/opt/kache ; argv[]=/opt/kache daemon run ; ignore_errors=no ; } { path=/other ; argv[]=/other ; }",
+        ] {
+            let text = properties(&unit, exe).replace(original, replacement);
+            assert!(!ordinary_loaded_unit(&unit, exe, &text, root.path()));
+        }
+        assert!(ordinary_loaded_unit(
+            &unit,
+            exe,
+            &properties(&unit, exe),
+            root.path()
+        ));
     }
 }

@@ -3727,6 +3727,81 @@ fn sweep_orphan_blobs_removes_unreferenced_files_only() {
 }
 
 #[test]
+fn sweep_orphan_blobs_aborts_before_unlinking_on_reference_row_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let write_blob = |contents: &[u8]| {
+        let hash = blake3::hash(contents).to_hex().to_string();
+        let path = store.blob_path(&hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        (hash, path)
+    };
+    let live = b"indexed live blob";
+    let malformed = b"blob with an unreadable reference";
+    let orphan = b"unreferenced orphan blob";
+    let (live_hash, live_path) = write_blob(live);
+    let (malformed_hash, malformed_path) = write_blob(malformed);
+    let (_, orphan_path) = write_blob(orphan);
+    store
+        .db
+        .execute(
+            "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+            params![live_hash, live.len() as i64],
+        )
+        .unwrap();
+    // SQLite permits a BLOB in this TEXT column. Its bytes still name a real
+    // blob, but reading that reference as a String must fail the whole sweep.
+    store
+        .db
+        .execute(
+            "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+            params![malformed_hash.as_bytes(), malformed.len() as i64],
+        )
+        .unwrap();
+
+    let error = store.sweep_orphan_blobs(Duration::ZERO).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SqlError>(),
+        Some(SqlError::InvalidColumnType(
+            0,
+            _,
+            rusqlite::types::Type::Blob
+        ))
+    ));
+    assert!(store.db.is_autocommit(), "the failed sweep must roll back");
+    for (path, contents) in [
+        (&live_path, live.as_slice()),
+        (&malformed_path, malformed.as_slice()),
+        (&orphan_path, orphan.as_slice()),
+    ] {
+        assert_eq!(fs::read(path).unwrap(), contents);
+    }
+
+    assert_eq!(
+        store
+            .db
+            .execute(
+                "DELETE FROM blobs WHERE hash = ?1",
+                [malformed_hash.as_bytes()]
+            )
+            .unwrap(),
+        1
+    );
+    let swept = store.sweep_orphan_blobs(Duration::ZERO).unwrap();
+    assert_eq!(swept.scanned, 3);
+    assert_eq!(swept.removed, 2);
+    assert_eq!(
+        swept.bytes_reclaimed,
+        (malformed.len() + orphan.len()) as u64
+    );
+    assert!(store.db.is_autocommit(), "the next sweep must commit");
+    assert_eq!(fs::read(live_path).unwrap(), live);
+    assert!(!malformed_path.exists());
+    assert!(!orphan_path.exists());
+}
+
+#[test]
 fn sweep_orphan_blobs_respects_min_age() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

@@ -110,8 +110,8 @@ fn ordinary_unit(text: &str, executable: &Path) -> bool {
     starts == 1
 }
 
-// `home` is the manager's HOME: a user manager runs a unit without its own
-// WorkingDirectory= in that home and reports it as `!<home>`.
+// Match the reported directory to the manager's HOME. The `!` prefix allows
+// a missing directory, so manager_environment also checks that HOME exists.
 fn ordinary_loaded_unit(unit: &Path, executable: &Path, text: &str, home: &Path) -> bool {
     let Some(properties) = assignments(text) else {
         return false;
@@ -177,7 +177,7 @@ fn manager_environment(text: &str) -> Option<(BTreeMap<String, String>, PathBuf)
         }
     }
     let home = PathBuf::from(variables.get("HOME")?);
-    if !home.is_absolute() {
+    if !home.is_absolute() || !home.is_dir() {
         return None;
     }
     Some((variables, home))
@@ -286,10 +286,43 @@ mod tests {
     }
 
     #[test]
+    fn the_managers_home_is_the_cwd_for_a_relative_config_override() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("manager-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("chosen.toml"),
+            "[cache]\nruntime_dir = '~/manager-runtime'\n",
+        )
+        .unwrap();
+        let text = manager(&home, "KACHE_CONFIG=chosen.toml\n");
+        let (_, parsed_home) = manager_environment(&text).unwrap();
+        assert_eq!(parsed_home, home);
+        assert_eq!(
+            configured_socket(&text).unwrap(),
+            home.join("manager-runtime/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_nondirectory_manager_home_does_not_prove_the_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        for home in [&missing, &file] {
+            assert!(manager_environment(&manager(home, "")).is_none());
+        }
+        assert!(manager_environment("HOME=.\n").is_none());
+        assert!(manager_environment(&manager(root.path(), "")).is_some());
+    }
+
+    #[test]
     fn unsupported_or_ambiguous_environment_is_not_guessed() {
         for text in [
             "",
             "HOME=relative\n",
+            "HOME=.\n",
             "HOME=/a\nHOME=/b\n",
             "HOME=$(command)\n",
             "HOME='unterminated\n",
@@ -396,5 +429,51 @@ mod tests {
         ));
         assert!(!ordinary_loaded_unit(&unit, exe, "", home));
         assert!(assignments("X=a\nX=b\n").is_none());
+    }
+
+    #[test]
+    fn the_reported_directory_must_match_the_managers_home() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("kache.service");
+        let exe = Path::new("/opt/kache");
+        let home = root.path().join("manager-home");
+        let build_home = root.path().join("build-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&build_home).unwrap();
+        let text = properties(&unit, exe).replace(
+            "WorkingDirectory=\n",
+            &format!("WorkingDirectory=!{}\n", home.display()),
+        );
+        assert!(ordinary_loaded_unit(&unit, exe, &text, &home));
+        assert!(!ordinary_loaded_unit(&unit, exe, &text, &build_home));
+        let missing_property = text
+            .lines()
+            .filter(|line| !line.starts_with("WorkingDirectory="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!ordinary_loaded_unit(&unit, exe, &missing_property, &home));
+    }
+
+    #[test]
+    fn loaded_commands_cannot_hide_an_environment_wrapper_or_another_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("kache.service");
+        let exe = Path::new("/opt/kache");
+        let original = "{ path=/opt/kache ; argv[]=/opt/kache daemon run ; ignore_errors=no ; }";
+        for replacement in [
+            "{ path=/usr/bin/env ; argv[]=/usr/bin/env KACHE_CONFIG=/other /opt/kache daemon run ; ignore_errors=no ; }",
+            "{ path=/usr/bin/env ; argv[]=/opt/kache daemon run ; ignore_errors=no ; }",
+            "{ path=/other/kache ; argv[]=/opt/kache daemon run ; ignore_errors=no ; }",
+            "{ path=/opt/kache ; argv[]=/opt/kache daemon run ; ignore_errors=no ; } { path=/other ; argv[]=/other ; }",
+        ] {
+            let text = properties(&unit, exe).replace(original, replacement);
+            assert!(!ordinary_loaded_unit(&unit, exe, &text, root.path()));
+        }
+        assert!(ordinary_loaded_unit(
+            &unit,
+            exe,
+            &properties(&unit, exe),
+            root.path()
+        ));
     }
 }

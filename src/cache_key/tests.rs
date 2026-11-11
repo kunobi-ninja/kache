@@ -6330,9 +6330,13 @@ fn an_out_dir_suffix_keeps_a_parent_component_that_stays_inside() {
     );
     assert_eq!(suffix("/o/x/../../y.rs", "/o"), None);
     assert_eq!(
-        suffix("/o/x\\y/../../z.rs", "/o"),
-        None,
-        "on Unix `x\\y` is one level, so this leaves `/o`"
+        suffix("/o/x\\y/../../z.rs", "/o").as_deref(),
+        if cfg!(windows) {
+            Some("/x\\y/../../z.rs")
+        } else {
+            None
+        },
+        "on Unix `x\\y` is one level, so this leaves `/o`; on Windows it is two"
     );
     assert_eq!(
         suffix("/o/x\\..\\..\\y.rs", "/o"),
@@ -7206,6 +7210,15 @@ fn a_relative_source_must_stay_in_the_workspace() {
         source("kt\\..\\..\\outside.txt", &roots),
         None,
         "a Windows walk that leaves, which a `/` split alone would miss"
+    );
+    // rustc on Windows spells an include in a module's subdirectory with
+    // both separators. There `\` separates, so it stays inside; on Unix
+    // `kt\src\media\..` is one name and the walk leaves.
+    let mixed = "kt\\src\\media\\../../../assets/a.txt";
+    assert_eq!(
+        source(mixed, &roots),
+        if cfg!(windows) { kept(mixed) } else { None },
+        "a walk read the way this system reads it"
     );
     roots.cwd = "/kt".to_string();
     assert_eq!(source("../assets/a.txt", &roots), kept("../assets/a.txt"));

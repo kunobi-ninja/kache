@@ -10,6 +10,11 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(windows)]
 mod windows;
 
+// waitid's required flags occupy disjoint bits, so their sum is the exact
+// immutable mask for observing exits without blocking or reaping the leader.
+#[cfg(unix)]
+const PROBE_WAIT_OPTIONS: libc::c_int = libc::WEXITED + libc::WNOHANG + libc::WNOWAIT;
+
 #[derive(Clone, Default)]
 pub(crate) struct Cancellation(Arc<Request>);
 
@@ -261,7 +266,7 @@ impl Child {
                     libc::P_PID,
                     self.pid as libc::id_t,
                     &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    PROBE_WAIT_OPTIONS,
                 )
             };
             if result != 0 {
@@ -629,10 +634,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn probe_wait_options_have_only_the_required_disjoint_flags() {
+        assert_eq!(libc::WEXITED & libc::WNOHANG, 0);
+        assert_eq!(libc::WEXITED & libc::WNOWAIT, 0);
+        assert_eq!(libc::WNOHANG & libc::WNOWAIT, 0);
+        assert_eq!(
+            PROBE_WAIT_OPTIONS,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "stdin-gated child with its own deadline for probe wait tests"]
+    fn probe_wait_child_fixture() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            let _ = tx.send(line);
+        });
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(5));
+        std::process::exit(if finished.is_ok_and(|line| line == "finish\n") {
+            7
+        } else {
+            93
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn probe_wait_preserves_pending_and_repeated_completed_status() {
         use std::io::Write;
-        let mut command = shell("read answer; [ \"$answer\" = finish ]; exit 7");
-        command.stdin(Stdio::piped());
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "invocation::process::tests::probe_wait_child_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut child = command.invocation_spawn_in_group().unwrap();
         assert!(child.try_wait_probe().unwrap().is_none());
         child.stdin.take().unwrap().write_all(b"finish\n").unwrap();

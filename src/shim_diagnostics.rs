@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT: u64 = 65_536;
 
+fn output_exceeds_limit(length: u64) -> bool {
+    length > MAX_OUTPUT
+}
+
 pub(crate) struct Diagnostic {
     pub(crate) label: &'static str,
     pub(crate) pass: bool,
@@ -147,7 +151,7 @@ fn run_probe(
         .map_err(|error| error.to_string())?;
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if output.metadata().map_err(|error| error.to_string())?.len() > MAX_OUTPUT {
+        if output_exceeds_limit(output.metadata().map_err(|error| error.to_string())?.len()) {
             return Err("version probe exceeded 64 KiB of output".into());
         }
         if let Some(status) = child.try_wait_probe().map_err(|error| error.to_string())? {
@@ -174,7 +178,7 @@ fn read_probe_output(output: &mut std::fs::File, name: &str, success: bool) -> R
 }
 
 fn classify(name: &str, success: bool, bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() as u64 > MAX_OUTPUT {
+    if output_exceeds_limit(bytes.len() as u64) {
         return Err("version probe exceeded 64 KiB of output".into());
     }
     let text = String::from_utf8_lossy(bytes);
@@ -435,6 +439,51 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn ordinary_rust_tools_only_get_checks_when_their_kache_shim_is_used() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for name in ["cargo", "rustdoc"] {
+            let program = root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::write(&program, "").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        // Ordinary tools exist on PATH, but there is no Kache Rust shim.
+        // Missing explicit choices keep this metadata-only: no tool is run,
+        // even while the negative control changes the discovery condition.
+        let env = InvocationEnv::from_parts(
+            [
+                ("PATH", std::env::join_paths([&root]).unwrap()),
+                (
+                    "KACHE_REAL_CARGO",
+                    root.join("absent-cargo").into_os_string(),
+                ),
+                (
+                    "KACHE_REAL_RUSTDOC",
+                    root.join("absent-rustdoc").into_os_string(),
+                ),
+            ],
+            Some(root.clone()),
+            None,
+            root.clone(),
+        );
+        assert!(
+            inspect_for(&env, false, None).is_empty(),
+            "unmanaged tools must not produce Rust shim checks"
+        );
+        // An absolute build.rustdoc shim can be configured outside PATH.
+        // That makes rustdoc relevant without making the ordinary Cargo relevant.
+        let checks = inspect_for(&env, true, None);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].label, "rustdoc shim chain");
+        assert!(!checks[0].pass);
+        assert!(checks[0].detail.contains("absent-rustdoc"));
     }
 
     #[test]

@@ -1,0 +1,102 @@
+name: Adoption 1883 preflight
+
+on:
+  push:
+    branches: [validation/adoption-1883-service-manager]
+    paths: [.github/workflows/adoption-1883-preflight.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adoption-preflight-1883
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: just check PR${{ matrix.pr }}
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: [{"pr": 1883, "head": "f0997e6bf4c773644fc50ef6eb599fe50c5060ac", "tree": "1ac950a8778d9cd6ea060a7048a080118d222179"}]
+    env:
+      RUSTC_WRAPPER: ""
+      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      EXPECTED_HEAD: ${{ matrix.head }}
+      EXPECTED_TREE: ${{ matrix.tree }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ matrix.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned candidate
+        run: |
+          mkdir -p "$RUNNER_TEMP/adoption-evidence"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          git log -1 --format='%H%n%T%n%an <%ae>%n%cn <%ce>' | tee "$RUNNER_TEMP/adoption-evidence/candidate.txt"
+          printf '%s\n' "$RUNNER_NAME" "$RUNNER_ENVIRONMENT" "$RUNNER_OS" > "$RUNNER_TEMP/adoption-evidence/runner.txt"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          install: true
+          version: 2026.6.9
+          cache: false
+      - name: Run required pre-publication checks
+        run: just check 2>&1 | tee "$RUNNER_TEMP/adoption-evidence/just-check.log"
+      - name: Check documentation and configuration references
+        run: bash scripts/check-docs.sh 2>&1 | tee "$RUNNER_TEMP/adoption-evidence/check-docs.log"
+      - name: Verify focused negative controls and restore the candidate
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, subprocess
+          source = Path("src/service/systemd_environment.rs")
+          original = source.read_bytes()
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "adoption-evidence"
+          controls = [
+              ("default-cwd", "v.is_empty() || v.strip_prefix('!').map(Path::new) == Some(home)",
+               "v.is_empty() && home.is_absolute()", "the_reported_directory_must_match_the_managers_home",
+               "assertion failed: ordinary_loaded_unit(&unit, exe, &text, &home)"),
+              ("missing-home", "!home.is_absolute() || !home.is_dir()", "!home.is_absolute()",
+               "a_missing_or_nondirectory_manager_home_does_not_prove_the_cwd",
+               'assertion failed: manager_environment(&manager(home, "")).is_none()'),
+          ]
+          try:
+              for label, before, after, test, expected_panic in controls:
+                  text = original.decode()
+                  assert text.count(before) == 1, label
+                  source.write_text(text.replace(before, after))
+                  name = "service::systemd_environment::tests::" + test
+                  result = subprocess.run(
+                      ["timeout", "--kill-after=5s", "300s", "cargo", "test", "--lib", name, "--", "--exact"],
+                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                      env={**os.environ, "CARGO_TERM_COLOR": "never"},
+                  )
+                  (evidence / (label + "-negative.log")).write_bytes(result.stdout)
+                  assert result.returncode == 101, (label, result.returncode)
+                  assert ("test " + name + " ... FAILED").encode() in result.stdout, label
+                  assert b"test result: FAILED" in result.stdout, label
+                  assert expected_panic.encode() in result.stdout, label
+          finally:
+              source.write_bytes(original)
+          subprocess.run(["timeout", "--kill-after=5s", "300s", "cargo", "test", "--lib",
+                          "service::systemd_environment::tests"], check=True)
+          subprocess.run(["git", "diff", "--exit-code", "HEAD"], check=True)
+          print("Both negative controls failed their expected assertion; restored source passes.")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: adoption-${{ matrix.pr }}-${{ matrix.head }}
+          path: ${{ runner.temp }}/adoption-evidence/
+          retention-days: 7

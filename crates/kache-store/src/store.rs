@@ -5831,8 +5831,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let referenced: std::collections::HashSet<String> = {
                 let mut stmt = self.db.prepare("SELECT hash FROM blobs")?;
                 stmt.query_map([], |row| row.get::<_, String>(0))?
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .collect::<Result<_, _>>()?
             };
             for (hash, path, size) in &candidates {
                 if referenced.contains(hash) {

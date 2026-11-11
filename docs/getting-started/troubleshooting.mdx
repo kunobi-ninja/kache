@@ -48,11 +48,8 @@ binaries together`, check the executable path in the error. For an ordinary
 Kache installation, reinstall the client and engine together.
 
 For a path inside a Cargo target's `.kache-build-script-shims/` directory,
-the current release's recovery is to stop its builds and programs, then use
-the package cleanup below.
-
-Source builds and the next release also provide a repair command that keeps
-the compiled scripts. Stop that target's builds and programs, then run:
+v2.1.0 and later provide a repair command that keeps the compiled scripts.
+Stop that target's builds and programs, then run:
 
 ```sh
 kache doctor --repair-build-scripts target
@@ -65,9 +62,9 @@ scripts, holds Cargo's profile locks, and switches the records to a new copy of
 the installed engine. It leaves the old runtime pins and real scripts intact.
 `kache init` configures future builds; it does not refresh existing runtime pins.
 
-If validation reports a missing or invalid preserved script, use the package
-cleanup below. Do not copy a client or symlink an arbitrary engine into an old
-runtime pin: the client and engine must come from the same release.
+On older releases, or if validation reports a missing or invalid preserved
+script, use the package cleanup below. Do not copy a client or symlink an
+arbitrary engine into an old runtime pin: the client and engine must come from the same release.
 
 ## Repair an invalid build-script launcher
 

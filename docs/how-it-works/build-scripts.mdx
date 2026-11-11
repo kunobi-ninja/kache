@@ -30,7 +30,7 @@ keep running the copy they were installed with
 until their script is rebuilt or the target directory is cleaned. If that copy
 is gone, the launcher runs the script directly, uncached.
 
-Source builds and the next release support refreshing existing runtime pins
+Since v2.1.0, Kache supports refreshing existing runtime pins
 without rebuilding scripts. Stop that target's builds and programs and run
 `kache doctor --repair-build-scripts target`.
 The command validates each Kache launcher and its preserved script, locks the
@@ -201,7 +201,7 @@ build-script cache. Hermetic runs still refuse links that leave `OUT_DIR`
 and fall back to the regular path.
 Entries stay in the local store: `kache sync` never uploads them.
 
-On main, a configured `cache.readonly_store` is also checked after a local run
+Since v2.1.0, a configured `cache.readonly_store` is also checked after a local run
 miss. A restored run does not write to that fallback; a miss in both stores runs
 the script and records it locally. This is separate from remote artifact
 sharing. See [Read-only store](/docs/getting-started/configuration#read-only-store).

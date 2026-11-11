@@ -44,7 +44,7 @@ rules.
 Rust links can key supported `rust-lld` toolchains, compiled resource inputs,
 supported application manifests passed with `/MANIFESTINPUT` and `/MANIFEST:EMBED`,
 and modeled runtime/default-library selections. This does not make direct
-`cl.exe` object compilation cacheable. On main, DLL caching also retains import
+`cl.exe` object compilation cacheable. Since v2.1.0, DLL caching also retains import
 libraries omitted from rustc's artifact notifications.
 
 Long Rust commands can remain cacheable: RC.2 moves Kache-injected arguments into
@@ -74,7 +74,7 @@ incompatible access-token contexts and failed security queries. The trust option
 only permits the first case. Keep the full diagnostic when reporting a refused
 handoff; changing trust does not fix incompatible tokens.
 
-Source builds and the next release use the local engine after a client-side
+Since v2.1.0, Kache uses the local engine after a client-side
 permission denial, without starting the daemon again. Requests the client cannot
 prepare for transfer also use this fallback. A missing or unavailable daemon
 still gets a startup attempt. Fallbacks cannot rerun the compiler after Commit.
@@ -100,7 +100,7 @@ kache config set cache.native_runtime_warmup false
 ```
 
 Ordinary runtime-library hashes reuse file-hash memos when NTFS supplies a file
-index and change time. Source builds and the next release also use these memos
+index and change time. Since v2.1.0, Kache also uses these memos
 for Microsoft `link.exe` and `cl.exe` banner digests. A replaced file or an edit
 that restores its old modification time invalidates the memo. Other filesystems,
 or failed identity queries, keep caching artifacts but read bytes on each key. Explicit

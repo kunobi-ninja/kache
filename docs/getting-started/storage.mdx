@@ -85,7 +85,7 @@ The Cargo shim holds a target-use lease for the whole command, including a
 long-running `cargo run`. Cleanup can therefore retain targets until that
 command exits.
 
-On Linux, source builds and the next release include process start times in
+Since v2.1.0, Linux builds include process start times in
 waiting-command records, so a reused PID does not name an unrelated command.
 Older records and unreadable process metadata use conservative liveness checks.
 The shared lock controls removal; records supply the command names shown while
@@ -112,7 +112,7 @@ Missing or changed evidence keeps files. See
 `cache.readonly_store` lets a writable job reuse an authorized local store
 mounted read-only, within the same trust domain. Restores use private inodes;
 new entries remain in the job's writable store. It is separate from a filesystem
-remote. On main, build-script run results can also restore from this fallback.
+remote. Since v2.1.0, build-script run results can also restore from this fallback.
 See [Read-only store](/docs/getting-started/configuration#read-only-store).
 
 Kache does not prune remote objects when it runs local GC. Configure bucket,

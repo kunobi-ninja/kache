@@ -101,11 +101,11 @@ For clang-cl driver mode:
 $env:CC = "kache clang-cl"
 ```
 
-Windows has no compiler-name shim generator yet. On v2.0.0, use a wrapper prefix if your build system supports it. For a manual compiler-name shim, copy `kache.exe` to `gcc.exe`, keep the matching `kache-engine.exe` beside the copy, and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory so another Kache install skips the copies when finding the real compiler.
+Windows has no compiler-name shim generator yet. Use a wrapper prefix if your build system supports it. For a manual compiler-name shim, copy `kache.exe` to `gcc.exe`, keep the matching `kache-engine.exe` beside the copy, and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory so another Kache install skips the copies when finding the real compiler.
 
 ### Single-executable CC/CXX launchers
 
-Source builds include native `kache-clang-cl` and `kache-cl` launchers; these are not part of v2.0.0. The release pipeline includes them in archives and Debian, AUR, and Winget packages from the next release. Use them when a build system treats `CC` or `CXX` as one executable path and cannot split `kache clang-cl`:
+Since v2.1.0, Cargo installs and release archives include native `kache-clang-cl` and `kache-cl` launchers. Check whether your package manager exposes these commands before configuring them. Use them when a build system treats `CC` or `CXX` as one executable path and cannot split `kache clang-cl`:
 
 ```powershell
 $env:CC = "kache-clang-cl"

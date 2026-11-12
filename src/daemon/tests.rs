@@ -13274,6 +13274,58 @@ async fn configured_demand_timeout_returns_a_miss_and_keeps_the_remote_healthy()
     );
 }
 
+/// The handler budget already returned. A permit that shows up afterwards
+/// belongs to the next check, not to the GET still parked on the worker.
+/// Tokio's timeout polls that GET before the deadline, which is the Windows
+/// miss in `configured_demand_timeout_returns_a_miss_and_keeps_the_remote_healthy`.
+#[tokio::test]
+async fn abandoned_compile_download_does_not_take_a_later_permit() {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let consumed = Arc::new(AtomicBool::new(false));
+    let release_worker = Arc::clone(&release);
+    let entered_worker = Arc::clone(&entered);
+    let consumed_worker = Arc::clone(&consumed);
+    let pending = tokio::spawn(async move {
+        finish_compile_remote_download(RemoteDeadline::from_millis(1_000), async move {
+            entered_worker.add_permits(1);
+            release_worker
+                .acquire()
+                .await
+                .expect("release semaphore stays open")
+                .forget();
+            consumed_worker.store(true, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("the download must reach the parked GET")
+        .expect("entered semaphore stays open")
+        .forget();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .expect("the handler budget must answer while the GET stays parked")
+        .expect("download task");
+    assert!(
+        result.is_err(),
+        "an elapsed budget is a miss for that request"
+    );
+
+    release.add_permits(1);
+    let next = tokio::time::timeout(Duration::from_secs(2), release.acquire()).await;
+    assert!(
+        next.is_ok(),
+        "a permit released after the budget belongs to the next check"
+    );
+    assert!(
+        !consumed.load(Ordering::SeqCst),
+        "the abandoned GET must not finish"
+    );
+}
+
 #[tokio::test]
 async fn demand_queue_errors_preserve_prior_remote_failures() {
     let dir = tempfile::tempdir().unwrap();

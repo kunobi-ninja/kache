@@ -7927,6 +7927,12 @@ fn observe_connection_handler(result: std::result::Result<(), tokio::task::JoinE
 /// poll, so the deadline, the connection permit, and stats all wait with it.
 /// The worker thread owns that poll and is detached when `spawn` returns.
 /// An elapsed budget answers from the handler; process exit reaps the thread.
+///
+/// The wait future owns the cancel sender. Dropping that wait (the budget
+/// elapsed) closes the sender. The worker checks it before every poll of the
+/// download. Tokio's timeout polls the inner future first, so a permit that
+/// arrives after the budget would otherwise finish this GET. That completion
+/// is this request's miss only: it must not stay joinable for the next check.
 async fn finish_compile_remote_download<T, F>(
     deadline: RemoteDeadline,
     download: F,
@@ -7936,13 +7942,10 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
     if deadline.check("demand GET and extraction").is_err() {
-        return Err(anyhow::Error::new(
-            crate::remote_resilience::RemoteDeadlineElapsed {
-                stage: "demand GET and extraction",
-            },
-        ));
+        return Err(compile_remote_download_abandoned());
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     if let Err(error) = std::thread::Builder::new()
         .name("kache-compile-remote".into())
         .spawn(move || {
@@ -7957,7 +7960,14 @@ where
                     return;
                 }
             };
-            let outcome = runtime.block_on(download);
+            let outcome = runtime.block_on(async move {
+                let mut download = std::pin::pin!(download);
+                let mut cancel = cancel_rx;
+                std::future::poll_fn(move |cx| {
+                    poll_compile_download(download.as_mut(), &mut cancel, cx)
+                })
+                .await
+            });
             // Deliver the result before runtime shutdown. Shutdown only reaps
             // this thread; the handler must already be free to answer.
             let _ = tx.send(outcome);
@@ -7965,24 +7975,42 @@ where
         })
     {
         tracing::warn!("compile remote thread did not start: {error}");
-        return Err(anyhow::Error::new(
-            crate::remote_resilience::RemoteDeadlineElapsed {
-                stage: "demand GET and extraction",
-            },
-        ));
+        return Err(compile_remote_download_abandoned());
     }
     deadline
         .run("demand GET and extraction", async move {
+            // Dropped when the budget wins, which closes `cancel_rx` before
+            // this function returns to the caller.
+            let _cancel = cancel_tx;
             match rx.await {
                 Ok(result) => result,
-                Err(_) => Err(anyhow::Error::new(
-                    crate::remote_resilience::RemoteDeadlineElapsed {
-                        stage: "demand GET and extraction",
-                    },
-                )),
+                Err(_) => Err(compile_remote_download_abandoned()),
             }
         })
         .await
+}
+
+fn compile_remote_download_abandoned() -> anyhow::Error {
+    anyhow::Error::new(crate::remote_resilience::RemoteDeadlineElapsed {
+        stage: "demand GET and extraction",
+    })
+}
+
+/// `cancel` is the handler's wait. Once that wait is gone, do not poll
+/// `download`: a later wake (the permit the next check needs) would complete
+/// the abandoned GET. Tokio timeout checks its future before its deadline.
+fn poll_compile_download<F, T>(
+    download: std::pin::Pin<&mut F>,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<anyhow::Result<T>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    if std::pin::Pin::new(cancel).poll(cx).is_ready() {
+        return std::task::Poll::Ready(Err(compile_remote_download_abandoned()));
+    }
+    download.poll(cx)
 }
 
 /// Drain all accepted connection handlers under one deadline. Returns true if

@@ -3891,10 +3891,18 @@ fn compute_key_into(
     out.native_archives = Some(native_archives);
 
     // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
-    // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw.
+    // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw, except
+    // `-Z threads`, which only sets front-end parallelism (#1856).
     hasher.set_group("args");
     let backend_dylib = args.codegen_backend_dylib();
     for z in &args.unstable_flags {
+        // Artifact bytes do not depend on the parallel front end's thread
+        // count. `-Zthreads=8` and `-Z threads=8` both parse as `threads=8`.
+        // A different name, including one that merely contains `threads`,
+        // stays keyed.
+        if is_threads_unstable_flag(z) {
+            continue;
+        }
         // A backend dylib is keyed by its content, not its path: the wrapper
         // only reaches here for one when the user trusts it, and rebuilding
         // the backend in place must change the key while another checkout's
@@ -5133,6 +5141,16 @@ fn resolved_path_for(path: &Path, env: &InvocationEnv) -> Option<PathBuf> {
 /// an rlib and has a native dir rustc could bundle from.
 pub(crate) fn needs_native_bundle_audit(args: &RustcArgs, native_dirs: &[PathBuf]) -> bool {
     args.emits_rlib() && !native_dirs.is_empty()
+}
+
+/// Whether `flag` is rustc's `-Z threads` option.
+///
+/// The name is the text before the first `=`. Both `-Zthreads=8` and
+/// `-Z threads=8` are stored as `threads=8`. `threads-count` and
+/// `share-generics` are different flags.
+fn is_threads_unstable_flag(flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    name == "threads"
 }
 
 /// Whether `-Z packed-bundled-libs` makes rustc store every bundled archive

@@ -1931,10 +1931,11 @@ fn source_carries_build_script(file: &Path) -> bool {
     if parts.last() == Some(&"build.rs") {
         return true;
     }
-    let Some(build_at) = parts.iter().position(|part| *part == "build") else {
-        return false;
-    };
-    parts[build_at + 1..].contains(&"out")
+    // `out` anywhere after a `build` directory, not that directory itself.
+    parts
+        .split(|part| *part == "build")
+        .skip(1)
+        .any(|tail| tail.contains(&"out"))
 }
 
 fn registry_source_key_material(file: &Path, registry_src: &Path) -> Option<Vec<u8>> {

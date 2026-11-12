@@ -4010,6 +4010,7 @@ mod tests {
         let normalizer = PathNormalizer::from_env(Some(&workspace))
             .with_base_dirs(&[configured.to_string_lossy().into_owned()]);
         let relative = source.strip_prefix(&configured).unwrap().to_string_lossy();
+        let stored_relative = relative.replace('\\', "/");
         assert_eq!(
             normalizer.source_path_identity(&source).unwrap(),
             format!("<BASE_DIR_0>/{relative}").as_bytes()
@@ -4038,7 +4039,7 @@ mod tests {
             crate::link::DepInfoMode::Relativize,
         );
         assert!(
-            stored.contains(&format!("__kache_base_dir_0__/{relative}")),
+            stored.contains(&format!("__kache_base_dir_0__/{stored_relative}")),
             "{stored}"
         );
         assert!(!stored.contains("__kache_cwd__/"), "{stored}");

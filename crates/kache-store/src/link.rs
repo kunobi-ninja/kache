@@ -4096,6 +4096,15 @@ mod tests {
         assert!(content.contains("/home/user/project/"));
     }
 
+    /// Prefix spelling from expand, then the stored suffix in the local separator.
+    /// Slash-form anchors keep `/` on the prefix; only the suffix follows the host.
+    fn expanded_depinfo_path(anchor: &Path, relative_slash: &str) -> String {
+        let prefixes = depinfo_prefixes_for_path(anchor, DepInfoMode::Expand, cfg!(windows));
+        let mut out = prefixes[0].clone();
+        out.push_str(&relative_slash.replace('/', std::path::MAIN_SEPARATOR_STR));
+        out
+    }
+
     #[test]
     fn rebasing_depinfo_preserves_escaping_sources_and_prefix_boundaries() {
         let dir = tempfile::tempdir().unwrap();
@@ -4114,7 +4123,7 @@ mod tests {
         let expected = format!(
             "{}: {} {} registry.rs\n# env-dep:OUT_DIR={}\n",
             make(&to.join("lib.rlib")),
-            make(&to.join("out/generated.rs")),
+            escape_depinfo_make_path(&expanded_depinfo_path(&to, "out/generated.rs")),
             make(&similar),
             env(&from.join("out")),
         );
@@ -4213,9 +4222,18 @@ mod tests {
             None,
             DepInfoMode::Expand,
         );
-        assert!(restored.contains("/build/worktree-b/target/debug/deps/libdemo.rlib"));
-        assert!(restored.contains("/build/worktree-b/src/lib.rs"));
-        assert!(restored.contains("/build/worktree-b/assets/value.txt"));
+        assert!(restored.contains(&expanded_depinfo_path(
+            Path::new("/build/worktree-b/target"),
+            "debug/deps/libdemo.rlib",
+        )));
+        assert!(restored.contains(&expanded_depinfo_path(
+            Path::new("/build/worktree-b"),
+            "src/lib.rs",
+        )));
+        assert!(restored.contains(&expanded_depinfo_path(
+            Path::new("/build/worktree-b"),
+            "assets/value.txt",
+        )));
         assert!(!restored.contains("worktree-a"));
     }
 
@@ -4251,9 +4269,24 @@ mod tests {
             Some(consumer_workspace),
             DepInfoMode::Expand,
         );
-        assert!(restored.contains("/build/work\\ tree-b/target/debug/deps/libdemo.rlib"));
-        assert!(restored.contains("/build/work\\ tree-b/crates/demo/src/lib.rs"));
-        assert!(restored.contains("/build/work\\ tree-b/shared/schema.txt"));
+        assert!(
+            restored.contains(&escape_depinfo_make_path(&expanded_depinfo_path(
+                &consumer_workspace.join("target"),
+                "debug/deps/libdemo.rlib",
+            )))
+        );
+        assert!(
+            restored.contains(&escape_depinfo_make_path(&expanded_depinfo_path(
+                &consumer_workspace.join("crates/demo"),
+                "src/lib.rs",
+            )))
+        );
+        assert!(
+            restored.contains(&escape_depinfo_make_path(&expanded_depinfo_path(
+                consumer_workspace,
+                "shared/schema.txt",
+            )))
+        );
         assert!(restored.contains("# env-dep:SCHEMA_ROOT=/build/work tree-b/shared"));
         assert!(!restored.contains("work tree-a"));
         assert!(!restored.contains("work\\ tree-a"));
@@ -4285,7 +4318,10 @@ mod tests {
             &[(consumer, sentinel, 8)],
             DepInfoMode::Expand,
         );
-        assert!(restored.contains("/mount-b/generated/schema/data.json"));
+        assert!(restored.contains(&expanded_depinfo_path(
+            Path::new("/mount-b/generated"),
+            "schema/data.json",
+        )));
         assert!(!restored.contains("/mount-a/generated"));
     }
 
@@ -4370,8 +4406,11 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
         );
         assert_eq!(
             restored,
-            "/external-b/target/debug/deps/demo.d: \
-/external-b/target/debug/build/demo/out/generated.rs\n"
+            format!(
+                "{}: {}\n",
+                expanded_depinfo_path(&consumer_target, "debug/deps/demo.d"),
+                expanded_depinfo_path(&consumer_target, "debug/build/demo/out/generated.rs"),
+            )
         );
     }
 
@@ -4424,7 +4463,13 @@ __kache_profile__/build/serde_core-fe75/out/private.rs\n"
             DepInfoMode::Expand,
         );
         assert!(
-            restored.ends_with(" /work/target/alt/build/serde_core-fe75/out/private.rs\n"),
+            restored.ends_with(&format!(
+                " {}\n",
+                expanded_depinfo_path(
+                    &PathBuf::from("/work/target/alt"),
+                    "build/serde_core-fe75/out/private.rs",
+                )
+            )),
             "{restored}"
         );
     }
@@ -4476,9 +4521,15 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
         );
         assert_eq!(
             restored,
-            "/work/target_2/debug/deps/serde_core.d: \
-/work/src/lib.rs \
-/work/target_2/debug/build/serde_core-fe75/out/private.rs\n"
+            format!(
+                "{}: {} {}\n",
+                expanded_depinfo_path(&consumer_target, "debug/deps/serde_core.d"),
+                expanded_depinfo_path(&workspace, "src/lib.rs"),
+                expanded_depinfo_path(
+                    &consumer_target,
+                    "debug/build/serde_core-fe75/out/private.rs",
+                ),
+            )
         );
     }
 
@@ -4540,8 +4591,14 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
             &consumer_roots,
             DepInfoMode::Expand,
         );
-        assert!(restored.contains("/Users/bob/project/src/lib.rs"));
-        assert!(restored.contains("/Users/bob/shared/schema.json"));
+        assert!(restored.contains(&expanded_depinfo_path(
+            Path::new("/Users/bob/project"),
+            "src/lib.rs",
+        )));
+        assert!(restored.contains(&expanded_depinfo_path(
+            Path::new("/Users/bob"),
+            "shared/schema.json",
+        )));
         assert!(!restored.contains("/home/alice"));
     }
 
@@ -6048,6 +6105,69 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         .unwrap();
 
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn depinfo_separator_bounds_cover_length_cr_and_lf() {
+        let store = DepInfoSeparatorMode::Store;
+        // Nothing after the prefix, then one, two, and three name bytes.
+        for bare in ["__kache_", "__kache_a", "__kache_ab", "__kache_abc"] {
+            assert_eq!(
+                normalize_depinfo_separators(bare, store, false),
+                bare,
+                "{bare}"
+            );
+        }
+        // A closing `__` with no separator is not a sentinel, including at EOF.
+        assert_eq!(
+            normalize_depinfo_separators("__kache_ab__", store, false),
+            "__kache_ab__"
+        );
+        // One underscore before `/` is part of the name, not the terminator.
+        assert_eq!(
+            normalize_depinfo_separators("__kache_a_x/foo\\bar", store, false),
+            "__kache_a_x/foo\\bar"
+        );
+        // A short name still normalizes a trailing separator after `__/`.
+        assert_eq!(
+            normalize_depinfo_separators("__kache_abcd__/\\", store, false),
+            "__kache_abcd__//"
+        );
+        // `__/` at the first name byte is an empty name, not a sentinel.
+        assert_eq!(
+            normalize_depinfo_separators("__kache___/foo\\bar", store, false),
+            "__kache___/foo\\bar"
+        );
+        // No byte after `\`, and one byte after it. Env values and make lines.
+        assert_eq!(
+            normalize_depinfo_separators("__kache_cwd__/\\", store, true),
+            "__kache_cwd__//"
+        );
+        assert_eq!(
+            normalize_depinfo_separators("__kache_root__/\\", store, false),
+            "__kache_root__//"
+        );
+        assert_eq!(
+            normalize_depinfo_separators("__kache_cwd__/a\\nb\\rc\\ d\\\\e", store, true),
+            "__kache_cwd__/a\\nb\\rc\\ d/e"
+        );
+        assert_eq!(
+            normalize_depinfo_separators("__kache_root__/a\\ b", store, false),
+            "__kache_root__/a\\ b"
+        );
+        // A backslash before a real CR or LF stays, in env values and make lines.
+        for (env_value, sample) in [
+            (true, "__kache_cwd__/tail\\\n next\n"),
+            (true, "__kache_cwd__/tail\\\r next\n"),
+            (false, "__kache_root__/tail\\\n next\n"),
+            (false, "__kache_root__/tail\\\r next\n"),
+        ] {
+            assert_eq!(
+                normalize_depinfo_separators(sample, store, env_value),
+                sample,
+                "env={env_value} {sample:?}"
+            );
+        }
     }
 
     #[test]

@@ -22533,6 +22533,16 @@ fn registry_source_separators_agree_only_without_build_script() {
         .is_some()
     );
     assert!(!source_carries_build_script(&build_only[0]));
+    assert!(source_carries_build_script(Path::new(
+        "registry/src/index/pkg/build/mid/out/file.rs"
+    )));
+    assert!(source_carries_build_script(Path::new("build/out/lib.rs")));
+    assert!(!source_carries_build_script(Path::new("build/lib.rs")));
+    assert!(!source_carries_build_script(Path::new("out/build/lib.rs")));
+    assert!(!source_carries_build_script(Path::new("build")));
+    assert!(!source_carries_build_script(Path::new(
+        "build/build/lib.rs"
+    )));
     let out_then_build = [PathBuf::from(
         "C:/Users/u/.cargo/registry/src/index/pkg/out/build/file.rs",
     )];
@@ -22776,6 +22786,12 @@ fn registry_source_separators_agree_only_without_build_script() {
         Some(plan.clone())
     );
 
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    clear_host_neutral_decision();
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Unknown
+    );
     publish_host_neutral_decision(&args, Some(plan.clone()));
     publish_host_neutral_plan(&args, true, Some(&reg_root), &clean_sources);
     assert_eq!(

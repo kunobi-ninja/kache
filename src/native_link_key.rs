@@ -16,7 +16,8 @@
 //! `-L`, `/LIBPATH` and `LIB` in the order LINK would use.
 //!
 //! Everything else fails closed to passthrough: `LINK`/`_LINK_` option
-//! variables, a linker other than `link.exe`/`lld-link`, an ambiguous or
+//! variables, a linker other than `link.exe`/`lld-link` (a wrapper script is
+//! admitted only when it names one of those two), an ambiguous or
 //! missing `-l` library, cross-target and windows-gnu links, and any
 //! `-C link-arg` that hands LINK a file the identity does not hash. That last
 //! group is checked by [`windows_link_argument_input_files`]. Absolute `.res`
@@ -859,9 +860,10 @@ pub(crate) struct WindowsMsvcIdentity {
     pub(crate) ucrt: String,
     pub(crate) architecture: String,
     pub(crate) libraries: BTreeMap<String, String>,
-    /// Wrapper script digest and extra flags it injects (Firefox
-    /// `cargo-host-linker.bat` via `MOZ_CARGO_WRAP_*`). Empty when rustc
-    /// invoked `link.exe` / `lld-link.exe` directly.
+    /// Wrapper script digest and extra flags it injects. Firefox's
+    /// `cargo-host-linker.bat` supplies flags via `MOZ_CARGO_WRAP_*`. A
+    /// script that names `link.exe` or `lld-link.exe` contributes its bytes
+    /// and no flags. Empty when rustc invoked the linker directly.
     pub(crate) wrapper: Option<(String, Vec<String>)>,
     /// Only explicit manifest inputs need the external merger's selected
     /// path and original bytes. Ordinary link identities retain their format.
@@ -2929,6 +2931,11 @@ const MOZ_SANITIZER_RUNTIME_SWAP: &str = "MOZ_CLANG_NEWER_THAN_RUSTC_LLVM";
 /// identity still pins the tool. Where host and target are the same triple,
 /// as on Windows, cargo links build scripts and proc-macros with the target
 /// linker, so the Python route is the one Firefox's host units take.
+///
+/// Any other wrapper is cacheable when its text names `link.exe` or
+/// `lld-link.exe`: the key is the wrapper bytes plus that linker's banner.
+/// The script is not executed. A script that names neither, or names both,
+/// keeps the passthrough.
 fn unwrap_windows_linker_wrapper(
     wrapper: &Path,
     environment: &WindowsProbeEnvironment,
@@ -3024,7 +3031,111 @@ fn unwrap_windows_linker_wrapper(
         }
         return Ok((effective, Some((digest, extra))));
     }
+    if let Some(named) = forwarded_windows_linker(&text)? {
+        let effective = resolve_forwarded_windows_linker(&named, wrapper, environment)?;
+        return Ok((effective, Some((digest, Vec::new()))));
+    }
     bail!("selected Windows linker is neither link.exe nor lld-link.exe")
+}
+
+/// The linker command a wrapper script names, when that command's file name
+/// is exactly `link.exe` or `lld-link.exe`. `custom-link.exe` does not count:
+/// the script is not run, so a longer name is not a forward to `link.exe`.
+/// Two different commands is unmodeled; the same command may be repeated.
+fn forwarded_windows_linker(text: &str) -> Result<Option<String>> {
+    let mut found: Option<String> = None;
+    for line in text.lines() {
+        for token in cmd_tokens(line) {
+            if !token_names_windows_linker(&token) {
+                continue;
+            }
+            if let Some(previous) = &found {
+                if !same_linker_command(previous, &token) {
+                    bail!(
+                        "wrapper names both {previous} and {token}; which linker it runs is unmodeled"
+                    );
+                }
+            } else {
+                found = Some(token);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn token_names_windows_linker(token: &str) -> bool {
+    let file_name = windows_script_file_name(token);
+    file_name.eq_ignore_ascii_case("lld-link.exe") || file_name.eq_ignore_ascii_case("link.exe")
+}
+
+/// File name as `cmd` sees it. Separators are both `/` and `\`, including
+/// when this process is not Windows.
+fn windows_script_file_name(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'/' || *byte == b'\\' {
+            start = index + 1;
+        }
+    }
+    &token[start..]
+}
+
+fn same_linker_command(left: &str, right: &str) -> bool {
+    left.replace('\\', "/")
+        .eq_ignore_ascii_case(&right.replace('\\', "/"))
+}
+
+/// Split one `cmd` line on whitespace, keeping a quoted path together.
+/// Quotes are the script's syntax, not part of the command.
+fn cmd_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in line.chars() {
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if character.is_whitespace() && !quoted {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn resolve_forwarded_windows_linker(
+    named: &str,
+    wrapper: &Path,
+    environment: &WindowsProbeEnvironment,
+) -> Result<PathBuf> {
+    let named = named.replace('\\', "/");
+    let named_path = Path::new(&named);
+    if !is_path_like(named_path) {
+        return path_lookup(environment, &named).with_context(|| {
+            format!(
+                "wrapper {} names {named}, which is not on PATH",
+                wrapper.display()
+            )
+        });
+    }
+    if named_path.is_absolute() {
+        return Ok(named_path.to_path_buf());
+    }
+    let cwd = environment.cwd.as_deref().with_context(|| {
+        format!(
+            "current directory is unavailable to resolve {named} in {}",
+            wrapper.display()
+        )
+    })?;
+    Ok(cwd.join(named_path))
 }
 
 #[cfg(test)]
@@ -3034,6 +3145,19 @@ mod tests {
 
     fn words(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn cmd_tokens_keeps_a_quoted_path_and_drops_empty_spans() {
+        assert_eq!(
+            cmd_tokens(r#""C:\Program Files\link.exe" /libpath:a"#),
+            ["C:\\Program Files\\link.exe", "/libpath:a"]
+        );
+        // A trailing separator leaves `current` empty. Pushing that empty
+        // token is what `delete !` in the final check would do.
+        assert_eq!(cmd_tokens("link.exe "), ["link.exe"]);
+        assert_eq!(cmd_tokens("  link.exe"), ["link.exe"]);
+        assert!(cmd_tokens(" \t ").is_empty());
     }
 
     #[test]
@@ -5925,6 +6049,218 @@ esac
 
         std::fs::remove_file(&script).unwrap();
         assert!(format!("{:#}", probe(&environment).unwrap_err()).contains("not readable"));
+    }
+
+    /// A `.cmd` that names `link.exe` or `lld-link.exe` is keyed by the
+    /// wrapper bytes and that linker's banner. The script is not executed.
+    /// A script that names something else, including a longer name that
+    /// merely ends in `link.exe`, stays the old passthrough.
+    #[test]
+    fn windows_identity_keys_cmd_wrapper_that_forwards_to_link_exe() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut environment = windows_environment(directory.path(), "x64");
+        // The real linkers live on PATH, not in the working directory, so a
+        // bare name has to be looked up rather than joined onto cwd.
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let lld = bin.join("lld-link.exe");
+        let link = bin.join("link.exe");
+        std::fs::rename(directory.path().join("link.exe"), &link).unwrap();
+        std::fs::rename(directory.path().join("cl.exe"), bin.join("cl.exe")).unwrap();
+        std::fs::write(&lld, b"lld").unwrap();
+        environment.path = vec![bin.clone()];
+
+        let probe_at = |environment: &WindowsProbeEnvironment,
+                        wrapper: &Path,
+                        linker: &Path,
+                        tool: WindowsTool,
+                        banner: &str| {
+            probe_windows_msvc_identity_with(
+                Some(wrapper),
+                "x64",
+                &[],
+                environment,
+                |probed, path| {
+                    if !matches!(probed, WindowsTool::Cl) {
+                        assert_eq!(
+                            path.canonicalize().unwrap(),
+                            linker.canonicalize().unwrap(),
+                            "wrapper must resolve to the named linker"
+                        );
+                    }
+                    Ok(match probed {
+                        WindowsTool::Cl => compiler_banner("x64"),
+                        WindowsTool::LldLink if matches!(tool, WindowsTool::LldLink) => {
+                            banner.into()
+                        }
+                        WindowsTool::Link if matches!(tool, WindowsTool::Link) => banner.into(),
+                        WindowsTool::LldLink | WindowsTool::Link => {
+                            unreachable!("wrapper resolved to the other linker")
+                        }
+                    })
+                },
+            )
+        };
+
+        let lld_wrapper = directory.path().join("forward-lld.cmd");
+        std::fs::write(&lld_wrapper, "@echo off\r\nLLD-LINK.EXE %*\r\n").unwrap();
+        let identity = probe_at(
+            &environment,
+            &lld_wrapper,
+            &lld,
+            WindowsTool::LldLink,
+            LLD_LINK_BANNER,
+        )
+        .unwrap();
+        assert_eq!(identity.linker, LLD_LINK_BANNER);
+        let (digest, extra) = identity.wrapper.as_ref().expect("wrapper bytes");
+        let digest = digest.clone();
+        assert!(extra.is_empty(), "a cmd forward injects no extra flags");
+        let wrapper_bytes = std::fs::read(&lld_wrapper).unwrap();
+        assert_eq!(digest, blake3::hash(&wrapper_bytes).to_hex().to_string());
+        assert!(identity.encode().contains(&format!("wrapper={digest}")));
+
+        std::fs::write(
+            &lld_wrapper,
+            "@echo off\r\nlld-link.exe %*\r\nLLD-LINK.EXE %*\r\n",
+        )
+        .unwrap();
+        let repeated = probe_at(
+            &environment,
+            &lld_wrapper,
+            &lld,
+            WindowsTool::LldLink,
+            LLD_LINK_BANNER,
+        )
+        .unwrap();
+        let (repeated_digest, _) = repeated.wrapper.expect("repeated command");
+        assert_ne!(digest, repeated_digest, "wrapper bytes must change the key");
+        assert_eq!(
+            repeated_digest,
+            blake3::hash(&std::fs::read(&lld_wrapper).unwrap())
+                .to_hex()
+                .to_string()
+        );
+
+        let link_wrapper = directory.path().join("forward-link.cmd");
+        std::fs::write(&link_wrapper, "@echo off\r\nLink.EXE %*\r\n").unwrap();
+        let identity = probe_at(
+            &environment,
+            &link_wrapper,
+            &link,
+            WindowsTool::Link,
+            LINK_BANNER,
+        )
+        .unwrap();
+        assert_eq!(identity.linker, LINK_BANNER);
+        let (digest, extra) = identity.wrapper.expect("link.exe wrapper bytes");
+        assert!(extra.is_empty());
+        assert_eq!(
+            digest,
+            blake3::hash(&std::fs::read(&link_wrapper).unwrap())
+                .to_hex()
+                .to_string()
+        );
+
+        let spaced = directory.path().join("llvm bin");
+        std::fs::create_dir(&spaced).unwrap();
+        let spaced_lld = spaced.join("lld-link.exe");
+        std::fs::write(&spaced_lld, b"spaced").unwrap();
+        let quoted = directory.path().join("forward-quoted.cmd");
+        std::fs::write(
+            &quoted,
+            format!("@echo off\r\n\"{}\" %*\r\n", spaced_lld.display()),
+        )
+        .unwrap();
+        let identity = probe_at(
+            &environment,
+            &quoted,
+            &spaced_lld,
+            WindowsTool::LldLink,
+            LLD_LINK_BANNER,
+        )
+        .unwrap();
+        assert_eq!(identity.linker, LLD_LINK_BANNER);
+
+        let tools = directory.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let relative_lld = tools.join("lld-link.exe");
+        std::fs::write(&relative_lld, b"relative").unwrap();
+        let relative = directory.path().join("forward-relative.cmd");
+        std::fs::write(&relative, "@echo off\r\ntools\\lld-link.exe %*\r\n").unwrap();
+        let identity = probe_at(
+            &environment,
+            &relative,
+            &relative_lld,
+            WindowsTool::LldLink,
+            LLD_LINK_BANNER,
+        )
+        .unwrap();
+        assert_eq!(identity.linker, LLD_LINK_BANNER);
+
+        let mut no_cwd = environment.clone();
+        no_cwd.cwd = None;
+        std::fs::write(bin.join("forward-no-cwd.cmd"), "tools/lld-link.exe %*\n").unwrap();
+        let error = probe_windows_msvc_identity_with(
+            Some(Path::new("forward-no-cwd.cmd")),
+            "x64",
+            &[],
+            &no_cwd,
+            |_, _| unreachable!("relative linker needs a current directory"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("current directory is unavailable"),
+            "{error:#}"
+        );
+
+        let resolved = resolve_forwarded_windows_linker(
+            &lld.to_string_lossy(),
+            Path::new("forward-absolute.cmd"),
+            &no_cwd,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            lld.canonicalize().unwrap(),
+            "an absolute forward does not need the current directory"
+        );
+
+        let absent = directory.path().join("forward-absent.cmd");
+        std::fs::write(&absent, "@echo off\r\nlld-link.exe %*\r\n").unwrap();
+        let mut empty_path = environment.clone();
+        empty_path.path.clear();
+        let error =
+            probe_windows_msvc_identity_with(Some(&absent), "x64", &[], &empty_path, |_, _| {
+                unreachable!("lld-link.exe is not on PATH")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("not on PATH"), "{error:#}");
+
+        let other = directory.path().join("forward-other.cmd");
+        std::fs::write(&other, "@echo off\r\ncustom-link.exe %*\r\n").unwrap();
+        let error =
+            probe_at(&environment, &other, &link, WindowsTool::Link, LINK_BANNER).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("neither link.exe nor lld-link.exe"),
+            "{error:#}"
+        );
+
+        let both = directory.path().join("forward-both.cmd");
+        std::fs::write(&both, "@echo off\r\nlld-link.exe %*\r\nlink.exe %*\r\n").unwrap();
+        let error = probe_at(
+            &environment,
+            &both,
+            &lld,
+            WindowsTool::LldLink,
+            LLD_LINK_BANNER,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unmodeled"), "{error:#}");
     }
 
     #[test]

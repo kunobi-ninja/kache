@@ -3487,6 +3487,7 @@ struct BackendCalls {
     gets: Vec<String>,
     puts: Vec<String>,
     lists: Vec<String>,
+    heads: Vec<String>,
 }
 
 struct TestBackend {
@@ -3494,6 +3495,7 @@ struct TestBackend {
     calls: std::sync::Mutex<BackendCalls>,
     fail_put: bool,
     listing: Option<Arc<ControlledListing>>,
+    transfer_gate: Option<Arc<SyncTransferGate>>,
 }
 
 impl TestBackend {
@@ -3503,6 +3505,7 @@ impl TestBackend {
             calls: std::sync::Mutex::new(BackendCalls::default()),
             fail_put: false,
             listing: None,
+            transfer_gate: None,
         })
     }
 
@@ -3512,6 +3515,7 @@ impl TestBackend {
             calls: std::sync::Mutex::new(BackendCalls::default()),
             fail_put: true,
             listing: None,
+            transfer_gate: None,
         })
     }
 
@@ -3540,6 +3544,10 @@ impl TestBackend {
     fn list_calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().lists.clone()
     }
+
+    fn head_calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().heads.clone()
+    }
 }
 
 fn as_remote_backend(backend: &Arc<TestBackend>) -> Arc<dyn crate::remote_backend::RemoteBackend> {
@@ -3556,6 +3564,7 @@ fn as_cache_remote(
 #[async_trait::async_trait]
 impl crate::remote_backend::RemoteBackend for TestBackend {
     async fn head(&self, key: &str) -> Result<bool> {
+        self.calls.lock().unwrap().heads.push(key.to_string());
         crate::remote_backend::RemoteBackend::head(&self.inner, key).await
     }
 
@@ -3565,6 +3574,18 @@ impl crate::remote_backend::RemoteBackend for TestBackend {
         max_bytes: Option<u64>,
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         self.calls.lock().unwrap().gets.push(key.to_string());
+        if let Some(gate) = &self.transfer_gate {
+            let gate = gate.as_ref();
+            let active = gate
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            gate.peak
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            gate.entered.add_permits(1);
+            let _active = ActiveTransfer(gate);
+            gate.release.acquire().await.unwrap().forget();
+        }
         crate::remote_backend::RemoteBackend::get(&self.inner, key, max_bytes).await
     }
 
@@ -3605,6 +3626,25 @@ struct ControlledListing {
     started: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     fail: bool,
+}
+
+/// Blocks each GET until the test releases it, so a pull's in-flight count is
+/// observable.
+struct SyncTransferGate {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+struct ActiveTransfer<'a>(&'a SyncTransferGate);
+
+impl Drop for ActiveTransfer<'_> {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 struct ActiveListing<'a>(&'a ControlledListing);
@@ -6690,8 +6730,8 @@ async fn sync_with_client_push_uploads_local_only_entry() {
 
 #[tokio::test]
 async fn sync_with_client_push_throttles_with_low_concurrency() {
-    // Two local entries with concurrency=1 force the push loop's
-    // max-concurrency wait branch (the second upload waits for the first).
+    // Two local entries still upload when the daemon pool is 1. Sync no longer
+    // uses that pool as its in-flight cap.
     let dir = tempfile::tempdir().unwrap();
     let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
     config.s3_concurrency = 1;
@@ -6974,10 +7014,10 @@ async fn sync_with_client_push_allows_partial_when_flag_set() {
 
 #[tokio::test]
 async fn sync_with_client_pull_throttles_with_low_concurrency() {
-    // Two remote-only keys with concurrency=1 force the pull loop's
-    // max-concurrency wait branch (the second download waits for the first
-    // to drain a slot). Packs are garbage so each download fails fast, but
-    // the throttle path is still exercised; with allow_partial, the sync completes Ok.
+    // Two remote-only keys still download when the daemon pool is 1. Packs are
+    // garbage so each download fails fast; with allow_partial, the sync
+    // completes Ok. The in-flight floor is covered by
+    // `sync_pull_plans_many_present_keys_without_one_head_each`.
     let dir = tempfile::tempdir().unwrap();
     let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
     config.s3_concurrency = 1;
@@ -7019,6 +7059,192 @@ async fn sync_with_client_pull_throttles_with_low_concurrency() {
     .await
     .expect("throttled pull sync should complete Ok with allow_partial");
     assert_eq!(backend.get_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn sync_pull_plans_many_present_keys_without_one_head_each() {
+    // Independent of `SYNC_TRANSFER_JOBS`: a smaller daemon pool must not win,
+    // and a larger one must.
+    assert_eq!(sync_transfer_jobs(0), 32);
+    assert_eq!(sync_transfer_jobs(1), 32);
+    assert_eq!(sync_transfer_jobs(16), 32);
+    assert_eq!(sync_transfer_jobs(31), 32);
+    assert_eq!(sync_transfer_jobs(32), 32);
+    assert_eq!(sync_transfer_jobs(64), 64);
+
+    let present = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    config.s3_concurrency = 1;
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let gate = Arc::new(SyncTransferGate {
+        active: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut backend = TestBackend::memory();
+    Arc::get_mut(&mut backend).unwrap().transfer_gate = Some(Arc::clone(&gate));
+    let mut present_keys = Vec::new();
+    for index in 0..present {
+        let key = sync_test_cache_key(&format!("present-{index}"));
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
+                b"not a pack".to_vec(),
+            )
+            .await;
+        present_keys.push(key);
+    }
+    let absent = sync_test_cache_key("absent");
+    let outside = sync_test_cache_key("outside-scope");
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/other/{outside}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+    let crates = std::collections::HashSet::from(["serde".to_string()]);
+    let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (result, ()) = tokio::join!(
+            sync_with_client(
+                &cache_remote,
+                &config,
+                &store,
+                None,
+                true,
+                false,
+                false,
+                false,
+                Some(&crates),
+                false,
+                true,
+            ),
+            async {
+                gate.entered.acquire_many(32).await.unwrap().forget();
+                assert_eq!(
+                    gate.active.load(std::sync::atomic::Ordering::SeqCst),
+                    32,
+                    "a daemon pool of 1 must not keep the pull at one transfer"
+                );
+                gate.release.add_permits(present);
+            }
+        );
+        result.expect("partial pull of invalid packs should succeed");
+    })
+    .await
+    .expect("32 transfers should be in flight before the gate opens");
+    assert_eq!(gate.peak.load(std::sync::atomic::Ordering::SeqCst), 32);
+    let heads = backend.head_calls();
+    assert!(
+        heads.len() < present_keys.len(),
+        "planning {} present keys performed {} HEADs",
+        present_keys.len(),
+        heads.len()
+    );
+    assert_eq!(backend.list_calls(), vec!["prefix/v3/manifests/serde/"]);
+    let gets = backend.get_calls();
+    assert_eq!(gets.len(), present_keys.len());
+    for key in &present_keys {
+        assert!(
+            gets.iter()
+                .any(|call| call.ends_with(&format!("{key}.tar.zst"))),
+            "present key {key} was not downloaded"
+        );
+        assert!(
+            heads.iter().all(|call| !call.contains(key)),
+            "present key {key} was checked with HEAD"
+        );
+    }
+    assert!(
+        gets.iter().all(|call| !call.contains(&absent)),
+        "absent key was downloaded"
+    );
+    assert!(
+        gets.iter().all(|call| !call.contains(&outside)),
+        "key outside the listed prefix was downloaded"
+    );
+
+    // A store that already holds every listed artifact plans no download.
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let backend = TestBackend::memory();
+    let mut imported = Vec::new();
+    for index in 0..8 {
+        let key = sync_test_cache_key(&format!("imported-{index}"));
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
+                build_entry_pack(&key, "serde"),
+            )
+            .await;
+        imported.push(key);
+    }
+    let absent = sync_test_cache_key("still-absent");
+    let cache_remote = as_cache_remote(as_remote_backend(&backend), &remote);
+    let pull = |dry_run: bool| {
+        let cache_remote = &cache_remote;
+        let config = &config;
+        let store = &store;
+        let crates = &crates;
+        async move {
+            sync_with_client(
+                cache_remote,
+                config,
+                store,
+                None,
+                true,
+                false,
+                dry_run,
+                false,
+                Some(crates),
+                false,
+                false,
+            )
+            .await
+        }
+    };
+    pull(false)
+        .await
+        .expect("pull of present packs should succeed");
+    for key in &imported {
+        assert!(store.contains(key), "present key {key} was not imported");
+    }
+    assert!(!store.contains(&absent));
+    let gets = backend.get_calls();
+    assert_eq!(gets.len(), imported.len());
+    for key in &imported {
+        assert!(gets.iter().any(|call| call.contains(key)));
+    }
+    assert!(gets.iter().all(|call| !call.contains(&absent)));
+    assert!(
+        backend.head_calls().len() < imported.len(),
+        "planning {} present keys performed {} HEADs",
+        imported.len(),
+        backend.head_calls().len()
+    );
+    let gets_after_import = backend.get_calls().len();
+    let heads_after_import = backend.head_calls().len();
+    pull(false)
+        .await
+        .expect("second pull of a complete store should succeed");
+    assert_eq!(backend.get_calls().len(), gets_after_import);
+    assert_eq!(backend.head_calls().len(), heads_after_import);
 }
 
 /// Build a valid v3 entry pack (tar.zst) for `key`/`crate_name` from a

@@ -3898,6 +3898,17 @@ fn cc_store_freezes_private_artifacts_without_mutating_compiler_outputs() {
     );
 }
 
+/// Anchor plus the stored suffix. Restore writes that suffix with the local
+/// separator; `Path::join` would keep `/` inside the suffix on Windows.
+fn restored_anchor_path(anchor: &std::path::Path, relative_slash: &str) -> String {
+    format!(
+        "{}{}{}",
+        anchor.display(),
+        std::path::MAIN_SEPARATOR,
+        relative_slash.replace('/', std::path::MAIN_SEPARATOR_STR)
+    )
+}
+
 /// Rust store staging leaves compiler outputs untouched while the cached
 /// dep-info round trip re-roots target, package, and workspace paths.
 #[test]
@@ -3968,23 +3979,15 @@ fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
         Some(&restoring_workspace),
         link::DepInfoMode::Expand,
     );
-    assert!(
-        restored.contains(
-            restoring_target
-                .join("release/deps/libfoo-abc.rlib")
-                .to_str()
-                .unwrap()
-        )
-    );
-    assert!(restored.contains(restoring_working_dir.join("src/lib.rs").to_str().unwrap()));
-    assert!(
-        restored.contains(
-            restoring_workspace
-                .join("shared/asset.txt")
-                .to_str()
-                .unwrap()
-        )
-    );
+    assert!(restored.contains(&restored_anchor_path(
+        &restoring_target,
+        "release/deps/libfoo-abc.rlib"
+    )));
+    assert!(restored.contains(&restored_anchor_path(&restoring_working_dir, "src/lib.rs")));
+    assert!(restored.contains(&restored_anchor_path(
+        &restoring_workspace,
+        "shared/asset.txt"
+    )));
 }
 
 /// A `0600` dep-info snapshot is published as `0400`, which another user of a
@@ -5006,11 +5009,8 @@ fn cc_generated_source_depinfo_rebases_headers_outside_the_build_directory() {
         .unwrap();
         assert_eq!(std::fs::read(&restored_object).unwrap(), b"wasm object");
         let restored = std::fs::read_to_string(&restored_depfile).unwrap();
-        let expected_header = consumer
-            .join("src/inc/header with space.h")
-            .display()
-            .to_string()
-            .replace(' ', "\\ ");
+        let expected_header =
+            restored_anchor_path(&consumer, "src/inc/header with space.h").replace(' ', "\\ ");
         assert_eq!(
             restored,
             format!(
@@ -5322,18 +5322,13 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
     let restored = std::fs::read_to_string(&target).unwrap();
     assert!(
         restored.starts_with(&format!(
-            "{}{}debug/deps/libfoo.rlib:",
-            anchor.display(),
-            std::path::MAIN_SEPARATOR
+            "{}:",
+            restored_anchor_path(&anchor, "debug/deps/libfoo.rlib")
         )),
         "dep-info should be expanded at restore anchor, got: {restored}"
     );
     assert!(
-        restored.contains(&format!(
-            "{}{}src/lib.rs",
-            dir.path().display(),
-            std::path::MAIN_SEPARATOR
-        )),
+        restored.contains(&restored_anchor_path(dir.path(), "src/lib.rs")),
         "dep-info source should be expanded at the consumer cwd: {restored}"
     );
     assert_eq!(

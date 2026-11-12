@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   preflight:
-    name: Musl portability and repository checks
+    name: Release dependencies, MSRV and repository checks
     if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private && github.ref == 'refs/heads/validation/musl-timespec-2.1.0'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -23,8 +23,8 @@ jobs:
       CARGO_BUILD_RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: af855eed5499ae6c3a65718f153d05a8263f4a16
-      EXPECTED_TREE: 56ae77ed4c7ada7a277ff61937f9c606b6b8d5a5
+      EXPECTED_HEAD: 3ebb554cfbf9d3f5681bd88ea0362040ddd317e6
+      EXPECTED_TREE: fa7cb41226819cca2d177a8a111c1be66bde9f41
       BASE_HEAD: 1f7e8bdf806911005446bc6113e46217b0586023
       BASE_TREE: 1ac950a8778d9cd6ea060a7048a080118d222179
       EXPECTED_VERSION: "2.1.1"
@@ -46,7 +46,7 @@ jobs:
           test "$RUNNER_ARCH" = X64
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: af855eed5499ae6c3a65718f153d05a8263f4a16
+          ref: 3ebb554cfbf9d3f5681bd88ea0362040ddd317e6
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact candidate and baseline
@@ -145,6 +145,31 @@ jobs:
             if [ "$check_exit" -ne 0 ]; then failures=1; fi
           done
           test "$failures" -eq 0
+      - name: Check the advertised minimum Rust versions
+        id: msrv
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.93.0 1.95.0 --profile minimal 2>&1 | tee "$EVIDENCE_DIR/msrv-toolchain-setup.log"
+          for toolchain in 1.93.0 1.95.0; do
+            rustup run "$toolchain" rustc --version --verbose | tee "$EVIDENCE_DIR/toolchain-$toolchain.txt"
+            rustup run "$toolchain" rustc --version | grep -F "rustc $toolchain "
+            rustup run "$toolchain" cargo --version | tee -a "$EVIDENCE_DIR/toolchain-$toolchain.txt"
+          done
+          core_started=$(date +%s)
+          core_exit=0
+          RUSTC="$(rustup which --toolchain 1.93.0 rustc)" RUSTDOC="$(rustup which --toolchain 1.93.0 rustdoc)" CARGO_TARGET_DIR="$RUNNER_TEMP/musl-timespec/msrv-core-1.93.0" \
+            rustup run 1.93.0 cargo check --locked --package kache-core --all-features --all-targets 2>&1 | tee "$EVIDENCE_DIR/msrv-core-1.93.0.log" || core_exit=$?
+          printf 'msrv_core\t1.93.0\t%s\t%s\n' "$core_exit" "$(( $(date +%s) - core_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          workspace_started=$(date +%s)
+          workspace_exit=0
+          RUSTC="$(rustup which --toolchain 1.95.0 rustc)" RUSTDOC="$(rustup which --toolchain 1.95.0 rustdoc)" CARGO_TARGET_DIR="$RUNNER_TEMP/musl-timespec/msrv-workspace-1.95.0" \
+            rustup run 1.95.0 cargo check --locked --workspace --all-features --all-targets 2>&1 | tee "$EVIDENCE_DIR/msrv-workspace-1.95.0.log" || workspace_exit=$?
+          printf 'msrv_workspace\t1.95.0\t%s\t%s\n' "$workspace_exit" "$(( $(date +%s) - workspace_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          # The per-command overrides above must leave the release toolchain active.
+          rustc --version | tee "$EVIDENCE_DIR/toolchain-restored.txt"
+          rustc --version | grep -E '^rustc 1\.99\.1 '
+          test "$core_exit" -eq 0
+          test "$workspace_exit" -eq 0
       - name: Run the canonical version bump idempotently
         id: bump
         run: |
@@ -179,6 +204,33 @@ jobs:
           printf 'docs_tests\tworkspace\t%s\t%s\n' "$docs_tests_exit" "$(( $(date +%s) - docs_tests_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
           test "$docs_exit" -eq 0
           test "$docs_tests_exit" -eq 0
+      - name: Audit every workspace member and fuzz
+        id: audit
+        run: |
+          set -euo pipefail
+          cargo deny --version | tee "$EVIDENCE_DIR/cargo-deny-version.txt"
+          cargo deny fetch db 2>&1 | tee "$EVIDENCE_DIR/advisory-db-fetch.log"
+          audit_started=$(date +%s)
+          audit_exit=0
+          just audit 2>&1 | tee "$EVIDENCE_DIR/just-audit.log" || audit_exit=$?
+          printf 'just_audit\tmembers_and_fuzz\t%s\t%s\n' "$audit_exit" "$(( $(date +%s) - audit_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          cargo_home = pathlib.Path(os.environ.get("CARGO_HOME", str(pathlib.Path.home() / ".cargo")))
+          records = []
+          for database in sorted((cargo_home / "advisory-dbs").iterdir()):
+              if (database / ".git").exists():
+                  def git(*arguments):
+                      return subprocess.check_output(["git", "-C", str(database), *arguments], text=True).strip()
+                  records.append({"directory": database.name,
+                                  "head": git("rev-parse", "HEAD"),
+                                  "commit_time": git("log", "-1", "--format=%cI")})
+          if not records:
+              raise SystemExit("No fetched advisory database provenance found")
+          output = pathlib.Path(os.environ["EVIDENCE_DIR"]) / "advisory-db-provenance.json"
+          output.write_text(json.dumps(records, indent=2) + "\n")
+          PY
+          exit "$audit_exit"
       - name: Verify source trees stayed clean
         id: clean
         if: always() && steps.verify.outcome == 'success'
@@ -198,13 +250,15 @@ jobs:
           CARGO_EDIT: ${{ steps.cargo_edit.outcome }}
           BASELINE: ${{ steps.baseline.outcome }}
           CANDIDATE: ${{ steps.candidate.outcome }}
+          MSRV: ${{ steps.msrv.outcome }}
           BUMP: ${{ steps.bump.outcome }}
           CHECK: ${{ steps.check.outcome }}
           DOCS: ${{ steps.docs.outcome }}
+          AUDIT: ${{ steps.audit.outcome }}
           CLEAN: ${{ steps.clean.outcome }}
         run: |
           mkdir -p "$EVIDENCE_DIR"
-          printf 'verify=%s\ntoolchain=%s\ncargo_edit=%s\nbaseline=%s\ncandidate=%s\nbump=%s\njust_check=%s\ndocs=%s\nclean=%s\n' "$VERIFY" "$TOOLCHAIN" "$CARGO_EDIT" "$BASELINE" "$CANDIDATE" "$BUMP" "$CHECK" "$DOCS" "$CLEAN" | tee "$EVIDENCE_DIR/outcomes.txt"
+          printf 'verify=%s\ntoolchain=%s\ncargo_edit=%s\nbaseline=%s\ncandidate=%s\nmsrv=%s\nbump=%s\njust_check=%s\ndocs=%s\naudit=%s\nclean=%s\n' "$VERIFY" "$TOOLCHAIN" "$CARGO_EDIT" "$BASELINE" "$CANDIDATE" "$MSRV" "$BUMP" "$CHECK" "$DOCS" "$AUDIT" "$CLEAN" | tee "$EVIDENCE_DIR/outcomes.txt"
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

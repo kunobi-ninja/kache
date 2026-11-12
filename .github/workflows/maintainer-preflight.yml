@@ -23,10 +23,12 @@ jobs:
       CARGO_BUILD_RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: 0e06d20ae94c9befef923e89f991641a40979a64
-      EXPECTED_TREE: 96cec1d4fa0899e9825d61f3a3a9fb09955c8aa2
+      EXPECTED_HEAD: af855eed5499ae6c3a65718f153d05a8263f4a16
+      EXPECTED_TREE: 56ae77ed4c7ada7a277ff61937f9c606b6b8d5a5
       BASE_HEAD: 1f7e8bdf806911005446bc6113e46217b0586023
       BASE_TREE: 1ac950a8778d9cd6ea060a7048a080118d222179
+      EXPECTED_VERSION: "2.1.1"
+      CARGO_EDIT_VERSION: "0.13.11"
     steps:
       - name: Record provenance and require an ephemeral hosted runner
         env:
@@ -44,7 +46,7 @@ jobs:
           test "$RUNNER_ARCH" = X64
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 0e06d20ae94c9befef923e89f991641a40979a64
+          ref: af855eed5499ae6c3a65718f153d05a8263f4a16
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact candidate and baseline
@@ -71,6 +73,18 @@ jobs:
           cargo --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
           just --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl 2>&1 | tee "$EVIDENCE_DIR/target-setup.log"
+      - name: Install pinned cargo-edit for the canonical bump
+        id: cargo_edit
+        run: |
+          set -euo pipefail
+          install_started=$(date +%s)
+          install_exit=0
+          cargo install --locked --version "=$CARGO_EDIT_VERSION" --bin cargo-set-version --root "$RUNNER_TEMP/cargo-edit-$CARGO_EDIT_VERSION" --target-dir "$RUNNER_TEMP/cargo-edit-target" cargo-edit 2>&1 | tee "$EVIDENCE_DIR/cargo-edit-install.log" || install_exit=$?
+          printf 'cargo_edit_install\t%s\t%s\t%s\n' "$CARGO_EDIT_VERSION" "$install_exit" "$(( $(date +%s) - install_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          test "$install_exit" -eq 0
+          printf '%s/bin\n' "$RUNNER_TEMP/cargo-edit-$CARGO_EDIT_VERSION" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cargo-edit-$CARGO_EDIT_VERSION/bin/cargo-set-version" set-version --version | tee "$EVIDENCE_DIR/cargo-edit-version.txt"
+          grep -Fx "cargo-edit-set-version $CARGO_EDIT_VERSION" "$EVIDENCE_DIR/cargo-edit-version.txt"
       - name: Require the exact deprecated-alias failure on both baseline targets
         id: baseline
         run: |
@@ -131,6 +145,17 @@ jobs:
             if [ "$check_exit" -ne 0 ]; then failures=1; fi
           done
           test "$failures" -eq 0
+      - name: Run the canonical version bump idempotently
+        id: bump
+        run: |
+          set -euo pipefail
+          test "$(command -v cargo-set-version)" = "$RUNNER_TEMP/cargo-edit-$CARGO_EDIT_VERSION/bin/cargo-set-version"
+          bump_started=$(date +%s)
+          bump_exit=0
+          just bump "$EXPECTED_VERSION" 2>&1 | tee "$EVIDENCE_DIR/just-bump.log" || bump_exit=$?
+          printf 'just_bump\t%s\t%s\t%s\n' "$EXPECTED_VERSION" "$bump_exit" "$(( $(date +%s) - bump_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          test "$bump_exit" -eq 0
+          git diff --exit-code HEAD
       - name: Run just check
         id: check
         run: |
@@ -140,6 +165,20 @@ jobs:
           just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log" || check_exit=$?
           printf 'just_check\tworkspace\t%s\t%s\n' "$check_exit" "$(( $(date +%s) - check_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
           exit "$check_exit"
+      - name: Check documentation routes and installation pins
+        id: docs
+        run: |
+          set -euo pipefail
+          docs_started=$(date +%s)
+          docs_exit=0
+          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log" || docs_exit=$?
+          printf 'docs_check\tworkspace\t%s\t%s\n' "$docs_exit" "$(( $(date +%s) - docs_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          docs_tests_started=$(date +%s)
+          docs_tests_exit=0
+          python3 scripts/test-docs.py 2>&1 | tee "$EVIDENCE_DIR/docs-tests.log" || docs_tests_exit=$?
+          printf 'docs_tests\tworkspace\t%s\t%s\n' "$docs_tests_exit" "$(( $(date +%s) - docs_tests_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          test "$docs_exit" -eq 0
+          test "$docs_tests_exit" -eq 0
       - name: Verify source trees stayed clean
         id: clean
         if: always() && steps.verify.outcome == 'success'
@@ -156,13 +195,16 @@ jobs:
         env:
           VERIFY: ${{ steps.verify.outcome }}
           TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          CARGO_EDIT: ${{ steps.cargo_edit.outcome }}
           BASELINE: ${{ steps.baseline.outcome }}
           CANDIDATE: ${{ steps.candidate.outcome }}
+          BUMP: ${{ steps.bump.outcome }}
           CHECK: ${{ steps.check.outcome }}
+          DOCS: ${{ steps.docs.outcome }}
           CLEAN: ${{ steps.clean.outcome }}
         run: |
           mkdir -p "$EVIDENCE_DIR"
-          printf 'verify=%s\ntoolchain=%s\nbaseline=%s\ncandidate=%s\njust_check=%s\nclean=%s\n' "$VERIFY" "$TOOLCHAIN" "$BASELINE" "$CANDIDATE" "$CHECK" "$CLEAN" | tee "$EVIDENCE_DIR/outcomes.txt"
+          printf 'verify=%s\ntoolchain=%s\ncargo_edit=%s\nbaseline=%s\ncandidate=%s\nbump=%s\njust_check=%s\ndocs=%s\nclean=%s\n' "$VERIFY" "$TOOLCHAIN" "$CARGO_EDIT" "$BASELINE" "$CANDIDATE" "$BUMP" "$CHECK" "$DOCS" "$CLEAN" | tee "$EVIDENCE_DIR/outcomes.txt"
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

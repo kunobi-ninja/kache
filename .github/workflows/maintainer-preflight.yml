@@ -1,8 +1,8 @@
-name: MSVC integration preflight
+name: Maintainer preflight
 
 on:
   push:
-    branches: [validation/msvc-integration-checks-20261101]
+    branches: [validation/musl-timespec-2.1.0]
     paths: [.github/workflows/maintainer-preflight.yml]
 
 permissions:
@@ -10,8 +10,8 @@ permissions:
 
 jobs:
   preflight:
-    name: Manifest parser and key checks (Linux)
-    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/msvc-integration-checks-20261101'
+    name: Musl portability and repository checks
+    if: github.repository == 'kunobi-ninja/kache' && !github.event.repository.private && github.ref == 'refs/heads/validation/musl-timespec-2.1.0'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -19,192 +19,155 @@ jobs:
         shell: bash
     env:
       RUSTC_WRAPPER: ""
+      RUSTC_WORKSPACE_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: adf507750d5b7f4b83746a68e2cd411931fec6b7
-      EXPECTED_TREE: f9fea29773b0eb1d5afe2ace938a6857c99e7301
-      BASE_HEAD: f2d98328ba9f86d10a74495dcca15ab6440f31ca
+      EXPECTED_HEAD: 0e06d20ae94c9befef923e89f991641a40979a64
+      EXPECTED_TREE: 96cec1d4fa0899e9825d61f3a3a9fb09955c8aa2
+      BASE_HEAD: 1f7e8bdf806911005446bc6113e46217b0586023
+      BASE_TREE: 1ac950a8778d9cd6ea060a7048a080118d222179
     steps:
       - name: Record provenance and require an ephemeral hosted runner
         env:
           RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/msvc-integration/evidence"
+          evidence="$RUNNER_TEMP/musl-timespec/evidence"
           mkdir -p "$evidence"
           printf 'EVIDENCE_DIR=%s\n' "$evidence" >> "$GITHUB_ENV"
-          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/msvc-integration/target" >> "$GITHUB_ENV"
-          printf 'helper=%s\nrun=%s\nrunner=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_KIND" | tee "$evidence/provenance.txt"
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/musl-timespec/target" >> "$GITHUB_ENV"
+          printf 'BASELINE_DIR=%s\n' "$RUNNER_TEMP/musl-timespec/baseline" >> "$GITHUB_ENV"
+          printf 'helper=%s\nrun=%s\nrunner=%s\nimage=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_KIND" "$ImageVersion" | tee "$evidence/provenance.txt"
           test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: adf507750d5b7f4b83746a68e2cd411931fec6b7
+          ref: 0e06d20ae94c9befef923e89f991641a40979a64
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify exact candidate
+      - name: Verify exact candidate and baseline
         id: verify
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
-          printf 'tested_head=%s\ntested_tree=%s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE" >> "$EVIDENCE_DIR/provenance.txt"
+          test "$(git rev-parse "$BASE_HEAD^{tree}")" = "$BASE_TREE"
+          git worktree add --detach "$BASELINE_DIR" "$BASE_HEAD"
+          printf 'tested_head=%s\ntested_tree=%s\nbaseline_head=%s\nbaseline_tree=%s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE" "$BASE_HEAD" "$BASE_TREE" >> "$EVIDENCE_DIR/provenance.txt"
       - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
         with:
           version: 2026.6.9
           install: true
           cache: false
-      - name: Record toolchain
+      - name: Verify toolchain and install musl standard libraries
+        id: toolchain
         run: |
           set -euo pipefail
           rustc --version --verbose | tee "$EVIDENCE_DIR/toolchain.txt"
+          rustc --version | grep -E '^rustc 1\.99\.1 '
           cargo --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
           just --version | tee -a "$EVIDENCE_DIR/toolchain.txt"
-      - name: Check closed XML and manifest key controls
-        id: green
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl 2>&1 | tee "$EVIDENCE_DIR/target-setup.log"
+      - name: Require the exact deprecated-alias failure on both baseline targets
+        id: baseline
         run: |
           set -euo pipefail
-          cargo test --locked -p kache --lib windows_defaultlib -- --nocapture
-          cargo test --locked -p kache --lib guarded_tool_directory_identity -- --nocapture
-          cargo test --locked -p kache --lib guarded_absence -- --nocapture
-          cargo test --locked -p kache --lib guarded_inputs -- --nocapture
-          cargo test --locked -p kache --lib key_inputs_changed -- --nocapture
-          cargo test --locked -p kache --lib warmup -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/warmup-tests.log"
-          cargo test --locked -p kache --lib manifest -- --nocapture 2>&1 | tee "$EVIDENCE_DIR/manifest-tests.log"
+          cd "$BASELINE_DIR"
+          failures=0
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            log="$EVIDENCE_DIR/baseline-$target.log"
+            check_started=$(date +%s)
+            check_exit=0
+            cargo check --locked --package kache-fs --all-features --lib --target "$target" --message-format=json > "$log" 2>&1 || check_exit=$?
+            cat "$log"
+            printf 'baseline\t%s\t%s\t%s\n' "$target" "$check_exit" "$(( $(date +%s) - check_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+            if [ "$check_exit" -ne 101 ]; then
+              failures=1
+              continue
+            fi
+            if ! python3 - "$log" <<'PY'
+          import json, sys
+          errors = []
+          for line in open(sys.argv[1], encoding="utf-8"):
+              try:
+                  item = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if item.get("reason") == "compiler-message":
+                  message = item["message"]
+                  if message["level"] == "error":
+                      errors.append(message)
+          def expected(message):
+              return ("deprecated" in message["message"]
+                      and "libc::time_t" in message["message"]
+                      and any(span["is_primary"]
+                              and span["file_name"].replace("\\", "/").endswith("crates/kache-fs/src/clock.rs")
+                              and span["line_start"] == 50
+                              for span in message["spans"]))
+          if not errors or not all(expected(message) for message in errors):
+              raise SystemExit("Baseline failed for an unexpected diagnostic")
+          print("Observed only the exact deprecated libc::time_t error in clock.rs:50")
+          PY
+            then
+              failures=1
+            fi
+          done
+          test "$failures" -eq 0
+      - name: Check the candidate on both musl targets
+        id: candidate
+        run: |
+          set -euo pipefail
+          failures=0
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            log="$EVIDENCE_DIR/candidate-$target.log"
+            check_started=$(date +%s)
+            check_exit=0
+            cargo check --locked --package kache-fs --all-features --lib --target "$target" > "$log" 2>&1 || check_exit=$?
+            cat "$log"
+            printf 'candidate\t%s\t%s\t%s\n' "$target" "$check_exit" "$(( $(date +%s) - check_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+            if [ "$check_exit" -ne 0 ]; then failures=1; fi
+          done
+          test "$failures" -eq 0
       - name: Run just check
         id: check
         run: |
           set -euo pipefail
-          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log"
-      - name: Check documentation
-        id: docs
+          check_started=$(date +%s)
+          check_exit=0
+          just check 2>&1 | tee "$EVIDENCE_DIR/just-check.log" || check_exit=$?
+          printf 'just_check\tworkspace\t%s\t%s\n' "$check_exit" "$(( $(date +%s) - check_started ))" >> "$EVIDENCE_DIR/metrics.tsv"
+          exit "$check_exit"
+      - name: Verify source trees stayed clean
+        id: clean
+        if: always() && steps.verify.outcome == 'success'
         run: |
           set -euo pipefail
-          bash scripts/check-docs.sh 2>&1 | tee "$EVIDENCE_DIR/docs-check.log"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test "$(git -C "$BASELINE_DIR" rev-parse HEAD)" = "$BASE_HEAD"
+          test "$(git -C "$BASELINE_DIR" rev-parse 'HEAD^{tree}')" = "$BASE_TREE"
+          git diff --exit-code HEAD
+          git -C "$BASELINE_DIR" diff --exit-code HEAD
       - name: Record outcomes
         if: always()
         env:
           VERIFY: ${{ steps.verify.outcome }}
-          GREEN: ${{ steps.green.outcome }}
+          TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          BASELINE: ${{ steps.baseline.outcome }}
+          CANDIDATE: ${{ steps.candidate.outcome }}
           CHECK: ${{ steps.check.outcome }}
-          DOCS: ${{ steps.docs.outcome }}
+          CLEAN: ${{ steps.clean.outcome }}
         run: |
           mkdir -p "$EVIDENCE_DIR"
-          printf 'verify=%s\ngreen=%s\njust_check=%s\ndocs=%s\n' "$VERIFY" "$GREEN" "$CHECK" "$DOCS" | tee "$EVIDENCE_DIR/outcomes.txt"
+          printf 'verify=%s\ntoolchain=%s\nbaseline=%s\ncandidate=%s\njust_check=%s\nclean=%s\n' "$VERIFY" "$TOOLCHAIN" "$BASELINE" "$CANDIDATE" "$CHECK" "$CLEAN" | tee "$EVIDENCE_DIR/outcomes.txt"
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: msvc-integration-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.EVIDENCE_DIR }}
-          retention-days: 7
-          if-no-files-found: error
-
-  native:
-    name: Native manifests (${{ matrix.runner }})
-    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/validation/msvc-integration-checks-20261101'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 100
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [windows-2025, windows-11-arm]
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      RUSTC_WRAPPER: ""
-      KACHE_TEST_USE_CARGO_BIN_EXE: "1"
-      CARGO_BUILD_JOBS: "2"
-      EXPECTED_HEAD: adf507750d5b7f4b83746a68e2cd411931fec6b7
-      EXPECTED_TREE: f9fea29773b0eb1d5afe2ace938a6857c99e7301
-    steps:
-      - name: Require hosted runner and record provenance
-        env:
-          RUNNER_KIND: ${{ runner.environment }}
-        run: |
-          if ($env:RUNNER_KIND -ne 'github-hosted') { throw 'Hosted runner required' }
-          $evidence = Join-Path $env:RUNNER_TEMP 'manifest-native-evidence'
-          [IO.Directory]::CreateDirectory($evidence) | Out-Null
-          "EVIDENCE_DIR=$evidence" >> $env:GITHUB_ENV
-          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'manifest-candidate-target')" >> $env:GITHUB_ENV
-          "helper=$env:GITHUB_SHA`nrun=$env:GITHUB_RUN_ID`nrunner=$env:RUNNER_KIND`nimage=$env:ImageVersion" | Set-Content (Join-Path $evidence 'provenance.txt')
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: adf507750d5b7f4b83746a68e2cd411931fec6b7
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify candidate source
-        run: |
-          if ((git rev-parse HEAD) -ne $env:EXPECTED_HEAD) { throw 'Wrong head' }
-          if ((git rev-parse 'HEAD^{tree}') -ne $env:EXPECTED_TREE) { throw 'Wrong tree' }
-          "tested_head=$env:EXPECTED_HEAD`ntested_tree=$env:EXPECTED_TREE" | Add-Content (Join-Path $env:EVIDENCE_DIR 'provenance.txt')
-      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
-        if: matrix.runner != 'windows-11-arm'
-      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
-        with:
-          version: 2026.6.9
-          install: true
-          install_args: --force rust
-          cache: false
-          reshim: false
-      - name: Compile and test parser and tool identity
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          rustc --version --verbose | Tee-Object (Join-Path $env:EVIDENCE_DIR 'toolchain.txt')
-          if ($LASTEXITCODE -ne 0) { throw 'Compiler unavailable' }
-          cargo test --locked -p kache --lib guarded_tool_directory_identity -- --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Directory identity guards failed' }
-          cargo test --locked -p kache --lib manifest -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'manifest-tests.log')
-          if ($LASTEXITCODE -ne 0) { throw 'Manifest unit tests failed' }
-          cargo test --locked -p kache --lib warmup -- --nocapture 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'warmup-tests.log')
-          if ($LASTEXITCODE -ne 0) { throw 'Warmup unit tests failed' }
-          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'clippy.log')
-          if ($LASTEXITCODE -ne 0) { throw 'Native clippy failed' }
-      - name: Build baseline with independent artifacts
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          $baseline = Join-Path $env:RUNNER_TEMP 'manifest-baseline'
-          git worktree add --detach $baseline f2d98328ba9f86d10a74495dcca15ab6440f31ca
-          if ($LASTEXITCODE -ne 0) { throw 'Baseline checkout failed' }
-          Push-Location $baseline
-          try {
-            cargo build --locked -p kache --bins --target-dir (Join-Path $env:RUNNER_TEMP 'manifest-baseline-target') 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-baseline.log')
-            if ($LASTEXITCODE -ne 0) { throw 'Baseline build failed' }
-          } finally { Pop-Location }
-      - name: Prove baseline refuses manifest caching after a successful native link
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $log = Join-Path $env:EVIDENCE_DIR 'baseline-control.log'
-          $observedFailure = $false
-          try {
-            ./scripts/adoption/msvc-manifest-probe.ps1 -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'baseline') -KachePath (Join-Path $env:RUNNER_TEMP 'manifest-baseline-target/debug/kache.exe') *> $log
-          } catch {
-            $_ | Out-String | Add-Content $log
-            $observedFailure = $true
-          }
-          $text = Get-Content -Raw $log
-          Write-Output $text
-          if (-not $observedFailure -or $text -notmatch 'Expected miss, got') { throw 'Baseline did not fail the cache-admission assertion' }
-          $xml = Join-Path $env:EVIDENCE_DIR 'baseline/cache-cold.RT_MANIFEST.xml'
-          if (-not (Test-Path -LiteralPath $xml) -or (Get-Content -Raw $xml) -notmatch 'KACHE_MANIFEST_V1') { throw 'Baseline failed before a successful resource-bearing native compile' }
-      - name: Build candidate binaries
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          cargo build --locked -p kache --bins 2>&1 | Tee-Object (Join-Path $env:EVIDENCE_DIR 'build-candidate.log')
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate build failed' }
-          Get-FileHash -Algorithm SHA256 (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe'), (Join-Path $env:CARGO_TARGET_DIR 'debug/kache-engine.exe') | Format-List | Out-String | Set-Content (Join-Path $env:EVIDENCE_DIR 'candidate-binary-hashes.txt')
-      - name: Prove XML and merger edit and revert behavior in actual RT_MANIFEST
-        run: |
-          ./scripts/adoption/msvc-manifest-probe.ps1 -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'candidate') -KachePath (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe')
-      - name: Prove runtime warmup and worker traces with the same candidate
-        run: |
-          ./scripts/adoption/windows-runtime-warmup-probe.ps1 -Kache (Join-Path $env:CARGO_TARGET_DIR 'debug/kache.exe') -OutputDirectory (Join-Path $env:EVIDENCE_DIR 'runtime-warmup')
-      - name: Upload native manifest evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: manifest-native-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: musl-timespec-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE_DIR }}
           retention-days: 7
           if-no-files-found: error

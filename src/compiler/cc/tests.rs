@@ -7955,6 +7955,65 @@ fn header_probe_scanner_refuses_conditionals_that_can_paste_an_operator_alias() 
     }
 }
 
+fn cc_header_paste_resolved(text: &[u8]) -> bool {
+    let scan = cc_header_probe_scan(text).unwrap();
+    let aliases = cc_header_probe_aliases(std::iter::once(&scan));
+    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &aliases).unwrap()
+}
+
+fn assert_indirect_paste_resolved(text: &str) {
+    assert!(
+        cc_header_paste_resolved(text.as_bytes()),
+        "{text}: paste was refused"
+    );
+    assert_eq!(cc_header_probes(text.as_bytes()), Some(vec![]), "{text}");
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, _) = probing_unit(temp.path(), text);
+    digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source))
+        .unwrap_or_else(|error| panic!("{text}: {error:#}"));
+}
+
+fn assert_indirect_paste_refused(text: &str) {
+    assert!(
+        !cc_header_paste_resolved(text.as_bytes()),
+        "{text}: paste was resolved"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, _) = probing_unit(temp.path(), text);
+    let error = digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("token pasting may construct a header availability probe"),
+        "{text}: {error:#}"
+    );
+}
+
+#[test]
+fn header_probe_indirect_numeric_paste_is_not_a_probe_error() {
+    for text in [
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(1, 0)\nint foo(void) { return 1; }\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(a, b)\nint foo(void) { return 1; }\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#define FEATURE(name) CAT(FEATURE_, name)\n#if !FEATURE(FOO)\nint foo(void) { return 1; }\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\nint x = CAT(1, 0);\n",
+    ] {
+        assert_indirect_paste_resolved(text);
+    }
+}
+
+#[test]
+fn header_probe_indirect_paste_that_can_spell_has_include_is_refused() {
+    for text in [
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(__has_, include)(<stdint.h>)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(__has_, include_next)(<stdint.h>)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#define HAS(x) __has_include(x)\n#if CAT(H, AS)(<optional.h>)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(1)\n#endif\n",
+        "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#if CAT(1, 0, extra)\n#endif\n",
+    ] {
+        assert_indirect_paste_refused(text);
+    }
+}
+
 #[test]
 fn header_probe_scanner_binds_constant_arguments_to_token_paste_helpers() {
     let text = b"#define JOIN3(a,b,c) a##b##c\n#define INT_MAX_FOR(n) JOIN3(INT,n,_MAX)\n#define INT64_MAX 1\n#define HAS(x) __has_include(x)\n#if INT_MAX_FOR(64) && HAS(<optional.h>)\n#endif\n";

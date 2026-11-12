@@ -5877,8 +5877,11 @@ fn cc_resolve_header_probes(
 }
 
 /// A macro can manufacture an operator or alias with `##`. Refuse when a
-/// conditional can reach such a constructor. Fixed pasted prefixes, such as
-/// glibc's `__GLIBC_USE_ ## feature`, cannot spell unrelated probe aliases.
+/// conditional can reach such a constructor and the operands visible there
+/// can spell a probe alias, or are not literals the scanner can see. Fixed
+/// pasted prefixes, such as glibc's `__GLIBC_USE_ ## feature`, cannot spell
+/// unrelated probe aliases. An indirect paste of two literals, such as
+/// `CAT(1, 0)` through `CAT_`, is held to that same proof.
 fn cc_header_probe_pastes_are_resolved<'a>(
     scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
     aliases: &HashSet<String>,
@@ -5895,10 +5898,37 @@ fn cc_header_probe_pastes_are_resolved<'a>(
             .or_default()
             .push(forwarder);
     }
+    let mut macro_bodies = std::collections::HashMap::<&str, CcPasteMacroBodies>::new();
+    for (name, parameters, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+        macro_bodies
+            .entry(name.as_str())
+            .or_default()
+            .push((parameters.as_slice(), uses.as_slice()));
+    }
+    let mut paste_patterns = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
+        paste_patterns
+            .entry(name.as_str())
+            .or_default()
+            .push(pattern.as_str());
+    }
+    let forwarding = CcPasteForwarding {
+        macros: &macro_bodies,
+        pastes: &paste_patterns,
+    };
+    let mut visiting = HashSet::new();
     let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
     for (name, parameters, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
         for used in uses {
-            if cc_paste_use_can_name_probe(used, parameters, &definitions, &forwarders, aliases)? {
+            if cc_paste_use_can_name_probe(
+                used,
+                parameters,
+                &definitions,
+                &forwarders,
+                aliases,
+                &forwarding,
+                &mut visiting,
+            )? {
                 edges.entry(&used.name).or_default().push(name);
             }
         }
@@ -5920,7 +5950,15 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     }
     for used in scans.iter().flat_map(|scan| &scan.conditionals) {
         if constructors.contains(used.name.as_str())
-            && cc_paste_use_can_name_probe(used, &[], &definitions, &forwarders, aliases)?
+            && cc_paste_use_can_name_probe(
+                used,
+                &[],
+                &definitions,
+                &forwarders,
+                aliases,
+                &forwarding,
+                &mut visiting,
+            )?
         {
             return Ok(false);
         }
@@ -5928,18 +5966,39 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     Ok(true)
 }
 
+/// Every definition of one macro: formals, then the uses in that body.
+type CcPasteMacroBodies<'a> = Vec<(&'a [String], &'a [CcHeaderMacroUse])>;
+
+/// Bodies and paste patterns reachable while binding a forwarding macro.
+struct CcPasteForwarding<'a> {
+    macros: &'a std::collections::HashMap<&'a str, CcPasteMacroBodies<'a>>,
+    pastes: &'a std::collections::HashMap<&'a str, Vec<&'a str>>,
+}
+
 /// Bind literal arguments to a pure concatenation helper. Caller parameters
 /// and macros that may expand stay unknown; every alternative definition
-/// must support the same proof before an edge can be discarded.
+/// must support the same proof before an edge can be discarded. A macro
+/// that only forwards its arguments is followed until that helper, so a
+/// paste of literals the scanner can see is not refused wholesale.
 fn cc_paste_use_can_name_probe(
     used: &CcHeaderMacroUse,
     parameters: &[String],
     definitions: &std::collections::HashMap<&str, usize>,
     forwarders: &std::collections::HashMap<&str, Vec<&CcHeaderPasteForwarder>>,
     aliases: &HashSet<String>,
+    forwarding: &CcPasteForwarding<'_>,
+    visiting: &mut HashSet<String>,
 ) -> Result<bool> {
     let Some(candidates) = forwarders.get(used.name.as_str()) else {
-        return Ok(true);
+        return cc_indirect_paste_can_name_probe(
+            used,
+            parameters,
+            definitions,
+            forwarders,
+            aliases,
+            forwarding,
+            visiting,
+        );
     };
     // An alternative definition may construct a name by another route.
     if definitions.get(used.name.as_str()) != Some(&candidates.len()) {
@@ -5979,6 +6038,93 @@ fn cc_paste_use_can_name_probe(
         }
     }
     Ok(false)
+}
+
+/// A use that is not itself `##`. Follow macros that pass their arguments
+/// on, and refuse when a reachable paste can spell a probe alias or its
+/// operands are not single literals visible here.
+fn cc_indirect_paste_can_name_probe(
+    used: &CcHeaderMacroUse,
+    parameters: &[String],
+    definitions: &std::collections::HashMap<&str, usize>,
+    forwarders: &std::collections::HashMap<&str, Vec<&CcHeaderPasteForwarder>>,
+    aliases: &HashSet<String>,
+    forwarding: &CcPasteForwarding<'_>,
+    visiting: &mut HashSet<String>,
+) -> Result<bool> {
+    if let Some(patterns) = forwarding.pastes.get(used.name.as_str()) {
+        for pattern in patterns {
+            let pattern = regex::Regex::new(pattern)?;
+            if aliases.iter().any(|alias| pattern.is_match(alias)) {
+                return Ok(true);
+            }
+        }
+    }
+    let Some(bodies) = forwarding.macros.get(used.name.as_str()) else {
+        return Ok(true);
+    };
+    let Some(actuals) = &used.arguments else {
+        return Ok(true);
+    };
+    if !visiting.insert(used.name.clone()) {
+        return Ok(true);
+    }
+    let mut names_probe = false;
+    for &(formals, uses) in bodies {
+        if formals.len() != actuals.len() {
+            names_probe = true;
+            break;
+        }
+        for body_use in uses {
+            let bound = cc_bind_paste_arguments(body_use, formals, actuals);
+            if cc_paste_use_can_name_probe(
+                &bound,
+                parameters,
+                definitions,
+                forwarders,
+                aliases,
+                forwarding,
+                visiting,
+            )? {
+                names_probe = true;
+                break;
+            }
+        }
+        if names_probe {
+            break;
+        }
+    }
+    visiting.remove(used.name.as_str());
+    Ok(names_probe)
+}
+
+/// Replace each argument that is one formal with the actual tokens from
+/// this invocation. Anything else stays as written, so the paste proof
+/// still treats it as unknown.
+fn cc_bind_paste_arguments(
+    used: &CcHeaderMacroUse,
+    formals: &[String],
+    actuals: &[Vec<String>],
+) -> CcHeaderMacroUse {
+    let arguments = used.arguments.as_ref().map(|arguments| {
+        arguments
+            .iter()
+            .map(|argument| match argument.as_slice() {
+                [token] => {
+                    if let Some(index) = formals.iter().position(|formal| formal == token) {
+                        actuals[index].clone()
+                    } else {
+                        argument.clone()
+                    }
+                }
+                _ => argument.clone(),
+            })
+            .collect()
+    });
+    CcHeaderMacroUse {
+        name: used.name.clone(),
+        arguments,
+    }
 }
 
 /// `bytes` with every backslash-newline removed, the line splice the

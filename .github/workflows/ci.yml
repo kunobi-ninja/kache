@@ -116,6 +116,17 @@ jobs:
           cache-key-prefix: kache-self-build
       - name: Clean bootstrap cache artifacts
         run: cargo clean
+      - name: Check kache-fs on musl targets
+        # The clock module needs staging; default features would miss it.
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTC_WORKSPACE_WRAPPER: ""
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cargo check --locked --package kache-fs --all-features --lib --target "$target"
+          done
+        timeout-minutes: 5
       - name: Run repo verification
         # kache-action exports the installed release version; self-checks must
         # compile with Cargo.toml's version from this PR.

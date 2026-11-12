@@ -17,10 +17,10 @@ Built by [Kunobi][kunobi-brand].
 
 ## Install
 
-Install Kache v2.1.0 and enable it for your build tools:
+Install Kache v2.1.1 and enable it for your build tools:
 
 ```bash
-cargo install kache --locked --version 2.1.0
+cargo install kache --locked --version 2.1.1
 kache init
 kache doctor --probe
 ```
@@ -153,7 +153,7 @@ Install your Rust toolchain, then add the official action before your build:
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
   with:
-    version: v2.1.0
+    version: v2.1.1
 - run: cargo build --locked
 ```
 

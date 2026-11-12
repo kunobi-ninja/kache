@@ -47,7 +47,7 @@ fn mtime_written_now_on(path: &Path, own_clock: bool) -> io::Result<libc::timesp
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(io::Error::other)?;
     Ok(libc::timespec {
-        tv_sec: sampled.as_secs() as libc::time_t,
+        tv_sec: sampled.as_secs() as _,
         tv_nsec: sampled.subsec_nanos() as libc::c_long,
     })
 }

@@ -22168,3 +22168,629 @@ fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
         "a crate-relative dotted spelling stays as rustc recorded it"
     );
 }
+
+#[test]
+fn registry_source_separators_agree_only_without_build_script() {
+    let manifest = PathBuf::from("C:/Users/u/.cargo/registry/src/index/memchr-2.7.4");
+    let slash = PathBuf::from("C:/Users/u/.cargo/registry/src/index/memchr-2.7.4/src/lib.rs");
+    let back = PathBuf::from(r"C:\Users\u\.cargo\registry\src\index\memchr-2.7.4\src\lib.rs");
+    let normalizer = PathNormalizer::empty();
+    let no_types: &[String] = &[];
+    let no_externs: &[crate::args::ExternDep] = &[];
+
+    fn unit<'a>(
+        name: Option<&'a str>,
+        types: &'a [String],
+        externs: &'a [crate::args::ExternDep],
+        sources: &'a [PathBuf],
+        manifest: Option<&'a Path>,
+        out_dir: Option<&'a Path>,
+        skip: bool,
+    ) -> UnitClosure<'a> {
+        UnitClosure {
+            crate_name: name,
+            crate_types: types,
+            externs,
+            sources,
+            manifest_dir: manifest,
+            out_dir,
+            skip_remap: skip,
+        }
+    }
+
+    let clean_sources = [slash.clone(), back.clone()];
+    let clean = unit(
+        Some("memchr"),
+        no_types,
+        no_externs,
+        &clean_sources,
+        Some(&manifest),
+        None,
+        false,
+    );
+    let root = applicable_host_neutral_root(false, true, &clean);
+    assert!(root.is_some());
+    let slash_mat = keyed_source_path(&slash, root.as_deref(), &normalizer).unwrap();
+    let back_mat = keyed_source_path(&back, root.as_deref(), &normalizer).unwrap();
+    assert_eq!(slash_mat, back_mat);
+    assert_eq!(slash_mat, b"registry-src/index/memchr-2.7.4/src/lib.rs");
+
+    let build = PathBuf::from("C:/Users/u/.cargo/registry/src/index/memchr-2.7.4/build.rs");
+    let build_sources = [slash.clone(), build.clone()];
+    let with_build = unit(
+        Some("memchr"),
+        no_types,
+        no_externs,
+        &build_sources,
+        Some(&manifest),
+        None,
+        false,
+    );
+    let build_root = applicable_host_neutral_root(false, true, &with_build);
+    assert!(build_root.is_none());
+    assert_ne!(
+        keyed_source_path(&slash, build_root.as_deref(), &normalizer).unwrap(),
+        keyed_source_path(&back, build_root.as_deref(), &normalizer).unwrap()
+    );
+    assert!(source_carries_build_script(&build));
+    assert!(!source_carries_build_script(&slash));
+
+    let proc_types = ["proc-macro".to_string()];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                &proc_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let rlib_types = ["rlib".to_string()];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                &rlib_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_some()
+    );
+
+    let dylib = [crate::args::ExternDep {
+        name: "macros".to_string(),
+        path: Some(PathBuf::from("libmacros.so")),
+    }];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                &dylib,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let rlib_extern = [crate::args::ExternDep {
+        name: "dep".to_string(),
+        path: Some(PathBuf::from("libdep.rlib")),
+    }];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                &rlib_extern,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_some()
+    );
+
+    let out = PathBuf::from("C:/target/debug/build/memchr/out");
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                Some(&out),
+                false,
+            ),
+        )
+        .is_none()
+    );
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                true,
+            ),
+        )
+        .is_none()
+    );
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("build_script_build"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let empty: [PathBuf; 0] = [];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &empty,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let workspace = PathBuf::from("/work/crates/memchr");
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &clean_sources,
+                Some(&workspace),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let relative = [PathBuf::from("src/lib.rs")];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &relative,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+    let outside = [PathBuf::from("C:/other/src/lib.rs")];
+    assert!(
+        applicable_host_neutral_root(
+            false,
+            true,
+            &unit(
+                Some("memchr"),
+                no_types,
+                no_externs,
+                &outside,
+                Some(&manifest),
+                None,
+                false,
+            ),
+        )
+        .is_none()
+    );
+
+    let pkg = PathBuf::from("C:/Users/u/.cargo/registry/src/index/pkg");
+    let two = [PathBuf::from("C:/Users/u/.cargo/registry/src/index/lib.rs")];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &two,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_none()
+    );
+    let three = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/lib.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &three,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+    let dotted = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/./lib.rs",
+    )];
+    let parent = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/src/../lib.rs",
+    )];
+    let doubled = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index//pkg/lib.rs",
+    )];
+    for sources in [&dotted, &parent, &doubled] {
+        assert!(
+            host_neutral_registry_root(&unit(
+                Some("pkg"),
+                no_types,
+                no_externs,
+                sources,
+                Some(&pkg),
+                None,
+                false,
+            ))
+            .is_none(),
+            "{sources:?}"
+        );
+    }
+    let adjacent = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src2/index/pkg/lib.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &adjacent,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_none()
+    );
+    let registry_root = PathBuf::from("C:/Users/u/.cargo/registry/src");
+    let root_only = keyed_source_path(&registry_root, Some(&registry_root), &normalizer).unwrap();
+    assert!(!root_only.starts_with(b"registry-src/"));
+
+    let build_out = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/build/out/file.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &build_out,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_none()
+    );
+    assert!(source_carries_build_script(&build_out[0]));
+    let build_only = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/build/file.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &build_only,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+    assert!(!source_carries_build_script(&build_only[0]));
+    let out_then_build = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/pkg/out/build/file.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("pkg"),
+            no_types,
+            no_externs,
+            &out_then_build,
+            Some(&pkg),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+    let named_build = PathBuf::from("C:/Users/u/.cargo/registry/src/index/build-0.1.0");
+    let named_build_src = [PathBuf::from(
+        "C:/Users/u/.cargo/registry/src/index/build-0.1.0/src/lib.rs",
+    )];
+    assert!(
+        host_neutral_registry_root(&unit(
+            Some("build"),
+            no_types,
+            no_externs,
+            &named_build_src,
+            Some(&named_build),
+            None,
+            false,
+        ))
+        .is_some()
+    );
+
+    assert!(applicable_host_neutral_root(true, true, &clean).is_none());
+    assert!(applicable_host_neutral_root(false, false, &clean).is_none());
+    assert!(applicable_host_neutral_root(true, false, &clean).is_none());
+    assert!(unit_can_publish_remaps(
+        Some("memchr"),
+        Some(Path::new("lib.rs"))
+    ));
+    assert!(!unit_can_publish_remaps(None, Some(Path::new("lib.rs"))));
+    assert!(!unit_can_publish_remaps(Some("memchr"), None));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"C:/Users/u/.cargo/registry/src/index/pkg/\xff.rs");
+        assert!(!source_carries_build_script(Path::new(raw)));
+        assert!(registry_directory_remaps(Path::new(raw), &three, '\\').is_empty());
+    }
+
+    let version = "rustc 1.99.0 (abc)\n host: x86_64-pc-windows-msvc\nhost-extra: kept\nHOST: not-a-host\nhost: second\n";
+    assert_eq!(rustc_version_key_text(version, false), version);
+    let text = rustc_version_key_text(version, true);
+    assert!(!text.contains("host:"), "{text}");
+    assert!(text.contains("host-extra: kept\n"), "{text}");
+    assert!(text.contains("HOST: not-a-host\n"), "{text}");
+    assert!(text.starts_with("rustc 1.99.0 (abc)\n"), "{text}");
+    assert_eq!(host_neutral_version_flags(false, true), (false, true));
+    assert_eq!(host_neutral_version_flags(true, false), (true, true));
+    assert_eq!(host_neutral_version_flags(false, false), (false, false));
+    assert_eq!(host_neutral_version_flags(true, true), (true, true));
+    assert_eq!(version_flags_for_unit(false), (false, false));
+    assert_eq!(version_flags_for_unit(true), (true, true));
+
+    let digest = |drop_host: bool, namespace: bool| {
+        let mut hasher = blake3::Hasher::new();
+        hash_rustc_version_for_unit(&mut hasher, version, drop_host, namespace);
+        hasher.finalize()
+    };
+    let manual = |drop_host: bool, namespace: bool| {
+        let mut hasher = blake3::Hasher::new();
+        let folded = rustc_version_key_text(version, drop_host);
+        hasher.update(b"rustc_version:");
+        hasher.update(folded.as_bytes());
+        hasher.update(b"\n");
+        if namespace {
+            fold_field(&mut hasher, b"host_neutral_sources.v1:", b"1");
+        }
+        hasher.finalize()
+    };
+    assert_eq!(digest(false, false), manual(false, false));
+    assert_eq!(digest(true, true), manual(true, true));
+    assert_eq!(digest(false, true), manual(false, true));
+    assert_eq!(digest(true, false), manual(true, false));
+    assert_ne!(digest(false, false), digest(true, true));
+    assert_ne!(digest(false, false), digest(false, true));
+    assert_ne!(digest(false, true), digest(true, true));
+    assert_ne!(digest(true, false), digest(true, true));
+
+    let reg_root = PathBuf::from("C:/Users/u/.cargo/registry/src");
+    let lib_win = PathBuf::from(r"C:\Users\u\.cargo\registry\src\index\memchr-2.7.4\src\lib.rs");
+    let sibling =
+        PathBuf::from(r"C:\Users\u\.cargo\registry\src\index\memchr-2.7.4\src\foo\mod.rs");
+    let remaps = registry_directory_remaps(
+        &reg_root,
+        &[lib_win.clone(), sibling, lib_win.clone()],
+        '\\',
+    );
+    assert!(remaps.windows(2).all(|pair| {
+        let from = |arg: &String| {
+            arg.strip_prefix("--remap-path-prefix=")
+                .unwrap()
+                .split_once('=')
+                .unwrap()
+                .0
+                .len()
+        };
+        from(&pair[0]) <= from(&pair[1])
+    }));
+    assert!(remaps.iter().any(|arg| arg.contains("src\\foo\\")));
+    for arg in &remaps {
+        let body = arg.strip_prefix("--remap-path-prefix=").unwrap();
+        let (from, to) = body.split_once('=').unwrap();
+        assert!(from.contains('\\') && from.ends_with('\\'), "{arg}");
+        assert!(
+            to.starts_with("/cargo/registry/") && to.ends_with('/'),
+            "{arg}"
+        );
+        assert!(!to.contains('\\') && !to.contains("lib.rs"), "{arg}");
+        assert!(!from.contains("lib.rs"), "{arg}");
+    }
+    assert_eq!(
+        registry_directory_remaps(&reg_root, std::slice::from_ref(&lib_win), '\\'),
+        registry_directory_remaps(&reg_root, &[lib_win.clone(), lib_win.clone()], '\\')
+    );
+    assert!(registry_directory_remaps(&reg_root, &[], '\\').is_empty());
+    assert!(
+        registry_directory_remaps(Path::new("/"), &[PathBuf::from("/index/pkg/lib.rs")], '/')
+            .is_empty()
+    );
+    let slash_remaps = registry_directory_remaps(&reg_root, &[lib_win], '/');
+    assert!(slash_remaps.iter().all(|arg| {
+        let from = arg
+            .strip_prefix("--remap-path-prefix=")
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .0;
+        !from.contains('\\') && from.ends_with('/')
+    }));
+
+    let base = vec![
+        "--remap-path-prefix=C:\\rustlib\\src\\rust=/rustc/abc".to_string(),
+        "--remap-path-prefix=/rustlib/src/rust=/rustc/abc".to_string(),
+        "--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string(),
+        "--remap-path-prefix=C:\\rustlib\\src\\rust\\=/rustc/abc/".to_string(),
+        "--remap-path-prefix=/home/u/proj=/proc/self/cwd".to_string(),
+        "--remap-path-prefix=/rustc/abc=/somewhere".to_string(),
+        "--remap-path-prefix=noseparator".to_string(),
+        "--cfg=foo".to_string(),
+    ];
+    let registry_flag = ["--remap-path-prefix=C:\\reg\\src\\=/cargo/registry/".to_string()];
+    let listed = host_neutral_remap_list(base.clone(), &registry_flag);
+    assert_eq!(
+        listed,
+        vec![
+            "--remap-path-prefix=C:\\rustlib\\src\\rust\\=/rustc/abc/".to_string(),
+            "--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string(),
+            "--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string(),
+            "--remap-path-prefix=C:\\rustlib\\src\\rust\\=/rustc/abc/".to_string(),
+            "--remap-path-prefix=/home/u/proj=/proc/self/cwd".to_string(),
+            "--remap-path-prefix=/rustc/abc=/somewhere".to_string(),
+            "--remap-path-prefix=noseparator".to_string(),
+            "--cfg=foo".to_string(),
+            "--remap-path-prefix=C:\\reg\\src\\=/cargo/registry/".to_string(),
+        ]
+    );
+    assert_eq!(
+        rustc_remap_args(true, base.clone(), Some(&registry_flag)),
+        Vec::<String>::new()
+    );
+    assert_eq!(rustc_remap_args(false, base.clone(), None), base);
+    assert_eq!(rustc_remap_args(false, base, Some(&registry_flag)), listed);
+    assert_eq!(
+        rustc_remap_args(
+            false,
+            vec!["--remap-path-prefix=/rustlib/src/rust=/rustc/abc".to_string()],
+            Some(&[]),
+        ),
+        vec!["--remap-path-prefix=/rustlib/src/rust/=/rustc/abc/".to_string()]
+    );
+
+    clear_host_neutral_decision();
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("memchr".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    let plan = vec!["--remap-path-prefix=a/=/cargo/registry/a/".to_string()];
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Unknown
+    );
+
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    let mut other = args.clone();
+    other.crate_name = Some("other".to_string());
+    assert_eq!(
+        take_host_neutral_decision(&other),
+        HostNeutralDecision::Unknown
+    );
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+
+    let mut nameless = args.clone();
+    nameless.source_file = None;
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    assert_eq!(
+        take_host_neutral_decision(&nameless),
+        HostNeutralDecision::Unknown
+    );
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+
+    publish_host_neutral_decision(&args, None);
+    assert_eq!(take_host_neutral_decision(&args), HostNeutralDecision::Off);
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    publish_host_neutral_decision(&RustcArgs::default(), Some(vec!["x".to_string()]));
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan.clone())
+    );
+
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    assert_eq!(take_execute_remaps(&args, true), None);
+    assert_eq!(take_execute_remaps(&args, false), Some(plan.clone()));
+    assert_eq!(host_neutral_extra_remaps(HostNeutralDecision::Off), None);
+    assert_eq!(
+        host_neutral_extra_remaps(HostNeutralDecision::Unknown),
+        None
+    );
+    assert_eq!(
+        host_neutral_extra_remaps(HostNeutralDecision::Remaps(plan.clone())),
+        Some(plan.clone())
+    );
+
+    publish_host_neutral_decision(&args, Some(plan.clone()));
+    publish_host_neutral_plan(&args, true, Some(&reg_root), &clean_sources);
+    assert_eq!(
+        take_host_neutral_decision(&args),
+        HostNeutralDecision::Remaps(plan)
+    );
+    publish_host_neutral_plan(&args, false, Some(&reg_root), &clean_sources);
+    match take_host_neutral_decision(&args) {
+        HostNeutralDecision::Remaps(published) => {
+            assert!(published.iter().all(|arg| arg.contains("/cargo/registry/")));
+            assert!(!published.is_empty());
+        }
+        other => panic!("expected remaps, got {other:?}"),
+    }
+    publish_host_neutral_plan(&args, false, None, &[]);
+    assert_eq!(take_host_neutral_decision(&args), HostNeutralDecision::Off);
+    clear_host_neutral_decision();
+}

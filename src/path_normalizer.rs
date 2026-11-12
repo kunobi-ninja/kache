@@ -3338,7 +3338,7 @@ mod tests {
             crate::link::DepInfoMode::Relativize,
         );
         assert!(
-            stored.contains("__kache_base_dir_0__/src\\value.rs"),
+            stored.contains("__kache_base_dir_0__/src/value.rs"),
             "{stored}"
         );
         let restored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(

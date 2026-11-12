@@ -3415,6 +3415,7 @@ mod tests {
                 "clean",
                 "monitor",
                 "explain",
+                "key",
                 "list",
                 "sync",
                 "login",

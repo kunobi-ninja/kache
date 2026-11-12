@@ -2283,6 +2283,28 @@ fn rewrite_depinfo_content_with_prefixes_and_sentinel(
     sentinel: &str,
     mode: DepInfoMode,
 ) -> String {
+    rewrite_depinfo_content_with_prefixes_for_restore(
+        content,
+        prefixes,
+        sentinel,
+        mode,
+        cfg!(windows),
+    )
+}
+
+/// `restore_on_windows` chooses the separator written back after a sentinel.
+/// It is not the prefix-spelling flag: a test can restore a Windows dep-info
+/// on any host. Store always uses `/` after the sentinel.
+fn rewrite_depinfo_content_with_prefixes_for_restore(
+    content: &str,
+    prefixes: &[String],
+    sentinel: &str,
+    mode: DepInfoMode,
+    restore_on_windows: bool,
+) -> String {
+    let restore = DepInfoSeparatorMode::Restore {
+        windows: restore_on_windows,
+    };
     content
         .split_inclusive('\n')
         .map(|line| {
@@ -2291,54 +2313,211 @@ fn rewrite_depinfo_content_with_prefixes_and_sentinel(
                     return line.to_string();
                 };
                 let value = match mode {
-                    DepInfoMode::Relativize => prefixes.iter().fold(value.to_string(), |acc, p| {
+                    DepInfoMode::Relativize => {
+                        let replaced = prefixes.iter().fold(value.to_string(), |acc, p| {
+                            replace_depinfo_text(
+                                &acc,
+                                &escape_depinfo_env_value(p),
+                                sentinel,
+                                cfg!(windows),
+                                DepInfoTextContext::EnvValue,
+                            )
+                        });
+                        normalize_depinfo_separators(&replaced, DepInfoSeparatorMode::Store, true)
+                    }
+                    DepInfoMode::Expand => {
+                        let normalized = normalize_depinfo_separators(value, restore, true);
                         replace_depinfo_text(
-                            &acc,
-                            &escape_depinfo_env_value(p),
+                            &normalized,
                             sentinel,
-                            cfg!(windows),
+                            &escape_depinfo_env_value(&prefixes[0]),
+                            false,
                             DepInfoTextContext::EnvValue,
                         )
-                    }),
-                    DepInfoMode::Expand => replace_depinfo_text(
-                        value,
-                        sentinel,
-                        &escape_depinfo_env_value(&prefixes[0]),
-                        false,
-                        DepInfoTextContext::EnvValue,
-                    ),
+                    }
                 };
                 format!("{DEPINFO_ENV_DEP_PREFIX}{key}={value}")
             } else {
                 match mode {
-                    DepInfoMode::Relativize => prefixes.iter().fold(line.to_string(), |acc, p| {
-                        let escaped = escape_depinfo_make_path(p);
-                        let escaped = replace_depinfo_text(
-                            &acc,
-                            &escaped,
-                            sentinel,
-                            cfg!(windows),
-                            DepInfoTextContext::MakeLine,
-                        );
+                    DepInfoMode::Relativize => {
+                        let replaced = prefixes.iter().fold(line.to_string(), |acc, p| {
+                            let escaped = escape_depinfo_make_path(p);
+                            let escaped = replace_depinfo_text(
+                                &acc,
+                                &escaped,
+                                sentinel,
+                                cfg!(windows),
+                                DepInfoTextContext::MakeLine,
+                            );
+                            replace_depinfo_text(
+                                &escaped,
+                                p,
+                                sentinel,
+                                cfg!(windows),
+                                DepInfoTextContext::MakeLine,
+                            )
+                        });
+                        normalize_depinfo_separators(&replaced, DepInfoSeparatorMode::Store, false)
+                    }
+                    DepInfoMode::Expand => {
+                        let normalized = normalize_depinfo_separators(line, restore, false);
                         replace_depinfo_text(
-                            &escaped,
-                            p,
+                            &normalized,
                             sentinel,
-                            cfg!(windows),
+                            &escape_depinfo_make_path(&prefixes[0]),
+                            false,
                             DepInfoTextContext::MakeLine,
                         )
-                    }),
-                    DepInfoMode::Expand => replace_depinfo_text(
-                        line,
-                        sentinel,
-                        &escape_depinfo_make_path(&prefixes[0]),
-                        false,
-                        DepInfoTextContext::MakeLine,
-                    ),
+                    }
                 }
             }
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum DepInfoSeparatorMode {
+    Store,
+    Restore { windows: bool },
+}
+
+/// Rewrite separators that belong to a `__kache_<name>__` path. Text before
+/// a sentinel is left alone, including an env-dep key. `__kache_name__/` and
+/// `__kache_name__\` are the same token. The remainder stops at unescaped
+/// whitespace so a later token is scanned on its own. Env `\\` is one
+/// separator; env `\n`, `\r`, and `\ ` stay. Make `\ ` and a backslash before
+/// a newline stay.
+fn normalize_depinfo_separators(
+    input: &str,
+    mode: DepInfoSeparatorMode,
+    env_value: bool,
+) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((name_end, sep_len)) = sentinel_name_end(input, i) {
+            out.push_str(&input[i..name_end]);
+            out.push('/');
+            i = name_end + sep_len;
+            let (rest, consumed) = normalize_depinfo_remainder(&input[i..], mode, env_value);
+            out.push_str(&rest);
+            i += consumed;
+            continue;
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Byte index just after `__kache_<name>__`, and the length of the following
+/// `/` or `\`. The name may contain `_`, so the terminator is the `__`
+/// immediately before the separator, not the first underscore.
+fn sentinel_name_end(input: &str, start: usize) -> Option<(usize, usize)> {
+    let rest = input.get(start..)?;
+    let rest = rest.strip_prefix("__kache_")?;
+    let bytes = rest.as_bytes();
+    let mut j = 0;
+    while j + 2 < bytes.len() {
+        if bytes[j] == b'_' && bytes[j + 1] == b'_' && matches!(bytes[j + 2], b'/' | b'\\') {
+            if j == 0
+                || !bytes[..j]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                return None;
+            }
+            let name_end = start + "__kache_".len() + j + 2;
+            return Some((name_end, 1));
+        }
+        if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            return None;
+        }
+        j += 1;
+    }
+    None
+}
+
+fn normalize_depinfo_remainder(
+    input: &str,
+    mode: DepInfoSeparatorMode,
+    env_value: bool,
+) -> (String, usize) {
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            if env_value {
+                if i + 1 < bytes.len() {
+                    match bytes[i + 1] {
+                        b'\\' => {
+                            push_depinfo_separator(&mut out, mode, true);
+                            i += 2;
+                            continue;
+                        }
+                        b'n' | b'r' | b' ' => {
+                            out.push('\\');
+                            out.push(bytes[i + 1] as char);
+                            i += 2;
+                            continue;
+                        }
+                        b'\n' | b'\r' => break,
+                        _ => {
+                            push_depinfo_separator(&mut out, mode, true);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                push_depinfo_separator(&mut out, mode, true);
+                i += 1;
+                continue;
+            }
+            if i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b' ' => {
+                        out.push('\\');
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                    b'\n' | b'\r' => break,
+                    _ => {
+                        push_depinfo_separator(&mut out, mode, false);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            push_depinfo_separator(&mut out, mode, false);
+            i += 1;
+            continue;
+        }
+        if b == b'/' {
+            push_depinfo_separator(&mut out, mode, env_value);
+            i += 1;
+            continue;
+        }
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            break;
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, i)
+}
+
+fn push_depinfo_separator(out: &mut String, mode: DepInfoSeparatorMode, env_value: bool) {
+    match (mode, env_value) {
+        (DepInfoSeparatorMode::Restore { windows: true }, true) => out.push_str("\\\\"),
+        (DepInfoSeparatorMode::Restore { windows: true }, false) => out.push('\\'),
+        _ => out.push('/'),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4482,6 +4661,11 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
         assert_eq!(with_trailing_separator(r"C:\", '\\'), r"C:\");
         assert_eq!(with_trailing_separator(r"C:\work\", '/'), "C:\\work/");
 
+        let native_rest = if cfg!(windows) {
+            r"debug\deps\demo.d"
+        } else {
+            "debug/deps/demo.d"
+        };
         let native = rewrite_depinfo_content_with_sentinel_for_platform(
             "__kache_root__/debug/deps/demo.d\n",
             Path::new(r"C:\work\target"),
@@ -4489,7 +4673,7 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
             DepInfoMode::Expand,
             true,
         );
-        assert_eq!(native, "C:\\work\\target\\debug/deps/demo.d\n");
+        assert_eq!(native, format!("C:\\work\\target\\{native_rest}\n"));
 
         let slash = rewrite_depinfo_content_with_sentinel_for_platform(
             "__kache_root__/debug/deps/demo.d\n",
@@ -4498,7 +4682,7 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
             DepInfoMode::Expand,
             true,
         );
-        assert_eq!(slash, "/external/target/debug/deps/demo.d\n");
+        assert_eq!(slash, format!("/external/target/{native_rest}\n"));
 
         let mixed = rewrite_depinfo_content_with_sentinel_for_platform(
             "/build/work/target/debug/deps/demo.d\n",
@@ -4573,19 +4757,19 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
                 )
             });
         assert!(
-            stored.contains(r"__kache_base_dir_0__/src\verbatim.rs"),
+            stored.contains("__kache_base_dir_0__/src/verbatim.rs"),
             "{stored}"
         );
         assert!(
-            stored.contains(r"__kache_base_dir_1__/src\plain.rs"),
+            stored.contains("__kache_base_dir_1__/src/plain.rs"),
             "{stored}"
         );
         assert!(
-            stored.contains(r"__kache_base_dir_2__/src\verbatim_unc.rs"),
+            stored.contains("__kache_base_dir_2__/src/verbatim_unc.rs"),
             "{stored}"
         );
         assert!(
-            stored.contains(r"__kache_base_dir_3__/src\plain_unc.rs"),
+            stored.contains("__kache_base_dir_3__/src/plain_unc.rs"),
             "{stored}"
         );
 
@@ -4618,10 +4802,25 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
                     true,
                 )
             });
-        assert!(restored.contains(r"\\?\D:\Other\src\verbatim.rs"));
-        assert!(restored.contains(r"D:\Other\src\plain.rs"));
-        assert!(restored.contains(r"\\?\UNC\server2\share2\src\verbatim_unc.rs"));
-        assert!(restored.contains(r"\\server2\share2\src\plain_unc.rs"));
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(
+            restored.contains(&format!("\\\\?\\D:\\Other\\src{sep}verbatim.rs")),
+            "{restored}"
+        );
+        assert!(
+            restored.contains(&format!("D:\\Other\\src{sep}plain.rs")),
+            "{restored}"
+        );
+        assert!(
+            restored.contains(&format!(
+                "\\\\?\\UNC\\server2\\share2\\src{sep}verbatim_unc.rs"
+            )),
+            "{restored}"
+        );
+        assert!(
+            restored.contains(&format!("\\\\server2\\share2\\src{sep}plain_unc.rs")),
+            "{restored}"
+        );
         assert!(!restored.contains(r"C:\Work"));
         assert!(!restored.contains(r"\\server\share"));
     }
@@ -4639,8 +4838,8 @@ D:\\WORK TREE\\crate\\src\\lib.rs\n\
             Some(Path::new(r"d:\work tree")),
             DepInfoMode::Relativize,
         );
-        assert!(stored.contains("__kache_root__/debug\\deps\\demo.d"));
-        assert!(stored.contains("__kache_cwd__/src\\lib.rs"));
+        assert!(stored.contains("__kache_root__/debug/deps/demo.d"));
+        assert!(stored.contains("__kache_cwd__/src/lib.rs"));
         assert!(stored.contains("# env-dep:ASSET=__kache_cwd__/asset.txt"));
         assert!(!stored.to_ascii_lowercase().contains(r"d:\work tree"));
     }
@@ -4697,7 +4896,7 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
             DepInfoMode::Expand,
         );
         assert!(
-            expanded.contains("T:\\other\\target\\debug\\build\\demo-8a22\\out/generated.rs"),
+            expanded.contains("T:\\other\\target\\debug\\build\\demo-8a22\\out\\generated.rs"),
             "consumer-rooted mixed-separator path: {expanded}"
         );
         assert!(!expanded.contains(DEPINFO_ROOT_SENTINEL));
@@ -4751,7 +4950,7 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
             .find(|l| l.starts_with(DEPINFO_ENV_DEP_PREFIX))
             .unwrap();
         assert!(
-            env_line.contains("# env-dep:OUT_DIR=__kache_root__/obj\\\\x86_64"),
+            env_line.contains("# env-dep:OUT_DIR=__kache_root__/obj/x86_64"),
             "escaped anchor must relativize whole, not split an escape pair: {rewritten}"
         );
         assert!(
@@ -4759,7 +4958,7 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
             "relativized env-dep value must stay parseable: {rewritten}"
         );
         assert!(
-            rewritten.contains("__kache_root__/src\\lib.rs"),
+            rewritten.contains("__kache_root__/src/lib.rs"),
             "file-list line keeps the plain-spelling rewrite: {rewritten}"
         );
     }
@@ -4792,6 +4991,8 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
     fn test_depinfo_env_dep_expand_inserts_escaped_prefix() {
         let stored = "target/debug/deps/demo.d: __kache_root__/src/lib.rs\n\
                       # env-dep:OUT_DIR=__kache_root__/obj-kache-bench\\\\x86_64-pc-windows-msvc\\\\out\n";
+        let slash_stored = "target/debug/deps/demo.d: __kache_root__/src/lib.rs\n\
+                      # env-dep:OUT_DIR=__kache_root__/obj-kache-bench/x86_64-pc-windows-msvc/out\n";
         let prefixes = [
             "C:\\other\\clone-b/".to_string(),
             "C:\\other\\clone-b\\".to_string(),
@@ -4799,29 +5000,49 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
 
         let expanded =
             rewrite_depinfo_content_with_prefixes(stored, &prefixes, DepInfoMode::Expand);
+        let expanded_slash =
+            rewrite_depinfo_content_with_prefixes(slash_stored, &prefixes, DepInfoMode::Expand);
+        assert_eq!(
+            expanded, expanded_slash,
+            "an older backslash remainder restores like the slash spelling"
+        );
 
         let env_line = expanded
             .lines()
             .find(|l| l.starts_with(DEPINFO_ENV_DEP_PREFIX))
             .unwrap();
+        let env_rest = if cfg!(windows) {
+            r"obj-kache-bench\\x86_64"
+        } else {
+            "obj-kache-bench/x86_64"
+        };
         assert!(
-            env_line.contains("OUT_DIR=C:\\\\other\\\\clone-b/obj-kache-bench\\\\x86_64"),
+            env_line.contains(&format!("OUT_DIR=C:\\\\other\\\\clone-b/{env_rest}")),
             "expanded env-dep anchor must be escaped: {expanded}"
         );
         assert!(
             cargo_env_dep_value_parses(env_line.split_once('=').unwrap().1),
             "expanded env-dep value must stay parseable: {expanded}"
         );
+        let file_rest = if cfg!(windows) {
+            r"src\lib.rs"
+        } else {
+            "src/lib.rs"
+        };
         assert!(
-            expanded.contains("demo.d: C:\\other\\clone-b/src/lib.rs"),
+            expanded.contains(&format!("demo.d: C:\\other\\clone-b/{file_rest}")),
             "file-list line takes the plain anchor (rustc leaves backslashes raw there): {expanded}"
         );
 
-        // Round trip: re-relativizing under the same anchor restores the
-        // stored form, so warm entries stay stable across hits.
+        // Re-relativizing stores slashes. The older backslash spelling is
+        // accepted on the way in and is not what a new store writes.
         let rerelativized =
             rewrite_depinfo_content_with_prefixes(&expanded, &prefixes, DepInfoMode::Relativize);
-        assert_eq!(rerelativized, stored, "expand/relativize must round-trip");
+        assert_eq!(
+            rerelativized, slash_stored,
+            "expand/relativize stores slashes"
+        );
+        assert_ne!(rerelativized, stored);
     }
 
     #[test]
@@ -5827,5 +6048,176 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         .unwrap();
 
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn depinfo_sentinel_backslashes_restore_to_native_separators() {
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_root__/line\\nnext\\\\tail\n",
+                DepInfoSeparatorMode::Store,
+                true,
+            ),
+            "__kache_root__/line\\nnext/tail\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_cwd__/src\\lib.rs __kache_cwd__/foo\\ bar.rs\n",
+                DepInfoSeparatorMode::Store,
+                false,
+            ),
+            "__kache_cwd__/src/lib.rs __kache_cwd__/foo\\ bar.rs\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_base_dir_0__\\src\\lib.rs\n",
+                DepInfoSeparatorMode::Store,
+                false,
+            ),
+            "__kache_base_dir_0__/src/lib.rs\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_target_rule__/a\\b\n",
+                DepInfoSeparatorMode::Store,
+                false,
+            ),
+            "__kache_target_rule__/a/b\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators("__kache_root__\n", DepInfoSeparatorMode::Store, false),
+            "__kache_root__\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_cwd__/src/lib.rs\\\n next.rs\n",
+                DepInfoSeparatorMode::Store,
+                false,
+            ),
+            "__kache_cwd__/src/lib.rs\\\n next.rs\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_cwd__/src/lib.rs\n",
+                DepInfoSeparatorMode::Restore { windows: true },
+                false,
+            ),
+            "__kache_cwd__/src\\lib.rs\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_root__/obj/x86\n",
+                DepInfoSeparatorMode::Restore { windows: true },
+                true,
+            ),
+            "__kache_root__/obj\\\\x86\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "__kache_cwd__\\src\\lib.rs\n",
+                DepInfoSeparatorMode::Restore { windows: false },
+                false,
+            ),
+            "__kache_cwd__/src/lib.rs\n"
+        );
+        assert_eq!(
+            normalize_depinfo_separators(
+                "keep\\this __kache_cwd__/src\\lib.rs\n",
+                DepInfoSeparatorMode::Store,
+                false,
+            ),
+            "keep\\this __kache_cwd__/src/lib.rs\n"
+        );
+
+        let stored = rewrite_depinfo_content_with_sentinel_for_platform(
+            "lib.d: D:\\work\\src\\lib.rs\n",
+            Path::new(r"D:\work"),
+            DEPINFO_CWD_SENTINEL,
+            DepInfoMode::Relativize,
+            true,
+        );
+        assert_eq!(stored, "lib.d: __kache_cwd__/src/lib.rs\n");
+
+        let windows_back = rewrite_depinfo_content_with_prefixes_for_restore(
+            "lib.d: __kache_cwd__/src\\lib.rs\n",
+            &["D:\\work\\".to_string()],
+            DEPINFO_CWD_SENTINEL,
+            DepInfoMode::Expand,
+            true,
+        );
+        let windows_token = rewrite_depinfo_content_with_prefixes_for_restore(
+            "lib.d: __kache_cwd__\\src\\lib.rs\n",
+            &["D:\\work\\".to_string()],
+            DEPINFO_CWD_SENTINEL,
+            DepInfoMode::Expand,
+            true,
+        );
+        assert_eq!(windows_back, "lib.d: D:\\work\\src\\lib.rs\n");
+        assert_eq!(windows_token, windows_back);
+        let unix_back = rewrite_depinfo_content_with_prefixes_for_restore(
+            "lib.d: __kache_cwd__/src\\lib.rs\n",
+            &["D:\\work\\".to_string()],
+            DEPINFO_CWD_SENTINEL,
+            DepInfoMode::Expand,
+            false,
+        );
+        assert_eq!(unix_back, "lib.d: D:\\work\\src/lib.rs\n");
+
+        let env_key = "# env-dep:__kache_root__/WEIRD_KEY\n\
+                       # env-dep:__kache_cwd__\\SRC=__kache_cwd__\\src\\lib.rs\n";
+        let expanded_key = rewrite_depinfo_content_with_prefixes_for_restore(
+            env_key,
+            &["/work/".to_string()],
+            DEPINFO_CWD_SENTINEL,
+            DepInfoMode::Expand,
+            false,
+        );
+        assert!(
+            expanded_key.contains("# env-dep:__kache_root__/WEIRD_KEY\n"),
+            "{expanded_key}"
+        );
+        assert!(
+            expanded_key.contains("# env-dep:__kache_cwd__\\SRC=/work/src/lib.rs\n"),
+            "{expanded_key}"
+        );
+        assert!(cargo_env_dep_value_parses(
+            expanded_key
+                .lines()
+                .find(|line| line.contains("SRC="))
+                .unwrap()
+                .split_once('=')
+                .unwrap()
+                .1
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("lib.rs");
+        fs::write(&file, b"pub fn f() {}\n").unwrap();
+        let mut restored_paths = Vec::new();
+        for spelling in [
+            "__kache_cwd__\\src\\lib.rs",
+            "__kache_cwd__/src\\lib.rs",
+            "__kache_cwd__/src/lib.rs",
+        ] {
+            let restored = rewrite_depinfo_content_with_sentinel(
+                &format!("lib.d: {spelling}\n"),
+                dir.path(),
+                DEPINFO_CWD_SENTINEL,
+                DepInfoMode::Expand,
+            );
+            let path = restored.trim().split_once(": ").unwrap().1;
+            let native = PathBuf::from(path);
+            assert!(
+                native.exists(),
+                "restore of {spelling} must name a file that is there: {restored}"
+            );
+            assert_eq!(native, file);
+            assert!(restored.contains(&format!("src{}lib.rs", std::path::MAIN_SEPARATOR)));
+            restored_paths.push(restored);
+        }
+        assert_eq!(restored_paths[0], restored_paths[1]);
+        assert_eq!(restored_paths[1], restored_paths[2]);
     }
 }

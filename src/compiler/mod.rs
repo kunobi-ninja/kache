@@ -2387,15 +2387,17 @@ pub(crate) mod shim {
     }
 
     /// What `kache install-shims` and `kache init` link besides
-    /// [`farm::SHIM_NAMES`], found in the directories of `path`: the
-    /// versioned drivers, or with `from_path` every compiler name. Only
-    /// `from_path` may run a program, to probe a name it does not know.
+    /// [`farm::SHIM_NAMES`], found in the directories of `path`: versioned
+    /// drivers (`gcc-13`), or with `from_path` every name
+    /// [`kache_shims::is_cc_compiler_name`] already accepts
+    /// (`x86_64-linux-gnu-gcc-13`). Both checks are lexical. An unknown
+    /// basename is not a compiler to link, and it is not executed.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn names_on_path(path: &std::ffi::OsStr, from_path: bool) -> Vec<String> {
         let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
         let self_exe = crate::platform::frontend_executable().ok();
         let wanted: &dyn Fn(&str) -> bool = if from_path {
-            &invoked_as_compiler
+            &kache_shims::is_cc_compiler_name
         } else {
             &farm::is_versioned_driver
         };
@@ -3265,7 +3267,7 @@ mod shim_tests {
         let names = extra_compiler_names(
             &[own, other, marked, real],
             Some(&me),
-            &invoked_as_compiler,
+            &kache_shims::is_cc_compiler_name,
             &|candidate| super::is_executable(candidate),
             &|path| std::fs::canonicalize(path).ok(),
             &|dir| kache_shims::farm::has_marker(dir),
@@ -3445,6 +3447,45 @@ mod shim_tests {
         assert_eq!(
             names_on_path(&path, true),
             ["clang++-19", "gcc-13", "x86_64-linux-gnu-gcc-13"]
+        );
+    }
+
+    /// `--from-path` must not spawn a PATH entry to decide what it is. `ssh`
+    /// treats `-P` as a file to create.
+    #[cfg(unix)]
+    #[test]
+    fn names_on_path_with_from_path_does_not_execute_unknown_names() {
+        run_path_fixture("names_on_path_with_from_path_does_not_execute_unknown_names_fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run in a child process by names_on_path_with_from_path_does_not_execute_unknown_names"]
+    fn names_on_path_with_from_path_does_not_execute_unknown_names_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let marker = dir.path().join("ssh-ran");
+        let quoted = marker.display().to_string().replace('\'', "'\\''");
+        write_executable(
+            &bin.join("ssh"),
+            &format!("#!/bin/sh\n: > '{quoted}'\nexit 0\n"),
+        );
+
+        // SAFETY: this fixture runs alone in its own process. A probe resolves
+        // the bare name `ssh` through the process PATH, so the marker script
+        // has to be the one that would run.
+        unsafe { std::env::set_var("PATH", &bin) };
+
+        let path = std::env::join_paths([&bin]).unwrap();
+        let names = names_on_path(&path, true);
+        assert!(
+            !names.iter().any(|name| name == "ssh"),
+            "ssh was treated as a compiler: {names:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "names_on_path executed ssh ({})",
+            marker.display()
         );
     }
 }

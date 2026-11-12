@@ -231,6 +231,7 @@ pub(crate) fn run_rustc(
     incremental_mode: IncrementalMode,
     metadata_sink: Option<&mut MetadataSink<'_>>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    host_neutral_extra: Option<&[String]>,
 ) -> Result<CompileResult> {
     let cwd = env
         .cwd()
@@ -293,11 +294,11 @@ pub(crate) fn run_rustc(
     // Skipped under coverage instrumentation — tools like tarpaulin
     // and llvm-cov need original source paths in profraw data to
     // map coverage hits back to source files.
-    let remap_args = if skip_remap {
-        Vec::new()
-    } else {
-        path_normalizer.remap_args()
-    };
+    let remap_args = crate::cache_key::rustc_remap_args(
+        skip_remap,
+        path_normalizer.remap_args(),
+        host_neutral_extra,
+    );
 
     // Normal artifact-cache compiles disable incremental compilation: the key
     // leaves the flag out, so a stored artifact must come from a compile
@@ -1146,6 +1147,7 @@ fi
                             &normalizer,
                             IncrementalMode::Strip,
                             Some(&mut MetadataSink::immediate(&mut metadata)),
+                            None,
                             None,
                         )
                         .unwrap();
@@ -2749,5 +2751,69 @@ fi
             .status()
             .expect_err("a line past the limit does not spawn");
         assert_eq!(error.raw_os_error(), Some(206), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_neutral_registry_remaps_reach_rustc_after_the_base_set() {
+        use crate::invocation::InvocationEnv;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path();
+        let temp = cwd.join("tmp");
+        fs::create_dir_all(&temp).unwrap();
+        let compiler = cwd.join("fake-rustc");
+        kache_fs::testutil::write_executable(
+            &compiler,
+            r#"#!/bin/sh
+set -eu
+response=${1#@}
+if test "$response" != "$1"; then
+    while IFS= read -r argument; do
+        printf '%s\n' "$argument"
+    done < "$response" > actual-args
+else
+    printf '%s\n' "$@" > actual-args
+fi
+"#,
+        );
+        let env = InvocationEnv::from_parts(
+            [("TMPDIR", temp.into_os_string())],
+            Some(cwd.to_path_buf()),
+            None,
+            std::path::PathBuf::from("tmp"),
+        );
+        let normalizer = crate::path_normalizer::PathNormalizer::from_invocation(Some(cwd), &env);
+        let extra =
+            vec!["--remap-path-prefix=C:\\reg\\src\\pkg\\=/cargo/registry/pkg/".to_string()];
+        let expected = crate::cache_key::rustc_remap_args(
+            false,
+            normalizer.remap_args(),
+            Some(extra.as_slice()),
+        );
+        let result = run_rustc(
+            &env,
+            &compiler,
+            None,
+            &["src/lib.rs".to_string()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            false,
+            &normalizer,
+            IncrementalMode::Strip,
+            None,
+            None,
+            Some(extra.as_slice()),
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        let actual = fs::read_to_string(cwd.join("actual-args")).unwrap();
+        assert_eq!(actual, format!("{}\nsrc/lib.rs\n", expected.join("\n")));
+        assert!(actual.contains("--remap-path-prefix=C:\\reg\\src\\pkg\\=/cargo/registry/pkg/\n"));
     }
 }

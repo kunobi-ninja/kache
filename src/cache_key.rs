@@ -1824,6 +1824,388 @@ pub(crate) fn source_path_identity(
     Ok(format!("<OPAQUE_PATH>/{}", opaque.finalize().to_hex()).into_bytes())
 }
 
+/// One rustc unit's dependency closure, as far as a cross-host registry key
+/// needs to see it. Paths keep the spelling dep-info recorded.
+pub(crate) struct UnitClosure<'a> {
+    pub(crate) crate_name: Option<&'a str>,
+    pub(crate) crate_types: &'a [String],
+    pub(crate) externs: &'a [crate::args::ExternDep],
+    pub(crate) sources: &'a [PathBuf],
+    pub(crate) manifest_dir: Option<&'a Path>,
+    pub(crate) out_dir: Option<&'a Path>,
+    pub(crate) skip_remap: bool,
+}
+
+/// `registry/src` for a registry package whose closure can share a key across
+/// hosts. `None` keeps today's path identity: a build script, a proc-macro,
+/// an empty closure, or a source that is not a file inside an extracted
+/// package.
+pub(crate) fn host_neutral_registry_root(unit: &UnitClosure<'_>) -> Option<PathBuf> {
+    if unit.skip_remap || unit.out_dir.is_some() {
+        return None;
+    }
+    if unit.crate_name == Some("build_script_build") {
+        return None;
+    }
+    if unit.crate_types.iter().any(|ty| ty == "proc-macro") {
+        return None;
+    }
+    if has_dylib_extern(unit.externs) {
+        return None;
+    }
+    let manifest_dir = unit.manifest_dir?;
+    let registry = registry_src_root(manifest_dir)?.to_path_buf();
+    if unit.sources.is_empty() {
+        return None;
+    }
+    for source in unit.sources {
+        if source_carries_build_script(source)
+            || registry_relative_slash(source, &registry).is_none()
+        {
+            return None;
+        }
+    }
+    Some(registry)
+}
+
+/// Host-neutral only when the closure qualifies and this key can publish the
+/// remaps the compiler will actually apply. An emitted closure was compiled
+/// with the ordinary remap set.
+pub(crate) fn applicable_host_neutral_root(
+    emitted: bool,
+    names_unit: bool,
+    unit: &UnitClosure<'_>,
+) -> Option<PathBuf> {
+    if emitted || !names_unit {
+        return None;
+    }
+    host_neutral_registry_root(unit)
+}
+
+pub(crate) fn unit_can_publish_remaps(
+    crate_name: Option<&str>,
+    source_file: Option<&Path>,
+) -> bool {
+    crate_name.is_some() && source_file.is_some()
+}
+
+fn slash_form(path: &Path) -> Option<String> {
+    Some(path.to_str()?.replace('\\', "/"))
+}
+
+/// Slash-separated path of `file` under `registry_src` (`index/pkg/src/lib.rs`).
+/// `None` unless the path is a file at least one directory inside a package,
+/// with no `.`, `..`, or empty component. Separators in either spelling match.
+fn registry_relative_slash(file: &Path, registry_src: &Path) -> Option<String> {
+    let file = slash_form(file)?;
+    let mut root = slash_form(registry_src)?;
+    while root.ends_with('/') {
+        root.pop();
+    }
+    if root.is_empty() {
+        return None;
+    }
+    let rest = file.strip_prefix(&root)?;
+    let rest = rest.strip_prefix('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn source_carries_build_script(file: &Path) -> bool {
+    let Some(slash) = slash_form(file) else {
+        return false;
+    };
+    let parts: Vec<&str> = slash.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.last() == Some(&"build.rs") {
+        return true;
+    }
+    // `out` anywhere after a `build` directory, not that directory itself.
+    parts
+        .split(|part| *part == "build")
+        .skip(1)
+        .any(|tail| tail.contains(&"out"))
+}
+
+fn registry_source_key_material(file: &Path, registry_src: &Path) -> Option<Vec<u8>> {
+    let relative = registry_relative_slash(file, registry_src)?;
+    let mut material = b"registry-src/".to_vec();
+    material.extend_from_slice(relative.as_bytes());
+    Some(material)
+}
+
+/// Key material for one source. A registry unit that qualifies uses the slash
+/// path under `registry/src`. Anything else keeps [`source_path_identity`].
+pub(crate) fn keyed_source_path(
+    file: &Path,
+    registry_src: Option<&Path>,
+    normalizer: &PathNormalizer,
+) -> Result<Vec<u8>> {
+    if let Some(registry_src) = registry_src
+        && let Some(material) = registry_source_key_material(file, registry_src)
+    {
+        return Ok(material);
+    }
+    source_path_identity(file, normalizer)
+}
+
+/// `rustc -vV` text folded into the key. `drop_host` removes lines whose
+/// first non-space text is `host:`.
+pub(crate) fn rustc_version_key_text(version: &str, drop_host: bool) -> String {
+    if !drop_host {
+        return version.to_string();
+    }
+    let mut out = String::new();
+    for line in version.split_inclusive('\n') {
+        if line.trim_start().starts_with("host:") {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn hash_rustc_version_for_unit<H: KeyFold>(
+    hasher: &mut H,
+    version: &str,
+    drop_host: bool,
+    namespace: bool,
+) {
+    let text = rustc_version_key_text(version, drop_host);
+    hasher.update(b"rustc_version:");
+    hasher.update(text.as_bytes());
+    hasher.update(b"\n");
+    if namespace {
+        fold_field(hasher, b"host_neutral_sources.v1:", b"1");
+    }
+}
+
+/// `(drop host line, fold host_neutral_sources.v1)`. The namespace stays when
+/// remaps were already applied, even if this key does not drop the host line.
+pub(crate) fn host_neutral_version_flags(neutral: bool, provisional_remaps: bool) -> (bool, bool) {
+    (neutral, neutral || provisional_remaps)
+}
+
+pub(crate) fn version_flags_for_unit(neutral: bool) -> (bool, bool) {
+    host_neutral_version_flags(neutral, false)
+}
+
+/// `--remap-path-prefix` for every directory from `registry_src` down to each
+/// source's parent. `FROM` uses `host_sep` and ends with it. `TO` is
+/// `/cargo/registry/.../` so the matched separator is consumed. Longest last.
+pub(crate) fn registry_directory_remaps(
+    registry_src: &Path,
+    sources: &[PathBuf],
+    host_sep: char,
+) -> Vec<String> {
+    let Some(root_slash) = slash_form(registry_src) else {
+        return Vec::new();
+    };
+    let root_slash = root_slash.trim_end_matches('/').to_string();
+    let mut dirs = std::collections::BTreeSet::<(usize, String, String)>::new();
+    for source in sources {
+        let Some(relative) = registry_relative_slash(source, registry_src) else {
+            continue;
+        };
+        push_registry_dir(&mut dirs, &root_slash, "", host_sep);
+        let parts: Vec<&str> = relative.split('/').collect();
+        let mut rel_dir = String::new();
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            if !rel_dir.is_empty() {
+                rel_dir.push('/');
+            }
+            rel_dir.push_str(part);
+            push_registry_dir(&mut dirs, &root_slash, &rel_dir, host_sep);
+        }
+    }
+    dirs.into_iter()
+        .map(|(_, from, to)| format!("--remap-path-prefix={from}={to}"))
+        .collect()
+}
+
+fn push_registry_dir(
+    dirs: &mut std::collections::BTreeSet<(usize, String, String)>,
+    root_slash: &str,
+    rel_dir: &str,
+    host_sep: char,
+) {
+    let from_rel = rel_dir.replace('/', &host_sep.to_string());
+    let mut from = root_slash.replace('/', &host_sep.to_string());
+    if !from.ends_with(host_sep) {
+        from.push(host_sep);
+    }
+    if !from_rel.is_empty() {
+        from.push_str(&from_rel);
+        if !from.ends_with(host_sep) {
+            from.push(host_sep);
+        }
+    }
+    let to = if rel_dir.is_empty() {
+        "/cargo/registry/".to_string()
+    } else {
+        format!("/cargo/registry/{rel_dir}/")
+    };
+    dirs.insert((from.len(), from, to));
+}
+
+/// Give a `/rustc/<hash>` remap a trailing slash on both sides, using the
+/// separator `FROM` already uses. Other arguments stay as they are.
+pub(crate) fn slash_terminate_rust_src_remap(arg: &str) -> String {
+    let Some(body) = arg.strip_prefix("--remap-path-prefix=") else {
+        return arg.to_string();
+    };
+    let Some((from, to)) = body.split_once('=') else {
+        return arg.to_string();
+    };
+    if !to.starts_with("/rustc/") {
+        return arg.to_string();
+    }
+    let mut to = to.to_string();
+    if !to.ends_with('/') {
+        to.push('/');
+    }
+    let mut from = from.to_string();
+    let sep = if from.contains('\\') { '\\' } else { '/' };
+    if !from.ends_with(sep) {
+        from.push(sep);
+    }
+    format!("--remap-path-prefix={from}={to}")
+}
+
+pub(crate) fn host_neutral_remap_list(
+    base: Vec<String>,
+    registry_remaps: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = base
+        .into_iter()
+        .map(|arg| slash_terminate_rust_src_remap(&arg))
+        .collect();
+    out.extend(registry_remaps.iter().cloned());
+    out
+}
+
+/// Remap arguments for one rustc invocation. `skip_remap` injects nothing.
+/// `host_neutral_extra` of `Some` slash-terminates rust-src and appends the
+/// registry directories, including when that list is empty.
+pub(crate) fn rustc_remap_args(
+    skip_remap: bool,
+    base: Vec<String>,
+    host_neutral_extra: Option<&[String]>,
+) -> Vec<String> {
+    if skip_remap {
+        return Vec::new();
+    }
+    match host_neutral_extra {
+        Some(extra) => host_neutral_remap_list(base, extra),
+        None => base,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostNeutralDecision {
+    Unknown,
+    Off,
+    Remaps(Vec<String>),
+}
+
+struct HostNeutralPlan {
+    crate_name: String,
+    source_file: PathBuf,
+    decision: HostNeutralDecision,
+}
+
+thread_local! {
+    static HOST_NEUTRAL_PLAN: RefCell<Option<HostNeutralPlan>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn clear_host_neutral_decision() {
+    HOST_NEUTRAL_PLAN.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// `None` records that this unit keeps today's remaps. `Some` records the
+/// registry directory remaps. No plan is published when the unit has no
+/// crate name or source file to match at compile time.
+pub(crate) fn publish_host_neutral_decision(args: &RustcArgs, remaps: Option<Vec<String>>) {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return;
+    };
+    let decision = match remaps {
+        Some(remaps) => HostNeutralDecision::Remaps(remaps),
+        None => HostNeutralDecision::Off,
+    };
+    HOST_NEUTRAL_PLAN.with(|cell| {
+        *cell.borrow_mut() = Some(HostNeutralPlan {
+            crate_name: crate_name.to_string(),
+            source_file: source_file.to_path_buf(),
+            decision,
+        });
+    });
+}
+
+pub(crate) fn publish_host_neutral_plan(
+    args: &RustcArgs,
+    emitted: bool,
+    root: Option<&Path>,
+    sources: &[PathBuf],
+) {
+    if emitted {
+        return;
+    }
+    let remaps =
+        root.map(|root| registry_directory_remaps(root, sources, std::path::MAIN_SEPARATOR));
+    publish_host_neutral_decision(args, remaps);
+}
+
+pub(crate) fn take_host_neutral_decision(args: &RustcArgs) -> HostNeutralDecision {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return HostNeutralDecision::Unknown;
+    };
+    HOST_NEUTRAL_PLAN.with(|cell| {
+        let matches = cell
+            .borrow()
+            .as_ref()
+            .is_some_and(|plan| plan.crate_name == crate_name && plan.source_file == source_file);
+        if !matches {
+            return HostNeutralDecision::Unknown;
+        }
+        cell.borrow_mut()
+            .take()
+            .map(|plan| plan.decision)
+            .unwrap_or(HostNeutralDecision::Unknown)
+    })
+}
+
+pub(crate) fn host_neutral_extra_remaps(decision: HostNeutralDecision) -> Option<Vec<String>> {
+    match decision {
+        HostNeutralDecision::Remaps(remaps) => Some(remaps),
+        HostNeutralDecision::Off | HostNeutralDecision::Unknown => None,
+    }
+}
+
+/// Remaps for this compile. Skipping remap does not consume a plan that
+/// belongs to a later compile of the same unit.
+pub(crate) fn take_execute_remaps(args: &RustcArgs, skip_remap: bool) -> Option<Vec<String>> {
+    if skip_remap {
+        return None;
+    }
+    host_neutral_extra_remaps(take_host_neutral_decision(args))
+}
+
 /// Identity of an explicit native search directory an rlib can bundle from.
 ///
 /// Rlib native inputs beneath this unit's OUT_DIR are all content-keyed by
@@ -3279,6 +3661,8 @@ fn compute_key_into(
     out: &mut KeyOutputs,
 ) -> Result<String> {
     let _trace = crate::phase_trace::phase("key");
+    // A key that never reaches compile must not leave remaps for the next unit.
+    clear_host_neutral_decision();
     let invocation = &file_hasher.invocation_env;
     // Grouped: the main digest is identical to a plain hasher's; the group
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
@@ -3323,11 +3707,40 @@ fn compute_key_into(
         );
     }
 
-    // rustc version
+    // rustc version. The closure is resolved first so a registry unit with
+    // no build script and no proc-macro can omit the host line. The bytes
+    // stay in this position: configured roots, then the version, then clippy.
     let rustc_version = get_rustc_version_for(&args.rustc, invocation)?;
-    hasher.update(b"rustc_version:");
-    hasher.update(rustc_version.as_bytes());
-    hasher.update(b"\n");
+    let emitted = dep_info_provided();
+    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
+    // Hand the closure back to the wrapper, which records it as a prediction
+    // only once the invocation it belongs to has succeeded. The clone is one
+    // allocation per closure file against a whole rustc spawn.
+    out.dep_info = dep_info.clone();
+    let manifest_dir = args
+        .invocation_env()
+        .var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from);
+    let sources = dep_info
+        .as_ref()
+        .map(|info| info.source_files.as_slice())
+        .unwrap_or(&[]);
+    let host_neutral_root = applicable_host_neutral_root(
+        emitted,
+        unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref()),
+        &UnitClosure {
+            crate_name: args.crate_name.as_deref(),
+            crate_types: &args.crate_types,
+            externs: &args.externs,
+            sources,
+            manifest_dir: manifest_dir.as_deref(),
+            out_dir: out_dir.as_deref().map(Path::new),
+            skip_remap: args.skip_path_remap(),
+        },
+    );
+    let (drop_host, namespace) = version_flags_for_unit(host_neutral_root.is_some());
+    publish_host_neutral_plan(args, emitted, host_neutral_root.as_deref(), sources);
+    hash_rustc_version_for_unit(&mut hasher, &rustc_version, drop_host, namespace);
     tracing::trace!(
         "[key:{}] rustc_version={}",
         crate_name,
@@ -3512,12 +3925,6 @@ fn compute_key_into(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
-    // Hand the closure back to the wrapper, which records it as a prediction
-    // only once the invocation it belongs to has succeeded. The clone is one
-    // allocation per closure file against a whole rustc spawn.
-    out.dep_info = dep_info.clone();
-
     let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
     externs.sort_by_key(|e| &e.name);
 
@@ -3541,7 +3948,8 @@ fn compute_key_into(
             let file_hash = file_hasher
                 .hash(file)
                 .with_context(|| format!("hashing source identity {}", file.display()))?;
-            let normalized_path = source_path_identity(file, path_normalizer)?;
+            let normalized_path =
+                keyed_source_path(file, host_neutral_root.as_deref(), path_normalizer)?;
             hashed.push((normalized_path, file_hash));
         }
         hashed.sort();

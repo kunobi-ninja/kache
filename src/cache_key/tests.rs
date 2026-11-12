@@ -13091,6 +13091,55 @@ fn unstable_flag_changes_key() {
     );
 }
 
+/// `-Z threads` sets front-end parallelism and does not change the output,
+/// so it is not key material. Every other `-Z` flag stays keyed.
+#[test]
+fn threads_unstable_flag_does_not_change_key() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+    let base = key_of_flags(&flag_base(&source, &[]));
+    let attached = key_of_flags(&flag_base(&source, &["-Zthreads=1"]));
+    let separated = key_of_flags(&flag_base(&source, &["-Z", "threads=8"]));
+    let bare = key_of_flags(&flag_base(&source, &["-Z", "threads"]));
+    assert_eq!(base, attached, "-Zthreads must not change the key");
+    assert_eq!(
+        attached, separated,
+        "both spellings of -Z threads share a key"
+    );
+    assert_eq!(base, bare, "a valueless -Z threads must not change the key");
+
+    let share = key_of_flags(&flag_base(&source, &["-Zshare-generics=off"]));
+    assert_ne!(base, share, "-Zshare-generics must change the key");
+    let share_and_threads = key_of_flags(&flag_base(
+        &source,
+        &["-Zthreads=8", "-Zshare-generics=off"],
+    ));
+    assert_eq!(
+        share, share_and_threads,
+        "adding -Zthreads beside another -Z flag must not change the key"
+    );
+
+    let near_name = key_of_flags(&flag_base(&source, &["-Zthreads-count=8"]));
+    assert_ne!(
+        base, near_name,
+        "a -Z flag whose name is not exactly threads must change the key"
+    );
+    let suffix = key_of_flags(&flag_base(&source, &["-Z", "not-threads=1"]));
+    assert_ne!(
+        base, suffix,
+        "a -Z flag whose name is not exactly threads must change the key"
+    );
+    let value_mentions_threads = key_of_flags(&flag_base(&source, &["-Zshare-generics=threads"]));
+    assert_ne!(
+        base, value_mentions_threads,
+        "mentioning threads in another flag's value must still change the key"
+    );
+    assert_ne!(share, value_mentions_threads);
+}
+
 /// A `--target` value can be a path to a custom target JSON spec (Firefox /
 /// embedded toolchains). Its file CONTENT — data-layout, target features,
 /// linker, panic strategy — must be folded into the key, so the same path

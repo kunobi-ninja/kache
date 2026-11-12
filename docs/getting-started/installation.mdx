@@ -7,7 +7,7 @@ Kache requires the `kache` client and `kache-engine`. Keep the same
 version of both in the same directory when installing a release manually.
 
 ```bash
-cargo install kache --locked --version 2.1.0
+cargo install kache --locked --version 2.1.1
 kache init
 ```
 
@@ -15,7 +15,7 @@ kache init
 
 ## Release channels
 
-These docs describe stable v2.1.0. Pin the version as above for reproducible
+These docs describe stable v2.1.1. Pin the version as above for reproducible
 installs, or use an unversioned command for the latest stable release.
 
 Release candidates and betas require an explicit version. Homebrew and Windows
@@ -33,7 +33,7 @@ existing installs and what state can start cold.
     ```bash
     cargo install kache --locked
     # Pin this release:
-    cargo install kache --locked --version 2.1.0
+    cargo install kache --locked --version 2.1.1
     ```
 
     Cargo builds Kache with your local Rust toolchain, which must be Rust 1.95 or newer.
@@ -42,7 +42,7 @@ existing installs and what state can start cold.
     ```bash
     cargo binstall kache
     # Pin this release:
-    cargo binstall kache --version 2.1.0
+    cargo binstall kache --version 2.1.1
     ```
 
     This downloads a release binary when one exists for your target. Release binaries have no Rust runtime dependency.
@@ -132,7 +132,7 @@ nix profile install github:kunobi-ninja/kache/stable
 Pin a release tag when updates must be explicit:
 
 ```bash
-nix profile install github:kunobi-ninja/kache/v2.1.0
+nix profile install github:kunobi-ninja/kache/v2.1.1
 ```
 
 The flake also exports `overlays.default`, `nixosModules.default` and `darwinModules.default`. The module's `services.kache` options are defined in [`packaging/nix/module.nix`](https://github.com/kunobi-ninja/kache/blob/main/packaging/nix/module.nix). `enable` installs Kache, writes `settings` to `/etc/kache/config.toml` and sets `KACHE_CONFIG`. `rustcWrapper`, on by default, sets `RUSTC_WRAPPER`. `daemon.enable` runs the daemon as a systemd or launchd user service. The module does not put the shims on `PATH`; use the example below for that.

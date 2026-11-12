@@ -13,13 +13,13 @@ steps:
   - uses: dtolnay/rust-toolchain@stable
   - uses: kunobi-ninja/kache-action@v1
     with:
-      version: v2.1.0
+      version: v2.1.1
   - run: cargo build --locked
 ```
 
 See the [kache-action repository](https://github.com/kunobi-ninja/kache-action) for its current input reference and release notes.
 
-The version input pins v2.1.0; omitting it selects the latest stable release.
+The version input pins v2.1.1; omitting it selects the latest stable release.
 The action installs the matching client/engine pair. Its `cache-executables`
 input defaults to `false`, independently of the CLI's Linux/macOS default; set
 that input explicitly if the job should cache eligible Rust executable outputs.

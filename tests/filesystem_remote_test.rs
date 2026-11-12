@@ -19,7 +19,10 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary, stop_daemon, wait_for_daemon_exit};
+use common::{
+    build_kache, cc_published_crate_name, isolated_config_path, kache_binary, stop_daemon,
+    wait_for_daemon_exit,
+};
 
 fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
@@ -741,12 +744,13 @@ fn daemon_upload_reaches_an_independent_client_for_a_c_object() {
     let source = "int answer(void) { return 42; }\n";
     std::fs::write(producer_source.path().join("foo.c"), source).unwrap();
     std::fs::write(consumer_source.path().join("foo.c"), source).unwrap();
+    let published = cc_published_crate_name("foo.c");
 
     let alpha = Client::new(shared.path());
     alpha.start_daemon();
     alpha.compile_cc_checkout(producer_source.path(), "foo.c", "foo.o");
-    let alpha_report = alpha.report_with_event("foo.c");
-    let alpha_event = crate_event(&alpha_report, "foo.c");
+    let alpha_report = alpha.report_with_event(&published);
+    let alpha_event = crate_event(&alpha_report, &published);
     assert!(
         alpha_event["result"] == "miss" || alpha_event["result"] == "dup",
         "client A's first C compile must be a real compile: {alpha_report}"
@@ -760,14 +764,14 @@ fn daemon_upload_reaches_an_independent_client_for_a_c_object() {
         .expect("producer event should include its cache key")
         .to_owned();
 
-    wait_for_remote_entry(shared.path(), "foo.c", &cache_key);
+    wait_for_remote_entry(shared.path(), &published, &cache_key);
     alpha.stop_daemon_and_wait();
 
     let beta = Client::new(shared.path());
     beta.start_daemon();
     beta.compile_cc_checkout(consumer_source.path(), "foo.c", "foo.o");
     let beta_report = beta.report();
-    let beta_event = crate_event(&beta_report, "foo.c");
+    let beta_event = crate_event(&beta_report, &published);
 
     assert_eq!(
         beta_event["result"], "remote_hit",

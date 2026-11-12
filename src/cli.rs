@@ -9027,7 +9027,19 @@ async fn sync_inner(
     .await
 }
 
-/// List the requested crate prefixes within the same limit as sync transfers.
+/// In-flight sync transfers. The daemon's `s3_concurrency` permit pool is a
+/// separate limit and must not shrink this one.
+const SYNC_TRANSFER_JOBS: usize = 32;
+
+/// How many sync uploads or downloads may run at once.
+///
+/// A daemon pool below [`SYNC_TRANSFER_JOBS`] does not lower the result. A
+/// larger pool is honored.
+fn sync_transfer_jobs(daemon_pool: u32) -> usize {
+    SYNC_TRANSFER_JOBS.max(daemon_pool as usize)
+}
+
+/// List the requested crate prefixes, overlapping up to `concurrency` listings.
 async fn list_remote_crates(
     remote: &dyn crate::cache_remote::CacheRemote,
     crates: &std::collections::HashSet<String>,
@@ -9199,7 +9211,7 @@ async fn sync_with_client(
         return Ok(());
     }
 
-    let max_concurrent = (config.s3_concurrency as usize).max(1);
+    let max_concurrent = sync_transfer_jobs(config.s3_concurrency);
     let mut total_failed = 0;
 
     // ── Pull phase ──────────────────────────────────────────────

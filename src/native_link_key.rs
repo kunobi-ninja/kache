@@ -3148,6 +3148,19 @@ mod tests {
     }
 
     #[test]
+    fn cmd_tokens_keeps_a_quoted_path_and_drops_empty_spans() {
+        assert_eq!(
+            cmd_tokens(r#""C:\Program Files\link.exe" /libpath:a"#),
+            ["C:\\Program Files\\link.exe", "/libpath:a"]
+        );
+        // A trailing separator leaves `current` empty. Pushing that empty
+        // token is what `delete !` in the final check would do.
+        assert_eq!(cmd_tokens("link.exe "), ["link.exe"]);
+        assert_eq!(cmd_tokens("  link.exe"), ["link.exe"]);
+        assert!(cmd_tokens(" \t ").is_empty());
+    }
+
+    #[test]
     fn linker_selection_reads_link_arguments_as_the_driver_does() {
         let selection = LinkerSelection::from_words(&words(&[
             "-fuse-ld=gold",

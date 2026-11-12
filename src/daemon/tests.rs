@@ -12515,6 +12515,48 @@ impl crate::remote_backend::RemoteBackend for StallingGetBackend {
     }
 }
 
+/// GET blocks the polling thread. An async `pending()` still lets the
+/// handler's deadline run; this one does not.
+struct BlockingGetBackend {
+    started: AtomicBool,
+    finished: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for BlockingGetBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        self.started.store(true, Ordering::SeqCst);
+        std::thread::sleep(BLOCKING_REMOTE_OP);
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    async fn put(
+        &self,
+        _key: &str,
+        _body: bytes::Bytes,
+        _content_type: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn describe(&self, key: &str) -> String {
+        format!("blocking://test/{key}")
+    }
+}
+
 /// Backend whose GET fails with the given error class on every call.
 struct FailingGetBackend {
     timeout: bool,
@@ -13309,6 +13351,231 @@ async fn test_restore_deadline_returns_miss_instead_of_hanging() {
         0,
         "a timeout is never negative-cached"
     );
+}
+
+/// A compile-path remote op that does not yield is abandoned with the
+/// handler's budget. The client gets a miss (local compile), stats is not
+/// stuck behind that handler, and shutdown does not wait the op out.
+const BLOCKING_REMOTE_OP: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
+    let shutdown = CONNECTION_HANDLER_DRAIN_TIMEOUT
+        + PREFETCH_SHUTDOWN_TIMEOUT
+        + UPLOAD_PIPELINE_DRAIN_TIMEOUT
+        + RUNTIME_SHUTDOWN_TIMEOUT;
+    assert!(
+        shutdown < Duration::from_secs(35),
+        "restart waits 35s for the run lock, shutdown took {shutdown:?}"
+    );
+    assert_eq!(shutdown, Duration::from_secs(12 + 5 + 8 + 1));
+    assert_blocked_handler_is_abandoned_at_the_drain();
+
+    let skipped = Arc::new(AtomicBool::new(false));
+    let skipped_flag = Arc::clone(&skipped);
+    let already_elapsed = RemoteDeadline::from_millis_at(
+        Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("elapsed budget fits"),
+        1,
+    );
+    let skipped_download = finish_compile_remote_download(already_elapsed, async move {
+        skipped_flag.store(true, Ordering::SeqCst);
+        std::thread::sleep(BLOCKING_REMOTE_OP);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    assert!(
+        skipped_download.is_err(),
+        "an elapsed budget is a remote miss"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !skipped.load(Ordering::SeqCst),
+        "an elapsed budget must not start the remote op"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(BlockingGetBackend {
+        started: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+    });
+    let mut config = test_config(dir.path());
+    config.remote = Some(test_remote_config());
+    config.remote_restore_timeout_secs = 1;
+    config.demand_timeout_secs = 1;
+    let daemon = Arc::new(Daemon::new(config));
+    daemon.signal_warming_complete();
+    assert!(
+        daemon
+            .remote_backend
+            .set(backend.clone() as Arc<dyn crate::remote_backend::RemoteBackend>)
+            .is_ok()
+    );
+    let mut check = check_request(dir.path(), "blocking-remote-op");
+    check.deadline_ms = Some(800);
+    daemon
+        .key_cache
+        .populate(HashMap::from([(check.key.clone(), "serde".to_string())]))
+        .await;
+
+    let socket_path = daemon.config.socket_path();
+    let listener = bind_listener(&socket_path);
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let server_daemon = Arc::clone(&daemon);
+    let server_limiter = Arc::clone(&limiter);
+    let server = tokio::spawn(async move {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let mut handlers = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let stream = listener.accept().await.expect("accept");
+            let daemon = Arc::clone(&server_daemon);
+            let limiter = Arc::clone(&server_limiter);
+            let lifecycle = Arc::clone(&lifecycle);
+            let started_at = Instant::now();
+            handlers.spawn(async move {
+                handle_connection_after_queue(stream, &daemon, &lifecycle, limiter, started_at)
+                    .await
+                    .expect("connection handler");
+            });
+        }
+        while handlers.join_next().await.is_some() {}
+    });
+
+    let request = Request::RemoteCheck(check);
+    let remote_socket = socket_path.clone();
+    let started = Instant::now();
+    let remote_client =
+        tokio::spawn(async move { client_roundtrip(&remote_socket, &request).await });
+
+    let backend_for_wait = Arc::clone(&backend);
+    tokio::time::timeout(Duration::from_secs(2), async move {
+        while !backend_for_wait.started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the remote op must start");
+
+    let stats_socket = socket_path.clone();
+    let stats_client = tokio::spawn(async move {
+        client_roundtrip(
+            &stats_socket,
+            &Request::Stats(StatsRequest {
+                include_entries: false,
+                include_summaries: false,
+                sort_by: None,
+                event_hours: None,
+                event_secs: None,
+                client_epoch: 0,
+                client_version: None,
+            }),
+        )
+        .await
+    });
+
+    let remote_response = remote_client.await.expect("remote client");
+    let stats_response = stats_client.await.expect("stats client");
+    let elapsed = started.elapsed();
+    server.await.expect("server");
+
+    assert!(remote_response.ok);
+    assert_eq!(remote_response.found, Some(false));
+    assert!(
+        remote_response.error.is_none(),
+        "a remote failure is a miss the client compiles locally, got {remote_response:?}"
+    );
+    assert!(stats_response.ok, "stats must answer: {stats_response:?}");
+    assert!(stats_response.stats.is_some());
+    assert!(
+        !backend.finished.load(Ordering::SeqCst),
+        "the handler waited for the remote op to finish"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+        "handler and stats must return at the 800ms budget, not after the {BLOCKING_REMOTE_OP:?} op, took {elapsed:?}"
+    );
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_failed
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(daemon.negative_keys.len(), 0);
+    assert!(!daemon.remote_breaker.is_degraded());
+}
+
+fn assert_blocked_handler_is_abandoned_at_the_drain() {
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("kache-drain-probe".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("drain probe runtime");
+            let measured = runtime.block_on(async {
+                let aborted = Arc::new(AtomicBool::new(false));
+                let entered = Arc::new(AtomicBool::new(false));
+                let mut handlers = tokio::task::JoinSet::new();
+                let flag = Arc::clone(&aborted);
+                handlers.spawn(async move {
+                    let _observed = AbortObserved(flag);
+                    std::future::pending::<()>().await;
+                });
+                let entered_flag = Arc::clone(&entered);
+                handlers.spawn(async move {
+                    entered_flag.store(true, Ordering::SeqCst);
+                    std::thread::sleep(BLOCKING_REMOTE_OP);
+                });
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !entered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("blocked handler was polled");
+                let started_at = Instant::now();
+                let abandoned =
+                    drain_connection_handlers(&mut handlers, Duration::from_millis(20)).await;
+                (
+                    abandoned,
+                    started_at.elapsed(),
+                    handlers.is_empty(),
+                    aborted.load(Ordering::SeqCst),
+                )
+            });
+            let _ = tx.send(measured);
+            runtime.shutdown_timeout(Duration::from_millis(20));
+        })
+        .expect("spawn drain probe");
+    let (abandoned, elapsed, empty, aborted) = rx.recv_timeout(Duration::from_secs(2)).unwrap_or((
+        false,
+        BLOCKING_REMOTE_OP,
+        false,
+        false,
+    ));
+    drop(worker);
+    assert!(
+        abandoned,
+        "a drained handler that does not finish is abandoned"
+    );
+    assert!(empty, "abandoned handlers leave the drain set");
+    assert!(aborted, "abort must drop a parked handler");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drain joined a handler blocked in the remote op, took {elapsed:?}"
+    );
+}
+
+struct AbortObserved(Arc<AtomicBool>);
+
+impl Drop for AbortObserved {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 #[tokio::test]

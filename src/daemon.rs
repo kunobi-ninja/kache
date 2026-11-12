@@ -4385,12 +4385,16 @@ impl Daemon {
         self.transfer_counters
             .remote_check_roundtrips
             .fetch_add(1, Ordering::Relaxed);
-        let download_result = deadline
-            .run(
-                "demand GET and extraction",
-                remote_cache.download_entry(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
-            )
-            .await;
+        let key = req.key.clone();
+        let crate_name = cn.to_string();
+        let deadline_at = deadline.at();
+        let remote_cache = Arc::clone(&remote_cache);
+        let download_result = finish_compile_remote_download(deadline, async move {
+            remote_cache
+                .download_entry(&key, &crate_name, &entry_dir, &blobs_dir, deadline_at)
+                .await
+        })
+        .await;
         drop(semaphore_permit);
 
         match download_result {
@@ -6982,7 +6986,7 @@ fn run_daemon_runtime(
     // GC or migration does not cancel its spawn_blocking work: dropping the
     // runtime would wait forever and keep the daemon run lock held. This is
     // the foreground daemon's exit path; the process ends after we return.
-    runtime.shutdown_timeout(Duration::from_secs(1));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
 }
 
@@ -7459,7 +7463,7 @@ async fn server_main(
         let _ = handle.await;
     }
     if daemon
-        .finish_prefetch_shutdown(Duration::from_secs(5))
+        .finish_prefetch_shutdown(PREFETCH_SHUTDOWN_TIMEOUT)
         .await
     {
         tracing::warn!(
@@ -7471,7 +7475,13 @@ async fn server_main(
 
     drain_publications_then_close_uploads(&daemon, publish_done).await;
     drop(daemon);
-    if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
+    if drain_upload_pipeline(
+        enqueue_handle,
+        upload_handles,
+        UPLOAD_PIPELINE_DRAIN_TIMEOUT,
+    )
+    .await
+    {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
     }
 
@@ -7549,11 +7559,16 @@ fn accept_backoff(error: &std::io::Error) -> Option<Duration> {
     None
 }
 
-/// Maximum time to let accepted IPC handlers finish their current response
-/// during shutdown. A bounded drain preserves in-flight replies (including the
-/// shutdown acknowledgement) without letting a silent client hold the daemon
-/// open forever.
-const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// `kache daemon restart` waits 35s for this process to drop the run lock.
+/// Handler drain, prefetch shutdown, upload drain, and runtime shutdown are
+/// that wait. A compile whose remote op is still running is already a miss.
+const PREFETCH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(12);
+const UPLOAD_PIPELINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+/// After abort, a handler parked on an await joins immediately. One still
+/// inside a call that does not yield is detached so the drain can return.
+const HANDLER_ABORT_JOIN_GRACE: Duration = Duration::from_millis(200);
 
 /// Overall budget a `RemoteCheck` waits behind another task's in-flight
 /// download of the same key before giving up and reporting a remote miss
@@ -7905,6 +7920,71 @@ fn observe_connection_handler(result: std::result::Result<(), tokio::task::JoinE
     false
 }
 
+/// Poll a compile-path download on a thread the handler does not share.
+///
+/// `RemoteDeadline::run` is polled on the handler task. A GET that blocks
+/// inside `poll` (a silent read, a credential helper) never returns to that
+/// poll, so the deadline, the connection permit, and stats all wait with it.
+/// The worker thread owns that poll and is detached when `spawn` returns.
+/// An elapsed budget answers from the handler; process exit reaps the thread.
+async fn finish_compile_remote_download<T, F>(
+    deadline: RemoteDeadline,
+    download: F,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    if deadline.check("demand GET and extraction").is_err() {
+        return Err(anyhow::Error::new(
+            crate::remote_resilience::RemoteDeadlineElapsed {
+                stage: "demand GET and extraction",
+            },
+        ));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Err(error) = std::thread::Builder::new()
+        .name("kache-compile-remote".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("compile remote runtime")
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            };
+            let outcome = runtime.block_on(download);
+            // Deliver the result before runtime shutdown. Shutdown only reaps
+            // this thread; the handler must already be free to answer.
+            let _ = tx.send(outcome);
+            runtime.shutdown_timeout(Duration::from_millis(50));
+        })
+    {
+        tracing::warn!("compile remote thread did not start: {error}");
+        return Err(anyhow::Error::new(
+            crate::remote_resilience::RemoteDeadlineElapsed {
+                stage: "demand GET and extraction",
+            },
+        ));
+    }
+    deadline
+        .run("demand GET and extraction", async move {
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::Error::new(
+                    crate::remote_resilience::RemoteDeadlineElapsed {
+                        stage: "demand GET and extraction",
+                    },
+                )),
+            }
+        })
+        .await
+}
+
 /// Drain all accepted connection handlers under one deadline. Returns true if
 /// unfinished handlers had to be aborted.
 async fn drain_connection_handlers(
@@ -7924,8 +8004,15 @@ async fn drain_connection_handlers(
     }
 
     handlers.abort_all();
-    while let Some(result) = handlers.join_next().await {
-        observe_connection_handler(result);
+    let joined = tokio::time::timeout(HANDLER_ABORT_JOIN_GRACE, async {
+        while let Some(result) = handlers.join_next().await {
+            observe_connection_handler(result);
+        }
+    })
+    .await
+    .is_ok();
+    if !joined {
+        handlers.detach_all();
     }
     true
 }

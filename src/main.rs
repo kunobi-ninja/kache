@@ -1153,12 +1153,17 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 rustc_version,
                 rustc_version_file,
                 args,
-            } => key_inputs::print_invocation(
-                &args,
-                rustc_version,
-                rustc_version_file,
-                &config.base_dirs,
-            ),
+            } => {
+                let mut stdout = std::io::stdout().lock();
+                key_inputs::render_invocation(
+                    &args,
+                    rustc_version,
+                    rustc_version_file.as_deref(),
+                    &config.base_dirs,
+                    &invocation::InvocationEnv::capture(),
+                    &mut stdout,
+                )
+            }
             KeyCommands::Diff { file_a, file_b } => {
                 let fields = key_inputs::diff_files(&file_a, &file_b)?;
                 if json {
@@ -1169,7 +1174,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                         println!("{field}");
                     }
                 }
-                if !fields.is_empty() {
+                if key_inputs::key_diff_has_changes(&fields) {
                     std::process::exit(1);
                 }
                 Ok(())

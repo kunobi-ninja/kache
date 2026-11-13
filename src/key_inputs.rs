@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Inputs folded into one rustc cache key, in the form `kache key explain` prints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,23 +69,6 @@ pub(crate) fn rustc_version_text(
     std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))
         .map(Some)
-}
-
-pub(crate) fn print_invocation(
-    argv: &[String],
-    rustc_version: Option<String>,
-    rustc_version_file: Option<PathBuf>,
-    base_dirs: &[String],
-) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    render_invocation(
-        argv,
-        rustc_version,
-        rustc_version_file.as_deref(),
-        base_dirs,
-        &InvocationEnv::capture(),
-        &mut stdout,
-    )
 }
 
 pub(crate) fn render_invocation(
@@ -176,6 +159,11 @@ pub(crate) fn key_inputs_for(
         cargo_cfgs: cargo_cfg_inputs(env),
         rustc_version,
     })
+}
+
+/// A diff with at least one field exits 1. Matching documents exit 0.
+pub(crate) fn key_diff_has_changes(fields: &[String]) -> bool {
+    !fields.is_empty()
 }
 
 /// Field names whose values differ. Empty when the documents match.
@@ -413,6 +401,8 @@ mod tests {
         ));
         assert_eq!(slash["link_search"][0], "work/native");
         assert_eq!(back["link_search"][0], "work\\native");
+        assert!(!key_diff_has_changes(&[]));
+        assert!(key_diff_has_changes(&["link_search".to_string()]));
         assert_eq!(
             diff_key_input_documents(&slash, &back),
             vec!["link_search".to_string()]
@@ -527,6 +517,46 @@ mod tests {
                 "all=search".to_string(),
             ]
         );
+
+        // An unknown kind is the whole token. Splitting on `=` would hide a
+        // configured prefix that covers that token.
+        let base = "custom=/opt/lib".to_string();
+        let normalizer = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&base));
+        let configured = sample(
+            &env,
+            &normalizer,
+            &[
+                "rustc",
+                "--crate-name=demo",
+                "--crate-type=lib",
+                "-L",
+                "custom=/opt/lib",
+            ],
+            None,
+        );
+        assert_eq!(configured.link_search, vec!["<BASE_DIR_0>".to_string()]);
+    }
+
+    #[test]
+    fn explain_writes_the_key_inputs_as_json() {
+        let root = tempfile::tempdir().unwrap();
+        let env = fixture_env(root.path(), &[]);
+        let mut buf = Vec::new();
+        render_invocation(
+            &[
+                "rustc".to_string(),
+                "--crate-name=demo".to_string(),
+                "--crate-type=lib".to_string(),
+            ],
+            None,
+            None,
+            &[],
+            &env,
+            &mut buf,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"crate_name\": \"demo\""), "{text}");
     }
 
     #[test]

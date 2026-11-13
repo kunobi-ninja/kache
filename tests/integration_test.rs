@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, hermetic_command, isolated_config_path, kache_binary, settle_writes};
+use common::{
+    build_kache, cc_published_crate_name, hermetic_command, isolated_config_path, kache_binary,
+    settle_writes,
+};
 
 fn run_kache_cc(project: &Path, cache_dir: &Path, args: &[&str]) {
     run_kache_cc_from(project, cache_dir, args);
@@ -403,7 +406,8 @@ fn assert_last_cc_event(report: &serde_json::Value, result: &str, compiler_runs:
     let last = events
         .last()
         .expect("report should include at least one event");
-    assert_eq!(last["crate_name"].as_str(), Some("foo.c"));
+    let published = cc_published_crate_name("foo.c");
+    assert_eq!(last["crate_name"].as_str(), Some(published.as_str()));
     assert_eq!(last["result"].as_str(), Some(result));
     assert_eq!(last["compiler_runs"].as_u64(), Some(compiler_runs));
 }
@@ -3157,12 +3161,13 @@ fn test_cc_legacy_compound_depinfo_entry_self_heals_and_why_miss_explains_it() {
     std::fs::create_dir_all(project.path().join("build")).unwrap();
     run_kache_cc(project.path(), cache_dir.path(), &args);
 
+    let published = cc_published_crate_name("src/foo.c");
     let why = hermetic_command(
         kache_binary(),
         cache_dir.path(),
         Some(&isolated_config_path(cache_dir.path())),
     )
-    .args(["why-miss", "foo.c"])
+    .args(["why-miss", published.as_str()])
     .output()
     .expect("failed to run why-miss");
     assert!(why.status.success());
@@ -3660,7 +3665,8 @@ fn test_cc_direct_key_refuses_an_assembler_read_file() {
     run_kache_cc(project.path(), cache_dir.path(), &args);
     assert!(project.path().join("foo.o").exists());
     let event = last_event(cache_dir.path());
-    assert_eq!(event["crate_name"].as_str(), Some("foo.c"));
+    let published = cc_published_crate_name("foo.c");
+    assert_eq!(event["crate_name"].as_str(), Some(published.as_str()));
     assert_eq!(event["result"].as_str(), Some("skipped"), "{event}");
     assert_eq!(event["compiler_runs"].as_u64(), Some(1));
     assert_eq!(event["preprocessor_runs"].as_u64(), Some(0));

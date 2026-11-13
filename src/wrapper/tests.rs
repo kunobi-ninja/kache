@@ -6990,6 +6990,79 @@ fn parse_cc(args: &[&str]) -> crate::compiler::cc::CcArgs {
     crate::compiler::cc::CcArgs::parse(&s(args)).unwrap()
 }
 
+fn cc_args_named(source: &str, package: Option<&str>) -> crate::compiler::cc::CcArgs {
+    let vars: Vec<(String, String)> = package
+        .map(|name| ("CARGO_PKG_NAME".to_string(), name.to_string()))
+        .into_iter()
+        .collect();
+    let env = crate::invocation::InvocationEnv::from_parts(vars, None, None, std::env::temp_dir());
+    crate::compiler::cc::CcArgs::parse_for(
+        &[
+            "cc".to_string(),
+            "-c".to_string(),
+            source.to_string(),
+            "-o".to_string(),
+            "out.o".to_string(),
+        ],
+        &env,
+    )
+    .unwrap()
+}
+
+#[test]
+fn lock_scope_for_package_foo_includes_its_cc_entry_not_a_source_file() {
+    let lock = std::collections::HashSet::from(["foo".to_string()]);
+    let published = cc_entry_crate_name(&cc_args_named("src/bar.c", Some("foo")));
+    assert_eq!(published, "foo");
+    assert!(
+        lock.contains(&published),
+        "a lock scope for foo includes the cc entry named foo"
+    );
+    assert!(
+        !lock.contains("bar.c"),
+        "a lock scope for foo does not include an entry named only bar.c"
+    );
+
+    let bare = cc_entry_crate_name(&cc_args_named("src/bar.c", None));
+    assert_eq!(bare, "bar.c");
+    assert!(!lock.contains(&bare));
+
+    let hyphen = cc_entry_crate_name(&cc_args_named("curve25519.c", Some(" aws-lc-sys ")));
+    let hyphen_lock = std::collections::HashSet::from(["aws_lc_sys".to_string()]);
+    assert_eq!(hyphen, "aws_lc_sys");
+    assert!(hyphen_lock.contains(&hyphen));
+    assert!(!hyphen_lock.contains("curve25519.c"));
+
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some("  "))),
+        "bar.c"
+    );
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some(""))),
+        "bar.c"
+    );
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some("foo_bar"))),
+        "foo_bar"
+    );
+    assert_eq!(
+        cc_entry_crate_name(&cc_args_named("bar.c", Some("foo-bar"))),
+        "foo_bar"
+    );
+
+    let no_source = crate::compiler::cc::CcArgs::parse_for(
+        &["cc".to_string()],
+        &crate::invocation::InvocationEnv::from_parts(
+            Vec::<(String, String)>::new(),
+            None,
+            None,
+            std::env::temp_dir(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(cc_entry_crate_name(&no_source), "unknown");
+}
+
 /// `cc_event_root` honors the override exactly (pins whole-body
 /// mutants on a helper the diff would otherwise leave uncovered).
 #[test]

@@ -137,6 +137,25 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("config.toml")
 }
 
+/// Crate directory a cc object of `source` is published under.
+///
+/// Same rule as `cc_entry_crate_name`: a nonempty `CARGO_PKG_NAME` wins,
+/// with `-` folded to `_`, and otherwise the source file name. Cargo sets
+/// that variable on this process; the wrapper child inherits it.
+#[allow(dead_code)]
+pub fn cc_published_crate_name(source: &str) -> String {
+    if let Ok(package) = std::env::var("CARGO_PKG_NAME") {
+        let package = package.trim();
+        if !package.is_empty() {
+            return package.replace('-', "_");
+        }
+    }
+    Path::new(source)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// A child `cargo` or `kache` whose Kache state is pinned to `cache_dir`.
 ///
 /// Tests read `events.jsonl` and reach the daemon socket under the cache dir

@@ -2104,6 +2104,29 @@ thread_local! {
     static CC_PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
 }
 
+/// Crate directory a cc object is published under.
+///
+/// Lock-scoped sync lists Cargo package names. A build script sets
+/// `CARGO_PKG_NAME` to that package (`aws-lc-sys` is listed as `aws_lc_sys`),
+/// so the object has to be stored there or the pull never asks for it. The
+/// cc cache key still hashes each source path, which keeps two files in one
+/// package distinct. No package name keeps the source file name, and a lock
+/// scope does not list that.
+fn cc_entry_crate_name(parsed: &crate::compiler::cc::CcArgs) -> String {
+    if let Ok(package) = parsed.invocation_env.var("CARGO_PKG_NAME") {
+        let package = package.trim();
+        if !package.is_empty() {
+            return package.replace('-', "_");
+        }
+    }
+    parsed
+        .sources
+        .first()
+        .and_then(|source| source.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn run_cc_inner(
     config: &Config,
     wrapper_args: &[String],
@@ -2126,12 +2149,7 @@ fn run_cc_inner(
         .context("parsing cc-family arguments")?;
     drop(trace_parse);
     if crate::compiler::cc::cc_is_internal_key_probe_for(env) {
-        let crate_name = parsed
-            .sources
-            .first()
-            .and_then(|s| s.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
+        let crate_name = cc_entry_crate_name(&parsed);
         return cc_direct_passthrough_with_event(
             config,
             &parsed,
@@ -2143,14 +2161,7 @@ fn run_cc_inner(
     }
     let event_root = cc_event_root(&parsed);
 
-    // The crate-name slot in events / metadata is the source file
-    // name for cc — the closest analogue to rustc's crate name.
-    let crate_name = parsed
-        .sources
-        .first()
-        .and_then(|s| s.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".to_string());
+    let crate_name = cc_entry_crate_name(&parsed);
 
     // Refuse-to-cache check: non-empty = this invocation isn't a
     // cacheable single-source `-c` compile (link mode, multi-arch,

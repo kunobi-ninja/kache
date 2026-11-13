@@ -24,6 +24,7 @@ The envelope is documented in [`cli.schema.json`](https://github.com/kunobi-ninj
 | `clean` | Free disk space: remove old target directories, or empty the cache |
 | `monitor` | Open the live dashboard |
 | `explain` | Explain why a crate, or the latest build, missed the cache |
+| `key` | Print the cache-key inputs of one rustc invocation, or the fields that differ between two of those documents |
 | `list` | Inspect local entries |
 | `sync` | Pull from and push to a remote |
 | `login` | Log in to the planner with a Kunobi account |
@@ -426,6 +427,18 @@ kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
 Writes `metrics.otlp.json` and `schema_version` for Kartero. Metric names are `kache.cache.*` / `kache.prefetch.*` (scope `kache.cache`), never `kache.bench.*`. `--scenario` must match `kache.bench.project`. `--phase` is `cold`, `warm-same-tree`, `warm`, or `pull` so dumps from the same scenario do not collide. The rustc wrapper does not write these files.
 
 The payload also carries this host's shared cache: registered blob bytes (`kache.cache.store.physical_size`), index and WAL size, and a rowid high-water mark per table (`kache.cache.index.*`; it is not a row count). `kache.cache.store.size` counts logical entry bytes; GC compares the physical blob figure with `kache.cache.store.max`. Last-run GC gauges include duration, pinned and unreclaimable entries, bytes held by target directories, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The read-only index probe has a 25 ms lock timeout; unavailable figures are omitted.
+
+## `kache key`
+
+```bash
+kache key explain -- rustc --crate-name demo src/lib.rs
+kache key explain --rustc-version-file rustc-vv.txt -- rustc --crate-name demo src/lib.rs
+kache key diff a.json b.json
+```
+
+`kache key explain` prints the strings one rustc invocation contributes to its cache key. It does not run rustc. Put the rustc path and its arguments after `--`. `--rustc-version` or `--rustc-version-file` supplies `rustc -vV` text when the host line belongs in the document. Without either, that line is left out. The two version flags cannot be combined.
+
+`kache key diff` reads two of those documents and prints the fields that differ. Matching inputs print nothing.
 
 ## `kache explain`
 

@@ -36,6 +36,7 @@ mod init_completions;
 mod init_shell;
 mod invocation;
 mod key_env;
+mod key_inputs;
 use kache_store::link;
 mod cache_remote;
 mod link_probe;
@@ -143,6 +144,39 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum KeyCommands {
+    /// Print the canonical key inputs of one rustc invocation as JSON.
+    /// Does not run rustc.
+    Explain {
+        /// `rustc -vV` text. Without it, the host line is left out. This
+        /// command does not run rustc.
+        #[arg(long, value_name = "TEXT")]
+        rustc_version: Option<String>,
+
+        /// File containing `rustc -vV` text. This command does not run rustc.
+        #[arg(long, value_name = "FILE", conflicts_with = "rustc_version")]
+        rustc_version_file: Option<PathBuf>,
+
+        /// rustc path and the arguments it would receive
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "RUSTC_ARG",
+            num_args = 1..
+        )]
+        args: Vec<String>,
+    },
+
+    /// Name the fields that differ between two key-input JSON documents
+    Diff {
+        /// First document, from `kache key explain`
+        file_a: PathBuf,
+        /// Second document, from `kache key explain`
+        file_b: PathBuf,
+    },
 }
 
 kache_client::define_engine_commands!();
@@ -268,6 +302,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
         | Commands::Stats { .. }
         | Commands::Explain { .. }
         | Commands::Diff { .. }
+        | Commands::Key { .. }
         | Commands::Report { .. } => true,
         Commands::Init { shims, .. } => shims.is_none(),
         Commands::Config { command } => command.is_some(),
@@ -359,7 +394,7 @@ fn json_refusal(command: &Option<Commands>) -> Option<&'static str> {
         // The other forms of init have one.
         Some(Commands::Init { .. }) => "`kache init --shims` has no JSON form.",
         _ => {
-            "`--json` is supported on init, stats, clean, doctor, explain, list, and daemon status."
+            "`--json` is supported on init, stats, clean, doctor, explain, key, list, and daemon status."
         }
     })
 }
@@ -1113,6 +1148,38 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Explain {
             all: true, root, ..
         }) => explain::run_all(&config, root.as_deref(), json),
+        Some(Commands::Key { command }) => match command {
+            KeyCommands::Explain {
+                rustc_version,
+                rustc_version_file,
+                args,
+            } => {
+                let mut stdout = std::io::stdout().lock();
+                key_inputs::render_invocation(
+                    &args,
+                    rustc_version,
+                    rustc_version_file.as_deref(),
+                    &config.base_dirs,
+                    &invocation::InvocationEnv::capture(),
+                    &mut stdout,
+                )
+            }
+            KeyCommands::Diff { file_a, file_b } => {
+                let fields = key_inputs::diff_files(&file_a, &file_b)?;
+                if json {
+                    serde_json::to_writer(std::io::stdout(), &fields)?;
+                    println!();
+                } else {
+                    for field in &fields {
+                        println!("{field}");
+                    }
+                }
+                if key_inputs::key_diff_has_changes(&fields) {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+        },
         Some(Commands::Explain {
             crate_name: Some(crate_name),
             ..
@@ -3182,6 +3249,62 @@ mod tests {
     }
 
     #[test]
+    fn key_commands_parse_an_invocation_and_two_documents() {
+        let explain = Cli::try_parse_from([
+            "kache",
+            "key",
+            "explain",
+            "--rustc-version-file",
+            "vv.txt",
+            "--",
+            "rustc",
+            "--crate-name=demo",
+            "-L",
+            r"work\native",
+        ])
+        .unwrap();
+        match explain.command {
+            Some(Commands::Key {
+                command:
+                    KeyCommands::Explain {
+                        rustc_version,
+                        rustc_version_file,
+                        args,
+                    },
+            }) => {
+                assert!(rustc_version.is_none());
+                assert_eq!(
+                    rustc_version_file.as_deref(),
+                    Some(std::path::Path::new("vv.txt"))
+                );
+                assert_eq!(args, ["rustc", "--crate-name=demo", "-L", r"work\native",]);
+            }
+            _ => panic!("key explain did not parse"),
+        }
+        let diff = Cli::try_parse_from(["kache", "key", "diff", "a.json", "b.json"]).unwrap();
+        assert!(matches!(
+            diff.command,
+            Some(Commands::Key {
+                command: KeyCommands::Diff { .. }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "kache",
+                "key",
+                "explain",
+                "--rustc-version",
+                "rustc 1.99.0",
+                "--rustc-version-file",
+                "vv.txt",
+                "--",
+                "rustc",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn dry_run_spellings_reach_every_preview() {
         for spelling in ["--check", "--dry-run", "-n"] {
             let parsed = Cli::try_parse_from(["kache", "init", spelling, "--no-service"]).unwrap();
@@ -3297,6 +3420,7 @@ mod tests {
                 "clean",
                 "monitor",
                 "explain",
+                "key",
                 "list",
                 "sync",
                 "login",

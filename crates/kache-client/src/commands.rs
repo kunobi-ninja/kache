@@ -318,6 +318,13 @@ enum Commands {
         command: TelemetryCommands,
     },
 
+    /// Print one rustc invocation's cache-key inputs, or diff two of those documents
+    #[command(display_order = 21)]
+    Key {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+
     /// Explain why a crate, or the latest build, missed the cache
     #[command(display_order = 20, alias = "why-miss")]
     Explain {

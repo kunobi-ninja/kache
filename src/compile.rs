@@ -1447,6 +1447,22 @@ fi
         }
     }
 
+    /// A compiler left suspended would hang a test; kill it after 30 s
+    /// unless the returned sender is dropped first, so the failure shows.
+    #[cfg(target_os = "linux")]
+    fn kill_if_still_running(pid: u32) -> std::sync::mpsc::Sender<()> {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let waited = wait.recv_timeout(std::time::Duration::from_secs(30));
+            if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                && let Ok(pid) = libc::pid_t::try_from(pid)
+            {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        });
+        done
+    }
+
     /// A compiler with a child (a linker, or the real compiler under a
     /// wrapper) is never frozen to be stopped: the caller is not asked, and
     /// the compile runs to the end.
@@ -1463,6 +1479,7 @@ fi
             .unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
+        let done = kill_if_still_running(child.id());
         // The child is started right after the line; give it time to exist.
         std::thread::sleep(std::time::Duration::from_millis(100));
         let mut asked = false;
@@ -1473,6 +1490,7 @@ fi
         let (status, _, captured) =
             capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop), true)
                 .unwrap();
+        drop(done);
         assert!(!asked, "a compiler with a child was offered a stop");
         assert!(!captured.stopped);
         assert!(status.success());
@@ -1508,23 +1526,9 @@ fi
             (child, stdout, stderr)
         };
         let lines = || fs::read_to_string(&ticks).map_or(0, |text| text.lines().count());
-        // A compiler left suspended would hang the test; kill it instead so
-        // the failure shows.
-        let watchdog = |pid: u32| {
-            let (done, wait) = std::sync::mpsc::channel::<()>();
-            std::thread::spawn(move || {
-                let waited = wait.recv_timeout(std::time::Duration::from_secs(30));
-                if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    && let Ok(pid) = libc::pid_t::try_from(pid)
-                {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
-            });
-            done
-        };
 
         let (mut child, stdout, stderr) = spawn();
-        let done = watchdog(child.id());
+        let done = kill_if_still_running(child.id());
         let mut frozen_progress = None;
         let mut go_on = || {
             std::thread::sleep(std::time::Duration::from_millis(50));

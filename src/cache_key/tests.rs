@@ -2088,7 +2088,7 @@ fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
         assert!(!input.stamp_settled());
         assert!(
             hasher
-                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .memo_input_is_unchanged(&input, &|_| vec![path.clone()], &|_| None,)
                 .is_none()
         );
         assert!(hasher.hash_static_lib(&path).is_ok());

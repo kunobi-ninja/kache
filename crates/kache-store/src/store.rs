@@ -1729,6 +1729,10 @@ fn compute_content_hash(files: &[CachedFile]) -> String {
 
 const STORE_OPEN_MAX_ATTEMPTS: u32 = 6;
 const STORE_OPEN_RETRY_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 250];
+/// How many times a compile store tries to open an index write transaction
+/// when that lock is busy. Each attempt waits out the production
+/// `busy_timeout` (5s). A lock that stays taken still fails the put.
+const COMPILE_STORE_LOCK_ATTEMPTS: u32 = 3;
 
 fn sqlite_open_retry_delay(attempt: u32) -> Duration {
     let idx = attempt.saturating_sub(1) as usize;
@@ -3107,7 +3111,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // its refcounts until doctor or an index rebuild.
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
-        let tx = self.db.unchecked_transaction()?;
+        // IMMEDIATE, and retried: a deferred transaction upgrades at
+        // `release_entry_blob_refs`'s UPDATE, and SQLite returns
+        // SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT for that upgrade without
+        // calling the busy handler. The lock is then held across blob
+        // rematerialization, so a queue of compile stores can outlast one
+        // busy_timeout window.
+        let tx = self.begin_immediate_writer()?;
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
@@ -4273,10 +4283,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         rename: impl FnMut() -> std::io::Result<()>,
         is_transient: impl Fn(&std::io::Error) -> bool,
     ) -> Result<PublishRename> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let tx = self.begin_immediate_writer()?;
         if blob.is_file() {
             Self::discard_staged_blob(staged);
             return Ok(PublishRename::LostRace);
@@ -4495,6 +4502,36 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         !self.config.deferred_durability
     }
 
+    /// `BEGIN IMMEDIATE`, retried while the index write lock is busy.
+    ///
+    /// Publishing a blob, registering the entry, and marking it durable hold
+    /// that lock across filesystem work, so a queue of compile stores can
+    /// outlast one `busy_timeout` window (5s). Each attempt waits out that
+    /// window. A lock that stays taken still fails the put.
+    fn begin_immediate_writer(&self) -> Result<rusqlite::Transaction<'_>> {
+        let mut attempt = 1u32;
+        loop {
+            match rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => return Ok(tx),
+                Err(err) => {
+                    let err = anyhow::Error::from(err);
+                    if attempt < COMPILE_STORE_LOCK_ATTEMPTS && is_sqlite_contention(&err) {
+                        tracing::debug!(
+                            attempt,
+                            "retrying a compile-store index write after lock contention: {err:#}"
+                        );
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Strict success requires a verified flush of the current publication,
     /// including shared blobs. A peer may already have completed that flush.
     fn finish_strict_durability(&self, cache_key: &str) -> Result<()> {
@@ -4621,10 +4658,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         before_promotion();
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let tx = self.begin_immediate_writer()?;
         let current_hash: Option<String> = tx
             .query_row(
                 "SELECT content_hash FROM entries

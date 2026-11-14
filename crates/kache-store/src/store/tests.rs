@@ -4910,6 +4910,71 @@ fn evict_waits_for_a_competing_writer_and_still_evicts() {
     assert!(!store.contains("contended"));
 }
 
+/// A compile store waits out an index writer instead of failing the put.
+/// The first two lock attempts are refused, so a store that tries only
+/// once, or only twice, returns the busy error. The third takes the lock
+/// after that writer commits.
+#[test]
+fn put_waits_out_an_index_writer_and_still_stores() {
+    static COMPILE_STORE_REFUSALS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    // One call per refused BEGIN. Returning false makes SQLite give up
+    // this attempt without waiting out the busy timeout.
+    fn refuse_two_lock_attempts_then_wait(count: i32) -> bool {
+        if COMPILE_STORE_REFUSALS.load(Ordering::SeqCst) < 2 {
+            COMPILE_STORE_REFUSALS.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        count < 2_000
+    }
+
+    COMPILE_STORE_REFUSALS.store(0, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let mut store = Store::open(&config).unwrap();
+    store
+        .db
+        .busy_handler(Some(refuse_two_lock_attempts_then_wait))
+        .unwrap();
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute("UPDATE entries SET durable = durable", [])
+        .unwrap();
+    let committer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while COMPILE_STORE_REFUSALS.load(Ordering::SeqCst) < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.execute_batch("COMMIT").unwrap();
+    });
+
+    let output = dir.path().join("libwaited.rlib");
+    std::fs::write(&output, b"waited").unwrap();
+    let stored = store.put(
+        "waited",
+        "waited_crate",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        &[(output, "libwaited.rlib".to_string())],
+        "",
+        "",
+    );
+    committer.join().unwrap();
+    stored.expect("put waits out the index writer");
+    assert_eq!(
+        COMPILE_STORE_REFUSALS.load(Ordering::SeqCst),
+        2,
+        "the store did not refuse exactly two lock attempts"
+    );
+    assert!(store.contains("waited"));
+}
+
 #[test]
 fn is_sqlite_contention_matches_busy_and_locked_only() {
     let sqlite = |code: i32| {

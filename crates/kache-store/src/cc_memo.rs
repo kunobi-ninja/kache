@@ -1,7 +1,7 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
 use crate::file_hash::{FileFingerprint, FileHashCache, file_hash_memo_eligible, stamp_is_settled};
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcPreprocessMemoInput {
@@ -86,6 +86,9 @@ fn unproven(path: String) -> FileFingerprint {
 pub struct CcPreprocessMemo {
     pub preprocessed_hash: String,
     pub inputs: Vec<CcPreprocessMemoInput>,
+    /// What the compiler derived from the inputs' header scans, opaque here.
+    /// The value carries its own proof of which inputs it describes.
+    pub shadowing: Option<String>,
     pub needs_touch: bool,
 }
 
@@ -98,7 +101,7 @@ fn has_current_schema(db: &Connection) -> rusqlite::Result<bool> {
 
 pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
     if has_current_schema(db)? {
-        return Ok(());
+        return ensure_shadowing_column(db);
     }
     // Recheck after acquiring the writer lock: concurrent wrappers may have
     // observed the legacy table before the first migration committed.
@@ -111,7 +114,8 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
                 memo_key TEXT NOT NULL UNIQUE,
                 preprocessed_hash TEXT NOT NULL,
                 input_count INTEGER NOT NULL,
-                last_used INTEGER NOT NULL DEFAULT (unixepoch())
+                last_used INTEGER NOT NULL DEFAULT (unixepoch()),
+                shadowing TEXT
              );
              CREATE INDEX cc_preprocess_memos_last_used ON cc_preprocess_memos(last_used);
              CREATE TABLE cc_memo_inputs (
@@ -135,7 +139,25 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
              CREATE INDEX cc_memo_input_refs_input ON cc_memo_input_refs(input_id);",
         )?;
     }
-    tx.commit()
+    tx.commit()?;
+    ensure_shadowing_column(db)
+}
+
+/// Whether memo rows can carry the include-shadowing derivation.
+pub(crate) fn has_shadowing_column(db: &Connection) -> rusqlite::Result<bool> {
+    has_column(db, "cc_preprocess_memos", "shadowing")
+}
+
+/// Add `cc_preprocess_memos.shadowing` to a table from before it. Rows keep
+/// no value, and the first hit on each computes one.
+fn ensure_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
+    if has_shadowing_column(db)? {
+        return Ok(());
+    }
+    match db.execute_batch("ALTER TABLE cc_preprocess_memos ADD COLUMN shadowing TEXT") {
+        Err(error) if !error.to_string().contains("duplicate column name") => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// The mapped-content memo: what a file's bytes hash to once the prefix maps
@@ -428,6 +450,7 @@ impl FileHashCache<'_> {
                 result = Some(CcPreprocessMemo {
                     preprocessed_hash: row.get(0)?,
                     inputs: Vec::new(),
+                    shadowing: None,
                     needs_touch: row.get(2)?,
                 });
             }
@@ -448,7 +471,20 @@ impl FileHashCache<'_> {
             });
         }
         // A damaged/incomplete reference set cannot stand in for the full closure.
-        Ok(result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count))
+        let Some(mut memo) =
+            result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count)
+        else {
+            return Ok(None);
+        };
+        // Apart from the rows above: the sort would copy it into every one.
+        // A value from a newer row is harmless, since it names its inputs.
+        memo.shadowing = self
+            .db()
+            .prepare_cached("SELECT shadowing FROM cc_preprocess_memos WHERE memo_key = ?1")?
+            .query_row([memo_key], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(Some(memo))
     }
 
     /// Record `inputs` as the read set behind `preprocessed_hash`.
@@ -469,7 +505,8 @@ impl FileHashCache<'_> {
         let id: i64 = tx.query_row(
             "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
              VALUES (?1, ?2, 0) ON CONFLICT(memo_key) DO UPDATE SET
-             preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch()
+             preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch(),
+             shadowing = NULL
              RETURNING id",
             params![memo_key, preprocessed_hash],
             |row| row.get(0),
@@ -546,6 +583,22 @@ impl FileHashCache<'_> {
         let inputs: Vec<CcPreprocessMemoInput> = serde_json::from_str(json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         self.put_cc_preprocess_memo_inputs(memo_key, hash, &inputs)
+    }
+
+    /// Attach the compiler's include-shadowing derivation to the memo row
+    /// that still records `preprocessed_hash`. A row replaced since keeps
+    /// whatever it has.
+    pub fn set_cc_preprocess_memo_shadowing(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        shadowing: &str,
+    ) -> rusqlite::Result<usize> {
+        self.db().execute(
+            "UPDATE cc_preprocess_memos SET shadowing = ?3
+             WHERE memo_key = ?1 AND preprocessed_hash = ?2",
+            params![memo_key, preprocessed_hash, shadowing],
+        )
     }
 
     /// Called after a successful validation and only when the read marked it
@@ -649,6 +702,37 @@ mod tests {
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "proof");
         assert_eq!(memo.inputs, [read_back(first), read_back(last)]);
+    }
+
+    #[test]
+    fn shadowing_stays_with_the_row_it_was_derived_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let shadowing = |cache: &FileHashCache| {
+            cache
+                .get_cc_preprocess_memo("unit")
+                .unwrap()
+                .unwrap()
+                .shadowing
+        };
+        cache
+            .put_cc_preprocess_memo_inputs("unit", "first", &[input("a.h", "a")])
+            .unwrap();
+        assert_eq!(shadowing(&cache), None);
+        assert_eq!(
+            cache
+                .set_cc_preprocess_memo_shadowing("unit", "other", "stale")
+                .unwrap(),
+            0
+        );
+        cache
+            .set_cc_preprocess_memo_shadowing("unit", "first", "derived")
+            .unwrap();
+        assert_eq!(shadowing(&cache).as_deref(), Some("derived"));
+        cache
+            .put_cc_preprocess_memo_inputs("unit", "second", &[input("b.h", "b")])
+            .unwrap();
+        assert_eq!(shadowing(&cache), None, "a replaced row drops it");
     }
 
     #[test]

@@ -8370,12 +8370,25 @@ impl<'db> FileHasher<'db> {
     /// write has moved it; an input observed sooner was recorded without a
     /// stamp and is compared by content every time. Any database, decoding,
     /// or metadata uncertainty is still a miss.
+    #[cfg(test)]
     pub(crate) fn cc_preprocess_memo_lookup(
         &self,
         memo_key: &str,
         resolve: impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<(String, Vec<PathBuf>)> {
+        self.cc_preprocess_memo_lookup_shadowing(memo_key, resolve, mapped_content)
+            .map(|(hash, satisfied, _)| (hash, satisfied))
+    }
+
+    /// [`Self::cc_preprocess_memo_lookup`], with the include-shadowing
+    /// derivation the compiler stored on the memo row, if any.
+    pub(crate) fn cc_preprocess_memo_lookup_shadowing(
+        &self,
+        memo_key: &str,
+        resolve: impl Fn(&str) -> Vec<PathBuf>,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
+    ) -> Option<(String, Vec<PathBuf>, Option<String>)> {
         let cache = self.cache.as_ref()?;
         let trace_fetch = crate::phase_trace::phase("cc_memo_fetch");
         let record = cache.get_cc_preprocess_memo(memo_key);
@@ -8423,7 +8436,46 @@ impl<'db> FileHasher<'db> {
         {
             tracing::debug!("cc preprocess memo touch failed: {error}");
         }
-        Some((record.preprocessed_hash, satisfied))
+        Some((record.preprocessed_hash, satisfied, record.shadowing))
+    }
+
+    /// Store the compiler's include-shadowing derivation on a memo row.
+    pub(crate) fn cc_preprocess_memo_set_shadowing(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        shadowing: &str,
+    ) {
+        if let Some(cache) = &self.cache
+            && let Err(error) =
+                cache.set_cc_preprocess_memo_shadowing(memo_key, preprocessed_hash, shadowing)
+        {
+            tracing::debug!("cc preprocess memo shadowing update failed: {error}");
+        }
+    }
+
+    /// The content hash of each path, from this invocation's validated
+    /// stamps where it has one, else by hashing.
+    pub(crate) fn cc_input_contents(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+        paths
+            .iter()
+            .map(|path| self.selected_content(path))
+            .collect()
+    }
+
+    fn selected_content(&self, path: &Path) -> anyhow::Result<String> {
+        let recent = {
+            let resolved = self.resolve_path(path)?;
+            let recent = self.recent_hashes.borrow();
+            recent
+                .get(&resolved)
+                .filter(|recent| recent.fingerprint.is_some())
+                .map(|recent| recent.hash.clone())
+        };
+        match recent {
+            Some(content) => Ok(content),
+            None => self.hash(path),
+        }
     }
 
     /// Does this input still hold the bytes the memo was recorded against?
@@ -8643,18 +8695,7 @@ impl<'db> FileHasher<'db> {
     ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());
         for path in paths {
-            let recent = {
-                let resolved = self.resolve_path(path)?;
-                let recent = self.recent_hashes.borrow();
-                recent
-                    .get(&resolved)
-                    .filter(|recent| recent.fingerprint.is_some())
-                    .map(|recent| recent.hash.clone())
-            };
-            let content = match recent {
-                Some(content) => content,
-                None => self.hash(path)?,
-            };
+            let content = self.selected_content(path)?;
             let is_held = held(&content);
             contents.push((content, is_held));
         }

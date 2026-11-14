@@ -5700,11 +5700,62 @@ struct CcProbedHeader {
     candidates: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 fn cc_shadowing_names(
     parsed: &CcArgs,
     read_inputs: &[PathBuf],
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<CcShadowingNames> {
+    cc_shadowing_names_reusing(parsed, read_inputs, file_hasher, None).map(|(names, _)| names)
+}
+
+/// What [`CcShadowingNames`] takes from the read headers' scans and the
+/// command-line definitions. It depends on their bytes and on no path, so a
+/// memo hit, which has proven every input's bytes, can reuse the one stored
+/// with the memo instead of loading every scan again.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CcShadowingDerivation {
+    /// [`cc_shadowing_derivation_digest`] of what this was derived from.
+    inputs: String,
+    /// Resolved probes by content hash. Contents without probes are absent.
+    probes: std::collections::BTreeMap<String, Vec<CcHeaderProbe>>,
+    /// Probes in the command-line definitions.
+    arguments: Vec<CcHeaderProbe>,
+}
+
+/// Bump when alias, paste or probe resolution changes what a scan derives.
+/// The release version is folded in as well.
+const CC_SHADOWING_DERIVATION: &[u8] = b"cc-shadowing-derivation-v1";
+
+/// Identity of a derivation's inputs. Sorted, because aliases, the paste
+/// check and each header's probes depend on which bytes were read, not on
+/// the order they were listed in.
+fn cc_shadowing_derivation_digest(contents: &[String], definitions: &str) -> String {
+    let mut sorted = contents.iter().map(String::as_str).collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    fold_cc_memo_field(&mut hasher, b"schema", CC_SHADOWING_DERIVATION);
+    fold_cc_memo_field(&mut hasher, b"kache", crate::version::VERSION.as_bytes());
+    fold_cc_memo_field(
+        &mut hasher,
+        b"scan-version",
+        &CC_HEADER_SCAN_VERSION.to_le_bytes(),
+    );
+    for content in sorted {
+        fold_cc_memo_field(&mut hasher, b"content", content.as_bytes());
+    }
+    fold_cc_memo_field(&mut hasher, b"definitions", definitions.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// [`cc_shadowing_names`], reusing `stored` when it was derived from exactly
+/// these inputs. Returns a new derivation to store when it computed one.
+fn cc_shadowing_names_reusing(
+    parsed: &CcArgs,
+    read_inputs: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    stored: Option<&str>,
+) -> Result<(CcShadowingNames, Option<String>)> {
     let cwd = parsed
         .invocation_env
         .cwd()
@@ -5737,12 +5788,71 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = cc_parsed_header_scans(&read_inputs, file_hasher)?;
     let definitions = parsed
         .defines
         .iter()
         .map(|(name, value)| format!("#define {name} {}\n", value.as_deref().unwrap_or("1")))
         .collect::<String>();
+    let contents = file_hasher.cc_input_contents(&read_inputs)?;
+    let digest = cc_shadowing_derivation_digest(&contents, &definitions);
+    let reused = stored
+        .and_then(|stored| serde_json::from_str::<CcShadowingDerivation>(stored).ok())
+        .filter(|derivation| derivation.inputs == digest);
+    let (derivation, fresh) = match reused {
+        Some(derivation) => (derivation, false),
+        None => (
+            cc_derive_shadowing(&read_inputs, &contents, &definitions, digest, file_hasher)?,
+            true,
+        ),
+    };
+    let mut result = CcShadowingNames::default();
+    for (absolute, content) in read_inputs.iter().zip(&contents) {
+        // Keep the ordinary shadowing names as before: the most specific
+        // relative path and the basename can both be used by an include.
+        if let Some(relative) = dirs
+            .iter()
+            .filter_map(|dir| absolute.strip_prefix(dir).ok())
+            .min_by_key(|relative| relative.components().count())
+        {
+            result.names.insert(relative.to_path_buf());
+        }
+        if let Some(file_name) = absolute.file_name() {
+            result.names.insert(PathBuf::from(file_name));
+        }
+        let probes = derivation
+            .probes
+            .get(content)
+            .map_or(&[][..], Vec::as_slice);
+        for probe in probes.iter().chain(&derivation.arguments) {
+            let mut candidates = Vec::new();
+            if probe.quoted
+                && let Some(parent) = absolute.parent()
+            {
+                candidates.push(parent.join(&probe.name));
+            }
+            candidates.extend(probe_dirs.iter().map(|dir| dir.join(&probe.name)));
+            result.probes.push(CcProbedHeader {
+                name: probe.name.clone(),
+                candidates,
+            });
+        }
+    }
+    let fresh = fresh
+        .then(|| serde_json::to_string(&derivation))
+        .transpose()?;
+    Ok((result, fresh))
+}
+
+/// Derive from the scans of `read_inputs`, whose content hashes are
+/// `contents`.
+fn cc_derive_shadowing(
+    read_inputs: &[PathBuf],
+    contents: &[String],
+    definitions: &str,
+    digest: String,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) -> Result<CcShadowingDerivation> {
+    let scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
     let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
         .context("cc: unresolved header availability probe in command-line definitions")?;
     let all_scans = || {
@@ -5758,49 +5868,30 @@ fn cc_shadowing_names(
         "cc: token pasting may construct a header availability probe"
     );
     drop(trace_pastes);
-    let argument_probes = cc_resolve_header_probes(&argument_scan, &aliases)
+    let arguments = cc_resolve_header_probes(&argument_scan, &aliases)
         .context("cc: unresolved header availability probe in command-line definitions")?;
-    let mut result = CcShadowingNames::default();
-    for (input, scan) in read_inputs.iter().zip(scans) {
-        let absolute = absolutize_path(cwd, input);
-        // Keep the ordinary shadowing names as before: the most specific
-        // relative path and the basename can both be used by an include.
-        if let Some(relative) = dirs
-            .iter()
-            .filter_map(|dir| absolute.strip_prefix(dir).ok())
-            .min_by_key(|relative| relative.components().count())
-        {
-            result.names.insert(relative.to_path_buf());
-        }
-        if let Some(file_name) = absolute.file_name() {
-            result.names.insert(PathBuf::from(file_name));
-        }
-        let probes = scan
+    let mut probes = std::collections::BTreeMap::new();
+    for ((input, content), scan) in read_inputs.iter().zip(contents).zip(&scans) {
+        let resolved = scan
             .as_ref()
             .as_ref()
             .and_then(|scan| cc_resolve_header_probes(scan, &aliases));
-        let Some(probes) = probes else {
+        let Some(resolved) = resolved else {
             anyhow::bail!(
                 "cc: a header availability probe (__has_include) in {} cannot be resolved \
                  from literal source text",
                 input.display()
             );
         };
-        for probe in probes.iter().chain(&argument_probes) {
-            let mut candidates = Vec::new();
-            if probe.quoted
-                && let Some(parent) = absolute.parent()
-            {
-                candidates.push(parent.join(&probe.name));
-            }
-            candidates.extend(probe_dirs.iter().map(|dir| dir.join(&probe.name)));
-            result.probes.push(CcProbedHeader {
-                name: probe.name.clone(),
-                candidates,
-            });
+        if !resolved.is_empty() {
+            probes.insert(content.clone(), resolved);
         }
     }
-    Ok(result)
+    Ok(CcShadowingDerivation {
+        inputs: digest,
+        probes,
+        arguments,
+    })
 }
 
 /// One header's probe scan, or `None` for text the scanner cannot resolve.
@@ -7194,6 +7285,8 @@ struct PendingCcPreprocessMemo {
     /// The inputs came from a compile's own read set, fingerprinted after
     /// it ran, rather than from a preprocess that preceded the compile.
     captured: bool,
+    /// The include-shadowing derivation to store with the memo.
+    shadowing: Option<String>,
 }
 
 /// How the key learns what the translation unit reads.
@@ -7685,6 +7778,14 @@ impl CcCompiler {
             &pending.fingerprints,
             &|path| cc_mapped_content_hash(path, &pending.prefix_maps),
         );
+        // Lands only on the row recorded above; the value proves its inputs.
+        if let Some(shadowing) = &pending.shadowing {
+            file_hasher.cc_preprocess_memo_set_shadowing(
+                &pending.memo_key,
+                &pending.preprocessed_hash,
+                shadowing,
+            );
+        }
     }
 
     /// The memo a deferred compile would publish, for a daemon to record in
@@ -8468,7 +8569,7 @@ impl CcCompiler {
         } else {
             memo_key.as_ref().and_then(|key| {
                 let _trace = crate::phase_trace::phase("cc_memo_lookup");
-                ctx.file_hasher.cc_preprocess_memo_lookup(
+                ctx.file_hasher.cc_preprocess_memo_lookup_shadowing(
                     key,
                     |name| cc_unmapped_path_candidates(name, &prefix_maps),
                     &|path| cc_mapped_content_hash(path, &prefix_maps),
@@ -8476,18 +8577,27 @@ impl CcCompiler {
             })
         };
         let memo_hit = memo_hit
-            .map(|(hash, inputs)| -> Result<_> {
-                let Some((hash, expected_resolution)) = hash.split_once('@') else {
+            .map(|(memo_hash, inputs, stored)| -> Result<_> {
+                let Some((hash, expected_resolution)) = memo_hash.split_once('@') else {
                     return Ok(None);
                 };
                 let trace_names = crate::phase_trace::phase("cc_shadow_names");
-                let names = cc_shadowing_names(parsed, &inputs, ctx.file_hasher)?;
+                let (names, derived) = cc_shadowing_names_reusing(
+                    parsed,
+                    &inputs,
+                    ctx.file_hasher,
+                    stored.as_deref(),
+                )?;
                 drop(trace_names);
                 let _trace_digest = crate::phase_trace::phase("cc_shadow_digest");
                 let (resolution, stamps) =
                     digest_cc_shadowing_names_stamped(parsed, &names, Some(ctx.file_hasher))?;
                 if resolution != expected_resolution {
                     return Ok(None);
+                }
+                if let (Some(derived), Some(key)) = (derived, memo_key.as_deref()) {
+                    ctx.file_hasher
+                        .cc_preprocess_memo_set_shadowing(key, &memo_hash, &derived);
                 }
                 memo_shadowing = Some((names, resolution, stamps));
                 Ok(Some((hash.to_string(), inputs)))
@@ -8517,6 +8627,7 @@ impl CcCompiler {
                         fingerprints: captured.fingerprints,
                         prefix_maps: prefix_maps.clone(),
                         captured: true,
+                        shadowing: None,
                     });
             }
             tracing::trace!(
@@ -8582,6 +8693,7 @@ impl CcCompiler {
                         fingerprints,
                         prefix_maps: prefix_maps.clone(),
                         captured: false,
+                        shadowing: None,
                     });
             }
             tracing::trace!(
@@ -8637,10 +8749,16 @@ impl CcCompiler {
         let (names, include_dir_digest, stamps, include_dir_mode) = match memo_shadowing {
             Some((names, digest, stamps)) => (Some(names), digest, stamps, "resolved"),
             None => {
-                let names = read_inputs
+                let derived = read_inputs
                     .as_deref()
-                    .map(|inputs| cc_shadowing_names(parsed, inputs, ctx.file_hasher))
+                    .map(|inputs| cc_shadowing_names_reusing(parsed, inputs, ctx.file_hasher, None))
                     .transpose()?;
+                let names = derived.map(|(names, derivation)| {
+                    if let Some(pending) = self.pending_preprocess_memo.borrow_mut().as_mut() {
+                        pending.shadowing = derivation;
+                    }
+                    names
+                });
                 let (digest, stamps, mode) = match &names {
                     Some(names) => {
                         let (digest, stamps) = digest_cc_shadowing_names_stamped(

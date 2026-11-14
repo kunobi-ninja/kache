@@ -10055,6 +10055,7 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
         fingerprints: vec![input.clone()],
         prefix_maps: Vec::new(),
         captured,
+        shadowing: None,
     };
     let compiler = CcCompiler::new();
     assert!(compiler.captured_preprocess_memo().is_none());
@@ -10865,4 +10866,79 @@ fn parsed_header_scans_are_shared_across_units() {
     .unwrap();
     assert!(std::sync::Arc::ptr_eq(&first[0], &later[0]));
     assert!(std::sync::Arc::ptr_eq(&later[0], &later[1]));
+}
+
+#[test]
+fn a_stored_shadowing_derivation_is_reused_only_for_its_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    fs::create_dir_all(cwd.join("include")).unwrap();
+    fs::write(
+        cwd.join("include/probe.h"),
+        "#define HAS(x) __has_include(x)\n#if HAS(<optional.h>)\n#endif\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("include/plain.h"), "int plain;\n").unwrap();
+    fs::write(cwd.join("unit.c"), "#include <probe.h>\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        Vec::<(&str, &str)>::new(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let parsed = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let hasher = crate::cache_key::FileHasher::new();
+    let inputs = [
+        PathBuf::from("unit.c"),
+        cwd.join("include/probe.h"),
+        cwd.join("include/plain.h"),
+    ];
+    let (fresh, derived) = cc_shadowing_names_reusing(&parsed, &inputs, &hasher, None).unwrap();
+    let derived = derived.expect("computed without a stored value");
+    assert!(
+        fresh
+            .probes
+            .iter()
+            .any(|probe| probe.name == Path::new("optional.h"))
+    );
+    let digest = |names: &CcShadowingNames| digest_cc_shadowing_names(&parsed, names).unwrap();
+    // Listed in another order, the same bytes reuse it and agree.
+    let reordered = [inputs[2].clone(), inputs[0].clone(), inputs[1].clone()];
+    let (reused, again) =
+        cc_shadowing_names_reusing(&parsed, &reordered, &hasher, Some(&derived)).unwrap();
+    assert!(again.is_none(), "a matching derivation is reused");
+    assert_eq!(digest(&reused), digest(&fresh));
+    assert_eq!(reused.probes.len(), fresh.probes.len());
+    // Different bytes do not.
+    fs::write(
+        cwd.join("include/plain.h"),
+        "#if __has_include(<other.h>)\n#endif\n",
+    )
+    .unwrap();
+    let hasher = crate::cache_key::FileHasher::new();
+    let (changed, recomputed) =
+        cc_shadowing_names_reusing(&parsed, &inputs, &hasher, Some(&derived)).unwrap();
+    assert!(
+        recomputed.is_some(),
+        "a derivation for other bytes is ignored"
+    );
+    assert!(
+        changed
+            .probes
+            .iter()
+            .any(|probe| probe.name == Path::new("other.h"))
+    );
+    // Nor do different definitions.
+    let defined = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-DX=1", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let (_, redone) =
+        cc_shadowing_names_reusing(&defined, &inputs, &hasher, recomputed.as_deref()).unwrap();
+    assert!(redone.is_some());
 }

@@ -1764,7 +1764,10 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     // ([`crate::file_hash::has_rule_columns`]), so those are checked too.
     // Both checks only read.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation == INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
+    if generation == INDEX_SCHEMA_GENERATION
+        && crate::file_hash::has_rule_columns(db)?
+        && crate::cc_memo::has_shadowing_column(db)?
+    {
         return Ok(());
     }
 
@@ -1961,7 +1964,9 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 ///    payload schema. Compiled cache entries are retained.
 /// 13: `entries.rustc_version`, for explicit compiler-version cleanup.
 /// 14: partial index for pending durability counts and ordered flush batches.
-const INDEX_SCHEMA_GENERATION: i64 = 14;
+/// 15: `cc_preprocess_memos.shadowing`. An older release stamps 14 back, so
+///    the open also checks for the column.
+const INDEX_SCHEMA_GENERATION: i64 = 15;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's

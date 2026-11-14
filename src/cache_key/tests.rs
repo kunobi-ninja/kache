@@ -2088,7 +2088,7 @@ fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
         assert!(!input.stamp_settled());
         assert!(
             hasher
-                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .memo_input_is_unchanged(&input, &|_| vec![path.clone()], &|_| None,)
                 .is_none()
         );
         assert!(hasher.hash_static_lib(&path).is_ok());
@@ -15709,6 +15709,13 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
             + kache_store::file_hash::HASH_SETTLE_NS;
     }
     first.cc_preprocess_memo_record_if_unchanged("memo", &"a".repeat(64), &inputs, &no_mapping);
+    // The include-shadowing derivation rides on the row it was set for.
+    first.cc_preprocess_memo_set_shadowing("memo", &"b".repeat(64), "other row");
+    first.cc_preprocess_memo_set_shadowing("memo", &"a".repeat(64), "derived");
+    let (_, _, shadowing) = FileHasher::persistent(&db)
+        .cc_preprocess_memo_lookup_shadowing("memo", no_remap, &no_mapping)
+        .unwrap();
+    assert_eq!(shadowing.as_deref(), Some("derived"));
     let warm = FileHasher::persistent(&db);
     let (_, satisfied) = warm
         .cc_preprocess_memo_lookup("memo", no_remap, &no_mapping)

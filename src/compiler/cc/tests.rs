@@ -10055,6 +10055,7 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
         fingerprints: vec![input.clone()],
         prefix_maps: Vec::new(),
         captured,
+        shadowing: None,
     };
     let compiler = CcCompiler::new();
     assert!(compiler.captured_preprocess_memo().is_none());
@@ -10771,4 +10772,252 @@ fn linker_selection_is_keyed_with_warning_outcome_gates() {
         assert_ne!(without_linker, lld_link);
         assert_ne!(lld_link, raw_flags(Some("-fuse-ld=lld")));
     }
+}
+
+#[test]
+fn paste_wildcards_agree_with_regex() {
+    let words = ["__has_include", "x+y", "a.b", "#", "-", "", "0x1ULL"];
+    let mut patterns = vec![
+        "^.*$".to_owned(),
+        "^$".to_owned(),
+        "^.*.*$".to_owned(),
+        "^__has_.*$".to_owned(),
+        "^.*_include$".to_owned(),
+        "^_.*_.*e$".to_owned(),
+        "^__has_include.*_next$".to_owned(),
+        "^aa.*aa$".to_owned(),
+        "^a.*b.*b$".to_owned(),
+    ];
+    for left in words {
+        for right in words {
+            patterns.push(format!(
+                "^{}.*{}$",
+                regex::escape(left),
+                regex::escape(right)
+            ));
+            patterns.push(format!("^{}{}$", regex::escape(left), regex::escape(right)));
+        }
+    }
+    let texts = [
+        "ab",
+        "abb",
+        "__has_include",
+        "__has_include_next",
+        "aa",
+        "aaa",
+        "aaaa",
+        "x+y",
+        "a.b",
+        "axb",
+        "#-",
+        "",
+        "0x1ULL",
+    ];
+    for pattern in &patterns {
+        let pieces = cc_paste_wildcards(pattern).expect("scanner-shaped pattern");
+        let regex = regex::Regex::new(pattern).unwrap();
+        for text in texts {
+            assert_eq!(
+                cc_paste_wildcards_match(&pieces, text),
+                regex.is_match(text),
+                "{pattern} against {text:?}"
+            );
+        }
+    }
+    for other in [
+        "^a+$", "^\\d$", "^\\<a$", "^\\☃$", "^a.b$", "^(a)$", "a.*", "^a|b$",
+    ] {
+        assert!(cc_paste_wildcards(other).is_none(), "{other}");
+    }
+}
+
+#[test]
+fn parsed_header_scans_are_shared_across_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = dir.path().join("probe.h");
+    // The path makes the bytes, and so the shared entry, unique to this test.
+    fs::write(
+        &header,
+        format!(
+            "// {}\n#if __has_include(<optional.h>)\n#endif\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let first = cc_parsed_header_scans(
+        std::slice::from_ref(&header),
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
+    let probes = |scan: &CcParsedScan| {
+        cc_resolve_header_probes(
+            scan.as_ref().as_ref().unwrap(),
+            &cc_header_probe_aliases(std::iter::empty()),
+        )
+    };
+    assert_eq!(
+        probes(&first[0].1),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    let later = cc_parsed_header_scans(
+        &[header.clone(), header],
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first[0].1, &later[0].1));
+    assert!(std::sync::Arc::ptr_eq(&later[0].1, &later[1].1));
+}
+
+#[test]
+fn a_stored_shadowing_derivation_is_reused_only_for_its_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    fs::create_dir_all(cwd.join("include")).unwrap();
+    fs::write(
+        cwd.join("include/probe.h"),
+        "#define HAS(x) __has_include(x)\n#if HAS(<optional.h>)\n#endif\n",
+    )
+    .unwrap();
+    fs::write(cwd.join("include/plain.h"), "int plain;\n").unwrap();
+    fs::write(cwd.join("unit.c"), "#include <probe.h>\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        Vec::<(&str, &str)>::new(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let parsed = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let hasher = crate::cache_key::FileHasher::new();
+    let inputs = [
+        PathBuf::from("unit.c"),
+        cwd.join("include/probe.h"),
+        cwd.join("include/plain.h"),
+    ];
+    let (fresh, derived) = cc_shadowing_names_reusing(&parsed, &inputs, &hasher, None).unwrap();
+    let derived = derived.expect("computed without a stored value");
+    assert!(
+        fresh
+            .probes
+            .iter()
+            .any(|probe| probe.name == Path::new("optional.h"))
+    );
+    let digest = |names: &CcShadowingNames| digest_cc_shadowing_names(&parsed, names).unwrap();
+    // Listed in another order, the same bytes reuse it and agree.
+    let reordered = [inputs[2].clone(), inputs[0].clone(), inputs[1].clone()];
+    let (reused, again) =
+        cc_shadowing_names_reusing(&parsed, &reordered, &hasher, Some(&derived)).unwrap();
+    assert!(again.is_none(), "a matching derivation is reused");
+    assert_eq!(digest(&reused), digest(&fresh));
+    assert_eq!(reused.probes.len(), fresh.probes.len());
+    // Different bytes do not.
+    fs::write(
+        cwd.join("include/plain.h"),
+        "#if __has_include(<other.h>)\n#endif\n",
+    )
+    .unwrap();
+    let hasher = crate::cache_key::FileHasher::new();
+    let (changed, recomputed) =
+        cc_shadowing_names_reusing(&parsed, &inputs, &hasher, Some(&derived)).unwrap();
+    assert!(
+        recomputed.is_some(),
+        "a derivation for other bytes is ignored"
+    );
+    assert!(
+        changed
+            .probes
+            .iter()
+            .any(|probe| probe.name == Path::new("other.h"))
+    );
+    // Nor do different definitions.
+    let defined = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-DX=1", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let (_, redone) =
+        cc_shadowing_names_reusing(&defined, &inputs, &hasher, recomputed.as_deref()).unwrap();
+    assert!(redone.is_some());
+}
+
+#[test]
+fn parsed_scan_cache_stays_within_its_limit() {
+    let scan = || CcParsedScan::new(None);
+    let mut cache = CcParsedScans::default();
+    assert!(cache.admit("a".into(), scan(), 4, 10).is_none());
+    assert!(cache.admit("b".into(), scan(), 6, 10).is_none());
+    assert_eq!(cache.weight, 10, "filling exactly to the limit keeps both");
+    // Held already: no double count, nothing evicted.
+    assert!(cache.admit("a".into(), scan(), 4, 10).is_none());
+    assert_eq!(cache.weight, 10);
+    // Larger than the whole limit: never held.
+    assert!(cache.admit("huge".into(), scan(), 11, 10).is_none());
+    assert!(!cache.scans.contains_key("huge"));
+    // One more byte starts over with only the newcomer.
+    let evicted = cache.admit("c".into(), scan(), 1, 10).unwrap();
+    assert_eq!(evicted.scans.len(), 2);
+    assert_eq!(cache.weight, 1);
+    assert!(cache.scans.contains_key("c") && cache.scans.len() == 1);
+    // A scan weighing exactly the whole limit still fits.
+    let mut whole = CcParsedScans::default();
+    assert!(whole.admit("w".into(), scan(), 10, 10).is_none());
+    assert!(whole.scans.contains_key("w"));
+}
+
+#[test]
+fn parsed_scan_weight_counts_key_text_and_overhead() {
+    assert_eq!(cc_parsed_scan_weight("", ""), 128);
+    assert_eq!(cc_parsed_scan_weight("ab", "xyz"), 2 + 2 * 3 + 128);
+}
+
+#[test]
+fn a_newline_alias_keeps_regex_semantics() {
+    let macros = std::collections::HashMap::new();
+    let pastes = std::collections::HashMap::new();
+    // Verdicts are remembered for one alias set, so each set gets its own.
+    let spells = |alias: &str| {
+        CcPasteForwarding {
+            macros: &macros,
+            pastes: &pastes,
+            verdicts: Default::default(),
+        }
+        .spells_alias("^a.*b$", &HashSet::from([alias.to_owned()]))
+        .unwrap()
+    };
+    // `.` stops at a newline in a regex; a wildcard would not.
+    assert!(!spells("a\nb"));
+    assert!(spells("axb"));
+}
+
+#[test]
+fn header_scans_keep_one_bare_use_per_name_and_every_probe() {
+    let text = b"#if PREFIX\n#endif\n#if PREFIX\n#endif\n#if PREFIX\n#endif\n\
+#if __has_include(<x.h>)\n#endif\n#if defined(Z) && Z\n#endif\n#if defined(Z) && Z\n#endif\n\
+#if __has_include(<x.h>)\n#endif\n";
+    let scan = cc_header_probe_scan(text).unwrap();
+    let bare = |name: &str| {
+        scan.uses
+            .iter()
+            .filter(|(used, probe)| used == name && probe.is_none())
+            .count()
+    };
+    assert_eq!(bare("PREFIX"), 1);
+    assert_eq!(bare("if"), 1);
+    assert_eq!(
+        scan.conditionals.iter().filter(|c| c.name == "Z").count(),
+        1
+    );
+    // Both probes stay, in order: they are what a unit's resolution folds.
+    let probes = cc_resolve_header_probes(&scan, &cc_header_probe_aliases(std::iter::empty()));
+    let x = CcHeaderProbe {
+        name: "x.h".into(),
+        quoted: false,
+    };
+    assert_eq!(probes, Some(vec![x.clone(), x]));
 }

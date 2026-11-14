@@ -5966,8 +5966,7 @@ fn cc_parsed_header_scans(
                 let json = json.context("cc: a held header scan went missing")?;
                 let scan = CcParsedScan::new(serde_json::from_str(&json)?);
                 held.insert(content.clone(), scan.clone());
-                // Parsed vectors and the key cost more than the text.
-                let weight = content.len() + 2 * json.len() + 128;
+                let weight = cc_parsed_scan_weight(&content, &json);
                 learned.push((content.clone(), scan.clone(), weight));
                 scan
             }
@@ -5979,18 +5978,37 @@ fn cc_parsed_header_scans(
     if !learned.is_empty() {
         let mut shared = cc_parsed_scans();
         for (content, scan, weight) in learned {
-            if weight > CC_PARSED_SCANS_WEIGHT || shared.scans.contains_key(&content) {
-                continue;
-            }
-            if shared.weight + weight > CC_PARSED_SCANS_WEIGHT {
-                evicted.push(std::mem::take(&mut *shared));
-            }
-            shared.scans.insert(content, scan);
-            shared.weight += weight;
+            evicted.extend(shared.admit(content, scan, weight, CC_PARSED_SCANS_WEIGHT));
         }
     }
     drop(evicted);
     Ok(scans)
+}
+
+/// Estimated memory of one held scan: parsed vectors and the key cost more
+/// than the serialized text.
+fn cc_parsed_scan_weight(content: &str, json: &str) -> usize {
+    content.len() + 2 * json.len() + 128
+}
+
+impl CcParsedScans {
+    /// Hold `scan` within `limit`, starting over when it would not fit.
+    /// Returns the map that made room, for the caller to drop.
+    fn admit(
+        &mut self,
+        content: String,
+        scan: CcParsedScan,
+        weight: usize,
+        limit: usize,
+    ) -> Option<Self> {
+        if weight > limit || self.scans.contains_key(&content) {
+            return None;
+        }
+        let evicted = (self.weight + weight > limit).then(|| std::mem::take(self));
+        self.scans.insert(content, scan);
+        self.weight += weight;
+        evicted
+    }
 }
 
 /// A header name an availability probe tests for.

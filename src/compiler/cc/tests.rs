@@ -10786,6 +10786,7 @@ fn paste_wildcards_agree_with_regex() {
         "^_.*_.*e$".to_owned(),
         "^__has_include.*_next$".to_owned(),
         "^aa.*aa$".to_owned(),
+        "^a.*b.*b$".to_owned(),
     ];
     for left in words {
         for right in words {
@@ -10798,6 +10799,8 @@ fn paste_wildcards_agree_with_regex() {
         }
     }
     let texts = [
+        "ab",
+        "abb",
         "__has_include",
         "__has_include_next",
         "aa",
@@ -10941,4 +10944,49 @@ fn a_stored_shadowing_derivation_is_reused_only_for_its_inputs() {
     let (_, redone) =
         cc_shadowing_names_reusing(&defined, &inputs, &hasher, recomputed.as_deref()).unwrap();
     assert!(redone.is_some());
+}
+
+#[test]
+fn parsed_scan_cache_stays_within_its_limit() {
+    let scan = || CcParsedScan::new(None);
+    let mut cache = CcParsedScans::default();
+    assert!(cache.admit("a".into(), scan(), 4, 10).is_none());
+    assert!(cache.admit("b".into(), scan(), 6, 10).is_none());
+    assert_eq!(cache.weight, 10, "filling exactly to the limit keeps both");
+    // Held already: no double count, nothing evicted.
+    assert!(cache.admit("a".into(), scan(), 4, 10).is_none());
+    assert_eq!(cache.weight, 10);
+    // Larger than the whole limit: never held.
+    assert!(cache.admit("huge".into(), scan(), 11, 10).is_none());
+    assert!(!cache.scans.contains_key("huge"));
+    // One more byte starts over with only the newcomer.
+    let evicted = cache.admit("c".into(), scan(), 1, 10).unwrap();
+    assert_eq!(evicted.scans.len(), 2);
+    assert_eq!(cache.weight, 1);
+    assert!(cache.scans.contains_key("c") && cache.scans.len() == 1);
+}
+
+#[test]
+fn parsed_scan_weight_counts_key_text_and_overhead() {
+    assert_eq!(cc_parsed_scan_weight("", ""), 128);
+    assert_eq!(cc_parsed_scan_weight("ab", "xyz"), 2 + 2 * 3 + 128);
+}
+
+#[test]
+fn a_newline_alias_keeps_regex_semantics() {
+    let macros = std::collections::HashMap::new();
+    let pastes = std::collections::HashMap::new();
+    // Verdicts are remembered for one alias set, so each set gets its own.
+    let spells = |alias: &str| {
+        CcPasteForwarding {
+            macros: &macros,
+            pastes: &pastes,
+            verdicts: Default::default(),
+        }
+        .spells_alias("^a.*b$", &HashSet::from([alias.to_owned()]))
+        .unwrap()
+    };
+    // `.` stops at a newline in a regex; a wildcard would not.
+    assert!(!spells("a\nb"));
+    assert!(spells("axb"));
 }

@@ -154,6 +154,11 @@ fn ensure_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
     if has_shadowing_column(db)? {
         return Ok(());
     }
+    add_shadowing_column(db)
+}
+
+/// Another process may add the column between the look and the `ALTER`.
+fn add_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
     match db.execute_batch("ALTER TABLE cc_preprocess_memos ADD COLUMN shadowing TEXT") {
         Err(error) if !error.to_string().contains("duplicate column name") => Err(error),
         _ => Ok(()),
@@ -702,6 +707,25 @@ mod tests {
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "proof");
         assert_eq!(memo.inputs, [read_back(first), read_back(last)]);
+    }
+
+    #[test]
+    fn an_index_from_before_the_shadowing_column_gains_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .db()
+            .execute_batch("ALTER TABLE cc_preprocess_memos DROP COLUMN shadowing")
+            .unwrap();
+        assert!(!has_shadowing_column(cache.db()).unwrap());
+        ensure_schema(cache.db()).unwrap();
+        assert!(has_shadowing_column(cache.db()).unwrap());
+        // A racing process that added it first is not an error; anything
+        // else is.
+        add_shadowing_column(cache.db()).unwrap();
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(add_shadowing_column(&bare).is_err());
     }
 
     #[test]

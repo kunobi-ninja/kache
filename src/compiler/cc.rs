@@ -5813,7 +5813,7 @@ type CcParsedScan = std::sync::Arc<Option<CcHeaderProbeScan>>;
 #[derive(Default)]
 struct CcParsedScans {
     scans: foldhash::HashMap<String, CcParsedScan>,
-    /// Serialized size of the held scans, to bound memory.
+    /// Estimated memory of the held scans, from their serialized size.
     weight: usize,
 }
 
@@ -5866,26 +5866,30 @@ fn cc_parsed_header_scans(
                 let json = json.context("cc: a held header scan went missing")?;
                 let scan = CcParsedScan::new(serde_json::from_str(&json)?);
                 held.insert(content.clone(), scan.clone());
-                learned.push((content, scan.clone(), json.len()));
+                // Parsed vectors and the key cost more than the text.
+                let weight = content.len() + 2 * json.len() + 128;
+                learned.push((content, scan.clone(), weight));
                 scan
             }
         };
         scans.push(scan);
     }
+    // Full maps are dropped after the lock is released.
+    let mut evicted = Vec::new();
     if !learned.is_empty() {
         let mut shared = cc_parsed_scans();
         for (content, scan, weight) in learned {
-            if weight > CC_PARSED_SCANS_WEIGHT {
+            if weight > CC_PARSED_SCANS_WEIGHT || shared.scans.contains_key(&content) {
                 continue;
             }
             if shared.weight + weight > CC_PARSED_SCANS_WEIGHT {
-                *shared = CcParsedScans::default();
+                evicted.push(std::mem::take(&mut *shared));
             }
-            if shared.scans.insert(content, scan).is_none() {
-                shared.weight += weight;
-            }
+            shared.scans.insert(content, scan);
+            shared.weight += weight;
         }
     }
+    drop(evicted);
     Ok(scans)
 }
 

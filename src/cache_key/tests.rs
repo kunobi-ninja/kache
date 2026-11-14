@@ -1815,6 +1815,27 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
         first,
         "reverting recovers the old key"
     );
+    // The same resource in another target directory (a new worktree's
+    // `<OUT_DIR>/resource.res`): only its bytes and place are keyed.
+    let moved_arg = if cfg!(windows) {
+        dir.path().join("other-target").join("first.res")
+    } else {
+        PathBuf::from("C:/other-target/first.res")
+    };
+    let moved_res = file_hasher.resolve_path(&moved_arg).unwrap();
+    std::fs::create_dir_all(moved_res.parent().unwrap()).unwrap();
+    std::fs::copy(&first_res, &moved_res).unwrap();
+    assert_eq!(
+        key(&[moved_arg.as_path(), second_arg.as_path()], None).unwrap(),
+        first,
+        "a resource keys by its bytes, not its directory"
+    );
+    std::fs::write(&moved_res, windows_test_resource(b"resource v3")).unwrap();
+    assert_ne!(
+        key(&[moved_arg.as_path(), second_arg.as_path()], None).unwrap(),
+        first,
+        "the moved resource's bytes still reach the key"
+    );
     for argument in [
         "C:/extra.obj",
         "/MANIFESTINPUT:app.xml",
@@ -9797,6 +9818,39 @@ fn cache_key_ignores_linker_path() {
     )
     .unwrap();
     assert_eq!(a, b, "linker path must not affect the cache key");
+}
+
+#[test]
+fn a_resource_path_keeps_its_spelling_off_a_native_msvc_link() {
+    // Only a native MSVC link keys a lone `.res` link-arg by its bytes; a
+    // unit that does not link there still keys the path as spelled.
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let key = |resource: &str| {
+        let argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            format!("-Clink-arg={resource}"),
+        ];
+        compute_cache_key(
+            &RustcArgs::parse(&argv).unwrap(),
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        key(r"C:\one\resource.res"),
+        key(r"C:\two\resource.res"),
+        "off a native MSVC link the resource path stays in the key"
+    );
 }
 
 /// Shared base argv for the flag-keying regression tests below.
@@ -22063,6 +22117,65 @@ fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
     assert!(
         output.fields.unwrap().contains_key("pe_pdb_admission"),
         "legacy producers cannot write this namespace"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_native_msvc_link_keys_its_resource_alike_in_every_target_directory() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").unwrap();
+    let invocation = client_invocation(&workspace, &[("OUT_DIR", None)]);
+    let version = get_rustc_version_for(Path::new("rustc"), &invocation).unwrap();
+    let target = rustc_host_triple(&version).unwrap().to_string();
+    // winresource's `<OUT_DIR>/resource.res` in two target directories.
+    let first = dir.path().join("a").join("resource.res");
+    let moved = dir.path().join("b").join("resource.res");
+    for resource in [&first, &moved] {
+        std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        std::fs::write(resource, windows_test_resource(b"icon")).unwrap();
+    }
+    let key = |resource: &Path| {
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-name=app".into(),
+                "--crate-type=bin".into(),
+                format!("--target={target}"),
+                format!("-Clink-arg={}", resource.display()),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        compute_cache_key(
+            &args,
+            &FileHasher::new_for(&invocation),
+            &PathNormalizer::from_invocation(Some(&workspace), &invocation),
+            &KeyEnv::from_invocation(&invocation),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        key(&first),
+        key(&moved),
+        "the same resource bytes key alike in another target directory"
+    );
+    std::fs::write(&moved, windows_test_resource(b"other icon")).unwrap();
+    assert_ne!(
+        key(&first),
+        key(&moved),
+        "other resource bytes change the key"
     );
 }
 

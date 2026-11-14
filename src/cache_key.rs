@@ -3476,9 +3476,20 @@ fn compute_key_into(
         })
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
+    // A native MSVC link keys a compiled resource named alone by its bytes
+    // and place in the MSVC identity below, so its path stays out here.
+    let native_windows_msvc =
+        is_native_windows_msvc_link(args, &rustc_version, cfg!(target_os = "windows"), |rustc| {
+            get_rustc_version_for(rustc, invocation)
+        })?;
     for (key, value) in &codegen_opts {
         fold_field(&mut hasher, b"codegen_key:", key.as_bytes());
         if let Some(v) = value {
+            let v = if native_windows_msvc && is_keyed_windows_resource(key, v) {
+                WINDOWS_RESOURCE_ARGUMENT
+            } else {
+                v
+            };
             // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
             // carry absolute paths. None of these go through
             // PathNormalizer (they're rustc-controlled flags, not env);
@@ -3837,12 +3848,6 @@ fn compute_key_into(
     if native_linker_side_files_are_unmodeled(args) {
         anyhow::bail!("native linker order/map/response side files are not cacheable");
     }
-    // Native MSVC links resolve their libraries and link-argument files in
-    // the MSVC identity below, so the Unix rules here stay off for them.
-    let native_windows_msvc =
-        is_native_windows_msvc_link(args, &rustc_version, cfg!(target_os = "windows"), |rustc| {
-            get_rustc_version_for(rustc, invocation)
-        })?;
     // Only a link searches for libraries, so only a link reads the host.
     let link_rustc_version = if args.invokes_linker() {
         Some(rustc_version_for_native_link(
@@ -11403,6 +11408,9 @@ fn windows_link_identity_with_argument_files(
 
 /// Generic codegen hashing sorts by option name. LINK options can override
 /// earlier options across link-arg/link-args carriers, so retain that order too.
+///
+/// A compiled resource named alone ([`is_keyed_windows_resource`]) folds as
+/// [`WINDOWS_RESOURCE_ARGUMENT`]: its bytes and place are in the identity.
 fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs) {
     for (index, (carrier, value)) in args
         .codegen_opts
@@ -11415,7 +11423,14 @@ fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs
             .and_then(crate::native_link_key::WindowsDefaultLibrary::parse);
         let (carrier, value) = match default_library {
             Some(library) => ("defaultlib", library.canonical_name()),
-            None => (carrier.as_str(), value.as_deref().unwrap_or("")),
+            None => {
+                let value = value.as_deref().unwrap_or("");
+                if is_keyed_windows_resource(carrier, value) {
+                    (carrier.as_str(), WINDOWS_RESOURCE_ARGUMENT)
+                } else {
+                    (carrier.as_str(), value)
+                }
+            }
         };
         fold_field(
             hasher,
@@ -11425,6 +11440,30 @@ fn fold_windows_link_argument_order<H: KeyFold>(hasher: &mut H, args: &RustcArgs
         fold_field(hasher, b"windows_link_arg_carrier.v1:", carrier.as_bytes());
         fold_field(hasher, b"windows_link_arg_value.v1:", value.as_bytes());
     }
+}
+
+/// What a native MSVC link keys in place of a compiled resource's path.
+const WINDOWS_RESOURCE_ARGUMENT: &str = "kache-windows-resource";
+
+/// Whether a `-C link-arg` value is one compiled resource (`.res`) named by
+/// absolute path and nothing else. A native MSVC link keys that file by its
+/// bytes and its place among the link arguments in the MSVC identity
+/// ([`windows_link_identity_with_argument_files`]), and the linker reads
+/// nothing else of it, so the path itself stays out of the key. winresource
+/// and embed-resource print `<OUT_DIR>/resource.res` this way; folded as
+/// spelled, that path tied the link's key to one target directory.
+fn is_keyed_windows_resource(key: &str, value: &str) -> bool {
+    key == "link-arg"
+        && matches!(
+            crate::native_link_key::windows_link_argument_input_files(key, value),
+            Some(crate::native_link_key::WindowsLinkArgumentInputs { files, default_libraries })
+                if default_libraries.is_empty()
+                    && matches!(
+                        files.as_slice(),
+                        [crate::native_link_key::WindowsLinkInput::Resource(path)]
+                            if path.as_os_str() == value
+                    )
+        )
 }
 
 fn windows_libpath_argument(value: &str) -> Result<Option<String>> {

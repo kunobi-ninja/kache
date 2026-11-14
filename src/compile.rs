@@ -1514,10 +1514,10 @@ fi
             let (done, wait) = std::sync::mpsc::channel::<()>();
             std::thread::spawn(move || {
                 let waited = wait.recv_timeout(std::time::Duration::from_secs(30));
-                if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                    if let Ok(pid) = libc::pid_t::try_from(pid) {
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                    }
+                if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    && let Ok(pid) = libc::pid_t::try_from(pid)
+                {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
             });
             done

@@ -5985,7 +5985,10 @@ impl CcPasteForwarding<'_> {
         if let Some(verdict) = self.verdicts.borrow().get(pattern) {
             return Ok(*verdict);
         }
-        let verdict = match cc_paste_wildcards(pattern) {
+        // `.` does not match a newline; an identifier never holds one.
+        let wildcards = cc_paste_wildcards(pattern)
+            .filter(|_| !aliases.iter().any(|alias| alias.contains('\n')));
+        let verdict = match wildcards {
             Some(pieces) => aliases
                 .iter()
                 .any(|alias| cc_paste_wildcards_match(&pieces, alias)),
@@ -6009,8 +6012,9 @@ fn cc_paste_wildcards(pattern: &str) -> Option<Vec<String>> {
     let mut chars = body.chars();
     while let Some(c) = chars.next() {
         match c {
+            // Exactly what `regex::escape` emits; other escapes have meaning.
             '\\' => match chars.next() {
-                Some(escaped) if !escaped.is_alphanumeric() => {
+                Some(escaped) if "\\.+*?()|[]{}^$#&-~".contains(escaped) => {
                     pieces.last_mut()?.push(escaped);
                 }
                 _ => return None,

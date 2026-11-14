@@ -10820,7 +10820,9 @@ fn paste_wildcards_agree_with_regex() {
             );
         }
     }
-    for other in ["^a+$", "^\\d$", "^a.b$", "^(a)$", "a.*", "^a|b$"] {
+    for other in [
+        "^a+$", "^\\d$", "^\\<a$", "^\\☃$", "^a.b$", "^(a)$", "a.*", "^a|b$",
+    ] {
         assert!(cc_paste_wildcards(other).is_none(), "{other}");
     }
 }

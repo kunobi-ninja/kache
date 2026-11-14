@@ -508,6 +508,9 @@ fn capture_rustc_output_with(
             capture_rustc_stderr_with(stderr, metadata_sink.as_deref_mut(), on_dep_info, freeze);
         if stderr.as_ref().is_err() || stderr.as_ref().is_ok_and(|captured| captured.stopped) {
             let _ = child.lock().unwrap().kill();
+            // A frozen compiler the kill missed must not stay stopped; run
+            // on, it finishes before the wait below lets a restore start.
+            crate::compile_freeze::resume(freeze);
         }
         let stdout = stdout.join();
         // Neither reader needs the child lock after joining. Holding it during
@@ -582,14 +585,11 @@ fn capture_rustc_stderr_with(
         // rustc writes dep-info right after expansion, long before metadata,
         // so nothing has reached Cargo yet when the caller decides.
         if emit == Some("dep-info") {
-            // A compile that must be frozen to be stopped is only asked
-            // about when it could be; otherwise it runs on and keys after.
-            let suspended = crate::compile_freeze::Suspended::new(freeze);
-            if let Some(decide) = on_dep_info
-                .as_deref_mut()
-                .filter(|_| freeze.is_none() || suspended.is_some())
-            {
-                if !decide() {
+            if let Some(decide) = on_dep_info.as_deref_mut() {
+                // A compile that must be frozen to be stopped is only asked
+                // about when it could be; otherwise it runs on and keys after.
+                let suspended = crate::compile_freeze::Suspended::new(freeze);
+                if (freeze.is_none() || suspended.is_some()) && !decide() {
                     if metadata_sink.as_ref().is_some_and(|sink| sink.attempted) {
                         return Err(io::Error::other(
                             "cannot stop rustc after metadata delivery was attempted",
@@ -602,7 +602,6 @@ fn capture_rustc_stderr_with(
                     return Ok(captured);
                 }
             }
-            drop(suspended);
             if let Some(sink) = metadata_sink.as_deref_mut() {
                 sink.dep_info_reported()?;
             }

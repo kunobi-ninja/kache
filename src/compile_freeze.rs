@@ -2,10 +2,13 @@
 //! can be stopped on a cache hit without a linker outliving it.
 
 /// A compiler suspended at its dep-info report, if it could be shown safe
-/// to stop: Linux reports it stopped and without a child process, so it
-/// has started no linker or other writer that would outlive it (a wrapper
-/// that spawned the real compiler fails this as well). Dropping it resumes
-/// the compiler; a stop keeps it suspended until the caller kills it.
+/// to stop: Linux reports every thread stopped and no child process, so it
+/// has started no linker that would outlive it (a wrapper that spawned the
+/// real compiler fails this as well). rustc runs its linker only after
+/// codegen, which a stopped compiler cannot reach. A process detached
+/// before dep-info, such as one a proc macro spawned, is out of reach here
+/// as it is for a compile that does not link. Dropping it resumes the
+/// compiler; a stop keeps it suspended until the caller kills it.
 pub(crate) struct Suspended(Option<u32>);
 
 impl Suspended {
@@ -38,30 +41,50 @@ impl Suspended {
 
 impl Drop for Suspended {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-            unsafe { libc::kill(pid, libc::SIGCONT) };
-        }
+        resume(self.0);
     }
 }
 
-/// Whether the process reports itself stopped, waiting briefly for the
-/// signal to land. An exited compiler (a zombie) never does.
+/// Continue `pid` if it is stopped. Harmless on a running or killed one;
+/// the caller has not reaped it, so the pid is still its own.
+pub(crate) fn resume(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Whether every thread of the process reports itself stopped, waiting
+/// briefly for the group stop to complete. Threads stop one at a time; a
+/// thread still running could finish a fork after the children are read.
+/// An exited compiler (a zombie) never qualifies.
 #[cfg(target_os = "linux")]
 fn linux_stopped(proc_dir: &std::path::Path) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
     loop {
-        let state = std::fs::read_to_string(proc_dir.join("stat"))
-            .ok()
-            .and_then(|stat| linux_process_state(&stat));
-        if state == Some('T') {
-            return true;
+        match linux_thread_states(proc_dir) {
+            Some(states) if !states.is_empty() && states.iter().all(|state| *state == 'T') => {
+                return true;
+            }
+            None => return false,
+            Some(_) if std::time::Instant::now() >= deadline => return false,
+            Some(_) => std::thread::sleep(std::time::Duration::from_micros(200)),
         }
-        if state.is_none() || std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(200));
     }
+}
+
+/// The state of each thread, or `None` when the process cannot be read.
+#[cfg(target_os = "linux")]
+fn linux_thread_states(proc_dir: &std::path::Path) -> Option<Vec<char>> {
+    std::fs::read_dir(proc_dir.join("task"))
+        .ok()?
+        .map(|task| {
+            let stat = std::fs::read_to_string(task.ok()?.path().join("stat")).ok()?;
+            linux_process_state(&stat)
+        })
+        .collect()
 }
 
 /// The state letter of a `/proc/<pid>/stat` line. The command name can hold

@@ -15548,8 +15548,7 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
 
 /// An index stamped 10 by a release from before the header-scan memo
 /// (#1638) has no `cc_header_scans`: opening it must add the table, or
-/// every C/C++ preprocess memo read (which joins it) and the memo pruning
-/// fail on that store for good.
+/// every header scan read and the memo pruning fail on that store for good.
 #[test]
 fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -15592,7 +15591,12 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     assert!(cache.get_cc_preprocess_memo("absent").unwrap().is_none());
     let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
     assert_eq!(memo.preprocessed_hash, "preprocessed");
-    assert_eq!(memo.header_scans, vec![None]);
+    assert!(
+        cache
+            .get_cc_header_scans(7, &["header-content"])
+            .unwrap()
+            .is_empty()
+    );
     cache
         .put_cc_header_scans(7, &[("header-content".into(), "[]".into())])
         .unwrap();
@@ -15603,5 +15607,8 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let cache = crate::file_hash::FileHashCache::Borrowed(&db);
     let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
     assert_eq!(memo.preprocessed_hash, "preprocessed");
-    assert_eq!(memo.header_scans, vec![Some((7, "[]".into()))]);
+    assert_eq!(
+        cache.get_cc_header_scans(7, &["header-content"]).unwrap()["header-content"],
+        "[]"
+    );
 }

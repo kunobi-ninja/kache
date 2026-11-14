@@ -1,7 +1,7 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
 use crate::file_hash::{FileFingerprint, FileHashCache, file_hash_memo_eligible, stamp_is_settled};
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcPreprocessMemoInput {
@@ -86,8 +86,9 @@ fn unproven(path: String) -> FileFingerprint {
 pub struct CcPreprocessMemo {
     pub preprocessed_hash: String,
     pub inputs: Vec<CcPreprocessMemoInput>,
-    /// Content-addressed header scans, in the same order as `inputs`.
-    pub header_scans: Vec<Option<(i64, String)>>,
+    /// What the compiler derived from the inputs' header scans, opaque here.
+    /// The value carries its own proof of which inputs it describes.
+    pub shadowing: Option<String>,
     pub needs_touch: bool,
 }
 
@@ -100,7 +101,7 @@ fn has_current_schema(db: &Connection) -> rusqlite::Result<bool> {
 
 pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
     if has_current_schema(db)? {
-        return Ok(());
+        return ensure_shadowing_column(db);
     }
     // Recheck after acquiring the writer lock: concurrent wrappers may have
     // observed the legacy table before the first migration committed.
@@ -113,7 +114,8 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
                 memo_key TEXT NOT NULL UNIQUE,
                 preprocessed_hash TEXT NOT NULL,
                 input_count INTEGER NOT NULL,
-                last_used INTEGER NOT NULL DEFAULT (unixepoch())
+                last_used INTEGER NOT NULL DEFAULT (unixepoch()),
+                shadowing TEXT
              );
              CREATE INDEX cc_preprocess_memos_last_used ON cc_preprocess_memos(last_used);
              CREATE TABLE cc_memo_inputs (
@@ -137,7 +139,30 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
              CREATE INDEX cc_memo_input_refs_input ON cc_memo_input_refs(input_id);",
         )?;
     }
-    tx.commit()
+    tx.commit()?;
+    ensure_shadowing_column(db)
+}
+
+/// Whether memo rows can carry the include-shadowing derivation.
+pub(crate) fn has_shadowing_column(db: &Connection) -> rusqlite::Result<bool> {
+    has_column(db, "cc_preprocess_memos", "shadowing")
+}
+
+/// Add `cc_preprocess_memos.shadowing` to a table from before it. Rows keep
+/// no value, and the first hit on each computes one.
+fn ensure_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
+    if has_shadowing_column(db)? {
+        return Ok(());
+    }
+    add_shadowing_column(db)
+}
+
+/// Another process may add the column between the look and the `ALTER`.
+fn add_shadowing_column(db: &Connection) -> rusqlite::Result<()> {
+    match db.execute_batch("ALTER TABLE cc_preprocess_memos ADD COLUMN shadowing TEXT") {
+        Err(error) if !error.to_string().contains("duplicate column name") => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// The mapped-content memo: what a file's bytes hash to once the prefix maps
@@ -412,12 +437,10 @@ impl FileHashCache<'_> {
         let mut stmt = self.db().prepare_cached(
             "SELECT m.preprocessed_hash, m.input_count, m.last_used <= unixepoch() - 86400,
                     i.id, i.name, i.content, i.mapped, i.local_path,
-                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof,
-                    s.version, s.scan
+                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof
              FROM cc_preprocess_memos m
              LEFT JOIN cc_memo_input_refs r ON r.memo_id = m.id
              LEFT JOIN cc_memo_inputs i ON i.id = r.input_id
-             LEFT JOIN cc_header_scans s ON s.content = i.content
              WHERE m.memo_key = ?1 ORDER BY i.name, r.input_id",
         )?;
         let mut rows = stmt.query([memo_key])?;
@@ -432,7 +455,7 @@ impl FileHashCache<'_> {
                 result = Some(CcPreprocessMemo {
                     preprocessed_hash: row.get(0)?,
                     inputs: Vec::new(),
-                    header_scans: Vec::new(),
+                    shadowing: None,
                     needs_touch: row.get(2)?,
                 });
             }
@@ -444,11 +467,6 @@ impl FileHashCache<'_> {
                 inode: row.get(11)?,
             };
             let proven = row.get::<_, Option<i64>>(12)? == Some(stamp_proof(&stamp));
-            result.as_mut().unwrap().header_scans.push(
-                row.get::<_, Option<i64>>(13)?
-                    .map(|version| row.get(14).map(|scan| (version, scan)))
-                    .transpose()?,
-            );
             result.as_mut().unwrap().inputs.push(CcPreprocessMemoInput {
                 name: row.get(4)?,
                 content: row.get(5)?,
@@ -458,7 +476,20 @@ impl FileHashCache<'_> {
             });
         }
         // A damaged/incomplete reference set cannot stand in for the full closure.
-        Ok(result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count))
+        let Some(mut memo) =
+            result.filter(|memo| expected_count > 0 && memo.inputs.len() as i64 == expected_count)
+        else {
+            return Ok(None);
+        };
+        // Apart from the rows above: the sort would copy it into every one.
+        // A value from a newer row is harmless, since it names its inputs.
+        memo.shadowing = self
+            .db()
+            .prepare_cached("SELECT shadowing FROM cc_preprocess_memos WHERE memo_key = ?1")?
+            .query_row([memo_key], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(Some(memo))
     }
 
     /// Record `inputs` as the read set behind `preprocessed_hash`.
@@ -479,7 +510,8 @@ impl FileHashCache<'_> {
         let id: i64 = tx.query_row(
             "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
              VALUES (?1, ?2, 0) ON CONFLICT(memo_key) DO UPDATE SET
-             preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch()
+             preprocessed_hash = excluded.preprocessed_hash, last_used = unixepoch(),
+             shadowing = NULL
              RETURNING id",
             params![memo_key, preprocessed_hash],
             |row| row.get(0),
@@ -556,6 +588,22 @@ impl FileHashCache<'_> {
         let inputs: Vec<CcPreprocessMemoInput> = serde_json::from_str(json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         self.put_cc_preprocess_memo_inputs(memo_key, hash, &inputs)
+    }
+
+    /// Attach the compiler's include-shadowing derivation to the memo row
+    /// that still records `preprocessed_hash`. A row replaced since keeps
+    /// whatever it has.
+    pub fn set_cc_preprocess_memo_shadowing(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        shadowing: &str,
+    ) -> rusqlite::Result<usize> {
+        self.db().execute(
+            "UPDATE cc_preprocess_memos SET shadowing = ?3
+             WHERE memo_key = ?1 AND preprocessed_hash = ?2",
+            params![memo_key, preprocessed_hash, shadowing],
+        )
     }
 
     /// Called after a successful validation and only when the read marked it
@@ -656,25 +704,59 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(id_order, ["z.h", "a.h"]);
-        cache
-            .put_cc_header_scans(
-                6,
-                &[
-                    ("first".into(), "first scan".into()),
-                    ("last".into(), "last scan".into()),
-                ],
-            )
-            .unwrap();
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "proof");
         assert_eq!(memo.inputs, [read_back(first), read_back(last)]);
+    }
+
+    #[test]
+    fn an_index_from_before_the_shadowing_column_gains_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .db()
+            .execute_batch("ALTER TABLE cc_preprocess_memos DROP COLUMN shadowing")
+            .unwrap();
+        assert!(!has_shadowing_column(cache.db()).unwrap());
+        ensure_schema(cache.db()).unwrap();
+        assert!(has_shadowing_column(cache.db()).unwrap());
+        // A racing process that added it first is not an error; anything
+        // else is.
+        add_shadowing_column(cache.db()).unwrap();
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(add_shadowing_column(&bare).is_err());
+    }
+
+    #[test]
+    fn shadowing_stays_with_the_row_it_was_derived_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let shadowing = |cache: &FileHashCache| {
+            cache
+                .get_cc_preprocess_memo("unit")
+                .unwrap()
+                .unwrap()
+                .shadowing
+        };
+        cache
+            .put_cc_preprocess_memo_inputs("unit", "first", &[input("a.h", "a")])
+            .unwrap();
+        assert_eq!(shadowing(&cache), None);
         assert_eq!(
-            memo.header_scans,
-            [
-                Some((6, "first scan".into())),
-                Some((6, "last scan".into()))
-            ]
+            cache
+                .set_cc_preprocess_memo_shadowing("unit", "other", "stale")
+                .unwrap(),
+            0
         );
+        cache
+            .set_cc_preprocess_memo_shadowing("unit", "first", "derived")
+            .unwrap();
+        assert_eq!(shadowing(&cache).as_deref(), Some("derived"));
+        cache
+            .put_cc_preprocess_memo_inputs("unit", "second", &[input("b.h", "b")])
+            .unwrap();
+        assert_eq!(shadowing(&cache), None, "a replaced row drops it");
     }
 
     #[test]
@@ -710,14 +792,6 @@ mod tests {
         cache
             .put_cc_preprocess_memo_inputs("live", "hash", &[input("a.h", "content-0")])
             .unwrap();
-        assert_eq!(
-            cache
-                .get_cc_preprocess_memo("live")
-                .unwrap()
-                .unwrap()
-                .header_scans,
-            [Some((2, "new".into()))]
-        );
         cache.prune_cc_preprocess_memos().unwrap();
         assert_eq!(count(&cache, "cc_header_scans"), 1);
         assert_eq!(

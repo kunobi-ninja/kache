@@ -7048,11 +7048,18 @@ fn compile_before_key(
 /// to report its dep-info as a JSON artifact, and must not link: stopping
 /// kills rustc alone, and a linker it had already started could still write
 /// over the restored output.
+///
+/// On Linux a compile that links qualifies too: it is suspended at its
+/// dep-info while it is keyed, and only offered a stop once Linux shows it
+/// stopped with no child (`compile::capture_rustc_output_with`).
+#[cfg(target_os = "linux")]
 fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
-    // A compile that links is suspended at its dep-info while it is keyed,
-    // and only once Linux shows it stopped with no child
-    // (`compile::capture_rustc_output_with`).
-    args.reports_artifacts() && (!args.invokes_linker() || cfg!(target_os = "linux"))
+    args.reports_artifacts()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
+    args.reports_artifacts() && !args.invokes_linker()
 }
 
 /// The closure the running compile wrote to its dep-info, once rustc has

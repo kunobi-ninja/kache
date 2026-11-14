@@ -1508,8 +1508,23 @@ fi
             (child, stdout, stderr)
         };
         let lines = || fs::read_to_string(&ticks).map_or(0, |text| text.lines().count());
+        // A compiler left suspended would hang the test; kill it instead so
+        // the failure shows.
+        let watchdog = |pid: u32| {
+            let (done, wait) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let waited = wait.recv_timeout(std::time::Duration::from_secs(30));
+                if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    if let Ok(pid) = libc::pid_t::try_from(pid) {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            });
+            done
+        };
 
         let (mut child, stdout, stderr) = spawn();
+        let done = watchdog(child.id());
         let mut frozen_progress = None;
         let mut go_on = || {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1521,6 +1536,7 @@ fi
         let (status, _, captured) =
             capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut go_on), true)
                 .unwrap();
+        drop(done);
         assert_eq!(frozen_progress, Some(0), "the compiler ran while frozen");
         assert!(!captured.stopped);
         assert!(status.success(), "the compiler was not resumed");

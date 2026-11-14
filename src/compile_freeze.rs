@@ -57,22 +57,28 @@ pub(crate) fn resume(pid: Option<u32>) {
 }
 
 /// Whether every thread of the process reports itself stopped, waiting
-/// briefly for the group stop to complete. Threads stop one at a time; a
-/// thread still running could finish a fork after the children are read.
-/// An exited compiler (a zombie) never qualifies.
+/// briefly (up to 250 polls, about 50 ms) for the group stop to complete.
 #[cfg(target_os = "linux")]
 fn linux_stopped(proc_dir: &std::path::Path) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
-    loop {
-        match linux_thread_states(proc_dir) {
-            Some(states) if !states.is_empty() && states.iter().all(|state| *state == 'T') => {
-                return true;
-            }
-            None => return false,
-            Some(_) if std::time::Instant::now() >= deadline => return false,
-            Some(_) => std::thread::sleep(std::time::Duration::from_micros(200)),
+    all_stopped(|| linux_thread_states(proc_dir), 250)
+}
+
+/// Whether `states` reports every thread stopped within `polls` reads.
+/// Threads stop one at a time; a thread still running could finish a fork
+/// after the children are read. An unreadable process never qualifies, nor
+/// does one with no threads left (a zombie).
+#[cfg(any(target_os = "linux", test))]
+fn all_stopped(mut states: impl FnMut() -> Option<Vec<char>>, polls: usize) -> bool {
+    for _ in 0..polls {
+        let Some(states) = states() else {
+            return false;
+        };
+        if !states.is_empty() && states.iter().all(|state| *state == 'T') {
+            return true;
         }
+        std::thread::sleep(std::time::Duration::from_micros(200));
     }
+    false
 }
 
 /// The state of each thread, or `None` when the process cannot be read.
@@ -117,5 +123,63 @@ mod tests {
         assert_eq!(linux_process_state("42 (a) (b) R 1"), Some('R'));
         assert_eq!(linux_process_state("42 (odd)name) S 1"), Some('S'));
         assert_eq!(linux_process_state("no state"), None);
+    }
+
+    #[test]
+    fn only_a_process_whose_threads_all_stop_in_time_counts_as_stopped() {
+        let reads = |seq: &'static [&'static [char]]| {
+            let mut next = seq.iter();
+            move || next.next().map(|states| states.to_vec())
+        };
+        assert!(all_stopped(reads(&[&['R', 'T'], &['T', 'T']]), 2));
+        assert!(!all_stopped(reads(&[&['R', 'T'], &['T', 'T']]), 1));
+        assert!(!all_stopped(reads(&[&['T', 'S'], &['T', 'R']]), 5));
+        assert!(!all_stopped(reads(&[&[]]), 1), "no threads left");
+        assert!(!all_stopped(reads(&[]), 5), "unreadable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_running_process_is_not_stopped() {
+        assert!(!linux_stopped(std::path::Path::new("/proc/self")));
+    }
+
+    /// A kept compiler stays stopped for the kill; a dropped one runs on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kept_compiler_stays_stopped_and_a_dropped_one_runs_on() {
+        use crate::invocation::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .invocation_spawn()
+            .unwrap();
+        let pid = child.id();
+        let state = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| linux_process_state(&stat))
+        };
+        let runs_within_a_second = || {
+            (0..100).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                state() != Some('T')
+            })
+        };
+
+        let suspended = Suspended::new(Some(pid)).expect("a builtin loop can be frozen");
+        assert_eq!(state(), Some('T'));
+        drop(suspended);
+        assert!(
+            runs_within_a_second(),
+            "a dropped suspension left it stopped"
+        );
+
+        Suspended::new(Some(pid)).unwrap().keep();
+        assert!(!runs_within_a_second(), "a kept suspension resumed it");
+
+        resume(Some(pid));
+        assert!(runs_within_a_second(), "resume left it stopped");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

@@ -231,6 +231,7 @@ pub(crate) fn run_rustc(
     incremental_mode: IncrementalMode,
     metadata_sink: Option<&mut MetadataSink<'_>>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    freeze_at_dep_info: bool,
 ) -> Result<CompileResult> {
     let cwd = env
         .cwd()
@@ -372,6 +373,7 @@ pub(crate) fn run_rustc(
         child_stderr,
         metadata_sink,
         on_dep_info,
+        freeze_at_dep_info,
     );
     drop(compiler_trace);
     drop(response_file);
@@ -473,18 +475,23 @@ fn capture_rustc_output(
     metadata_sink: Option<&mut dyn Write>,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
     let mut metadata_sink = metadata_sink.map(MetadataSink::immediate);
-    capture_rustc_output_with(child, stdout, stderr, metadata_sink.as_mut(), None)
+    capture_rustc_output_with(child, stdout, stderr, metadata_sink.as_mut(), None, false)
 }
 
 /// Drain both pipes. `on_dep_info` is asked, when rustc reports its dep-info
 /// written, whether to let the compile go on; `false` stops rustc there.
+/// With `freeze_at_dep_info`, rustc is suspended while the caller decides,
+/// so a compile that links cannot have started its linker when it is
+/// stopped: the linker would outlive rustc and write over a restored hit.
 fn capture_rustc_output_with(
     child: &mut Child,
     mut stdout: impl Read + Send,
     stderr: impl Read,
     mut metadata_sink: Option<&mut MetadataSink<'_>>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    freeze_at_dep_info: bool,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
+    let freeze = freeze_at_dep_info.then(|| child.id());
     let child = std::sync::Mutex::new(child);
     let captured = std::thread::scope(|scope| {
         let stdout = scope.spawn(|| {
@@ -497,7 +504,8 @@ fn capture_rustc_output_with(
             }
             result
         });
-        let stderr = capture_rustc_stderr_with(stderr, metadata_sink.as_deref_mut(), on_dep_info);
+        let stderr =
+            capture_rustc_stderr_with(stderr, metadata_sink.as_deref_mut(), on_dep_info, freeze);
         if stderr.as_ref().is_err() || stderr.as_ref().is_ok_and(|captured| captured.stopped) {
             let _ = child.lock().unwrap().kill();
         }
@@ -540,13 +548,46 @@ fn capture_rustc_stderr(
     metadata_sink: Option<&mut dyn Write>,
 ) -> io::Result<CapturedStderr> {
     let mut metadata_sink = metadata_sink.map(MetadataSink::immediate);
-    capture_rustc_stderr_with(reader, metadata_sink.as_mut(), None)
+    capture_rustc_stderr_with(reader, metadata_sink.as_mut(), None, None)
+}
+
+/// A compiler suspended at its dep-info report. Dropping it resumes the
+/// compiler, so no path leaves it stopped; a stop keeps it suspended until
+/// the caller kills it.
+struct Suspended(Option<u32>);
+
+impl Suspended {
+    fn new(pid: Option<u32>) -> Self {
+        #[cfg(unix)]
+        let pid = pid.filter(|pid| {
+            libc::pid_t::try_from(*pid)
+                .is_ok_and(|pid| unsafe { libc::kill(pid, libc::SIGSTOP) } == 0)
+        });
+        #[cfg(not(unix))]
+        let pid = pid.and(None);
+        Self(pid)
+    }
+
+    /// Leave the compiler stopped for the kill that follows.
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Suspended {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            unsafe { libc::kill(pid, libc::SIGCONT) };
+        }
+    }
 }
 
 fn capture_rustc_stderr_with(
     reader: impl Read,
     mut metadata_sink: Option<&mut MetadataSink<'_>>,
     mut on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    freeze: Option<u32>,
 ) -> io::Result<CapturedStderr> {
     let mut reader = BufReader::new(reader);
     let mut captured = CapturedStderr {
@@ -573,16 +614,18 @@ fn capture_rustc_stderr_with(
         // rustc writes dep-info right after expansion, long before metadata,
         // so nothing has reached Cargo yet when the caller decides.
         if emit == Some("dep-info") {
-            if let Some(decide) = on_dep_info.as_deref_mut()
-                && !decide()
-            {
-                if metadata_sink.as_ref().is_some_and(|sink| sink.attempted) {
-                    return Err(io::Error::other(
-                        "cannot stop rustc after metadata delivery was attempted",
-                    ));
+            if let Some(decide) = on_dep_info.as_deref_mut() {
+                let suspended = Suspended::new(freeze);
+                if !decide() {
+                    if metadata_sink.as_ref().is_some_and(|sink| sink.attempted) {
+                        return Err(io::Error::other(
+                            "cannot stop rustc after metadata delivery was attempted",
+                        ));
+                    }
+                    suspended.keep();
+                    captured.stopped = true;
+                    return Ok(captured);
                 }
-                captured.stopped = true;
-                return Ok(captured);
             }
             if let Some(sink) = metadata_sink.as_deref_mut() {
                 sink.dep_info_reported()?;
@@ -1147,6 +1190,7 @@ fi
                             IncrementalMode::Strip,
                             Some(&mut MetadataSink::immediate(&mut metadata)),
                             None,
+                            false,
                         )
                         .unwrap();
                         assert_eq!(result.exit_code, 0, "{}", result.stderr);
@@ -1247,6 +1291,7 @@ fi
                         ReadErrorAfter(Cursor::new(input)),
                         Some(&mut sink),
                         None,
+                        false,
                     )
                     .err()
                     .expect("read failure must remain a failure");
@@ -1285,7 +1330,7 @@ fi
             let mut ready = || true;
             let mut sink = MetadataSink::after_dep_info(&mut writer, &mut ready);
             let captured =
-                capture_rustc_stderr_with(input.as_slice(), Some(&mut sink), None).unwrap();
+                capture_rustc_stderr_with(input.as_slice(), Some(&mut sink), None, None).unwrap();
             let completion = finish_rustc_output(
                 Err(io::Error::other("injected wait failure")),
                 Ok(Ok(Vec::new())),
@@ -1363,6 +1408,7 @@ fi
                 input.as_slice(),
                 Some(&mut sink),
                 Some(&mut stop),
+                false,
             );
             if case == "gated-unexposed" {
                 assert!(result.unwrap().2.stopped);
@@ -1408,6 +1454,7 @@ fi
                 input.as_slice(),
                 Some(&mut MetadataSink::after_dep_info(&mut writer, &mut ready)),
                 None,
+                false,
             );
             assert_eq!(checked, 2);
             if revoke {
@@ -1423,6 +1470,68 @@ fi
             }
             assert!(child.try_wait().unwrap().is_some());
         }
+    }
+
+    /// A compile that links is suspended while the caller decides, so it
+    /// cannot reach its linker, and runs on once the caller lets it. A stop
+    /// kills the suspended compiler.
+    #[cfg(unix)]
+    #[test]
+    fn a_frozen_compile_waits_for_the_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = dir.path().join("ticks");
+        // After its dep-info line the child appends to a file as fast as it
+        // can, standing in for codegen racing toward the linker.
+        let script = format!(
+            "printf '%s\\n' '{{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}}' >&2; \
+             i=0; while [ $i -lt 400 ]; do echo $i >> '{}'; i=$((i+1)); sleep 0.005; done",
+            ticks.display()
+        );
+        let spawn = || {
+            let mut child = Command::new("sh")
+                .args(["-c", &script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .invocation_spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            (child, stdout, stderr)
+        };
+        let lines = || fs::read_to_string(&ticks).map_or(0, |text| text.lines().count());
+
+        let (mut child, stdout, stderr) = spawn();
+        let mut frozen_progress = None;
+        let mut go_on = || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let before = lines();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            frozen_progress = Some(lines() - before);
+            true
+        };
+        let (status, _, captured) =
+            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut go_on), true)
+                .unwrap();
+        assert_eq!(frozen_progress, Some(0), "the compiler ran while frozen");
+        assert!(!captured.stopped);
+        assert!(status.success(), "the compiler was not resumed");
+        assert_eq!(lines(), 400);
+
+        fs::remove_file(&ticks).unwrap();
+        let (mut child, stdout, stderr) = spawn();
+        let mut at_stop = None;
+        let mut stop = || {
+            at_stop = Some(lines());
+            false
+        };
+        let (status, _, captured) =
+            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop), true)
+                .unwrap();
+        assert!(captured.stopped);
+        assert!(!status.success());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(Some(lines()), at_stop, "a stopped compiler kept working");
     }
 
     /// Stopping at the dep-info line kills the compiler and returns at once,
@@ -1443,7 +1552,8 @@ fi
         let started = std::time::Instant::now();
         let mut stop = || false;
         let (status, _, captured) =
-            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop)).unwrap();
+            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop), false)
+                .unwrap();
         assert!(captured.stopped);
         assert!(!status.success());
         assert!(
@@ -1567,6 +1677,7 @@ fi
             reader,
             Some(&mut MetadataSink::after_dep_info(&mut writer, &mut ready)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(asked, 1);
@@ -1600,6 +1711,7 @@ fi
                 input.as_slice(),
                 Some(&mut MetadataSink::after_dep_info(&mut sink, &mut ready)),
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(asked, usize::from(report_dep_info));
@@ -1626,6 +1738,7 @@ fi
             input.as_slice(),
             Some(&mut MetadataSink::after_dep_info(&mut sink, &mut ready)),
             Some(&mut stop),
+            None,
         )
         .unwrap();
         assert!(captured.stopped);
@@ -1677,6 +1790,7 @@ fi
                 &mut reader,
                 Some(&mut MetadataSink::immediate(&mut sink)),
                 Some(&mut decide),
+                None,
             )
             .unwrap();
             assert_eq!(asked, 1);

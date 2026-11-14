@@ -361,6 +361,7 @@ impl RustcCompiler {
             incremental_mode,
             metadata_sink.as_mut(),
             on_dep_info,
+            parsed.invokes_linker(),
         );
         let result = result.map(|mut result| {
             if !skip_remap

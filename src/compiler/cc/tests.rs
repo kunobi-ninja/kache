@@ -10772,3 +10772,55 @@ fn linker_selection_is_keyed_with_warning_outcome_gates() {
         assert_ne!(lld_link, raw_flags(Some("-fuse-ld=lld")));
     }
 }
+
+#[test]
+fn paste_wildcards_agree_with_regex() {
+    let words = ["__has_include", "x+y", "a.b", "#", "-", "", "0x1ULL"];
+    let mut patterns = vec![
+        "^.*$".to_owned(),
+        "^$".to_owned(),
+        "^.*.*$".to_owned(),
+        "^__has_.*$".to_owned(),
+        "^.*_include$".to_owned(),
+        "^_.*_.*e$".to_owned(),
+        "^__has_include.*_next$".to_owned(),
+        "^aa.*aa$".to_owned(),
+    ];
+    for left in words {
+        for right in words {
+            patterns.push(format!(
+                "^{}.*{}$",
+                regex::escape(left),
+                regex::escape(right)
+            ));
+            patterns.push(format!("^{}{}$", regex::escape(left), regex::escape(right)));
+        }
+    }
+    let texts = [
+        "__has_include",
+        "__has_include_next",
+        "aa",
+        "aaa",
+        "aaaa",
+        "x+y",
+        "a.b",
+        "axb",
+        "#-",
+        "",
+        "0x1ULL",
+    ];
+    for pattern in &patterns {
+        let pieces = cc_paste_wildcards(pattern).expect("scanner-shaped pattern");
+        let regex = regex::Regex::new(pattern).unwrap();
+        for text in texts {
+            assert_eq!(
+                cc_paste_wildcards_match(&pieces, text),
+                regex.is_match(text),
+                "{pattern} against {text:?}"
+            );
+        }
+    }
+    for other in ["^a+$", "^\\d$", "^a.b$", "^(a)$", "a.*", "^a|b$"] {
+        assert!(cc_paste_wildcards(other).is_none(), "{other}");
+    }
+}

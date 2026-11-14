@@ -5764,10 +5764,12 @@ fn cc_shadowing_names(
             .chain(std::iter::once(&argument_scan))
     };
     let aliases = cc_header_probe_aliases(all_scans());
+    let trace_pastes = crate::phase_trace::phase("cc_shadow_pastes");
     anyhow::ensure!(
         cc_header_probe_pastes_are_resolved(all_scans(), &aliases)?,
         "cc: token pasting may construct a header availability probe"
     );
+    drop(trace_pastes);
     let argument_probes = cc_resolve_header_probes(&argument_scan, &aliases)
         .context("cc: unresolved header availability probe in command-line definitions")?;
     let mut result = CcShadowingNames::default();
@@ -5915,6 +5917,7 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     let forwarding = CcPasteForwarding {
         macros: &macro_bodies,
         pastes: &paste_patterns,
+        verdicts: Default::default(),
     };
     let mut visiting = HashSet::new();
     let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
@@ -5935,8 +5938,7 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     }
     let mut pending = Vec::new();
     for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
-        let pattern = regex::Regex::new(pattern)?;
-        if aliases.iter().any(|alias| pattern.is_match(alias)) {
+        if forwarding.spells_alias(pattern, aliases)? {
             pending.push(name.as_str());
         }
     }
@@ -5973,6 +5975,74 @@ type CcPasteMacroBodies<'a> = Vec<(&'a [String], &'a [CcHeaderMacroUse])>;
 struct CcPasteForwarding<'a> {
     macros: &'a std::collections::HashMap<&'a str, CcPasteMacroBodies<'a>>,
     pastes: &'a std::collections::HashMap<&'a str, Vec<&'a str>>,
+    /// Whether each paste pattern can spell an alias. The same patterns are
+    /// reached from many uses, and compiling them again dominated a C++ hit.
+    verdicts: std::cell::RefCell<foldhash::HashMap<String, bool>>,
+}
+
+impl CcPasteForwarding<'_> {
+    fn spells_alias(&self, pattern: &str, aliases: &HashSet<String>) -> Result<bool> {
+        if let Some(verdict) = self.verdicts.borrow().get(pattern) {
+            return Ok(*verdict);
+        }
+        let verdict = match cc_paste_wildcards(pattern) {
+            Some(pieces) => aliases
+                .iter()
+                .any(|alias| cc_paste_wildcards_match(&pieces, alias)),
+            None => {
+                let regex = regex::Regex::new(pattern)?;
+                aliases.iter().any(|alias| regex.is_match(alias))
+            }
+        };
+        self.verdicts
+            .borrow_mut()
+            .insert(pattern.to_owned(), verdict);
+        Ok(verdict)
+    }
+}
+
+/// The literal pieces between `.*` wildcards of an anchored paste pattern,
+/// the only shape the scanner builds. `None` sends anything else to `regex`.
+fn cc_paste_wildcards(pattern: &str) -> Option<Vec<String>> {
+    let body = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let mut pieces = vec![String::new()];
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped) if !escaped.is_alphanumeric() => {
+                    pieces.last_mut()?.push(escaped);
+                }
+                _ => return None,
+            },
+            '.' => {
+                if chars.next() != Some('*') {
+                    return None;
+                }
+                pieces.push(String::new());
+            }
+            '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => return None,
+            c => pieces.last_mut()?.push(c),
+        }
+    }
+    Some(pieces)
+}
+
+/// Whether `text` matches the pieces, with any text between neighbours.
+fn cc_paste_wildcards_match(pieces: &[String], text: &str) -> bool {
+    let [first, middle @ .., last] = pieces else {
+        return pieces.first().is_some_and(|only| only == text);
+    };
+    let Some(mut rest) = text.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    for piece in middle {
+        match rest.find(piece.as_str()) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last.as_str())
 }
 
 /// Bind literal arguments to a pure concatenation helper. Caller parameters
@@ -6032,8 +6102,7 @@ fn cc_paste_use_can_name_probe(
             }
         }
         pattern.push('$');
-        let pattern = regex::Regex::new(&pattern)?;
-        if aliases.iter().any(|alias| pattern.is_match(alias)) {
+        if forwarding.spells_alias(&pattern, aliases)? {
             return Ok(true);
         }
     }
@@ -6054,8 +6123,7 @@ fn cc_indirect_paste_can_name_probe(
 ) -> Result<bool> {
     if let Some(patterns) = forwarding.pastes.get(used.name.as_str()) {
         for pattern in patterns {
-            let pattern = regex::Regex::new(pattern)?;
-            if aliases.iter().any(|alias| pattern.is_match(alias)) {
+            if forwarding.spells_alias(pattern, aliases)? {
                 return Ok(true);
             }
         }
@@ -8327,7 +8395,10 @@ impl CcCompiler {
                 let Some((hash, expected_resolution)) = hash.split_once('@') else {
                     return Ok(None);
                 };
+                let trace_names = crate::phase_trace::phase("cc_shadow_names");
                 let names = cc_shadowing_names(parsed, &inputs, ctx.file_hasher)?;
+                drop(trace_names);
+                let _trace_digest = crate::phase_trace::phase("cc_shadow_digest");
                 let (resolution, stamps) =
                     digest_cc_shadowing_names_stamped(parsed, &names, Some(ctx.file_hasher))?;
                 if resolution != expected_resolution {

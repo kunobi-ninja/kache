@@ -12158,10 +12158,11 @@ fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
     );
 }
 
-/// Only a compile that reports its dep-info and does not link may start
-/// before its key: a stopped rustc must not leave a linker behind.
+/// Only a compile that reports its dep-info may start before its key. One
+/// that links is suspended while it is keyed, which needs Linux to show it
+/// stopped and childless: a stopped rustc must not leave a linker behind.
 #[test]
-fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
+fn a_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     let parse = |crate_type: &str, json: bool| {
         let mut argv = vec![
             "rustc",
@@ -12181,7 +12182,12 @@ fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     assert!(stop_on_hit_allowed(&parse("rlib", true)));
     assert!(!stop_on_hit_allowed(&parse("lib", false)));
     for linked in ["bin", "proc-macro", "cdylib", "dylib"] {
-        assert!(!stop_on_hit_allowed(&parse(linked, true)), "{linked}");
+        assert_eq!(
+            stop_on_hit_allowed(&parse(linked, true)),
+            cfg!(target_os = "linux"),
+            "{linked}"
+        );
+        assert!(!stop_on_hit_allowed(&parse(linked, false)), "{linked}");
     }
 }
 

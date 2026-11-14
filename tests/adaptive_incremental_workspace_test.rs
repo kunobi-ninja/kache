@@ -464,6 +464,31 @@ impl RaceWorkspace {
     }
 }
 
+/// A binary that compiled while a save landed is never stored. On Linux it
+/// can be stopped on a hit, so it compiles before its key, without the
+/// pre-pass, and is either skipped or seeds a private incremental
+/// directory, which is never published. Elsewhere it keys from the pre-pass
+/// first, as [`assert_unstored_after_a_save`] describes.
+#[cfg(unix)]
+fn assert_binary_unstored_after_a_save(event: &Value) {
+    if !cfg!(target_os = "linux") {
+        return assert_unstored_after_a_save(event);
+    }
+    assert_eq!(event["dep_info_runs"], 0, "no pre-pass: {event:#}");
+    match event["result"].as_str() {
+        Some("skipped") => {
+            assert_eq!(event["skip_reason"], "inputs-changed", "event: {event:#}");
+        }
+        Some("passthrough") => {}
+        _ => panic!("a compile that read a save was stored: {event:#}"),
+    }
+    assert_eq!(
+        event["store_output_blobs"].as_u64().unwrap_or(0),
+        0,
+        "event: {event:#}"
+    );
+}
+
 /// A unit with policy state took its key from the pre-pass, before the
 /// compile, and a save landed after that key. The compile must not be stored
 /// under it.
@@ -532,7 +557,7 @@ fn a_save_while_a_binary_with_policy_state_compiles_is_not_stored() {
     fs::write(fixture.project.join("README.md"), "race, edited\n").unwrap();
     let (printed, app_event) = build("b", Some(&main("new")));
     assert_eq!(printed, "new b", "rustc read the saved source");
-    assert_unstored_after_a_save(&app_event);
+    assert_binary_unstored_after_a_save(&app_event);
 
     fs::write(fixture.project.join("app/src/main.rs"), main("old")).unwrap();
     let (printed, app_event) = build("b", None);
@@ -540,11 +565,11 @@ fn a_save_while_a_binary_with_policy_state_compiles_is_not_stored() {
     assert_eq!(printed, "old b", "the revert compiled");
 }
 
-/// A binary whose predicted key missed, as after an eviction, re-derives
-/// that key with the pre-pass first, because its compile cannot be stopped
-/// on a hit. When the key comes out the same and no seed can start, since
-/// the unit was last built under it, the binary still compiles before keying
-/// again.
+/// A binary whose predicted key missed, as after an eviction, must
+/// re-derive that key before anything is stored. Where its compile can be
+/// stopped on a hit (Linux) it compiles first and keys from what it read;
+/// elsewhere it re-derives with the pre-pass and, when no seed can start,
+/// still compiles before keying again.
 #[cfg(unix)]
 #[test]
 fn a_save_while_a_binary_re_derives_its_key_is_not_stored() {
@@ -562,7 +587,7 @@ fn a_save_while_a_binary_re_derives_its_key_is_not_stored() {
     purge_crate(&fixture.project, fixture.cache.path(), "race_app");
     let (printed, app_event) = build(Some(&main("new")));
     assert_eq!(printed, "new", "rustc read the saved source");
-    assert_unstored_after_a_save(&app_event);
+    assert_binary_unstored_after_a_save(&app_event);
 
     fs::write(fixture.project.join("app/src/main.rs"), main("old")).unwrap();
     let (printed, app_event) = build(None);

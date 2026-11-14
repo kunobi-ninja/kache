@@ -13,6 +13,7 @@ mod cargo_proxy;
 mod checked_regions;
 mod cli;
 mod compile;
+mod compile_freeze;
 mod compiler;
 mod config;
 mod config_cli;

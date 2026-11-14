@@ -5855,10 +5855,19 @@ fn cc_derive_shadowing(
     let scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
     let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
         .context("cc: unresolved header availability probe in command-line definitions")?;
+    // The scans must describe the bytes the digest names.
+    anyhow::ensure!(
+        scans.len() == contents.len()
+            && scans
+                .iter()
+                .zip(contents)
+                .all(|((scanned, _), content)| scanned == content),
+        "cc: a header changed while its probes were derived"
+    );
     let all_scans = || {
         scans
             .iter()
-            .filter_map(|scan| scan.as_ref().as_ref())
+            .filter_map(|(_, scan)| scan.as_ref().as_ref())
             .chain(std::iter::once(&argument_scan))
     };
     let aliases = cc_header_probe_aliases(all_scans());
@@ -5871,7 +5880,7 @@ fn cc_derive_shadowing(
     let arguments = cc_resolve_header_probes(&argument_scan, &aliases)
         .context("cc: unresolved header availability probe in command-line definitions")?;
     let mut probes = std::collections::BTreeMap::new();
-    for ((input, content), scan) in read_inputs.iter().zip(contents).zip(&scans) {
+    for (input, (content, scan)) in read_inputs.iter().zip(&scans) {
         let resolved = scan
             .as_ref()
             .as_ref()
@@ -5919,11 +5928,11 @@ fn cc_parsed_scans() -> std::sync::MutexGuard<'static, CcParsedScans> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The probe scan of each read input, in order.
+/// The content hash and probe scan of each read input, in order.
 fn cc_parsed_header_scans(
     read_inputs: &[PathBuf],
     file_hasher: &crate::cache_key::FileHasher<'_>,
-) -> Result<Vec<CcParsedScan>> {
+) -> Result<Vec<(String, CcParsedScan)>> {
     let mut held = foldhash::HashMap::<String, CcParsedScan>::default();
     let fetched = file_hasher.cc_header_scans_except(
         read_inputs,
@@ -5959,11 +5968,11 @@ fn cc_parsed_header_scans(
                 held.insert(content.clone(), scan.clone());
                 // Parsed vectors and the key cost more than the text.
                 let weight = content.len() + 2 * json.len() + 128;
-                learned.push((content, scan.clone(), weight));
+                learned.push((content.clone(), scan.clone(), weight));
                 scan
             }
         };
-        scans.push(scan);
+        scans.push((content, scan));
     }
     // Full maps are dropped after the lock is released.
     let mut evicted = Vec::new();
@@ -7778,7 +7787,8 @@ impl CcCompiler {
             &pending.fingerprints,
             &|path| cc_mapped_content_hash(path, &pending.prefix_maps),
         );
-        // Lands only on the row recorded above; the value proves its inputs.
+        // The value names its inputs, so a row replaced meanwhile at worst
+        // recomputes it.
         if let Some(shadowing) = &pending.shadowing {
             file_hasher.cc_preprocess_memo_set_shadowing(
                 &pending.memo_key,

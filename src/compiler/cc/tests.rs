@@ -10853,7 +10853,7 @@ fn parsed_header_scans_are_shared_across_units() {
         )
     };
     assert_eq!(
-        probes(&first[0]),
+        probes(&first[0].1),
         Some(vec![CcHeaderProbe {
             name: "optional.h".into(),
             quoted: false
@@ -10864,8 +10864,8 @@ fn parsed_header_scans_are_shared_across_units() {
         &crate::cache_key::FileHasher::new(),
     )
     .unwrap();
-    assert!(std::sync::Arc::ptr_eq(&first[0], &later[0]));
-    assert!(std::sync::Arc::ptr_eq(&later[0], &later[1]));
+    assert!(std::sync::Arc::ptr_eq(&first[0].1, &later[0].1));
+    assert!(std::sync::Arc::ptr_eq(&later[0].1, &later[1].1));
 }
 
 #[test]

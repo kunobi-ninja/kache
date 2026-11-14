@@ -10964,6 +10964,10 @@ fn parsed_scan_cache_stays_within_its_limit() {
     assert_eq!(evicted.scans.len(), 2);
     assert_eq!(cache.weight, 1);
     assert!(cache.scans.contains_key("c") && cache.scans.len() == 1);
+    // A scan weighing exactly the whole limit still fits.
+    let mut whole = CcParsedScans::default();
+    assert!(whole.admit("w".into(), scan(), 10, 10).is_none());
+    assert!(whole.scans.contains_key("w"));
 }
 
 #[test]

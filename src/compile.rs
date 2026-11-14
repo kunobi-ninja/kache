@@ -551,38 +551,6 @@ fn capture_rustc_stderr(
     capture_rustc_stderr_with(reader, metadata_sink.as_mut(), None, None)
 }
 
-/// A compiler suspended at its dep-info report. Dropping it resumes the
-/// compiler, so no path leaves it stopped; a stop keeps it suspended until
-/// the caller kills it.
-struct Suspended(Option<u32>);
-
-impl Suspended {
-    fn new(pid: Option<u32>) -> Self {
-        #[cfg(unix)]
-        let pid = pid.filter(|pid| {
-            libc::pid_t::try_from(*pid)
-                .is_ok_and(|pid| unsafe { libc::kill(pid, libc::SIGSTOP) } == 0)
-        });
-        #[cfg(not(unix))]
-        let pid = pid.and(None);
-        Self(pid)
-    }
-
-    /// Leave the compiler stopped for the kill that follows.
-    fn keep(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for Suspended {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-            unsafe { libc::kill(pid, libc::SIGCONT) };
-        }
-    }
-}
-
 fn capture_rustc_stderr_with(
     reader: impl Read,
     mut metadata_sink: Option<&mut MetadataSink<'_>>,
@@ -614,19 +582,27 @@ fn capture_rustc_stderr_with(
         // rustc writes dep-info right after expansion, long before metadata,
         // so nothing has reached Cargo yet when the caller decides.
         if emit == Some("dep-info") {
-            if let Some(decide) = on_dep_info.as_deref_mut() {
-                let suspended = Suspended::new(freeze);
+            // A compile that must be frozen to be stopped is only asked
+            // about when it could be; otherwise it runs on and keys after.
+            let suspended = crate::compile_freeze::Suspended::new(freeze);
+            if let Some(decide) = on_dep_info
+                .as_deref_mut()
+                .filter(|_| freeze.is_none() || suspended.is_some())
+            {
                 if !decide() {
                     if metadata_sink.as_ref().is_some_and(|sink| sink.attempted) {
                         return Err(io::Error::other(
                             "cannot stop rustc after metadata delivery was attempted",
                         ));
                     }
-                    suspended.keep();
+                    if let Some(suspended) = suspended {
+                        suspended.keep();
+                    }
                     captured.stopped = true;
                     return Ok(captured);
                 }
             }
+            drop(suspended);
             if let Some(sink) = metadata_sink.as_deref_mut() {
                 sink.dep_info_reported()?;
             }
@@ -1472,10 +1448,41 @@ fi
         }
     }
 
+    /// A compiler with a child (a linker, or the real compiler under a
+    /// wrapper) is never frozen to be stopped: the caller is not asked, and
+    /// the compile runs to the end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_compile_with_a_child_is_not_frozen() {
+        let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; sleep 0.3 & wait";
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .invocation_spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        // The child is started right after the line; give it time to exist.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut asked = false;
+        let mut stop = || {
+            asked = true;
+            false
+        };
+        let (status, _, captured) =
+            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop), true)
+                .unwrap();
+        assert!(!asked, "a compiler with a child was offered a stop");
+        assert!(!captured.stopped);
+        assert!(status.success());
+    }
+
     /// A compile that links is suspended while the caller decides, so it
     /// cannot reach its linker, and runs on once the caller lets it. A stop
     /// kills the suspended compiler.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_frozen_compile_waits_for_the_decision() {
         let dir = tempfile::tempdir().unwrap();

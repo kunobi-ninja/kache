@@ -7049,9 +7049,10 @@ fn compile_before_key(
 /// kills rustc alone, and a linker it had already started could still write
 /// over the restored output.
 fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
-    // A compile that links is suspended at its dep-info while it is keyed
-    // (`compile::capture_rustc_output_with`), which needs Unix signals.
-    args.reports_artifacts() && (!args.invokes_linker() || cfg!(unix))
+    // A compile that links is suspended at its dep-info while it is keyed,
+    // and only once Linux shows it stopped with no child
+    // (`compile::capture_rustc_output_with`).
+    args.reports_artifacts() && (!args.invokes_linker() || cfg!(target_os = "linux"))
 }
 
 /// The closure the running compile wrote to its dep-info, once rustc has

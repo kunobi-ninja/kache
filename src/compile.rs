@@ -1484,13 +1484,15 @@ fi
     #[cfg(target_os = "linux")]
     #[test]
     fn a_frozen_compile_waits_for_the_decision() {
+        const TICKS: usize = 50_000;
         let dir = tempfile::tempdir().unwrap();
         let ticks = dir.path().join("ticks");
         // After its dep-info line the child appends to a file as fast as it
-        // can, standing in for codegen racing toward the linker.
+        // can, standing in for codegen racing toward the linker. Builtins
+        // only: a child process would rightly keep it from being frozen.
         let script = format!(
             "printf '%s\\n' '{{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}}' >&2; \
-             i=0; while [ $i -lt 400 ]; do echo $i >> '{}'; i=$((i+1)); sleep 0.005; done",
+             i=0; while [ $i -lt {TICKS} ]; do echo $i >> '{}'; i=$((i+1)); done",
             ticks.display()
         );
         let spawn = || {
@@ -1522,7 +1524,7 @@ fi
         assert_eq!(frozen_progress, Some(0), "the compiler ran while frozen");
         assert!(!captured.stopped);
         assert!(status.success(), "the compiler was not resumed");
-        assert_eq!(lines(), 400);
+        assert_eq!(lines(), TICKS);
 
         fs::remove_file(&ticks).unwrap();
         let (mut child, stdout, stderr) = spawn();

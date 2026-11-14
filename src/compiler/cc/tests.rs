@@ -10990,3 +10990,30 @@ fn a_newline_alias_keeps_regex_semantics() {
     assert!(!spells("a\nb"));
     assert!(spells("axb"));
 }
+
+#[test]
+fn header_scans_keep_one_bare_use_per_name_and_every_probe() {
+    let text = b"#if PREFIX\n#endif\n#if PREFIX\n#endif\n#if PREFIX\n#endif\n\
+#if __has_include(<x.h>)\n#endif\n#if defined(Z) && Z\n#endif\n#if defined(Z) && Z\n#endif\n\
+#if __has_include(<x.h>)\n#endif\n";
+    let scan = cc_header_probe_scan(text).unwrap();
+    let bare = |name: &str| {
+        scan.uses
+            .iter()
+            .filter(|(used, probe)| used == name && probe.is_none())
+            .count()
+    };
+    assert_eq!(bare("PREFIX"), 1);
+    assert_eq!(bare("if"), 1);
+    assert_eq!(
+        scan.conditionals.iter().filter(|c| c.name == "Z").count(),
+        1
+    );
+    // Both probes stay, in order: they are what a unit's resolution folds.
+    let probes = cc_resolve_header_probes(&scan, &cc_header_probe_aliases(std::iter::empty()));
+    let x = CcHeaderProbe {
+        name: "x.h".into(),
+        quoted: false,
+    };
+    assert_eq!(probes, Some(vec![x.clone(), x]));
+}

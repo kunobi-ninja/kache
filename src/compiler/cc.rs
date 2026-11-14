@@ -5917,7 +5917,8 @@ struct CcParsedScans {
     weight: usize,
 }
 
-const CC_HEADER_SCAN_VERSION: i64 = 6;
+/// 7: repeated uses without a probe, and repeated conditionals, are kept once.
+const CC_HEADER_SCAN_VERSION: i64 = 7;
 const CC_PARSED_SCANS_WEIGHT: usize = 64 << 20;
 static CC_PARSED_SCANS: std::sync::LazyLock<std::sync::Mutex<CcParsedScans>> =
     std::sync::LazyLock::new(Default::default);
@@ -6475,6 +6476,17 @@ fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
         scanned_to = end;
     }
     cc_scan_header_probe_line(text, &line, &mut scan)?;
+    // A use without a probe matters only by its name: should the name prove
+    // to be an alias, one such use already leaves the header unresolved.
+    // Keep the first of each, and every use with a probe, in order, so the
+    // probes a unit resolves are unchanged. A symbol-prefix header repeats
+    // the same few names thousands of times. Conditionals are only asked
+    // whether any can construct a probe.
+    let mut bare = HashSet::new();
+    scan.uses
+        .retain(|(name, probe)| probe.is_some() || bare.insert(name.clone()));
+    scan.conditionals.sort();
+    scan.conditionals.dedup();
     Some(scan)
 }
 

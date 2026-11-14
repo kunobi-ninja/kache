@@ -5737,19 +5737,7 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = file_hasher.cc_header_scans(&read_inputs, 6, &|path| {
-        let bytes = fs::read(path)
-            .with_context(|| format!("reading header availability input {}", path.display()))?;
-        let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
-        Ok((
-            blake3::hash(&bytes).to_hex().to_string(),
-            serde_json::to_string(&probes)?,
-        ))
-    })?;
-    let scans = scans
-        .iter()
-        .map(|scan| serde_json::from_str::<Option<CcHeaderProbeScan>>(scan))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let scans = cc_parsed_header_scans(&read_inputs, file_hasher)?;
     let definitions = parsed
         .defines
         .iter()
@@ -5760,7 +5748,7 @@ fn cc_shadowing_names(
     let all_scans = || {
         scans
             .iter()
-            .flatten()
+            .filter_map(|scan| scan.as_ref().as_ref())
             .chain(std::iter::once(&argument_scan))
     };
     let aliases = cc_header_probe_aliases(all_scans());
@@ -5787,7 +5775,10 @@ fn cc_shadowing_names(
         if let Some(file_name) = absolute.file_name() {
             result.names.insert(PathBuf::from(file_name));
         }
-        let probes = scan.and_then(|scan| cc_resolve_header_probes(&scan, &aliases));
+        let probes = scan
+            .as_ref()
+            .as_ref()
+            .and_then(|scan| cc_resolve_header_probes(scan, &aliases));
         let Some(probes) = probes else {
             anyhow::bail!(
                 "cc: a header availability probe (__has_include) in {} cannot be resolved \
@@ -5810,6 +5801,92 @@ fn cc_shadowing_names(
         }
     }
     Ok(result)
+}
+
+/// One header's probe scan, or `None` for text the scanner cannot resolve.
+type CcParsedScan = std::sync::Arc<Option<CcHeaderProbeScan>>;
+
+/// Parsed scans by content hash, shared by every unit this process keys. A
+/// scan depends only on the bytes, so an entry never goes stale. Headers
+/// recur across a build's units, and loading and parsing their scans again
+/// for each unit was a large part of a warm C++ hit.
+#[derive(Default)]
+struct CcParsedScans {
+    scans: foldhash::HashMap<String, CcParsedScan>,
+    /// Serialized size of the held scans, to bound memory.
+    weight: usize,
+}
+
+const CC_HEADER_SCAN_VERSION: i64 = 6;
+const CC_PARSED_SCANS_WEIGHT: usize = 64 << 20;
+static CC_PARSED_SCANS: std::sync::LazyLock<std::sync::Mutex<CcParsedScans>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn cc_parsed_scans() -> std::sync::MutexGuard<'static, CcParsedScans> {
+    CC_PARSED_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The probe scan of each read input, in order.
+fn cc_parsed_header_scans(
+    read_inputs: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) -> Result<Vec<CcParsedScan>> {
+    let mut held = foldhash::HashMap::<String, CcParsedScan>::default();
+    let fetched = file_hasher.cc_header_scans_except(
+        read_inputs,
+        CC_HEADER_SCAN_VERSION,
+        &mut |content| {
+            if held.contains_key(content) {
+                return true;
+            }
+            let Some(scan) = cc_parsed_scans().scans.get(content).cloned() else {
+                return false;
+            };
+            held.insert(content.to_owned(), scan);
+            true
+        },
+        &|path| {
+            let bytes = fs::read(path)
+                .with_context(|| format!("reading header availability input {}", path.display()))?;
+            let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
+            Ok((
+                blake3::hash(&bytes).to_hex().to_string(),
+                serde_json::to_string(&probes)?,
+            ))
+        },
+    )?;
+    let mut learned = Vec::new();
+    let mut scans = Vec::with_capacity(fetched.len());
+    for (content, json) in fetched {
+        let scan = match held.get(&content) {
+            Some(scan) => scan.clone(),
+            None => {
+                let json = json.context("cc: a held header scan went missing")?;
+                let scan = CcParsedScan::new(serde_json::from_str(&json)?);
+                held.insert(content.clone(), scan.clone());
+                learned.push((content, scan.clone(), json.len()));
+                scan
+            }
+        };
+        scans.push(scan);
+    }
+    if !learned.is_empty() {
+        let mut shared = cc_parsed_scans();
+        for (content, scan, weight) in learned {
+            if weight > CC_PARSED_SCANS_WEIGHT {
+                continue;
+            }
+            if shared.weight + weight > CC_PARSED_SCANS_WEIGHT {
+                *shared = CcParsedScans::default();
+            }
+            if shared.scans.insert(content, scan).is_none() {
+                shared.weight += weight;
+            }
+        }
+    }
+    Ok(scans)
 }
 
 /// A header name an availability probe tests for.

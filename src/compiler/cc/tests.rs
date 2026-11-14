@@ -10826,3 +10826,43 @@ fn paste_wildcards_agree_with_regex() {
         assert!(cc_paste_wildcards(other).is_none(), "{other}");
     }
 }
+
+#[test]
+fn parsed_header_scans_are_shared_across_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = dir.path().join("probe.h");
+    // The path makes the bytes, and so the shared entry, unique to this test.
+    fs::write(
+        &header,
+        format!(
+            "// {}\n#if __has_include(<optional.h>)\n#endif\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let first = cc_parsed_header_scans(
+        std::slice::from_ref(&header),
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
+    let probes = |scan: &CcParsedScan| {
+        cc_resolve_header_probes(
+            scan.as_ref().as_ref().unwrap(),
+            &cc_header_probe_aliases(std::iter::empty()),
+        )
+    };
+    assert_eq!(
+        probes(&first[0]),
+        Some(vec![CcHeaderProbe {
+            name: "optional.h".into(),
+            quoted: false
+        }])
+    );
+    let later = cc_parsed_header_scans(
+        &[header.clone(), header],
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first[0], &later[0]));
+    assert!(std::sync::Arc::ptr_eq(&later[0], &later[1]));
+}

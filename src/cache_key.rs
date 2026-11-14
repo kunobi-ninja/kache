@@ -7764,7 +7764,6 @@ fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: 
 struct RecentHash {
     hash: String,
     fingerprint: Option<FileFingerprint>,
-    header_scan: Option<(i64, String)>,
 }
 
 /// [`hash_file`], for a read that follows a stat of the same file.
@@ -8378,7 +8377,10 @@ impl<'db> FileHasher<'db> {
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<(String, Vec<PathBuf>)> {
         let cache = self.cache.as_ref()?;
-        let record = match cache.get_cc_preprocess_memo(memo_key) {
+        let trace_fetch = crate::phase_trace::phase("cc_memo_fetch");
+        let record = cache.get_cc_preprocess_memo(memo_key);
+        drop(trace_fetch);
+        let record = match record {
             Ok(record) => record?,
             Err(error) => {
                 tracing::debug!("cc preprocess memo lookup failed: {error}");
@@ -8411,14 +8413,10 @@ impl<'db> FileHasher<'db> {
         // The paths that satisfied the memo are the inputs this invocation
         // would have discovered by preprocessing, and the caller needs them to
         // resolve include shadowing without a fresh dependency capture.
+        let _trace_verify = crate::phase_trace::phase("cc_memo_verify");
         let mut satisfied = Vec::with_capacity(inputs.len());
-        for (expected, scan) in inputs.iter().zip(&record.header_scans) {
-            satisfied.push(self.memo_input_is_unchanged(
-                expected,
-                scan,
-                &resolve,
-                mapped_content,
-            )?);
+        for expected in &inputs {
+            satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
         }
         if record.needs_touch
             && let Err(error) = cache.touch_cc_preprocess_memo(memo_key)
@@ -8437,7 +8435,6 @@ impl<'db> FileHasher<'db> {
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
-        header_scan: &Option<(i64, String)>,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
@@ -8473,7 +8470,6 @@ impl<'db> FileHasher<'db> {
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
-                        header_scan: header_scan.clone(),
                     },
                 );
                 return Some(path.clone());
@@ -8615,49 +8611,62 @@ impl<'db> FileHasher<'db> {
         Some(inputs)
     }
 
-    /// Scan the input content already selected for this key, reusing results
-    /// across wrapper processes. Memo validation and hashing register the
-    /// snapshot for the write guard; do not stat every input a second time.
-    /// A new scan must report the hash of its bytes so a racing save cannot
-    /// poison the content-addressed result.
+    #[cfg(test)]
     pub(crate) fn cc_header_scans(
         &self,
         paths: &[PathBuf],
         version: i64,
         scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
     ) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .cc_header_scans_except(paths, version, &mut |_| false, scan)?
+            .into_iter()
+            .map(|(_, scan)| scan.expect("nothing is held"))
+            .collect())
+    }
+
+    /// Scan the input content already selected for this key, reusing results
+    /// across wrapper processes. Memo validation and hashing register the
+    /// snapshot for the write guard; do not stat every input a second time.
+    /// A new scan must report the hash of its bytes so a racing save cannot
+    /// poison the content-addressed result.
+    ///
+    /// Returns each path's content hash with its scan. Contents `held` claims
+    /// are scans the caller already has: they are neither loaded nor
+    /// computed, and come back as `None`.
+    pub(crate) fn cc_header_scans_except(
+        &self,
+        paths: &[PathBuf],
+        version: i64,
+        held: &mut dyn FnMut(&str) -> bool,
+        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+    ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());
-        let mut known = std::collections::HashMap::new();
         for path in paths {
-            let selected = {
+            let recent = {
                 let resolved = self.resolve_path(path)?;
                 let recent = self.recent_hashes.borrow();
-                recent.get(&resolved).and_then(|recent| {
-                    recent
-                        .fingerprint
-                        .as_ref()
-                        .map(|_| (recent.hash.clone(), recent.header_scan.clone()))
-                })
+                recent
+                    .get(&resolved)
+                    .filter(|recent| recent.fingerprint.is_some())
+                    .map(|recent| recent.hash.clone())
             };
-            let content = match selected {
-                Some((content, analysis)) => {
-                    if let Some((scan_version, scan)) = analysis
-                        && scan_version == version
-                    {
-                        known.insert(content.clone(), scan);
-                    }
-                    content
-                }
+            let content = match recent {
+                Some(content) => content,
                 None => self.hash(path)?,
             };
-            contents.push(content);
+            let is_held = held(&content);
+            contents.push((content, is_held));
         }
         let missing: Vec<_> = contents
             .iter()
-            .filter(|content| !known.contains_key(*content))
-            .map(String::as_str)
+            .filter(|(_, is_held)| !is_held)
+            .map(|(content, _)| content.as_str())
             .collect();
-        if let Some(cache) = &self.cache {
+        let mut known = std::collections::HashMap::new();
+        if let Some(cache) = &self.cache
+            && !missing.is_empty()
+        {
             match cache.get_cc_header_scans(version, &missing) {
                 Ok(found) => known.extend(found),
                 Err(error) => tracing::debug!("cc header scan lookup failed: {error}"),
@@ -8665,9 +8674,11 @@ impl<'db> FileHasher<'db> {
         }
         let mut learned = Vec::new();
         let mut results = Vec::with_capacity(paths.len());
-        for (path, content) in paths.iter().zip(contents) {
-            let result = if let Some(result) = known.get(&content) {
-                result.clone()
+        for (path, (content, is_held)) in paths.iter().zip(contents) {
+            let result = if is_held {
+                None
+            } else if let Some(result) = known.get(&content) {
+                Some(result.clone())
             } else {
                 let (raw, result) = scan(path)?;
                 anyhow::ensure!(
@@ -8676,12 +8687,13 @@ impl<'db> FileHasher<'db> {
                     path.display()
                 );
                 known.insert(content.clone(), result.clone());
-                learned.push((content, result.clone()));
-                result
+                learned.push((content.clone(), result.clone()));
+                Some(result)
             };
-            results.push(result);
+            results.push((content, result));
         }
         if let Some(cache) = &self.cache
+            && !learned.is_empty()
             && let Err(error) = cache.put_cc_header_scans(version, &learned)
         {
             tracing::debug!("cc header scan update failed: {error}");
@@ -8780,7 +8792,6 @@ impl<'db> FileHasher<'db> {
             if self
                 .memo_input_is_unchanged(
                     expected,
-                    &None,
                     &|_: &str| vec![recorded_path.clone()],
                     mapped_content,
                 )
@@ -9007,7 +9018,6 @@ impl<'db> FileHasher<'db> {
         let recent = RecentHash {
             hash,
             fingerprint: observed.map(|observed| observed.fingerprint),
-            header_scan: None,
         };
         self.recent_hashes
             .borrow_mut()
@@ -9053,7 +9063,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -9086,7 +9095,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -9118,7 +9126,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -9673,7 +9680,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)

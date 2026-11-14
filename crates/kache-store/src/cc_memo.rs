@@ -86,8 +86,6 @@ fn unproven(path: String) -> FileFingerprint {
 pub struct CcPreprocessMemo {
     pub preprocessed_hash: String,
     pub inputs: Vec<CcPreprocessMemoInput>,
-    /// Content-addressed header scans, in the same order as `inputs`.
-    pub header_scans: Vec<Option<(i64, String)>>,
     pub needs_touch: bool,
 }
 
@@ -412,12 +410,10 @@ impl FileHashCache<'_> {
         let mut stmt = self.db().prepare_cached(
             "SELECT m.preprocessed_hash, m.input_count, m.last_used <= unixepoch() - 86400,
                     i.id, i.name, i.content, i.mapped, i.local_path,
-                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof,
-                    s.version, s.scan
+                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof
              FROM cc_preprocess_memos m
              LEFT JOIN cc_memo_input_refs r ON r.memo_id = m.id
              LEFT JOIN cc_memo_inputs i ON i.id = r.input_id
-             LEFT JOIN cc_header_scans s ON s.content = i.content
              WHERE m.memo_key = ?1 ORDER BY i.name, r.input_id",
         )?;
         let mut rows = stmt.query([memo_key])?;
@@ -432,7 +428,6 @@ impl FileHashCache<'_> {
                 result = Some(CcPreprocessMemo {
                     preprocessed_hash: row.get(0)?,
                     inputs: Vec::new(),
-                    header_scans: Vec::new(),
                     needs_touch: row.get(2)?,
                 });
             }
@@ -444,11 +439,6 @@ impl FileHashCache<'_> {
                 inode: row.get(11)?,
             };
             let proven = row.get::<_, Option<i64>>(12)? == Some(stamp_proof(&stamp));
-            result.as_mut().unwrap().header_scans.push(
-                row.get::<_, Option<i64>>(13)?
-                    .map(|version| row.get(14).map(|scan| (version, scan)))
-                    .transpose()?,
-            );
             result.as_mut().unwrap().inputs.push(CcPreprocessMemoInput {
                 name: row.get(4)?,
                 content: row.get(5)?,
@@ -656,25 +646,9 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(id_order, ["z.h", "a.h"]);
-        cache
-            .put_cc_header_scans(
-                6,
-                &[
-                    ("first".into(), "first scan".into()),
-                    ("last".into(), "last scan".into()),
-                ],
-            )
-            .unwrap();
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "proof");
         assert_eq!(memo.inputs, [read_back(first), read_back(last)]);
-        assert_eq!(
-            memo.header_scans,
-            [
-                Some((6, "first scan".into())),
-                Some((6, "last scan".into()))
-            ]
-        );
     }
 
     #[test]
@@ -710,14 +684,6 @@ mod tests {
         cache
             .put_cc_preprocess_memo_inputs("live", "hash", &[input("a.h", "content-0")])
             .unwrap();
-        assert_eq!(
-            cache
-                .get_cc_preprocess_memo("live")
-                .unwrap()
-                .unwrap()
-                .header_scans,
-            [Some((2, "new".into()))]
-        );
         cache.prune_cc_preprocess_memos().unwrap();
         assert_eq!(count(&cache, "cc_header_scans"), 1);
         assert_eq!(

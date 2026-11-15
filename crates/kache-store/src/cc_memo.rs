@@ -285,6 +285,10 @@ fn purge(db: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// A header scan to record: its content hash, the scan, and its macro
+/// definitions as `(name, bodies)`.
+pub type CcHeaderScanRow = (String, String, Vec<(String, String)>);
+
 /// Headers looked up per statement. Far below SQLite's bound on bound
 /// parameters, and a round number of prepared-statement shapes to cache.
 const MEMO_LOOKUP_CHUNK: usize = 256;
@@ -338,7 +342,7 @@ impl FileHashCache<'_> {
     pub fn put_cc_header_scans_with_macros(
         &self,
         version: i64,
-        rows: &[(String, String, Vec<(String, String)>)],
+        rows: &[CcHeaderScanRow],
     ) -> rusqlite::Result<()> {
         if rows.is_empty() {
             return Ok(());

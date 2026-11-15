@@ -5801,7 +5801,14 @@ fn cc_shadowing_names_reusing(
     let (derivation, fresh) = match reused {
         Some(derivation) => (derivation, false),
         None => (
-            cc_derive_shadowing(&read_inputs, &contents, &definitions, digest, file_hasher)?,
+            cc_derive_shadowing(
+                &read_inputs,
+                &cc_absolute_sources(parsed, cwd),
+                &contents,
+                &definitions,
+                digest,
+                file_hasher,
+            )?,
             true,
         ),
     };
@@ -5847,12 +5854,13 @@ fn cc_shadowing_names_reusing(
 /// `contents`.
 fn cc_derive_shadowing(
     read_inputs: &[PathBuf],
+    sources: &[PathBuf],
     contents: &[String],
     definitions: &str,
     digest: String,
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<CcShadowingDerivation> {
-    let mut scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
+    let mut scans = cc_parsed_header_scans(read_inputs, sources, file_hasher)?;
     let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
         .context("cc: unresolved header availability probe in command-line definitions")?;
     // The scans must describe the bytes the digest names.
@@ -5875,7 +5883,7 @@ fn cc_derive_shadowing(
         Err(error) if error.is::<CcMacrosMissing>() => {
             let dropped = std::mem::take(&mut *cc_parsed_scans());
             drop(dropped);
-            scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
+            scans = cc_parsed_header_scans(read_inputs, sources, file_hasher)?;
             ensure_scans_describe(&scans)?;
             cc_reached_macro_uses(&scans, &argument_scan, file_hasher)?
         }
@@ -6082,9 +6090,20 @@ fn cc_parsed_scans() -> std::sync::MutexGuard<'static, CcParsedScans> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The content hash and probe scan of each read input, in order.
+/// The unit's own sources, as absolute paths.
+fn cc_absolute_sources(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
+    parsed
+        .sources
+        .iter()
+        .map(|source| absolutize_path(cwd, source))
+        .collect()
+}
+
+/// The content hash and probe scan of each read input, in order. Scans of
+/// `sources` are not stored.
 fn cc_parsed_header_scans(
     read_inputs: &[PathBuf],
+    sources: &[PathBuf],
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<Vec<(String, CcParsedScan)>> {
     let mut held = foldhash::HashMap::<String, CcParsedScan>::default();
@@ -6121,6 +6140,7 @@ fn cc_parsed_header_scans(
                 .insert(content.clone(), (CcParsedScan::new(scan), defined));
             Ok((content, core, macros))
         },
+        &|path| sources.iter().any(|source| source == path),
     )?;
     let fresh = fresh.into_inner();
     let mut learned = Vec::new();
@@ -9240,13 +9260,12 @@ impl CcCompiler {
         };
         // The depfile lists the source itself; adding it again is harmless,
         // the fingerprints are deduplicated by name.
-        for source in &parsed.sources {
-            paths.push(if source.is_absolute() {
-                source.clone()
-            } else {
-                cwd.join(source)
-            });
-        }
+        let sources: Vec<PathBuf> = parsed
+            .sources
+            .iter()
+            .map(|source| absolutize_path(cwd, source))
+            .collect();
+        paths.extend(sources.iter().cloned());
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
         let mapped: Vec<(String, PathBuf)> = paths
             .into_iter()
@@ -9259,13 +9278,17 @@ impl CcCompiler {
         )?;
         // After the fingerprints: the scan is memoised by the content hash
         // they carry, so a header shared by every unit is read once.
-        if let Some(found) = file_hasher.cc_inputs_hide_assembler_input(&inputs, &|path| {
-            let bytes = fs::read(path).ok()?;
-            Some((
-                blake3::hash(&bytes).to_hex().to_string(),
-                cc_raw_assembler_hidden_input(&bytes),
-            ))
-        }) {
+        if let Some(found) = file_hasher.cc_inputs_hide_assembler_input(
+            &inputs,
+            &|path| {
+                let bytes = fs::read(path).ok()?;
+                Some((
+                    blake3::hash(&bytes).to_hex().to_string(),
+                    cc_raw_assembler_hidden_input(&bytes),
+                ))
+            },
+            &|path| sources.iter().any(|source| source == path),
+        ) {
             let why = if found == crate::cache_key::CC_INPUT_CHANGED_WHILE_SCANNED {
                 found
             } else {

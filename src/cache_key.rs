@@ -8672,7 +8672,7 @@ impl<'db> FileHasher<'db> {
     ) -> anyhow::Result<Vec<String>> {
         let scan = |path: &Path| scan(path).map(|(raw, json)| (raw, json, Vec::new()));
         Ok(self
-            .cc_header_scans_except(paths, version, &mut |_| false, &scan)?
+            .cc_header_scans_except(paths, version, &mut |_| false, &scan, &|_| false)?
             .into_iter()
             .map(|(_, scan)| scan.expect("nothing is held"))
             .collect())
@@ -8688,13 +8688,16 @@ impl<'db> FileHasher<'db> {
     /// are scans the caller already has: they are neither loaded nor
     /// computed, and come back as `None`. `scan` also returns the header's
     /// macro definitions as `(name, bodies)`; they are stored apart and read
-    /// back by name ([`Self::cc_header_macros`]).
+    /// back by name ([`Self::cc_header_macros`]). Scans of paths
+    /// `unrecorded` claims (a unit's own source, read by no other unit) are
+    /// not stored: writing them cost more than scanning them again.
     pub(crate) fn cc_header_scans_except(
         &self,
         paths: &[PathBuf],
         version: i64,
         held: &mut dyn FnMut(&str) -> bool,
         scan: &impl Fn(&Path) -> anyhow::Result<(String, String, Vec<(String, String)>)>,
+        unrecorded: &dyn Fn(&Path) -> bool,
     ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());
         for path in paths {
@@ -8731,7 +8734,9 @@ impl<'db> FileHasher<'db> {
                     path.display()
                 );
                 known.insert(content.clone(), result.clone());
-                learned.push((content.clone(), result.clone(), macros));
+                if !unrecorded(path) {
+                    learned.push((content.clone(), result.clone(), macros));
+                }
                 Some(result)
             };
             results.push((content, result));
@@ -8777,6 +8782,7 @@ impl<'db> FileHasher<'db> {
         &self,
         inputs: &[CcPreprocessMemoInput],
         scan: &impl Fn(&Path) -> Option<(String, Option<&'static str>)>,
+        unrecorded: &dyn Fn(&Path) -> bool,
     ) -> Option<String> {
         let _trace = crate::phase_trace::phase("cc_asm_scan");
         let known = match &self.cache {
@@ -8805,7 +8811,9 @@ impl<'db> FileHasher<'db> {
                     }
                     let construct = scanned.unwrap_or("").to_string();
                     known.insert(input.content.clone(), construct.clone());
-                    learned.push((input.content.clone(), construct.clone()));
+                    if !unrecorded(Path::new(&input.fingerprint.path)) {
+                        learned.push((input.content.clone(), construct.clone()));
+                    }
                     construct
                 }
             };

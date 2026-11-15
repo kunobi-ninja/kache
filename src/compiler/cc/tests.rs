@@ -10847,6 +10847,7 @@ fn parsed_header_scans_are_shared_across_units() {
     .unwrap();
     let first = cc_parsed_header_scans(
         std::slice::from_ref(&header),
+        &[],
         &crate::cache_key::FileHasher::new(),
     )
     .unwrap();
@@ -10865,6 +10866,7 @@ fn parsed_header_scans_are_shared_across_units() {
     );
     let later = cc_parsed_header_scans(
         &[header.clone(), header],
+        &[],
         &crate::cache_key::FileHasher::new(),
     )
     .unwrap();
@@ -11083,12 +11085,12 @@ fn stored_scans_load_only_the_macros_a_conditional_reaches() {
 
     let hasher = crate::cache_key::FileHasher::persistent(&db);
     let absolute = inputs("benign.h").map(|path| cwd.join(path));
-    let scans = cc_parsed_header_scans(&absolute, &hasher).unwrap();
+    let scans = cc_parsed_header_scans(&absolute, &[], &hasher).unwrap();
     assert!(
-        scans
+        scans[1..]
             .iter()
             .all(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart)),
-        "read back from the store"
+        "headers read back from the store"
     );
     let reached = cc_reached_macro_uses(&scans, &CcHeaderProbeScan::default(), &hasher).unwrap();
     let mut names: Vec<_> = reached.keys().map(|(_, name)| name.as_str()).collect();
@@ -11112,9 +11114,10 @@ fn stored_scans_load_only_the_macros_a_conditional_reaches() {
     // Cores this process holds outlive the rows they were read with: once
     // pruned, the proof must not run without the definitions.
     let absolute = inputs("probe.h").map(|path| cwd.join(path));
-    let held = cc_parsed_header_scans(&absolute, &hasher).unwrap();
+    let held = cc_parsed_header_scans(&absolute, &[], &hasher).unwrap();
     assert!(
-        held.iter()
+        held[1..]
+            .iter()
             .all(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart))
     );
     kache_store::file_hash::FileHashCache::open(&db)

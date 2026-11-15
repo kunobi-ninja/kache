@@ -15864,7 +15864,10 @@ fn assembler_scans_are_memoised_by_content() {
     let inputs = hasher
         .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &no_mapping)
         .unwrap();
-    assert_eq!(hasher.cc_inputs_hide_assembler_input(&inputs, &scan), None);
+    assert_eq!(
+        hasher.cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false),
+        None
+    );
     assert_eq!(scans.get(), 1, "twins share one scan");
     let later = FileHasher::persistent(&db);
     let inputs = later
@@ -15872,7 +15875,7 @@ fn assembler_scans_are_memoised_by_content() {
         .unwrap();
     assert_eq!(
         later
-            .cc_inputs_hide_assembler_input(&inputs, &scan)
+            .cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false)
             .as_deref(),
         Some(".incbin")
     );
@@ -15883,7 +15886,7 @@ fn assembler_scans_are_memoised_by_content() {
     );
     assert_eq!(
         later
-            .cc_inputs_hide_assembler_input(&inputs, &scan)
+            .cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false)
             .as_deref(),
         Some(".incbin"),
         "the construct verdict is memoised too"
@@ -15894,11 +15897,11 @@ fn assembler_scans_are_memoised_by_content() {
     gone[0].fingerprint.path = dir.path().join("absent.h").to_string_lossy().into_owned();
     gone[0].content = "c".repeat(64);
     assert_eq!(
-        later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+        later.cc_inputs_hide_assembler_input(&gone[..1], &scan, &|_| false),
         None
     );
     assert_eq!(
-        later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+        later.cc_inputs_hide_assembler_input(&gone[..1], &scan, &|_| false),
         None
     );
     assert_eq!(
@@ -16482,7 +16485,7 @@ fn an_assembler_verdict_on_other_bytes_is_never_learned() {
 
     assert_eq!(
         hasher
-            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save)
+            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save, &|_| false)
             .as_deref(),
         Some(CC_INPUT_CHANGED_WHILE_SCANNED)
     );
@@ -22223,4 +22226,44 @@ fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
         }),
         "a crate-relative dotted spelling stays as rustc recorded it"
     );
+}
+
+#[test]
+fn a_units_own_source_is_scanned_but_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let paths: Vec<_> = ["unit.c", "shared.h"]
+        .iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+    std::fs::write(&paths[0], "int unit;\n").unwrap();
+    std::fs::write(&paths[1], "int shared;\n").unwrap();
+    let scan = |path: &Path| -> anyhow::Result<(String, String, Vec<(String, String)>)> {
+        let bytes = std::fs::read(path)?;
+        Ok((
+            blake3::hash(&bytes).to_hex().to_string(),
+            "scan".into(),
+            Vec::new(),
+        ))
+    };
+    let hasher = FileHasher::persistent(&db);
+    let scanned = hasher
+        .cc_header_scans_except(&paths, 1, &mut |_| false, &scan, &|path| path == paths[0])
+        .unwrap();
+    assert!(
+        scanned
+            .iter()
+            .all(|(_, scan)| scan.as_deref() == Some("scan"))
+    );
+    let cache = kache_store::file_hash::FileHashCache::open(&db).unwrap();
+    let contents: Vec<&str> = scanned
+        .iter()
+        .map(|(content, _)| content.as_str())
+        .collect();
+    let stored = cache.get_cc_header_scans(1, &contents).unwrap();
+    assert!(
+        !stored.contains_key(contents[0]),
+        "the source is not stored"
+    );
+    assert!(stored.contains_key(contents[1]), "a header is");
 }

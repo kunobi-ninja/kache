@@ -78,8 +78,12 @@ pub(crate) struct Lease {
     /// The donor profile whose state this lease imported.
     worktree_seed_donor: Option<PathBuf>,
     worktree_bootstrap: bool,
+    /// The flush of an in-flight record published while rustc starts.
+    marker_flush: Option<MarkerFlush>,
     _lock: UnitLock,
 }
+
+type MarkerFlush = std::thread::JoinHandle<bool>;
 
 struct UnitLock(File);
 
@@ -338,6 +342,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
+            marker_flush: None,
             _lock: lock,
         })
     }
@@ -389,9 +394,15 @@ impl AdaptiveUnit {
         let mut busy = previous.clone();
         busy.in_flight = true;
         // The old graph must remain whole if publishing the marker fails.
-        if !self.store_state(&busy, true) {
+        // Without one, rustc writes into a fresh directory, so its flush can
+        // run beside the compile and join before the lease finishes.
+        let marker_flush = if definitely_missing(&self.rustc_dir) {
+            Some(self.publish_in_flight_record_unflushed()?)
+        } else if self.store_state(&busy, true) {
+            None
+        } else {
             return None;
-        }
+        };
         if !remove_path_safely(&self.rustc_dir) {
             // Leave the marker beside any partial removal so a later caller
             // resets it rather than borrowing an incomplete graph.
@@ -407,6 +418,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
+            marker_flush,
             _lock: lock,
         })
     }
@@ -474,6 +486,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
+            marker_flush: None,
             _lock: lock,
         })
     }
@@ -515,6 +528,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
+            marker_flush: None,
             _lock: lock,
         })
     }
@@ -571,6 +585,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
+            marker_flush: None,
             _lock: lock,
         })
     }
@@ -746,6 +761,33 @@ impl AdaptiveUnit {
 
     #[cfg(unix)]
     fn publish_in_flight_record(&self) -> bool {
+        // The new state.json entry must be durable before the caller starts
+        // rustc or removes a graph.
+        self.link_in_flight_record() && crate::atomic::fsync_dir(&self.unit_dir).is_ok()
+    }
+
+    /// Publish the in-flight record and flush it on another thread.
+    #[cfg(unix)]
+    fn publish_in_flight_record_unflushed(&self) -> Option<MarkerFlush> {
+        if unsafe_file(&self.state_path) || !self.link_in_flight_record() {
+            return None;
+        }
+        let unit_dir = self.unit_dir.clone();
+        Some(std::thread::spawn(move || {
+            crate::atomic::fsync_dir(&unit_dir).is_ok()
+        }))
+    }
+
+    #[cfg(not(unix))]
+    fn publish_in_flight_record_unflushed(&self) -> Option<MarkerFlush> {
+        self.store_state(&self.in_flight_marker(), true)
+            .then(|| std::thread::spawn(|| true))
+    }
+
+    /// Marker data was flushed when created, so only its directory entry
+    /// still needs a flush.
+    #[cfg(unix)]
+    fn link_in_flight_record(&self) -> bool {
         let Some(source) = self.prepare_in_flight_record() else {
             return false;
         };
@@ -759,12 +801,7 @@ impl AdaptiveUnit {
         if fs::hard_link(source, &linked).is_err() {
             return false;
         }
-        if fs::rename(linked, &self.state_path).is_err() {
-            return false;
-        }
-        // Marker data was flushed when created. The new state.json entry
-        // must be durable before the caller starts rustc or removes a graph.
-        crate::atomic::fsync_dir(&self.unit_dir).is_ok()
+        fs::rename(linked, &self.state_path).is_ok()
     }
 
     /// The state every lease resets, written before private rustc state is
@@ -826,7 +863,9 @@ impl Lease {
             last_used_secs: now,
             in_flight: true,
         };
-        if !self.unit.store_state(&busy, true) {
+        // The in-flight record already on disk covers this graph, and the
+        // write replaces it with another in-flight state, so it needs no flush.
+        if !self.unit.store_state(&busy, false) {
             return false;
         }
         self.completion = Completion::Seed {
@@ -865,7 +904,16 @@ impl Lease {
         self.finish_at(outcome, now_secs())
     }
 
-    fn finish_at(self, outcome: CompileOutcome, now: u64) -> bool {
+    fn finish_at(mut self, outcome: CompileOutcome, now: u64) -> bool {
+        // A marker that may not have reached disk cannot cover this graph.
+        if self
+            .marker_flush
+            .take()
+            .is_some_and(|flush| !flush.join().unwrap_or(false))
+        {
+            let _ = reset_locked(&self.unit);
+            return false;
+        }
         let keep = match outcome {
             // A success that wrote no incremental files proves nothing reusable.
             CompileOutcome::Success => nonempty_real_directory(&self.unit.rustc_dir),
@@ -1655,6 +1703,61 @@ mod tests {
             103,
         ));
         assert!(!lease.finish_at(CompileOutcome::Abnormal, 104));
+    }
+
+    #[test]
+    fn deferred_seed_flushes_its_marker_beside_rustc_only_without_a_graph() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        assert!(!path_exists(&unit.rustc_dir));
+        let mut lease = unit.try_deferred_seed().unwrap();
+        assert!(read_state(&unit).in_flight);
+        assert!(lease.marker_flush.take().unwrap().join().unwrap());
+        assert!(!lease.finish_at(CompileOutcome::Success, 101));
+
+        teach(&unit, 102);
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        let lease = unit.try_deferred_seed().unwrap();
+        assert!(read_state(&unit).in_flight);
+        assert!(lease.marker_flush.is_none());
+        assert!(!lease.finish_at(CompileOutcome::Success, 103));
+    }
+
+    #[test]
+    fn a_marker_that_failed_to_flush_discards_the_qualified_graph() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let mut lease = unit.try_deferred_seed().unwrap();
+        assert!(lease.marker_flush.take().unwrap().join().unwrap());
+        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+        assert!(lease.qualify_deferred_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-b", "extern-a"),
+            101,
+        ));
+        lease.marker_flush = Some(std::thread::spawn(|| false));
+
+        assert!(!lease.finish_at(CompileOutcome::Success, 102));
+        assert!(!path_exists(&unit.rustc_dir));
+        assert!(!path_exists(&unit.state_path));
+    }
+
+    #[test]
+    fn a_flushed_marker_keeps_the_qualified_graph() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let lease = unit.try_deferred_seed();
+        let mut lease = lease.unwrap();
+        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+        assert!(lease.qualify_deferred_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-b", "extern-a"),
+            101,
+        ));
+
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        assert_eq!(read_state(&unit).phase, Phase::Active);
+        assert!(!read_state(&unit).in_flight);
     }
 
     #[cfg(unix)]

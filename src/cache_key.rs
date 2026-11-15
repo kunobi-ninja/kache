@@ -7877,6 +7877,10 @@ impl FileHasher<'static> {
     }
 }
 
+/// A header scan as a scanner returns it: the raw content hash, the scan
+/// stored without its macro definitions, and those as `(name, bodies)`.
+pub(crate) type CcScannedHeader = (String, String, Vec<(String, String)>);
+
 impl<'db> FileHasher<'db> {
     pub(crate) fn invocation_env(&self) -> &InvocationEnv {
         &self.invocation_env
@@ -7918,6 +7922,15 @@ impl<'db> FileHasher<'db> {
         if let Err(error) = written {
             tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
         }
+    }
+
+    /// Drop the pending memo rows of paths `unrecorded` claims, such as a
+    /// unit's own source: no other unit hashes it, and a memo check only
+    /// hashes it again when its stamp moved.
+    pub(crate) fn forget_pending_memo(&self, unrecorded: &dyn Fn(&Path) -> bool) {
+        self.pending_memo
+            .borrow_mut()
+            .retain(|(observed, _)| !unrecorded(Path::new(&observed.fingerprint.path)));
     }
 
     /// Flush as if every pending file had been observed one settle window
@@ -8463,6 +8476,22 @@ impl<'db> FileHasher<'db> {
             .collect()
     }
 
+    /// Take the content hashes another hasher in this process observed for
+    /// a compile's read set, so keying selects those bytes, the ones the
+    /// read-set digest names, instead of hashing each input again.
+    pub(crate) fn adopt_observed(&self, inputs: &[CcPreprocessMemoInput]) {
+        let mut recent = self.recent_hashes.borrow_mut();
+        for input in inputs {
+            let Ok(resolved) = self.resolve_path(Path::new(input.local_path())) else {
+                continue;
+            };
+            recent.entry(resolved).or_insert_with(|| RecentHash {
+                hash: input.content.clone(),
+                fingerprint: Some(input.fingerprint.clone()),
+            });
+        }
+    }
+
     fn selected_content(&self, path: &Path) -> anyhow::Result<String> {
         let recent = {
             let resolved = self.resolve_path(path)?;
@@ -8566,6 +8595,19 @@ impl<'db> FileHasher<'db> {
         maps_key: &str,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
+        self.cc_preprocess_fingerprints_recording(paths, maps_key, mapped_content, &|_| false)
+    }
+
+    /// [`Self::cc_preprocess_fingerprints`], not recording the mapped hashes
+    /// of paths `unrecorded` claims (a unit's own source, which no other
+    /// unit reads).
+    pub(crate) fn cc_preprocess_fingerprints_recording(
+        &self,
+        paths: &[(String, PathBuf)],
+        maps_key: &str,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
+        unrecorded: &dyn Fn(&Path) -> bool,
+    ) -> Option<Vec<CcPreprocessMemoInput>> {
         let paths = paths
             .iter()
             .map(|(name, path)| Some((name.clone(), self.invocation_env.resolve(path)?)))
@@ -8641,7 +8683,9 @@ impl<'db> FileHasher<'db> {
                         return None;
                     }
                     known.insert(content.clone(), read.mapped.clone());
-                    learned.push((content.clone(), read.mapped.clone()));
+                    if !unrecorded(&path) {
+                        learned.push((content.clone(), read.mapped.clone()));
+                    }
                     read.mapped
                 }
             };
@@ -8670,8 +8714,9 @@ impl<'db> FileHasher<'db> {
         version: i64,
         scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
     ) -> anyhow::Result<Vec<String>> {
+        let scan = |path: &Path| scan(path).map(|(raw, json)| (raw, json, Vec::new()));
         Ok(self
-            .cc_header_scans_except(paths, version, &mut |_| false, scan)?
+            .cc_header_scans_except(paths, version, &mut |_| false, &scan, &|_| false)?
             .into_iter()
             .map(|(_, scan)| scan.expect("nothing is held"))
             .collect())
@@ -8685,13 +8730,18 @@ impl<'db> FileHasher<'db> {
     ///
     /// Returns each path's content hash with its scan. Contents `held` claims
     /// are scans the caller already has: they are neither loaded nor
-    /// computed, and come back as `None`.
+    /// computed, and come back as `None`. `scan` also returns the header's
+    /// macro definitions as `(name, bodies)`; they are stored apart and read
+    /// back by name ([`Self::cc_header_macros`]). Scans of paths
+    /// `unrecorded` claims (a unit's own source, read by no other unit) are
+    /// not stored: writing them cost more than scanning them again.
     pub(crate) fn cc_header_scans_except(
         &self,
         paths: &[PathBuf],
         version: i64,
         held: &mut dyn FnMut(&str) -> bool,
-        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+        scan: &impl Fn(&Path) -> anyhow::Result<CcScannedHeader>,
+        unrecorded: &dyn Fn(&Path) -> bool,
     ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());
         for path in paths {
@@ -8721,25 +8771,42 @@ impl<'db> FileHasher<'db> {
             } else if let Some(result) = known.get(&content) {
                 Some(result.clone())
             } else {
-                let (raw, result) = scan(path)?;
+                let (raw, result, macros) = scan(path)?;
                 anyhow::ensure!(
                     raw == content,
                     "cc: input changed while scanning header probes: {}",
                     path.display()
                 );
                 known.insert(content.clone(), result.clone());
-                learned.push((content.clone(), result.clone()));
+                if !unrecorded(path) {
+                    learned.push((content.clone(), result.clone(), macros));
+                }
                 Some(result)
             };
             results.push((content, result));
         }
         if let Some(cache) = &self.cache
             && !learned.is_empty()
-            && let Err(error) = cache.put_cc_header_scans(version, &learned)
+            && let Err(error) = cache.put_cc_header_scans_with_macros(version, &learned)
         {
             tracing::debug!("cc header scan update failed: {error}");
         }
         Ok(results)
+    }
+
+    /// The macro definitions named `names` in the scans of `contents`, as
+    /// `(content, name, bodies)`. Without a store there is nothing recorded,
+    /// and every scan was computed with its definitions in hand.
+    pub(crate) fn cc_header_macros(
+        &self,
+        version: i64,
+        contents: &[&str],
+        names: &[&str],
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        match &self.cache {
+            Some(cache) => Ok(cache.get_cc_header_macros(version, contents, names)?),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The first input whose raw text hides a file the assembler would read,
@@ -8757,6 +8824,7 @@ impl<'db> FileHasher<'db> {
         &self,
         inputs: &[CcPreprocessMemoInput],
         scan: &impl Fn(&Path) -> Option<(String, Option<&'static str>)>,
+        unrecorded: &dyn Fn(&Path) -> bool,
     ) -> Option<String> {
         let _trace = crate::phase_trace::phase("cc_asm_scan");
         let known = match &self.cache {
@@ -8785,7 +8853,9 @@ impl<'db> FileHasher<'db> {
                     }
                     let construct = scanned.unwrap_or("").to_string();
                     known.insert(input.content.clone(), construct.clone());
-                    learned.push((input.content.clone(), construct.clone()));
+                    if !unrecorded(Path::new(&input.fingerprint.path)) {
+                        learned.push((input.content.clone(), construct.clone()));
+                    }
                     construct
                 }
             };

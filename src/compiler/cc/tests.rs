@@ -7958,7 +7958,8 @@ fn header_probe_scanner_refuses_conditionals_that_can_paste_an_operator_alias() 
 fn cc_header_paste_resolved(text: &[u8]) -> bool {
     let scan = cc_header_probe_scan(text).unwrap();
     let aliases = cc_header_probe_aliases(std::iter::once(&scan));
-    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &aliases).unwrap()
+    let macro_uses = cc_inline_macro_uses(std::iter::once(&scan));
+    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &macro_uses, &aliases).unwrap()
 }
 
 fn assert_indirect_paste_resolved(text: &str) {
@@ -10846,6 +10847,7 @@ fn parsed_header_scans_are_shared_across_units() {
     .unwrap();
     let first = cc_parsed_header_scans(
         std::slice::from_ref(&header),
+        &[],
         &crate::cache_key::FileHasher::new(),
     )
     .unwrap();
@@ -10864,6 +10866,7 @@ fn parsed_header_scans_are_shared_across_units() {
     );
     let later = cc_parsed_header_scans(
         &[header.clone(), header],
+        &[],
         &crate::cache_key::FileHasher::new(),
     )
     .unwrap();
@@ -10972,8 +10975,17 @@ fn parsed_scan_cache_stays_within_its_limit() {
 
 #[test]
 fn parsed_scan_weight_counts_key_text_and_overhead() {
-    assert_eq!(cc_parsed_scan_weight("", ""), 128);
-    assert_eq!(cc_parsed_scan_weight("ab", "xyz"), 2 + 2 * 3 + 128);
+    assert_eq!(cc_parsed_scan_weight("", "", 0), 128);
+    assert_eq!(cc_parsed_scan_weight("ab", "xyz", 0), 2 + 2 * 3 + 128);
+    assert_eq!(cc_parsed_scan_weight("ab", "xyz", 5), 2 + 2 * (3 + 5) + 128);
+    assert_eq!(
+        cc_stored_macros_len(&[("AB".into(), "wxyz".into()), ("C".into(), "[]".into())]),
+        2 + 4 + 1 + 2
+    );
+    assert_eq!(
+        CcMacrosMissing(vec!["a".into(), "b".into()]).to_string(),
+        "cc: stored macro definitions of 2 header scans are missing"
+    );
 }
 
 #[test]
@@ -11020,4 +11032,182 @@ fn header_scans_keep_one_bare_use_per_name_and_every_probe() {
         quoted: false,
     };
     assert_eq!(probes, Some(vec![x.clone(), x]));
+}
+
+/// Stored scans keep macro definitions apart. A unit loads the ones its
+/// conditionals reach, across headers, and none of a symbol table nothing
+/// tests.
+#[test]
+fn stored_scans_load_only_the_macros_a_conditional_reaches() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    fs::create_dir_all(cwd.join("include")).unwrap();
+    // Unique text: the process-wide cache must not already hold these.
+    let tag = format!("{:x}", std::process::id()) + &format!("{:?}", std::time::Instant::now());
+    let tag: String = tag.chars().filter(char::is_ascii_alphanumeric).collect();
+    let mut table = format!("#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n// {tag}\n");
+    for n in 0..50 {
+        table.push_str(&format!("#define SYM_{n} CAT(PREFIX_, SYM_{n})\n"));
+    }
+    fs::write(cwd.join("include/table.h"), &table).unwrap();
+    fs::write(
+        cwd.join("include/benign.h"),
+        format!("// {tag}\n#if CAT(1, 0)\n#endif\n"),
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("include/probe.h"),
+        format!("// {tag}\n#if CAT(__has_, include)(<stdint.h>)\n#endif\n"),
+    )
+    .unwrap();
+    fs::write(cwd.join("unit.c"), "int unit;\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        Vec::<(&str, &str)>::new(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let parsed = CcArgs::parse_for(
+        &s(&["cc", "-Iinclude", "-c", "unit.c", "-o", "unit.o"]),
+        &env,
+    )
+    .unwrap();
+    let db = root.path().join("index.sqlite");
+    let inputs = |header: &str| {
+        [
+            PathBuf::from("unit.c"),
+            cwd.join("include/table.h"),
+            cwd.join("include").join(header),
+        ]
+    };
+    // Scan once so the store holds them, then forget the parsed scans.
+    for header in ["benign.h", "probe.h"] {
+        let hasher = crate::cache_key::FileHasher::persistent(&db);
+        let _ = cc_shadowing_names_reusing(&parsed, &inputs(header), &hasher, None);
+    }
+    for path in inputs("benign.h").iter().chain(&inputs("probe.h")[2..]) {
+        let content = blake3::hash(&fs::read(cwd.join(path)).unwrap())
+            .to_hex()
+            .to_string();
+        cc_parsed_scans().scans.remove(&content);
+    }
+
+    // The unit's own source was scanned, never stored.
+    let hash_of = |path: &Path| {
+        blake3::hash(&fs::read(cwd.join(path)).unwrap())
+            .to_hex()
+            .to_string()
+    };
+    let (source, table) = (
+        hash_of(Path::new("unit.c")),
+        hash_of(Path::new("include/table.h")),
+    );
+    let stored = kache_store::file_hash::FileHashCache::open(&db)
+        .unwrap()
+        .get_cc_header_scans(CC_HEADER_SCAN_VERSION, &[&source, &table])
+        .unwrap();
+    assert!(!stored.contains_key(&source) && stored.contains_key(&table));
+    let hasher = crate::cache_key::FileHasher::persistent(&db);
+    let absolute = inputs("benign.h").map(|path| cwd.join(path));
+    let scans = cc_parsed_header_scans(&absolute, &[], &hasher).unwrap();
+    assert!(
+        scans[1..]
+            .iter()
+            .all(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart)),
+        "headers read back from the store"
+    );
+    let reached = cc_reached_macro_uses(&scans, &CcHeaderProbeScan::default(), &hasher)
+        .unwrap()
+        .unwrap();
+    let mut names: Vec<_> = reached.keys().map(|(_, name)| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["CAT", "CAT_"], "the symbol table is never loaded");
+    cc_shadowing_names_reusing(&parsed, &inputs("benign.h"), &hasher, None).unwrap();
+
+    // The constructor lives in another header than the conditional.
+    let refused = |hasher: &crate::cache_key::FileHasher<'_>| {
+        let error = cc_shadowing_names_reusing(&parsed, &inputs("probe.h"), hasher, None)
+            .err()
+            .expect("a pasted probe must be refused from stored scans");
+        assert!(
+            format!("{error:#}")
+                .contains("token pasting may construct a header availability probe"),
+            "{error:#}"
+        );
+    };
+    refused(&hasher);
+
+    // Cores this process holds outlive the rows they were read with: once
+    // pruned, the proof must not run without the definitions.
+    let absolute = inputs("probe.h").map(|path| cwd.join(path));
+    let held = cc_parsed_header_scans(&absolute, &[], &hasher).unwrap();
+    assert!(
+        held[1..]
+            .iter()
+            .all(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart))
+    );
+    kache_store::file_hash::FileHashCache::open(&db)
+        .unwrap()
+        .prune_cc_preprocess_memos()
+        .unwrap();
+    let reached = cc_reached_macro_uses(&held, &CcHeaderProbeScan::default(), &hasher);
+    assert!(matches!(reached, Ok(Err(CcMacrosMissing(_)))));
+    refused(&hasher);
+}
+
+/// Nothing a unit records about its own source helps another unit, so a
+/// captured read set records its headers only.
+#[test]
+fn a_captured_read_set_records_its_headers_but_not_its_source() {
+    let dir = tempfile::tempdir().unwrap();
+    // A canonical Windows path starts with `\\?\`. The depfile parser treats
+    // `\\` as one backslash, so that spelling does not name the written file.
+    let root = dir.path();
+    let source = root.join("unit.c");
+    let header = root.join("shared.h");
+    // Above the size the file-hash memo keeps rows for.
+    std::fs::write(&source, vec![b' '; 70_000]).unwrap();
+    std::fs::write(&header, vec![b'\n'; 70_000]).unwrap();
+    let depfile = root.join("unit.d");
+    let make = |path: &Path| path.to_string_lossy().replace(' ', "\\ ");
+    std::fs::write(
+        &depfile,
+        format!("unit.o: {} {}\n", make(&source), make(&header)),
+    )
+    .unwrap();
+    let map = format!("-ffile-prefix-map={}=.", root.display());
+    let source_arg = source.to_string_lossy().into_owned();
+    let parsed = CcArgs::parse(&s(&["cc", &map, "-c", &source_arg])).unwrap();
+    let db = root.join("index.db");
+    let file_hasher = crate::cache_key::FileHasher::persistent(&db);
+    let inputs = CcCompiler::new()
+        .captured_inputs(&parsed, &depfile, &file_hasher)
+        .expect("keyed from its read set");
+    file_hasher.flush_memo_as_if_settled();
+    let content = |path: &Path| {
+        inputs
+            .iter()
+            .find(|input| Path::new(input.local_path()).file_name() == path.file_name())
+            .map(|input| input.content.clone())
+            .unwrap()
+    };
+    let (source_content, header_content) = (content(&source), content(&header));
+    let cache = kache_store::file_hash::FileHashCache::open(&db).unwrap();
+    let asm = cache
+        .get_cc_asm_scans(&[&source_content, &header_content])
+        .unwrap();
+    assert!(asm.contains_key(&header_content) && !asm.contains_key(&source_content));
+    let maps = cc_prefix_maps_key(&cc_prefix_maps(&parsed, &[]));
+    let mapped = cache
+        .get_cc_mapped_hashes(&maps, &[&source_content, &header_content])
+        .unwrap();
+    assert!(mapped.contains_key(&header_content) && !mapped.contains_key(&source_content));
+    let next = crate::cache_key::FileHasher::persistent(&db);
+    // Windows memoises a hash only with a file identity it may not have.
+    if cfg!(not(windows)) {
+        next.hash(&header).unwrap();
+        assert_eq!(next.stats().cache_hits, 1, "the header's hash was memoised");
+        next.hash(&source).unwrap();
+        assert_eq!(next.stats().cache_hits, 1, "the source's was not");
+    }
 }

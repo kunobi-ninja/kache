@@ -7924,6 +7924,15 @@ impl<'db> FileHasher<'db> {
         }
     }
 
+    /// Drop the pending memo rows of paths `unrecorded` claims, such as a
+    /// unit's own source: no other unit hashes it, and a memo check only
+    /// hashes it again when its stamp moved.
+    pub(crate) fn forget_pending_memo(&self, unrecorded: &dyn Fn(&Path) -> bool) {
+        self.pending_memo
+            .borrow_mut()
+            .retain(|(observed, _)| !unrecorded(Path::new(&observed.fingerprint.path)));
+    }
+
     /// Flush as if every pending file had been observed one settle window
     /// later, for tests that write a file and then expect its row.
     #[cfg(test)]

@@ -22292,3 +22292,29 @@ fn keying_selects_the_hashes_the_capture_observed() {
     );
     assert_eq!(hasher.stats().cache_misses, 0, "nothing was read");
 }
+
+#[test]
+fn a_forgotten_memo_row_is_not_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let source = dir.path().join("unit.c");
+    let header = dir.path().join("shared.h");
+    std::fs::write(&source, vec![b'a'; 70_000]).unwrap();
+    std::fs::write(&header, vec![b'b'; 70_000]).unwrap();
+    let first = FileHasher::persistent(&db);
+    let named =
+        [source.clone(), header.clone()].map(|path| (path.to_string_lossy().into_owned(), path));
+    first
+        .cc_preprocess_fingerprints(&named, "", &|path| {
+            let bytes = std::fs::read(path).ok()?;
+            Some(content_hashes(&bytes, &bytes))
+        })
+        .unwrap();
+    first.forget_pending_memo(&|path| path == source);
+    first.flush_memo_as_if_settled();
+    let next = FileHasher::persistent(&db);
+    next.hash(&header).unwrap();
+    assert_eq!(next.stats().cache_hits, 1, "the header's row was written");
+    next.hash(&source).unwrap();
+    assert_eq!(next.stats().cache_hits, 1, "the source's row was not");
+}

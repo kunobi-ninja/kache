@@ -9278,6 +9278,7 @@ impl CcCompiler {
             &|path| cc_mapped_content_hash(path, &prefix_maps),
             &|path| sources.iter().any(|source| source == path),
         )?;
+        file_hasher.forget_pending_memo(&|path| sources.iter().any(|source| source == path));
         // After the fingerprints: the scan is memoised by the content hash
         // they carry, so a header shared by every unit is read once.
         if let Some(found) = file_hasher.cc_inputs_hide_assembler_input(

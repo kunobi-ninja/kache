@@ -373,7 +373,8 @@ impl FileHashCache<'_> {
     }
 
     /// The recorded macro definitions named `names` in any of `contents`,
-    /// as `(content, name, bodies)`.
+    /// as `(content, name, bodies)`. Every chunk reads one snapshot, so a
+    /// marker row found by one chunk vouches for what the others found.
     pub fn get_cc_header_macros(
         &self,
         version: i64,
@@ -382,9 +383,10 @@ impl FileHashCache<'_> {
     ) -> rusqlite::Result<Vec<(String, String, String)>> {
         let wanted: std::collections::HashSet<&str> = contents.iter().copied().collect();
         let mut found = Vec::new();
+        let snapshot = Transaction::new_unchecked(self.db(), TransactionBehavior::Deferred)?;
         for chunk in names.chunks(MEMO_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = self.db().prepare_cached(&format!(
+            let mut stmt = snapshot.prepare_cached(&format!(
                 "SELECT content, name, bodies FROM cc_header_macros
                  WHERE version = ?1 AND name IN ({placeholders})"
             ))?;
@@ -407,6 +409,7 @@ impl FileHashCache<'_> {
                 }
             }
         }
+        snapshot.finish()?;
         Ok(found)
     }
 
@@ -965,6 +968,27 @@ mod tests {
         // Pruned with the scan once no memo reads the content.
         cache.prune_cc_preprocess_memos().unwrap();
         assert_eq!(count(&cache, "cc_header_macros"), 0);
+    }
+
+    #[test]
+    fn header_macros_are_read_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let names: Vec<String> = (0..MEMO_LOOKUP_CHUNK * 2 + 1)
+            .map(|n| format!("M{n}"))
+            .collect();
+        let macros = names
+            .iter()
+            .map(|name| (name.clone(), "[]".to_owned()))
+            .collect();
+        cache
+            .put_cc_header_scans_with_macros(1, &[("a".into(), "scan".into(), macros)])
+            .unwrap();
+        let asked: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            cache.get_cc_header_macros(1, &["a"], &asked).unwrap().len(),
+            names.len()
+        );
     }
 
     /// Every process that opens an older index looks for the rule columns

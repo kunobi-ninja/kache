@@ -2406,7 +2406,12 @@ fn normalize_depinfo_separators(
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
+    // One pass per byte. A cursor that stays put used to rescan that byte
+    // until the test process was killed.
+    for _ in 0..bytes.len() {
+        if i >= bytes.len() {
+            break;
+        }
         if let Some((name_end, sep_len)) = sentinel_name_end(input, i) {
             out.push_str(&input[i..name_end]);
             out.push('/');
@@ -2434,7 +2439,10 @@ fn sentinel_name_end(input: &str, start: usize) -> Option<(usize, usize)> {
     let rest = rest.strip_prefix("__kache_")?;
     let bytes = rest.as_bytes();
     let mut j = 0;
-    while j + 2 < bytes.len() {
+    for _ in 0..bytes.len() {
+        if j + 2 >= bytes.len() {
+            break;
+        }
         if bytes[j] == b'_' && bytes[j + 1] == b'_' && matches!(bytes[j + 2], b'/' | b'\\') {
             if j == 0
                 || !bytes[..j]
@@ -2462,7 +2470,10 @@ fn normalize_depinfo_remainder(
     let bytes = input.as_bytes();
     let mut out = String::new();
     let mut i = 0;
-    while i < bytes.len() {
+    for _ in 0..bytes.len() {
+        if i >= bytes.len() {
+            break;
+        }
         let b = bytes[i];
         if b == b'\\' {
             if env_value {
@@ -4663,6 +4674,7 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
 
     #[test]
     fn depinfo_cursor_forward_rejects_a_step_that_does_not_advance() {
+        assert_eq!(depinfo_cursor_forward(0, 1), 1);
         assert_eq!(depinfo_cursor_forward(4, 1), 5);
         assert_eq!(depinfo_cursor_forward(4, 2), 6);
         let caught = std::panic::catch_unwind(|| depinfo_cursor_forward(4, 0));

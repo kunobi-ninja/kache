@@ -947,7 +947,7 @@ impl GuardWalk {
 
 /// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk_observing`]
 /// takes it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WalkedRoot {
     path: PathBuf,
     role: Vec<u8>,
@@ -966,10 +966,11 @@ enum StampRefusal {
     Unwalkable,
 }
 
+#[derive(Clone)]
 struct StampedRoot {
     stamp: crate::tree_stamp::TreeStamp,
     entries: usize,
-    small_files: Vec<FileFingerprint>,
+    small_files: std::sync::Arc<Vec<FileFingerprint>>,
 }
 
 // A weak identity can survive replacement while the containing tree changes.
@@ -1001,53 +1002,79 @@ fn stamp_roots(
                 hook(&root.path);
             }
         });
-        let mut stamper = crate::tree_stamp::Stamper::new();
-        let mut budget = max_entries;
-        stamper.label(&root.role);
-        let mut small_files = Vec::new();
-        let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
-            let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-            let inode = metadata_inode(metadata);
-            if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
-                // The memo stores UTF-8 paths. Lossy spellings could merge
-                // distinct names in the path-keyed batch result.
-                if !path.is_absolute() {
-                    return;
-                }
-                let Ok(path) = path.into_os_string().into_string() else {
-                    return;
-                };
-                small_files.push(FileFingerprint {
-                    path,
-                    size,
-                    mtime_ns: metadata_mtime_ns(metadata),
-                    ctime_ns: metadata_ctime_ns(metadata),
-                    inode,
-                });
+        match stamp_one_root(root, max_entries, collect_small_files) {
+            Ok(stamped) => stamps.push(stamped),
+            Err(crate::tree_stamp::WalkOutcome::TooLarge) => {
+                return Err(StampRefusal::TooLarge(index));
             }
-        };
-        match stamper.walk_observing(
-            &root.path,
-            &root.excluded,
-            root.rules,
-            &mut budget,
-            &mut observe,
-        ) {
-            crate::tree_stamp::WalkOutcome::Fits => {
-                stamps.push(StampedRoot {
-                    stamp: stamper.finish(),
-                    entries: max_entries - budget,
-                    small_files,
-                });
-            }
-            crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
-            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
+            Err(_) => return Err(StampRefusal::Unwalkable),
         }
     }
     if stamps.iter().map(|root| root.entries).sum::<usize>() > max_entries {
         return Err(StampRefusal::TooLargeTogether);
     }
     Ok(stamps)
+}
+
+/// Concurrent walks of one root, as units of one workspace stamp it.
+static STAMP_WALKS: std::sync::LazyLock<
+    crate::walk_flight::NextFlight<(WalkedRoot, usize, bool), StampOutcome>,
+> = std::sync::LazyLock::new(crate::walk_flight::NextFlight::new);
+
+type StampOutcome = std::result::Result<StampedRoot, crate::tree_stamp::WalkOutcome>;
+
+/// The stamp of `root` from a walk that started after this call, shared with
+/// the units that asked for the same walk meanwhile ([`crate::walk_flight`]).
+fn stamp_one_root(
+    root: &WalkedRoot,
+    max_entries: usize,
+    collect_small_files: bool,
+) -> StampOutcome {
+    STAMP_WALKS.run(&(root.clone(), max_entries, collect_small_files), || {
+        walk_one_root(root, max_entries, collect_small_files)
+    })
+}
+
+fn walk_one_root(root: &WalkedRoot, max_entries: usize, collect_small_files: bool) -> StampOutcome {
+    let mut stamper = crate::tree_stamp::Stamper::new();
+    let mut budget = max_entries;
+    stamper.label(&root.role);
+    let mut small_files = Vec::new();
+    let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let inode = metadata_inode(metadata);
+        if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
+            // The memo stores UTF-8 paths. Lossy spellings could merge
+            // distinct names in the path-keyed batch result.
+            if !path.is_absolute() {
+                return;
+            }
+            let Ok(path) = path.into_os_string().into_string() else {
+                return;
+            };
+            small_files.push(FileFingerprint {
+                path,
+                size,
+                mtime_ns: metadata_mtime_ns(metadata),
+                ctime_ns: metadata_ctime_ns(metadata),
+                inode,
+            });
+        }
+    };
+    match stamper.walk_observing(
+        &root.path,
+        &root.excluded,
+        root.rules,
+        &mut budget,
+        &mut observe,
+    ) {
+        crate::tree_stamp::WalkOutcome::Fits => Ok(StampedRoot {
+            stamp: stamper.finish(),
+            entries: max_entries - budget,
+            small_files: std::sync::Arc::new(small_files),
+        }),
+        outcome => Err(outcome),
+    }
 }
 
 /// [`stamp_roots`] for one root.

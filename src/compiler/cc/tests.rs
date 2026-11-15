@@ -11160,16 +11160,19 @@ fn stored_scans_load_only_the_macros_a_conditional_reaches() {
 #[test]
 fn a_captured_read_set_records_its_headers_but_not_its_source() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    // A canonical Windows path starts with `\\?\`. The depfile parser treats
+    // `\\` as one backslash, so that spelling does not name the written file.
+    let root = dir.path();
     let source = root.join("unit.c");
     let header = root.join("shared.h");
     // Above the size the file-hash memo keeps rows for.
     std::fs::write(&source, vec![b' '; 70_000]).unwrap();
     std::fs::write(&header, vec![b'\n'; 70_000]).unwrap();
     let depfile = root.join("unit.d");
+    let make = |path: &Path| path.to_string_lossy().replace(' ', "\\ ");
     std::fs::write(
         &depfile,
-        format!("unit.o: {} {}\n", source.display(), header.display()),
+        format!("unit.o: {} {}\n", make(&source), make(&header)),
     )
     .unwrap();
     let map = format!("-ffile-prefix-map={}=.", root.display());

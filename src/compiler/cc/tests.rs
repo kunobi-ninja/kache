@@ -10979,8 +10979,8 @@ fn parsed_scan_weight_counts_key_text_and_overhead() {
     assert_eq!(cc_parsed_scan_weight("ab", "xyz", 0), 2 + 2 * 3 + 128);
     assert_eq!(cc_parsed_scan_weight("ab", "xyz", 5), 2 + 2 * (3 + 5) + 128);
     assert_eq!(
-        cc_stored_macros_len(&[("AB".into(), "xyz".into()), ("C".into(), "[]".into())]),
-        2 + 3 + 1 + 2
+        cc_stored_macros_len(&[("AB".into(), "wxyz".into()), ("C".into(), "[]".into())]),
+        2 + 4 + 1 + 2
     );
     assert_eq!(
         CcMacrosMissing(vec!["a".into(), "b".into()]).to_string(),
@@ -11184,7 +11184,7 @@ fn a_captured_read_set_records_its_headers_but_not_its_source() {
     let content = |path: &Path| {
         inputs
             .iter()
-            .find(|input| Path::new(input.local_path()) == path)
+            .find(|input| Path::new(input.local_path()).file_name() == path.file_name())
             .map(|input| input.content.clone())
             .unwrap()
     };
@@ -11200,11 +11200,11 @@ fn a_captured_read_set_records_its_headers_but_not_its_source() {
         .unwrap();
     assert!(mapped.contains_key(&header_content) && !mapped.contains_key(&source_content));
     let next = crate::cache_key::FileHasher::persistent(&db);
-    next.hash(&header).unwrap();
-    next.hash(&source).unwrap();
-    assert_eq!(
-        next.stats().cache_hits,
-        1,
-        "only the header's hash was memoised"
-    );
+    // Windows memoises a hash only with a file identity it may not have.
+    if cfg!(not(windows)) {
+        next.hash(&header).unwrap();
+        assert_eq!(next.stats().cache_hits, 1, "the header's hash was memoised");
+        next.hash(&source).unwrap();
+        assert_eq!(next.stats().cache_hits, 1, "the source's was not");
+    }
 }

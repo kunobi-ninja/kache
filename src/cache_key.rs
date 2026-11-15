@@ -8804,10 +8804,8 @@ impl<'db> FileHasher<'db> {
         names: &[&str],
     ) -> anyhow::Result<Vec<(String, String, String)>> {
         match &self.cache {
-            Some(cache) if !contents.is_empty() && !names.is_empty() => {
-                Ok(cache.get_cc_header_macros(version, contents, names)?)
-            }
-            _ => Ok(Vec::new()),
+            Some(cache) => Ok(cache.get_cc_header_macros(version, contents, names)?),
+            None => Ok(Vec::new()),
         }
     }
 

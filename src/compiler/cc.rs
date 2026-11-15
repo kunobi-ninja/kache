@@ -5877,17 +5877,17 @@ fn cc_derive_shadowing(
     };
     ensure_scans_describe(&scans)?;
     let trace_pastes = crate::phase_trace::phase("cc_shadow_pastes");
-    let reached = match cc_reached_macro_uses(&scans, &argument_scan, file_hasher) {
+    let reached = match cc_reached_macro_uses(&scans, &argument_scan, file_hasher)? {
+        Ok(reached) => reached,
         // Rare: start the shared scans over and read these from the store,
         // or scan them again.
-        Err(error) if error.is::<CcMacrosMissing>() => {
+        Err(_) => {
             let dropped = std::mem::take(&mut *cc_parsed_scans());
             drop(dropped);
             scans = cc_parsed_header_scans(read_inputs, sources, file_hasher)?;
             ensure_scans_describe(&scans)?;
-            cc_reached_macro_uses(&scans, &argument_scan, file_hasher)?
+            cc_reached_macro_uses(&scans, &argument_scan, file_hasher)??
         }
-        reached => reached?,
     };
     let all_scans = || {
         scans
@@ -5942,7 +5942,7 @@ fn cc_reached_macro_uses(
     scans: &[(String, CcParsedScan)],
     argument_scan: &CcHeaderProbeScan,
     file_hasher: &crate::cache_key::FileHasher<'_>,
-) -> Result<std::collections::HashMap<(String, String), Vec<CcStoredMacroBody>>> {
+) -> Result<std::result::Result<CcReachedMacros, CcMacrosMissing>> {
     let mut reached = std::collections::HashMap::new();
     let held = || {
         scans
@@ -5958,7 +5958,7 @@ fn cc_reached_macro_uses(
     apart.sort_unstable();
     apart.dedup();
     if apart.is_empty() {
-        return Ok(reached);
+        return Ok(Ok(reached));
     }
     let mut inline = std::collections::HashMap::<&str, Vec<&[CcHeaderMacroUse]>>::new();
     for (name, _, uses) in held().flat_map(|scan| &scan.macro_uses) {
@@ -5998,7 +5998,7 @@ fn cc_reached_macro_uses(
             .map(|content| (*content).to_owned())
             .collect();
         if !missing.is_empty() {
-            return Err(CcMacrosMissing(missing).into());
+            return Ok(Err(CcMacrosMissing(missing)));
         }
         let mut next = Vec::new();
         for name in &names {
@@ -6025,8 +6025,11 @@ fn cc_reached_macro_uses(
         }
         frontier = next;
     }
-    Ok(reached)
+    Ok(Ok(reached))
 }
+
+/// Stored definitions by content and name.
+type CcReachedMacros = std::collections::HashMap<(String, String), Vec<CcStoredMacroBody>>;
 
 /// Every macro definition the paste proof sees, in the order of the inputs
 /// that hold them, then the command line: in-hand definitions as scanned,
@@ -6034,7 +6037,7 @@ fn cc_reached_macro_uses(
 fn cc_macro_uses_in_order<'a>(
     scans: &'a [(String, CcParsedScan)],
     argument_scan: &'a CcHeaderProbeScan,
-    reached: &'a std::collections::HashMap<(String, String), Vec<CcStoredMacroBody>>,
+    reached: &'a CcReachedMacros,
 ) -> Vec<CcMacroDefinition<'a>> {
     let mut by_content =
         std::collections::HashMap::<&str, Vec<(&str, &[CcStoredMacroBody])>>::new();
@@ -6131,10 +6134,7 @@ fn cc_parsed_header_scans(
             let content = blake3::hash(&bytes).to_hex().to_string();
             let scan = cc_header_probe_scan(&cc_splice_lines(&bytes));
             let (core, macros) = cc_stored_header_scan(scan.as_ref())?;
-            let defined = macros
-                .iter()
-                .map(|(name, bodies)| name.len() + bodies.len())
-                .sum();
+            let defined = cc_stored_macros_len(&macros);
             fresh
                 .borrow_mut()
                 .insert(content.clone(), (CcParsedScan::new(scan), defined));
@@ -6155,7 +6155,7 @@ fn cc_parsed_header_scans(
                     None => (CcParsedScan::new(serde_json::from_str(&json)?), 0),
                 };
                 held.insert(content.clone(), scan.clone());
-                let weight = cc_parsed_scan_weight(&content, &json) + 2 * defined;
+                let weight = cc_parsed_scan_weight(&content, &json, defined);
                 learned.push((content.clone(), scan.clone(), weight));
                 scan
             }
@@ -6243,8 +6243,17 @@ struct CcHeaderProbeScanCore<'a> {
 
 /// Estimated memory of one held scan: parsed vectors and the key cost more
 /// than the serialized text.
-fn cc_parsed_scan_weight(content: &str, json: &str) -> usize {
-    content.len() + 2 * json.len() + 128
+fn cc_parsed_scan_weight(content: &str, json: &str, defined: usize) -> usize {
+    content.len() + 2 * (json.len() + defined) + 128
+}
+
+/// The stored size of a scan's definitions, which a fresh scan holds in
+/// hand on top of its stored core.
+fn cc_stored_macros_len(macros: &[(String, String)]) -> usize {
+    macros
+        .iter()
+        .map(|(name, bodies)| name.len() + bodies.len())
+        .sum()
 }
 
 impl CcParsedScans {

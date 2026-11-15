@@ -8951,6 +8951,7 @@ impl CcCompiler {
             // of that read set stands where the expansion hash would, and
             // the memo records it under the same identity.
             let digest = cc_direct_inputs_digest(&captured.fingerprints);
+            ctx.file_hasher.adopt_observed(&captured.fingerprints);
             self.key_path_bound.set(captured.path_bound);
             let read_inputs = captured
                 .fingerprints
@@ -9271,10 +9272,11 @@ impl CcCompiler {
             .into_iter()
             .map(|path| (cc_mapped_path(&path, &prefix_maps), path))
             .collect();
-        let inputs = file_hasher.cc_preprocess_fingerprints(
+        let inputs = file_hasher.cc_preprocess_fingerprints_recording(
             &mapped,
             &cc_prefix_maps_key(&prefix_maps),
             &|path| cc_mapped_content_hash(path, &prefix_maps),
+            &|path| sources.iter().any(|source| source == path),
         )?;
         // After the fingerprints: the scan is memoised by the content hash
         // they carry, so a header shared by every unit is read once.

@@ -7877,6 +7877,10 @@ impl FileHasher<'static> {
     }
 }
 
+/// A header scan as a scanner returns it: the raw content hash, the scan
+/// stored without its macro definitions, and those as `(name, bodies)`.
+pub(crate) type CcScannedHeader = (String, String, Vec<(String, String)>);
+
 impl<'db> FileHasher<'db> {
     pub(crate) fn invocation_env(&self) -> &InvocationEnv {
         &self.invocation_env
@@ -8463,6 +8467,22 @@ impl<'db> FileHasher<'db> {
             .collect()
     }
 
+    /// Take the content hashes another hasher in this process observed for
+    /// a compile's read set, so keying selects those bytes, the ones the
+    /// read-set digest names, instead of hashing each input again.
+    pub(crate) fn adopt_observed(&self, inputs: &[CcPreprocessMemoInput]) {
+        let mut recent = self.recent_hashes.borrow_mut();
+        for input in inputs {
+            let Ok(resolved) = self.resolve_path(Path::new(input.local_path())) else {
+                continue;
+            };
+            recent.entry(resolved).or_insert_with(|| RecentHash {
+                hash: input.content.clone(),
+                fingerprint: Some(input.fingerprint.clone()),
+            });
+        }
+    }
+
     fn selected_content(&self, path: &Path) -> anyhow::Result<String> {
         let recent = {
             let resolved = self.resolve_path(path)?;
@@ -8566,6 +8586,19 @@ impl<'db> FileHasher<'db> {
         maps_key: &str,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
+        self.cc_preprocess_fingerprints_recording(paths, maps_key, mapped_content, &|_| false)
+    }
+
+    /// [`Self::cc_preprocess_fingerprints`], not recording the mapped hashes
+    /// of paths `unrecorded` claims (a unit's own source, which no other
+    /// unit reads).
+    pub(crate) fn cc_preprocess_fingerprints_recording(
+        &self,
+        paths: &[(String, PathBuf)],
+        maps_key: &str,
+        mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
+        unrecorded: &dyn Fn(&Path) -> bool,
+    ) -> Option<Vec<CcPreprocessMemoInput>> {
         let paths = paths
             .iter()
             .map(|(name, path)| Some((name.clone(), self.invocation_env.resolve(path)?)))
@@ -8641,7 +8674,9 @@ impl<'db> FileHasher<'db> {
                         return None;
                     }
                     known.insert(content.clone(), read.mapped.clone());
-                    learned.push((content.clone(), read.mapped.clone()));
+                    if !unrecorded(&path) {
+                        learned.push((content.clone(), read.mapped.clone()));
+                    }
                     read.mapped
                 }
             };
@@ -8696,7 +8731,7 @@ impl<'db> FileHasher<'db> {
         paths: &[PathBuf],
         version: i64,
         held: &mut dyn FnMut(&str) -> bool,
-        scan: &impl Fn(&Path) -> anyhow::Result<(String, String, Vec<(String, String)>)>,
+        scan: &impl Fn(&Path) -> anyhow::Result<CcScannedHeader>,
         unrecorded: &dyn Fn(&Path) -> bool,
     ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());

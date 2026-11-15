@@ -22238,7 +22238,7 @@ fn a_units_own_source_is_scanned_but_not_recorded() {
         .collect();
     std::fs::write(&paths[0], "int unit;\n").unwrap();
     std::fs::write(&paths[1], "int shared;\n").unwrap();
-    let scan = |path: &Path| -> anyhow::Result<(String, String, Vec<(String, String)>)> {
+    let scan = |path: &Path| -> anyhow::Result<CcScannedHeader> {
         let bytes = std::fs::read(path)?;
         Ok((
             blake3::hash(&bytes).to_hex().to_string(),
@@ -22266,4 +22266,29 @@ fn a_units_own_source_is_scanned_but_not_recorded() {
         "the source is not stored"
     );
     assert!(stored.contains_key(contents[1]), "a header is");
+}
+
+/// Keying a compile-first unit selects the hashes its capture took, which
+/// the read-set digest names, instead of reading the inputs again.
+#[test]
+fn keying_selects_the_hashes_the_capture_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.h");
+    std::fs::write(&path, "int a;\n").unwrap();
+    let observed = ObservedFingerprint::from_path(&path).unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("idx.sqlite"));
+    hasher.adopt_observed(&[CcPreprocessMemoInput {
+        name: "a.h".into(),
+        fingerprint: observed.fingerprint,
+        content: "captured".into(),
+        mapped: String::new(),
+        observed_ns: observed.observed_ns,
+    }]);
+    assert_eq!(
+        hasher
+            .cc_input_contents(std::slice::from_ref(&path))
+            .unwrap(),
+        ["captured"]
+    );
+    assert_eq!(hasher.stats().cache_misses, 0, "nothing was read");
 }

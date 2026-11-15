@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// A digest of every entry a [`Stamper`] walked: name, kind, size,
 /// modification and change time, and the link text of a symlink.
+#[derive(Clone)]
 pub(crate) struct TreeStamp {
     pub(crate) digest: String,
     /// [`Self::digest`] without the roots' own metadata
@@ -43,7 +44,7 @@ impl TreeStamp {
 }
 
 /// How a stamp walk treats symlinks and Cargo's build directories.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct StampRules {
     /// Fold a symlink's text instead of refusing the tree. Only for a digest
     /// that does not read through a link either: one that does could change

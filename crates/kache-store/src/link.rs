@@ -4672,6 +4672,22 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
         );
     }
 
+    /// Each whitespace byte ends the path. `&&` binds tighter than `||`, so
+    /// replacing the `||` before CR makes a raw newline part of the path and
+    /// rewrites the backslash after it.
+    #[test]
+    fn depinfo_remainder_stops_before_each_whitespace_byte() {
+        let store = DepInfoSeparatorMode::Store;
+        for gap in [' ', '\t', '\n', '\r'] {
+            let sample = format!("__kache_cwd__/a{gap}C:\\b");
+            assert_eq!(
+                normalize_depinfo_separators(&sample, store, false),
+                sample,
+                "gap {gap:?} must end the path before the backslash"
+            );
+        }
+    }
+
     /// `replace_depinfo_text`'s search loop terminates only because this step
     /// strictly advances. Asserted here rather than left to the loop, where a
     /// slip shows up as a hang instead of a failure.

@@ -2381,6 +2381,17 @@ enum DepInfoSeparatorMode {
     Restore { windows: bool },
 }
 
+/// Move a dep-info scan cursor forward by `step` bytes.
+///
+/// The separator scans only terminate because every continue takes this
+/// step. A zero step leaves the cursor on the same byte, and the scan
+/// retries it until the process is killed. Tested on its own in
+/// `depinfo_cursor_forward_rejects_a_step_that_does_not_advance`.
+fn depinfo_cursor_forward(cursor: usize, step: usize) -> usize {
+    assert!(step >= 1, "depinfo cursor step must advance");
+    cursor + step
+}
+
 /// Rewrite separators that belong to a `__kache_<name>__` path. Text before
 /// a sentinel is left alone, including an env-dep key. `__kache_name__/` and
 /// `__kache_name__\` are the same token. The remainder stops at unescaped
@@ -2402,12 +2413,15 @@ fn normalize_depinfo_separators(
             i = name_end + sep_len;
             let (rest, consumed) = normalize_depinfo_remainder(&input[i..], mode, env_value);
             out.push_str(&rest);
-            i += consumed;
+            i = match consumed {
+                0 => i,
+                step => depinfo_cursor_forward(i, step),
+            };
             continue;
         }
         let ch = input[i..].chars().next().unwrap();
         out.push(ch);
-        i += ch.len_utf8();
+        i = depinfo_cursor_forward(i, ch.len_utf8());
     }
     out
 }
@@ -2435,7 +2449,7 @@ fn sentinel_name_end(input: &str, start: usize) -> Option<(usize, usize)> {
         if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
             return None;
         }
-        j += 1;
+        j = depinfo_cursor_forward(j, 1);
     }
     None
 }
@@ -2456,25 +2470,25 @@ fn normalize_depinfo_remainder(
                     match bytes[i + 1] {
                         b'\\' => {
                             push_depinfo_separator(&mut out, mode, true);
-                            i += 2;
+                            i = depinfo_cursor_forward(i, 2);
                             continue;
                         }
                         b'n' | b'r' | b' ' => {
                             out.push('\\');
                             out.push(bytes[i + 1] as char);
-                            i += 2;
+                            i = depinfo_cursor_forward(i, 2);
                             continue;
                         }
                         b'\n' | b'\r' => break,
                         _ => {
                             push_depinfo_separator(&mut out, mode, true);
-                            i += 1;
+                            i = depinfo_cursor_forward(i, 1);
                             continue;
                         }
                     }
                 }
                 push_depinfo_separator(&mut out, mode, true);
-                i += 1;
+                i = depinfo_cursor_forward(i, 1);
                 continue;
             }
             if i + 1 < bytes.len() {
@@ -2482,24 +2496,24 @@ fn normalize_depinfo_remainder(
                     b' ' => {
                         out.push('\\');
                         out.push(' ');
-                        i += 2;
+                        i = depinfo_cursor_forward(i, 2);
                         continue;
                     }
                     b'\n' | b'\r' => break,
                     _ => {
                         push_depinfo_separator(&mut out, mode, false);
-                        i += 1;
+                        i = depinfo_cursor_forward(i, 1);
                         continue;
                     }
                 }
             }
             push_depinfo_separator(&mut out, mode, false);
-            i += 1;
+            i = depinfo_cursor_forward(i, 1);
             continue;
         }
         if b == b'/' {
             push_depinfo_separator(&mut out, mode, env_value);
-            i += 1;
+            i = depinfo_cursor_forward(i, 1);
             continue;
         }
         if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
@@ -2507,7 +2521,7 @@ fn normalize_depinfo_remainder(
         }
         let ch = input[i..].chars().next().unwrap();
         out.push(ch);
-        i += ch.len_utf8();
+        i = depinfo_cursor_forward(i, ch.len_utf8());
     }
     (out, i)
 }
@@ -4644,6 +4658,17 @@ __kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
                 DepInfoTextContext::MakeLine,
             ),
             r"keep __kache_cwd__/src\lib.rs and __kache_cwd__/asset.txt"
+        );
+    }
+
+    #[test]
+    fn depinfo_cursor_forward_rejects_a_step_that_does_not_advance() {
+        assert_eq!(depinfo_cursor_forward(4, 1), 5);
+        assert_eq!(depinfo_cursor_forward(4, 2), 6);
+        let caught = std::panic::catch_unwind(|| depinfo_cursor_forward(4, 0));
+        assert!(
+            caught.is_err(),
+            "a zero step must not leave the cursor in place"
         );
     }
 

@@ -78,12 +78,20 @@ pub(crate) struct Lease {
     /// The donor profile whose state this lease imported.
     worktree_seed_donor: Option<PathBuf>,
     worktree_bootstrap: bool,
-    /// The flush of an in-flight record published while rustc starts.
-    marker_flush: Option<MarkerFlush>,
+    /// A deferred seed compiling into scratch while its marker flushes.
+    deferred_graph: Option<DeferredGraph>,
     _lock: UnitLock,
 }
 
-type MarkerFlush = std::thread::JoinHandle<bool>;
+/// Scratch for a deferred seed's graph. No lease reuses it, so rustc may
+/// write there before the in-flight record is durable.
+const DEFERRED_GRAPH: &str = "rustc.deferred";
+
+struct DeferredGraph {
+    marker_flush: std::thread::JoinHandle<bool>,
+    /// Where the graph moves once the marker is durable.
+    rustc_dir: PathBuf,
+}
 
 struct UnitLock(File);
 
@@ -342,7 +350,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
-            marker_flush: None,
+            deferred_graph: None,
             _lock: lock,
         })
     }
@@ -394,31 +402,36 @@ impl AdaptiveUnit {
         let mut busy = previous.clone();
         busy.in_flight = true;
         // The old graph must remain whole if publishing the marker fails.
-        // Without one, rustc writes into a fresh directory, so its flush can
-        // run beside the compile and join before the lease finishes.
-        let marker_flush = if definitely_missing(&self.rustc_dir) {
-            Some(self.publish_in_flight_record_unflushed()?)
+        // Without one, rustc writes to scratch while the marker flushes.
+        let mut unit = self.clone();
+        let deferred_graph = if definitely_missing(&self.rustc_dir) {
+            unit.rustc_dir = self.unit_dir.join(DEFERRED_GRAPH);
+            Some(DeferredGraph {
+                marker_flush: self.publish_in_flight_record_unflushed()?,
+                rustc_dir: self.rustc_dir.clone(),
+            })
         } else if self.store_state(&busy, true) {
             None
         } else {
             return None;
         };
-        if !remove_path_safely(&self.rustc_dir) {
+        let unit = unit;
+        if !remove_path_safely(&unit.rustc_dir) {
             // Leave the marker beside any partial removal so a later caller
             // resets it rather than borrowing an incomplete graph.
             return None;
         }
-        if !ensure_real_directory(&self.rustc_dir) {
+        if !ensure_real_directory(&unit.rustc_dir) {
             return None;
         }
         Some(Lease {
-            unit: self.clone(),
+            unit,
             kind: LeaseKind::Seed,
             completion: Completion::DeferredSeed { previous },
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
-            marker_flush,
+            deferred_graph,
             _lock: lock,
         })
     }
@@ -486,7 +499,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
-            marker_flush: None,
+            deferred_graph: None,
             _lock: lock,
         })
     }
@@ -528,7 +541,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
-            marker_flush: None,
+            deferred_graph: None,
             _lock: lock,
         })
     }
@@ -585,7 +598,7 @@ impl AdaptiveUnit {
             worktree_seed_key: None,
             worktree_seed_donor: None,
             worktree_bootstrap: false,
-            marker_flush: None,
+            deferred_graph: None,
             _lock: lock,
         })
     }
@@ -768,7 +781,7 @@ impl AdaptiveUnit {
 
     /// Publish the in-flight record and flush it on another thread.
     #[cfg(unix)]
-    fn publish_in_flight_record_unflushed(&self) -> Option<MarkerFlush> {
+    fn publish_in_flight_record_unflushed(&self) -> Option<std::thread::JoinHandle<bool>> {
         if unsafe_file(&self.state_path) || !self.link_in_flight_record() {
             return None;
         }
@@ -779,7 +792,7 @@ impl AdaptiveUnit {
     }
 
     #[cfg(not(unix))]
-    fn publish_in_flight_record_unflushed(&self) -> Option<MarkerFlush> {
+    fn publish_in_flight_record_unflushed(&self) -> Option<std::thread::JoinHandle<bool>> {
         self.store_state(&self.in_flight_marker(), true)
             .then(|| std::thread::spawn(|| true))
     }
@@ -906,13 +919,13 @@ impl Lease {
 
     fn finish_at(mut self, outcome: CompileOutcome, now: u64) -> bool {
         // A marker that may not have reached disk cannot cover this graph.
-        if self
-            .marker_flush
-            .take()
-            .is_some_and(|flush| !flush.join().unwrap_or(false))
-        {
-            let _ = reset_locked(&self.unit);
-            return false;
+        let mut promote_to = None;
+        if let Some(deferred) = self.deferred_graph.take() {
+            if !deferred.marker_flush.join().unwrap_or(false) {
+                let _ = reset_locked(&self.unit);
+                return false;
+            }
+            promote_to = Some(deferred.rustc_dir);
         }
         let keep = match outcome {
             // A success that wrote no incremental files proves nothing reusable.
@@ -959,6 +972,14 @@ impl Lease {
             (Completion::Immediate { restore }, _) => restore,
         };
 
+        // The marker is durable now, so the graph may leave scratch.
+        if let (Some(_), Some(rustc_dir)) = (&next, promote_to) {
+            if fs::rename(&self.unit.rustc_dir, &rustc_dir).is_err() {
+                let _ = reset_locked(&self.unit);
+                return false;
+            }
+            self.unit.rustc_dir = rustc_dir;
+        }
         let kept = match next {
             // The durable busy marker already protects this graph. A lost
             // completion must reset it, so no second flush is needed here.
@@ -1215,7 +1236,9 @@ fn reset_locked(unit: &AdaptiveUnit) -> bool {
     {
         return false;
     }
-    if !remove_path_safely(&unit.rustc_dir) {
+    if !remove_path_safely(&unit.rustc_dir)
+        || !remove_path_safely(&unit.unit_dir.join(DEFERRED_GRAPH))
+    {
         return false;
     }
     remove_path_safely(&unit.state_path)
@@ -1705,59 +1728,96 @@ mod tests {
         assert!(!lease.finish_at(CompileOutcome::Abnormal, 104));
     }
 
-    #[test]
-    fn deferred_seed_flushes_its_marker_beside_rustc_only_without_a_graph() {
-        let (_temp, _args, unit) = fixture();
-        teach(&unit, 100);
-        assert!(!path_exists(&unit.rustc_dir));
-        let mut lease = unit.try_deferred_seed().unwrap();
-        assert!(read_state(&unit).in_flight);
-        assert!(lease.marker_flush.take().unwrap().join().unwrap());
-        assert!(!lease.finish_at(CompileOutcome::Success, 101));
-
-        teach(&unit, 102);
-        fs::create_dir(&unit.rustc_dir).unwrap();
-        let lease = unit.try_deferred_seed().unwrap();
-        assert!(read_state(&unit).in_flight);
-        assert!(lease.marker_flush.is_none());
-        assert!(!lease.finish_at(CompileOutcome::Success, 103));
-    }
-
-    #[test]
-    fn a_marker_that_failed_to_flush_discards_the_qualified_graph() {
-        let (_temp, _args, unit) = fixture();
-        teach(&unit, 100);
-        let mut lease = unit.try_deferred_seed().unwrap();
-        assert!(lease.marker_flush.take().unwrap().join().unwrap());
-        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+    fn qualify(lease: &mut Lease) {
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
         assert!(lease.qualify_deferred_seed_at(
             &cache_key("second"),
             &fields("stable", "source-b", "extern-a"),
             101,
         ));
-        lease.marker_flush = Some(std::thread::spawn(|| false));
+    }
+
+    #[test]
+    fn a_deferred_seed_without_a_graph_compiles_into_scratch() {
+        let (_temp, args, unit) = fixture();
+        teach(&unit, 100);
+        let scratch = unit.unit_dir.join(DEFERRED_GRAPH);
+        fs::create_dir(&scratch).unwrap();
+        fs::write(scratch.join("stale"), b"crashed").unwrap();
+
+        let mut lease = unit.try_deferred_seed().unwrap();
+        assert!(read_state(&unit).in_flight);
+        assert_eq!(lease.unit.rustc_dir, scratch);
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        assert!(!path_exists(&unit.rustc_dir));
+        let rewritten = lease.compiler_args(&args);
+        assert!(rewritten.contains(&format!("incremental={}", scratch.display())));
+
+        qualify(&mut lease);
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        assert!(!path_exists(&scratch));
+        assert_eq!(
+            fs::read(unit.rustc_dir.join("dep-graph.bin")).unwrap(),
+            b"new"
+        );
+        let state = read_state(&unit);
+        assert_eq!(state.phase, Phase::Active);
+        assert!(!state.in_flight);
+    }
+
+    #[test]
+    fn a_deferred_seed_over_a_graph_flushes_before_rustc_starts() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        let lease = unit.try_deferred_seed().unwrap();
+        assert!(read_state(&unit).in_flight);
+        assert!(lease.deferred_graph.is_none());
+        assert_eq!(lease.unit.rustc_dir, unit.rustc_dir);
+        assert!(!lease.finish_at(CompileOutcome::Success, 101));
+    }
+
+    #[test]
+    fn a_marker_that_failed_to_flush_discards_the_scratch_graph() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let mut lease = unit.try_deferred_seed().unwrap();
+        qualify(&mut lease);
+        let deferred = lease.deferred_graph.as_mut().unwrap();
+        let flushed = std::mem::replace(&mut deferred.marker_flush, std::thread::spawn(|| false));
+        assert!(flushed.join().unwrap());
 
         assert!(!lease.finish_at(CompileOutcome::Success, 102));
+        assert!(!path_exists(&unit.unit_dir.join(DEFERRED_GRAPH)));
         assert!(!path_exists(&unit.rustc_dir));
         assert!(!path_exists(&unit.state_path));
     }
 
     #[test]
-    fn a_flushed_marker_keeps_the_qualified_graph() {
+    fn a_scratch_graph_that_cannot_move_is_discarded() {
         let (_temp, _args, unit) = fixture();
         teach(&unit, 100);
-        let lease = unit.try_deferred_seed();
-        let mut lease = lease.unwrap();
-        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
-        assert!(lease.qualify_deferred_seed_at(
-            &cache_key("second"),
-            &fields("stable", "source-b", "extern-a"),
-            101,
-        ));
+        let mut lease = unit.try_deferred_seed().unwrap();
+        qualify(&mut lease);
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        fs::write(unit.rustc_dir.join("blocker"), b"x").unwrap();
 
-        assert!(lease.finish_at(CompileOutcome::Success, 102));
-        assert_eq!(read_state(&unit).phase, Phase::Active);
-        assert!(!read_state(&unit).in_flight);
+        assert!(!lease.finish_at(CompileOutcome::Success, 102));
+        assert!(!path_exists(&unit.unit_dir.join(DEFERRED_GRAPH)));
+        assert!(!path_exists(&unit.state_path));
+    }
+
+    #[test]
+    fn an_unqualified_deferred_seed_leaves_no_scratch() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let lease = unit.try_deferred_seed().unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+
+        assert!(!lease.finish_at(CompileOutcome::CompileError, 101));
+        assert!(!path_exists(&unit.unit_dir.join(DEFERRED_GRAPH)));
+        assert!(!path_exists(&unit.rustc_dir));
+        assert_eq!(read_state(&unit).phase, Phase::Learning);
     }
 
     #[cfg(unix)]
@@ -1771,7 +1831,7 @@ mod tests {
         teach(&unit, 100);
         let mut lease = unit.try_deferred_seed().unwrap();
         let marker = fs::read(&unit.state_path).unwrap();
-        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
         fs::set_permissions(&unit.unit_dir, fs::Permissions::from_mode(0o500)).unwrap();
         let qualified = lease.qualify_deferred_seed_at(
             &cache_key("second"),
@@ -1791,17 +1851,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unqualified_deferred_cleanup_failure_never_restores_learning_over_partial_state() {
-        use std::os::unix::net::UnixListener;
-        let (temp, _args, mut unit) = fixture();
-        unit.rustc_dir = temp.path().join("blocked-deferred-finish");
+        use std::os::unix::ffi::OsStrExt;
+        let (_temp, _args, unit) = fixture();
         teach(&unit, 100);
         let lease = unit.try_deferred_seed().unwrap();
-        fs::remove_dir(&unit.rustc_dir).unwrap();
-        let _socket = UnixListener::bind(&unit.rustc_dir).unwrap();
+        let scratch = lease.unit.rustc_dir.clone();
+        fs::remove_dir(&scratch).unwrap();
+        // Neither a file nor a directory, so cleanup cannot remove it.
+        let fifo = std::ffi::CString::new(scratch.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
         assert!(!lease.finish_at(CompileOutcome::Success, 101));
         assert!(read_state(&unit).in_flight);
-        assert!(path_exists(&unit.rustc_dir));
+        assert!(path_exists(&scratch));
         assert!(unit.try_deferred_seed().is_none());
         assert!(unit.try_active_at(102).is_none());
     }
@@ -1849,7 +1911,7 @@ mod tests {
                 let before = fs::read(&unit.state_path).unwrap();
                 let lease = unit.try_deferred_seed().unwrap();
                 if wrote_graph {
-                    fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+                    fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
                 }
                 assert!(
                     !lease.finish_at(outcome, 101),
@@ -1882,7 +1944,7 @@ mod tests {
                 let before = fs::read(&unit.state_path).unwrap();
                 let mut lease = unit.try_deferred_seed().unwrap();
                 if wrote_graph {
-                    fs::write(unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
+                    fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"new").unwrap();
                 }
                 assert!(lease.qualify_deferred_seed(
                     &cache_key("second"),
@@ -1920,7 +1982,7 @@ mod tests {
             let (_temp, _args, unit) = fixture();
             teach(&unit, 100);
             let mut lease = unit.try_deferred_seed().unwrap();
-            fs::write(unit.rustc_dir.join("partial"), b"partial").unwrap();
+            fs::write(lease.unit.rustc_dir.join("partial"), b"partial").unwrap();
             if qualify {
                 assert!(lease.qualify_deferred_seed_at(
                     &cache_key("second"),

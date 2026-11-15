@@ -5852,18 +5852,35 @@ fn cc_derive_shadowing(
     digest: String,
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<CcShadowingDerivation> {
-    let scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
+    let mut scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
     let argument_scan = cc_header_probe_scan(&cc_splice_lines(definitions.as_bytes()))
         .context("cc: unresolved header availability probe in command-line definitions")?;
     // The scans must describe the bytes the digest names.
-    anyhow::ensure!(
-        scans.len() == contents.len()
-            && scans
-                .iter()
-                .zip(contents)
-                .all(|((scanned, _), content)| scanned == content),
-        "cc: a header changed while its probes were derived"
-    );
+    let ensure_scans_describe = |scans: &[(String, CcParsedScan)]| {
+        anyhow::ensure!(
+            scans.len() == contents.len()
+                && scans
+                    .iter()
+                    .zip(contents)
+                    .all(|((scanned, _), content)| scanned == content),
+            "cc: a header changed while its probes were derived"
+        );
+        Ok(())
+    };
+    ensure_scans_describe(&scans)?;
+    let trace_pastes = crate::phase_trace::phase("cc_shadow_pastes");
+    let reached = match cc_reached_macro_uses(&scans, &argument_scan, file_hasher) {
+        // Rare: start the shared scans over and read these from the store,
+        // or scan them again.
+        Err(error) if error.is::<CcMacrosMissing>() => {
+            let dropped = std::mem::take(&mut *cc_parsed_scans());
+            drop(dropped);
+            scans = cc_parsed_header_scans(read_inputs, file_hasher)?;
+            ensure_scans_describe(&scans)?;
+            cc_reached_macro_uses(&scans, &argument_scan, file_hasher)?
+        }
+        reached => reached?,
+    };
     let all_scans = || {
         scans
             .iter()
@@ -5871,9 +5888,9 @@ fn cc_derive_shadowing(
             .chain(std::iter::once(&argument_scan))
     };
     let aliases = cc_header_probe_aliases(all_scans());
-    let trace_pastes = crate::phase_trace::phase("cc_shadow_pastes");
+    let macro_uses = cc_macro_uses_in_order(&scans, &argument_scan, &reached);
     anyhow::ensure!(
-        cc_header_probe_pastes_are_resolved(all_scans(), &aliases)?,
+        cc_header_probe_pastes_are_resolved(all_scans(), &macro_uses, &aliases)?,
         "cc: token pasting may construct a header availability probe"
     );
     drop(trace_pastes);
@@ -5903,6 +5920,141 @@ fn cc_derive_shadowing(
     })
 }
 
+/// A stored macro definition: formals, then the uses in its body.
+type CcStoredMacroBody = (Vec<String>, Vec<CcHeaderMacroUse>);
+
+/// The stored macro definitions the paste proof can look up, by content and
+/// name. The proof reads a definition only for a name it meets in a
+/// conditional, or in the body of a definition it read, either as the name
+/// of a use or as a token of its arguments; so starting from every
+/// conditional and following those names finds all it can need. Definitions
+/// held in hand (fresh scans, the command line) are followed too, as they
+/// can name a stored macro.
+fn cc_reached_macro_uses(
+    scans: &[(String, CcParsedScan)],
+    argument_scan: &CcHeaderProbeScan,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) -> Result<std::collections::HashMap<(String, String), Vec<CcStoredMacroBody>>> {
+    let mut reached = std::collections::HashMap::new();
+    let held = || {
+        scans
+            .iter()
+            .filter_map(|(_, scan)| scan.as_ref().as_ref())
+            .chain(std::iter::once(argument_scan))
+    };
+    let mut apart: Vec<&str> = scans
+        .iter()
+        .filter(|(_, scan)| scan.as_ref().as_ref().is_some_and(|scan| scan.macros_apart))
+        .map(|(content, _)| content.as_str())
+        .collect();
+    apart.sort_unstable();
+    apart.dedup();
+    if apart.is_empty() {
+        return Ok(reached);
+    }
+    let mut inline = std::collections::HashMap::<&str, Vec<&[CcHeaderMacroUse]>>::new();
+    for (name, _, uses) in held().flat_map(|scan| &scan.macro_uses) {
+        inline.entry(name).or_default().push(uses);
+    }
+    fn names_in<'u>(used: &'u CcHeaderMacroUse, into: &mut Vec<&'u str>) {
+        into.push(&used.name);
+        for argument in used.arguments.iter().flatten() {
+            into.extend(argument.iter().map(String::as_str));
+        }
+    }
+    let mut seen = HashSet::<String>::new();
+    let mut frontier = Vec::new();
+    for used in held().flat_map(|scan| &scan.conditionals) {
+        names_in(used, &mut frontier);
+    }
+    let mut frontier: Vec<String> = frontier.into_iter().map(str::to_owned).collect();
+    while !frontier.is_empty() {
+        frontier.retain(|name| seen.insert(name.clone()));
+        if frontier.is_empty() {
+            break;
+        }
+        let mut names: Vec<&str> = frontier.iter().map(String::as_str).collect();
+        names.push(CC_MACROS_PRESENT);
+        let rows = file_hasher.cc_header_macros(CC_HEADER_SCAN_VERSION, &apart, &names)?;
+        names.pop();
+        // Rows of one content come and go together, so a round that sees
+        // the marker saw every definition it asked for.
+        let present: HashSet<&str> = rows
+            .iter()
+            .filter(|(_, name, _)| name == CC_MACROS_PRESENT)
+            .map(|(content, _, _)| content.as_str())
+            .collect();
+        let missing: Vec<String> = apart
+            .iter()
+            .filter(|content| !present.contains(*content))
+            .map(|content| (*content).to_owned())
+            .collect();
+        if !missing.is_empty() {
+            return Err(CcMacrosMissing(missing).into());
+        }
+        let mut next = Vec::new();
+        for name in &names {
+            for uses in inline.get(name).into_iter().flatten() {
+                for used in *uses {
+                    names_in(used, &mut next);
+                }
+            }
+        }
+        let mut next: Vec<String> = next.into_iter().map(str::to_owned).collect();
+        for (content, name, bodies) in rows {
+            if name == CC_MACROS_PRESENT {
+                continue;
+            }
+            let bodies: Vec<CcStoredMacroBody> = serde_json::from_str(&bodies)?;
+            let mut found = Vec::new();
+            for (_, uses) in &bodies {
+                for used in uses {
+                    names_in(used, &mut found);
+                }
+            }
+            next.extend(found.into_iter().map(str::to_owned));
+            reached.insert((content, name), bodies);
+        }
+        frontier = next;
+    }
+    Ok(reached)
+}
+
+/// Every macro definition the paste proof sees, in the order of the inputs
+/// that hold them, then the command line: in-hand definitions as scanned,
+/// stored ones as `reached` found them.
+fn cc_macro_uses_in_order<'a>(
+    scans: &'a [(String, CcParsedScan)],
+    argument_scan: &'a CcHeaderProbeScan,
+    reached: &'a std::collections::HashMap<(String, String), Vec<CcStoredMacroBody>>,
+) -> Vec<CcMacroDefinition<'a>> {
+    let mut by_content =
+        std::collections::HashMap::<&str, Vec<(&str, &[CcStoredMacroBody])>>::new();
+    for ((content, name), bodies) in reached {
+        by_content.entry(content).or_default().push((name, bodies));
+    }
+    for names in by_content.values_mut() {
+        names.sort_unstable_by_key(|(name, _)| *name);
+    }
+    let mut macro_uses = Vec::new();
+    for (content, scan) in scans {
+        let Some(scan) = scan.as_ref().as_ref() else {
+            continue;
+        };
+        if !scan.macros_apart {
+            macro_uses.extend(cc_inline_macro_uses(std::iter::once(scan)));
+            continue;
+        }
+        for (name, bodies) in by_content.get(content.as_str()).into_iter().flatten() {
+            for (parameters, uses) in *bodies {
+                macro_uses.push((*name, parameters.as_slice(), uses.as_slice()));
+            }
+        }
+    }
+    macro_uses.extend(cc_inline_macro_uses(std::iter::once(argument_scan)));
+    macro_uses
+}
+
 /// One header's probe scan, or `None` for text the scanner cannot resolve.
 type CcParsedScan = std::sync::Arc<Option<CcHeaderProbeScan>>;
 
@@ -5918,7 +6070,8 @@ struct CcParsedScans {
 }
 
 /// 7: repeated uses without a probe, and repeated conditionals, are kept once.
-const CC_HEADER_SCAN_VERSION: i64 = 7;
+/// 8: macro definitions are stored apart, by name.
+const CC_HEADER_SCAN_VERSION: i64 = 8;
 const CC_PARSED_SCANS_WEIGHT: usize = 64 << 20;
 static CC_PARSED_SCANS: std::sync::LazyLock<std::sync::Mutex<CcParsedScans>> =
     std::sync::LazyLock::new(Default::default);
@@ -5935,6 +6088,11 @@ fn cc_parsed_header_scans(
     file_hasher: &crate::cache_key::FileHasher<'_>,
 ) -> Result<Vec<(String, CcParsedScan)>> {
     let mut held = foldhash::HashMap::<String, CcParsedScan>::default();
+    // Scans made here keep their macro definitions in hand; the store gets
+    // them apart, by name.
+    // Each with the stored size of its definitions, for the cache weight.
+    let fresh =
+        std::cell::RefCell::new(foldhash::HashMap::<String, (CcParsedScan, usize)>::default());
     let fetched = file_hasher.cc_header_scans_except(
         read_inputs,
         CC_HEADER_SCAN_VERSION,
@@ -5951,13 +6109,20 @@ fn cc_parsed_header_scans(
         &|path| {
             let bytes = fs::read(path)
                 .with_context(|| format!("reading header availability input {}", path.display()))?;
-            let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
-            Ok((
-                blake3::hash(&bytes).to_hex().to_string(),
-                serde_json::to_string(&probes)?,
-            ))
+            let content = blake3::hash(&bytes).to_hex().to_string();
+            let scan = cc_header_probe_scan(&cc_splice_lines(&bytes));
+            let (core, macros) = cc_stored_header_scan(scan.as_ref())?;
+            let defined = macros
+                .iter()
+                .map(|(name, bodies)| name.len() + bodies.len())
+                .sum();
+            fresh
+                .borrow_mut()
+                .insert(content.clone(), (CcParsedScan::new(scan), defined));
+            Ok((content, core, macros))
         },
     )?;
+    let fresh = fresh.into_inner();
     let mut learned = Vec::new();
     let mut scans = Vec::with_capacity(fetched.len());
     for (content, json) in fetched {
@@ -5965,9 +6130,12 @@ fn cc_parsed_header_scans(
             Some(scan) => scan.clone(),
             None => {
                 let json = json.context("cc: a held header scan went missing")?;
-                let scan = CcParsedScan::new(serde_json::from_str(&json)?);
+                let (scan, defined) = match fresh.get(&content) {
+                    Some((scan, defined)) => (scan.clone(), *defined),
+                    None => (CcParsedScan::new(serde_json::from_str(&json)?), 0),
+                };
                 held.insert(content.clone(), scan.clone());
-                let weight = cc_parsed_scan_weight(&content, &json);
+                let weight = cc_parsed_scan_weight(&content, &json) + 2 * defined;
                 learned.push((content.clone(), scan.clone(), weight));
                 scan
             }
@@ -5984,6 +6152,73 @@ fn cc_parsed_header_scans(
     }
     drop(evicted);
     Ok(scans)
+}
+
+/// A scan as stored: the scan without its macro definitions, marked as
+/// keeping them apart, and the definitions grouped by name in source order.
+/// A header that defines thousands of macros (a symbol prefix table) would
+/// otherwise be loaded whole by every unit that includes it.
+fn cc_stored_header_scan(
+    scan: Option<&CcHeaderProbeScan>,
+) -> Result<(String, Vec<(String, String)>)> {
+    let Some(scan) = scan else {
+        return Ok((
+            serde_json::to_string(&None::<CcHeaderProbeScan>)?,
+            Vec::new(),
+        ));
+    };
+    let mut by_name = std::collections::BTreeMap::<&str, Vec<_>>::new();
+    for (name, parameters, uses) in &scan.macro_uses {
+        by_name.entry(name).or_default().push((parameters, uses));
+    }
+    let mut macros = by_name
+        .into_iter()
+        .map(|(name, bodies)| Ok((name.to_owned(), serde_json::to_string(&bodies)?)))
+        .collect::<Result<Vec<_>>>()?;
+    // Written and removed with the definitions: a reader that finds it has
+    // them all, and one that does not knows they are gone.
+    macros.push((CC_MACROS_PRESENT.to_owned(), "[]".to_owned()));
+    let core = CcHeaderProbeScanCore {
+        macros_apart: true,
+        aliases: &scan.aliases,
+        uses: &scan.uses,
+        conditionals: &scan.conditionals,
+        pastes: &scan.pastes,
+        paste_forwarders: &scan.paste_forwarders,
+    };
+    Ok((serde_json::to_string(&Some(core))?, macros))
+}
+
+/// A row no identifier can name, stored with every scan's definitions.
+const CC_MACROS_PRESENT: &str = "";
+
+/// Stored definitions a cached core relied on are gone (pruned, or a core
+/// from another store): reload those scans, or rescan them.
+#[derive(Debug)]
+struct CcMacrosMissing(Vec<String>);
+
+impl std::fmt::Display for CcMacrosMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cc: stored macro definitions of {} header scans are missing",
+            self.0.len()
+        )
+    }
+}
+
+impl std::error::Error for CcMacrosMissing {}
+
+/// The stored form of [`CcHeaderProbeScan`], which reads it back with no
+/// macro definitions and `macros_apart` set.
+#[derive(serde::Serialize)]
+struct CcHeaderProbeScanCore<'a> {
+    macros_apart: bool,
+    aliases: &'a [(String, String)],
+    uses: &'a [(String, Option<CcHeaderProbe>)],
+    conditionals: &'a [CcHeaderMacroUse],
+    pastes: &'a [(String, String)],
+    paste_forwarders: &'a [CcHeaderPasteForwarder],
 }
 
 /// Estimated memory of one held scan: parsed vectors and the key cost more
@@ -6027,8 +6262,13 @@ struct CcHeaderProbe {
 /// every possible literal probe participates in the availability guard.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct CcHeaderProbeScan {
+    /// Read from the store: `macro_uses` is empty and the definitions are
+    /// loaded by name ([`cc_reached_macro_uses`]).
+    #[serde(default)]
+    macros_apart: bool,
     aliases: Vec<(String, String)>,
     uses: Vec<(String, Option<CcHeaderProbe>)>,
+    #[serde(default)]
     macro_uses: Vec<(String, Vec<String>, Vec<CcHeaderMacroUse>)>,
     conditionals: Vec<CcHeaderMacroUse>,
     pastes: Vec<(String, String)>,
@@ -6086,12 +6326,13 @@ fn cc_resolve_header_probes(
 /// `CAT(1, 0)` through `CAT_`, is held to that same proof.
 fn cc_header_probe_pastes_are_resolved<'a>(
     scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
+    macro_uses: &[CcMacroDefinition<'a>],
     aliases: &HashSet<String>,
 ) -> Result<bool> {
     let scans = scans.collect::<Vec<_>>();
     let mut definitions = std::collections::HashMap::<&str, usize>::new();
     let mut forwarders = std::collections::HashMap::<&str, Vec<&CcHeaderPasteForwarder>>::new();
-    for (name, _, _) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+    for &(name, _, _) in macro_uses {
         *definitions.entry(name).or_default() += 1;
     }
     for forwarder in scans.iter().flat_map(|scan| &scan.paste_forwarders) {
@@ -6101,11 +6342,11 @@ fn cc_header_probe_pastes_are_resolved<'a>(
             .push(forwarder);
     }
     let mut macro_bodies = std::collections::HashMap::<&str, CcPasteMacroBodies>::new();
-    for (name, parameters, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+    for &(name, parameters, uses) in macro_uses {
         macro_bodies
-            .entry(name.as_str())
+            .entry(name)
             .or_default()
-            .push((parameters.as_slice(), uses.as_slice()));
+            .push((parameters, uses));
     }
     let mut paste_patterns = std::collections::HashMap::<&str, Vec<&str>>::new();
     for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
@@ -6119,9 +6360,33 @@ fn cc_header_probe_pastes_are_resolved<'a>(
         pastes: &paste_patterns,
         verdicts: Default::default(),
     };
+    // Only a macro a conditional can reach through bodies can carry a
+    // constructor to it. A header that defines thousands of macros nothing
+    // tests (a symbol prefix table) is then never examined.
+    let mut reachable = HashSet::<&str>::new();
+    let mut pending: Vec<&str> = scans
+        .iter()
+        .flat_map(|scan| &scan.conditionals)
+        .map(|used| used.name.as_str())
+        .collect();
+    while let Some(name) = pending.pop() {
+        if reachable.insert(name)
+            && let Some(bodies) = macro_bodies.get(name)
+        {
+            pending.extend(
+                bodies
+                    .iter()
+                    .flat_map(|(_, uses)| uses.iter())
+                    .map(|used| used.name.as_str()),
+            );
+        }
+    }
     let mut visiting = HashSet::new();
     let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
-    for (name, parameters, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+    for &(name, parameters, uses) in macro_uses {
+        if !reachable.contains(name) {
+            continue;
+        }
         for used in uses {
             if cc_paste_use_can_name_probe(
                 used,
@@ -6138,7 +6403,7 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     }
     let mut pending = Vec::new();
     for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
-        if forwarding.spells_alias(pattern, aliases)? {
+        if reachable.contains(name.as_str()) && forwarding.spells_alias(pattern, aliases)? {
             pending.push(name.as_str());
         }
     }
@@ -6166,6 +6431,19 @@ fn cc_header_probe_pastes_are_resolved<'a>(
         }
     }
     Ok(true)
+}
+
+/// One macro definition: its name, formals, and the uses in its body.
+type CcMacroDefinition<'a> = (&'a str, &'a [String], &'a [CcHeaderMacroUse]);
+
+/// The macro definitions a scan holds in hand.
+fn cc_inline_macro_uses<'a>(
+    scans: impl Iterator<Item = &'a CcHeaderProbeScan>,
+) -> Vec<CcMacroDefinition<'a>> {
+    scans
+        .flat_map(|scan| &scan.macro_uses)
+        .map(|(name, parameters, uses)| (name.as_str(), parameters.as_slice(), uses.as_slice()))
+        .collect()
 }
 
 /// Every definition of one macro: formals, then the uses in that body.
@@ -6426,7 +6704,8 @@ fn cc_splice_lines(bytes: &[u8]) -> Vec<u8> {
 fn cc_header_probes(text: &[u8]) -> Option<Vec<CcHeaderProbe>> {
     let scan = cc_header_probe_scan(text)?;
     let aliases = cc_header_probe_aliases(std::iter::once(&scan));
-    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &aliases)
+    let macro_uses = cc_inline_macro_uses(std::iter::once(&scan));
+    cc_header_probe_pastes_are_resolved(std::iter::once(&scan), &macro_uses, &aliases)
         .ok()?
         .then(|| cc_resolve_header_probes(&scan, &aliases))?
 }

@@ -8670,8 +8670,9 @@ impl<'db> FileHasher<'db> {
         version: i64,
         scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
     ) -> anyhow::Result<Vec<String>> {
+        let scan = |path: &Path| scan(path).map(|(raw, json)| (raw, json, Vec::new()));
         Ok(self
-            .cc_header_scans_except(paths, version, &mut |_| false, scan)?
+            .cc_header_scans_except(paths, version, &mut |_| false, &scan)?
             .into_iter()
             .map(|(_, scan)| scan.expect("nothing is held"))
             .collect())
@@ -8685,13 +8686,15 @@ impl<'db> FileHasher<'db> {
     ///
     /// Returns each path's content hash with its scan. Contents `held` claims
     /// are scans the caller already has: they are neither loaded nor
-    /// computed, and come back as `None`.
+    /// computed, and come back as `None`. `scan` also returns the header's
+    /// macro definitions as `(name, bodies)`; they are stored apart and read
+    /// back by name ([`Self::cc_header_macros`]).
     pub(crate) fn cc_header_scans_except(
         &self,
         paths: &[PathBuf],
         version: i64,
         held: &mut dyn FnMut(&str) -> bool,
-        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+        scan: &impl Fn(&Path) -> anyhow::Result<(String, String, Vec<(String, String)>)>,
     ) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut contents = Vec::with_capacity(paths.len());
         for path in paths {
@@ -8721,25 +8724,42 @@ impl<'db> FileHasher<'db> {
             } else if let Some(result) = known.get(&content) {
                 Some(result.clone())
             } else {
-                let (raw, result) = scan(path)?;
+                let (raw, result, macros) = scan(path)?;
                 anyhow::ensure!(
                     raw == content,
                     "cc: input changed while scanning header probes: {}",
                     path.display()
                 );
                 known.insert(content.clone(), result.clone());
-                learned.push((content.clone(), result.clone()));
+                learned.push((content.clone(), result.clone(), macros));
                 Some(result)
             };
             results.push((content, result));
         }
         if let Some(cache) = &self.cache
             && !learned.is_empty()
-            && let Err(error) = cache.put_cc_header_scans(version, &learned)
+            && let Err(error) = cache.put_cc_header_scans_with_macros(version, &learned)
         {
             tracing::debug!("cc header scan update failed: {error}");
         }
         Ok(results)
+    }
+
+    /// The macro definitions named `names` in the scans of `contents`, as
+    /// `(content, name, bodies)`. Without a store there is nothing recorded,
+    /// and every scan was computed with its definitions in hand.
+    pub(crate) fn cc_header_macros(
+        &self,
+        version: i64,
+        contents: &[&str],
+        names: &[&str],
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        match &self.cache {
+            Some(cache) if !contents.is_empty() && !names.is_empty() => {
+                Ok(cache.get_cc_header_macros(version, contents, names)?)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// The first input whose raw text hides a file the assembler would read,

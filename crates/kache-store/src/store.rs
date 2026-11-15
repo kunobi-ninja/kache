@@ -1771,6 +1771,7 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     if generation == INDEX_SCHEMA_GENERATION
         && crate::file_hash::has_rule_columns(db)?
         && crate::cc_memo::has_shadowing_column(db)?
+        && crate::cc_memo::has_header_macros_table(db)?
     {
         return Ok(());
     }
@@ -1970,7 +1971,8 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 /// 14: partial index for pending durability counts and ordered flush batches.
 /// 15: `cc_preprocess_memos.shadowing`. An older release stamps 14 back, so
 ///    the open also checks for the column.
-const INDEX_SCHEMA_GENERATION: i64 = 15;
+/// 16: `cc_header_macros`, checked for the same reason.
+const INDEX_SCHEMA_GENERATION: i64 = 16;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's

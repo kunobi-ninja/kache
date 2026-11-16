@@ -499,4 +499,12 @@ mod tests {
         assert!(forms.contains(&link.to_str().unwrap().as_bytes().to_vec()));
         assert!(forms.contains(&real.to_str().unwrap().as_bytes().to_vec()));
     }
+
+    #[test]
+    fn a_plain_path_has_one_spelling() {
+        assert_eq!(
+            spellings(Path::new("/no/such/work/a")),
+            vec![b"/no/such/work/a".to_vec()]
+        );
+    }
 }

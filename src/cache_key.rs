@@ -1007,7 +1007,9 @@ fn stamp_roots(
             Err(crate::tree_stamp::WalkOutcome::TooLarge) => {
                 return Err(StampRefusal::TooLarge(index));
             }
-            Err(_) => return Err(StampRefusal::Unwalkable),
+            Err(
+                crate::tree_stamp::WalkOutcome::Unreadable | crate::tree_stamp::WalkOutcome::Fits,
+            ) => return Err(StampRefusal::Unwalkable),
         }
     }
     if stamps.iter().map(|root| root.entries).sum::<usize>() > max_entries {

@@ -32,6 +32,9 @@ struct SlotState<V> {
     finished: u64,
     running: bool,
     result: Option<V>,
+    /// Callers parked on `finished`, so tests can wait until they are.
+    #[cfg(test)]
+    parked: usize,
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> NextFlight<K, V> {
@@ -62,6 +65,8 @@ impl<K: Eq + Hash + Clone, V: Clone> NextFlight<K, V> {
                     finished: 0,
                     running: false,
                     result: None,
+                    #[cfg(test)]
+                    parked: 0,
                 }),
                 finished: Condvar::new(),
                 callers: Mutex::new(0),
@@ -106,10 +111,20 @@ impl<K: Eq + Hash + Clone, V: Clone> NextFlight<K, V> {
                 slot.finished.notify_all();
                 return result;
             }
+            // Only a running walk ends a wait: with none, nothing would wake us.
+            debug_assert!(state.running, "waiting with no walk running");
+            #[cfg(test)]
+            {
+                state.parked += 1;
+            }
             state = slot
                 .finished
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                state.parked -= 1;
+            }
         }
     }
 }
@@ -152,6 +167,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, mpsc};
     use std::time::Duration;
+
+    fn wait_for_parked<V>(flights: &Arc<NextFlight<u32, V>>, key: &u32, parked: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let slot = Arc::clone(&flights.slots.lock().unwrap()[key]);
+            if slot.state.lock().unwrap().parked == parked {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "callers never parked");
+            std::thread::yield_now();
+        }
+    }
 
     #[test]
     fn a_lone_caller_walks_and_leaves_no_slot() {
@@ -215,15 +242,10 @@ mod tests {
             })
             .collect();
         ready.wait();
-        // Let every waiter reach the slot before the first walk ends.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while *flights.slots.lock().unwrap()[&1].callers.lock().unwrap() < WAITERS + 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "waiters never arrived"
-            );
-            std::thread::yield_now();
-        }
+        // Let every waiter park on the first walk before it ends. Counting
+        // callers is not enough: one counted but not yet parked could take a
+        // later walk than the others.
+        wait_for_parked(&flights, &1, WAITERS);
         release.send(()).unwrap();
         assert_eq!(first.join().unwrap(), 0, "the first walk");
         for waiter in waiters {
@@ -249,18 +271,21 @@ mod tests {
             })
         };
         wait_entered.recv().unwrap();
-        let waiter = {
+        let (walked, wait_walked) = mpsc::channel();
+        {
             let flights = Arc::clone(&flights);
-            std::thread::spawn(move || flights.run(&1, || 9))
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while *flights.slots.lock().unwrap()[&1].callers.lock().unwrap() < 2 {
-            assert!(std::time::Instant::now() < deadline, "waiter never arrived");
-            std::thread::yield_now();
+            std::thread::spawn(move || walked.send(flights.run(&1, || 9)));
         }
+        wait_for_parked(&flights, &1, 1);
         release.send(()).unwrap();
         assert!(panicking.join().is_err());
-        assert_eq!(waiter.join().unwrap(), 9);
+        // A timeout, not a join: a waiter left parked must fail the test, not
+        // hang it.
+        assert_eq!(
+            wait_walked.recv_timeout(Duration::from_secs(10)),
+            Ok(9),
+            "the waiter walks once the panicking walk unwinds"
+        );
         assert!(flights.slots.lock().unwrap().is_empty());
     }
 }

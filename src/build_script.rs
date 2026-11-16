@@ -4615,7 +4615,9 @@ mod tests {
             let error = run.record(stdout.as_bytes(), b"", 5, after).unwrap_err();
             // Reading a path through a file already fails before the key.
             assert!(
-                path == "file/below" || error.is::<inputs::RerunsEveryBuild>(),
+                path == "file/below"
+                    || error.is::<inputs::RerunsEveryBuild>()
+                        && format!("{error:#}").contains("reruns this script on every build"),
                 "{path}: {error:#}"
             );
             assert!(run.prediction().unwrap().is_none(), "{path}");

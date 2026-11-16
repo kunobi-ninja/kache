@@ -14202,3 +14202,108 @@ fn scheduler_cancellation_guard_keeps_an_existing_error_event() {
     assert_eq!(events[0].elapsed_ms, 19);
     assert_eq!(events[0].scheduler_decisions[0].elapsed_ms, 17);
 }
+
+#[test]
+fn seed_attempt_is_settled_and_recorded_on_the_event() {
+    use super::SeedAttempt::*;
+    for (looked, portable, imported, attempt) in [
+        (false, true, false, NotTried),
+        (true, false, false, Unportable),
+        (true, true, false, NoDonor),
+        // A donor an earlier preparation imported counts, looked or not.
+        (false, false, true, Imported),
+        (true, true, true, Imported),
+    ] {
+        assert_eq!(
+            super::SeedAttempt::of(looked, portable, imported),
+            attempt,
+            "looked={looked} portable={portable} imported={imported}"
+        );
+    }
+    for (attempt, seeded, settled) in [
+        (NotTried, true, Imported),
+        (NotTried, false, NotTried),
+        (Imported, false, Unportable),
+        (NoDonor, false, NoDonor),
+        (Unportable, false, Unportable),
+    ] {
+        assert_eq!(
+            attempt.settle(seeded),
+            settled,
+            "{attempt:?} seeded={seeded}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    for (attempt, recorded) in [
+        (Imported, "imported"),
+        (NoDonor, "no-donor"),
+        (Unportable, "unportable"),
+        (NotTried, ""),
+    ] {
+        let event = super::build_event_details(
+            &config,
+            EventInputs::new("/repo", "unit", EventResult::Passthrough, 10)
+                .incremental_seed_attempt(attempt),
+        );
+        assert_eq!(event.incremental_seed_attempt, recorded);
+        // Older events lack the field; an empty one is not written.
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json.get("incremental_seed_attempt").is_some(),
+            !recorded.is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
+    use super::SeedAttempt::*;
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let _cache = crate::config::tests::set_env_for_test("KACHE_CACHE_DIR", Some(root.as_os_str()));
+    let compiler = root.join("rustc-mock");
+    kache_fs::testutil::write_executable(&compiler, "#!/bin/sh\nprintf 'rustc 1.99.0 (test)\\n'\n");
+    let missing = root.join("gone/target/debug");
+    // (automatic seeding, explicit donor, unstable) -> attempt
+    for (case, (automatic, explicit, unstable, expected)) in [
+        (false, false, true, NotTried),
+        (false, true, false, NotTried),
+        (false, true, true, NoDonor),
+        (true, false, false, NoDonor),
+        (true, true, false, NoDonor),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A fresh unit per case: each has no incremental state of its own.
+        let profile = root.join(format!("receiver-{case}/target/debug"));
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let args = RustcArgs::parse(&[
+            compiler.display().to_string(),
+            "--crate-name".into(),
+            "sample".into(),
+            "src/lib.rs".into(),
+            "--out-dir".into(),
+            profile.join("deps").display().to_string(),
+            "-Cincremental=".to_owned() + profile.join("incremental").to_str().unwrap(),
+            "-Cextra-filename=-1234abcd".into(),
+            "-Zremap-cwd-prefix=/src".into(),
+        ])
+        .unwrap();
+        let unit = crate::incremental_policy::AdaptiveUnit::eligible(&args, b"guard").unwrap();
+        let mut config = test_config(root.join("cache"));
+        config.seed_incremental = automatic;
+        config.unstable = unstable;
+        config.incremental_seed_from = explicit.then(|| missing.clone());
+        let mut lease = unit.try_immediate().unwrap();
+        let (_, attempt) = super::prepare_worktree_compiler_args(&config, &args, &mut lease);
+        assert_eq!(
+            attempt, expected,
+            "automatic={automatic} explicit={explicit} unstable={unstable}"
+        );
+    }
+}

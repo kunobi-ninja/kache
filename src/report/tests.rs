@@ -542,6 +542,7 @@ fn test_event(
         store_error: String::new(),
         store_handed_off: false,
         incremental_seed: String::new(),
+        incremental_seed_attempt: String::new(),
         daemon_store_ms: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
@@ -5302,4 +5303,77 @@ fn a_seeded_compile_names_the_checkout_its_state_came_from() {
     event.incremental_seed.clear();
     let detail = to_bypass_detail(&event);
     assert_eq!(bypass_detail_words(&detail, "seeded".to_string()), "seeded");
+}
+
+#[test]
+fn seed_summary_counts_attempts_and_times_successful_compiles() {
+    let event = |attempt: &str, exit: Option<i32>, compile_ms: u64| {
+        let mut event = test_event(
+            "unit",
+            EventResult::Passthrough,
+            compile_ms,
+            compile_ms,
+            0,
+            "",
+        );
+        event.passthrough_reason = "adaptive seed".into();
+        event.incremental_seed_attempt = attempt.into();
+        event.exit_code = exit;
+        event
+    };
+    let events = [
+        event("imported", Some(0), 1_000),
+        event("imported", Some(1), 9_000),
+        event("no-donor", Some(0), 4_000),
+        event("unportable", Some(0), 6_000),
+        event("", Some(0), 50_000),
+        event("imported", None, 7_000),
+        event("no-donor", Some(1), 8_000),
+        event("unportable", None, 8_000),
+    ];
+    assert_eq!(
+        seed_summary(&events),
+        SeedSummary {
+            imported: 3,
+            no_donor: 2,
+            unportable: 2,
+            seeded_compiles: 1,
+            seeded_compile_ms: 1_000,
+            unseeded_compiles: 2,
+            unseeded_compile_ms: 10_000,
+        }
+    );
+    assert_eq!(build_bypass_analysis(&events, 10).seeds.looked(), 7);
+}
+
+#[test]
+fn seed_summary_line_shows_rate_and_both_averages_only() {
+    assert_eq!(format_seed_summary(&SeedSummary::default()), None);
+    let only_unseeded = SeedSummary {
+        no_donor: 1,
+        unseeded_compiles: 1,
+        unseeded_compile_ms: 4_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_seed_summary(&only_unseeded),
+        Some(("0 of 1".into(), "seeded from another checkout".into()))
+    );
+    let both = SeedSummary {
+        imported: 1,
+        no_donor: 1,
+        unportable: 2,
+        seeded_compiles: 2,
+        seeded_compile_ms: 2_000,
+        unseeded_compiles: 3,
+        unseeded_compile_ms: 9_000,
+    };
+    assert_eq!(
+        format_seed_summary(&both),
+        Some((
+            "1 of 4".into(),
+            "seeded from another checkout, 2 not portable; mean successful compile 1.0 s seeded (n=2), 3.0 s without (n=3)"
+                .into()
+        ))
+    );
 }

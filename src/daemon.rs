@@ -3220,6 +3220,7 @@ impl Daemon {
             stores: inventory.stores,
             events: EventStatsResponse {
                 local_hits: es.local_hits,
+                readonly_hits: es.readonly_hits,
                 prefetch_hits: es.prefetch_hits,
                 remote_hits: es.remote_hits,
                 dups: es.dups,

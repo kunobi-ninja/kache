@@ -409,6 +409,10 @@ pub struct StatsEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventStatsResponse {
     pub local_hits: usize,
+    /// Local hits restored from the read-only store; part of `local_hits`.
+    /// Zero from a daemon that predates the field.
+    #[serde(default)]
+    pub readonly_hits: usize,
     #[serde(default)]
     pub prefetch_hits: usize,
     pub remote_hits: usize,

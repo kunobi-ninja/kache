@@ -1528,6 +1528,7 @@ fn sample_build_event(
         miss_reason: events::MissReason::None,
         object_output: String::new(),
         package: String::new(),
+        readonly_store: false,
     }
 }
 
@@ -3370,6 +3371,7 @@ fn event_stats(
 ) -> daemon::EventStatsResponse {
     daemon::EventStatsResponse {
         local_hits,
+        readonly_hits: 0,
         prefetch_hits,
         remote_hits,
         dups,

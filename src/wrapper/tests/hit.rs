@@ -27,6 +27,7 @@ fn report_preserves_phase_metrics() {
         restore_ms: 19,
         key_record: KeyEventRecord::default(),
         object_output: "consumer.o".to_string(),
+        readonly_store: false,
     }
     .report(&config, &meta);
     let events = events::read_events(&config.event_log_path()).unwrap();

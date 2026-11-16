@@ -1565,6 +1565,7 @@ pub(crate) fn run_nvcc_for(
                 restore_ms,
                 key_record: KeyEventRecord::default(),
                 object_output: recorded_object_output(parsed.object_output_path()),
+                readonly_store: hit_store.is_read_only(),
             }
             .report(config, &meta);
             return Ok(0);
@@ -1640,6 +1641,7 @@ pub(crate) fn run_nvcc_for(
             restore_ms,
             key_record: KeyEventRecord::default(),
             object_output: recorded_object_output(parsed.object_output_path()),
+            readonly_store: false,
         }
         .report(config, &meta);
         return Ok(0);
@@ -2050,6 +2052,7 @@ fn nvcc_try_remote_hit(
         restore_ms,
         key_record: KeyEventRecord::default(),
         object_output: recorded_object_output(parsed.object_output_path()),
+        readonly_store: false,
     }
     .report(config, &meta);
     Ok(Some(0))
@@ -2464,6 +2467,7 @@ fn run_cc_with_store(
                     restore_ms,
                     key_record: KeyEventRecord::default(),
                     object_output: recorded_object_output(parsed.object_output_path()),
+                    readonly_store: hit_store.is_read_only(),
                 }
                 .report(config, &meta);
                 drop(trace_report);
@@ -2587,6 +2591,7 @@ fn run_cc_with_store(
             restore_ms,
             key_record: KeyEventRecord::default(),
             object_output: recorded_object_output(parsed.object_output_path()),
+            readonly_store: false,
         }
         .report(config, &meta);
         compiler.commit_preprocess_memo(&file_hasher);
@@ -3616,6 +3621,7 @@ fn cc_try_remote_hit(
         restore_ms,
         key_record: KeyEventRecord::default(),
         object_output: recorded_object_output(parsed.object_output_path()),
+        readonly_store: false,
     }
     .report(config, &meta);
     compiler.commit_preprocess_memo(file_hasher);
@@ -9371,6 +9377,7 @@ pub(crate) struct EventInputs<'a> {
     fallback_attempt: Option<crate::fallback::Attempt>,
     key_record: KeyEventRecord,
     rebuilt: RebuiltArtifacts,
+    readonly_store: bool,
 }
 
 impl<'a> EventInputs<'a> {
@@ -9406,6 +9413,7 @@ impl<'a> EventInputs<'a> {
             fallback_attempt: None,
             key_record: KeyEventRecord::default(),
             rebuilt: RebuiltArtifacts::default(),
+            readonly_store: false,
         }
     }
 
@@ -9533,6 +9541,13 @@ impl<'a> EventInputs<'a> {
     /// Package a build-script run belongs to.
     pub(crate) fn package(mut self, package: String) -> Self {
         self.package = package;
+        self
+    }
+
+    /// Mark a local hit whose entry came from `[cache] readonly_store`.
+    /// Ignored on any other result.
+    pub(crate) fn readonly_store(mut self, readonly_store: bool) -> Self {
+        self.readonly_store = readonly_store && self.result == EventResult::LocalHit;
         self
     }
 
@@ -9711,6 +9726,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         fallback_attempt,
         key_record: recorded,
         rebuilt,
+        readonly_store,
     } = inputs;
     // Session attribution (#583 P0.5): join or open the root's build session
     // and refresh the marker so the 5-minute window measures inactivity. Both
@@ -9783,7 +9799,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
             .then(|| cache_key.to_string()),
         rebuilt_path: rebuilt.primary,
         rebuilt_paths: rebuilt.paths,
-        schema: 27,
+        schema: 28,
         demands: crate::demand::take(),
         session_id,
         key_ms,
@@ -9831,6 +9847,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         miss_reason,
         object_output,
         package,
+        readonly_store,
         store_error,
         store_handed_off: store_put.output_blobs != 0
             && INVOCATION_SETTINGS.with(|slot| {

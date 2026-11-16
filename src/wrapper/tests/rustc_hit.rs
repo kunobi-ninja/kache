@@ -830,6 +830,50 @@ fn readonly_hit_records_restored_output_hashes_in_the_primary_store() {
 }
 
 #[test]
+fn readonly_store_hits_are_marked_apart_from_own_store_hits() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let fixture = Fixture::new();
+    let readonly = Store::open_read_only(&fixture.config).unwrap();
+    for (source, result) in [
+        (&fixture.store, EventResult::LocalHit),
+        (&readonly, EventResult::LocalHit),
+        // Only a local hit names its store; a prefetched entry was imported.
+        (&readonly, EventResult::PrefetchHit),
+    ] {
+        fixture
+            .context()
+            .restore_and_finish(
+                source,
+                &fixture.meta,
+                result,
+                &shared_key(),
+                0,
+                FileHashStats::default(),
+                0,
+                None,
+                &fixture.key(),
+                &key_record(),
+            )
+            .unwrap();
+    }
+    let events = events::read_events(&fixture.config.event_log_path()).unwrap();
+    let marked: Vec<_> = events
+        .iter()
+        .map(|event| (event.result, event.readonly_store))
+        .collect();
+    assert_eq!(
+        marked,
+        [
+            (EventResult::LocalHit, false),
+            (EventResult::LocalHit, true),
+            (EventResult::PrefetchHit, false),
+        ]
+    );
+    let stats = events::compute_stats(&events);
+    assert_eq!((stats.local_hits, stats.readonly_hits), (2, 1));
+}
+
+#[test]
 fn incomplete_or_mismatched_executable_pairs_never_publish_a_hit() {
     let _lock = crate::test_support::process_state_test_lock();
     let invocation = crate::invocation::InvocationEnv::capture();

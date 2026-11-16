@@ -84,6 +84,7 @@ impl RustcHitContext<'_> {
             restore_ms,
             key_record,
             object_output: String::new(),
+            readonly_store: store.is_read_only(),
         }
         .report(self.config, meta);
         record_input_prediction(self.config, prediction_store, self.args, true, key_outputs);

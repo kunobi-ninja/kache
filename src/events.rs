@@ -1323,6 +1323,10 @@ pub fn clear_events(event_log_path: &Path) -> Result<()> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventStats {
     pub local_hits: usize,
+    /// Local hits restored from `[cache] readonly_store`. A subset of
+    /// `local_hits`, the way `store_failures` is a subset of `misses`, so
+    /// totals built from the hit counts stay correct.
+    pub readonly_hits: usize,
     pub prefetch_hits: usize,
     pub remote_hits: usize,
     pub dups: usize,
@@ -1404,6 +1408,9 @@ pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> Event
         match event.result {
             EventResult::LocalHit => {
                 stats.local_hits += 1;
+                if event.readonly_store {
+                    stats.readonly_hits += 1;
+                }
                 stats.hit_elapsed_ms += event.elapsed_ms;
                 stats.hit_compile_time_ms += event.compile_time_ms;
             }
@@ -1662,6 +1669,7 @@ mod tests {
             miss_reason: MissReason::None,
             object_output: String::new(),
             package: String::new(),
+            readonly_store: false,
         };
 
         log_event(&log_path, &event).unwrap();
@@ -1985,6 +1993,34 @@ mod tests {
             serde_json::from_str::<HeartbeatEvent>(&build_line).is_err(),
             "BuildEvent must not deserialize as heartbeat"
         );
+    }
+
+    /// #1858: the read-only store marker is additive. An older hit has no
+    /// marker and counts as a local hit only; a marked one counts in both.
+    #[test]
+    fn readonly_store_hits_are_a_subset_of_local_hits() {
+        let older = r#"{"ts":"2026-07-01T00:00:00Z","crate_name":"own",
+            "result":"local_hit","elapsed_ms":1,"size":2,"cache_key":"k","schema":27}"#;
+        let marked = r#"{"ts":"2026-07-01T00:00:00Z","crate_name":"host",
+            "result":"local_hit","elapsed_ms":1,"size":2,"cache_key":"k","schema":28,
+            "readonly_store":true}"#;
+        // Only a local hit can name its store.
+        let stray = r#"{"ts":"2026-07-01T00:00:00Z","crate_name":"remote",
+            "result":"remote_hit","elapsed_ms":1,"size":2,"cache_key":"k","schema":28,
+            "readonly_store":true}"#;
+        let events: Vec<BuildEvent> = [older, marked, stray]
+            .into_iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!events[0].readonly_store);
+        let stats = compute_stats(&events);
+        assert_eq!(
+            (stats.local_hits, stats.readonly_hits, stats.remote_hits),
+            (2, 1, 1)
+        );
+
+        let own = serde_json::to_value(&events[0]).unwrap();
+        assert!(own.get("readonly_store").is_none(), "{own}");
     }
 
     /// #609: `key_externs` is additive. A schema-11 line written before it

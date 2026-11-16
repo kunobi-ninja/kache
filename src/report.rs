@@ -419,6 +419,11 @@ pub struct ReportSummary {
     pub time_saved_ms: u64,
     pub total_crates: usize,
     pub local_hits: usize,
+    /// Local hits restored from `[cache] readonly_store`. Part of
+    /// `local_hits`, not added to it. Zero in reports written before this
+    /// field existed and for events logged before event schema 28.
+    #[serde(default)]
+    pub readonly_hits: usize,
     pub prefetch_hits: usize,
     pub remote_hits: usize,
     #[serde(default)]
@@ -1369,6 +1374,7 @@ pub fn generate_report_with_filter(
             time_saved_ms: stats.hit_compile_time_ms,
             total_crates: total_cacheable,
             local_hits: stats.local_hits,
+            readonly_hits: stats.readonly_hits,
             prefetch_hits: stats.prefetch_hits,
             remote_hits: stats.remote_hits,
             dups: stats.dups,
@@ -3349,6 +3355,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
         "| Hits | {} (local: {}, prefetch: {}, remote: {}) |",
         total_hits, s.local_hits, s.prefetch_hits, s.remote_hits
     ));
+    if s.readonly_hits > 0 {
+        lines.push(format!(
+            "| Read-only store hits | {} (included in local) |",
+            s.readonly_hits
+        ));
+    }
     if s.dups > 0 {
         lines.push(format!("| Dups | {} |", s.dups));
     }
@@ -4218,6 +4230,16 @@ pub fn format_text(report: &BuildReport) -> String {
             "Miss work",
             term::duration_ms(t.miss_compile_time_ms),
             "compiling on misses".into(),
+        ));
+    }
+    if s.readonly_hits > 0 {
+        summary.push((
+            "Read-only",
+            term::count(s.readonly_hits as u64),
+            format!(
+                "of {} local hits from the read-only store",
+                term::count(s.local_hits as u64)
+            ),
         ));
     }
     if s.dups > 0 {

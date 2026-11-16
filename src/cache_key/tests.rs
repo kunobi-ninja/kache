@@ -23151,6 +23151,9 @@ fn provisional_registry_remaps_need_a_plain_registry_unit() {
     let mut script = parse(&["--crate-type=bin"], &[manifest, no_out]);
     script.crate_name = Some("build_script_build".to_string());
     assert!(provisional_registry_remaps(&script).is_none());
+    let mut unnormalized = parse(&["--crate-type=rlib"], &[manifest, no_out]);
+    unnormalized.path_normalize_disabled = true;
+    assert!(provisional_registry_remaps(&unnormalized).is_none());
 }
 
 #[test]

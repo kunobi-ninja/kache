@@ -151,8 +151,22 @@ fn file_names_checkout(
     if longest == 0 {
         return Ok(false);
     }
-    let tail = longest + PATH_TAIL;
-    let mut file = std::fs::File::open(path)?;
+    reader_names_checkout(
+        std::fs::File::open(path)?,
+        checkout,
+        target,
+        longest + PATH_TAIL,
+    )
+}
+
+/// [`file_names_checkout`] over any reader, keeping `tail` bytes between
+/// chunks.
+fn reader_names_checkout(
+    mut file: impl Read,
+    checkout: &[Vec<u8>],
+    target: &[Vec<u8>],
+    tail: usize,
+) -> std::io::Result<bool> {
     let mut window: Vec<u8> = Vec::with_capacity(CHUNK + tail);
     loop {
         let start = window.len();
@@ -413,5 +427,48 @@ mod tests {
         assert!(both.contains(&b"/w/root".to_vec()));
         assert_eq!(checkout_spellings(member, None), spellings(member));
         assert_eq!(checkout_spellings(member, Some(member)), spellings(member));
+    }
+
+    /// Yields one error, then `bytes`.
+    struct FailOnce {
+        error: Option<std::io::ErrorKind>,
+        bytes: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.error.take() {
+                Some(kind) => Err(kind.into()),
+                None => self.bytes.read(buf),
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_error_fails_the_scan_but_an_interruption_retries() {
+        let checkout = vec![b"/work/a".to_vec()];
+        let reader = |kind| FailOnce {
+            error: Some(kind),
+            bytes: std::io::Cursor::new(b"x\0/work/a/assets\0".to_vec()),
+        };
+        let interrupted = reader(std::io::ErrorKind::Interrupted);
+        assert!(reader_names_checkout(interrupted, &checkout, &[], 64).unwrap());
+        let failed = reader(std::io::ErrorKind::PermissionDenied);
+        assert!(reader_names_checkout(failed, &checkout, &[], 64).is_err());
+    }
+
+    #[test]
+    fn a_match_exactly_tail_bytes_from_an_open_end_is_decided_now() {
+        let checkout = vec![b"/work/a".to_vec()];
+        let bytes = b"/work/a/assets";
+        assert!(names_checkout(bytes, &checkout, &[], false, bytes.len()));
+        assert!(!names_checkout(
+            bytes,
+            &checkout,
+            &[],
+            false,
+            bytes.len() + 1
+        ));
+        assert!(names_checkout(bytes, &checkout, &[], true, bytes.len() + 1));
     }
 }

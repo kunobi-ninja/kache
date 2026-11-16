@@ -55,6 +55,8 @@ pub(crate) fn embedded_checkout_reason(
                 | ArtifactKind::Executable
                 | ArtifactKind::DynamicLibrary
                 | ArtifactKind::WasmModule
+                // A Unix executable has no extension.
+                | ArtifactKind::Other("extensionless")
         ) {
             continue;
         }
@@ -188,9 +190,10 @@ fn reader_names_checkout(
     }
 }
 
-/// Whether `bytes` name the checkout. A match counts when it ends at a path
-/// boundary and is not a path inside the target directory, where a linker
-/// records object files. Unless the window is `complete`, a match within
+/// Whether `bytes` name the checkout. A match counts unless it is a path
+/// inside the target directory, where a linker records object files. It
+/// need not end at a path boundary: string literals sit side by side with
+/// nothing between them. Unless the window is `complete`, a match within
 /// `tail` bytes of its end is left for the next window, which keeps them.
 fn names_checkout(
     bytes: &[u8],
@@ -205,29 +208,29 @@ fn names_checkout(
             if !complete && rest.len() < tail {
                 return false;
             }
-            ends_at_boundary(rest.get(needle.len()).copied())
-                && !target.iter().any(|dir| inside_target(rest, dir))
+            !target.iter().any(|dir| inside_target(rest, dir, complete))
         })
     })
 }
 
-/// Whether the byte after a match ends that path component.
-fn ends_at_boundary(next: Option<u8>) -> bool {
-    next.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
-}
-
 /// Whether `rest` is a path below `dir` that does not climb back out of it.
-fn inside_target(rest: &[u8], dir: &[u8]) -> bool {
+/// The path must end within `rest`, or at its end when the file ends there:
+/// a path cut off by the window could still climb out past it.
+fn inside_target(rest: &[u8], dir: &[u8], complete: bool) -> bool {
     let Some(after) = rest.strip_prefix(dir) else {
         return false;
     };
     let Some((b'/' | b'\\', path)) = after.split_first() else {
         return false;
     };
-    let end = path
+    let end = match path
         .iter()
         .position(|byte| *byte < 0x20 || matches!(byte, b'"' | b'\''))
-        .unwrap_or(path.len());
+    {
+        Some(end) => end,
+        None if complete => path.len(),
+        None => return false,
+    };
     !path[..end]
         .split(|byte| matches!(byte, b'/' | b'\\'))
         .any(|component| component == b"..")
@@ -286,11 +289,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sibling_with_a_longer_name_is_not_the_checkout() {
+    fn a_match_counts_whatever_follows_it() {
         let checkout: &[&[u8]] = &[b"/work/a"];
-        assert!(!found(b"/work/ab/assets", checkout, &[]));
-        assert!(!found(b"/work/a.old/assets", checkout, &[]));
-        assert!(!found(b"/work/a_b", checkout, &[]));
+        // Literals are packed without separators, so `/work/a` may run into
+        // the next string. A sibling such as `/work/ab` only costs a store.
+        assert!(found(b"/work/aabc", checkout, &[]));
+        assert!(found(b"/work/ab/assets", checkout, &[]));
         assert!(found(b"/work/a\\assets", checkout, &[]));
         assert!(found(b"\"/work/a\"", checkout, &[]));
     }
@@ -390,6 +394,14 @@ mod tests {
             artifact(&clean, ArtifactKind::Library),
             artifact(&named, ArtifactKind::Library),
         ]);
+        let named_exe = dir.path().join("named");
+        std::fs::write(&named_exe, &bytes).unwrap();
+        let exe_set = ArtifactSet::new(vec![artifact(
+            &named_exe,
+            ArtifactKind::Other("extensionless"),
+        )]);
+        let reason = embedded_checkout_reason(&args, &exe_set, false).unwrap();
+        assert!(reason.contains("`named`"), "{reason}");
         let reason = embedded_checkout_reason(&args, &named_set, false).unwrap();
         assert!(reason.contains("libnamed.rlib"), "{reason}");
         assert_eq!(embedded_checkout_reason(&args, &named_set, true), None);
@@ -506,5 +518,21 @@ mod tests {
             spellings(Path::new("/no/such/work/a")),
             vec![b"/no/such/work/a".to_vec()]
         );
+    }
+
+    #[test]
+    fn a_target_path_cut_off_by_the_window_is_not_exempt() {
+        let checkout = vec![b"/work/a".to_vec()];
+        let target = vec![b"/work/a/target".to_vec()];
+        let cut = b"/work/a/target/debug/deps/x";
+        assert!(names_checkout(cut, &checkout, &target, false, 0));
+        assert!(!names_checkout(cut, &checkout, &target, true, 0));
+        assert!(!names_checkout(
+            b"/work/a/target/x.o\0",
+            &checkout,
+            &target,
+            false,
+            0
+        ));
     }
 }

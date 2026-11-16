@@ -1452,9 +1452,12 @@ fn push_rule_spellings(rules: &mut Vec<Rule>, path: Option<PathBuf>, sentinel: &
     let canonical = canonical_string(&path);
     let given = canonical_form(&path)
         .filter(|given| Some(given) != canonical.as_ref() && !is_filesystem_root_prefix(given));
-    push_rule_with_variants(rules, canonical, sentinel);
-    if given.is_some() {
-        push_rule_with_variants(rules, given, sentinel);
+    // Longer first, so a spelling that is a prefix of the other cannot take
+    // the other's paths.
+    let mut spellings: Vec<String> = canonical.into_iter().chain(given).collect();
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    for spelling in spellings {
+        push_rule_with_variants(rules, Some(spelling), sentinel);
     }
 }
 
@@ -4292,7 +4295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().canonicalize().unwrap().join("real");
         std::fs::create_dir(&real).unwrap();
-        let link = dir.path().canonicalize().unwrap().join("link");
+        let link = dir.path().canonicalize().unwrap().join("a-longer-link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let prefixes = |path: &Path| {
             let mut rules = Vec::new();
@@ -4303,13 +4306,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let both = prefixes(&link);
-        assert!(
-            both.contains(&real.to_str().unwrap().to_string()),
-            "{both:?}"
-        );
-        assert!(
-            both.contains(&link.to_str().unwrap().to_string()),
-            "{both:?}"
+        assert_eq!(
+            both,
+            vec![
+                link.to_str().unwrap().to_string(),
+                real.to_str().unwrap().to_string()
+            ],
+            "both spellings, longer first"
         );
         assert_eq!(prefixes(&real), vec![real.to_str().unwrap().to_string()]);
         let mut rules = Vec::new();

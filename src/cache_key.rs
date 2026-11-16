@@ -3770,6 +3770,19 @@ fn executable_pdb_admission(args: &RustcArgs, rustc_version: &str, custom_target
                 .is_none_or(|target| target.split('-').any(|part| part == "windows")))
 }
 
+/// Whether this executable's entry stores a macOS `.dSYM`. Since
+/// kunobi-ninja/kache#1905 it is stored file by file. An older client would
+/// restore such an entry without its bundle, and its own entries hold a
+/// `.dsym.tar` this layout replaces, so these executables take a key
+/// namespace of their own. Other executables keep their keys.
+fn macos_debug_bundle_admission(args: &RustcArgs, target: Option<&str>) -> bool {
+    args.is_user_facing_executable()
+        && args.emits_link()
+        && args.debuginfo_enabled()
+        && args.get_codegen_opt("split-debuginfo") != Some("off")
+        && target.is_some_and(|target| target.contains("-apple-"))
+}
+
 /// Compute the blake3 cache key for a rustc invocation, with what the
 /// computation learned on the way ([`KeyOutputs`]).
 ///
@@ -3996,6 +4009,10 @@ fn compute_key_into(
     if executable_pdb_admission(args, &rustc_version, custom_target) {
         hasher.set_group("pe_pdb_admission");
         fold_field(&mut hasher, b"executable_pdb_pairing.v1:", b"verified");
+    }
+    if macos_debug_bundle_admission(args, compiler_target) {
+        hasher.set_group("debug_bundle_layout");
+        fold_field(&mut hasher, b"debug_bundle_layout.v2:", b"per-file");
     }
 
     // crate identity

@@ -5203,14 +5203,14 @@ fn run_parsed_rustc(
     // objects, so the platform runs dsymutil. Packed debug info, including
     // rustc's macOS default when `-Csplit-debuginfo` was not passed, already
     // wrote the adjacent `.dSYM` (kunobi-ninja/kache#1752); that bundle is
-    // what gets cached. The store holds one flat tar. Restore unpacks it
-    // next to the binary, where lldb prefers it over the stale debug map.
-    // The staging TempDir must outlive `store.put*` below, which hashes the
-    // tar at this path — same lifetime pattern as `prepare_cc_store_files`.
+    // what gets cached. The store holds it one file per artifact plus a
+    // manifest (kunobi-ninja/kache#1905). Restore clones the files next to
+    // the binary, where lldb prefers them over the stale debug map. The
+    // staging TempDir must outlive `store.put*` below, which hashes the
+    // staged files — same lifetime pattern as `prepare_cc_store_files`.
     let mut _debug_bundle_staging: Option<tempfile::TempDir> = None;
     if wants_debug_bundle(args)
-        && let Some((exec_path, exec_name)) =
-            find_executable_output(compiler, args, &result.artifacts)
+        && let Some((exec_path, _)) = find_executable_output(compiler, args, &result.artifacts)
     {
         match tempfile::tempdir_in(args.invocation_env().temp_dir()) {
             Ok(staging) => {
@@ -5219,16 +5219,13 @@ fn run_parsed_rustc(
                     staging.path(),
                     args.get_codegen_opt("split-debuginfo"),
                 ) {
-                    Ok(Some(tar_path)) => {
-                        result.artifacts.push(crate::compiler::Artifact {
-                            path: tar_path,
-                            // Single path component (`is_safe_artifact_name`
-                            // gates restore) derived from the executable's
-                            // store name: `foo-abc` → `foo-abc.dsym.tar`.
-                            store_name: format!("{exec_name}.dsym.tar"),
-                            kind: ArtifactKind::DebugBundle,
-                            required: false,
-                        });
+                    Ok(Some(bundle)) => {
+                        // Single path components (`is_safe_artifact_name`
+                        // gates restore) named after the executable:
+                        // `foo-abc` → `foo-abc.dsym.json`, `foo-abc.dsym.0`.
+                        for artifact in bundle.into_artifacts() {
+                            result.artifacts.push(artifact);
+                        }
                         _debug_bundle_staging = Some(staging);
                     }
                     // None (non-macOS host, packed with no bundle, tool
@@ -8257,8 +8254,24 @@ fn restore_from_cache_with_memo_store(
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
         // Older entries may carry a bundle despite an explicit opt-out.
-        if kind == ArtifactKind::DebugBundle && !wants_debug_bundle(args) {
+        if kind.is_debug_bundle() && !wants_debug_bundle(args) {
             continue;
+        }
+        match kind {
+            // Restored through its manifest, never as a file of its own.
+            ArtifactKind::DebugBundleFile => continue,
+            ArtifactKind::DebugBundleManifest => {
+                crate::compiler::debug_bundle::restore(
+                    store,
+                    &meta.files,
+                    cached_file,
+                    &target_path,
+                    config.restore_max_size,
+                )
+                .context("rustc restore: restoring debug bundle")?;
+                continue;
+            }
+            _ => {}
         }
         let restored = materialize_cached_artifact(
             config.restore_max_size,
@@ -9297,7 +9310,7 @@ impl RebuiltArtifacts {
         let outputs: Vec<_> = artifacts
             .outputs()
             .iter()
-            .filter(|artifact| artifact.kind != ArtifactKind::DebugBundle)
+            .filter(|artifact| !artifact.kind.is_debug_bundle())
             .collect();
         if outputs.is_empty() {
             return Self::default();

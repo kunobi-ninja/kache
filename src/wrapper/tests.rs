@@ -5837,7 +5837,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<crate::compiler::debug_bundle::StagedDebugBundle>> {
             Ok(None)
         }
     }
@@ -5955,7 +5955,7 @@ fn an_unproven_loadability_check_runs_on_every_restore() {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<crate::compiler::debug_bundle::StagedDebugBundle>> {
             Ok(None)
         }
     }
@@ -6174,6 +6174,69 @@ fn debug_bundle_restore_honors_the_current_policy_for_legacy_entries() {
     }
 }
 
+/// An entry with a bundle stored file by file (#1905) restores the bundle
+/// through its manifest and never places the manifest or its files beside
+/// the binary. The current opt-outs skip it like a legacy tar.
+#[test]
+fn split_debug_bundle_restore_honors_the_current_policy() {
+    for (flags, expected) in [
+        (vec!["-g"], true),
+        (vec!["-g", "-Csplit-debuginfo=off"], false),
+        (vec!["-Cdebuginfo=0"], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let blob = |content: &[u8]| {
+            let hash = blake3::hash(content).to_hex().to_string();
+            create_blob(&store, &hash, content);
+            hash
+        };
+        let executable = b"\x7fELFcached executable";
+        let mut primary = cached_file("foo", &blob(executable));
+        primary.size = executable.len() as u64;
+        primary.executable = true;
+        let manifest = br#"{"version":1,"files":[{"path":"Contents/Resources/DWARF/foo","name":"foo.dsym.0"}],"empty_files":["Contents/empty"]}"#;
+        let mut argv = vec![
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ];
+        argv.extend(&flags);
+        let args = rustc_args(&argv);
+        let mut meta = entry_meta(
+            "split-debug-bundle",
+            vec![
+                primary,
+                cached_file("foo.dsym.json", &blob(manifest)),
+                cached_file("foo.dsym.0", &blob(b"d")),
+            ],
+            &[],
+        );
+        meta.crate_types = vec!["bin".into()];
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        assert!(out_dir.join("foo").is_file(), "{flags:?}");
+        assert!(!out_dir.join("foo.dsym.json").exists(), "{flags:?}");
+        assert!(!out_dir.join("foo.dsym.0").exists(), "{flags:?}");
+        let dwarf = out_dir.join("foo.dSYM/Contents/Resources/DWARF/foo");
+        assert_eq!(dwarf.is_file(), expected, "{flags:?}");
+        assert_eq!(
+            out_dir.join("foo.dSYM/Contents/empty").is_file(),
+            expected,
+            "{flags:?}"
+        );
+        if expected {
+            assert_eq!(std::fs::read(dwarf).unwrap(), b"d");
+        }
+    }
+}
+
 /// Tar bytes shaped like a store-time debug bundle: entries relative to
 /// the bundle root, the layout `unpack_debug_bundle` re-creates.
 fn debug_bundle_tar(dwarf_name: &str, dwarf: &[u8]) -> Vec<u8> {
@@ -6284,41 +6347,47 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         .expect("cc link must be runnable on the macOS test host");
     assert!(link.success(), "cc link failed");
 
-    // Store side: bake + tar the bundle while the `.o` exists.
+    // Store side: bake + stage the bundle while the `.o` exists.
     use crate::compiler::platform::Platform as _;
     let staging = tempfile::tempdir().unwrap();
-    let tar_path = crate::compiler::platform::MacOsPlatform::default()
+    let artifacts = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
         .unwrap()
-        .expect("macOS host must package a bundle for a -g binary");
+        .expect("macOS host must package a bundle for a -g binary")
+        .into_artifacts();
 
     // Cache + restore side, in a directory the `.o` never existed in.
     let restore_dir = tempfile::tempdir().unwrap();
     let config = test_config(restore_dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
-    let hash = crate::cache_key::hash_file(&tar_path).unwrap();
-    let blob = store.blob_path(&hash);
-    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
-    std::fs::copy(&tar_path, &blob).unwrap();
-    let cached = cached_file("hello-bin.dsym.tar", &hash);
+    let files: Vec<_> = artifacts
+        .iter()
+        .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
+        .collect();
+    let key = "3193193193193193193193193193193193193193193193193193193193193193";
+    store
+        .put_with_compile_time(
+            key,
+            "hello",
+            &["bin".into()],
+            &[],
+            "",
+            "",
+            &files,
+            "",
+            "",
+            0,
+        )
+        .unwrap();
+    let meta = store.get(key).unwrap().unwrap();
     let deps = restore_dir.path().join("deps");
     std::fs::create_dir_all(&deps).unwrap();
-    let target = deps.join("hello-bin.dsym.tar");
-    let platform = platform::current();
-    materialize_cached_artifact(
-        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+    crate::compiler::debug_bundle::restore(
         &store,
-        &cached,
-        &target,
-        ArtifactKind::DebugBundle,
-        None,
-        restore_dir.path(),
-        restore_dir.path(),
-        None,
-        &[],
-        &*platform,
-        "test restore",
-        None,
+        &meta.files,
+        &meta.files[0],
+        &deps.join("hello-bin.dsym.json"),
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
     )
     .unwrap();
 
@@ -12941,12 +13010,21 @@ fn rebuilt_event_keeps_unknown_package_and_unkeyed_fingerprint_absent() {
     assert!(event.rebuilt_package.is_none());
     assert!(event.rebuilt_fingerprint.is_none());
     assert!(event.rebuilt_path.is_some());
-    let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
-        path: PathBuf::from("/staging/temp.dsym.tar"),
-        store_name: "bundle.tar".into(),
-        kind: ArtifactKind::DebugBundle,
-        required: false,
-    }]);
+    let outputs = ArtifactSet::new(
+        [
+            ArtifactKind::DebugBundle,
+            ArtifactKind::DebugBundleManifest,
+            ArtifactKind::DebugBundleFile,
+        ]
+        .into_iter()
+        .map(|kind| crate::compiler::Artifact {
+            path: PathBuf::from("/staging/temp.dsym.tar"),
+            store_name: "bundle.tar".into(),
+            kind,
+            required: false,
+        })
+        .collect(),
+    );
     let event = build_event_details(
         &config,
         EventInputs::new("/repo", "example", EventResult::Miss, 1)

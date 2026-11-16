@@ -27,9 +27,9 @@
 //! kunobi-ninja/kache#319): a macOS `-g` binary carries `N_OSO`
 //! debug-map records pointing at per-build `.o` files, so a restored
 //! binary loses source-level debugging elsewhere. At store time the
-//! macOS impl hands the wrapper one flat tar of a `.dSYM`. Unpacked
-//! debug info still has the `.o` files, so that tar comes from
-//! `dsymutil`. Packed debug info, including rustc's default when
+//! macOS impl hands the wrapper a `.dSYM` staged file by file
+//! ([`super::debug_bundle`]). Unpacked debug info still has the `.o`
+//! files, so that bundle comes from `dsymutil`. Packed debug info, including rustc's default when
 //! `-Csplit-debuginfo` was not passed, already has the adjacent bundle.
 //! lldb prefers an adjacent UUID-matched `.dSYM` over the debug map, so
 //! no binary mutation is needed.
@@ -45,6 +45,7 @@
 //! - `probe_compiler(path) -> CompilerInfo` — for cc cache keys to
 //!   know gcc-vs-clang-vs-MSVC.
 
+use super::debug_bundle::StagedDebugBundle;
 use crate::invocation::InvocationEnv;
 use anyhow::{Context as _, Result};
 use std::io::Read as _;
@@ -100,8 +101,8 @@ pub trait Platform: Send + Sync {
     }
 
     /// Produce a self-contained, relocatable debug-info companion for a
-    /// just-linked binary, as ONE flat file inside `staging_dir`
-    /// (kunobi-ninja/kache#319).
+    /// just-linked binary, staged as flat files inside `staging_dir`
+    /// (kunobi-ninja/kache#319, #1905).
     ///
     /// `split_debuginfo` is rustc's `-Csplit-debuginfo` value, or `None`
     /// when that flag was not passed. On macOS, `unpacked` still has the
@@ -124,7 +125,7 @@ pub trait Platform: Send + Sync {
         binary: &Path,
         staging_dir: &Path,
         split_debuginfo: Option<&str>,
-    ) -> Result<Option<PathBuf>>;
+    ) -> Result<Option<StagedDebugBundle>>;
 
     /// Whether a restored executable or dynamic library may share its inode
     /// with the store blob when nothing else rewrites it in place. True only
@@ -270,7 +271,7 @@ impl Platform for MacOsPlatform {
         binary: &Path,
         staging_dir: &Path,
         split_debuginfo: Option<&str>,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<StagedDebugBundle>> {
         package_macos_debug_bundle(
             &self.env,
             binary,
@@ -304,7 +305,7 @@ fn package_macos_debug_bundle(
     staging_dir: &Path,
     split_debuginfo: Option<&str>,
     host_os: &str,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<StagedDebugBundle>> {
     // Compiled on every host (same convention as ensure_binary_loadable):
     // the actual `dsymutil` spawn is runtime-gated so a Linux test can
     // construct MacOsPlatform and exercise this method as a no-op.
@@ -331,7 +332,6 @@ fn package_macos_debug_bundle(
     // (kunobi-ninja/kache#319): a restoring build unpacks the bundle to
     // that sibling path, and lldb looks up `<binary>.dSYM` there.
     let bundle_dir = binary.with_file_name(format!("{file_name}.dSYM"));
-    let tar_path = staging_dir.join(format!("{file_name}.dsym.tar"));
     match debug_bundle_spawn(binary, &bundle_dir, env, split_debuginfo)? {
         DebugBundleSpawn::Skip => return Ok(None),
         DebugBundleSpawn::Reuse => {}
@@ -353,16 +353,16 @@ fn package_macos_debug_bundle(
         }
     }
 
-    // Tar the bundle into the ONE flat file the store can hold
-    // (single-component artifact names, file-level hashing/linking).
-    match build_deterministic_tar(&bundle_dir, &tar_path) {
-        Ok(()) => Ok(Some(tar_path)),
+    // The store holds flat files, so stage the bundle one file per
+    // artifact plus a manifest. A partial staging is discarded with the
+    // caller's staging directory.
+    match super::debug_bundle::stage(&bundle_dir, file_name, staging_dir) {
+        Ok(staged) => Ok(Some(staged)),
         Err(err) => {
             tracing::warn!(
                 "failed to package debug bundle for {}: {err:#}",
                 binary.display()
             );
-            let _ = std::fs::remove_file(&tar_path);
             Ok(None)
         }
     }
@@ -481,8 +481,9 @@ pub(crate) fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
 /// fixed modes. Reproducible tar bytes mean two identical dSYMs dedupe to one
 /// content-addressed store blob (kunobi-ninja/kache#319).
 ///
-/// Used by macOS rustc ingest and by the C/C++ link store when a compiler
-/// already left a `.dSYM` directory next to the binary.
+/// Used by the C/C++ link store when a compiler already left a `.dSYM`
+/// directory next to the binary. Rust executables store their bundle file by
+/// file instead ([`super::debug_bundle`]).
 pub(crate) fn build_deterministic_tar(bundle_dir: &Path, tar_path: &Path) -> Result<()> {
     let mut files = Vec::new();
     collect_files_recursively(bundle_dir, bundle_dir, &mut files)?;
@@ -519,7 +520,11 @@ pub(crate) fn build_deterministic_tar(bundle_dir: &Path, tar_path: &Path) -> Res
 /// Collect every regular file under `dir`, as paths relative to `root`.
 /// Directories are implied by their files (the unpacker `create_dir_all`s
 /// parents), which keeps the archive minimal and the byte layout stable.
-fn collect_files_recursively(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+pub(super) fn collect_files_recursively(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
         let entry = entry.with_context(|| format!("reading dir entry in {}", dir.display()))?;
         let path = entry.path();
@@ -571,7 +576,7 @@ impl Platform for LinuxPlatform {
         _binary: &Path,
         _staging_dir: &Path,
         _split_debuginfo: Option<&str>,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<StagedDebugBundle>> {
         // Linux embeds DWARF in the binary under default `-Cdebuginfo`
         // settings, so a restored executable is already self-contained
         // (kunobi-ninja/kache#319) — nothing to package.
@@ -610,7 +615,7 @@ impl Platform for WindowsPlatform {
         _binary: &Path,
         _staging_dir: &Path,
         _split_debuginfo: Option<&str>,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<StagedDebugBundle>> {
         // Nothing to package: rustc names the `.pdb` by file name
         // (`/PDBALTPATH:%_PDB%`) and it is stored with the `.exe` as an
         // output of its own; the store checks the pair (`pe_pdb`).
@@ -726,7 +731,7 @@ pub(crate) mod tests {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<StagedDebugBundle>> {
             self.package_debug_bundle_calls
                 .fetch_add(1, Ordering::Relaxed);
             Ok(None)
@@ -1112,27 +1117,18 @@ pub(crate) mod tests {
         let staging = tempfile::tempdir().unwrap();
 
         for split in [None, Some("packed")] {
-            let tar = package_macos_debug_bundle(&env, &binary, staging.path(), split, "macos")
-                .unwrap()
-                .unwrap_or_else(|| panic!("{split:?} must package the existing bundle"));
-            assert_eq!(tar.file_name().unwrap(), "demo.dsym.tar");
-            let bytes = std::fs::read(&tar).unwrap();
-            let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-            let names: Vec<String> = archive
-                .entries()
-                .unwrap()
-                .map(|entry| {
-                    entry
-                        .unwrap()
-                        .path()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect();
-            assert!(
-                names.iter().any(|name| name == "Contents/Info.plist"),
-                "{split:?} tar must contain the bundle rustc wrote, got {names:?}"
+            let staged = tempfile::tempdir_in(staging.path()).unwrap();
+            let artifacts =
+                package_macos_debug_bundle(&env, &binary, staged.path(), split, "macos")
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{split:?} must package the existing bundle"))
+                    .into_artifacts();
+            let names: Vec<_> = artifacts.iter().map(|a| a.store_name.as_str()).collect();
+            assert_eq!(names, ["demo.dsym.json", "demo.dsym.0"], "{split:?}");
+            assert_eq!(
+                std::fs::read(&artifacts[1].path).unwrap(),
+                b"plist",
+                "{split:?} must stage the bundle rustc wrote"
             );
         }
 
@@ -1467,7 +1463,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn macos_package_debug_bundle_produces_tar_with_dwarf_and_adjacent_bundle() {
+    fn macos_package_debug_bundle_stages_dwarf_and_keeps_the_adjacent_bundle() {
         // Runtime-gated real-tool leg: skipped (compile_debug_c_binary →
         // None) everywhere but a macOS host with a working `cc`.
         let dir = tempfile::tempdir().unwrap();
@@ -1476,63 +1472,55 @@ pub(crate) mod tests {
         };
         let staging = tempfile::tempdir().unwrap();
 
-        let tar_path = MacOsPlatform::default()
+        let artifacts = MacOsPlatform::default()
             .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
             .unwrap()
-            .expect("macOS host with dsymutil must produce a bundle tar");
-        assert_eq!(
-            tar_path.file_name().unwrap().to_str().unwrap(),
-            "hello-bin.dsym.tar"
-        );
+            .expect("macOS host with dsymutil must produce a bundle")
+            .into_artifacts();
+        assert_eq!(artifacts[0].store_name, "hello-bin.dsym.json");
 
         // The bundle itself stays next to the binary (cold/warm parity —
         // see MacOsPlatform::package_debug_bundle).
-        let bundle = dir.path().join("hello-bin.dSYM");
+        let dwarf = dir
+            .path()
+            .join("hello-bin.dSYM/Contents/Resources/DWARF/hello-bin");
         assert!(
-            bundle.join("Contents/Resources/DWARF/hello-bin").is_file(),
+            dwarf.is_file(),
             "dSYM bundle must remain adjacent to the binary"
         );
-
-        // The tar holds the bundle contents relative to the bundle root —
-        // the layout `unpack_debug_bundle` re-creates on restore.
-        let mut archive = tar::Archive::new(std::fs::File::open(&tar_path).unwrap());
-        let names: Vec<String> = archive
-            .entries()
-            .unwrap()
-            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let dwarf = std::fs::read(dwarf).unwrap();
         assert!(
-            names
+            artifacts[1..]
                 .iter()
-                .any(|n| n == "Contents/Resources/DWARF/hello-bin"),
-            "tar must contain the DWARF payload, got: {names:?}"
+                .any(|a| std::fs::read(&a.path).unwrap() == dwarf),
+            "the DWARF payload must be staged as a file of its own"
         );
     }
 
     #[test]
-    fn macos_package_debug_bundle_tar_bytes_are_reproducible() {
-        // Two packagings of the same binary must produce identical tar
-        // bytes so identical dSYMs dedupe to one content-addressed blob.
+    fn macos_package_debug_bundle_staged_bytes_are_reproducible() {
+        // Two packagings of the same binary must stage identical bytes so
+        // identical dSYMs dedupe to the same content-addressed blobs.
         let dir = tempfile::tempdir().unwrap();
         let Some(binary) = compile_debug_c_binary(dir.path()) else {
             return;
         };
+        let staged = |staging: &Path| -> Vec<(String, Vec<u8>)> {
+            MacOsPlatform::default()
+                .package_debug_bundle(&binary, staging, Some("unpacked"))
+                .unwrap()
+                .expect("packaging must succeed")
+                .into_artifacts()
+                .into_iter()
+                .map(|a| (a.store_name, std::fs::read(a.path).unwrap()))
+                .collect()
+        };
         let staging_a = tempfile::tempdir().unwrap();
         let staging_b = tempfile::tempdir().unwrap();
-
-        let tar_a = MacOsPlatform::default()
-            .package_debug_bundle(&binary, staging_a.path(), Some("unpacked"))
-            .unwrap()
-            .expect("first packaging must succeed");
-        let tar_b = MacOsPlatform::default()
-            .package_debug_bundle(&binary, staging_b.path(), Some("unpacked"))
-            .unwrap()
-            .expect("second packaging must succeed");
-
         assert_eq!(
-            std::fs::read(&tar_a).unwrap(),
-            std::fs::read(&tar_b).unwrap(),
-            "debug bundle tar bytes must be reproducible for store dedup"
+            staged(staging_a.path()),
+            staged(staging_b.path()),
+            "debug bundle files must be reproducible for store dedup"
         );
     }
 }

@@ -23,6 +23,7 @@ use crate::invocation::InvocationEnv;
 use crate::link::LinkStrategy;
 
 pub mod cc;
+pub mod debug_bundle;
 pub mod flags;
 pub mod nvcc;
 pub mod platform;
@@ -243,14 +244,33 @@ pub enum ArtifactKind {
     /// holds flat files only (single-component artifact names, file-level
     /// hashing/linking), so the bundle is tarred into one flat file at store
     /// time and unpacked next to the binary by
-    /// [`PostRestoreAction::UnpackDebugBundle`] on restore.
+    /// [`PostRestoreAction::UnpackDebugBundle`] on restore. New entries
+    /// store [`Self::DebugBundleManifest`] and [`Self::DebugBundleFile`]
+    /// instead; this kind remains for older entries and C/C++ links.
     DebugBundle,
+    /// Manifest of a debug bundle stored file by file (`<bin>.dsym.json`,
+    /// kunobi-ninja/kache#1905). Restore clones the files it names into a
+    /// `.dSYM` beside the binary ([`debug_bundle::restore`]).
+    DebugBundleManifest,
+    /// One regular file of a debug bundle (`<bin>.dsym.<n>`). It is restored
+    /// only through its manifest, never as a file of its own.
+    DebugBundleFile,
     /// Compiler-specific output that doesn't fit the categories above.
     /// Defaults to immutable handling.
     Other(&'static str),
 }
 
 impl ArtifactKind {
+    /// Whether this is part of a kache-made debug bundle, in either layout.
+    pub fn is_debug_bundle(self) -> bool {
+        matches!(
+            self,
+            ArtifactKind::DebugBundle
+                | ArtifactKind::DebugBundleManifest
+                | ArtifactKind::DebugBundleFile
+        )
+    }
+
     /// Link strategy for restoring this kind. Mutable artifacts (executables,
     /// dynamic libraries, and Rust metadata rewritten by cargo fix) must end
     /// up as independent files without CoW reflink, so mutations cannot reach the
@@ -325,7 +345,7 @@ impl ArtifactSet {
     }
 
     /// Append one artifact kache produced itself (not a compiler output) —
-    /// today the store-time debug bundle tar (kunobi-ninja/kache#319). The
+    /// today the store-time debug bundle files (kunobi-ninja/kache#319). The
     /// caller owns keeping `path` alive until the store put has hashed it.
     pub fn push(&mut self, artifact: Artifact) {
         self.outputs.push(artifact);
@@ -362,12 +382,12 @@ impl ArtifactSet {
 /// to it for the known-extension cases. Adding a new artifact extension
 /// happens here, not at every call site that does suffix matching.
 pub fn classify_by_filename(name: &str) -> ArtifactKind {
-    // kache-produced debug-bundle tar (`<bin>.dsym.tar`, see #319). Checked
-    // before the extension match because `Path::extension` sees only "tar",
-    // which would land in `Other("unknown-ext")` — and restore dispatches the
-    // unpack action off this classification.
-    if name.ends_with(".dsym.tar") {
-        return ArtifactKind::DebugBundle;
+    // kache-produced debug-bundle artifacts (`<bin>.dsym.tar`, see #319;
+    // `<bin>.dsym.json` and `<bin>.dsym.<n>`, see #1905). Checked before the
+    // extension match because `Path::extension` sees only the last suffix,
+    // and restore dispatches off this classification.
+    if let Some(kind) = debug_bundle::classify(name) {
+        return kind;
     }
     let ext = std::path::Path::new(name)
         .extension()
@@ -633,27 +653,8 @@ const MAX_DEBUG_BUNDLE_BYTES: u64 = crate::config::DEFAULT_RESTORE_MAX_SIZE;
 fn unpack_debug_bundle_with_cap(tar_path: &std::path::Path, max_bytes: u64) -> Result<()> {
     use anyhow::Context as _;
 
-    let file_name = tar_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .with_context(|| {
-            format!(
-                "debug bundle has no usable file name: {}",
-                tar_path.display()
-            )
-        })?;
-    let stem = file_name
-        .strip_suffix(".dsym.tar")
-        .with_context(|| format!("debug bundle artifact is not a `.dsym.tar`: {}", file_name))?;
-    let parent = tar_path
-        .parent()
-        .with_context(|| format!("debug bundle has no parent dir: {}", tar_path.display()))?;
-    let bundle_dir = parent.join(format!("{stem}.dSYM"));
-
-    let tmp_dir = tempfile::Builder::new()
-        .prefix(".kache-dsym-")
-        .tempdir_in(parent)
-        .context("creating temp dir for debug bundle unpack")?;
+    let bundle_dir = debug_bundle::bundle_dir_for(tar_path, ".dsym.tar")?;
+    let tmp_dir = debug_bundle::new_bundle_staging(&bundle_dir)?;
 
     let file = std::fs::File::open(tar_path)
         .with_context(|| format!("opening debug bundle {}", tar_path.display()))?;
@@ -709,27 +710,7 @@ fn unpack_debug_bundle_with_cap(tar_path: &std::path::Path, max_bytes: u64) -> R
             .with_context(|| format!("unpacking debug bundle entry {}", path.display()))?;
     }
 
-    // Replace any stale bundle atomically-ish: remove, then rename the fully
-    // unpacked temp dir into place. A stale `.dSYM` from an earlier build at
-    // this path would otherwise shadow the restored one for lldb.
-    if bundle_dir.symlink_metadata().is_ok() {
-        if bundle_dir.is_dir() {
-            std::fs::remove_dir_all(&bundle_dir)
-                .with_context(|| format!("removing stale bundle {}", bundle_dir.display()))?;
-        } else {
-            std::fs::remove_file(&bundle_dir)
-                .with_context(|| format!("removing stale bundle {}", bundle_dir.display()))?;
-        }
-    }
-    let tmp_path = tmp_dir.keep();
-    std::fs::rename(&tmp_path, &bundle_dir).with_context(|| {
-        format!(
-            "publishing debug bundle {} -> {}",
-            tmp_path.display(),
-            bundle_dir.display()
-        )
-    })?;
-    Ok(())
+    debug_bundle::publish_bundle(tmp_dir, &bundle_dir)
 }
 
 /// A cacheable compiler.

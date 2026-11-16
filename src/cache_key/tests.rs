@@ -22130,6 +22130,90 @@ fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
     );
 }
 
+#[test]
+fn debug_bundle_layout_namespace_covers_only_macos_debug_executables() {
+    let _lock = key_test_lock();
+    let invocation = InvocationEnv::capture();
+    let parse = |extra: &[&str]| {
+        let argv = ["rustc", "src/main.rs"]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        RustcArgs::parse_for(&argv, &invocation).unwrap()
+    };
+    let apple = Some("aarch64-apple-darwin");
+    let bin_g = parse(&["--crate-type=bin", "-g"]);
+    assert!(macos_debug_bundle_admission(&bin_g, apple));
+    assert!(macos_debug_bundle_admission(
+        &parse(&["--test", "-Cdebuginfo=line-tables-only"]),
+        Some("x86_64-apple-darwin")
+    ));
+    assert!(macos_debug_bundle_admission(
+        &parse(&["--crate-type=bin", "-g", "-Csplit-debuginfo=packed"]),
+        apple
+    ));
+    assert!(!macos_debug_bundle_admission(
+        &bin_g,
+        Some("x86_64-unknown-linux-gnu")
+    ));
+    assert!(!macos_debug_bundle_admission(&bin_g, None));
+    for args in [
+        &["--crate-type=rlib", "-g"][..],
+        &["--crate-type=bin", "-g", "--emit=metadata"][..],
+        &["--crate-type=bin"][..],
+        &["--crate-type=bin", "-g", "-Csplit-debuginfo=off"][..],
+    ] {
+        assert!(
+            !macos_debug_bundle_admission(&parse(args), apple),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn a_macos_debug_executable_key_carries_the_bundle_layout_namespace() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").unwrap();
+    let invocation = client_invocation(&workspace, &[("OUT_DIR", None)]);
+    for (debug, expected) in [("-Cdebuginfo=2", true), ("-Cdebuginfo=0", false)] {
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-name=app".into(),
+                "--crate-type=bin".into(),
+                "--target=aarch64-apple-darwin".into(),
+                debug.into(),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        let (key, output) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new_for(&invocation),
+            &PathNormalizer::from_invocation(Some(&workspace), &invocation),
+            &KeyEnv::from_invocation(&invocation),
+        );
+        key.unwrap();
+        assert_eq!(
+            output.fields.unwrap().contains_key("debug_bundle_layout"),
+            expected,
+            "{debug}"
+        );
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn a_native_msvc_link_keys_its_resource_alike_in_every_target_directory() {

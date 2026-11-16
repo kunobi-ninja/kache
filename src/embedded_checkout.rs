@@ -26,14 +26,15 @@ const PATH_TAIL: usize = 512;
 ///
 /// Any unit can run a proc macro: one its own dependency re-exports loads
 /// through the library search path, not an `--extern` on its command line.
-/// A key that already holds the manifest dir by value (the unit's own source
-/// reads `CARGO_MANIFEST_DIR`, #167) is bound to this checkout and may store.
+/// A key bound to this checkout may store: one that holds the manifest dir
+/// by value (the unit's own source reads `CARGO_MANIFEST_DIR`, #167), or one
+/// for a compile without path remapping, which folds the local paths.
 pub(crate) fn embedded_checkout_reason(
     args: &RustcArgs,
     artifacts: &ArtifactSet,
     key_binds_manifest_dir: bool,
 ) -> Option<String> {
-    if key_binds_manifest_dir {
+    if key_binds_manifest_dir || args.skip_path_remap() {
         return None;
     }
     let manifest_dir = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
@@ -50,7 +51,13 @@ pub(crate) fn embedded_checkout_reason(
         .map(|dir| spellings(&dir))
         .unwrap_or_default();
     for artifact in artifacts.outputs() {
-        if artifact.kind == ArtifactKind::DepInfo {
+        // Dep-info is rewritten on restore. Debug info never runs: a PDB
+        // records the build's working directory, which a debugger may show
+        // but the program cannot read.
+        if matches!(
+            artifact.kind,
+            ArtifactKind::DepInfo | ArtifactKind::DebugSidecar | ArtifactKind::DebugBundle
+        ) {
             continue;
         }
         match file_names_checkout(&artifact.path, &checkout, &target) {
@@ -98,6 +105,9 @@ fn spellings(path: &Path) -> Vec<Vec<u8>> {
         let Some(text) = form.to_str() else {
             continue;
         };
+        // Windows canonicalizes to a verbatim `\\?\C:\...` path that
+        // generated code rarely spells.
+        let text = text.strip_prefix(r"\\?\").unwrap_or(text);
         let text = text.trim_end_matches(['/', '\\']);
         if text.is_empty() {
             continue;
@@ -289,7 +299,10 @@ mod tests {
         for spelling in [r"C:\work\a", "C:/work/a", r"c:\work\a", "c:/work/a"] {
             assert!(forms.contains(&spelling.as_bytes().to_vec()), "{spelling}");
         }
+        #[cfg(unix)]
         assert_eq!(spellings(Path::new("/")), Vec::<Vec<u8>>::new());
+        let verbatim = spellings(Path::new(r"\\?\C:\work\a"));
+        assert!(verbatim.contains(&b"C:/work/a".to_vec()), "{verbatim:?}");
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         let forms = spellings(dir.path());
@@ -335,9 +348,13 @@ mod tests {
         let depinfo = dir.path().join("clean.d");
         std::fs::write(&depinfo, &bytes).unwrap();
 
+        let pdb = dir.path().join("named.pdb");
+        std::fs::write(&pdb, &bytes).unwrap();
         let clean_set = ArtifactSet::new(vec![
             artifact(&clean, ArtifactKind::Library),
             artifact(&depinfo, ArtifactKind::DepInfo),
+            artifact(&pdb, ArtifactKind::DebugSidecar),
+            artifact(&pdb, ArtifactKind::DebugBundle),
         ]);
         assert_eq!(embedded_checkout_reason(&args, &clean_set, false), None);
 
@@ -348,6 +365,12 @@ mod tests {
         let reason = embedded_checkout_reason(&args, &named_set, false).unwrap();
         assert!(reason.contains("libnamed.rlib"), "{reason}");
         assert_eq!(embedded_checkout_reason(&args, &named_set, true), None);
+        let mut unremapped = args.clone();
+        unremapped.path_normalize_disabled = true;
+        assert_eq!(
+            embedded_checkout_reason(&unremapped, &named_set, false),
+            None
+        );
 
         let missing = ArtifactSet::new(vec![artifact(
             &dir.path().join("gone.rlib"),

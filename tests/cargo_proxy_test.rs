@@ -479,21 +479,26 @@ fn build_dir_override_needs_a_cargo_that_knows_the_key() {
         std::fs::create_dir_all(&project).unwrap();
         versioned_fake_cargo(&fake_cargo, version);
 
-        let output = Command::new(KACHE_BIN)
-            .arg("cargo")
-            .arg("--")
-            .args(args)
-            .current_dir(&project)
-            .env("HOME", &home)
-            .env("CARGO_HOME", home.join(".cargo"))
-            .env("KACHE_REAL_CARGO", &fake_cargo)
-            .env("KACHE_TEST_CAPTURE", &capture)
-            .env_remove("CARGO_BUILD_BUILD_DIR")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_BUILD_RUSTFLAGS")
-            .output()
-            .unwrap();
+        let cache = dir.path().join("cache");
+        let output = hermetic_command(
+            KACHE_BIN,
+            &cache,
+            Some(&common::isolated_config_path(&cache)),
+        )
+        .arg("cargo")
+        .arg("--")
+        .args(args)
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CARGO_HOME", home.join(".cargo"))
+        .env("KACHE_REAL_CARGO", &fake_cargo)
+        .env("KACHE_TEST_CAPTURE", &capture)
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .output()
+        .unwrap();
         assert!(
             output.status.success(),
             "proxy failed: {}",
@@ -735,16 +740,21 @@ fn configured_build_dir_reaches_cargo_without_proxy_override() {
         "#!/bin/sh\nprintf '%s %s' \"${CARGO_BUILD_BUILD_DIR-unset}\" \"$*\" > \"$KACHE_TEST_CAPTURE\"\n",
     );
 
-    let output = Command::new(KACHE_BIN)
-        .args(["cargo", "--", "build"])
-        .current_dir(&project)
-        .env("HOME", &home)
-        .env("CARGO_HOME", home.join(".cargo"))
-        .env("KACHE_REAL_CARGO", &fake_cargo)
-        .env("KACHE_TEST_CAPTURE", &capture)
-        .env_remove("CARGO_BUILD_BUILD_DIR")
-        .output()
-        .unwrap();
+    let cache = dir.path().join("cache");
+    let output = hermetic_command(
+        KACHE_BIN,
+        &cache,
+        Some(&common::isolated_config_path(&cache)),
+    )
+    .args(["cargo", "--", "build"])
+    .current_dir(&project)
+    .env("HOME", &home)
+    .env("CARGO_HOME", home.join(".cargo"))
+    .env("KACHE_REAL_CARGO", &fake_cargo)
+    .env("KACHE_TEST_CAPTURE", &capture)
+    .env_remove("CARGO_BUILD_BUILD_DIR")
+    .output()
+    .unwrap();
 
     assert!(
         output.status.success(),

@@ -1591,7 +1591,11 @@ fn a_fresh_client_uses_the_remote_row_of_a_registry_unit() {
     build_kache();
     let shared = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
-    let package = home.path().join("registry/src/index-test/kt-1.0.0");
+    // Canonical, as a compiler working there reads it: a package named through
+    // a symlinked temp dir (/var on macOS) keeps that path in its rlib, and an
+    // output that names its checkout is not stored.
+    let home_dir = home.path().canonicalize().unwrap();
+    let package = home_dir.join("registry/src/index-test/kt-1.0.0");
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"kt\"\n").unwrap();
     std::fs::write(
@@ -1612,7 +1616,7 @@ fn a_fresh_client_uses_the_remote_row_of_a_registry_unit() {
     wait_for_remote_entry(shared.path(), "kt", &cache_key);
     wait_for_prediction_rows(shared.path(), 1);
     alpha.stop_daemon_and_wait();
-    let home_path = home.path().display().to_string();
+    let home_path = home_dir.display().to_string();
     for row in remote_prediction_rows(shared.path()) {
         let bytes = std::fs::read_to_string(&row).unwrap();
         assert!(

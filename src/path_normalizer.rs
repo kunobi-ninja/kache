@@ -295,11 +295,7 @@ impl PathNormalizer {
             .map(PathBuf::from)
             .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
             .and_then(|path| resolve(&path));
-        push_rule_with_variants(
-            &mut rules,
-            cargo_home.and_then(|p| canonical_string(&p)),
-            "<CARGO_HOME>",
-        );
+        push_rule_spellings(&mut rules, cargo_home, "<CARGO_HOME>");
 
         // Same default-fallback story for RUSTUP_HOME. rustup paths
         // appear in -L flags and toolchain refs — without this rule,
@@ -310,19 +306,9 @@ impl PathNormalizer {
             .map(PathBuf::from)
             .or_else(|| env.home_dir().map(|home| home.join(".rustup")))
             .and_then(|path| resolve(&path));
-        push_rule_with_variants(
-            &mut rules,
-            rustup_home.and_then(|p| canonical_string(&p)),
-            "<RUSTUP_HOME>",
-        );
+        push_rule_spellings(&mut rules, rustup_home, "<RUSTUP_HOME>");
 
-        push_rule_with_variants(
-            &mut rules,
-            env.home_dir()
-                .and_then(resolve)
-                .and_then(|path| canonical_string(&path)),
-            "<HOME>",
-        );
+        push_rule_spellings(&mut rules, env.home_dir().and_then(resolve), "<HOME>");
 
         // Windows-specific rules: cargo / rustup paths often live
         // under %APPDATA% / %LOCALAPPDATA% (e.g. CARGO_HOME defaults
@@ -336,11 +322,10 @@ impl PathNormalizer {
             ("LOCALAPPDATA", "<LOCALAPPDATA>"),
             ("PROGRAMFILES", "<PROGRAMFILES>"),
         ] {
-            push_rule_with_variants(
+            push_rule_spellings(
                 &mut rules,
                 env.var_os(env_key)
-                    .and_then(|value| resolve(Path::new(&value)))
-                    .and_then(|path| canonical_string(&path)),
+                    .and_then(|value| resolve(Path::new(&value))),
                 sentinel,
             );
         }
@@ -349,11 +334,7 @@ impl PathNormalizer {
         // segment on macOS like `/var/folders/1z/.../T`). Build
         // artifacts from build.rs scripts often pass through tempdirs
         // for intermediate output.
-        push_rule_with_variants(
-            &mut rules,
-            resolve(env.temp_dir()).and_then(|path| canonical_string(&path)),
-            "<TMPDIR>",
-        );
+        push_rule_spellings(&mut rules, resolve(env.temp_dir()), "<TMPDIR>");
 
         // De-dupe: if (e.g.) CARGO_HOME == workspace_root, the second
         // entry would never fire. Keep order stable so the first-listed
@@ -1459,6 +1440,25 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
     // `/rustc/<hash>` target) goes through `push_rule_with_variants_target`.
     let flag_target = flag_target_for(sentinel);
     push_rule_with_variants_target(rules, prefix, sentinel, &flag_target);
+}
+
+/// Push a root's canonical rule and, when it differs, the spelling it was
+/// named by. A path reached through a symlink (`/var` for `/private/var` on
+/// macOS, a symlinked home) keeps that spelling in compiler output.
+fn push_rule_spellings(rules: &mut Vec<Rule>, path: Option<PathBuf>, sentinel: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    let canonical = canonical_string(&path);
+    let given = canonical_form(&path)
+        .filter(|given| Some(given) != canonical.as_ref() && !is_filesystem_root_prefix(given));
+    // Longer first, so a spelling that is a prefix of the other cannot take
+    // the other's paths.
+    let mut spellings: Vec<String> = canonical.into_iter().chain(given).collect();
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    for spelling in spellings {
+        push_rule_with_variants(rules, Some(spelling), sentinel);
+    }
 }
 
 fn push_rule_with_variants_source(
@@ -4287,5 +4287,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_remapped_in_both_spellings_and_a_plain_one_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().canonicalize().unwrap().join("a-longer-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let prefixes = |path: &Path| {
+            let mut rules = Vec::new();
+            push_rule_spellings(&mut rules, Some(path.to_path_buf()), "<HOME>");
+            rules
+                .into_iter()
+                .map(|rule| rule.prefix)
+                .collect::<Vec<_>>()
+        };
+        let both = prefixes(&link);
+        assert_eq!(
+            both,
+            vec![
+                link.to_str().unwrap().to_string(),
+                real.to_str().unwrap().to_string()
+            ],
+            "both spellings, longer first"
+        );
+        assert_eq!(prefixes(&real), vec![real.to_str().unwrap().to_string()]);
+        let mut rules = Vec::new();
+        push_rule_spellings(&mut rules, None, "<HOME>");
+        assert!(rules.is_empty());
     }
 }

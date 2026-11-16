@@ -40,6 +40,7 @@ mod key_env;
 mod key_inputs;
 use kache_store::link;
 mod cache_remote;
+mod embedded_checkout;
 mod link_probe;
 mod machine;
 mod maintenance;

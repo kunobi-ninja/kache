@@ -49,6 +49,9 @@ windows-sys = { version = "0.61", features = [
     # GetSystemTimeAsFileTime: the system time NTFS stamps files with, which
     # a build start is read from (file_hash::stamp_clock_ns).
     "Win32_System_SystemInformation",
+    # NtQuerySystemInformation(SystemTimeOfDayInformation): the boot time a
+    # file-hash memo row must postdate (file_hash::windows_boot_time_secs).
+    "Wdk_System_SystemInformation",
 ] }
 blake3 = { version = "1", features = ["pure"] }
 

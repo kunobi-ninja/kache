@@ -896,7 +896,7 @@ pub fn with_weak_windows_fingerprints_for_tests<T>(run: impl FnOnce() -> T) -> T
 /// file stays untouched. A row recorded before the boot is therefore not
 /// served: the file is read once again and the row recorded then is. A clean
 /// reboot costs the same single read per file. `0`, every row, where the boot
-/// time is unknown (every platform but Linux and Android, for now).
+/// time is unknown (every platform but Linux, Android and Windows, for now).
 fn memo_rows_valid_since() -> i64 {
     #[cfg(test)]
     if let Some(boot) = BOOT_SECS_FOR_TESTS.with(std::cell::Cell::get) {
@@ -907,18 +907,72 @@ fn memo_rows_valid_since() -> i64 {
 }
 
 /// When this machine booted, in Unix seconds: the `btime` line of
-/// `/proc/stat`. `None` where it is unknown, and every row is served, as
-/// before.
+/// `/proc/stat`, or on Windows the boot time the kernel keeps
+/// ([`windows_boot_time_secs`]). `None` where it is unknown, and every row is
+/// served, as before.
 fn boot_time_secs() -> Option<i64> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         boot_time_in_proc_stat(&stat)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        windows_boot_time_secs()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     {
         None
     }
+}
+
+/// When Windows booted, in Unix seconds: the boot time the kernel keeps,
+/// which `NtQuerySystemInformation` reports for `SystemTimeOfDayInformation`
+/// and WMI as `Win32_OperatingSystem.LastBootUpTime`. Like Linux's `btime`
+/// it moves when the clock is set, by the size of the step. The system time
+/// minus `GetTickCount64` is not the same value: it is only as fine as the
+/// tick (about 16 ms) and can sit below the kernel's boot time, the side
+/// that serves a row from before the boot.
+#[cfg(windows)]
+fn windows_boot_time_secs() -> Option<i64> {
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemTimeOfDayInformation,
+    };
+    // SYSTEM_TIMEOFDAY_INFORMATION, which winternl.h leaves opaque: the boot
+    // time and the current time as FILETIMEs, then the time zone bias, its id
+    // and padding, the boot time bias and the sleep time bias, 48 bytes.
+    let mut info = [0u64; 6];
+    let mut written = 0u32;
+    // SAFETY: `info` is 48 writable bytes, aligned for the 64-bit fields the
+    // call writes, alive across the call, and the length passed is their size;
+    // `written` is a live u32 the call may fill.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of_val(&info) as u32,
+            &mut written,
+        )
+    };
+    if status < 0 || (written as usize) < 2 * std::mem::size_of::<u64>() {
+        return None;
+    }
+    let unix_ns = |filetime: u64| filetime_to_unix_ns((filetime >> 32) as u32, filetime as u32);
+    boot_secs_from_time_of_day(unix_ns(info[0]), unix_ns(info[1]), windows_system_time_ns())
+}
+
+/// The boot second from what `SystemTimeOfDayInformation` reports, its boot
+/// time and its current time (nanoseconds since the Unix epoch), checked
+/// against the system time read beside the call (`now_ns`): a current time
+/// off it, or a boot after it, means the bytes are not laid out as
+/// [`windows_boot_time_secs`] reads them, and the boot time is unknown.
+/// Rounded down, so a row recorded in the boot's own second is served.
+#[cfg(any(test, windows))]
+fn boot_secs_from_time_of_day(boot_ns: i64, current_ns: i64, now_ns: i64) -> Option<i64> {
+    const LAYOUT_SLACK_NS: u64 = 60_000_000_000;
+    let laid_out =
+        boot_ns > 0 && boot_ns <= current_ns && current_ns.abs_diff(now_ns) <= LAYOUT_SLACK_NS;
+    laid_out.then(|| boot_ns.div_euclid(1_000_000_000))
 }
 
 /// The `btime` line of `/proc/stat`.
@@ -2393,10 +2447,49 @@ mod tests {
         assert_eq!(boot_time_in_proc_stat("cpu 1\nbtimes 7\n"), None);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_windows_boot_time_is_rounded_down_and_read_only_from_the_expected_layout() {
+        const SECOND: i64 = 1_000_000_000;
+        // 2026-11-16 19:47:39.999999999 UTC, read 15 minutes later.
+        let boot = 1_794_858_459 * SECOND + 999_999_999;
+        let now = boot + 900 * SECOND;
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now),
+            Some(1_794_858_459),
+            "a row stamped in the boot's own second must be served"
+        );
+        // The call's current time and the system time read beside it agree
+        // within a minute when the bytes hold what they are read as.
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now + 60 * SECOND),
+            Some(1_794_858_459)
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now - 60 * SECOND),
+            Some(1_794_858_459)
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now + 60 * SECOND + 1),
+            None
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now - 60 * SECOND - 1),
+            None
+        );
+        // A boot in the reported instant itself is still a boot; one after it,
+        // or none at all, is not.
+        assert_eq!(
+            boot_secs_from_time_of_day(now, now, now),
+            Some(1_794_859_359)
+        );
+        assert_eq!(boot_secs_from_time_of_day(now + 1, now, now), None);
+        assert_eq!(boot_secs_from_time_of_day(0, now, now), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     #[test]
     fn this_machine_booted_in_the_past() {
-        let boot = boot_time_secs().expect("/proc/stat has a btime line");
+        let boot = boot_time_secs().expect("this platform's boot time is known");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

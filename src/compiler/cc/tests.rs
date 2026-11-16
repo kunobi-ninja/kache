@@ -11826,3 +11826,17 @@ fn include_order_stamps_cover_the_run_directories_it_listed() {
     fs::write(root.join("b/sub/x.h"), "int b;\n").unwrap();
     assert!(!compiler.include_dir_names_still_match(&parsed));
 }
+
+#[test]
+fn only_the_nix_store_and_profiles_are_system_paths() {
+    for (path, system) in [
+        ("/nix/store/abc-clang/include/stddef.h", true),
+        ("/nix/var/nix/profiles/default/include/zlib.h", true),
+        ("/nix/var/nix/builds/nix-1-2/source/a/a.h", false),
+        ("/nix", false),
+        ("/usr/include/stdio.h", true),
+        ("/Users/me/src/a.h", false),
+    ] {
+        assert_eq!(cc_system_path(path), system, "{path}");
+    }
+}

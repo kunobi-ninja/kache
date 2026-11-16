@@ -19,6 +19,8 @@ pub(super) struct HitCompletion<'a> {
     pub key_record: KeyEventRecord,
     /// Object path for a C or C++ hit. Empty for rustc.
     pub object_output: String,
+    /// The entry came from `[cache] readonly_store`.
+    pub readonly_store: bool,
 }
 
 impl HitCompletion<'_> {
@@ -36,7 +38,8 @@ impl HitCompletion<'_> {
                 .lookup_ms(self.lookup_ms)
                 .restore_ms(self.restore_ms)
                 .key_record(self.key_record)
-                .object_output(&self.object_output),
+                .object_output(&self.object_output)
+                .readonly_store(self.readonly_store),
         );
         print_progress(self.crate_name, self.result, elapsed, size);
         replay_cached_diagnostics(

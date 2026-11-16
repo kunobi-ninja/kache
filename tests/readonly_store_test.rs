@@ -154,6 +154,10 @@ fn rejected_readonly_hits_are_recompiled_and_cached_locally() {
         compile(&job, &job_config, &source, &out);
         let warm = last_event(&job);
         assert_eq!(warm["result"], "local_hit", "{rejection}: {warm}");
+        assert!(
+            warm.get("readonly_store").is_none(),
+            "a hit from the job's own store is not a read-only hit: {warm}"
+        );
         assert_eq!(std::fs::read(&metadata).unwrap(), original_metadata);
         drop(owner);
     }
@@ -199,10 +203,26 @@ fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {
     let hit = last_event_for(&job, &published);
     assert_eq!(hit["cache_key"], cold["cache_key"]);
     assert_eq!(hit["result"], "local_hit", "{hit}");
+    assert_eq!(hit["readonly_store"], true, "{hit}");
     assert_eq!(hit["compiler_runs"], 0, "{hit}");
     assert_eq!(
         std::fs::read(work.join("readonly_probe.o")).unwrap(),
         expected_object
+    );
+    let stats = hermetic_command(kache_binary(), &job, Some(&job_config))
+        .args(["stats", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        stats.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(
+        (&stats["local_hits"], &stats["readonly_hits"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{stats}"
     );
     drop(owner);
 }

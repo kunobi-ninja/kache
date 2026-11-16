@@ -2064,6 +2064,7 @@ fn a_hardlinked_artifact_records_its_link_group() {
 fn zero_event_stats() -> daemon::EventStatsResponse {
     daemon::EventStatsResponse {
         local_hits: 0,
+        readonly_hits: 0,
         prefetch_hits: 0,
         remote_hits: 0,
         dups: 0,
@@ -5112,6 +5113,29 @@ fn stats_summary_shows_every_source_even_when_zero() {
 }
 
 #[test]
+fn stats_sources_name_the_read_only_share_of_local_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().join("cache"), None);
+    let mut snap = StatsSnapshot::default();
+    snap.event_stats.local_hits = 30;
+    snap.event_stats.readonly_hits = 12;
+    snap.event_stats.misses = 10;
+    let lines = render_stats(&snap, &config, SinceWindow::DEFAULT);
+    assert_eq!(
+        stats_row(&lines, "Sources").as_deref(),
+        Some(
+            "Sources | local 30 · prefetch 0 · remote 0 · dup 0 · miss 10 | \
+             12 of the local hits from the read-only store"
+        )
+    );
+    // Read-only hits are inside `local_hits`, not added to it.
+    assert_eq!(
+        stats_row(&lines, "Hit rate").as_deref(),
+        Some("Hit rate | 75.0% | 30 of 40 crates from cache")
+    );
+}
+
+#[test]
 fn hit_rate_row_adds_every_outcome() {
     let row = |local, prefetch, remote, dups, misses| {
         let dir = tempfile::tempdir().unwrap();
@@ -6332,6 +6356,7 @@ fn build_event(
         rebuilt_fingerprint: None,
         rebuilt_path: None,
         rebuilt_paths: Vec::new(),
+        readonly_store: false,
     }
 }
 

@@ -86,6 +86,7 @@ impl Default for StatsSnapshot {
             entries: Vec::new(),
             event_stats: daemon::EventStatsResponse {
                 local_hits: 0,
+                readonly_hits: 0,
                 prefetch_hits: 0,
                 remote_hits: 0,
                 dups: 0,
@@ -301,6 +302,7 @@ pub(crate) fn snapshot_from_direct_reads(
         stores: inventory.stores,
         event_stats: daemon::EventStatsResponse {
             local_hits: es.local_hits,
+            readonly_hits: es.readonly_hits,
             prefetch_hits: es.prefetch_hits,
             remote_hits: es.remote_hits,
             dups: es.dups,
@@ -921,6 +923,9 @@ pub fn stats(
             #[serde(skip_serializing_if = "Option::is_none")]
             longest_scheduler_wait: Option<&'a kache_core::scheduler::SchedulerWait>,
             local_hits: usize,
+            /// Local hits restored from `[cache] readonly_store`; part of
+            /// `local_hits`.
+            readonly_hits: usize,
             prefetch_hits: usize,
             remote_hits: usize,
             dups: usize,
@@ -969,6 +974,7 @@ pub fn stats(
                 total_permit_wait_ms: snap.event_stats.total_permit_wait_ms,
                 longest_scheduler_wait: snap.event_stats.longest_scheduler_wait.as_ref(),
                 local_hits: snap.event_stats.local_hits,
+                readonly_hits: snap.event_stats.readonly_hits,
                 prefetch_hits: snap.event_stats.prefetch_hits,
                 remote_hits: snap.event_stats.remote_hits,
                 dups: snap.event_stats.dups,
@@ -1238,6 +1244,17 @@ fn since_label(since: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
     }
 }
 
+/// How many local hits the read-only store served; empty when none did.
+fn readonly_hits_note(readonly_hits: usize) -> String {
+    if readonly_hits == 0 {
+        return String::new();
+    }
+    format!(
+        "{} of the local hits from the read-only store",
+        term::count(readonly_hits as u64)
+    )
+}
+
 /// Hit rate, source counts, weighted hit rate, time saved and miss time.
 fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
     let es = &snap.event_stats;
@@ -1264,7 +1281,7 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
                 term::count(es.dups as u64),
                 term::count(es.misses as u64),
             ),
-            String::new(),
+            readonly_hits_note(es.readonly_hits),
         ),
     ];
     if let Some(weighted) = compile_weighted_hit_rate(es) {

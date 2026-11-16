@@ -558,6 +558,7 @@ fn test_event(
         miss_reason: crate::events::MissReason::None,
         object_output: String::new(),
         package: String::new(),
+        readonly_store: false,
     }
 }
 
@@ -911,6 +912,48 @@ fn store_failures_are_visible_without_leaving_the_miss_accounting() {
             .ends_with(" | not cached: refusing to cache zero-byte artifact: liblint.rmeta"),
         "the miss row should carry the reason: {text}"
     );
+}
+
+/// A hit from the read-only store stays a local hit, so totals and the hit
+/// rate do not move, and is also counted on its own.
+#[test]
+fn readonly_store_hits_are_counted_inside_local_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    assert_eq!(report.summary.readonly_hits, 0);
+    assert!(text_row(&format_text(&report), "Read-only").is_none());
+    assert!(!format_markdown(&report).contains("Read-only"));
+    let (local, hits, rate) = (
+        report.summary.local_hits,
+        report.summary.total_hits(),
+        report.summary.hit_rate_pct,
+    );
+
+    let own = test_event("own", EventResult::LocalHit, 5, 300, 1024, "aaa111");
+    let mut host = test_event("host", EventResult::LocalHit, 5, 300, 1024, "bbb222");
+    host.readonly_store = true;
+    events::log_event(&config.event_log_path(), &own).unwrap();
+    events::log_event(&config.event_log_path(), &host).unwrap();
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+
+    assert_eq!(report.summary.readonly_hits, 1);
+    assert_eq!(report.summary.local_hits, local + 2);
+    assert_eq!(report.summary.total_hits(), hits + 2);
+    assert!(report.summary.hit_rate_pct > rate);
+    assert_eq!(
+        text_row(&format_text(&report), "Read-only").as_deref(),
+        Some(
+            format!(
+                "Read-only | 1 | of {} local hits from the read-only store",
+                local + 2
+            )
+            .as_str()
+        ),
+    );
+    assert!(format_markdown(&report).contains("| Read-only store hits | 1 (included in local) |"));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["summary"]["readonly_hits"], 1);
 }
 
 #[test]

@@ -703,6 +703,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
                         StorePutResult::default(),
                         size,
                         meta.compile_time_ms,
+                        blobs.is_read_only(),
                     );
                     return Ok(0);
                 }
@@ -2122,6 +2123,7 @@ impl Run {
             put,
             size,
             compile_ms,
+            false,
         );
         Ok(())
     }
@@ -2138,6 +2140,7 @@ impl Run {
         put: StorePutResult,
         size: u64,
         compile_ms: u64,
+        readonly_store: bool,
     ) {
         let root = crate::wrapper::build_script_event_root(
             &self.environment.out_dir,
@@ -2154,7 +2157,8 @@ impl Run {
                 .lookup_ms(lookup_ms)
                 .restore_ms(restore_ms)
                 .store_ms(store_ms)
-                .store_put(put),
+                .store_put(put)
+                .readonly_store(readonly_store),
         );
     }
 
@@ -7771,6 +7775,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Event results, with `+readonly` on a hit from the read-only store.
     fn event_results(cache: &Path) -> Vec<String> {
         let path = cache.join("events.jsonl");
         if !path.is_file() {
@@ -7780,7 +7785,16 @@ mod tests {
             .unwrap()
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|event| event["result"].as_str().map(str::to_string))
+            .filter_map(|event| {
+                let readonly = if event["readonly_store"] == true {
+                    "+readonly"
+                } else {
+                    ""
+                };
+                event["result"]
+                    .as_str()
+                    .map(|result| result.to_string() + readonly)
+            })
             .collect()
     }
 
@@ -7875,7 +7889,7 @@ mod tests {
         );
         assert_eq!(host_store.entry_count().unwrap(), entries);
         assert_eq!(entry_metas(&host), metas);
-        assert_eq!(event_results(&job), ["local_hit"]);
+        assert_eq!(event_results(&job), ["local_hit+readonly"]);
     }
 
     /// No read-only store is configured. A miss still records into the local

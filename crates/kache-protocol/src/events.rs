@@ -107,6 +107,7 @@ pub struct BuildEvent {
     /// 25 = reasons for compiled results that were not stored.
     /// 26 = successful compilation outputs and captured package identity.
     /// 27 = recorded scheduler decisions and admission outcomes.
+    /// 28 = local hits served from the read-only store.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -405,6 +406,11 @@ pub struct BuildEvent {
     /// Package a build-script run belongs to. Empty for compiles. Schema 23.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub package: String,
+    /// A `LocalHit` restored from `[cache] readonly_store` rather than from
+    /// this process's own store. Always false on other results. Events before
+    /// schema 28 omit it, so their source is unknown.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub readonly_store: bool,
 }
 
 impl BuildEvent {
@@ -640,6 +646,7 @@ impl BuildEvent {
             miss_reason: MissReason::None,
             object_output: String::new(),
             package: String::new(),
+            readonly_store: false,
         }
     }
 }

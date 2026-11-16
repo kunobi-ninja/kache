@@ -96,6 +96,7 @@
         "time_saved_ms": { "type": "integer", "minimum": 0 },
         "total_crates": { "type": "integer", "minimum": 0 },
         "local_hits": { "type": "integer", "minimum": 0 },
+        "readonly_hits": { "type": "integer", "minimum": 0, "description": "Local hits restored from cache.readonly_store. Part of local_hits." },
         "prefetch_hits": { "type": "integer", "minimum": 0 },
         "remote_hits": { "type": "integer", "minimum": 0 },
         "dups": { "type": "integer", "minimum": 0 },

@@ -7,11 +7,20 @@
 //! Neither the source nor the dep-info shows that read, and the key normalizes
 //! the workspace path, so another checkout of the same sources gets the same
 //! key. Such outputs are not stored.
+//!
+//! The check looks for the checkout's paths as plain bytes. A path the macro
+//! encodes, compresses or writes relative to something else is not found.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::args::RustcArgs;
 use crate::compiler::{ArtifactKind, ArtifactSet};
+
+/// Bytes read from an artifact at a time.
+const CHUNK: usize = 1 << 20;
+/// Bytes past a match the target-directory check may read.
+const PATH_TAIL: usize = 512;
 
 /// Why this compile's outputs must not be stored, if they name its checkout.
 ///
@@ -28,7 +37,14 @@ pub(crate) fn embedded_checkout_reason(
         return None;
     }
     let manifest_dir = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
-    let checkout = spellings(Path::new(&manifest_dir));
+    let mut checkout = spellings(Path::new(&manifest_dir));
+    if let Some(root) = args.path_normalization_root() {
+        for spelling in spellings(root) {
+            if !checkout.contains(&spelling) {
+                checkout.push(spelling);
+            }
+        }
+    }
     let target = args
         .target_dir()
         .map(|dir| spellings(&dir))
@@ -37,15 +53,15 @@ pub(crate) fn embedded_checkout_reason(
         if artifact.kind == ArtifactKind::DepInfo {
             continue;
         }
-        match std::fs::read(&artifact.path) {
-            Ok(bytes) if names_checkout(&bytes, &checkout, &target) => {
+        match file_names_checkout(&artifact.path, &checkout, &target) {
+            Ok(false) => {}
+            Ok(true) => {
                 return Some(format!(
                     "`{}` names this checkout's directory, which a proc macro can embed \
                      without the key seeing it",
                     artifact.store_name
                 ));
             }
-            Ok(_) => {}
             Err(error) => {
                 return Some(format!(
                     "`{}` could not be read to check for this checkout's directory: {error}",
@@ -68,8 +84,8 @@ pub(crate) fn key_binds_manifest_dir(
     })
 }
 
-/// The spellings a path can take in generated code: as given, canonical,
-/// and each with forward slashes.
+/// The spellings a path can take in generated code: as given and canonical,
+/// each with forward slashes and with either drive-letter case.
 fn spellings(path: &Path) -> Vec<Vec<u8>> {
     let mut forms: Vec<PathBuf> = vec![path.to_path_buf()];
     if let Ok(canonical) = std::fs::canonicalize(path)
@@ -77,7 +93,7 @@ fn spellings(path: &Path) -> Vec<Vec<u8>> {
     {
         forms.push(canonical);
     }
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     for form in forms {
         let Some(text) = form.to_str() else {
             continue;
@@ -87,58 +103,192 @@ fn spellings(path: &Path) -> Vec<Vec<u8>> {
             continue;
         }
         for spelling in [text.to_string(), text.replace('\\', "/")] {
-            if !out.contains(&spelling.as_bytes().to_vec()) {
-                out.push(spelling.into_bytes());
+            let mut variants = vec![spelling.clone()];
+            if let [drive, b':', ..] = spelling.as_bytes()
+                && drive.is_ascii_alphabetic()
+            {
+                let mut other = spelling.into_bytes();
+                other[0] ^= 0x20;
+                variants.push(String::from_utf8(other).unwrap_or_default());
+            }
+            for variant in variants {
+                if !variant.is_empty() && !out.contains(&variant.as_bytes().to_vec()) {
+                    out.push(variant.into_bytes());
+                }
             }
         }
     }
     out
 }
 
-/// Whether `bytes` hold a `checkout` spelling anywhere other than at the
-/// start of a `target` spelling. A linker can record object paths under the
-/// target directory; those say nothing a key cannot see.
-fn names_checkout(bytes: &[u8], checkout: &[Vec<u8>], target: &[Vec<u8>]) -> bool {
+/// Whether the file at `path` names the checkout, read in chunks.
+fn file_names_checkout(
+    path: &Path,
+    checkout: &[Vec<u8>],
+    target: &[Vec<u8>],
+) -> std::io::Result<bool> {
+    let longest = checkout.iter().map(Vec::len).max().unwrap_or(0);
+    if longest == 0 {
+        return Ok(false);
+    }
+    let tail = longest + PATH_TAIL;
+    let mut file = std::fs::File::open(path)?;
+    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + tail);
+    loop {
+        let start = window.len();
+        window.resize(start + CHUNK, 0);
+        let mut filled = start;
+        while filled < window.len() {
+            match file.read(&mut window[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let complete = filled < window.len();
+        window.truncate(filled);
+        if names_checkout(&window, checkout, target, complete, tail) {
+            return Ok(true);
+        }
+        if complete {
+            return Ok(false);
+        }
+        // Keep the bytes a match near the end still needs.
+        let keep_from = window.len().saturating_sub(tail);
+        window.drain(..keep_from);
+    }
+}
+
+/// Whether `bytes` name the checkout. A match counts when it ends at a path
+/// boundary and is not a path inside the target directory, where a linker
+/// records object files. Unless the window is `complete`, a match within
+/// `tail` bytes of its end is left for the next window, which keeps them.
+fn names_checkout(
+    bytes: &[u8],
+    checkout: &[Vec<u8>],
+    target: &[Vec<u8>],
+    complete: bool,
+    tail: usize,
+) -> bool {
     checkout.iter().any(|needle| {
         memchr::memmem::find_iter(bytes, needle).any(|at| {
             let rest = &bytes[at..];
-            !target.iter().any(|dir| rest.starts_with(dir))
+            if !complete && rest.len() < tail {
+                return false;
+            }
+            ends_at_boundary(rest.get(needle.len()).copied())
+                && !target.iter().any(|dir| inside_target(rest, dir))
         })
     })
+}
+
+/// Whether the byte after a match ends that path component.
+fn ends_at_boundary(next: Option<u8>) -> bool {
+    next.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+}
+
+/// Whether `rest` is a path below `dir` that does not climb back out of it.
+fn inside_target(rest: &[u8], dir: &[u8]) -> bool {
+    let Some(after) = rest.strip_prefix(dir) else {
+        return false;
+    };
+    let Some((b'/' | b'\\', path)) = after.split_first() else {
+        return false;
+    };
+    let end = path
+        .iter()
+        .position(|byte| *byte < 0x20 || matches!(byte, b'"' | b'\''))
+        .unwrap_or(path.len());
+    !path[..end]
+        .split(|byte| matches!(byte, b'/' | b'\\'))
+        .any(|component| component == b"..")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_checkout_path_outside_the_target_dir_is_found() {
-        let checkout = vec![b"/work/a".to_vec()];
-        let target = vec![b"/work/a/target".to_vec()];
-        assert!(names_checkout(b"x\0/work/a/assets/\0y", &checkout, &target));
-        assert!(!names_checkout(
-            b"x\0/work/a/target/debug/deps/x.o\0",
-            &checkout,
-            &target
-        ));
-        assert!(names_checkout(
-            b"/work/a/target/x.o\0/work/a/assets/",
-            &checkout,
-            &target
-        ));
-        assert!(!names_checkout(
-            b"/kache/workspace/assets/",
-            &checkout,
-            &target
-        ));
-        assert!(!names_checkout(b"", &checkout, &target));
+    fn found(bytes: &[u8], checkout: &[&[u8]], target: &[&[u8]]) -> bool {
+        let checkout: Vec<Vec<u8>> = checkout.iter().map(|path| path.to_vec()).collect();
+        let target: Vec<Vec<u8>> = target.iter().map(|path| path.to_vec()).collect();
+        names_checkout(bytes, &checkout, &target, true, 0)
     }
 
     #[test]
-    fn spellings_cover_trailing_separators_and_forward_slashes() {
+    fn a_checkout_path_outside_the_target_dir_is_found() {
+        let checkout: &[&[u8]] = &[b"/work/a"];
+        let target: &[&[u8]] = &[b"/work/a/target"];
+        assert!(found(b"x\0/work/a/assets/\0y", checkout, target));
+        assert!(found(b"x\0/work/a", checkout, target));
+        assert!(!found(
+            b"x\0/work/a/target/debug/deps/x.o\0",
+            checkout,
+            target
+        ));
+        assert!(found(
+            b"/work/a/target/x.o\0/work/a/assets/",
+            checkout,
+            target
+        ));
+        assert!(!found(b"/kache/workspace/assets/", checkout, target));
+        assert!(!found(b"", checkout, target));
+    }
+
+    #[test]
+    fn a_target_lookalike_or_a_climb_out_still_counts() {
+        let checkout: &[&[u8]] = &[b"/work/a"];
+        let target: &[&[u8]] = &[b"/work/a/target"];
+        assert!(found(b"/work/a/target/../assets\0", checkout, target));
+        assert!(found(
+            b"/work/a/target/debug/../../assets\0",
+            checkout,
+            target
+        ));
+        assert!(found(b"/work/a/target-old/assets\0", checkout, target));
+        assert!(found(b"/work/a/target\0", checkout, target));
+        assert!(!found(b"/work/a/target/debug/x..y.o\0", checkout, target));
+    }
+
+    #[test]
+    fn a_sibling_with_a_longer_name_is_not_the_checkout() {
+        let checkout: &[&[u8]] = &[b"/work/a"];
+        assert!(!found(b"/work/ab/assets", checkout, &[]));
+        assert!(!found(b"/work/a.old/assets", checkout, &[]));
+        assert!(!found(b"/work/a_b", checkout, &[]));
+        assert!(found(b"/work/a\\assets", checkout, &[]));
+        assert!(found(b"\"/work/a\"", checkout, &[]));
+    }
+
+    #[test]
+    fn a_match_split_across_chunks_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.rlib");
+        let mut bytes = vec![b'x'; CHUNK - 3];
+        bytes.extend_from_slice(b"/work/a/assets\0");
+        bytes.extend(std::iter::repeat_n(b'y', 100));
+        std::fs::write(&file, &bytes).unwrap();
+        let checkout = vec![b"/work/a".to_vec()];
+        assert!(file_names_checkout(&file, &checkout, &[]).unwrap());
+        let clean = dir.path().join("clean.rlib");
+        std::fs::write(&clean, vec![b'z'; CHUNK * 2 + 7]).unwrap();
+        assert!(!file_names_checkout(&clean, &checkout, &[]).unwrap());
+        assert!(!file_names_checkout(&file, &[], &[]).unwrap());
+        // A target exemption decided with the full path, past the chunk edge.
+        let mut edge = vec![b'x'; CHUNK - 10];
+        edge.extend_from_slice(b"/work/a/target/debug/x.o\0");
+        let exempt = dir.path().join("exempt.rlib");
+        std::fs::write(&exempt, &edge).unwrap();
+        let target = vec![b"/work/a/target".to_vec()];
+        assert!(!file_names_checkout(&exempt, &checkout, &target).unwrap());
+    }
+
+    #[test]
+    fn spellings_cover_separators_and_drive_case() {
         let forms = spellings(Path::new(r"C:\work\a\"));
-        assert!(forms.contains(&br"C:\work\a".to_vec()));
-        assert!(forms.contains(&b"C:/work/a".to_vec()));
+        for spelling in [r"C:\work\a", "C:/work/a", r"c:\work\a", "c:/work/a"] {
+            assert!(forms.contains(&spelling.as_bytes().to_vec()), "{spelling}");
+        }
         assert_eq!(spellings(Path::new("/")), Vec::<Vec<u8>>::new());
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();

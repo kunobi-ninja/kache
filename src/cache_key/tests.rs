@@ -23028,9 +23028,33 @@ fn a_compile_first_registry_unit_keys_like_a_key_first_one() {
         );
         assert!(remaps.contains(&remap), "{remap}: {remaps:?}");
     }
-    assert!(compiled_with_registry_remaps(&args));
+    assert!(applied_registry_remaps(&args).is_some());
     assert_eq!(emitted_key(), key_first);
     assert_eq!(take_execute_remaps(&args, false), Some(remaps));
+
+    // A source in another package took a remap the walk did not cover.
+    let foreign = root.join("registry/src/index/other-1.0.0/src/x.rs");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, "pub fn x() {}\n").unwrap();
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), foreign.clone()],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let mixed = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    record_compiled_remaps(&args, None);
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), foreign],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let mixed_unremapped = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    assert_ne!(mixed, key_first);
+    assert_ne!(mixed, mixed_unremapped);
 }
 
 #[test]
@@ -23044,9 +23068,42 @@ fn a_compile_that_applied_no_registry_remaps_keeps_the_ordinary_key() {
     args.source_file = Some(package.join("src/lib.rs"));
     publish_host_neutral_decision(&args, None);
     assert_eq!(take_execute_remaps(&args, false), None);
-    assert!(!compiled_with_registry_remaps(&args));
-    assert_eq!(take_execute_remaps(&args, false), None);
+    assert!(applied_registry_remaps(&args).is_none());
     assert_eq!(take_execute_remaps(&args, true), None);
+
+    publish_host_neutral_decision(&args, Some(vec!["--remap-path-prefix=a/=b/".to_string()]));
+    assert!(take_execute_remaps(&args, false).is_some());
+    assert!(applied_registry_remaps(&args).is_some());
+    assert_eq!(take_execute_remaps(&args, true), None);
+    assert!(applied_registry_remaps(&args).is_none());
+}
+
+#[test]
+fn applied_remaps_must_cover_every_source_directory() {
+    let registry = PathBuf::from("/home/u/.cargo/registry/src");
+    let own = registry.join("index/a-1.0.0/src/lib.rs");
+    let other = registry.join("index/b-1.0.0/src/x.rs");
+    let applied = registry_directory_remaps(
+        &registry,
+        std::slice::from_ref(&own),
+        std::path::MAIN_SEPARATOR,
+    );
+    assert!(remaps_cover_closure(
+        &registry,
+        std::slice::from_ref(&own),
+        &applied
+    ));
+    assert!(!remaps_cover_closure(
+        &registry,
+        &[own.clone(), other.clone()],
+        &applied
+    ));
+    let both = registry_directory_remaps(
+        &registry,
+        &[own.clone(), other.clone()],
+        std::path::MAIN_SEPARATOR,
+    );
+    assert!(remaps_cover_closure(&registry, &[own, other], &both));
 }
 
 #[test]

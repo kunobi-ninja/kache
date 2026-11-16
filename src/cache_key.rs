@@ -2205,6 +2205,7 @@ pub(crate) fn host_neutral_extra_remaps(decision: HostNeutralDecision) -> Option
 /// computed before compiling.
 pub(crate) fn take_execute_remaps(args: &RustcArgs, skip_remap: bool) -> Option<Vec<String>> {
     if skip_remap {
+        record_compiled_remaps(args, None);
         return None;
     }
     let remaps = match take_host_neutral_decision(args) {
@@ -2262,10 +2263,21 @@ fn compiled_remaps(args: &RustcArgs) -> Option<Option<Vec<String>>> {
     })
 }
 
-/// Whether the compile that emitted this unit's closure applied registry
-/// remaps.
-pub(crate) fn compiled_with_registry_remaps(args: &RustcArgs) -> bool {
-    compiled_remaps(args).is_some_and(|remaps| remaps.is_some())
+/// The registry remaps the compile that emitted this unit's closure applied.
+pub(crate) fn applied_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
+    compiled_remaps(args).flatten()
+}
+
+/// Whether `applied` holds every remap a key-first compile of this closure
+/// would pass. Only then did each source take the same remap.
+pub(crate) fn remaps_cover_closure(
+    registry: &Path,
+    sources: &[PathBuf],
+    applied: &[String],
+) -> bool {
+    registry_directory_remaps(registry, sources, std::path::MAIN_SEPARATOR)
+        .iter()
+        .all(|remap| applied.contains(remap))
 }
 
 /// Registry remaps for every directory of the unit's package, for a compile
@@ -3824,7 +3836,8 @@ fn compute_key_into(
     let emitted = dep_info_provided();
     // An emitted closure is keyed as its compile ran: with registry remaps,
     // as a key computed before compiling would be.
-    let compiled_neutral = emitted && compiled_with_registry_remaps(args);
+    let applied = emitted.then(|| applied_registry_remaps(args)).flatten();
+    let compiled_neutral = applied.is_some();
     let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
     // Hand the closure back to the wrapper, which records it as a prediction
     // only once the invocation it belongs to has succeeded. The clone is one
@@ -3850,7 +3863,12 @@ fn compute_key_into(
             out_dir: out_dir.as_deref().map(Path::new),
             skip_remap: args.skip_path_remap(),
         },
-    );
+    )
+    .filter(|root| {
+        applied
+            .as_deref()
+            .is_none_or(|applied| remaps_cover_closure(root, sources, applied))
+    });
     let (drop_host, namespace) =
         host_neutral_version_flags(host_neutral_root.is_some(), compiled_neutral);
     publish_host_neutral_plan(args, emitted, host_neutral_root.as_deref(), sources);

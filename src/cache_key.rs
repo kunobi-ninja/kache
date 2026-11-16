@@ -1990,11 +1990,11 @@ fn hash_rustc_version_for_unit<H: KeyFold>(
     hasher.update(text.as_bytes());
     hasher.update(b"\n");
     if namespace {
-        fold_field(hasher, b"host_neutral_sources.v1:", b"1");
+        fold_field(hasher, b"host_neutral_sources.v2:", b"1");
     }
 }
 
-/// `(drop host line, fold host_neutral_sources.v1)`. The namespace stays when
+/// `(drop host line, fold host_neutral_sources.v2)`. The namespace stays when
 /// remaps were already applied, even if this key does not drop the host line.
 pub(crate) fn host_neutral_version_flags(neutral: bool, provisional_remaps: bool) -> (bool, bool) {
     (neutral, neutral || provisional_remaps)
@@ -2002,7 +2002,8 @@ pub(crate) fn host_neutral_version_flags(neutral: bool, provisional_remaps: bool
 
 /// `--remap-path-prefix` for every directory from `registry_src` down to each
 /// source's parent. `FROM` uses `host_sep` and ends with it. `TO` is
-/// `/cargo/registry/.../` so the matched separator is consumed. Longest last.
+/// `/kache/.cargo/registry/src/.../`, the shape the base remaps give a
+/// registry path, so the matched separator is consumed. Longest last.
 pub(crate) fn registry_directory_remaps(
     registry_src: &Path,
     sources: &[PathBuf],
@@ -2033,6 +2034,10 @@ pub(crate) fn registry_directory_remaps(
         .collect()
 }
 
+/// Where registry sources land in debug info and panic paths: the same place
+/// the base `<CARGO_HOME>` remap puts them, which samply resolves to crates.io.
+const REGISTRY_REMAP_TARGET: &str = "/kache/.cargo/registry/src";
+
 fn push_registry_dir(
     dirs: &mut std::collections::BTreeSet<(usize, String, String)>,
     root_slash: &str,
@@ -2051,9 +2056,9 @@ fn push_registry_dir(
         }
     }
     let to = if rel_dir.is_empty() {
-        "/cargo/registry/".to_string()
+        format!("{REGISTRY_REMAP_TARGET}/")
     } else {
-        format!("/cargo/registry/{rel_dir}/")
+        format!("{REGISTRY_REMAP_TARGET}/{rel_dir}/")
     };
     dirs.insert((from.len(), from, to));
 }

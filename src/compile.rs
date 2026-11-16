@@ -2926,8 +2926,9 @@ fi
             std::path::PathBuf::from("tmp"),
         );
         let normalizer = crate::path_normalizer::PathNormalizer::from_invocation(Some(cwd), &env);
-        let extra =
-            vec!["--remap-path-prefix=C:\\reg\\src\\pkg\\=/cargo/registry/pkg/".to_string()];
+        let extra = vec![
+            "--remap-path-prefix=C:\\reg\\src\\pkg\\=/kache/.cargo/registry/src/pkg/".to_string(),
+        ];
         let expected = crate::cache_key::rustc_remap_args(
             false,
             normalizer.remap_args(),
@@ -2957,6 +2958,10 @@ fi
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         let actual = fs::read_to_string(cwd.join("actual-args")).unwrap();
         assert_eq!(actual, format!("{}\nsrc/lib.rs\n", expected.join("\n")));
-        assert!(actual.contains("--remap-path-prefix=C:\\reg\\src\\pkg\\=/cargo/registry/pkg/\n"));
+        assert!(
+            actual.contains(
+                "--remap-path-prefix=C:\\reg\\src\\pkg\\=/kache/.cargo/registry/src/pkg/\n"
+            )
+        );
     }
 }

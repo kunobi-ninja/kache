@@ -22767,7 +22767,7 @@ fn registry_source_separators_agree_only_without_build_script() {
         hasher.update(folded.as_bytes());
         hasher.update(b"\n");
         if namespace {
-            fold_field(&mut hasher, b"host_neutral_sources.v1:", b"1");
+            fold_field(&mut hasher, b"host_neutral_sources.v2:", b"1");
         }
         hasher.finalize()
     };
@@ -22806,7 +22806,7 @@ fn registry_source_separators_agree_only_without_build_script() {
         let (from, to) = body.split_once('=').unwrap();
         assert!(from.contains('\\') && from.ends_with('\\'), "{arg}");
         assert!(
-            to.starts_with("/cargo/registry/") && to.ends_with('/'),
+            to.starts_with("/kache/.cargo/registry/src/") && to.ends_with('/'),
             "{arg}"
         );
         assert!(!to.contains('\\') && !to.contains("lib.rs"), "{arg}");
@@ -22842,7 +22842,8 @@ fn registry_source_separators_agree_only_without_build_script() {
         "--remap-path-prefix=noseparator".to_string(),
         "--cfg=foo".to_string(),
     ];
-    let registry_flag = ["--remap-path-prefix=C:\\reg\\src\\=/cargo/registry/".to_string()];
+    let registry_flag =
+        ["--remap-path-prefix=C:\\reg\\src\\=/kache/.cargo/registry/src/".to_string()];
     let listed = host_neutral_remap_list(base.clone(), &registry_flag);
     assert_eq!(
         listed,
@@ -22855,7 +22856,7 @@ fn registry_source_separators_agree_only_without_build_script() {
             "--remap-path-prefix=/rustc/abc=/somewhere".to_string(),
             "--remap-path-prefix=noseparator".to_string(),
             "--cfg=foo".to_string(),
-            "--remap-path-prefix=C:\\reg\\src\\=/cargo/registry/".to_string(),
+            "--remap-path-prefix=C:\\reg\\src\\=/kache/.cargo/registry/src/".to_string(),
         ]
     );
     assert_eq!(
@@ -22877,7 +22878,7 @@ fn registry_source_separators_agree_only_without_build_script() {
     let mut args = RustcArgs::default();
     args.crate_name = Some("memchr".to_string());
     args.source_file = Some(PathBuf::from("lib.rs"));
-    let plan = vec!["--remap-path-prefix=a/=/cargo/registry/a/".to_string()];
+    let plan = vec!["--remap-path-prefix=a/=/kache/.cargo/registry/src/a/".to_string()];
     publish_host_neutral_decision(&args, Some(plan.clone()));
     assert_eq!(
         take_host_neutral_decision(&args),
@@ -22949,7 +22950,11 @@ fn registry_source_separators_agree_only_without_build_script() {
     publish_host_neutral_plan(&args, false, Some(&reg_root), &clean_sources);
     match take_host_neutral_decision(&args) {
         HostNeutralDecision::Remaps(published) => {
-            assert!(published.iter().all(|arg| arg.contains("/cargo/registry/")));
+            assert!(
+                published
+                    .iter()
+                    .all(|arg| arg.contains("/kache/.cargo/registry/src/"))
+            );
             assert!(!published.is_empty());
         }
         other => panic!("expected remaps, got {other:?}"),
@@ -23023,7 +23028,7 @@ fn a_compile_first_registry_unit_keys_like_a_key_first_one() {
             "--remap-path-prefix={}{sep}{}={}",
             registry.display(),
             dir.replace('/', std::path::MAIN_SEPARATOR_STR),
-            format_args!("/cargo/registry/{dir}"),
+            format_args!("/kache/.cargo/registry/src/{dir}"),
             sep = std::path::MAIN_SEPARATOR,
         );
         assert!(remaps.contains(&remap), "{remap}: {remaps:?}");

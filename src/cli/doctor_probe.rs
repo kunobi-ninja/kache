@@ -23,7 +23,11 @@ pub(super) fn check() -> Check {
 
 fn probe() -> Result<()> {
     let fixture = tempfile::Builder::new().prefix("kache-doctor-").tempdir()?;
-    let root = fixture.path();
+    // The canonical spelling, as the compiler's working directory reads: a
+    // source named through a symlinked temp dir (`/tmp` on macOS) would keep
+    // its raw path, and kache does not store an output that names its
+    // checkout.
+    let root = &fixture.path().canonicalize()?;
     let cache = root.join("cache");
     let output = root.join("target/debug/deps");
     fs::create_dir_all(&output)?;

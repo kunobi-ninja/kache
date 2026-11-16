@@ -779,22 +779,23 @@ impl AdaptiveUnit {
         self.link_in_flight_record() && crate::atomic::fsync_dir(&self.unit_dir).is_ok()
     }
 
-    /// Publish the in-flight record and flush it on another thread.
-    #[cfg(unix)]
+    /// Publish the in-flight record and flush it on another thread. Other
+    /// platforms store it durably first.
     fn publish_in_flight_record_unflushed(&self) -> Option<std::thread::JoinHandle<bool>> {
-        if unsafe_file(&self.state_path) || !self.link_in_flight_record() {
-            return None;
+        #[cfg(not(unix))]
+        return self
+            .store_state(&self.in_flight_marker(), true)
+            .then(|| std::thread::spawn(|| true));
+        #[cfg(unix)]
+        {
+            if unsafe_file(&self.state_path) || !self.link_in_flight_record() {
+                return None;
+            }
+            let unit_dir = self.unit_dir.clone();
+            Some(std::thread::spawn(move || {
+                crate::atomic::fsync_dir(&unit_dir).is_ok()
+            }))
         }
-        let unit_dir = self.unit_dir.clone();
-        Some(std::thread::spawn(move || {
-            crate::atomic::fsync_dir(&unit_dir).is_ok()
-        }))
-    }
-
-    #[cfg(not(unix))]
-    fn publish_in_flight_record_unflushed(&self) -> Option<std::thread::JoinHandle<bool>> {
-        self.store_state(&self.in_flight_marker(), true)
-            .then(|| std::thread::spawn(|| true))
     }
 
     /// Marker data was flushed when created, so only its directory entry

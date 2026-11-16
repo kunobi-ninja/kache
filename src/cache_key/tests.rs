@@ -23301,3 +23301,19 @@ fn an_invocation_starts_without_an_earlier_compile_record() {
     assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
     record_compiled_remaps(&args, None);
 }
+
+#[test]
+fn a_compile_record_belongs_to_one_crate_and_source() {
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("owner".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    let _scope = InvocationKeyScope::enter();
+    record_compiled_remaps(&args, Some(vec!["x".to_string()]));
+    let mut other_source = args.clone();
+    other_source.source_file = Some(PathBuf::from("main.rs"));
+    let mut other_crate = args.clone();
+    other_crate.crate_name = Some("other".to_string());
+    assert_eq!(compiled_remaps(&other_source), None);
+    assert_eq!(compiled_remaps(&other_crate), None);
+    assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
+}

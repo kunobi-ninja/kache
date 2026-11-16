@@ -5112,7 +5112,18 @@ fn run_parsed_rustc(
     // A Windows executable finds its `.pdb` by the GUID, age and name it
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
-    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
+    // A proc macro can write the checkout path into generated code where the
+    // key cannot see it (kunobi-ninja/kache#1914).
+    let key_binds_manifest_dir =
+        crate::embedded_checkout::key_binds_manifest_dir(key_outputs.env_deps.as_ref());
+    let names_checkout = || {
+        crate::embedded_checkout::embedded_checkout_reason(
+            args,
+            &result.artifacts,
+            key_binds_manifest_dir,
+        )
+    };
+    if let Some(reason) = unaudited.or(degraded).or(unpaired).or_else(names_checkout) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(

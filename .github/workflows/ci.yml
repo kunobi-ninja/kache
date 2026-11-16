@@ -746,12 +746,12 @@ jobs:
   # (`--version`, `--dryrun` host discovery), dependency queries (`-M`),
   # and `-c` compiles are all host-side. This is the only lane that
   # exercises the nvcc adapter against genuine driver behavior (#1024).
-  # The distro codename is detected at runtime (not pinned) so the job
-  # survives `ubuntu-latest` image flips; the adapter itself is
-  # version-agnostic, CUDA is pinned to the mature 12.8 branch.
+  # CUDA is pinned to the mature 12.8 branch, which NVIDIA publishes for
+  # Ubuntu 24.04 but not 26.04, so the hosted runner is pinned too. The
+  # distro is still read at runtime for the repository URL.
   cuda-toolkit:
     name: CUDA toolkit (nvcc)
-    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-24.04"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     timeout-minutes: 40

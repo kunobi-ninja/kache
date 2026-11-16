@@ -22941,26 +22941,6 @@ fn registry_source_separators_agree_only_without_build_script() {
         take_host_neutral_decision(&args),
         HostNeutralDecision::Unknown
     );
-    publish_host_neutral_decision(&args, Some(plan.clone()));
-    publish_host_neutral_plan(&args, true, Some(&reg_root), None, &clean_sources);
-    assert_eq!(
-        take_host_neutral_decision(&args),
-        HostNeutralDecision::Remaps(plan)
-    );
-    publish_host_neutral_plan(&args, false, Some(&reg_root), None, &clean_sources);
-    match take_host_neutral_decision(&args) {
-        HostNeutralDecision::Remaps(published) => {
-            assert!(
-                published
-                    .iter()
-                    .all(|arg| arg.contains("/kache/.cargo/registry/src/"))
-            );
-            assert!(!published.is_empty());
-        }
-        other => panic!("expected remaps, got {other:?}"),
-    }
-    publish_host_neutral_plan(&args, false, None, None, &[]);
-    assert_eq!(take_host_neutral_decision(&args), HostNeutralDecision::Off);
     clear_host_neutral_decision();
 }
 
@@ -23245,4 +23225,62 @@ fn a_registry_unit_outside_the_neutral_closure_keys_alike_in_both_lanes() {
         compute_cache_key(&args, &hasher, &normalizer, &env).unwrap(),
         key_first
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_package_that_cannot_be_walked_keys_without_remaps_in_both_lanes() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanelocked".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+    let walked = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+
+    let locked = package.join("tests/data");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env);
+    let decision = take_host_neutral_decision(&args);
+    let compiled = take_execute_remaps(&args, false);
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), package.join("src/inner/mod.rs")],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let emitted = compute_cache_key(&args, &hasher, &normalizer, &env);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(decision, HostNeutralDecision::Off);
+    assert_eq!(compiled, None);
+    let key_first = key_first.unwrap();
+    assert_eq!(emitted.unwrap(), key_first);
+    assert_ne!(key_first, walked);
 }

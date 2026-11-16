@@ -2467,6 +2467,27 @@ mod tests {
                 "get_many serves a row from this boot"
             );
         });
+        fh.db()
+            .execute(
+                "UPDATE file_hashes SET updated_at = '2026-11-07 13:15:39'",
+                [],
+            )
+            .unwrap();
+        with_boot_time_for_tests(boot, || {
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row stamped in the boot second is served"
+            );
+            assert_eq!(
+                fh.get_many(&[&stamp])
+                    .unwrap()
+                    .get(&stamp.path)
+                    .map(String::as_str),
+                Some("readafterboot"),
+                "get_many serves a row stamped in the boot second"
+            );
+        });
     }
 
     #[test]

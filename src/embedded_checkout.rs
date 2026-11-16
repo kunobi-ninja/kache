@@ -38,14 +38,7 @@ pub(crate) fn embedded_checkout_reason(
         return None;
     }
     let manifest_dir = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
-    let mut checkout = spellings(Path::new(&manifest_dir));
-    if let Some(root) = args.path_normalization_root() {
-        for spelling in spellings(root) {
-            if !checkout.contains(&spelling) {
-                checkout.push(spelling);
-            }
-        }
-    }
+    let checkout = checkout_spellings(Path::new(&manifest_dir), args.path_normalization_root());
     let target = args
         .target_dir()
         .map(|dir| spellings(&dir))
@@ -83,6 +76,18 @@ pub(crate) fn embedded_checkout_reason(
         }
     }
     None
+}
+
+/// The spellings of the manifest dir and, when it differs, the workspace
+/// root, which a member's proc macro can embed without its manifest dir.
+fn checkout_spellings(manifest_dir: &Path, workspace_root: Option<&Path>) -> Vec<Vec<u8>> {
+    let mut checkout = spellings(manifest_dir);
+    for spelling in workspace_root.map(spellings).unwrap_or_default() {
+        if !checkout.contains(&spelling) {
+            checkout.push(spelling);
+        }
+    }
+    checkout
 }
 
 /// Whether the key holds `CARGO_MANIFEST_DIR` by value: rustc reported it as
@@ -397,5 +402,16 @@ mod tests {
         assert!(!key_binds_manifest_dir(Some(&deps)));
         deps.insert("CARGO_MANIFEST_DIR".to_string(), "h".to_string());
         assert!(key_binds_manifest_dir(Some(&deps)));
+    }
+
+    #[test]
+    fn the_workspace_root_is_searched_once_beside_the_member() {
+        let member = Path::new("/w/root/member");
+        let root = Path::new("/w/root");
+        let both = checkout_spellings(member, Some(root));
+        assert!(both.contains(&b"/w/root/member".to_vec()));
+        assert!(both.contains(&b"/w/root".to_vec()));
+        assert_eq!(checkout_spellings(member, None), spellings(member));
+        assert_eq!(checkout_spellings(member, Some(member)), spellings(member));
     }
 }

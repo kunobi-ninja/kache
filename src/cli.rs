@@ -9225,7 +9225,8 @@ async fn sync_with_client(
             // Bounded concurrency: wait for a slot
             while in_flight.len() >= max_concurrent {
                 use futures::StreamExt;
-                in_flight.next().await;
+                let finished = in_flight.next().await;
+                debug_assert!(finished.is_some(), "sync transfer wait made no progress");
                 eprint!(
                     "\r  Downloading: {}/{}",
                     ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -9322,7 +9323,8 @@ async fn sync_with_client(
         for (key, crate_name) in to_push {
             while in_flight.len() >= max_concurrent {
                 use futures::StreamExt;
-                in_flight.next().await;
+                let finished = in_flight.next().await;
+                debug_assert!(finished.is_some(), "sync transfer wait made no progress");
                 eprint!(
                     "\r  Uploading: {}/{}",
                     ok.load(std::sync::atomic::Ordering::Relaxed)

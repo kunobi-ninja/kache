@@ -114,19 +114,25 @@ impl<K: Eq + Hash + Clone, V: Clone> NextFlight<K, V> {
             // Only a running walk ends a wait: with none, nothing would wake us.
             debug_assert!(state.running, "waiting with no walk running");
             #[cfg(test)]
-            {
-                state.parked += 1;
-            }
+            park(&mut state);
             state = slot
                 .finished
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
             #[cfg(test)]
-            {
-                state.parked -= 1;
-            }
+            unpark(&mut state);
         }
     }
+}
+
+#[cfg(test)]
+fn park<V>(state: &mut SlotState<V>) {
+    state.parked += 1;
+}
+
+#[cfg(test)]
+fn unpark<V>(state: &mut SlotState<V>) {
+    state.parked -= 1;
 }
 
 /// Leaves the slot however the call ends.

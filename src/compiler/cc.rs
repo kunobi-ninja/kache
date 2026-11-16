@@ -5691,6 +5691,18 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
 struct CcShadowingNames {
     names: std::collections::BTreeSet<PathBuf>,
     probes: Vec<CcProbedHeader>,
+    /// Each read input relative to every user directory above it: the
+    /// names an include through the search path can have used to reach it.
+    reached_as: std::collections::BTreeSet<PathBuf>,
+    /// A read header has an include whose name the scan cannot place.
+    unplaced: bool,
+    /// Read inputs that use `#include_next` or `__has_include_next`.
+    searches_next: Vec<PathBuf>,
+    /// A command-line definition names `__has_include_next`, for a use no
+    /// scan places.
+    definitions_search_next: bool,
+    /// The read inputs, absolute, for the slower operand check.
+    read_inputs: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -5721,11 +5733,17 @@ struct CcShadowingDerivation {
     probes: std::collections::BTreeMap<String, Vec<CcHeaderProbe>>,
     /// Probes in the command-line definitions.
     arguments: Vec<CcHeaderProbe>,
+    /// Contents using `#include_next` or `__has_include_next`.
+    searches_next: std::collections::BTreeSet<String>,
+    /// Contents with an include operand the scan cannot place.
+    unplaced: std::collections::BTreeSet<String>,
+    /// The command-line definitions use `__has_include_next`.
+    arguments_search_next: bool,
 }
 
 /// Bump when alias, paste or probe resolution changes what a scan derives.
 /// The release version is folded in as well.
-const CC_SHADOWING_DERIVATION: &[u8] = b"cc-shadowing-derivation-v1";
+const CC_SHADOWING_DERIVATION: &[u8] = b"cc-shadowing-derivation-v2";
 
 /// Identity of a derivation's inputs. Sorted, because aliases, the paste
 /// check and each header's probes depend on which bytes were read, not on
@@ -5812,8 +5830,22 @@ fn cc_shadowing_names_reusing(
             true,
         ),
     };
-    let mut result = CcShadowingNames::default();
+    let mut result = CcShadowingNames {
+        definitions_search_next: derivation.arguments_search_next,
+        ..CcShadowingNames::default()
+    };
     for (absolute, content) in read_inputs.iter().zip(&contents) {
+        for dir in &dirs {
+            if let Ok(relative) = absolute.strip_prefix(dir) {
+                result.reached_as.insert(relative.to_path_buf());
+            }
+        }
+        if derivation.unplaced.contains(content) {
+            result.unplaced = true;
+        }
+        if derivation.searches_next.contains(content) {
+            result.searches_next.push(absolute.clone());
+        }
         // Keep the ordinary shadowing names as before: the most specific
         // relative path and the basename can both be used by an include.
         if let Some(relative) = dirs
@@ -5844,6 +5876,7 @@ fn cc_shadowing_names_reusing(
             });
         }
     }
+    result.read_inputs = read_inputs;
     let fresh = fresh
         .then(|| serde_json::to_string(&derivation))
         .transpose()?;
@@ -5905,6 +5938,18 @@ fn cc_derive_shadowing(
     let arguments = cc_resolve_header_probes(&argument_scan, &aliases)
         .context("cc: unresolved header availability probe in command-line definitions")?;
     let mut probes = std::collections::BTreeMap::new();
+    let mut searches_next = std::collections::BTreeSet::new();
+    let mut unplaced = std::collections::BTreeSet::new();
+    for (content, scan) in &scans {
+        if let Some(scan) = scan.as_ref().as_ref() {
+            if scan.searches_next {
+                searches_next.insert(content.clone());
+            }
+            if scan.unplaced_include {
+                unplaced.insert(content.clone());
+            }
+        }
+    }
     for (input, (content, scan)) in read_inputs.iter().zip(&scans) {
         let resolved = scan
             .as_ref()
@@ -5925,6 +5970,9 @@ fn cc_derive_shadowing(
         inputs: digest,
         probes,
         arguments,
+        searches_next,
+        unplaced,
+        arguments_search_next: argument_scan.searches_next,
     })
 }
 
@@ -6082,7 +6130,8 @@ struct CcParsedScans {
 
 /// 7: repeated uses without a probe, and repeated conditionals, are kept once.
 /// 8: macro definitions are stored apart, by name.
-const CC_HEADER_SCAN_VERSION: i64 = 8;
+/// 9: include operands and the includes the search order can redirect.
+const CC_HEADER_SCAN_VERSION: i64 = 9;
 const CC_PARSED_SCANS_WEIGHT: usize = 64 << 20;
 static CC_PARSED_SCANS: std::sync::LazyLock<std::sync::Mutex<CcParsedScans>> =
     std::sync::LazyLock::new(Default::default);
@@ -6205,6 +6254,9 @@ fn cc_stored_header_scan(
         conditionals: &scan.conditionals,
         pastes: &scan.pastes,
         paste_forwarders: &scan.paste_forwarders,
+        includes: &scan.includes,
+        searches_next: scan.searches_next,
+        unplaced_include: scan.unplaced_include,
     };
     Ok((serde_json::to_string(&Some(core))?, macros))
 }
@@ -6239,6 +6291,9 @@ struct CcHeaderProbeScanCore<'a> {
     conditionals: &'a [CcHeaderMacroUse],
     pastes: &'a [(String, String)],
     paste_forwarders: &'a [CcHeaderPasteForwarder],
+    includes: &'a [(String, bool)],
+    searches_next: bool,
+    unplaced_include: bool,
 }
 
 /// Estimated memory of one held scan: parsed vectors and the key cost more
@@ -6302,6 +6357,18 @@ struct CcHeaderProbeScan {
     conditionals: Vec<CcHeaderMacroUse>,
     pastes: Vec<(String, String)>,
     paste_forwarders: Vec<CcHeaderPasteForwarder>,
+    /// Literal `#include`/`#import` operands: the name and whether a lookup
+    /// starts beside the includer (quoted, and not `_next`).
+    #[serde(default)]
+    includes: Vec<(String, bool)>,
+    /// `#include_next` or `__has_include_next`: resolution continues after
+    /// the directory the header was found in.
+    #[serde(default)]
+    searches_next: bool,
+    /// An include whose name the scan cannot place: a computed operand, or
+    /// one with a `..` component.
+    #[serde(default)]
+    unplaced_include: bool,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -6795,7 +6862,27 @@ fn cc_header_probe_scan(text: &[u8]) -> Option<CcHeaderProbeScan> {
         .retain(|(name, probe)| probe.is_some() || bare.insert(name.clone()));
     scan.conditionals.sort();
     scan.conditionals.dedup();
+    scan.includes.sort();
+    scan.includes.dedup();
     Some(scan)
+}
+
+/// The name and quoting of a literal include operand, from the directive's
+/// text after `include`. `None` for a computed operand.
+fn cc_include_operand(operand: &[u8]) -> Option<(String, bool)> {
+    let (close, quoted) = match operand.first()? {
+        b'"' => (b'"', true),
+        b'<' => (b'>', false),
+        _ => return None,
+    };
+    let end = memchr::memchr(close, &operand[1..])?;
+    let name = String::from_utf8_lossy(&operand[1..=end]).into_owned();
+    (!name.is_empty()).then_some((name, quoted))
+}
+
+/// Whether a path, spelled with either separator, steps up a directory.
+fn cc_path_has_parent_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|part| part == "..")
 }
 
 fn cc_scan_header_probe_line(
@@ -6814,6 +6901,29 @@ fn cc_scan_header_probe_line(
         _ => 0,
     };
     let directive = &tokens[offset..];
+    // Wherever it appears, an alias or a probe may use it.
+    scan.searches_next |= tokens.contains(&b"__has_include_next".as_slice());
+    if offset != 0
+        && let Some(kind) = directive.first()
+        && matches!(
+            *kind,
+            b"include" | b"include_next" | b"import" | b"import_next"
+        )
+    {
+        let next = kind.ends_with(b"_next");
+        scan.searches_next |= next;
+        match spans
+            .get(offset + 1)
+            .and_then(|first| cc_include_operand(&text[first.start..spans[spans.len() - 1].end]))
+        {
+            // `#include_next "x.h"` continues the search path; it never
+            // looks beside its includer first.
+            Some((name, quoted)) if !cc_path_has_parent_component(&name) => {
+                scan.includes.push((name, quoted && !next))
+            }
+            _ => scan.unplaced_include = true,
+        }
+    }
     let definition = offset != 0 && directive.first() == Some(&b"define".as_slice());
     if offset != 0 && matches!(directive.first(), Some(&b"ifdef" | &b"ifndef" | &b"undef")) {
         return Some(());
@@ -7060,6 +7170,7 @@ fn cc_skip_probe_trivia(text: &[u8], mut i: usize) -> usize {
 
 /// Digest where each of `names` is first provided in the include search
 /// order, read from the directories as they are now.
+#[cfg(test)]
 fn digest_cc_shadowing_names(parsed: &CcArgs, names: &CcShadowingNames) -> Result<String> {
     digest_cc_shadowing_names_stamped(parsed, names, None).map(|(digest, _)| digest)
 }
@@ -7073,13 +7184,23 @@ fn digest_cc_shadowing_names_stamped(
     names: &CcShadowingNames,
     file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
 ) -> Result<(String, Option<CcListingStamps>)> {
+    digest_cc_shadowing_names_listing(parsed, names, file_hasher, CcDirectoryListings::default())
+}
+
+/// [`digest_cc_shadowing_names_stamped`], adding to `listings` read earlier
+/// for the same key, whose stamps are returned with the rest.
+fn digest_cc_shadowing_names_listing(
+    parsed: &CcArgs,
+    names: &CcShadowingNames,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+    mut listings: CcDirectoryListings,
+) -> Result<(String, Option<CcListingStamps>)> {
     let cwd = parsed
         .invocation_env
         .cwd()
         .context("cc invocation has no working directory")?;
     let dirs = cc_user_include_dirs(parsed, cwd);
     let mut hasher = blake3::Hasher::new();
-    let mut listings = CcDirectoryListings::default();
     for name in &names.names {
         hasher.update(name.as_os_str().as_encoded_bytes());
         hasher.update(b"\x1f");
@@ -7396,12 +7517,27 @@ impl CcDirectoryListings {
         }
         let slot = &mut self.by_position[position];
         if slot.is_none() {
-            *slot = Some(CcStampedListing::read(directory)?);
+            // A listing read by path for the same key, such as by the `-I`
+            // order check, moves here rather than being read again.
+            *slot = Some(match self.listings.remove(directory) {
+                Some(listing) => listing,
+                None => CcStampedListing::read(directory)?,
+            });
         }
         match slot.as_ref().and_then(|stamped| stamped.listing.as_ref()) {
             Some(listing) => listing.provides(directory, file_name),
             None => Ok(false),
         }
+    }
+
+    /// These listings keyed by path, `dirs` being what `by_position` indexes.
+    fn by_path(mut self, dirs: &[PathBuf]) -> Self {
+        for (slot, dir) in std::mem::take(&mut self.by_position).into_iter().zip(dirs) {
+            if let Some(listing) = slot {
+                self.listings.insert(dir.clone(), listing);
+            }
+        }
+        self
     }
 
     /// Every directory listed so far with its stamp; `None` when any of them
@@ -7474,6 +7610,325 @@ fn digest_cc_include_dir_names_capped(parsed: &CcArgs, cap: usize) -> Result<Str
         hasher.update(b"enddir\n");
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// A compile whose adjacent `-I` operands can be keyed in a canonical order.
+///
+/// Build scripts that gather include directories in a hash set pass the same
+/// `-I` directories in a new order on every run. The key uses `canonical`,
+/// with each run of adjacent `-I` operands sorted by mapped path, whenever
+/// [`cc_include_order_free`] shows the order cannot change which file an
+/// include resolves to; otherwise it also folds `argv_order`.
+#[derive(Clone)]
+struct CcIncludeOrder {
+    canonical: CcArgs,
+    /// The distinct directories of the reordered runs.
+    run_dirs: Vec<PathBuf>,
+    /// The mapped run directories in argv order.
+    argv_order: Vec<u8>,
+}
+
+/// `None` when no run of two or more adjacent `-I` operands exists, or one
+/// cannot be reordered: a `..` component, `-I-`, a sysroot-relative or
+/// system directory, one directory spelled two ways, or `-I` operands this
+/// parse cannot place in the argv.
+fn cc_include_order(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Option<CcIncludeOrder> {
+    if parsed.family.dialect() != Dialect::Gnu {
+        return None;
+    }
+    let cwd = parsed.invocation_env.cwd()?;
+    let system = cc_system_include_dirs(parsed, cwd);
+    struct Include {
+        value: PathBuf,
+        dir: PathBuf,
+        mapped: Vec<u8>,
+    }
+    let mut segments: Vec<(&[String], Option<Include>)> = Vec::new();
+    let mut rest = parsed.rest.as_slice();
+    // An `-I` handed to a `-Xclang`-style flag belongs to it.
+    let mut forwarding = false;
+    while !rest.is_empty() {
+        let arg = parse_cc_arg_at(rest, 0, Dialect::Gnu);
+        let consumed = arg.as_ref().map_or(1, |arg| arg.consumed);
+        let (tokens, remaining) = rest.split_at(consumed);
+        let include = match arg {
+            Some(arg) if matches!(arg.spec.action, CcArgAction::Include) => {
+                if forwarding {
+                    return None;
+                }
+                let value = arg
+                    .value
+                    .filter(|value| !value.is_empty() && value != "-")?;
+                // `=dir` and `$SYSROOT/dir` are under the sysroot, not here.
+                if cc_path_has_parent_component(&value)
+                    || value.starts_with('=')
+                    || value.starts_with("$SYSROOT")
+                {
+                    return None;
+                }
+                let dir = absolutize_path(cwd, Path::new(&value));
+                let mapped = apply_cc_prefix_maps_to_bytes(
+                    dir.as_os_str().as_encoded_bytes().to_vec(),
+                    prefix_maps,
+                );
+                Some(Include {
+                    value: PathBuf::from(value),
+                    dir,
+                    mapped,
+                })
+            }
+            _ => None,
+        };
+        forwarding = tokens.len() == 1 && tokens[0].starts_with("-X") && !tokens[0].contains('=');
+        segments.push((tokens, include));
+        rest = remaining;
+    }
+    let found = segments.iter().filter(|(_, include)| include.is_some());
+    if found.count() != parsed.includes.len() {
+        return None;
+    }
+    let mut canonical_rest = Vec::with_capacity(parsed.rest.len());
+    let mut includes = Vec::with_capacity(parsed.includes.len());
+    let mut run_dirs: Vec<PathBuf> = Vec::new();
+    let mut spellings: Vec<(&PathBuf, &PathBuf)> = Vec::new();
+    let mut argv_order = Vec::new();
+    for group in segments.chunk_by(|a, b| a.1.is_some() && b.1.is_some()) {
+        let mut group = group.iter().collect::<Vec<_>>();
+        if group.len() >= 2 {
+            for (_, include) in &group {
+                let include = include.as_ref()?;
+                if cc_system_path(&include.dir.to_string_lossy())
+                    || system.iter().any(|root| include.dir.starts_with(root))
+                {
+                    return None;
+                }
+                argv_order.extend_from_slice(&(include.mapped.len() as u64).to_le_bytes());
+                argv_order.extend_from_slice(&include.mapped);
+                // The first spelling of a repeated directory is the one
+                // `__FILE__` and dependency output carry.
+                match spellings.iter().find(|(dir, _)| *dir == &include.dir) {
+                    Some((_, value)) if *value != &include.value => return None,
+                    Some(_) => {}
+                    None => {
+                        spellings.push((&include.dir, &include.value));
+                        run_dirs.push(include.dir.clone());
+                    }
+                }
+            }
+            group.sort_by(|a, b| {
+                let mapped = |segment: &(&[String], Option<Include>)| {
+                    segment.1.as_ref().map(|include| include.mapped.clone())
+                };
+                mapped(a).cmp(&mapped(b)).then_with(|| a.0.cmp(b.0))
+            });
+        }
+        for (tokens, include) in group {
+            canonical_rest.extend_from_slice(tokens);
+            includes.extend(include.as_ref().map(|include| include.value.clone()));
+        }
+    }
+    if run_dirs.is_empty() {
+        return None;
+    }
+    let mut canonical = parsed.clone();
+    canonical.rest = canonical_rest;
+    canonical.includes = includes;
+    Some(CcIncludeOrder {
+        canonical,
+        run_dirs,
+        argv_order,
+    })
+}
+
+/// How many run directories provide `name`. `listings` positions are the
+/// run directories' own.
+fn cc_run_providers(
+    run_dirs: &[PathBuf],
+    name: &Path,
+    listings: &mut CcDirectoryListings,
+) -> Result<usize> {
+    // `./x.h` names `x.h`; the top-level check below must not look up `.`.
+    let name = cc_lexically_normal(name);
+    let Some(file_name) = name.file_name() else {
+        return Ok(0);
+    };
+    let parent = name
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let first = name.components().next().map(|first| first.as_os_str());
+    let mut providers = 0;
+    for (position, dir) in run_dirs.iter().enumerate() {
+        let provided = match (parent, first) {
+            // Most nested names do not start at a run directory's top level;
+            // its listing answers that without joining a path.
+            (Some(parent), Some(first)) => {
+                listings.contains_at(position, dir, first)?
+                    && listings.contains(&dir.join(parent), file_name)?
+            }
+            _ => listings.contains_at(position, dir, file_name)?,
+        };
+        providers += usize::from(provided);
+    }
+    Ok(providers)
+}
+
+/// Whether reordering the `-I` runs keeps every include resolving to the same
+/// file: at most one run directory provides any name a search-path include
+/// can have used. Checked first against every name the read inputs can be
+/// reached by, which needs no scan; an operand the scan cannot place, or a
+/// name two directories provide, falls back to the include operands.
+fn cc_include_order_free(
+    parsed: &CcArgs,
+    order: &CcIncludeOrder,
+    names: &CcShadowingNames,
+    listings: &mut CcDirectoryListings,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+) -> Result<bool> {
+    // A symlink can stand for another run directory, and a file operand (a
+    // header map) can send a name anywhere.
+    for dir in &order.run_dirs {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            // An absent directory provides nothing; one appearing later
+            // changes the listing the store-time check compares.
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            _ => return Ok(false),
+        }
+    }
+    // `#include_next` continues after the directory its header was found
+    // in, which the order moves when that directory is in a run. From
+    // anywhere else it is an ordinary lookup of a read file.
+    if names.definitions_search_next
+        || names
+            .searches_next
+            .iter()
+            .any(|input| order.run_dirs.iter().any(|dir| input.starts_with(dir)))
+    {
+        return Ok(false);
+    }
+    if !names.unplaced {
+        let mut unique = true;
+        for name in names.names.iter().chain(&names.reached_as) {
+            if cc_run_providers(&order.run_dirs, name, listings)? > 1 {
+                unique = false;
+                break;
+            }
+        }
+        if unique {
+            return Ok(true);
+        }
+    }
+    cc_include_operands_free(parsed, order, names, listings, file_hasher)
+}
+
+/// The operand check: every include a read header makes through the search
+/// path names something at most one run directory provides. A quoted include
+/// whose file beside the includer was read never reached the search path.
+fn cc_include_operands_free(
+    parsed: &CcArgs,
+    order: &CcIncludeOrder,
+    names: &CcShadowingNames,
+    listings: &mut CcDirectoryListings,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+) -> Result<bool> {
+    let cwd = parsed
+        .invocation_env
+        .cwd()
+        .context("cc invocation has no working directory")?;
+    let sources = cc_absolute_sources(parsed, cwd);
+    let fallback;
+    let file_hasher = match file_hasher {
+        Some(file_hasher) => file_hasher,
+        None => {
+            fallback = crate::cache_key::FileHasher::new_for(&parsed.invocation_env);
+            &fallback
+        }
+    };
+    let scans = cc_parsed_header_scans(&names.read_inputs, &sources, file_hasher)?;
+    let read = names
+        .read_inputs
+        .iter()
+        .map(|path| cc_lexically_normal(path))
+        .collect::<HashSet<_>>();
+    for (input, (_, scan)) in names.read_inputs.iter().zip(&scans) {
+        let Some(scan) = scan.as_ref().as_ref() else {
+            return Ok(false);
+        };
+        if scan.unplaced_include {
+            return Ok(false);
+        }
+        for (operand, quoted) in &scan.includes {
+            let operand = Path::new(operand);
+            if operand.is_absolute() {
+                continue;
+            }
+            if *quoted
+                && input
+                    .parent()
+                    .is_some_and(|dir| read.contains(&cc_lexically_normal(&dir.join(operand))))
+            {
+                continue;
+            }
+            if cc_run_providers(&order.run_dirs, operand, listings)? > 1 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `path` without `.` components.
+fn cc_lexically_normal(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
+}
+
+/// The resolution digest folded into the key, with the `-I` order decided:
+/// the canonical order when it cannot matter, else the argv order folded in.
+/// Without an [`CcIncludeOrder`] this is [`digest_cc_shadowing_names_stamped`].
+fn digest_cc_resolution(
+    parsed: &CcArgs,
+    order: Option<&CcIncludeOrder>,
+    names: &CcShadowingNames,
+    file_hasher: Option<&crate::cache_key::FileHasher<'_>>,
+) -> Result<(String, Option<CcListingStamps>)> {
+    let Some(order) = order else {
+        return digest_cc_shadowing_names_stamped(parsed, names, file_hasher);
+    };
+    let mut run_listings = CcDirectoryListings::default();
+    let free = cc_include_order_free(parsed, order, names, &mut run_listings, file_hasher)?;
+    let listings = run_listings.by_path(&order.run_dirs);
+    let (digest, stamps) = digest_cc_shadowing_names_listing(
+        if free { &order.canonical } else { parsed },
+        names,
+        file_hasher,
+        listings,
+    )?;
+    Ok((cc_include_order_digest(order, free, &digest), stamps))
+}
+
+/// [`digest_cc_include_dir_names`] with the argv order of any `-I` run folded
+/// in: a walk proves nothing about which name an include used.
+fn digest_cc_walked_resolution(parsed: &CcArgs, order: Option<&CcIncludeOrder>) -> Result<String> {
+    let digest = digest_cc_include_dir_names(parsed)?;
+    Ok(match order {
+        Some(order) => cc_include_order_digest(order, false, &digest),
+        None => digest,
+    })
+}
+
+fn cc_include_order_digest(order: &CcIncludeOrder, free: bool, digest: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cc-include-order.v1\0");
+    if free {
+        hasher.update(b"free\0");
+    } else {
+        hasher.update(b"argv\0");
+        hasher.update(&order.argv_order);
+    }
+    hasher.update(digest.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn cc_user_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
@@ -7965,6 +8420,8 @@ struct PendingIncludeDirDigest {
     /// Stamps of the directories the digest listed, when all could vouch
     /// for their listing.
     stamps: Option<CcListingStamps>,
+    /// The `-I` order the digest decided on.
+    order: Option<CcIncludeOrder>,
 }
 
 fn named_tool_family(name: &str) -> Option<ToolFamily> {
@@ -8193,8 +8650,9 @@ impl CcCompiler {
         // against a different set of names than the key used would compare
         // two unrelated digests and refuse every store.
         let now = match &pending.names {
-            Some(names) => digest_cc_shadowing_names(parsed, names),
-            None => digest_cc_include_dir_names(parsed),
+            Some(names) => digest_cc_resolution(parsed, pending.order.as_ref(), names, None)
+                .map(|(digest, _)| digest),
+            None => digest_cc_walked_resolution(parsed, pending.order.as_ref()),
         };
         now.is_ok_and(|now| now == pending.digest)
     }
@@ -8548,6 +9006,11 @@ impl CcCompiler {
             );
         }
 
+        // Keyed in a canonical `-I` order; the resolution digest below folds
+        // the argv order back in whenever it can change what an include finds.
+        let order = cc_include_order(parsed, &prefix_maps);
+        let key_parsed = order.as_ref().map_or(parsed, |order| &order.canonical);
+
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
@@ -8617,12 +9080,12 @@ impl CcCompiler {
         // compiler identity) and the resolved invocation (`cc -###`,
         // the driver's fully-expanded `-cc1` line). One probe per build
         // per flag set; the rest of the build reads the record.
-        let config_args = parsed.config_args();
-        let probe_args = parsed.probe_args();
+        let config_args = key_parsed.config_args();
+        let probe_args = key_parsed.probe_args();
         // Per-TU paths to blank from the shared probe record's resolved
         // tokens, so the record is invariant across the build's TUs and
         // parallel builds don't race on whose paths it holds (#keyrace).
-        let per_tu_paths = cc_resolved_per_tu_paths(parsed);
+        let per_tu_paths = cc_resolved_per_tu_paths(key_parsed);
         let trace_probe = crate::phase_trace::phase("cc_probe");
         let resolved = crate::probe::probe_for(
             ctx.cache_dir,
@@ -8904,7 +9367,7 @@ impl CcCompiler {
         let memo_key = ctx
             .file_hasher
             .supports_cc_preprocess_memo()
-            .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
+            .then(|| cc_preprocess_memo_key(key_parsed, &prefix_maps, &resolved.version_line))
             .flatten();
         drop(trace_memo_key);
         // A content-matching read set is not enough: a formerly absent
@@ -8931,7 +9394,7 @@ impl CcCompiler {
                 };
                 let trace_names = crate::phase_trace::phase("cc_shadow_names");
                 let (names, derived) = cc_shadowing_names_reusing(
-                    parsed,
+                    key_parsed,
                     &inputs,
                     ctx.file_hasher,
                     stored.as_deref(),
@@ -8939,7 +9402,7 @@ impl CcCompiler {
                 drop(trace_names);
                 let _trace_digest = crate::phase_trace::phase("cc_shadow_digest");
                 let (resolution, stamps) =
-                    digest_cc_shadowing_names_stamped(parsed, &names, Some(ctx.file_hasher))?;
+                    digest_cc_resolution(parsed, order.as_ref(), &names, Some(ctx.file_hasher))?;
                 if resolution != expected_resolution {
                     return Ok(None);
                 }
@@ -9100,7 +9563,9 @@ impl CcCompiler {
             None => {
                 let derived = read_inputs
                     .as_deref()
-                    .map(|inputs| cc_shadowing_names_reusing(parsed, inputs, ctx.file_hasher, None))
+                    .map(|inputs| {
+                        cc_shadowing_names_reusing(key_parsed, inputs, ctx.file_hasher, None)
+                    })
                     .transpose()?;
                 let names = derived.map(|(names, derivation)| {
                     if let Some(pending) = self.pending_preprocess_memo.borrow_mut().as_mut() {
@@ -9110,14 +9575,19 @@ impl CcCompiler {
                 });
                 let (digest, stamps, mode) = match &names {
                     Some(names) => {
-                        let (digest, stamps) = digest_cc_shadowing_names_stamped(
+                        let (digest, stamps) = digest_cc_resolution(
                             parsed,
+                            order.as_ref(),
                             names,
                             Some(ctx.file_hasher),
                         )?;
                         (digest, stamps, "resolved")
                     }
-                    None => (digest_cc_include_dir_names(parsed)?, None, "walked"),
+                    None => (
+                        digest_cc_walked_resolution(parsed, order.as_ref())?,
+                        None,
+                        "walked",
+                    ),
                 };
                 (names, digest, stamps, mode)
             }
@@ -9133,6 +9603,7 @@ impl CcCompiler {
                 digest: include_dir_digest.clone(),
                 names,
                 stamps,
+                order,
             });
         hasher.update(b"include_dir_names:");
         hasher.update(include_dir_digest.as_bytes());

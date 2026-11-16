@@ -8376,6 +8376,7 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
             digest,
             names: Some(names),
             stamps,
+            order: None,
         }));
     assert!(compiler.include_dir_names_still_match(&parsed));
     fs::write(&target, "int value;\n").unwrap();
@@ -9074,6 +9075,7 @@ fn a_stamped_recheck_notices_a_header_added_after_the_key() {
                 digest,
                 names: Some(names.clone()),
                 stamps,
+                order: None,
             }));
         stamped
     };
@@ -11210,4 +11212,617 @@ fn a_captured_read_set_records_its_headers_but_not_its_source() {
         next.hash(&source).unwrap();
         assert_eq!(next.stats().cache_hits, 1, "the source's was not");
     }
+}
+
+/// Keys `unit.c` under the `-I` operands `dirs` and then `extra` (what
+/// precedes a `--` in `extra` goes before the run), from a
+/// captured read set, with a fixture compiler whose resolved invocation
+/// echoes its argv.
+#[cfg(unix)]
+fn key_with_include_order(
+    root: &Path,
+    dirs: &[&str],
+    extra: &[&str],
+    read: &[&str],
+) -> (String, CcCompiler, CcArgs) {
+    let (before, extra) = match extra.iter().position(|arg| *arg == "--") {
+        Some(split) => (&extra[..split], &extra[split + 1..]),
+        None => (&[][..], extra),
+    };
+    let program = root.join("cc");
+    if !program.exists() {
+        kache_fs::testutil::write_executable(
+            &program,
+            r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) shift; printf '"cc1"' >&2; for arg do printf ' "%s"' "$arg" >&2; done; printf '\n' >&2; exit 0 ;;
+esac
+exit 1
+"#,
+        );
+    }
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let mut argv = vec![program.to_string_lossy().into_owned(), "-c".into()];
+    argv.extend(before.iter().map(|arg| arg.to_string()));
+    argv.extend(dirs.iter().map(|dir| format!("-I{dir}")));
+    argv.extend(extra.iter().map(|arg| arg.to_string()));
+    argv.extend(["unit.c".into(), "-o".into(), "unit.o".into()]);
+    let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+    let maps = cc_prefix_maps(&parsed, &[]);
+    let hasher = crate::cache_key::FileHasher::new_for(&env);
+    let fingerprints = hasher
+        .cc_preprocess_fingerprints(
+            &read
+                .iter()
+                .map(|path| {
+                    let path = root.join(path);
+                    (cc_mapped_path(&path, &maps), path)
+                })
+                .collect::<Vec<_>>(),
+            &cc_prefix_maps_key(&maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .unwrap();
+    let compiler = CcCompiler::new().with_invocation_env(&env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    // Outside `root`, so keying leaves its listings settled.
+    let cache = tempfile::tempdir().unwrap();
+    let outcome = compiler
+        .cache_key_with(
+            &parsed,
+            &KeyCtx {
+                invocation_env: &env,
+                file_hasher: &hasher,
+                path_normalizer: &normalizer,
+                cache_dir: cache.path(),
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+                build_script_inputs_digest: None,
+            },
+            CcKeyDiscovery::Captured(CcCapturedInputs {
+                fingerprints,
+                path_bound: false,
+                inputs_changed: false,
+            }),
+        )
+        .unwrap();
+    let key = match outcome {
+        CcKeyOutcome::Key(key) => key,
+        CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+    };
+    (key, compiler, parsed)
+}
+
+#[cfg(unix)]
+#[test]
+fn reordered_include_dirs_share_a_key_only_when_order_cannot_matter() {
+    let _lock = crate::test_support::process_state_test_lock();
+    // (case, files, read set, extra args, order can matter)
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a [&'a str],
+        &'a [&'a str],
+        bool,
+    );
+    let cases: &[Case] = &[
+        (
+            "distinct names",
+            &[("unit.c", "#include <a.h>\n#include <b.h>\n")],
+            &["unit.c", "a/a.h", "b/b.h"],
+            &[],
+            false,
+        ),
+        (
+            "a looked-up name in two run directories",
+            &[("unit.c", "#include <a.h>\n"), ("b/a.h", "int b;\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "a nested name in two run directories",
+            &[
+                ("unit.c", "#include <sub/x.h>\n"),
+                ("a/sub/x.h", "int a;\n"),
+                ("b/sub/x.h", "int b;\n"),
+            ],
+            &["unit.c", "a/sub/x.h"],
+            &[],
+            true,
+        ),
+        (
+            "a nested name only one run directory has in full",
+            &[
+                ("unit.c", "#include <sub/x.h>\n"),
+                ("a/sub/x.h", "int a;\n"),
+                ("b/sub/y.h", "int b;\n"),
+            ],
+            &["unit.c", "a/sub/x.h"],
+            &[],
+            false,
+        ),
+        (
+            "a duplicate only included beside its includer",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#include \"p.h\"\n#include \"./q.h\"\n"),
+                ("a/p.h", "int a;\n"),
+                ("b/p.h", "int b;\n"),
+                ("a/q.h", "int a;\n"),
+                ("b/q.h", "int b;\n"),
+            ],
+            &["unit.c", "a/a.h", "a/p.h", "a/q.h"],
+            &[],
+            false,
+        ),
+        (
+            "a quoted duplicate not found beside its includer",
+            &[
+                ("unit.c", "#include \"p.h\"\n"),
+                ("a/p.h", "int a;\n"),
+                ("b/p.h", "int b;\n"),
+            ],
+            &["unit.c", "a/p.h"],
+            &[],
+            true,
+        ),
+        (
+            "#include_next in a run directory",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#include_next <b.h>\n"),
+            ],
+            &["unit.c", "a/a.h", "b/b.h"],
+            &[],
+            true,
+        ),
+        (
+            "__has_include_next in a run directory",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#if __has_include_next(<b.h>)\n#endif\n"),
+            ],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "#include_next outside every user directory",
+            &[
+                ("unit.c", "#include <s.h>\n#include <a.h>\n"),
+                ("s/s.h", "#include_next <s.h>\n"),
+            ],
+            &["unit.c", "s/s.h", "a/a.h"],
+            &["-isystem", "s"],
+            false,
+        ),
+        (
+            "a plain command-line definition",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-DPLAIN=1"],
+            false,
+        ),
+        (
+            "__has_include_next in a command-line definition",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-DNEXT=__has_include_next"],
+            true,
+        ),
+        (
+            "a quoted #include_next ahead of the run",
+            &[
+                ("unit.c", "#include <w.h>\n"),
+                ("p/w.h", "#include \"x.h\"\n#include_next \"x.h\"\n"),
+                ("p/x.h", "\n"),
+                ("a/x.h", "int a;\n"),
+                ("b/x.h", "int b;\n"),
+            ],
+            &["unit.c", "p/w.h", "p/x.h", "a/x.h"],
+            &["-Ip", "-DSEP=1", "--"],
+            true,
+        ),
+        (
+            "a ./ operand two run directories provide",
+            &[("unit.c", "#include <./a.h>\n"), ("b/a.h", "int b;\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "a computed include",
+            &[("unit.c", "#define H <a.h>\n#include H\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            true,
+        ),
+        (
+            "a parent-directory operand",
+            &[
+                ("unit.c", "#include <a.h>\n"),
+                ("a/a.h", "#include \"../c/c.h\"\n"),
+            ],
+            &["unit.c", "a/a.h", "c/c.h"],
+            &[],
+            true,
+        ),
+        (
+            "an absolute operand",
+            &[("unit.c", "#include <a.h>\n#include \"/nonexistent/p.h\"\n")],
+            &["unit.c", "a/a.h"],
+            &[],
+            false,
+        ),
+        (
+            "an absent run directory",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-Id"],
+            false,
+        ),
+        (
+            "a run directory below a file",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-Ia/a.h/sub"],
+            true,
+        ),
+    ];
+    for (case, files, read, extra, order_matters) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for (path, content) in [
+            ("a/a.h", "int a;\n"),
+            ("b/b.h", "int b;\n"),
+            ("c/c.h", "int c;\n"),
+        ]
+        .iter()
+        .chain(files.iter())
+        {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let key = |dirs: &[&str]| key_with_include_order(&root, dirs, extra, read).0;
+        let sorted = key(&["a", "b", "c"]);
+        assert_eq!(key(&["a", "b", "c"]), sorted, "{case}: unstable key");
+        assert_eq!(
+            key(&["b", "a", "c"]) != sorted,
+            *order_matters,
+            "{case}: order_matters={order_matters}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn include_order_keys_track_the_search_path_itself() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <a.h>\n"),
+        ("a/a.h", "int a;\n"),
+        ("b/b.h", "int b;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let read = ["unit.c", "a/a.h"];
+    let key = |dirs: &[&str]| key_with_include_order(&root, dirs, &[], &read).0;
+    // Two directories are the smallest run; a repeat is searched once.
+    assert_eq!(key(&["b", "a"]), key(&["a", "b"]));
+    assert_eq!(key(&["a", "b", "a"]), key(&["b", "a", "a"]));
+    // A different set of directories is a different search path.
+    assert_ne!(key(&["a"]), key(&["a", "b"]));
+    // The source's own directory in the run lists every subdirectory.
+    assert_eq!(key(&[".", "a"]), key(&["a", "."]));
+
+    // A symlinked run directory can stand for another one.
+    std::os::unix::fs::symlink(root.join("a"), root.join("l")).unwrap();
+    assert_ne!(key(&["l", "b"]), key(&["b", "l"]));
+    // So can a file operand, such as a header map.
+    fs::write(root.join("m"), "map").unwrap();
+    assert_ne!(key(&["m", "b"]), key(&["b", "m"]));
+
+    // A header appearing during the compile that would now shadow `a/a.h`
+    // under the argv order must stop the store.
+    let (_, compiler, parsed) = key_with_include_order(&root, &["b", "a"], &[], &read);
+    assert!(compiler.include_dir_names_still_match(&parsed));
+    fs::write(root.join("b/a.h"), "int shadow;\n").unwrap();
+    assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[test]
+fn include_order_sorts_only_adjacent_reorderable_operands() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().to_path_buf();
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(cwd.clone()),
+        None,
+        cwd.clone(),
+    );
+    let order = |args: &[&str]| {
+        let mut argv = vec!["cc", "-c"];
+        argv.extend(args);
+        argv.extend(["unit.c", "-o", "unit.o"]);
+        let parsed = CcArgs::parse_for(&s(&argv), &env).unwrap();
+        cc_include_order(&parsed, &cc_prefix_maps(&parsed, &[]))
+    };
+    let canonical = |args: &[&str]| {
+        let order = order(args).expect("reorderable");
+        (order.canonical.rest, order.canonical.includes)
+    };
+    let sorted = canonical(&["-Ia", "-Ib", "-DX", "-Ic"]);
+    assert_eq!(
+        sorted.0,
+        s(&["-c", "-Ia", "-Ib", "-DX", "-Ic", "unit.c", "-o", "unit.o"])
+    );
+    assert_eq!(sorted.1, ["a", "b", "c"].map(PathBuf::from));
+    assert_eq!(canonical(&["-Ib", "-Ia", "-DX", "-Ic"]), sorted);
+    let separate = canonical(&["-I", "b", "-I", "a"]);
+    assert_eq!(
+        separate.0,
+        s(&["-c", "-I", "a", "-I", "b", "unit.c", "-o", "unit.o"])
+    );
+    assert_eq!(separate.1, ["a", "b"].map(PathBuf::from));
+    assert_ne!(
+        order(&["-Ib", "-Ia"]).unwrap().argv_order,
+        order(&["-Ia", "-Ib"]).unwrap().argv_order
+    );
+    assert_eq!(order(&["-Ib", "-Ia", "-Ib"]).unwrap().run_dirs.len(), 2);
+    let spelled_twice = format!("-I{}", cwd.join("a").display());
+    for args in [
+        &["-Ia"][..],
+        &["-Ia", "-DX", "-Ib"],
+        &["-Ia", "-I../b"],
+        &["-Ia", "-I-"],
+        &["-Ia", "-Ib", "-isystem", "b"],
+        &["-Xclang", "-Ia", "-Ib"],
+        &["-Ia", &spelled_twice],
+        &["-Ia", "-I=b"],
+        &["-Ia", "-I$SYSROOT/b"],
+    ]
+    .into_iter()
+    // `/usr/include` is a system root only where it exists.
+    .chain(cfg!(unix).then_some(&["-Ia", "-I/usr/include"][..]))
+    {
+        assert!(order(args).is_none(), "{args:?} must keep its order");
+    }
+}
+
+#[test]
+fn include_operands_are_read_from_the_directive() {
+    let scan = |text: &str| cc_header_probe_scan(text.as_bytes()).unwrap();
+    let plain = scan("#include <a/b.h>\n# import \"c.h\" // note\n%:include \"d.h\"\n");
+    assert_eq!(
+        plain.includes,
+        [("a/b.h", false), ("c.h", true), ("d.h", true)].map(|(n, q)| (n.to_string(), q))
+    );
+    // `#include_next` never starts beside its includer.
+    assert_eq!(
+        scan("#include_next \"x.h\"\n").includes,
+        [("x.h".to_string(), false)]
+    );
+    assert!(!plain.searches_next && !plain.unplaced_include);
+    // Twice, so a toggled flag would read as unset.
+    assert!(scan("#include_next <a.h>\n#include_next <b.h>\n").searches_next);
+    assert!(
+        scan("#define N __has_include_next\n#if __has_include_next(<a.h>)\n#endif\n").searches_next
+    );
+    assert!(scan("#include H\n#include G\n").unplaced_include);
+    for unplaced in [
+        "#include H\n",
+        "#include <..\\a.h>\n",
+        "#include \"../a.h\"\n",
+        "#include <>\n",
+        "#include\n",
+    ] {
+        assert!(scan(unplaced).unplaced_include, "{unplaced:?}");
+    }
+}
+
+/// A memo recorded under one `-I` order answers the other, and only while
+/// the order cannot matter. The fixture compiler cannot preprocess, so a
+/// rejected memo fails the key.
+#[cfg(unix)]
+#[test]
+fn a_cc_memo_is_shared_across_include_orders_only_when_order_cannot_matter() {
+    use kache_store::file_hash::FileHashCache;
+
+    let _lock = crate::test_support::process_state_test_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <a.h>\n"),
+        ("a/a.h", "int a;\n"),
+        ("b/b.h", "int b;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let program = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) shift; printf '"cc1"' >&2; for arg do printf ' "%s"' "$arg" >&2; done; printf '\n' >&2; exit 0 ;;
+esac
+exit 1
+"#,
+    );
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let cache = FileHashCache::open(&root.join("index.db")).unwrap();
+    let hasher =
+        || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(cache.db()), &env);
+    let parse = |dirs: &[&str]| {
+        let mut argv = vec![program.to_string_lossy().into_owned(), "-c".into()];
+        argv.extend(dirs.iter().map(|dir| format!("-I{dir}")));
+        argv.extend(["unit.c".into(), "-o".into(), "unit.o".into()]);
+        CcArgs::parse_for(&argv, &env).unwrap()
+    };
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let key = |compiler: &CcCompiler, parsed: &CcArgs, discovery| -> Result<String> {
+        match compiler.cache_key_with(
+            parsed,
+            &KeyCtx {
+                invocation_env: &env,
+                file_hasher: &hasher(),
+                path_normalizer: &normalizer,
+                cache_dir: &root.join("cache"),
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+                build_script_inputs_digest: None,
+            },
+            discovery,
+        )? {
+            CcKeyOutcome::Key(key) => Ok(key),
+            CcKeyOutcome::Deferred(_) => panic!("a recorded memo must produce a key"),
+        }
+    };
+    let recorded = parse(&["a", "b"]);
+    let maps = cc_prefix_maps(&recorded, &[]);
+    let fingerprints = hasher()
+        .cc_preprocess_fingerprints(
+            &["unit.c", "a/a.h"].map(|path| {
+                let path = root.join(path);
+                (cc_mapped_path(&path, &maps), path)
+            }),
+            &cc_prefix_maps_key(&maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .unwrap();
+    let compiler = CcCompiler::new().with_invocation_env(&env);
+    let captured = key(
+        &compiler,
+        &recorded,
+        CcKeyDiscovery::Captured(CcCapturedInputs {
+            fingerprints,
+            path_bound: false,
+            inputs_changed: false,
+        }),
+    )
+    .unwrap();
+    compiler.commit_preprocess_memo(&hasher());
+
+    let reordered = parse(&["b", "a"]);
+    let lookup = CcCompiler::new().with_invocation_env(&env);
+    assert_eq!(
+        key(&lookup, &reordered, CcKeyDiscovery::Expansion).unwrap(),
+        captured
+    );
+    // `b/a.h` would win for `<a.h>` under `-Ib -Ia`, so the memo recorded
+    // under `-Ia -Ib` must not answer it.
+    fs::write(root.join("b/a.h"), "int shadow;\n").unwrap();
+    assert!(key(&lookup, &reordered, CcKeyDiscovery::Expansion).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn include_order_names_carry_what_the_order_check_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <x.h>\n"),
+        ("a/sub/x.h", "#include_next <x.h>\n"),
+        ("b/y.h", "#include H\n"),
+        ("b/z.h", "#include G\n"),
+        ("b/w.h", "int w;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let parsed = |args: &[&str]| {
+        let mut argv = vec!["cc", "-c", "-Ia", "-Ia/sub", "-Ib"];
+        argv.extend(args);
+        argv.extend(["unit.c", "-o", "unit.o"]);
+        CcArgs::parse_for(&s(&argv), &env).unwrap()
+    };
+    let names = |parsed: &CcArgs, read: &[&str]| {
+        let read = read.iter().map(|path| root.join(path)).collect::<Vec<_>>();
+        cc_shadowing_names(parsed, &read, &crate::cache_key::FileHasher::new_for(&env)).unwrap()
+    };
+    let plain = parsed(&[]);
+    let clean = names(&plain, &["unit.c", "b/w.h"]);
+    assert!(!clean.unplaced && clean.searches_next.is_empty());
+    assert!(!clean.definitions_search_next);
+    let all = names(&plain, &["unit.c", "a/sub/x.h", "b/y.h", "b/z.h"]);
+    assert!(all.unplaced);
+    assert_eq!(all.searches_next, [root.join("a/sub/x.h")]);
+    for reached in ["sub/x.h", "x.h", "y.h", "a/sub/x.h"] {
+        assert!(all.reached_as.contains(Path::new(reached)), "{reached}");
+    }
+    assert_eq!(all.read_inputs.len(), 4);
+    let defined = names(&parsed(&["-DN=__has_include_next"]), &["unit.c"]);
+    assert!(defined.definitions_search_next);
+
+    // The fast path answers from names alone: with the read inputs gone, the
+    // operand check could not run.
+    let order = cc_include_order(&plain, &cc_prefix_maps(&plain, &[])).unwrap();
+    let mut gone = clean.clone();
+    gone.read_inputs = vec![root.join("missing.h")];
+    let mut listings = CcDirectoryListings::default();
+    assert!(cc_include_order_free(&plain, &order, &gone, &mut listings, None).unwrap());
+    gone.unplaced = true;
+    assert!(cc_include_order_free(&plain, &order, &gone, &mut listings, None).is_err());
+}
+
+/// The store-time recheck trusts stamps only when they cover every directory
+/// the order check listed, nested ones included.
+#[cfg(unix)]
+#[test]
+fn include_order_stamps_cover_the_run_directories_it_listed() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    for (path, content) in [
+        ("unit.c", "#include <sub/x.h>\n"),
+        ("a/sub/x.h", "int a;\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    fs::create_dir_all(root.join("b/sub")).unwrap();
+    let read = ["unit.c", "a/sub/x.h"];
+    key_with_include_order(&root, &["b", "a"], &[], &read);
+    for dir in ["", "a", "b", "a/sub", "b/sub"] {
+        settle(&root.join(dir));
+    }
+    let (_, compiler, parsed) = key_with_include_order(&root, &["b", "a"], &[], &read);
+    let stamped = |dir: &str| {
+        let pending = compiler.pending_include_dir_digest.borrow();
+        let stamps = pending.as_ref().unwrap().stamps.as_ref().expect("settled");
+        stamps.iter().any(|(stamped, _)| stamped == &root.join(dir))
+    };
+    assert!(stamped("b/sub"), "the order check listed `b/sub`");
+    assert!(compiler.include_dir_names_still_match(&parsed));
+    fs::write(root.join("b/sub/x.h"), "int b;\n").unwrap();
+    assert!(!compiler.include_dir_names_still_match(&parsed));
 }

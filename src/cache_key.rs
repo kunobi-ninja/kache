@@ -289,6 +289,10 @@ mod apple_install_name;
 // `KACHE_RUSTC_PATH_NORMALIZE=0` still fold every prefix. Only the trybuild
 // `remap:none` bytes change, so a previous trybuild entry misses and every
 // other key stays valid.
+//
+// Keying adjacent cc `-I` operands in a canonical order needs no bump either.
+// A compile with such a run folds a new marker into its resolution digest, so
+// its earlier entries miss once; a compile without one keys as before.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

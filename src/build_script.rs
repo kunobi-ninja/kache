@@ -681,9 +681,12 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     };
     // Everything below writes into `OUT_DIR` itself.
     detach_out_dir(&run.environment.out_dir)?;
-    if let Some(prediction) = &prediction {
-        let key_start = std::time::Instant::now();
-        let key = run.action_key(prediction)?;
+    let key_start = std::time::Instant::now();
+    // A stored run Cargo would now rerun is a miss, so running the script
+    // records its current declarations.
+    if let Some(prediction) = &prediction
+        && let Some(key) = unless_rerun_every_build(run.action_key(prediction))?
+    {
         let key_ms = key_start.elapsed().as_millis() as u64;
         let lookup_start = std::time::Instant::now();
         let found = lookup_recorded_run(&run.store, readonly.as_ref(), &key)?;
@@ -864,6 +867,14 @@ fn stored_prediction(store: &Store, identity: &str) -> Result<Option<Prediction>
 
 /// A rejected restore whose outputs could not be removed cannot fall back to
 /// the real script. The marker survives extra context at either caller.
+/// `key`, or `None` when the script watches a path Cargo cannot stat.
+fn unless_rerun_every_build(key: Result<String>) -> Result<Option<String>> {
+    match key {
+        Err(error) if error.is::<inputs::RerunsEveryBuild>() => Ok(None),
+        key => key.map(Some),
+    }
+}
+
 fn cache_bypass_exit_code(error: &anyhow::Error) -> Option<i32> {
     error.is::<RestoreCleanupFailed>().then_some(1)
 }
@@ -1104,6 +1115,16 @@ impl Environment {
     fn within_target_dir(&self, path: &Path) -> bool {
         self.mappings.iter().any(|(root, placeholder)| {
             *placeholder == TARGET_DIR_PLACEHOLDER && path.starts_with(root)
+        })
+    }
+
+    /// Whether Cargo skips `path` as a watched input: it never checks one
+    /// below its home's `git` or `registry` directory, and compares the
+    /// spelling only.
+    fn cargo_never_checks(&self, path: &Path) -> bool {
+        self.spellings.iter().any(|(root, placeholder)| {
+            *placeholder == "${KACHE_CARGO_HOME}"
+                && (path.starts_with(root.join("git")) || path.starts_with(root.join("registry")))
         })
     }
 
@@ -3050,6 +3071,7 @@ mod tests {
         let root = dir.join("checkout");
         std::fs::create_dir_all(root.join("build")).unwrap();
         std::fs::create_dir_all(root.join("crate")).unwrap();
+        std::fs::write(root.join("crate/build.rs"), b"fn main() {}").unwrap();
         let mut config = crate::test_support::test_config(dir.join("cache"));
         config.path_only_env_vars.push("RUSTC_LINKER".into());
         let mut env = environment(&root.join("target/out"), &root.join("crate"));
@@ -4564,6 +4586,112 @@ mod tests {
         assert!(run.store.get(&key).unwrap().is_some());
         std::fs::write(common.join("refs/heads/topic"), "2222\n").unwrap();
         assert_ne!(key, run.action_key(&prediction).unwrap());
+    }
+
+    /// Cargo reruns a path package's script on every build while a path it
+    /// watches cannot be read, so such a run is neither recorded nor
+    /// replayed. A watched file that exists records as before.
+    #[test]
+    fn a_path_package_watching_a_missing_path_is_never_replayed() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let package = dir.as_path().join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("file"), "x").unwrap();
+        // `git` and `registry` are exempt only below the Cargo home.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(package.join("gone"), package.join("dangling")).unwrap();
+        let watched = ["absent", "file/below", "git/absent", "registry/absent"]
+            .into_iter()
+            .chain(cfg!(unix).then_some("dangling"));
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&dir.as_path().join("out"), &package),
+            start: std::time::Instant::now(),
+        };
+        std::fs::create_dir_all(&run.environment.out_dir).unwrap();
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        for path in watched {
+            let stdout = format!("cargo:rerun-if-changed={path}\n");
+            let error = run.record(stdout.as_bytes(), b"", 5, after).unwrap_err();
+            // Reading a path through a file already fails before the key.
+            assert!(
+                path == "file/below"
+                    || error.is::<inputs::RerunsEveryBuild>()
+                        && format!("{error:#}").contains("reruns this script on every build"),
+                "{path}: {error:#}"
+            );
+            assert!(run.prediction().unwrap().is_none(), "{path}");
+            // Nor does a run an earlier kache recorded.
+            let (inputs, env, default_package) =
+                parse_declarations(&stdout, &run.environment).unwrap();
+            let prediction = recorded_prediction(inputs, env, default_package, Vec::new(), false);
+            let error = run.action_key(&prediction).unwrap_err();
+            assert!(error.is::<inputs::RerunsEveryBuild>(), "{path}: {error:#}");
+        }
+        run.record(b"cargo:rerun-if-changed=file\n", b"", 5, after)
+            .unwrap();
+        let prediction = run.prediction().unwrap().unwrap();
+        assert!(
+            run.store
+                .get(&run.action_key(&prediction).unwrap())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Cargo never checks a watched path below its home's `git` or
+    /// `registry` directory, whichever package watches it, so a missing one
+    /// there is keyed as missing. Elsewhere it reruns the script every build.
+    #[test]
+    fn only_missing_paths_below_cargo_home_sources_are_recorded() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let cargo_home = dir.as_path().join("cargo");
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "aaaa".to_string(),
+            environment: checkout_environment(&dir.as_path().join("target"), &cargo_home),
+            start: std::time::Instant::now(),
+        };
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        for (watched, recorded) in [
+            (PathBuf::from("absent"), true),
+            (cargo_home.join("git/checkouts/y/absent"), true),
+            (cargo_home.join("config-absent"), false),
+            (dir.as_path().join("elsewhere/absent"), false),
+        ] {
+            let stdout = format!("cargo:rerun-if-changed={}\n", watched.display());
+            let result = run.record(stdout.as_bytes(), b"", 5, after);
+            assert_eq!(
+                result.is_ok(),
+                recorded,
+                "{}: {result:?}",
+                watched.display()
+            );
+        }
+        let prediction = run.prediction().unwrap().unwrap();
+        let key = run.action_key(&prediction).unwrap();
+        assert!(run.store.get(&key).unwrap().is_some());
+        std::fs::create_dir_all(cargo_home.join("git/checkouts/y")).unwrap();
+        std::fs::write(cargo_home.join("git/checkouts/y/absent"), "now").unwrap();
+        assert_ne!(key, run.action_key(&prediction).unwrap());
+    }
+
+    #[test]
+    fn only_a_rerun_every_build_key_is_a_miss() {
+        let rerun = inputs::RerunsEveryBuild(PathBuf::from("x"));
+        assert_eq!(unless_rerun_every_build(Err(rerun.into())).unwrap(), None);
+        assert_eq!(
+            unless_rerun_every_build(Ok("k".to_string())).unwrap(),
+            Some("k".to_string())
+        );
+        assert!(unless_rerun_every_build(Err(anyhow::anyhow!("other"))).is_err());
     }
 
     /// A result whose objects name registry sources restores in another
@@ -7820,6 +7948,51 @@ mod tests {
             }
         }
         found
+    }
+
+    /// A stored run that now watches a missing path is a miss, not a bypass:
+    /// the script runs and records what it watches now, which hits next time.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_run_watching_a_now_missing_path_rerecords_the_script() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        kache_fs::testutil::write_executable(
+            &fixture.script,
+            "#!/bin/sh\nset -e\nprintf x >> \"$1\"\nmode=$(cat \"$CARGO_MANIFEST_DIR/mode\")\nprintf \"$mode\" > \"$OUT_DIR/marker\"\necho cargo:rerun-if-changed=mode\nif [ \"$mode\" = a ]; then echo cargo:rerun-if-changed=optional; fi\n",
+        );
+        let set = |name: &str, contents: &str, at: i64| {
+            let path = fixture.package.join(name);
+            std::fs::write(&path, contents).unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(at, 0)).unwrap();
+        };
+        let (cache, config, out) = (root.join("cache"), root.join("k.toml"), root.join("out"));
+        write_reader_config(&config, &cache, None);
+        let mut build = || {
+            prepare_out(&out);
+            let code = run_reader(
+                &mut env,
+                &config,
+                &out,
+                &fixture.package,
+                &fixture.script,
+                &fixture.sentinel,
+            );
+            assert_eq!(code, 0, "{}", event_results(&cache).join(","));
+            (
+                std::fs::read_to_string(out.join("marker")).unwrap(),
+                std::fs::read_to_string(&fixture.sentinel).unwrap(),
+            )
+        };
+        set("mode", "a", 1_000_000_000);
+        set("optional", "o", 1_000_000_000);
+        assert_eq!(build(), ("a".into(), "x".into()));
+        set("mode", "b", 1_000_000_100);
+        std::fs::remove_file(fixture.package.join("optional")).unwrap();
+        assert_eq!(build(), ("b".into(), "xx".into()));
+        assert_eq!(build(), ("b".into(), "xx".into()), "the new run hits");
     }
 
     /// The entry is only in the read-only store. The reader restores it and

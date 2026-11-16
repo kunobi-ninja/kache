@@ -237,7 +237,9 @@ pub(super) fn run(
     };
     let below_target = cargo_out_dir.strip_prefix(&target)?.to_path_buf();
     let key_start = std::time::Instant::now();
-    let key = key(run, prediction, &below_target)?;
+    let Some(key) = super::unless_rerun_every_build(key(run, prediction, &below_target))? else {
+        return Ok(None);
+    };
     let key_ms = key_start.elapsed().as_millis() as u64;
     let sandbox = Sandbox::new(&run.config.cache_dir, &key, &below_target);
 

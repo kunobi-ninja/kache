@@ -4595,12 +4595,11 @@ mod tests {
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join("file"), "x").unwrap();
         // `git` and `registry` are exempt only below the Cargo home.
-        let mut watched = vec!["absent", "file/below", "git/absent", "registry/absent"];
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(package.join("gone"), package.join("dangling")).unwrap();
-            watched.push("dangling");
-        }
+        std::os::unix::fs::symlink(package.join("gone"), package.join("dangling")).unwrap();
+        let watched = ["absent", "file/below", "git/absent", "registry/absent"]
+            .into_iter()
+            .chain(cfg!(unix).then_some("dangling"));
         let config = crate::test_support::test_config(dir.as_path().join("cache"));
         let run = Run {
             store: Store::open(&config).unwrap(),

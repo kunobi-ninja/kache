@@ -136,11 +136,12 @@ The check has costs:
 
 The check does not see:
 
-- A directory a macro lists outside the workspace, through a symlinked
-  directory, or in a directory the project leaves out with
-  [`guard_exclude`](/docs/getting-started/configuration#tool-output-in-the-workspace),
-  that held no file the crate read when the record was made. A file added
-  there goes unseen.
+- A directory a macro lists outside the workspace, or through a symlinked
+  directory, that held no file the crate read when the record was made. A
+  file added there goes unseen.
+- Anything in a directory the project leaves out with
+  [`guard_exclude`](/docs/getting-started/configuration#tool-output-in-the-workspace).
+  Kache cannot check that nothing reads it while Rust compiles.
 - On Windows, a listed file removed and put back with its old size and
   modification time while the crate compiles. On Linux and macOS its new
   inode and change time show it.

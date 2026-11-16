@@ -7568,6 +7568,22 @@ fn guard_exclude_leaves_named_directories_out_of_the_workspace_guard() {
     std::fs::remove_dir_all(a.join("assets")).unwrap();
     write_file(&a.join("kt/node_modules"), "a file, not a directory");
     assert_ne!(digest(&a), shared, "only directories are left out");
+    std::fs::remove_file(a.join("kt/node_modules")).unwrap();
+    assert_eq!(digest(&a), shared);
+
+    // On a case-sensitive filesystem a differently cased directory is
+    // another directory; the guard leaves it out all the same.
+    write_file(&a.join("tools/Node_Modules/y.js"), "1");
+    let roots_a = roots_of(&a);
+    let cased = tree_guard_of(&hasher, || workspace_tree_digest(&roots_a, &hasher)).unwrap();
+    write_file(&a.join("tools/Node_Modules/y.js"), "2");
+    write_file(&a.join("tools/Node_Modules/z.js"), "");
+    assert!(cased.held(), "a differently cased name");
+    assert_eq!(
+        workspace_tree_digest(&roots_a, &hasher).unwrap(),
+        cased.digest,
+        "a differently cased name"
+    );
 }
 
 /// A closure that names a file in a left-out directory keeps no guard: a

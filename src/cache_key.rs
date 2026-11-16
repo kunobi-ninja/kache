@@ -957,7 +957,8 @@ struct WalkedRoot {
 }
 
 /// What a guard walk leaves out below its root: `paths`, and every
-/// directory named in `dir_names`. A symlink is never a directory here.
+/// directory named in `dir_names` ([`names_guard_excluded`]). A symlink is
+/// never a directory here.
 #[derive(Clone, Copy)]
 struct GuardSkips<'a> {
     paths: &'a [PathBuf],
@@ -970,9 +971,19 @@ impl GuardSkips<'_> {
             .iter()
             .any(|skipped| skipped.file_name() == path.file_name() && skipped == path)
             || (!self.dir_names.is_empty()
-                && self.dir_names.iter().any(|name| *name == entry.file_name())
+                && names_guard_excluded(&entry.file_name(), self.dir_names)
                 && entry.file_type().is_ok_and(|kind| kind.is_dir()))
     }
+}
+
+/// Is `name` one of `excluded`? Compared without ASCII case, as a
+/// case-insensitive filesystem would match it.
+fn names_guard_excluded(name: &OsStr, excluded: &[std::ffi::OsString]) -> bool {
+    excluded.iter().any(|excluded| {
+        excluded
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(name.as_encoded_bytes())
+    })
 }
 
 /// Why [`stamp_roots`] gave no stamps.
@@ -3368,10 +3379,10 @@ fn workspace_roots_in(
 /// at the workspace root. The file is part of the tree the guard digests, so
 /// two checkouts whose guards match leave out the same names.
 ///
-/// Leaving a directory out is the project's promise that no macro lists it,
-/// the way the guard already treats a directory outside the workspace: a
-/// closure that names a file there keeps no guard ([`guard_covers`]), but a
-/// file added to a directory a macro listed and found empty goes unseen.
+/// Leaving a directory out is the project's promise that nothing reads it
+/// while Rust compiles, which Kache cannot check. A closure that names a file
+/// there keeps no guard ([`guard_covers`]), but an unreported read there goes
+/// unseen.
 /// Empty when the file is missing or the setting is not a list of plain
 /// names, so the guard then reads the whole tree.
 fn workspace_guard_excluded(root: &Path) -> Vec<std::ffi::OsString> {
@@ -7861,9 +7872,8 @@ fn guard_place<'a>(
 /// Does a walk from `root` that follows no symlink reach the file at
 /// `below`, a lexical path inside `root`? With `skips_build_dirs`, not
 /// through a directory Cargo tagged as its build directory either, and never
-/// through one named in `excluded_dirs`, compared without ASCII case as a
-/// case-insensitive filesystem would. `entered` keeps the answer for each
-/// directory checked.
+/// through one named in `excluded_dirs` ([`names_guard_excluded`]).
+/// `entered` keeps the answer for each directory checked.
 fn walk_reaches(
     root: &Path,
     below: &str,
@@ -7890,10 +7900,7 @@ fn walk_reaches(
             directory.pop();
             continue;
         }
-        if excluded_dirs.iter().any(|name| {
-            name.as_encoded_bytes()
-                .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes())
-        }) {
+        if names_guard_excluded(component.as_os_str(), excluded_dirs) {
             return false;
         }
         directory.push(component);

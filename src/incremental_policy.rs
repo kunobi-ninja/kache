@@ -2910,6 +2910,12 @@ mod tests {
             write(unusable);
             assert!(unit.source_set_digest().is_none(), "{unusable:?}");
         }
+        // Only a missing file is skipped; any other open error gives up.
+        #[cfg(unix)]
+        {
+            write("out.d: src/lib.rs src/lib.rs/below\n");
+            assert!(unit.source_set_digest().is_none());
+        }
 
         // The budget on source bytes is inclusive.
         let big = checkout.join("src/big.rs");

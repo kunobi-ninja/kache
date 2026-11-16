@@ -33,6 +33,23 @@ impl std::fmt::Display for TooManyInputs {
 
 impl std::error::Error for TooManyInputs {}
 
+/// The script watches a path Cargo cannot stat, so Cargo reruns it on every
+/// build and no recorded run may stand in for one.
+#[derive(Debug)]
+pub(crate) struct RerunsEveryBuild(pub(super) PathBuf);
+
+impl std::fmt::Display for RerunsEveryBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cargo reruns this script on every build: it watches {}, which cannot be read",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for RerunsEveryBuild {}
+
 /// Metadata included in a run key. Cargo's implicit package input is a file
 /// list, so creating an excluded build directory must not change its key.
 #[derive(Clone, Copy, Default)]
@@ -159,6 +176,10 @@ pub(super) fn declared_input_state(
         super::git::resolve(path)?
     };
     let Some(git) = git else {
+        // Cargo follows links and counts any failure as missing.
+        if std::fs::metadata(path).is_err() && !environment.cargo_never_checks(path) {
+            return Err(RerunsEveryBuild(path.to_path_buf()).into());
+        }
         return run_input_state(
             path,
             excluded,

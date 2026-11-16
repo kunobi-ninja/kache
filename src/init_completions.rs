@@ -59,7 +59,11 @@ fn activation(shell: Shell, script: &Path) -> Result<Option<String>> {
             "if [[ -o interactive && -r {quoted} ]]; then\n    if (( ! $+functions[compdef] )); then\n        autoload -Uz compinit\n        compinit\n    fi\n    source {quoted}\nfi"
         )
     } else {
-        format!("if [[ $- == *i* && -r {quoted} ]]; then\n    . {quoted}\nfi")
+        // POSIX syntax: the bash login file can be `~/.profile`, which `sh`
+        // login shells such as dash also read (kunobi-ninja/kache#1923).
+        format!(
+            "case $- in\n    *i*) if [ -n \"${{BASH_VERSION-}}\" ] && [ -r {quoted} ]; then\n        . {quoted}\n    fi ;;\nesac"
+        )
     }))
 }
 
@@ -206,5 +210,43 @@ mod tests {
                 "a missing script must not break startup"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bash_block_parses_in_posix_sh_and_sources_only_under_bash() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("it's completions.bash");
+        std::fs::write(&script, "echo sourced\n").unwrap();
+        let block = activation(Shell::Bash, &script).unwrap().unwrap();
+        assert!(!block.contains("[["), "{block}");
+        let profile = temp.path().join("profile");
+        std::fs::write(&profile, format!("{block}\necho done\n")).unwrap();
+        let run = |shell: &str, interactive: bool| {
+            let mut command = std::process::Command::new(shell);
+            if interactive {
+                command.arg("-i");
+            }
+            let output = command
+                .arg("-c")
+                .arg(format!(". '{}'", profile.display()))
+                .env_remove("BASH_VERSION")
+                .env("HOME", temp.path())
+                .output()
+                .unwrap();
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        };
+        let (ok, out) = run("sh", false);
+        assert!(ok, "{out}");
+        assert_eq!(out, "done\n");
+        let (ok, out) = run("bash", true);
+        assert!(ok, "{out}");
+        assert_eq!(out, "sourced\ndone\n");
+        let (ok, out) = run("bash", false);
+        assert!(ok, "{out}");
+        assert_eq!(out, "done\n");
     }
 }

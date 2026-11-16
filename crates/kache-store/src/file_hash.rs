@@ -224,7 +224,8 @@ impl<'db> FileHashCache<'db> {
     }
 
     /// The memoised hash for `fingerprint`: a row whose whole stamp matches,
-    /// recorded under [`FILE_HASH_RULE`] or a later rule.
+    /// recorded under [`FILE_HASH_RULE`] or a later rule, in this boot
+    /// ([`memo_rows_valid_since`]).
     pub fn get(&self, fingerprint: &FileFingerprint) -> rusqlite::Result<Option<String>> {
         if !file_hash_memo_eligible(fingerprint.inode, cfg!(windows)) {
             return Ok(None);
@@ -233,14 +234,15 @@ impl<'db> FileHashCache<'db> {
             .query_row(
                 "SELECT hash FROM file_hashes
                  WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5
-                   AND rule >= ?6",
+                   AND rule >= ?6 AND updated_at >= datetime(?7, 'unixepoch')",
                 params![
                     fingerprint.path,
                     fingerprint.size,
                     fingerprint.mtime_ns,
                     fingerprint.ctime_ns,
                     fingerprint.inode,
-                    FILE_HASH_RULE
+                    FILE_HASH_RULE,
+                    memo_rows_valid_since()
                 ],
                 |row| row.get(0),
             )
@@ -257,13 +259,15 @@ impl<'db> FileHashCache<'db> {
         fingerprints: &[&FileFingerprint],
     ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
         let mut found = std::collections::HashMap::new();
+        let since = memo_rows_valid_since();
         for chunk in fingerprints.chunks(FILE_HASH_LOOKUP_CHUNK) {
             let wanted: std::collections::HashSet<&FileFingerprint> =
                 chunk.iter().copied().collect();
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
                 "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
-                 WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}"
+                 WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}
+                   AND updated_at >= datetime({since}, 'unixepoch')"
             ))?;
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(chunk.iter().map(|f| f.path.as_str())),
@@ -879,6 +883,68 @@ pub fn with_weak_windows_fingerprints_for_tests<T>(run: impl FnOnce() -> T) -> T
         }
     }
     let _restore = Restore(WEAK_WINDOWS_FINGERPRINTS.with(|weak| weak.replace(true)));
+    run()
+}
+
+/// The Unix second from which `file_hashes` rows are served: when this
+/// machine booted. A row vouches for a file's bytes by its stamp (size,
+/// mtime, ctime, inode), and a hard stop (power loss, a kernel panic, a VM
+/// killed by its host) can break that: the stamp is journaled, but data still
+/// in the page cache is lost, so a file written in the seconds before the stop
+/// comes back at its size, its times and its inode, as zeros or as holes. The
+/// row then vouches for bytes the file no longer holds, for as long as the
+/// file stays untouched. A row recorded before the boot is therefore not
+/// served: the file is read once again and the row recorded then is. A clean
+/// reboot costs the same single read per file. `0`, every row, where the boot
+/// time is unknown (every platform but Linux and Android, for now).
+fn memo_rows_valid_since() -> i64 {
+    #[cfg(test)]
+    if let Some(boot) = BOOT_SECS_FOR_TESTS.with(std::cell::Cell::get) {
+        return boot;
+    }
+    static BOOT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(|| boot_time_secs().unwrap_or(0))
+}
+
+/// When this machine booted, in Unix seconds: the `btime` line of
+/// `/proc/stat`. `None` where it is unknown, and every row is served, as
+/// before.
+fn boot_time_secs() -> Option<i64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        boot_time_in_proc_stat(&stat)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
+/// The `btime` line of `/proc/stat`.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn boot_time_in_proc_stat(stat: &str) -> Option<i64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|secs| secs.trim().parse().ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BOOT_SECS_FOR_TESTS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `run` as on a machine that booted at `boot_secs` (Unix seconds), for
+/// tests of the memo across an unclean stop ([`memo_rows_valid_since`]).
+#[cfg(test)]
+fn with_boot_time_for_tests<T>(boot_secs: i64, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOOT_SECS_FOR_TESTS.with(|boot| boot.set(self.0));
+        }
+    }
+    let _restore = Restore(BOOT_SECS_FOR_TESTS.with(|boot| boot.replace(Some(boot_secs))));
     run()
 }
 
@@ -2318,6 +2384,110 @@ mod tests {
             fh.lookup_cached(&dir.path().join("nope.rlib")),
             FileHashLookup::Uncacheable
         ));
+    }
+
+    #[test]
+    fn the_boot_time_is_the_btime_line_of_proc_stat() {
+        let stat = "cpu  1 2 3\nintr 5\nbtime 1794057339\nprocesses 9\n";
+        assert_eq!(boot_time_in_proc_stat(stat), Some(1_794_057_339));
+        assert_eq!(boot_time_in_proc_stat("cpu 1\nbtimes 7\n"), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn this_machine_booted_in_the_past() {
+        let boot = boot_time_secs().expect("/proc/stat has a btime line");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // 2017-07-14: no machine running these tests booted before it.
+        assert!(boot > 1_500_000_000, "boot time {boot}");
+        assert!(
+            boot <= i64::try_from(now).unwrap(),
+            "boot time {boot} is ahead of now {now}"
+        );
+    }
+
+    #[test]
+    fn a_row_recorded_before_this_boot_is_not_served() {
+        // A hard stop can lose a file's last writes while its size, times and
+        // inode, already journaled, survive: the file then reads as zeros
+        // under a stamp the memo recorded with the old bytes' hash. A row
+        // from before the boot is read again once, and the row the read
+        // records is served.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("crashed.rmeta");
+        std::fs::write(&file, vec![0u8; 70 * 1024]).unwrap();
+        let fh = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let FileHashLookup::NeedsHash(stamp) = fh.lookup_cached(&file) else {
+            panic!("a new file has no row");
+        };
+        fh.record_cached(&stamp, "beforethestop");
+        let before_the_stop = || {
+            fh.db()
+                .execute(
+                    "UPDATE file_hashes SET updated_at = '2026-11-07 13:14:09'",
+                    [],
+                )
+                .unwrap();
+        };
+        before_the_stop();
+        let boot = 1_794_057_339; // 2026-11-07 13:15:39 UTC
+        with_boot_time_for_tests(boot, || {
+            assert!(
+                matches!(fh.lookup_cached(&file), FileHashLookup::NeedsHash(_)),
+                "the row predates the boot, so the file must be read again"
+            );
+            assert_eq!(fh.get(&stamp).unwrap(), None, "get serves no pre-boot row");
+            assert!(
+                fh.get_many(&[&stamp]).unwrap().is_empty(),
+                "get_many serves no pre-boot row"
+            );
+            fh.record_cached(&stamp, "readafterboot");
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row recorded in this boot is served"
+            );
+        });
+        before_the_stop();
+        with_boot_time_for_tests(boot - 3_600, || {
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row from this boot keeps vouching"
+            );
+            assert_eq!(
+                fh.get_many(&[&stamp])
+                    .unwrap()
+                    .get(&stamp.path)
+                    .map(String::as_str),
+                Some("readafterboot"),
+                "get_many serves a row from this boot"
+            );
+        });
+        fh.db()
+            .execute(
+                "UPDATE file_hashes SET updated_at = '2026-11-07 13:15:39'",
+                [],
+            )
+            .unwrap();
+        with_boot_time_for_tests(boot, || {
+            assert_eq!(
+                fh.get(&stamp).unwrap().as_deref(),
+                Some("readafterboot"),
+                "a row stamped in the boot second is served"
+            );
+            assert_eq!(
+                fh.get_many(&[&stamp])
+                    .unwrap()
+                    .get(&stamp.path)
+                    .map(String::as_str),
+                Some("readafterboot"),
+                "get_many serves a row stamped in the boot second"
+            );
+        });
     }
 
     #[test]

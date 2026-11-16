@@ -148,8 +148,10 @@ for (const [name, expression] of routing) {
       ? "WINDOWS"
       : "LINUX";
   const platform = `CI_RUNNER_${os}`;
+  // Jobs pinned to an Ubuntu release: kani, and the CUDA toolkit job, whose
+  // pinned CUDA 12.8 has no packages for newer Ubuntu releases.
   const hosted =
-    name === "ci.yml:kani"
+    name === "ci.yml:kani" || name === "ci.yml:cuda-toolkit"
       ? "ubuntu-24.04"
       : {
           LINUX: "ubuntu-latest",

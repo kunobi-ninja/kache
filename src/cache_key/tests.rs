@@ -22942,12 +22942,12 @@ fn registry_source_separators_agree_only_without_build_script() {
         HostNeutralDecision::Unknown
     );
     publish_host_neutral_decision(&args, Some(plan.clone()));
-    publish_host_neutral_plan(&args, true, Some(&reg_root), &clean_sources);
+    publish_host_neutral_plan(&args, true, Some(&reg_root), None, &clean_sources);
     assert_eq!(
         take_host_neutral_decision(&args),
         HostNeutralDecision::Remaps(plan)
     );
-    publish_host_neutral_plan(&args, false, Some(&reg_root), &clean_sources);
+    publish_host_neutral_plan(&args, false, Some(&reg_root), None, &clean_sources);
     match take_host_neutral_decision(&args) {
         HostNeutralDecision::Remaps(published) => {
             assert!(
@@ -22959,7 +22959,7 @@ fn registry_source_separators_agree_only_without_build_script() {
         }
         other => panic!("expected remaps, got {other:?}"),
     }
-    publish_host_neutral_plan(&args, false, None, &[]);
+    publish_host_neutral_plan(&args, false, None, None, &[]);
     assert_eq!(take_host_neutral_decision(&args), HostNeutralDecision::Off);
     clear_host_neutral_decision();
 }
@@ -23182,4 +23182,67 @@ fn package_directories_stop_at_their_limit() {
     assert_eq!(package_directories(&package, 5).unwrap().len(), 5);
     assert!(package_directories(&package, 4).is_none());
     assert!(package_directories(&root.join("missing"), 5).is_none());
+}
+
+#[test]
+fn a_registry_unit_outside_the_neutral_closure_keys_alike_in_both_lanes() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    std::fs::write(package.join("README.md"), "docs\n").unwrap();
+    let source = package.join("src/lib.rs");
+    std::fs::write(
+        &source,
+        "#![doc = include_str!(\"../README.md\")]\nmod inner;\npub fn f() {}\n",
+    )
+    .unwrap();
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanereadme".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    // The closure names `src/../README.md`, so it is not host-neutral, yet the
+    // compile still takes the package's remaps.
+    let HostNeutralDecision::Remaps(plan) = take_host_neutral_decision(&args) else {
+        panic!("a registry unit compiles with remaps");
+    };
+    assert!(!plan.is_empty());
+
+    // No plan and no earlier compile: the compile-first lane.
+    let remaps = take_execute_remaps(&args, false);
+    assert!(remaps.is_some());
+    let mut readme = package.join("src");
+    readme.push("..");
+    readme.push("README.md");
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), readme, package.join("src/inner/mod.rs")],
+            env_deps: vec![],
+        },
+        None,
+    );
+    assert_eq!(
+        compute_cache_key(&args, &hasher, &normalizer, &env).unwrap(),
+        key_first
+    );
 }

@@ -2163,13 +2163,23 @@ pub(crate) fn publish_host_neutral_plan(
     args: &RustcArgs,
     emitted: bool,
     root: Option<&Path>,
+    remap_unit: Option<&(PathBuf, PathBuf)>,
     sources: &[PathBuf],
 ) {
     if emitted {
         return;
     }
-    let remaps =
-        root.map(|root| registry_directory_remaps(root, sources, std::path::MAIN_SEPARATOR));
+    let remaps = match (root, remap_unit) {
+        (Some(root), _) => Some(registry_directory_remaps(
+            root,
+            sources,
+            std::path::MAIN_SEPARATOR,
+        )),
+        (None, Some((registry, manifest_dir))) => {
+            Some(registry_unit_remaps(registry, manifest_dir, sources))
+        }
+        (None, None) => None,
+    };
     publish_host_neutral_decision(args, remaps);
 }
 
@@ -2289,7 +2299,25 @@ pub(crate) fn remaps_cover_closure(
 /// that starts before its closure is known. Extra directories change nothing
 /// rustc writes: each path still takes its deepest directory's remap.
 pub(crate) fn provisional_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
-    if !unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref())
+    let (registry, manifest_dir) = registry_remap_unit(args)?;
+    let placeholders: Vec<PathBuf> = package_directories(&manifest_dir, MAX_PROVISIONAL_DIRS)?
+        .into_iter()
+        .map(|dir| dir.join("_"))
+        .collect();
+    Some(registry_directory_remaps(
+        &registry,
+        &placeholders,
+        std::path::MAIN_SEPARATOR,
+    ))
+}
+
+/// `(registry/src, package)` for a unit that compiles with registry remaps
+/// in every lane: a registry package that is not a build script or
+/// proc-macro, has no `OUT_DIR` and no dylib extern. Whether its key is also
+/// host-neutral depends on the closure.
+pub(crate) fn registry_remap_unit(args: &RustcArgs) -> Option<(PathBuf, PathBuf)> {
+    if args.skip_path_remap()
+        || !unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref())
         || args.crate_name.as_deref() == Some("build_script_build")
         || args.crate_types.iter().any(|ty| ty == "proc-macro")
         || has_dylib_extern(&args.externs)
@@ -2301,16 +2329,16 @@ pub(crate) fn provisional_registry_remaps(args: &RustcArgs) -> Option<Vec<String
         return None;
     }
     let manifest_dir = PathBuf::from(env.var_os("CARGO_MANIFEST_DIR")?);
-    let registry = registry_src_root(&manifest_dir)?;
-    let placeholders: Vec<PathBuf> = package_directories(&manifest_dir, MAX_PROVISIONAL_DIRS)?
-        .into_iter()
-        .map(|dir| dir.join("_"))
-        .collect();
-    Some(registry_directory_remaps(
-        registry,
-        &placeholders,
-        std::path::MAIN_SEPARATOR,
-    ))
+    let registry = registry_src_root(&manifest_dir)?.to_path_buf();
+    Some((registry, manifest_dir))
+}
+
+/// Remaps a key-first compile passes for a closure that is not host-neutral:
+/// its registry sources' directories and the package's own.
+fn registry_unit_remaps(registry: &Path, manifest_dir: &Path, sources: &[PathBuf]) -> Vec<String> {
+    let mut covered = sources.to_vec();
+    covered.push(manifest_dir.join("_"));
+    registry_directory_remaps(registry, &covered, std::path::MAIN_SEPARATOR)
 }
 
 /// `root` and every directory below it, without following links. `None`
@@ -3842,7 +3870,14 @@ fn compute_key_into(
     // An emitted closure is keyed as its compile ran: with registry remaps,
     // as a key computed before compiling would be.
     let applied = emitted.then(|| applied_registry_remaps(args)).flatten();
-    let compiled_neutral = applied.is_some();
+    // Every lane compiles such a unit with registry remaps, so its key always
+    // carries their namespace. An emitted closure follows what its compile did.
+    let remap_unit = registry_remap_unit(args);
+    let compiled_with_remaps = if emitted {
+        applied.is_some()
+    } else {
+        remap_unit.is_some()
+    };
     let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
     // Hand the closure back to the wrapper, which records it as a prediction
     // only once the invocation it belongs to has succeeded. The clone is one
@@ -3857,7 +3892,7 @@ fn compute_key_into(
         .map(|info| info.source_files.as_slice())
         .unwrap_or(&[]);
     let host_neutral_root = applicable_host_neutral_root(
-        emitted && !compiled_neutral,
+        emitted && applied.is_none(),
         unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref()),
         &UnitClosure {
             crate_name: args.crate_name.as_deref(),
@@ -3875,8 +3910,14 @@ fn compute_key_into(
             .is_none_or(|applied| remaps_cover_closure(root, sources, applied))
     });
     let (drop_host, namespace) =
-        host_neutral_version_flags(host_neutral_root.is_some(), compiled_neutral);
-    publish_host_neutral_plan(args, emitted, host_neutral_root.as_deref(), sources);
+        host_neutral_version_flags(host_neutral_root.is_some(), compiled_with_remaps);
+    publish_host_neutral_plan(
+        args,
+        emitted,
+        host_neutral_root.as_deref(),
+        remap_unit.as_ref(),
+        sources,
+    );
     hash_rustc_version_for_unit(&mut hasher, &rustc_version, drop_host, namespace);
     tracing::trace!(
         "[key:{}] rustc_version={}",

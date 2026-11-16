@@ -51,12 +51,17 @@ pub(crate) fn embedded_checkout_reason(
         .map(|dir| spellings(&dir))
         .unwrap_or_default();
     for artifact in artifacts.outputs() {
-        // Dep-info is rewritten on restore. Debug info never runs: a PDB
-        // records the build's working directory, which a debugger may show
-        // but the program cannot read.
-        if matches!(
+        // Only what a program runs or links: dep-info is rewritten on
+        // restore, and debug info and linker side files (`.pdb`, `.exp`)
+        // record the build's own paths without the program reading them.
+        if !matches!(
             artifact.kind,
-            ArtifactKind::DepInfo | ArtifactKind::DebugSidecar | ArtifactKind::DebugBundle
+            ArtifactKind::Library
+                | ArtifactKind::Metadata
+                | ArtifactKind::Object
+                | ArtifactKind::Executable
+                | ArtifactKind::DynamicLibrary
+                | ArtifactKind::WasmModule
         ) {
             continue;
         }
@@ -305,8 +310,10 @@ mod tests {
         assert!(verbatim.contains(&b"C:/work/a".to_vec()), "{verbatim:?}");
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
+        let canonical = canonical.to_str().unwrap();
+        let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
         let forms = spellings(dir.path());
-        assert!(forms.contains(&canonical.to_str().unwrap().as_bytes().to_vec()));
+        assert!(forms.contains(&canonical.as_bytes().to_vec()), "{forms:?}");
     }
 
     fn artifact(path: &Path, kind: ArtifactKind) -> crate::compiler::Artifact {
@@ -355,6 +362,7 @@ mod tests {
             artifact(&depinfo, ArtifactKind::DepInfo),
             artifact(&pdb, ArtifactKind::DebugSidecar),
             artifact(&pdb, ArtifactKind::DebugBundle),
+            artifact(&pdb, ArtifactKind::Other("exp")),
         ]);
         assert_eq!(embedded_checkout_reason(&args, &clean_set, false), None);
 

@@ -11305,7 +11305,14 @@ exit 1
 fn reordered_include_dirs_share_a_key_only_when_order_cannot_matter() {
     let _lock = crate::test_support::process_state_test_lock();
     // (case, files, read set, extra args, order can matter)
-    let cases: &[(&str, &[(&str, &str)], &[&str], &[&str], bool)] = &[
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a [&'a str],
+        &'a [&'a str],
+        bool,
+    );
+    let cases: &[Case] = &[
         (
             "distinct names",
             &[("unit.c", "#include <a.h>\n#include <b.h>\n")],
@@ -11567,13 +11574,16 @@ fn include_order_sorts_only_adjacent_reorderable_operands() {
         &["-Ia", "-DX", "-Ib"],
         &["-Ia", "-I../b"],
         &["-Ia", "-I-"],
-        &["-Ia", "-I/usr/include"],
         &["-Ia", "-Ib", "-isystem", "b"],
         &["-Xclang", "-Ia", "-Ib"],
         &["-Ia", &spelled_twice],
         &["-Ia", "-I=b"],
         &["-Ia", "-I$SYSROOT/b"],
-    ] {
+    ]
+    .into_iter()
+    // `/usr/include` is a system root only where it exists.
+    .chain(cfg!(unix).then_some(&["-Ia", "-I/usr/include"][..]))
+    {
         assert!(order(args).is_none(), "{args:?} must keep its order");
     }
 }
@@ -11679,12 +11689,10 @@ exit 1
     let maps = cc_prefix_maps(&recorded, &[]);
     let fingerprints = hasher()
         .cc_preprocess_fingerprints(
-            &["unit.c", "a/a.h"]
-                .map(|path| {
-                    let path = root.join(path);
-                    (cc_mapped_path(&path, &maps), path)
-                })
-                .to_vec(),
+            &["unit.c", "a/a.h"].map(|path| {
+                let path = root.join(path);
+                (cc_mapped_path(&path, &maps), path)
+            }),
             &cc_prefix_maps_key(&maps),
             &|path| cc_mapped_content_hash(path, &maps),
         )

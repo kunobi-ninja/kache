@@ -157,7 +157,7 @@ fn a_bundle_that_fails_to_restore_recompiles_and_records_the_cause() {
     // which the restore rejects. Trailing spaces keep the blob's length.
     let blob = stored_bundle_blob(&project.cache);
     let mut forged =
-        br#"{"version":1,"files":[],"empty_files":["Contents\nforged row/.."]}"#.to_vec();
+        br#"{"version":1,"files":[{"path":"Contents\nforged row/..","name":"x"}],"empty_files":[]}"#.to_vec();
     let length = usize::try_from(fs::metadata(&blob).unwrap().len()).unwrap();
     forged.resize(length.max(forged.len()), b' ');
     let staged = blob.with_extension("forged");

@@ -382,9 +382,26 @@ pub(crate) fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::f
     }
 }
 
-/// The digest recorded at `memo`, when it was recorded under `stamp`.
+/// The digest recorded at `memo`, when it was recorded under `stamp` in this
+/// boot. A hard stop can lose the last writes to a tree's files while their
+/// stamps survive, so a memo written before the boot
+/// ([`kache_store::file_hash::memo_rows_valid_since`], by its modification
+/// time) is not served: the tree is read again, and the memo recorded then
+/// is.
 pub(crate) fn memoised_digest(memo: &Path, stamp: &str) -> Option<String> {
-    let memo = std::fs::read_to_string(memo).ok()?;
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(memo).ok()?;
+    let recorded = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |age| i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
+    if recorded < kache_store::file_hash::memo_rows_valid_since() {
+        return None;
+    }
+    let mut memo = String::new();
+    file.read_to_string(&mut memo).ok()?;
     let (recorded_stamp, digest) = memo.trim_end().split_once('\n')?;
     (recorded_stamp == stamp).then(|| digest.to_string())
 }
@@ -423,6 +440,41 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    /// A hard stop can lose the last writes to a tree's files while their
+    /// stamps survive, so a digest memoised before the boot is not served.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_digest_memoised_before_this_boot_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let memo = dir.path().join("memo");
+        record_digest(&memo, "stamp", "digest");
+        assert_eq!(memoised_digest(&memo, "stamp").as_deref(), Some("digest"));
+        let boot = kache_store::file_hash::memo_rows_valid_since();
+        assert!(boot > 0, "/proc/stat names the boot time");
+        let recorded_at = |secs: i64| {
+            filetime::set_file_mtime(&memo, filetime::FileTime::from_unix_time(secs, 0)).unwrap();
+        };
+        recorded_at(boot - 1);
+        assert_eq!(
+            memoised_digest(&memo, "stamp"),
+            None,
+            "a memo from before the boot is not served"
+        );
+        recorded_at(boot);
+        assert_eq!(
+            memoised_digest(&memo, "stamp").as_deref(),
+            Some("digest"),
+            "a memo written in the boot second is from this boot"
+        );
+        recorded_at(boot - 1);
+        record_digest(&memo, "stamp", "read again");
+        assert_eq!(
+            memoised_digest(&memo, "stamp").as_deref(),
+            Some("read again"),
+            "the memo recorded after the boot is served"
+        );
     }
 
     #[test]

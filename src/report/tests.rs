@@ -5359,6 +5359,16 @@ fn seed_summary_line_shows_rate_and_both_averages_only() {
         format_seed_summary(&only_unseeded),
         Some(("0 of 1".into(), "seeded from another checkout".into()))
     );
+    let only_seeded = SeedSummary {
+        imported: 1,
+        seeded_compiles: 1,
+        seeded_compile_ms: 2_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_seed_summary(&only_seeded),
+        Some(("1 of 1".into(), "seeded from another checkout".into()))
+    );
     let both = SeedSummary {
         imported: 1,
         no_donor: 1,

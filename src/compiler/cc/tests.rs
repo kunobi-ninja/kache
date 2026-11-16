@@ -11462,6 +11462,20 @@ fn reordered_include_dirs_share_a_key_only_when_order_cannot_matter() {
             &[],
             false,
         ),
+        (
+            "an absent run directory",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-Id"],
+            false,
+        ),
+        (
+            "a run directory below a file",
+            &[("unit.c", "#include <a.h>\n")],
+            &["unit.c", "a/a.h"],
+            &["-Ia/a.h/sub"],
+            true,
+        ),
     ];
     for (case, files, read, extra, order_matters) in cases {
         let directory = tempfile::tempdir().unwrap();

@@ -5,8 +5,9 @@
 # per-build `.o` files; restored at another path those are gone and
 # lldb loses source-level symbols. The fix under test: at STORE time —
 # while the `.o`s still exist — kache bakes a self-contained `.dSYM`
-# via dsymutil, caches it as a flat `<bin>.dsym.tar` with the entry,
-# and at restore unpacks it next to the binary. lldb prefers an
+# via dsymutil, caches its files with the entry (one artifact per file
+# plus a manifest, kunobi-ninja/kache#1905), and at restore clones them
+# into a bundle next to the binary. lldb prefers an
 # adjacent UUID-matched `.dSYM` over the debug map, so the stale OSO
 # entries become inert without mutating the binary.
 #
@@ -53,7 +54,7 @@ min_entries_after = 1
 
 [assertions.warm]
 # A clean rebuild must restore BOTH the dependency AND the executable
-# (whose entry carries the dsym tar). Requiring 2 keeps a future gate
+# (whose entry carries the dSYM files). Requiring 2 keeps a future gate
 # regression from going green on the rlib alone — same rationale as
 # e2e-rust-test-exec.
 min_hits = 2

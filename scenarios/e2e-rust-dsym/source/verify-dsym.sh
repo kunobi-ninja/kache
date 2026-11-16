@@ -4,8 +4,7 @@
 # Runs after EVERY successful build phase, so it must hold on the cold
 # build too — which it does, because kache's store path leaves the baked
 # `.dSYM` next to the binary it packages (cold/warm parity), and the
-# restore path re-creates the same shape by unpacking the cached
-# `<bin>.dsym.tar`.
+# restore path re-creates the same shape from the cached bundle files.
 #
 # For every bundle kache baked (the bin and its unit-test harness and the
 # integration test in deps/, the example in examples/; from Cargo 1.100 each

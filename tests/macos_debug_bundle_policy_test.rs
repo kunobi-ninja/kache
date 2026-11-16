@@ -112,6 +112,13 @@ fn check_debug_bundle_policy(split: &str, expected_bundle: bool) {
             .filter(|path| path.extension().is_some_and(|ext| ext == "dSYM"))
             .collect();
         assert_eq!(!bundles.is_empty(), expected_bundle, "{split}: {bundles:?}");
+        // The bundle is restored in place; its stored pieces stay in the store.
+        let pieces: Vec<_> = fs::read_dir(&deps)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".dsym."))
+            .collect();
+        assert!(pieces.is_empty(), "{split} {expected_result}: {pieces:?}");
         fs::remove_dir_all(&project.target).unwrap();
     }
     project.stop_daemon();
@@ -127,39 +134,32 @@ fn unpacked_debuginfo_still_gets_a_relocatable_bundle_on_misses_and_hits() {
     check_debug_bundle_policy("unpacked", cfg!(target_os = "macos"));
 }
 
-/// A stored bundle that fails to unpack turns the hit into a compile, and the
+/// A stored bundle that fails to restore turns the hit into a compile, and the
 /// event records the cause under the step that failed (kunobi-ninja/kache#1786).
-/// The cause quotes an entry name from the archive, so its newline must reach
-/// the event log as a space.
+/// The cause quotes a path from the bundle's manifest, so its newline must
+/// reach the event log as a space.
 #[test]
-fn a_bundle_that_fails_to_unpack_recompiles_and_records_the_cause() {
+fn a_bundle_that_fails_to_restore_recompiles_and_records_the_cause() {
     if !cfg!(target_os = "macos") {
         // Only macOS stores a debug bundle.
         return;
     }
     let project = Project::new("unpacked");
     // A durable entry is checked by size alone on the next lookup, so the
-    // swapped bundle below reaches the unpack instead of failing its hash.
+    // swapped manifest below reaches the restore instead of failing its hash.
     let mut config = fs::read_to_string(&project.config).unwrap();
     config.push_str("deferred_durability = false\n");
     fs::write(&project.config, config).unwrap();
     assert_eq!(project.build().last().unwrap()["result"], "miss");
     fs::remove_dir_all(&project.target).unwrap();
 
-    // Swap the stored bundle for a tar whose only entry is a symlink, which the
-    // unpack rejects. Zero padding keeps the blob's length.
+    // Swap the stored manifest for one naming a path that leaves the bundle,
+    // which the restore rejects. Trailing spaces keep the blob's length.
     let blob = stored_bundle_blob(&project.cache);
-    let mut header = tar::Header::new_gnu();
-    header.set_size(0);
-    header.set_mode(0o644);
-    header.set_entry_type(tar::EntryType::Symlink);
-    let mut builder = tar::Builder::new(Vec::new());
-    builder
-        .append_link(&mut header, "Contents\nforged row", "/etc")
-        .unwrap();
-    let mut forged = builder.into_inner().unwrap();
+    let mut forged =
+        br#"{"version":1,"files":[],"empty_files":["Contents\nforged row/.."]}"#.to_vec();
     let length = usize::try_from(fs::metadata(&blob).unwrap().len()).unwrap();
-    forged.resize(length.max(forged.len()), 0);
+    forged.resize(length.max(forged.len()), b' ');
     let staged = blob.with_extension("forged");
     fs::write(&staged, forged).unwrap();
     fs::rename(&staged, &blob).unwrap();
@@ -170,21 +170,21 @@ fn a_bundle_that_fails_to_unpack_recompiles_and_records_the_cause() {
     let reason = event["passthrough_reason"].as_str().unwrap();
     assert_eq!(
         reason,
-        "restore failed: rustc restore: applying UnpackDebugBundle: \
-         debug bundle entry is a link (rejected): Contents forged row"
+        "restore failed: rustc restore: restoring debug bundle: \
+         debug bundle manifest has an unsafe path: Contents forged row/.."
     );
     let warning = stderr
         .lines()
         .find(|line| line.contains("restoring local cache hit for debug_bundle_policy failed:"))
         .unwrap_or_else(|| panic!("restore warning missing: {stderr}"));
     assert!(
-        warning.contains("Contents forged row — recompiling"),
-        "restore warning contains an unflattened archive name: {stderr}"
+        warning.contains("Contents forged row/.. — recompiling"),
+        "restore warning contains an unflattened manifest path: {stderr}"
     );
     project.stop_daemon();
 }
 
-/// The store blob behind the one `.dsym.tar` the cache holds.
+/// The store blob behind the one debug bundle manifest the cache holds.
 fn stored_bundle_blob(cache: &Path) -> PathBuf {
     let store = cache.join("store");
     let blobs: Vec<PathBuf> = fs::read_dir(&store)
@@ -198,7 +198,7 @@ fn stored_bundle_blob(cache: &Path) -> PathBuf {
                 .filter(|file| {
                     file["name"]
                         .as_str()
-                        .is_some_and(|name| name.ends_with(".dsym.tar"))
+                        .is_some_and(|name| name.ends_with(".dsym.json"))
                 })
                 .map(|file| file["hash"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>()

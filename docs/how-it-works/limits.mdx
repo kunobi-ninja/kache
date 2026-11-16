@@ -87,7 +87,7 @@ Test binaries can wait for the same pool. Set `kache test-runner` as Cargo's tar
 ## Restoring large cache entries
 
 `cache.restore_max_size` / `KACHE_RESTORE_MAX_SIZE` limits each compressed remote
-entry download and its extracted file contents, and each unpacked debug bundle.
+entry download and its extracted file contents, and each restored debug bundle.
 The default is `8GiB`. The limit must be positive; an entry that exceeds it falls
 back to compilation. It does not reserve memory or set a combined budget for
 concurrent restores.

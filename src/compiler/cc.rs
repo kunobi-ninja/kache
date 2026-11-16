@@ -8162,10 +8162,19 @@ fn cc_memo_identity_portable(parsed: &CcArgs, cwd: &Path, prefix_maps: &[CcPrefi
 }
 
 /// A path the toolchain owns, the same on every checkout of one machine.
+/// Under `/nix` only the store and profiles qualify: Nix builds a package in
+/// a per-build directory below `/nix/var/nix/builds`.
 fn cc_system_path(path: &str) -> bool {
-    ["/usr/", "/opt/", "/Library/", "/Applications/", "/nix/"]
-        .iter()
-        .any(|root| path.starts_with(root))
+    [
+        "/usr/",
+        "/opt/",
+        "/Library/",
+        "/Applications/",
+        "/nix/store/",
+        "/nix/var/nix/profiles/",
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
 }
 
 /// Hash each mapped input name with its content, preserving their association

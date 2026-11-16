@@ -22867,8 +22867,6 @@ fn registry_source_separators_agree_only_without_build_script() {
     assert_eq!(host_neutral_version_flags(true, false), (true, true));
     assert_eq!(host_neutral_version_flags(false, false), (false, false));
     assert_eq!(host_neutral_version_flags(true, true), (true, true));
-    assert_eq!(version_flags_for_unit(false), (false, false));
-    assert_eq!(version_flags_for_unit(true), (true, true));
 
     let digest = |drop_host: bool, namespace: bool| {
         let mut hasher = blake3::Hasher::new();
@@ -22882,7 +22880,7 @@ fn registry_source_separators_agree_only_without_build_script() {
         hasher.update(folded.as_bytes());
         hasher.update(b"\n");
         if namespace {
-            fold_field(&mut hasher, b"host_neutral_sources.v1:", b"1");
+            fold_field(&mut hasher, b"host_neutral_sources.v2:", b"1");
         }
         hasher.finalize()
     };
@@ -22921,7 +22919,7 @@ fn registry_source_separators_agree_only_without_build_script() {
         let (from, to) = body.split_once('=').unwrap();
         assert!(from.contains('\\') && from.ends_with('\\'), "{arg}");
         assert!(
-            to.starts_with("/cargo/registry/") && to.ends_with('/'),
+            to.starts_with("/kache/.cargo/registry/src/") && to.ends_with('/'),
             "{arg}"
         );
         assert!(!to.contains('\\') && !to.contains("lib.rs"), "{arg}");
@@ -22957,7 +22955,8 @@ fn registry_source_separators_agree_only_without_build_script() {
         "--remap-path-prefix=noseparator".to_string(),
         "--cfg=foo".to_string(),
     ];
-    let registry_flag = ["--remap-path-prefix=C:\\reg\\src\\=/cargo/registry/".to_string()];
+    let registry_flag =
+        ["--remap-path-prefix=C:\\reg\\src\\=/kache/.cargo/registry/src/".to_string()];
     let listed = host_neutral_remap_list(base.clone(), &registry_flag);
     assert_eq!(
         listed,
@@ -22970,7 +22969,7 @@ fn registry_source_separators_agree_only_without_build_script() {
             "--remap-path-prefix=/rustc/abc=/somewhere".to_string(),
             "--remap-path-prefix=noseparator".to_string(),
             "--cfg=foo".to_string(),
-            "--remap-path-prefix=C:\\reg\\src\\=/cargo/registry/".to_string(),
+            "--remap-path-prefix=C:\\reg\\src\\=/kache/.cargo/registry/src/".to_string(),
         ]
     );
     assert_eq!(
@@ -22992,7 +22991,7 @@ fn registry_source_separators_agree_only_without_build_script() {
     let mut args = RustcArgs::default();
     args.crate_name = Some("memchr".to_string());
     args.source_file = Some(PathBuf::from("lib.rs"));
-    let plan = vec!["--remap-path-prefix=a/=/cargo/registry/a/".to_string()];
+    let plan = vec!["--remap-path-prefix=a/=/kache/.cargo/registry/src/a/".to_string()];
     publish_host_neutral_decision(&args, Some(plan.clone()));
     assert_eq!(
         take_host_neutral_decision(&args),
@@ -23055,21 +23054,382 @@ fn registry_source_separators_agree_only_without_build_script() {
         take_host_neutral_decision(&args),
         HostNeutralDecision::Unknown
     );
-    publish_host_neutral_decision(&args, Some(plan.clone()));
-    publish_host_neutral_plan(&args, true, Some(&reg_root), &clean_sources);
-    assert_eq!(
-        take_host_neutral_decision(&args),
-        HostNeutralDecision::Remaps(plan)
-    );
-    publish_host_neutral_plan(&args, false, Some(&reg_root), &clean_sources);
-    match take_host_neutral_decision(&args) {
-        HostNeutralDecision::Remaps(published) => {
-            assert!(published.iter().all(|arg| arg.contains("/cargo/registry/")));
-            assert!(!published.is_empty());
-        }
-        other => panic!("expected remaps, got {other:?}"),
-    }
-    publish_host_neutral_plan(&args, false, None, &[]);
-    assert_eq!(take_host_neutral_decision(&args), HostNeutralDecision::Off);
     clear_host_neutral_decision();
+}
+
+fn registry_package(root: &Path) -> PathBuf {
+    let package = root.join("registry/src/index/lanepkg-1.0.0");
+    std::fs::create_dir_all(package.join("src/inner")).unwrap();
+    std::fs::create_dir_all(package.join("tests/data")).unwrap();
+    std::fs::write(package.join("src/lib.rs"), "mod inner;\npub fn f() {}\n").unwrap();
+    std::fs::write(package.join("src/inner/mod.rs"), "pub fn g() {}\n").unwrap();
+    package
+}
+
+#[test]
+fn a_compile_first_registry_unit_keys_like_a_key_first_one() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanepkg".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+    let emitted_key = || {
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone(), package.join("src/inner/mod.rs")],
+                env_deps: vec![],
+            },
+            None,
+        );
+        compute_cache_key(&args, &hasher, &normalizer, &env).unwrap()
+    };
+
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    let unremapped = emitted_key();
+    assert_ne!(unremapped, key_first);
+
+    let remaps = take_execute_remaps(&args, false).unwrap();
+    let registry = root.join("registry/src");
+    for dir in [
+        "",
+        "index/lanepkg-1.0.0/src/inner/",
+        "index/lanepkg-1.0.0/tests/data/",
+    ] {
+        let remap = format!(
+            "--remap-path-prefix={}{sep}{}={}",
+            registry.display(),
+            dir.replace('/', std::path::MAIN_SEPARATOR_STR),
+            format_args!("/kache/.cargo/registry/src/{dir}"),
+            sep = std::path::MAIN_SEPARATOR,
+        );
+        assert!(remaps.contains(&remap), "{remap}: {remaps:?}");
+    }
+    assert!(applied_registry_remaps(&args).is_some());
+    assert_eq!(emitted_key(), key_first);
+    assert_eq!(take_execute_remaps(&args, false), Some(remaps));
+
+    // A source in another package took a remap the walk did not cover.
+    let foreign = root.join("registry/src/index/other-1.0.0/src/x.rs");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, "pub fn x() {}\n").unwrap();
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), foreign.clone()],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let mixed = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    record_compiled_remaps(&args, None);
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), foreign],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let mixed_unremapped = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    assert_ne!(mixed, key_first);
+    assert_ne!(mixed, mixed_unremapped);
+}
+
+#[test]
+fn a_compile_that_applied_no_registry_remaps_keeps_the_ordinary_key() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("lanepkg_off".to_string());
+    args.source_file = Some(package.join("src/lib.rs"));
+    publish_host_neutral_decision(&args, None);
+    assert_eq!(take_execute_remaps(&args, false), None);
+    assert!(applied_registry_remaps(&args).is_none());
+    assert_eq!(take_execute_remaps(&args, true), None);
+
+    publish_host_neutral_decision(&args, Some(vec!["--remap-path-prefix=a/=b/".to_string()]));
+    assert!(take_execute_remaps(&args, false).is_some());
+    assert!(applied_registry_remaps(&args).is_some());
+    assert_eq!(take_execute_remaps(&args, true), None);
+    assert!(applied_registry_remaps(&args).is_none());
+}
+
+#[test]
+fn applied_remaps_must_cover_every_source_directory() {
+    let registry = PathBuf::from("/home/u/.cargo/registry/src");
+    let own = registry.join("index/a-1.0.0/src/lib.rs");
+    let other = registry.join("index/b-1.0.0/src/x.rs");
+    let applied = registry_directory_remaps(
+        &registry,
+        std::slice::from_ref(&own),
+        std::path::MAIN_SEPARATOR,
+    );
+    assert!(remaps_cover_closure(
+        &registry,
+        std::slice::from_ref(&own),
+        &applied
+    ));
+    assert!(!remaps_cover_closure(
+        &registry,
+        &[own.clone(), other.clone()],
+        &applied
+    ));
+    let both = registry_directory_remaps(
+        &registry,
+        &[own.clone(), other.clone()],
+        std::path::MAIN_SEPARATOR,
+    );
+    assert!(remaps_cover_closure(&registry, &[own, other], &both));
+}
+
+#[test]
+fn provisional_registry_remaps_need_a_plain_registry_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let parse = |extra: &[&str], vars: &[(&str, Option<&std::ffi::OsStr>)]| {
+        let invocation = client_invocation(&package, vars);
+        let mut argv: Vec<String> = vec![
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanepkg".into(),
+            source.to_str().unwrap().into(),
+        ];
+        argv.extend(extra.iter().map(|arg| arg.to_string()));
+        RustcArgs::parse_for(&argv, &invocation).unwrap()
+    };
+    let manifest = ("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+    let no_out = ("OUT_DIR", None);
+    assert!(
+        provisional_registry_remaps(&parse(&["--crate-type=rlib"], &[manifest, no_out])).is_some()
+    );
+    let out = root.join("out");
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--crate-type=rlib"],
+            &[manifest, ("OUT_DIR", Some(out.as_os_str()))]
+        ))
+        .is_none()
+    );
+    assert!(
+        provisional_registry_remaps(&parse(&["--crate-type=proc-macro"], &[manifest, no_out]))
+            .is_none()
+    );
+    let dylib = root.join("libm.so");
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--extern", &format!("m={}", dylib.display())],
+            &[manifest, no_out]
+        ))
+        .is_none()
+    );
+    let workspace = root.join("work");
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--crate-type=rlib"],
+            &[("CARGO_MANIFEST_DIR", Some(workspace.as_os_str())), no_out]
+        ))
+        .is_none()
+    );
+    assert!(
+        provisional_registry_remaps(&parse(
+            &["--crate-type=rlib"],
+            &[no_out, ("CARGO_MANIFEST_DIR", None)]
+        ))
+        .is_none()
+    );
+    let mut script = parse(&["--crate-type=bin"], &[manifest, no_out]);
+    script.crate_name = Some("build_script_build".to_string());
+    assert!(provisional_registry_remaps(&script).is_none());
+    let mut unnormalized = parse(&["--crate-type=rlib"], &[manifest, no_out]);
+    unnormalized.path_normalize_disabled = true;
+    assert!(provisional_registry_remaps(&unnormalized).is_none());
+}
+
+#[test]
+fn package_directories_stop_at_their_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    // Entries: src, tests, src/lib.rs, src/inner, tests/data, src/inner/mod.rs.
+    let found = package_directories(&package, 6).unwrap();
+    assert_eq!(found.len(), 5);
+    assert!(package_directories(&package, 5).is_none());
+    assert!(package_directories(&root.join("missing"), 6).is_none());
+}
+
+#[test]
+fn a_registry_unit_outside_the_neutral_closure_keys_alike_in_both_lanes() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    std::fs::write(package.join("README.md"), "docs\n").unwrap();
+    let source = package.join("src/lib.rs");
+    std::fs::write(
+        &source,
+        "#![doc = include_str!(\"../README.md\")]\nmod inner;\npub fn f() {}\n",
+    )
+    .unwrap();
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanereadme".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+    // The closure names `src/../README.md`, so it is not host-neutral, yet the
+    // compile still takes the package's remaps.
+    let HostNeutralDecision::Remaps(plan) = take_host_neutral_decision(&args) else {
+        panic!("a registry unit compiles with remaps");
+    };
+    assert!(!plan.is_empty());
+
+    // No plan and no earlier compile: the compile-first lane.
+    let remaps = take_execute_remaps(&args, false);
+    assert!(remaps.is_some());
+    let mut readme = package.join("src");
+    readme.push("..");
+    readme.push("README.md");
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), readme, package.join("src/inner/mod.rs")],
+            env_deps: vec![],
+        },
+        None,
+    );
+    assert_eq!(
+        compute_cache_key(&args, &hasher, &normalizer, &env).unwrap(),
+        key_first
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_package_that_cannot_be_walked_keys_without_remaps_in_both_lanes() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = registry_package(&root);
+    let source = package.join("src/lib.rs");
+    let invocation = client_invocation(
+        &package,
+        &[
+            ("OUT_DIR", None),
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+        ],
+    );
+    let args = RustcArgs::parse_for(
+        &[
+            "rustc".into(),
+            "--crate-name".into(),
+            "lanelocked".into(),
+            source.to_str().unwrap().into(),
+            "--crate-type=rlib".into(),
+            "--edition=2021".into(),
+        ],
+        &invocation,
+    )
+    .unwrap();
+    let hasher = FileHasher::new_for(&invocation);
+    let normalizer = PathNormalizer::empty();
+    let env = KeyEnv::from_parts(std::iter::empty::<(&str, &str)>(), Some(package.clone()));
+    let walked = compute_cache_key(&args, &hasher, &normalizer, &env).unwrap();
+
+    let locked = package.join("tests/data");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let key_first = compute_cache_key(&args, &hasher, &normalizer, &env);
+    let decision = take_host_neutral_decision(&args);
+    let compiled = take_execute_remaps(&args, false);
+    provide_dep_info(
+        DepInfo {
+            source_files: vec![source.clone(), package.join("src/inner/mod.rs")],
+            env_deps: vec![],
+        },
+        None,
+    );
+    let emitted = compute_cache_key(&args, &hasher, &normalizer, &env);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(decision, HostNeutralDecision::Off);
+    assert_eq!(compiled, None);
+    let key_first = key_first.unwrap();
+    assert_eq!(emitted.unwrap(), key_first);
+    assert_ne!(key_first, walked);
+}
+
+#[test]
+fn an_invocation_starts_without_an_earlier_compile_record() {
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("scoped".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    record_compiled_remaps(&args, Some(vec!["x".to_string()]));
+    {
+        let _scope = InvocationKeyScope::enter();
+        assert_eq!(compiled_remaps(&args), None);
+        record_compiled_remaps(&args, None);
+        assert_eq!(compiled_remaps(&args), Some(None));
+    }
+    assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
+    record_compiled_remaps(&args, None);
+}
+
+#[test]
+fn a_compile_record_belongs_to_one_crate_and_source() {
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("owner".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    let _scope = InvocationKeyScope::enter();
+    record_compiled_remaps(&args, Some(vec!["x".to_string()]));
+    let mut other_source = args.clone();
+    other_source.source_file = Some(PathBuf::from("main.rs"));
+    let mut other_crate = args.clone();
+    other_crate.crate_name = Some("other".to_string());
+    assert_eq!(compiled_remaps(&other_source), None);
+    assert_eq!(compiled_remaps(&other_crate), None);
+    assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
 }

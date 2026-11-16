@@ -4,7 +4,9 @@
 //! hit or a miss) and a later miss in the same target where only
 //! source/extern key groups changed, however far apart, the miss may seed a
 //! private incremental directory. Successful seeds enable a small, time-bounded run
-//! of early passthroughs before Kache probes the cache again. An explicit crate force-list can request the same managed
+//! of early passthroughs before Kache probes the cache again. A run ends early
+//! when the unit's sources move back to the last state that went through the
+//! cache, as after a revert or a branch switch. An explicit crate force-list can request the same managed
 //! directory without the learning step. A changed primary source can also
 //! prepare a compatible donor before key discovery. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
@@ -38,11 +40,18 @@ const STATE_SCHEMA: u32 = 1;
 const ACTIVE_IDLE_SECS: u64 = 15 * 60;
 const MAX_ACTIVE_LEASES: u8 = 8;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
+const MAX_DEP_INFO_BYTES: u64 = 1 << 20;
+/// Sources an active lease may hash before it skips the cached-source check.
+const MAX_SOURCE_BYTES: u64 = 64 << 20;
 
 /// One standard Cargo unit that is safe to manage automatically.
 #[derive(Clone, Debug)]
 pub(crate) struct AdaptiveUnit {
     source_file: Option<PathBuf>,
+    /// Cargo's dep-info for this unit, rewritten by every compile or restore.
+    dep_info: Option<PathBuf>,
+    /// Resolves the relative source paths rustc writes into dep-info.
+    invocation_cwd: Option<PathBuf>,
     original_incremental: PathBuf,
     policy_guard: Vec<u8>,
     unit_key: String,
@@ -216,6 +225,14 @@ struct DiskState {
     active_leases: u8,
     last_used_secs: u64,
     in_flight: bool,
+    /// [`AdaptiveUnit::source_set_digest`] of the last build that went
+    /// through the cache, so an active unit returning to it looks it up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_sources: Option<String>,
+    /// The same digest at the unit's last private compile. Sources that did
+    /// not move since then (a dependency-only rebuild) keep the fast path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_sources: Option<String>,
 }
 
 enum LoadedState {
@@ -281,6 +298,8 @@ impl AdaptiveUnit {
                 .source_file
                 .as_ref()
                 .and_then(|path| args.invocation_env().resolve(path)),
+            dep_info: args.dep_info_path(),
+            invocation_cwd: args.invocation_env().cwd().map(Path::to_path_buf),
             original_incremental: original_incremental.clone(),
             policy_guard: policy_guard.to_vec(),
             state_path: unit_dir.join("state.json"),
@@ -336,6 +355,8 @@ impl AdaptiveUnit {
             active_leases: 0,
             last_used_secs: now,
             in_flight: true,
+            cached_sources: previous.cached_sources.clone(),
+            last_sources: None,
         };
         if !self.store_state(&busy, true) {
             return None;
@@ -362,6 +383,54 @@ impl AdaptiveUnit {
         }
         let mut hash = blake3::Hasher::new();
         hash.update_reader(&mut input).ok()?;
+        Some(hash.finalize().to_hex().to_string())
+    }
+
+    /// Content digest of the sources the unit's dep-info names. It only
+    /// decides whether an active unit looks up the cache; it never keys one.
+    fn source_set_digest(&self) -> Option<String> {
+        let dep_info = File::open(self.dep_info.as_ref()?).ok()?;
+        if dep_info.metadata().ok()?.len() > MAX_DEP_INFO_BYTES {
+            return None;
+        }
+        let dep_info = std::io::read_to_string(dep_info).ok()?;
+        let sources = crate::cache_key::parse_dep_info(&dep_info);
+        // Contents only, sorted: a restore may spell the same paths differently.
+        let mut contents = Vec::with_capacity(sources.len());
+        let mut budget = MAX_SOURCE_BYTES;
+        for source in sources {
+            let path = if source.is_absolute() {
+                source
+            } else {
+                self.invocation_cwd.as_ref()?.join(source)
+            };
+            // The last compile's dep-info can name a module a branch switch
+            // deleted; the files that remain still identify the return.
+            let mut input = match File::open(&path) {
+                Ok(input) => input,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            if !input.metadata().ok()?.is_file() {
+                return None;
+            }
+            let mut content = blake3::Hasher::new();
+            let read = std::io::copy(
+                &mut std::io::Read::take(&mut input, budget + 1),
+                &mut content,
+            )
+            .ok()?;
+            budget = budget.checked_sub(read)?;
+            contents.push(*content.finalize().as_bytes());
+        }
+        if contents.is_empty() {
+            return None;
+        }
+        contents.sort_unstable();
+        let mut hash = blake3::Hasher::new();
+        for content in &contents {
+            hash.update(content);
+        }
         Some(hash.finalize().to_hex().to_string())
     }
 
@@ -482,8 +551,20 @@ impl AdaptiveUnit {
         if !active_lease_allowed(&state, now, nonempty_real_directory(&self.rustc_dir)) {
             return None;
         }
+        // A revert or branch switch back to cached sources restores this unit
+        // and lets its dependents hit; the key path keeps this state on a miss.
+        let current = state
+            .cached_sources
+            .as_ref()
+            .and_then(|_| self.source_set_digest());
+        if current.is_some() && current == state.cached_sources && current != state.last_sources {
+            return None;
+        }
 
         let mut busy = state;
+        if current.is_some() {
+            busy.last_sources = current;
+        }
         busy.active_leases += 1;
         busy.in_flight = true;
         if !self.store_state(&busy, true) {
@@ -528,6 +609,8 @@ impl AdaptiveUnit {
             active_leases: 0,
             last_used_secs: 0,
             in_flight: false,
+            cached_sources: None,
+            last_sources: None,
         });
         busy.in_flight = true;
         if !self.store_state(&busy, true) {
@@ -583,6 +666,8 @@ impl AdaptiveUnit {
             active_leases: 0,
             last_used_secs: now,
             in_flight: true,
+            cached_sources: previous.cached_sources.clone(),
+            last_sources: None,
         };
         if !self.store_state(&busy, true) {
             reset_locked(self);
@@ -630,6 +715,8 @@ impl AdaptiveUnit {
             active_leases: 0,
             last_used_secs: now,
             in_flight: false,
+            cached_sources: self.source_set_digest(),
+            last_sources: None,
         };
         let stored = self.store_state(&learning, false);
         drop(lock);
@@ -829,6 +916,8 @@ impl AdaptiveUnit {
             active_leases: 0,
             last_used_secs: 0,
             in_flight: true,
+            cached_sources: None,
+            last_sources: None,
         }
     }
 }
@@ -876,6 +965,8 @@ impl Lease {
             active_leases: 0,
             last_used_secs: now,
             in_flight: true,
+            cached_sources: previous.cached_sources.clone(),
+            last_sources: None,
         };
         // The in-flight record already on disk covers this graph, and the
         // write replaces it with another in-flight state, so it needs no flush.
@@ -954,7 +1045,13 @@ impl Lease {
                 let _ = reset_locked(&self.unit);
                 return false;
             }
-            (Completion::Seed { observation, .. }, CompileOutcome::Success) => Some(DiskState {
+            (
+                Completion::Seed {
+                    observation,
+                    previous,
+                },
+                CompileOutcome::Success,
+            ) => Some(DiskState {
                 schema: STATE_SCHEMA,
                 unit_key: self.unit.unit_key.clone(),
                 phase: Phase::Active,
@@ -962,6 +1059,11 @@ impl Lease {
                 active_leases: 0,
                 last_used_secs: now,
                 in_flight: false,
+                last_sources: previous
+                    .cached_sources
+                    .as_ref()
+                    .and_then(|_| self.unit.source_set_digest()),
+                cached_sources: previous.cached_sources,
             }),
             // A failed seed leaves the unit as it found it; the next miss seeds again.
             (Completion::Seed { previous, .. }, _) => Some(previous),
@@ -1080,6 +1182,13 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
                 .primary_source
                 .as_deref()
                 .is_some_and(|hash| !valid_hex_digest(hash)))
+    {
+        return false;
+    }
+    if [&state.cached_sources, &state.last_sources]
+        .into_iter()
+        .flatten()
+        .any(|hash| !valid_hex_digest(hash))
     {
         return false;
     }
@@ -2667,6 +2776,177 @@ mod tests {
         assert!(lease.finish_at(CompileOutcome::Success, 11));
     }
 
+    /// A unit in `checkout/` whose Cargo dep-info names two source files.
+    fn fixture_with_sources() -> (TempDir, PathBuf, AdaptiveUnit) {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let deps = checkout.join("target/debug/deps");
+        let incremental = checkout.join("target/debug/incremental");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::create_dir_all(&deps).unwrap();
+        fs::create_dir(&incremental).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "mod a;").unwrap();
+        fs::write(checkout.join("src/a.rs"), "cached").unwrap();
+        fs::write(
+            deps.join("sample-1234abcd.d"),
+            format!(
+                "{}: src/lib.rs src/a.rs\n\nsrc/lib.rs:\nsrc/a.rs:\n",
+                deps.join("sample-1234abcd.d").display()
+            ),
+        )
+        .unwrap();
+        let argv = [
+            "/toolchain/bin/rustc".to_string(),
+            "--crate-name".into(),
+            "sample".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "src/lib.rs".into(),
+            "--out-dir".into(),
+            deps.to_string_lossy().into_owned(),
+            "-C".into(),
+            format!("incremental={}", incremental.display()),
+            "-Cextra-filename=-1234abcd".into(),
+        ];
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("CARGO_PRIMARY_PACKAGE", "1")],
+            Some(checkout.clone()),
+            None,
+            temp.path().to_owned(),
+        );
+        let args = RustcArgs::parse_for(&argv, &env).unwrap();
+        let unit = AdaptiveUnit::eligible(&args, b"").unwrap();
+        (temp, checkout, unit)
+    }
+
+    #[test]
+    fn an_active_unit_back_at_cached_sources_looks_up_the_cache() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        let edit = |text: &str| fs::write(checkout.join("src/a.rs"), text).unwrap();
+        teach(&unit, 100);
+        edit("first edit");
+        let seed = unit
+            .try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                101,
+            )
+            .unwrap();
+        fs::write(seed.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(seed.finish_at(CompileOutcome::Success, 102));
+
+        edit("second edit");
+        let lease = unit
+            .try_active_at(103)
+            .expect("a real edit keeps the fast path");
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+
+        edit("cached");
+        assert!(unit.try_active_at(105).is_none());
+        let state = read_state(&unit);
+        assert_eq!((state.phase, state.in_flight), (Phase::Active, false));
+        assert!(nonempty_real_directory(&unit.rustc_dir));
+    }
+
+    #[test]
+    fn a_dependency_only_rebuild_keeps_the_fast_path() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        // Only an extern changed: the unit's own sources still match the cache.
+        let seed = unit
+            .try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-a", "extern-b"),
+                101,
+            )
+            .unwrap();
+        fs::write(seed.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(seed.finish_at(CompileOutcome::Success, 102));
+        for at in [103, 105] {
+            let lease = unit
+                .try_active_at(at)
+                .expect("unchanged sources stay active");
+            assert!(lease.finish_at(CompileOutcome::Success, at + 1));
+        }
+
+        // Moving away and back is a return to the cached sources.
+        fs::write(checkout.join("src/a.rs"), "edited").unwrap();
+        let lease = unit.try_active_at(107).unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 108));
+        fs::write(checkout.join("src/a.rs"), "cached").unwrap();
+        assert!(unit.try_active_at(109).is_none());
+    }
+
+    #[test]
+    fn source_set_digest_covers_only_a_complete_readable_dep_info() {
+        let (_temp, checkout, mut unit) = fixture_with_sources();
+        let dep_info = unit.dep_info.clone().unwrap();
+        let write = |text: &str| fs::write(&dep_info, text).unwrap();
+        let relative = "out.d: src/lib.rs src/a.rs\n";
+        write(relative);
+        let digest = unit.source_set_digest().unwrap();
+        assert_eq!(read_state_after_teach(&unit), Some(digest.clone()));
+
+        fs::write(checkout.join("src/a.rs"), "edited").unwrap();
+        let from_edit = unit.source_set_digest();
+        assert_ne!(from_edit, Some(digest));
+
+        // The size cap is inclusive.
+        let at_cap = MAX_DEP_INFO_BYTES as usize;
+        write(&format!(
+            "{relative}#{}",
+            "x".repeat(at_cap - relative.len() - 1)
+        ));
+        assert!(unit.source_set_digest().is_some());
+        write(&format!(
+            "{relative}#{}",
+            "x".repeat(at_cap - relative.len())
+        ));
+        assert!(unit.source_set_digest().is_none());
+
+        // A deleted file drops out of the set; nothing left is no digest.
+        write("out.d: src/lib.rs src/a.rs src/deleted.rs\n");
+        assert_eq!(unit.source_set_digest(), from_edit);
+        for unusable in ["out.d:\n", "out.d: src/deleted.rs\n", "out.d: src\n"] {
+            write(unusable);
+            assert!(unit.source_set_digest().is_none(), "{unusable:?}");
+        }
+        // Only a missing file is skipped; any other open error gives up.
+        #[cfg(unix)]
+        {
+            write("out.d: src/lib.rs src/lib.rs/below\n");
+            assert!(unit.source_set_digest().is_none());
+        }
+
+        // The budget on source bytes is inclusive.
+        let big = checkout.join("src/big.rs");
+        let sized = |len: u64| File::create(&big).unwrap().set_len(len).unwrap();
+        write("out.d: src/big.rs\n");
+        sized(MAX_SOURCE_BYTES);
+        assert!(unit.source_set_digest().is_some());
+        sized(MAX_SOURCE_BYTES + 1);
+        assert!(unit.source_set_digest().is_none());
+
+        // Spelling does not matter, but relative paths need the invocation
+        // directory.
+        write(relative);
+        let from_relative = unit.source_set_digest();
+        write(&format!(
+            "out.d: {} {}\n",
+            checkout.join("src/a.rs").display(),
+            checkout.join("src/lib.rs").display()
+        ));
+        assert_eq!(unit.source_set_digest(), from_relative);
+        unit.invocation_cwd = None;
+        assert_eq!(unit.source_set_digest(), from_relative);
+        write(relative);
+        assert!(unit.source_set_digest().is_none());
+    }
+
+    fn read_state_after_teach(unit: &AdaptiveUnit) -> Option<String> {
+        teach(unit, 100);
+        read_state(unit).cached_sources
+    }
+
     #[test]
     fn second_distinct_dynamic_miss_seeds_then_activates() {
         let (_temp, _args, unit) = fixture();
@@ -2923,6 +3203,8 @@ mod tests {
             active_leases: MAX_ACTIVE_LEASES - 1,
             last_used_secs: 100,
             in_flight: false,
+            cached_sources: None,
+            last_sources: None,
         };
 
         assert!(active_lease_allowed(&state, 100 + ACTIVE_IDLE_SECS, true));
@@ -3258,6 +3540,15 @@ mod tests {
         state.in_flight = false;
         assert!(valid_state(&state, &unit.unit_key));
 
+        let digests: [fn(&mut DiskState) -> &mut Option<String>; 2] =
+            [|s| &mut s.cached_sources, |s| &mut s.last_sources];
+        for field in digests {
+            *field(&mut state) = Some("not-hex".into());
+            assert!(!valid_state(&state, &unit.unit_key));
+            *field(&mut state) = Some(cache_key("sources"));
+            assert!(valid_state(&state, &unit.unit_key));
+        }
+
         state.phase = Phase::Seed;
         assert!(!valid_state(&state, &unit.unit_key));
         state.in_flight = true;
@@ -3318,6 +3609,8 @@ mod tests {
                     active_leases: 0,
                     last_used_secs: 11,
                     in_flight: true,
+                    cached_sources: None,
+                    last_sources: None,
                 };
                 fs::write(&unit.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
             } else {

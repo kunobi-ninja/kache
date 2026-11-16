@@ -155,7 +155,7 @@ fn file_names_checkout(
         std::fs::File::open(path)?,
         checkout,
         target,
-        longest + PATH_TAIL,
+        longest.saturating_add(PATH_TAIL),
     )
 }
 
@@ -169,19 +169,13 @@ fn reader_names_checkout(
 ) -> std::io::Result<bool> {
     let mut window: Vec<u8> = Vec::with_capacity(CHUNK + tail);
     loop {
-        let start = window.len();
-        window.resize(start + CHUNK, 0);
-        let mut filled = start;
-        while filled < window.len() {
-            match file.read(&mut window[filled..]) {
-                Ok(0) => break,
-                Ok(read) => filled += read,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let complete = filled < window.len();
-        window.truncate(filled);
+        // `read_to_end` retries an interrupted read.
+        let read = (&mut file).take(CHUNK as u64).read_to_end(&mut window)?;
+        let complete = read < CHUNK;
+        debug_assert!(
+            complete || read > 0,
+            "a chunk that is not the last reads bytes"
+        );
         if names_checkout(&window, checkout, target, complete, tail) {
             return Ok(true);
         }
@@ -477,5 +471,32 @@ mod tests {
             bytes.len() + 1
         ));
         assert!(names_checkout(bytes, &checkout, &[], true, bytes.len() + 1));
+    }
+
+    #[test]
+    fn a_nul_ends_a_path_in_the_target_check() {
+        let checkout: &[&[u8]] = &[b"/work/a"];
+        let target: &[&[u8]] = &[b"/work/a/target"];
+        assert!(!found(b"/work/a/target/x.o\0../../y", checkout, target));
+    }
+
+    #[test]
+    fn a_lowercase_drive_letter_gains_its_uppercase_spelling() {
+        let forms = spellings(Path::new(r"c:\work\a"));
+        assert!(forms.contains(&b"C:/work/a".to_vec()), "{forms:?}");
+        assert!(forms.contains(&b"c:/work/a".to_vec()), "{forms:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_checkout_is_searched_in_both_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().canonicalize().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let forms = spellings(&link);
+        assert!(forms.contains(&link.to_str().unwrap().as_bytes().to_vec()));
+        assert!(forms.contains(&real.to_str().unwrap().as_bytes().to_vec()));
     }
 }

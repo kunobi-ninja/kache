@@ -4285,4 +4285,35 @@ mod tests {
             }
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_remapped_in_both_spellings_and_a_plain_one_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().canonicalize().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let prefixes = |path: &Path| {
+            let mut rules = Vec::new();
+            push_rule_spellings(&mut rules, Some(path.to_path_buf()), "<HOME>");
+            rules
+                .into_iter()
+                .map(|rule| rule.prefix)
+                .collect::<Vec<_>>()
+        };
+        let both = prefixes(&link);
+        assert!(
+            both.contains(&real.to_str().unwrap().to_string()),
+            "{both:?}"
+        );
+        assert!(
+            both.contains(&link.to_str().unwrap().to_string()),
+            "{both:?}"
+        );
+        assert_eq!(prefixes(&real), vec![real.to_str().unwrap().to_string()]);
+        let mut rules = Vec::new();
+        push_rule_spellings(&mut rules, None, "<HOME>");
+        assert!(rules.is_empty());
+    }
 }

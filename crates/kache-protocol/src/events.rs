@@ -276,6 +276,11 @@ pub struct BuildEvent {
     /// state seeded this compile. Empty when none did.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub incremental_seed: String,
+    /// How the first private compile of a unit looked for another checkout's
+    /// incremental state: `imported`, `no-donor` or `unportable`. Empty when
+    /// it did not look. `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_seed_attempt: String,
     /// Why `Store::put` failed, when the compiler ran and produced outputs that
     /// were then not cached (kunobi-ninja/kache#629).
     ///
@@ -630,6 +635,7 @@ impl BuildEvent {
             store_error: String::new(),
             store_handed_off: false,
             incremental_seed: String::new(),
+            incremental_seed_attempt: String::new(),
             daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),

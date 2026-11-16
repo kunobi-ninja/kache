@@ -6681,7 +6681,8 @@ fn adaptive_compile_before_key(
         ctx.args.invokes_linker(),
         ctx.config.test_lease.as_deref(),
     );
-    let mut compiler_args = prepare_worktree_compiler_args(ctx.config, ctx.args, &mut lease);
+    let (mut compiler_args, seed_attempt) =
+        prepare_worktree_compiler_args(ctx.config, ctx.args, &mut lease);
     let bootstrap = std::cell::Cell::new(lease.worktree_bootstrap());
     let bootstrap_observed = std::cell::Cell::new(false);
     let ready = !bootstrap.get()
@@ -6855,6 +6856,7 @@ fn adaptive_compile_before_key(
         .lookup_ms(lookup_ms)
         .passthrough_reason("adaptive seed".to_owned())
         .incremental_seed(seeded_from.as_deref())
+        .incremental_seed_attempt(seed_attempt.settle(seeded_from.is_some()))
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -8641,27 +8643,82 @@ fn discard_bootstrap_outputs(outputs: &ArtifactSet) -> bool {
     true
 }
 
+/// How a private compile looked for another checkout's incremental state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeedAttempt {
+    NotTried,
+    /// It looked, but the invocation could not be made portable.
+    Unportable,
+    NoDonor,
+    Imported,
+}
+
+impl SeedAttempt {
+    /// `looked`: the unit had no state of its own and seeding was on.
+    /// `imported` holds the lease's donor, which an earlier preparation may
+    /// have set.
+    fn of(looked: bool, portable: bool, imported: bool) -> Self {
+        match (imported, looked, portable) {
+            (true, ..) => Self::Imported,
+            (false, false, _) => Self::NotTried,
+            (false, true, false) => Self::Unportable,
+            (false, true, true) => Self::NoDonor,
+        }
+    }
+
+    /// The outcome once the compile ran: an earlier preparation may have
+    /// imported the seed, and a declined bootstrap discards an import.
+    fn settle(self, seeded: bool) -> Self {
+        match (self, seeded) {
+            (_, true) => Self::Imported,
+            (Self::Imported, false) => Self::Unportable,
+            (other, false) => other,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotTried => "",
+            Self::Unportable => "unportable",
+            Self::NoDonor => "no-donor",
+            Self::Imported => "imported",
+        }
+    }
+}
+
 fn prepare_worktree_compiler_args(
     config: &Config,
     args: &RustcArgs,
     lease: &mut Lease,
-) -> Vec<String> {
+) -> (Vec<String>, SeedAttempt) {
     let automatic = automatic_seeding_enabled(config, args);
-    if !automatic {
-        return lease.worktree_compiler_args(
-            args,
-            config.incremental_seed_from.as_deref(),
-            config.unstable,
-        );
-    }
-    let donors = if let Some(profile) = &config.incremental_seed_from {
-        vec![profile.clone()]
-    } else if lease.needs_worktree_donor() {
-        automatic_worktree_donors(config, args)
+    let (compiler_args, looked) = if !automatic {
+        let donor = config.incremental_seed_from.as_deref();
+        let looked = config.unstable && donor.is_some() && lease.needs_worktree_donor();
+        (
+            lease.worktree_compiler_args(args, donor, config.unstable),
+            looked,
+        )
     } else {
-        Vec::new()
+        let looked = lease.needs_worktree_donor();
+        let donors = if let Some(profile) = &config.incremental_seed_from {
+            vec![profile.clone()]
+        } else if looked {
+            automatic_worktree_donors(config, args)
+        } else {
+            Vec::new()
+        };
+        (
+            lease.worktree_compiler_args_from(args, &donors, true),
+            looked,
+        )
     };
-    lease.worktree_compiler_args_from(args, &donors, true)
+    let attempt = SeedAttempt::of(
+        looked,
+        lease.worktree_portable(),
+        lease.worktree_seed_donor().is_some(),
+    );
+    (compiler_args, attempt)
 }
 
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
@@ -8741,7 +8798,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
-    let mut compiler_args = prepare_worktree_compiler_args(config, args, &mut lease);
+    let (mut compiler_args, seed_attempt) =
+        prepare_worktree_compiler_args(config, args, &mut lease);
     let permit = adaptive_lane_takes_permit(kind).then(|| {
         scheduler::begin_keyless_compile(
             &config.cache_dir,
@@ -8869,6 +8927,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         .lookup_ms(lookup_ms)
         .passthrough_reason(reason)
         .incremental_seed(seeded_from.as_deref())
+        .incremental_seed_attempt(seed_attempt.settle(seeded_from.is_some()))
         .exit_code(result.exit_code)
         .key_record(key_record),
     );
@@ -9368,6 +9427,7 @@ pub(crate) struct EventInputs<'a> {
     passthrough_reason: String,
     skip_reason: String,
     incremental_seed: String,
+    incremental_seed_attempt: &'static str,
     object_output: String,
     package: String,
     store_error: String,
@@ -9404,6 +9464,7 @@ impl<'a> EventInputs<'a> {
             passthrough_reason: String::new(),
             skip_reason: String::new(),
             incremental_seed: String::new(),
+            incremental_seed_attempt: "",
             object_output: String::new(),
             package: String::new(),
             store_error: String::new(),
@@ -9524,6 +9585,11 @@ impl<'a> EventInputs<'a> {
     /// The other checkout's profile whose incremental state seeded the compile.
     pub(crate) fn incremental_seed(mut self, donor: Option<&Path>) -> Self {
         self.incremental_seed = donor.map_or_else(String::new, |donor| donor.display().to_string());
+        self
+    }
+
+    fn incremental_seed_attempt(mut self, attempt: SeedAttempt) -> Self {
+        self.incremental_seed_attempt = attempt.as_str();
         self
     }
 
@@ -9717,6 +9783,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         passthrough_reason,
         skip_reason,
         incremental_seed,
+        incremental_seed_attempt,
         object_output,
         package,
         store_error,
@@ -9844,6 +9911,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         passthrough_reason,
         skip_reason,
         incremental_seed,
+        incremental_seed_attempt: incremental_seed_attempt.to_owned(),
         miss_reason,
         object_output,
         package,

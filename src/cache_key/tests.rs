@@ -7586,6 +7586,42 @@ fn guard_exclude_leaves_named_directories_out_of_the_workspace_guard() {
     );
 }
 
+/// The guard leaves out the target directory and `.git` at the workspace
+/// root only. Entries with those names deeper in the tree still count, in
+/// the digest and in the stat walk behind the guard.
+#[test]
+fn a_skipped_path_leaves_out_only_itself_not_its_name_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("target/debug/libx.rlib"), "");
+    write_file(&root.join(".git/HEAD"), "ref");
+    write_file(&root.join("assets/target/a.txt"), "");
+    write_file(&root.join("vendor/.git/HEAD"), "");
+    let canonical_root = root.canonicalize().unwrap();
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_target: canonical_root.join("target"),
+        canonical_root,
+        target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        guard_excluded: Vec::new(),
+    };
+    let hasher = FileHasher::new();
+    for nested in ["assets/target/b.txt", "vendor/.git/index"] {
+        let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+        write_file(&root.join(nested), "x");
+        assert!(!taken.held(), "{nested}");
+        assert_ne!(
+            workspace_tree_digest(&roots, &hasher).unwrap(),
+            taken.digest,
+            "{nested}"
+        );
+    }
+}
+
 /// A closure that names a file in a left-out directory keeps no guard: a
 /// macro listing that directory could find a new file the guard never sees.
 #[test]

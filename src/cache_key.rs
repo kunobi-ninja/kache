@@ -1673,6 +1673,7 @@ pub(crate) struct InvocationKeyScope {
     compile_while_keying: bool,
     provided_dep_info: Option<(DepInfo, Option<TreeGuard>)>,
     remote_rows: Option<RemoteRows>,
+    compiled_remaps: Option<CompiledRemaps>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -1683,6 +1684,7 @@ impl InvocationKeyScope {
             compile_while_keying: COMPILE_WHILE_KEYING.with(|cell| cell.replace(false)),
             provided_dep_info: PROVIDED_DEP_INFO.with(|cell| cell.replace(None)),
             remote_rows: REMOTE_ROWS.with(|cell| cell.replace(None)),
+            compiled_remaps: COMPILED_REMAPS.with(|cell| cell.replace(None)),
             _thread_bound: std::marker::PhantomData,
         }
     }
@@ -1695,6 +1697,7 @@ impl Drop for InvocationKeyScope {
         let discarded_dep_info =
             PROVIDED_DEP_INFO.with(|cell| cell.replace(self.provided_dep_info.take()));
         let discarded_remote = REMOTE_ROWS.with(|cell| cell.replace(self.remote_rows.take()));
+        COMPILED_REMAPS.with(|cell| *cell.borrow_mut() = self.compiled_remaps.take());
         // Release callback captures after every slot has been restored and
         // outside the RefCell borrow, so their destructors can observe it.
         drop((discarded_dep_info, discarded_remote));
@@ -2210,9 +2213,10 @@ pub(crate) fn take_execute_remaps(args: &RustcArgs, skip_remap: bool) -> Option<
     remaps
 }
 
-/// Most directories a registry package may hold before a compile that runs
-/// ahead of its key leaves out the registry remaps.
-const MAX_PROVISIONAL_DIRS: usize = 4096;
+/// Most entries a package walk reads. Every key of a registry unit walks its
+/// package, cache hits included; a larger package compiles without registry
+/// remaps in every lane. About 99% of crates.io packages are smaller.
+const MAX_PACKAGE_ENTRIES: usize = 1024;
 
 struct CompiledRemaps {
     crate_name: String,
@@ -2266,9 +2270,10 @@ pub(crate) fn remaps_cover_closure(
     sources: &[PathBuf],
     applied: &[String],
 ) -> bool {
+    let applied: std::collections::HashSet<&str> = applied.iter().map(String::as_str).collect();
     registry_directory_remaps(registry, sources, std::path::MAIN_SEPARATOR)
         .iter()
-        .all(|remap| applied.contains(remap))
+        .all(|remap| applied.contains(remap.as_str()))
 }
 
 /// Registry remaps for every directory of the unit's package, for a compile
@@ -2276,7 +2281,7 @@ pub(crate) fn remaps_cover_closure(
 /// rustc writes: each path still takes its deepest directory's remap.
 pub(crate) fn provisional_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
     let (registry, manifest_dir) = registry_remap_unit(args)?;
-    let placeholders: Vec<PathBuf> = package_directories(&manifest_dir, MAX_PROVISIONAL_DIRS)?
+    let placeholders: Vec<PathBuf> = package_directories(&manifest_dir, MAX_PACKAGE_ENTRIES)?
         .into_iter()
         .map(|dir| dir.join("_"))
         .collect();
@@ -2310,19 +2315,21 @@ pub(crate) fn registry_remap_unit(args: &RustcArgs) -> Option<(PathBuf, PathBuf)
 }
 
 /// `root` and every directory below it, without following links. `None`
-/// past `limit` directories or on any read error.
+/// past `limit` entries read or on any read error.
 fn package_directories(root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
     let mut found = vec![root.to_path_buf()];
     let mut next = 0;
+    let mut read = 0;
     while let Some(dir) = found.get(next).cloned() {
         next += 1;
         for entry in std::fs::read_dir(&dir).ok()? {
+            read += 1;
+            if read > limit {
+                return None;
+            }
             let entry = entry.ok()?;
             if entry.file_type().ok()?.is_dir() {
                 found.push(entry.path());
-                if found.len() > limit {
-                    return None;
-                }
             }
         }
     }

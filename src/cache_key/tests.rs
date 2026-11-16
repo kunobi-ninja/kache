@@ -23158,10 +23158,11 @@ fn package_directories_stop_at_their_limit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let package = registry_package(&root);
-    // The package, src, src/inner, tests and tests/data.
-    assert_eq!(package_directories(&package, 5).unwrap().len(), 5);
-    assert!(package_directories(&package, 4).is_none());
-    assert!(package_directories(&root.join("missing"), 5).is_none());
+    // Entries: src, tests, src/lib.rs, src/inner, tests/data, src/inner/mod.rs.
+    let found = package_directories(&package, 6).unwrap();
+    assert_eq!(found.len(), 5);
+    assert!(package_directories(&package, 5).is_none());
+    assert!(package_directories(&root.join("missing"), 6).is_none());
 }
 
 #[test]
@@ -23283,4 +23284,20 @@ fn a_package_that_cannot_be_walked_keys_without_remaps_in_both_lanes() {
     let key_first = key_first.unwrap();
     assert_eq!(emitted.unwrap(), key_first);
     assert_ne!(key_first, walked);
+}
+
+#[test]
+fn an_invocation_starts_without_an_earlier_compile_record() {
+    let mut args = RustcArgs::default();
+    args.crate_name = Some("scoped".to_string());
+    args.source_file = Some(PathBuf::from("lib.rs"));
+    record_compiled_remaps(&args, Some(vec!["x".to_string()]));
+    {
+        let _scope = InvocationKeyScope::enter();
+        assert_eq!(compiled_remaps(&args), None);
+        record_compiled_remaps(&args, None);
+        assert_eq!(compiled_remaps(&args), Some(None));
+    }
+    assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
+    record_compiled_remaps(&args, None);
 }

@@ -9635,9 +9635,9 @@ impl<'db> FileHasher<'db> {
     /// the input was observed moves on any later write. One taken sooner can
     /// survive a second write in the same timestamp tick, so the input is
     /// recorded by content alone and every lookup compares that content. For
-    /// a file of 64 KiB or more the comparison goes through the file-hash
-    /// memo, which answers by stamp, so it is only as fresh as that memo's
-    /// rows. Refusing the record instead would keep a fresh checkout from
+    /// a file of [`SOURCE_MEMO_MIN_BYTES`] or more (any size on Windows) the
+    /// comparison goes through the file-hash memo, which answers by stamp, so
+    /// it is only as fresh as that memo's rows. Refusing the record instead would keep a fresh checkout from
     /// memoising anything.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,

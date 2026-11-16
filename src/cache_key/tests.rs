@@ -6414,6 +6414,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         canonical_target: PathBuf::from("/private/w/target"),
         out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
         vendored_package: None,
+        guard_excluded: Vec::new(),
     }
 }
 
@@ -7286,6 +7287,7 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         target: root.join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        guard_excluded: Vec::new(),
     };
     let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
     let relative = PathBuf::from;
@@ -7322,17 +7324,19 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         );
     }
     let mut entered = HashMap::new();
-    assert!(walk_reaches(&root, "/top.txt", true, &mut entered));
+    assert!(walk_reaches(&root, "/top.txt", true, &[], &mut entered));
     assert!(walk_reaches(
         &root,
         "/kt/src/../src/lib.rs",
         true,
+        &[],
         &mut entered
     ));
     assert!(!walk_reaches(
         &root,
         "/../w/kt/src/lib.rs",
         true,
+        &[],
         &mut entered
     ));
 }
@@ -7423,6 +7427,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/kt-1/out")),
         vendored_package: None,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7477,6 +7482,7 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
         canonical_target: dir.path().join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
@@ -7497,6 +7503,144 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
     let before = registry();
     write_file(&package.join("stale/debug/a"), "");
     assert_ne!(registry(), before, "a registry package is read whole");
+}
+
+/// Untracked tool output, such as the state file pnpm writes into
+/// `node_modules` with the checkout's path and a timestamp, keeps two
+/// checkouts of one commit from sharing workspace records
+/// (kunobi-ninja/kache#1912). Directories the project names in
+/// `[workspace] guard_exclude` are left out at any depth.
+#[test]
+fn guard_exclude_leaves_named_directories_out_of_the_workspace_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = |name: &str, installed_at: Option<&str>| {
+        let (root, _) = workspace_invocation(dir.path(), name, "kt");
+        write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+        write_file(&root.join("web/package.json"), "{}");
+        if let Some(installed_at) = installed_at {
+            let state = format!("{{\"root\":\"{}\",\"at\":{installed_at}}}", root.display());
+            write_file(
+                &root.join("node_modules/.pnpm-workspace-state-v1.json"),
+                &state,
+            );
+            write_file(&root.join("web/node_modules/x/index.js"), installed_at);
+        }
+        root
+    };
+    let roots_of = |root: &Path| {
+        let name = root.file_name().unwrap().to_str().unwrap();
+        let (_, args) = workspace_invocation(dir.path(), name, "kt");
+        workspace_roots_in(&args, &manifest_vars(&root.join("kt")), root).unwrap()
+    };
+    let hasher = FileHasher::new();
+    let digest = |root: &Path| workspace_tree_digest(&roots_of(root), &hasher).unwrap();
+    let [a, b, c] = [
+        checkout("a", Some("1")),
+        checkout("b", Some("2")),
+        checkout("c", None),
+    ];
+    assert_ne!(digest(&a), digest(&b), "without the setting");
+
+    for root in [&a, &b, &c] {
+        write_file(
+            &root.join(".kache.toml"),
+            "[workspace]\nguard_exclude = [\"node_modules\"]\n",
+        );
+    }
+    let shared = digest(&a);
+    assert_eq!(digest(&b), shared, "another install");
+    assert_eq!(digest(&c), shared, "no install");
+    let mut plain = roots_of(&c);
+    assert_eq!(plain.guard_excluded, ["node_modules"]);
+    plain.guard_excluded.clear();
+    assert_ne!(
+        workspace_tree_digest(&plain, &hasher).unwrap(),
+        shared,
+        "the names are part of the digest"
+    );
+
+    let taken = tree_guard_of(&hasher, || workspace_tree_digest(&roots_of(&a), &hasher)).unwrap();
+    write_file(&a.join("web/node_modules/x/index.js"), "reinstalled");
+    assert!(taken.held(), "an install while the unit compiles");
+    write_file(&a.join("assets/new.txt"), "macro input");
+    assert!(!taken.held());
+    assert_ne!(digest(&a), shared, "the rest of the tree still counts");
+    std::fs::remove_dir_all(a.join("assets")).unwrap();
+    write_file(&a.join("kt/node_modules"), "a file, not a directory");
+    assert_ne!(digest(&a), shared, "only directories are left out");
+}
+
+/// A closure that names a file in a left-out directory keeps no guard: a
+/// macro listing that directory could find a new file the guard never sees.
+#[test]
+fn a_closure_reading_a_guard_excluded_directory_keeps_no_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    for file in [
+        "kt/src/lib.rs",
+        "node_modules/x/a.js",
+        "web/Node_Modules/y.js",
+    ] {
+        write_file(&root.join(file), "");
+    }
+    let canonical_root = root.canonicalize().unwrap();
+    let mut roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_target: canonical_root.join("target"),
+        canonical_root,
+        target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        guard_excluded: Vec::new(),
+    };
+    let sources = |files: &[&str]| files.iter().map(|file| root.join(file)).collect::<Vec<_>>();
+    let lib = sources(&["kt/src/lib.rs"]);
+    let bundled = sources(&["kt/src/lib.rs", "node_modules/x/a.js"]);
+    let other_case = sources(&["kt/src/lib.rs", "web/Node_Modules/y.js"]);
+    assert!(guard_covers(&bundled, &roots));
+    assert!(guard_covers(&other_case, &roots));
+    roots.guard_excluded = vec!["node_modules".into()];
+    assert!(guard_covers(&lib, &roots));
+    assert!(!guard_covers(&bundled, &roots));
+    assert!(
+        !guard_covers(&other_case, &roots),
+        "a case-insensitive filesystem"
+    );
+}
+
+/// The setting is used only when every entry is one directory name; anything
+/// else leaves the whole tree under the guard.
+#[test]
+fn guard_exclude_accepts_only_plain_directory_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let excluded = |config: &str| {
+        std::fs::write(dir.path().join(".kache.toml"), config).unwrap();
+        workspace_guard_excluded(dir.path())
+    };
+    assert_eq!(
+        excluded(
+            "[cache]\nlocal_max_size = \"1GiB\"\n[workspace]\nguard_exclude = [\"node_modules\", \".vite-hooks\"]\n"
+        ),
+        vec![
+            std::ffi::OsString::from("node_modules"),
+            ".vite-hooks".into()
+        ]
+    );
+    for config in [
+        "[workspace]\nguard_exclude = [\"node_modules\", \"web/node_modules\"]\n",
+        "[workspace]\nguard_exclude = [\"..\"]\n",
+        "[workspace]\nguard_exclude = [\".\"]\n",
+        "[workspace]\nguard_exclude = [\"\"]\n",
+        "[workspace]\nguard_exclude = [\"a\\\\b\"]\n",
+        "[workspace]\nguard_exclude = \"node_modules\"\n",
+        "[workspace\n",
+        "",
+    ] {
+        assert!(excluded(config).is_empty(), "{config}");
+    }
+    std::fs::remove_file(dir.path().join(".kache.toml")).unwrap();
+    assert!(workspace_guard_excluded(dir.path()).is_empty());
 }
 
 #[test]
@@ -7520,6 +7664,7 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/foo-1/out")),
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
@@ -7595,6 +7740,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard_excluded: Vec::new(),
     };
     // Old times, so a name added beside the package moves them on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
@@ -7638,6 +7784,7 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard_excluded: Vec::new(),
     }
 }
 
@@ -7749,6 +7896,7 @@ fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     let readable = workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7857,6 +8005,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: None,
+        guard_excluded: Vec::new(),
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -17172,7 +17321,7 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
 
     assert!(tree_digest_memoised(roots(), &hasher, 4, &memo, now).is_none());
     assert_eq!(hasher.stats().bytes_hashed, 0, "no file is read");
-    assert!(oversized_tree_marker(&memo, &tree, 4).exists());
+    assert!(oversized_tree_marker(&memo, &tree, &[], 4).exists());
     assert!(
         tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_some(),
         "the marker is per budget"
@@ -17188,7 +17337,7 @@ fn an_oversized_tree_is_counted_not_hashed_and_remembered() {
         tree_digest_memoised(roots(), &hasher, 4, &memo, half_an_hour).is_none(),
         "still remembered half an hour on"
     );
-    let marked = std::fs::metadata(oversized_tree_marker(&memo, &tree, 4))
+    let marked = std::fs::metadata(oversized_tree_marker(&memo, &tree, &[], 4))
         .and_then(|metadata| metadata.modified())
         .unwrap();
     assert!(
@@ -17231,8 +17380,8 @@ fn tree_budgets_add_up_across_roots_and_skip_exclusions() {
         ]
     };
     assert!(tree_digest_memoised(roots(), &hasher, 5, &memo, now).is_none());
-    assert!(!oversized_tree_marker(&memo, &first, 5).exists());
-    assert!(!oversized_tree_marker(&memo, &second, 5).exists());
+    assert!(!oversized_tree_marker(&memo, &first, &[], 5).exists());
+    assert!(!oversized_tree_marker(&memo, &second, &[], 5).exists());
     assert!(tree_digest_memoised(roots(), &hasher, 6, &memo, now).is_some());
 
     std::fs::remove_file(second.join("f2")).unwrap();
@@ -17663,7 +17812,10 @@ fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
         crate_tree_fold(
             root,
             &gone,
-            &[],
+            GuardSkips {
+                paths: &[],
+                dir_names: &[],
+            },
             false,
             &GuardFileHashes {
                 hasher: &hasher,

@@ -131,14 +131,16 @@ The check has costs:
 - A workspace of more than 20,000 entries is not checked, so its crates
   always use dependency discovery.
 - A crate that reads a file outside the workspace, in a target directory
-  other than its `OUT_DIR`, or through a symlinked directory always uses
-  dependency discovery.
+  other than its `OUT_DIR`, through a symlinked directory, or in a directory
+  left out with `guard_exclude` always uses dependency discovery.
 
 The check does not see:
 
-- A directory a macro lists outside the workspace, or through a symlinked
-  directory, that held no file the crate read when the record was made. A
-  file added there goes unseen.
+- A directory a macro lists outside the workspace, through a symlinked
+  directory, or in a directory the project leaves out with
+  [`guard_exclude`](/docs/getting-started/configuration#tool-output-in-the-workspace),
+  that held no file the crate read when the record was made. A file added
+  there goes unseen.
 - On Windows, a listed file removed and put back with its old size and
   modification time while the crate compiles. On Linux and macOS its new
   inode and change time show it.

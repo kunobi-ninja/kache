@@ -945,14 +945,34 @@ impl GuardWalk {
     }
 }
 
-/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk_observing`]
-/// takes it.
+/// One root of a [`GuardWalk`], as [`stamp_roots`] walks it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WalkedRoot {
     path: PathBuf,
     role: Vec<u8>,
     excluded: Vec<PathBuf>,
+    /// Directory names left out at any depth below the root.
+    excluded_dirs: Vec<std::ffi::OsString>,
     rules: crate::tree_stamp::StampRules,
+}
+
+/// What a guard walk leaves out below its root: `paths`, and every
+/// directory named in `dir_names`. A symlink is never a directory here.
+#[derive(Clone, Copy)]
+struct GuardSkips<'a> {
+    paths: &'a [PathBuf],
+    dir_names: &'a [std::ffi::OsString],
+}
+
+impl GuardSkips<'_> {
+    fn skips(&self, path: &Path, entry: &std::fs::DirEntry) -> bool {
+        self.paths
+            .iter()
+            .any(|skipped| skipped.file_name() == path.file_name() && skipped == path)
+            || (!self.dir_names.is_empty()
+                && self.dir_names.iter().any(|name| *name == entry.file_name())
+                && entry.file_type().is_ok_and(|kind| kind.is_dir()))
+    }
 }
 
 /// Why [`stamp_roots`] gave no stamps.
@@ -1063,9 +1083,13 @@ fn walk_one_root(root: &WalkedRoot, max_entries: usize, collect_small_files: boo
             });
         }
     };
-    match stamper.walk_observing(
+    let skips = GuardSkips {
+        paths: &root.excluded,
+        dir_names: &root.excluded_dirs,
+    };
+    match stamper.walk_skipping_observing(
         &root.path,
-        &root.excluded,
+        &|path, entry| skips.skips(path, entry),
         root.rules,
         &mut budget,
         &mut observe,
@@ -1233,6 +1257,9 @@ struct TreeRoot<'a> {
     /// Kache's own directories, and what Cargo writes in its home, below the
     /// root ([`own_dirs_within`]), left out wherever they lie.
     own: Vec<PathBuf>,
+    /// Directory names left out at any depth below the root
+    /// ([`WorkspaceRoots::guard_excluded`]).
+    excluded_dirs: Vec<std::ffi::OsString>,
 }
 
 impl<'a> TreeRoot<'a> {
@@ -1243,12 +1270,20 @@ impl<'a> TreeRoot<'a> {
             skipped,
             skips_build_dirs: false,
             own: Vec::new(),
+            excluded_dirs: Vec::new(),
         }
     }
 
     fn skipping_build_dirs(self) -> Self {
         Self {
             skips_build_dirs: true,
+            ..self
+        }
+    }
+
+    fn excluding_dirs(self, names: &[std::ffi::OsString]) -> Self {
+        Self {
+            excluded_dirs: names.to_vec(),
             ..self
         }
     }
@@ -1280,6 +1315,7 @@ impl<'a> TreeRoot<'a> {
             path: self.path.clone(),
             role: self.role.to_vec(),
             excluded: self.excluded(),
+            excluded_dirs: self.excluded_dirs.clone(),
             rules: self.stamp_rules(),
         }
     }
@@ -1304,11 +1340,20 @@ fn tree_digest(
 /// pre-pass, so a stale answer costs a shortcut, never a wrong key.
 pub(crate) const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// The marker recording that `root` holds more than `max_entries` entries.
-fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> PathBuf {
+/// The marker recording that `root` holds more than `max_entries` entries
+/// once the directories named in `excluded_dirs` are left out.
+fn oversized_tree_marker(
+    memo_dir: &Path,
+    root: &Path,
+    excluded_dirs: &[std::ffi::OsString],
+    max_entries: usize,
+) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(root.as_os_str().as_encoded_bytes());
     hasher.update(&max_entries.to_le_bytes());
+    for name in excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+    }
     memo_dir
         .join("oversized-trees")
         .join(&hasher.finalize().to_hex()[..32])
@@ -1325,6 +1370,9 @@ fn oversized_roots_marker(memo_dir: &Path, roots: &[WalkedRoot], max_entries: us
             b"root:",
             root.path.as_os_str().as_encoded_bytes(),
         );
+        for name in &root.excluded_dirs {
+            fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+        }
     }
     hasher.update(&max_entries.to_le_bytes());
     memo_dir
@@ -1386,7 +1434,7 @@ fn tree_digest_memoised(
     }
     if roots.iter().any(|root| {
         marked_recently(
-            &oversized_tree_marker(memo_dir, &root.path, max_entries),
+            &oversized_tree_marker(memo_dir, &root.path, &root.excluded_dirs, max_entries),
             now,
         )
     }) {
@@ -1403,6 +1451,7 @@ fn tree_digest_memoised(
             write_marker(&oversized_tree_marker(
                 memo_dir,
                 &walked[index].path,
+                &walked[index].excluded_dirs,
                 max_entries,
             ));
             return None;
@@ -1480,10 +1529,18 @@ fn root_digest(
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_DIGEST_VERSION);
     fold_field(&mut hasher, b"root:", root.role);
+    // Only when set, so a tree without exclusions keeps its digest.
+    for name in &root.excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+    }
+    let excluded = root.excluded();
     let read_every_file = crate_tree_fold(
         &root.path,
         &root.path,
-        &root.excluded(),
+        GuardSkips {
+            paths: &excluded,
+            dir_names: &root.excluded_dirs,
+        },
         root.skips_build_dirs,
         &GuardFileHashes {
             hasher: file_hasher,
@@ -1537,6 +1594,9 @@ fn tree_digest_memo(memo_dir: &Path, root: &TreeRoot<'_>) -> PathBuf {
     fold_field(&mut hasher, b"role:", root.role);
     for name in root.skipped {
         fold_field(&mut hasher, b"skipped:", name.as_bytes());
+    }
+    for name in &root.excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
     }
     fold_field(
         &mut hasher,
@@ -1608,7 +1668,7 @@ struct GuardFileHashes<'a, 'db> {
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
-    excluded: &[PathBuf],
+    excluded: GuardSkips<'_>,
     skips_build_dirs: bool,
     files: &GuardFileHashes<'_, '_>,
     hasher: &mut blake3::Hasher,
@@ -1631,7 +1691,7 @@ fn crate_tree_fold(
     let mut read_every_file = true;
     for entry in entries {
         let path = entry.path();
-        if excluded.contains(&path) {
+        if excluded.skips(&path, &entry) {
             continue;
         }
         *budget = budget.checked_sub(1)?;
@@ -3209,6 +3269,9 @@ pub(crate) struct WorkspaceRoots {
     /// The package directory, for a vendored package ([`is_vendored_package`]):
     /// its guard is the package, not the workspace.
     pub(crate) vendored_package: Option<PathBuf>,
+    /// Directory names the workspace guard leaves out at any depth
+    /// ([`workspace_guard_excluded`]).
+    pub(crate) guard_excluded: Vec<std::ffi::OsString>,
 }
 
 impl WorkspaceRoots {
@@ -3295,9 +3358,55 @@ fn workspace_roots_in(
             .map(|path| joined_under(Some(current_dir), Path::new(path))),
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
+        guard_excluded: workspace_guard_excluded(&root),
         root,
         target,
     })
+}
+
+/// The directory names `[workspace] guard_exclude` lists in the `.kache.toml`
+/// at the workspace root. The file is part of the tree the guard digests, so
+/// two checkouts whose guards match leave out the same names.
+///
+/// Leaving a directory out is the project's promise that no macro lists it,
+/// the way the guard already treats a directory outside the workspace: a
+/// closure that names a file there keeps no guard ([`guard_covers`]), but a
+/// file added to a directory a macro listed and found empty goes unseen.
+/// Empty when the file is missing or the setting is not a list of plain
+/// names, so the guard then reads the whole tree.
+fn workspace_guard_excluded(root: &Path) -> Vec<std::ffi::OsString> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Envelope {
+        workspace: Option<Section>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Section {
+        guard_exclude: Vec<String>,
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(".kache.toml")) else {
+        return Vec::new();
+    };
+    let names = match toml::from_str::<Envelope>(&text) {
+        Ok(envelope) => envelope.workspace.unwrap_or_default().guard_exclude,
+        Err(_) => return Vec::new(),
+    };
+    let plain = |name: &str| {
+        !name.contains(['/', '\\'])
+            && matches!(
+                Path::new(name).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+    };
+    if !names.iter().all(|name| plain(name)) {
+        tracing::warn!(
+            "ignoring [workspace] guard_exclude in {}: each entry must be one directory name",
+            root.join(".kache.toml").display()
+        );
+        return Vec::new();
+    }
+    names.into_iter().map(Into::into).collect()
 }
 
 /// Rows of workspace and path units, filed under an identity with the
@@ -3478,6 +3587,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
         excluded: vec![directory.join(".git")],
+        excluded_dirs: Vec::new(),
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
@@ -3565,8 +3675,11 @@ fn workspace_tree_digest_within(
         suffix_within(workspace.target.as_os_str(), &workspace.root, 0).unwrap_or_default();
     let target = target.trim_start_matches(['/', '\\']);
     let skipped = [target, ".git"];
-    let mut roots =
-        vec![TreeRoot::new(workspace.root.clone(), b"workspace", &skipped).skipping_build_dirs()];
+    let mut roots = vec![
+        TreeRoot::new(workspace.root.clone(), b"workspace", &skipped)
+            .skipping_build_dirs()
+            .excluding_dirs(&workspace.guard_excluded),
+    ];
     if let Some(out_dir) = &workspace.out_dir {
         roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
     }
@@ -7713,7 +7826,14 @@ fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
     let mut entered = HashMap::new();
     sources.iter().all(|source| {
         guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
-            walk_reaches(root, &below, skips_build_dirs, &mut entered)
+            // Only the workspace walk, the one that skips build dirs, leaves
+            // directory names out.
+            let excluded: &[std::ffi::OsString] = if skips_build_dirs {
+                &workspace.guard_excluded
+            } else {
+                &[]
+            };
+            walk_reaches(root, &below, skips_build_dirs, excluded, &mut entered)
         })
     })
 }
@@ -7740,12 +7860,15 @@ fn guard_place<'a>(
 
 /// Does a walk from `root` that follows no symlink reach the file at
 /// `below`, a lexical path inside `root`? With `skips_build_dirs`, not
-/// through a directory Cargo tagged as its build directory either.
-/// `entered` keeps the answer for each directory checked.
+/// through a directory Cargo tagged as its build directory either, and never
+/// through one named in `excluded_dirs`, compared without ASCII case as a
+/// case-insensitive filesystem would. `entered` keeps the answer for each
+/// directory checked.
 fn walk_reaches(
     root: &Path,
     below: &str,
     skips_build_dirs: bool,
+    excluded_dirs: &[std::ffi::OsString],
     entered: &mut HashMap<(PathBuf, bool), bool>,
 ) -> bool {
     use std::path::Component;
@@ -7766,6 +7889,12 @@ fn walk_reaches(
             depth = up;
             directory.pop();
             continue;
+        }
+        if excluded_dirs.iter().any(|name| {
+            name.as_encoded_bytes()
+                .eq_ignore_ascii_case(component.as_os_str().as_encoded_bytes())
+        }) {
+            return false;
         }
         directory.push(component);
         depth += 1;

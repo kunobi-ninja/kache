@@ -649,6 +649,19 @@ propagate_to_dependents = true
 
 Workspace rules are accepted only from the `.kache.toml` beside the active Cargo workspace manifest. After adding a declaration to a target Cargo already considers fresh, rebuild that package once.
 
+## Tool output in the workspace
+
+Kache reuses a workspace crate's recorded inputs only while the workspace holds what the recording build saw (see [Rust key inputs](/docs/how-it-works/cache-key#rust-key-inputs)). Tools that write into the tree, such as pnpm installing `node_modules`, leave files that differ between checkouts. A new worktree then runs dependency discovery for every workspace crate, even when each crate then restores from the cache.
+
+Use it only for directories that nothing reads while Rust compiles: no proc macro, build script or `include_str!`-style macro opens, lists or scans anything in them. List such a directory in the `.kache.toml` at the workspace root:
+
+```toml title=".kache.toml"
+[workspace]
+guard_exclude = ["node_modules"]
+```
+
+Each entry is a directory name, left out at any depth below the workspace root and matched without ASCII case. Kache cannot check that the directory is unread. If something does read it, a change there can go unseen and a crate can restore a result built from the old files. For example, a proc macro that reads a config file in the directory without reporting it, and picks which other files to include from it, keeps its old result when that config file changes. A crate whose recorded inputs name a file in a left-out directory keeps running dependency discovery, but most reads are not recorded that way. Kache ignores the whole list when any entry is not a single name, such as `web/node_modules`.
+
 ## Remote settings
 
 | Environment | TOML key | Default | Purpose |

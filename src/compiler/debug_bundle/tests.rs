@@ -281,8 +281,24 @@ fn a_failed_restore_leaves_no_partial_bundle() {
             None,
             "unsafe path: /etc/x",
         ),
-        (manifest("", r#""""#), None, "unsafe path: "),
-        (manifest("", r#""./x""#), None, "unsafe path: ./x"),
+        (manifest(both, r#""""#), None, "unsafe path: "),
+        (manifest(both, r#""./x""#), None, "unsafe path: ./x"),
+        (manifest("", ""), None, "lists no files"),
+        (manifest("", r#""Contents/empty""#), None, "lists no files"),
+        (
+            manifest(both, r#""contents/INFO.plist""#),
+            None,
+            "lists contents/INFO.plist twice",
+        ),
+        (
+            manifest(
+                r#"{"path":"Contents/Info.plist","name":"foo.dsym.0"},
+                   {"path":"contents/info.PLIST","name":"foo.dsym.1"}"#,
+                "",
+            ),
+            None,
+            "lists contents/info.PLIST twice",
+        ),
         (
             manifest(both, r#""Contents/Info.plist""#),
             None,
@@ -417,4 +433,125 @@ fn staging_snapshots_the_bundle_it_was_given() {
     );
     assert_eq!(manifest.empty_files, ["Contents/Resources/empty"]);
     assert_eq!(manifest.version, MANIFEST_VERSION);
+}
+
+/// A bundle with no file content is not stored: its manifest could never
+/// restore.
+#[test]
+fn a_bundle_without_content_is_not_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("foo.dSYM");
+    std::fs::create_dir_all(source.join("Contents")).unwrap();
+    std::fs::write(source.join("Contents/empty"), b"").unwrap();
+    let staging = tempfile::tempdir_in(dir.path()).unwrap();
+    let error = stage(&source, "foo", staging.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("no files with content"),
+        "{error}"
+    );
+}
+
+fn complete_bundle(root: &Path, marker: &[u8]) {
+    std::fs::create_dir_all(root.join("Contents/Resources/DWARF")).unwrap();
+    std::fs::write(root.join("Contents/Info.plist"), marker).unwrap();
+    std::fs::write(root.join("Contents/Resources/DWARF/foo"), marker).unwrap();
+}
+
+/// What a reader sees at `bundle`: nothing, or which complete bundle.
+fn observe(bundle: &Path) -> &'static str {
+    if bundle.symlink_metadata().is_err() {
+        return "absent";
+    }
+    let read = |path: &str| std::fs::read(bundle.join(path)).ok();
+    match (
+        read("Contents/Info.plist"),
+        read("Contents/Resources/DWARF/foo"),
+    ) {
+        (Some(a), Some(b)) if a == b && a == b"old" => "old",
+        (Some(a), Some(b)) if a == b && a == b"new" => "new",
+        _ => "partial",
+    }
+}
+
+/// The bundle path holds the old bundle, then nothing, then the new one:
+/// the old bundle is moved aside whole before the new one is renamed in,
+/// and deleted only afterwards.
+#[test]
+fn publishing_never_exposes_a_partial_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("foo.dSYM");
+    complete_bundle(&bundle, b"old");
+    let staging = new_bundle_staging(&bundle).unwrap();
+    complete_bundle(staging.path(), b"new");
+
+    let mut seen = Vec::new();
+    publish_bundle_via(staging, &bundle, &mut |from, to| {
+        seen.push(observe(&bundle));
+        std::fs::rename(from, to)
+    })
+    .unwrap();
+    seen.push(observe(&bundle));
+    assert_eq!(seen, ["old", "absent", "new"]);
+    assert!(leftovers(dir.path()).is_empty());
+}
+
+/// If the new bundle cannot be renamed into place, the old one is put back
+/// and both private directories are removed.
+#[test]
+fn a_failed_publish_puts_the_old_bundle_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("foo.dSYM");
+    complete_bundle(&bundle, b"old");
+    let staging = new_bundle_staging(&bundle).unwrap();
+    complete_bundle(staging.path(), b"new");
+    let staged = staging.path().to_path_buf();
+
+    let error = publish_bundle_via(staging, &bundle, &mut |from, to| {
+        if from == staged {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        std::fs::rename(from, to)
+    })
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("publishing debug bundle"),
+        "{error:#}"
+    );
+    assert_eq!(observe(&bundle), "old");
+    assert!(leftovers(dir.path()).is_empty());
+
+    // With nothing at the bundle path, a failed publish leaves nothing there.
+    std::fs::remove_dir_all(&bundle).unwrap();
+    let staging = new_bundle_staging(&bundle).unwrap();
+    complete_bundle(staging.path(), b"new");
+    publish_bundle_via(staging, &bundle, &mut |_, _| {
+        Err(std::io::ErrorKind::NotFound.into())
+    })
+    .unwrap_err();
+    assert_eq!(observe(&bundle), "absent");
+    assert!(leftovers(dir.path()).is_empty());
+}
+
+/// Moving the old bundle aside can fail for reasons other than absence;
+/// the publish then stops without touching it.
+#[test]
+fn a_bundle_that_cannot_be_moved_aside_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("foo.dSYM");
+    complete_bundle(&bundle, b"old");
+    let staging = new_bundle_staging(&bundle).unwrap();
+    complete_bundle(staging.path(), b"new");
+    let mut calls = 0;
+    let error = publish_bundle_via(staging, &bundle, &mut |_, _| {
+        calls += 1;
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    })
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("moving aside stale bundle"),
+        "{error:#}"
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(observe(&bundle), "old");
+    assert!(leftovers(dir.path()).is_empty());
 }

@@ -114,6 +114,13 @@ pub(super) fn stage(
         });
         files.push((staged, name));
     }
+    // A restore refuses a manifest with no files, so such a bundle is not
+    // worth storing.
+    anyhow::ensure!(
+        !files.is_empty(),
+        "debug bundle has no files with content: {}",
+        bundle_dir.display()
+    );
     let manifest_name = format!("{stem}{MANIFEST_SUFFIX}");
     let manifest_path = staging_dir.join(&manifest_name);
     std::fs::write(
@@ -199,6 +206,10 @@ fn restore_via(
         "unsupported debug bundle manifest version {}",
         parsed.version
     );
+    anyhow::ensure!(
+        !parsed.files.is_empty(),
+        "debug bundle manifest lists no files"
+    );
 
     let mut seen = std::collections::HashSet::new();
     let mut planned = Vec::with_capacity(parsed.files.len());
@@ -252,9 +263,12 @@ fn restore_via(
 }
 
 /// A relative path made only of normal components, not seen before.
+///
+/// Paths are compared without case: APFS is case-insensitive by default, so
+/// two names that differ only in case would land on the same file.
 fn checked_path<'a>(
     path: &'a str,
-    seen: &mut std::collections::HashSet<&'a str>,
+    seen: &mut std::collections::HashSet<String>,
 ) -> Result<&'a Path> {
     let relative = Path::new(path);
     anyhow::ensure!(
@@ -265,7 +279,7 @@ fn checked_path<'a>(
         "debug bundle manifest has an unsafe path: {path}"
     );
     anyhow::ensure!(
-        seen.insert(path),
+        seen.insert(path.to_lowercase()),
         "debug bundle manifest lists {path} twice"
     );
     Ok(relative)
@@ -311,25 +325,47 @@ pub(super) fn new_bundle_staging(bundle_dir: &Path) -> Result<tempfile::TempDir>
 /// Replace `bundle_dir` with the fully assembled `staging` directory. A stale
 /// `.dSYM` from an earlier build would otherwise shadow the restored one for
 /// lldb.
+///
+/// Whatever is at `bundle_dir` is renamed aside first and deleted only after
+/// the new bundle is in place, so the path holds either a complete bundle or
+/// nothing, never a half-deleted one. If the final rename fails, the old
+/// bundle is moved back.
 pub(super) fn publish_bundle(staging: tempfile::TempDir, bundle_dir: &Path) -> Result<()> {
-    if bundle_dir.symlink_metadata().is_ok() {
-        if bundle_dir.is_dir() {
-            std::fs::remove_dir_all(bundle_dir)
-                .with_context(|| format!("removing stale bundle {}", bundle_dir.display()))?;
-        } else {
-            std::fs::remove_file(bundle_dir)
-                .with_context(|| format!("removing stale bundle {}", bundle_dir.display()))?;
+    publish_bundle_via(staging, bundle_dir, &mut |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn publish_bundle_via(
+    staging: tempfile::TempDir,
+    bundle_dir: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let aside_dir = new_bundle_staging(bundle_dir)?;
+    let aside = aside_dir.path().join("previous");
+    let moved_aside = match rename(bundle_dir, &aside) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("moving aside stale bundle {}", bundle_dir.display()));
         }
+    };
+    if let Err(error) = rename(staging.path(), bundle_dir) {
+        if moved_aside {
+            let _ = rename(&aside, bundle_dir);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "publishing debug bundle {} -> {}",
+                staging.path().display(),
+                bundle_dir.display()
+            )
+        });
     }
-    std::fs::rename(staging.path(), bundle_dir).with_context(|| {
-        format!(
-            "publishing debug bundle {} -> {}",
-            staging.path().display(),
-            bundle_dir.display()
-        )
-    })?;
     // The directory now lives at `bundle_dir`; nothing is left to clean up.
     let _ = staging.keep();
+    // Dropping `aside_dir` deletes the old bundle.
     Ok(())
 }
 

@@ -72,7 +72,7 @@ The `save-cache` input above belongs to kache-action. maturin-action has no equi
 
 Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.
 
-On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential, and `KACHE_REMOTE_READONLY=0` does not turn that off. The one exception is a pull request job with a prefix of its own, described below.
+On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. On GitHub Actions a **scheduled run** of a protected branch counts too: it has no actor and no inputs, and it runs that branch's own code. Pull requests, merge requests, tags, unprotected branches and `workflow_dispatch` runs are read-only even if the job has a write credential, and `KACHE_REMOTE_READONLY=0` does not turn that off. The one exception is a pull request job with a prefix of its own, described below.
 
 A push counts as protected only when GitHub sets `GITHUB_REF_PROTECTED=true` or GitLab sets `CI_COMMIT_REF_PROTECTED=true`, so a branch the CI system does not report as protected never publishes, even the default branch. When a push does not publish, the `Remote writes` row of `kache doctor` says why.
 

@@ -38,7 +38,9 @@ fn github_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<F
     let event = display_env(get_env("GITHUB_EVENT_NAME"));
     let ref_type = display_env(get_env("GITHUB_REF_TYPE"));
     Some(ForcedReadonly {
-        reason: format!("GitHub Actions {event} ({ref_type}) is not a protected-branch push"),
+        reason: format!(
+            "GitHub Actions {event} ({ref_type}) is not a protected-branch push or scheduled run"
+        ),
     })
 }
 
@@ -53,8 +55,13 @@ fn gitlab_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<F
 }
 
 fn is_trusted_github_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
-    get_env("GITHUB_EVENT_NAME").as_deref() == Some("push")
-        && get_env("GITHUB_REF_TYPE").as_deref() == Some("branch")
+    // A scheduled run has no actor and no inputs, and always runs the default
+    // branch's own code, so on a protected branch it is as trusted as a push.
+    // `workflow_dispatch` stays out: a person triggers it and can pass inputs.
+    matches!(
+        get_env("GITHUB_EVENT_NAME").as_deref(),
+        Some("push" | "schedule")
+    ) && get_env("GITHUB_REF_TYPE").as_deref() == Some("branch")
         && env_truthy(get_env("GITHUB_REF_PROTECTED"))
 }
 
@@ -192,6 +199,37 @@ mod tests {
         ]);
         let forced = forced_remote_readonly_with(lookup(&vars)).expect("tags are untrusted");
         assert!(forced.reason.contains("tag"), "{}", forced.reason);
+    }
+
+    #[test]
+    fn github_protected_branch_schedule_may_write() {
+        let vars = github(&[
+            ("GITHUB_EVENT_NAME", "schedule"),
+            ("GITHUB_REF_TYPE", "branch"),
+            ("GITHUB_REF_PROTECTED", "true"),
+        ]);
+        assert_eq!(forced_remote_readonly_with(lookup(&vars)), None);
+    }
+
+    #[test]
+    fn github_unprotected_schedule_is_readonly() {
+        let vars = github(&[
+            ("GITHUB_EVENT_NAME", "schedule"),
+            ("GITHUB_REF_TYPE", "branch"),
+            ("GITHUB_REF_PROTECTED", "false"),
+        ]);
+        let forced = forced_remote_readonly_with(lookup(&vars)).expect("unprotected is untrusted");
+        assert!(forced.reason.contains("schedule"), "{}", forced.reason);
+    }
+
+    #[test]
+    fn github_tag_schedule_is_readonly() {
+        let vars = github(&[
+            ("GITHUB_EVENT_NAME", "schedule"),
+            ("GITHUB_REF_TYPE", "tag"),
+            ("GITHUB_REF_PROTECTED", "true"),
+        ]);
+        assert!(forced_remote_readonly_with(lookup(&vars)).is_some());
     }
 
     #[test]

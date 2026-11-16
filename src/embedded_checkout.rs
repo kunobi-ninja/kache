@@ -282,6 +282,13 @@ mod tests {
         assert!(found(b"/work/a/target-old/assets\0", checkout, target));
         assert!(found(b"/work/a/target\0", checkout, target));
         assert!(!found(b"/work/a/target/debug/x..y.o\0", checkout, target));
+        // A space is part of a path, so the climb after it still counts.
+        assert!(found(
+            b"/work/a/target/x y/../../assets\0",
+            checkout,
+            target
+        ));
+        assert!(!found(b"/work/a/target/x y/z.o\0", checkout, target));
     }
 
     #[test]

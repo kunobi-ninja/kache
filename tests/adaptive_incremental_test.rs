@@ -431,6 +431,12 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
         "the first edit after a hit discovers its closure once: {after_hit:#}"
     );
 
+    // Returning to cached source inside the active window, as a revert or a
+    // branch switch does, restores instead of compiling incrementally.
+    let returned = build(1);
+    assert_eq!(returned["result"], "local_hit", "event: {returned:#}");
+    assert_eq!(returned["compiler_runs"], 0);
+
     // The predicted key may select incremental compilation, but must not
     // publish its output. With policy state removed, this variant still misses.
     fs::remove_dir_all(&policy_root).unwrap();

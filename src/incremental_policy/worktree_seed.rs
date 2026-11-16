@@ -382,6 +382,8 @@ fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
         }
         let donor = AdaptiveUnit {
             source_file: None,
+            dep_info: None,
+            invocation_cwd: None,
             original_incremental: profile.join("incremental"),
             unit_key: name,
             unit_dir: entry.path(),

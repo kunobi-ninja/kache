@@ -3947,6 +3947,7 @@ fn save_manifest_config(
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,

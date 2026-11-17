@@ -145,6 +145,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
+| `KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES` | `cache.auto_clean_superseded_executables` | `0` | Keep this many builds of each test binary, program, example and bench in target directories still in use, and let the daemon remove older ones; `0` disables it. See [Superseded executables](#superseded-executables). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
@@ -467,6 +468,21 @@ Cargo units are kept on a filesystem where reads never change an access time (`n
 The same pass reclaims idle graphs under `incremental.kache-auto`, including graphs left after Cargo removed their fingerprints. On local filesystems, managed graphs use their recorded use and directory modification time rather than access times. A running compiler's unit lock protects its graph. Cleanup retains the small lock files so future compilers keep using the same locks.
 
 Terminal width, color and diagnostic format share one incremental directory. Cached diagnostics still use separate cache keys.
+
+### Superseded executables
+
+Frequent `cargo test` runs fill `target/debug/deps` with old test binaries. A change of features, a dependency update or a new toolchain gives a test binary a new unit hash, and Cargo keeps the old build beside it. Agents that test after every edit can collect gigabytes of these within a day, long before unused-unit cleanup would notice them.
+
+Set how many builds of each executable to keep, and the same hourly check removes the older ones from every tracked target directory that stays:
+
+```toml
+[cache]
+auto_clean_superseded_executables = 2
+```
+
+Builds of one executable are those of the same package and target in the same profile, such as the unit tests of one library or one integration test. They are ranked by when Cargo last built them. Keep at least `2` when you alternate commands that build a target with different features, such as `cargo test -p app` and `cargo test --workspace`; with `1`, each command would remove the other's build. Only test binaries, programs, examples and benches count. Libraries, build scripts and `cargo check` output are left to unused-unit cleanup.
+
+Nothing is removed while a command through kache uses the target directory, from a profile a build holds, or from a directory Cargo did not tag as its own. A build that is removed and needed again is restored from the cache or built again.
 
 ### Recorded-command cleanup
 

@@ -113,6 +113,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,

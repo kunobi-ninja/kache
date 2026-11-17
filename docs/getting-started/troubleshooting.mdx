@@ -261,7 +261,11 @@ kache clean --dry-run
 
 This previews tracked target directories and what removing each can free.
 Inside targets you still use, the daemon removes build units no build has read
-for 30 days (`auto_clean_unused_units_days`). To trim obsolete units sooner,
+for 30 days (`auto_clean_unused_units_days`). If old test binaries fill
+`target/debug/deps`, set `auto_clean_superseded_executables = 2` to keep only
+the two newest builds of each; see
+[Superseded executables](/docs/getting-started/configuration#superseded-executables).
+To trim obsolete units sooner,
 record a successful build with `KACHE_TARGET_LIVENESS=1 kache cargo check`,
 then preview `kache clean --units target --dry-run`. See
 [Recorded-command cleanup](/docs/getting-started/configuration#recorded-command-cleanup).

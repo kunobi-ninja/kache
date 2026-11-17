@@ -18,6 +18,12 @@ ignore = [
   # does not expose. cargo-deny must still run per workspace member (a
   # root-only invocation graphs the `kache` bin alone).
   "RUSTSEC-2023-0071",
+  # RUSTSEC-2026-0543: chrono is unmaintained (informational, not a
+  # vulnerability). Every version is affected and no release fixes it. Kache
+  # uses chrono for timestamps in events, stats, doctor output and the
+  # protocol's event types. Moving to `time` or `jiff` is its own change;
+  # re-evaluate when that lands or a vulnerability is reported.
+  "RUSTSEC-2026-0543",
 ]
 
 [bans]

@@ -15780,3 +15780,168 @@ fn a_current_index_without_the_macro_table_gains_it() {
     let db = open_index_db(&path).unwrap();
     assert!(crate::cc_memo::has_header_macros_table(&db).unwrap());
 }
+
+/// Make every `DELETE` on `table` slow, as a cold page cache makes it on a
+/// large index: a trigger counts a million-row join. Returns what deleting
+/// the row `probe` costs (rolled back).
+fn slow_deletes(side: &Connection, table: &str, probe: &str) -> Duration {
+    side.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS slow_n (x);
+         DELETE FROM slow_n;
+         WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000)
+             INSERT INTO slow_n SELECT x FROM c;
+         CREATE TABLE IF NOT EXISTS slow_sink (n);
+         CREATE TRIGGER slow_{table} AFTER DELETE ON {table}
+             BEGIN INSERT INTO slow_sink SELECT count(*) FROM slow_n a, slow_n b; END;"
+    ))
+    .unwrap();
+    side.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    side.execute(
+        &format!("DELETE FROM {table} WHERE cache_key = ?1"),
+        [probe],
+    )
+    .unwrap();
+    let cost = started.elapsed();
+    side.execute_batch("ROLLBACK").unwrap();
+    cost
+}
+
+/// Wait until something else holds the index's write lock.
+fn until_the_write_lock_is_held(side: &Connection) {
+    side.busy_timeout(Duration::ZERO).unwrap();
+    let started = std::time::Instant::now();
+    while side.execute_batch("BEGIN IMMEDIATE").is_ok() {
+        side.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the prune never took the write lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The tombstone prune finds its rows by a stamp no index covers, and
+/// deletes them a short transaction at a time: a put that asks for the
+/// write lock while it runs, waiting in SQLite's busy handler as puts do,
+/// gets it within a few of the prune's transactions, not after all its rows.
+/// Old rows of both tables go, recent ones stay.
+#[test]
+fn a_long_tombstone_prune_lets_a_waiting_put_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let side = Connection::open(dir.path().join("index.db")).unwrap();
+    side.execute(
+        "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES ('recent', datetime('now'))",
+        [],
+    )
+    .unwrap();
+    let row_cost = slow_deletes(&side, "eviction_tombstones", "recent");
+    // The busy handler asks again at most 100 ms apart.
+    let wait = (PRUNE_LOCK_HOLD + row_cost) * 3 + PRUNE_LOCK_GAP + Duration::from_millis(100);
+    let count = (wait.as_secs_f64() * 3.0 / row_cost.as_secs_f64()).ceil() as usize + 2;
+    side.execute_batch(&format!(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {count})
+             INSERT INTO eviction_tombstones (cache_key, evicted_at)
+             SELECT 'old' || x, datetime('now', '-30 days') FROM c;
+         INSERT INTO shadow_victims (cache_key, swept_at, shadow_policy) VALUES
+             ('old-shadow', datetime('now', '-30 days'), 'p'),
+             ('new-shadow', datetime('now'), 'p');"
+    ))
+    .unwrap();
+
+    let pruner = std::thread::spawn(move || store.prune_tombstones(14).map(|n| (n, store)));
+    until_the_write_lock_is_held(&side);
+    side.busy_timeout(wait).unwrap();
+    let got_in = side.execute_batch("BEGIN IMMEDIATE").is_ok();
+    if got_in {
+        side.execute_batch("ROLLBACK").unwrap();
+    }
+    let (removed, store) = pruner.join().unwrap().unwrap();
+
+    assert!(
+        got_in,
+        "a prune of {count} tombstones of {row_cost:?} each kept the write lock past {wait:?}"
+    );
+    assert_eq!(removed, count);
+    assert_eq!(
+        store.tombstone_stats().unwrap().0,
+        1,
+        "the recent one stays"
+    );
+    let shadows: Vec<String> = side
+        .prepare("SELECT cache_key FROM shadow_victims")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(shadows, ["new-shadow"]);
+}
+
+/// A key read as old but evicted again before its delete has a fresh row,
+/// which the prune keeps.
+#[test]
+fn a_tombstone_evicted_again_after_the_prune_read_it_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    store
+        .db
+        .execute(
+            "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES
+                   ('old', datetime('now', '-30 days')),
+                   ('again', datetime('now', '-30 days'))",
+            [],
+        )
+        .unwrap();
+    let keys = store
+        .keys_older_than("eviction_tombstones", "evicted_at", "-14 days")
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    store
+        .db
+        .execute(
+            "UPDATE eviction_tombstones SET evicted_at = datetime('now') WHERE cache_key = 'again'",
+            [],
+        )
+        .unwrap();
+
+    let removed = store
+        .delete_old_rows_by_key("eviction_tombstones", "evicted_at", &keys, "-14 days")
+        .unwrap();
+
+    assert_eq!(removed, 1);
+    let left: String = store
+        .db
+        .query_row("SELECT cache_key FROM eviction_tombstones", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(left, "again");
+}
+
+/// A prune whose rows take far less than [`PRUNE_LOCK_HOLD`] to delete
+/// deletes them in one transaction, after one gap, not one per row.
+#[test]
+fn a_quick_tombstone_prune_deletes_its_rows_in_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    store
+        .db
+        .execute_batch(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200)
+                 INSERT INTO eviction_tombstones (cache_key, evicted_at)
+                 SELECT 'old' || x, datetime('now', '-30 days') FROM c;",
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    assert_eq!(store.prune_tombstones(14).unwrap(), 200);
+    let took = started.elapsed();
+
+    assert!(
+        took < PRUNE_LOCK_GAP * 20,
+        "200 quick deletes took {took:?}, as if they went a transaction each"
+    );
+    assert_eq!(store.tombstone_stats().unwrap().0, 0);
+}

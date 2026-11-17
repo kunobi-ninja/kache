@@ -185,13 +185,15 @@ install started the daemon.
 
 Some daemons still run the installed file:
 
-- a daemon started by Kache 2.2.0 or earlier
+- a daemon started by Kache 2.1.1 or earlier
 - the login task that `kache daemon install` sets up
 - a daemon you run yourself with `kache daemon run`
 - a daemon started after copying the engine failed, for example on a full disk
 
-Any of these makes `cargo install` fail at the end with `Access is denied. (os
-error 5)`. Stop the daemon and build the upgrade without Kache:
+Any of these can make `cargo install` fail at the end with `Access is denied.
+(os error 5)`. Stop every Kache daemon that runs the installed engine, and build
+the upgrade without Kache. `kache daemon stop` stops the daemon for the current
+configuration; run it once for each cache you use.
 
 ```powershell
 kache daemon stop

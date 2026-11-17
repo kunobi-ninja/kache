@@ -15,22 +15,26 @@ const IMAGE: &str = if cfg!(windows) {
 const LOCK: &str = "lock";
 
 /// Where daemon images live: one directory per user, so each engine is
-/// copied once however many caches its daemons serve.
+/// copied once however many caches its daemons serve. Pruning removes what
+/// else is there, so the directory must be one only Kache writes to.
 #[cfg(windows)]
-pub(super) fn root(socket: &Path) -> PathBuf {
-    dirs::data_local_dir()
-        .map(|dir| dir.join("kache").join("daemon-engines"))
-        .unwrap_or_else(|| socket.with_extension("images"))
+pub(super) fn root() -> Result<PathBuf> {
+    Ok(dirs::data_local_dir()
+        .context("locating the local application data directory")?
+        .join("kache")
+        .join("daemon-engines"))
 }
 
 /// Exclusive use of an images root from staging until the daemon runs.
 /// Pruning happens under it, so no starter deletes an image another starter
-/// has placed but not yet started. A running image cannot be deleted.
+/// has placed but not yet started. NTFS refuses to delete a running image.
 pub(super) struct Lock {
     _file: std::fs::File,
 }
 
-pub(super) fn lock(root: &Path) -> Result<Lock> {
+/// Take the images lock, or fail at `deadline` so the caller starts the
+/// installed engine instead of waiting on another cache's daemon start.
+pub(super) fn lock(root: &Path, deadline: Instant) -> Result<Lock> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let path = root.join(LOCK);
     let file = std::fs::OpenOptions::new()
@@ -39,37 +43,65 @@ pub(super) fn lock(root: &Path) -> Result<Lock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("locking {}", path.display()))?;
-    Ok(Lock { _file: file })
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Lock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("{} stayed locked by another daemon start", path.display())
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
 }
 
-/// The image name for an engine: its release, length and modification time.
-/// A copy keeps the modification time, so this names the copy too.
-fn identity(metadata: &std::fs::Metadata) -> String {
+/// The image name for an engine: its release, length, modification time and
+/// file ID. Two builds of one release can share a length and a timestamp, but
+/// not a file; installing or relinking an engine creates a new one.
+fn identity(engine: &Path) -> Result<String> {
+    let metadata = std::fs::metadata(engine)?;
+    let file = kache_fs::file_identity(engine)?;
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |time| time.as_nanos());
-    format!("{VERSION}-{:x}-{modified:x}", metadata.len())
+    Ok(format!(
+        "{VERSION}-{:x}-{modified:x}-{:x}-{:x}",
+        metadata.len(),
+        file.dev,
+        file.ino
+    ))
 }
 
 /// Copy `engine` to `<root>/<identity>/kache-engine.exe` unless that copy
 /// exists, and return it. Images no process runs are removed. The caller
 /// holds [`lock`].
 pub(super) fn stage(engine: &Path, root: &Path, _lock: &Lock) -> Result<PathBuf> {
-    let name = identity(&std::fs::metadata(engine)?);
-    let image = root.join(&name).join(IMAGE);
+    let name = identity(engine)?;
+    let dir = root.join(&name);
+    let image = dir.join(IMAGE);
     if !image.is_file() {
-        std::fs::create_dir_all(root.join(&name))?;
-        let partial = image.with_extension("partial");
+        std::fs::create_dir_all(&dir)?;
+        // An interrupted start can leave a copy behind, possibly read-only.
+        // A new name never collides with it, and pruning removes it later.
+        let partial = dir.join(format!(
+            "{IMAGE}.{}-{}.partial",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos())
+        ));
         let placed = (|| {
             std::fs::copy(engine, &partial).with_context(|| {
                 format!("copying {} to {}", engine.display(), partial.display())
             })?;
             anyhow::ensure!(
-                identity(&std::fs::metadata(engine)?) == name,
+                identity(engine)? == name,
                 "{} changed while it was copied",
                 engine.display()
             );
@@ -123,13 +155,17 @@ pub(super) fn command(image: &Path, frontend: &Path) -> std::process::Command {
 mod tests {
     use super::*;
 
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
     #[test]
     fn staging_copies_an_engine_once_and_removes_older_images() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("images");
         let engine = dir.path().join("kache-engine");
         std::fs::write(&engine, "release one").unwrap();
-        let lock = lock(&root).unwrap();
+        let lock = lock(&root, later()).unwrap();
         let one = stage(&engine, &root, &lock).unwrap();
         assert_ne!(one, engine);
         assert_eq!(std::fs::read(&one).unwrap(), b"release one");
@@ -150,6 +186,46 @@ mod tests {
         let mut expected = vec![two.parent().unwrap().to_owned(), root.join(LOCK)];
         expected.sort();
         assert_eq!(left, expected);
+    }
+
+    /// A rebuild of one release can match the old engine's length and
+    /// timestamp. Installing it replaces the file, so it gets its own image.
+    #[test]
+    fn a_replaced_engine_with_the_same_length_and_time_is_copied_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("images");
+        let engine = dir.path().join("kache-engine");
+        std::fs::write(&engine, "build A").unwrap();
+        let modified = std::fs::metadata(&engine).unwrap().modified().unwrap();
+        let lock = lock(&root, later()).unwrap();
+        let a = stage(&engine, &root, &lock).unwrap();
+
+        let next = dir.path().join("next");
+        std::fs::write(&next, "build B").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let keep_a_file = dir.path().join("a");
+        std::fs::hard_link(&engine, &keep_a_file).unwrap();
+        std::fs::rename(&next, &engine).unwrap();
+        let b = stage(&engine, &root, &lock).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&b).unwrap(), b"build B");
+    }
+
+    #[test]
+    fn a_held_images_lock_fails_at_the_deadline_instead_of_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock(dir.path(), later()).unwrap();
+        let error = lock(dir.path(), Instant::now() + Duration::from_millis(50))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("stayed locked"), "{error:#}");
+        drop(held);
+        lock(dir.path(), Instant::now()).unwrap();
     }
 
     #[test]

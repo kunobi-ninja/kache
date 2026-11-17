@@ -10044,20 +10044,26 @@ fn spawn_detached_daemon(
 /// the daemon runs from `exe`, as it did before.
 fn spawn_daemon(
     exe: &Path,
-    socket: &Path,
+    deadline: Instant,
     stderr: impl Fn() -> kunobi_daemon::launch::DaemonOutput,
 ) -> Result<kunobi_daemon::launch::DaemonChild> {
     #[cfg(windows)]
     {
-        let root = image::root(socket);
-        if exe.starts_with(&root) {
+        let root = image::root();
+        if let Ok(root) = &root
+            && exe.starts_with(root)
+        {
             // A process the daemon started runs its copy already. That copy
             // finds its frontend only through the envelope it was given.
             let frontend =
                 crate::platform::frontend_executable().context("locating the Kache frontend")?;
             return spawn_detached(image::command(exe, &frontend), stderr());
         }
-        let started = image::lock(&root).and_then(|lock| {
+        // Another cache's start holds the images lock only while it copies
+        // and spawns. Waiting longer would stall this build on it.
+        let wait = deadline.min(Instant::now() + Duration::from_secs(5));
+        let started = root.and_then(|root| {
+            let lock = image::lock(&root, wait)?;
             let staged = image::stage(exe, &root, &lock)?;
             spawn_detached(
                 image::command(&staged, &kache_shims::frontend_for(exe)),
@@ -10074,7 +10080,7 @@ fn spawn_daemon(
         }
     }
     #[cfg(not(windows))]
-    let _ = socket;
+    let _ = deadline;
     spawn_detached_daemon(exe, stderr())
 }
 

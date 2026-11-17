@@ -85,9 +85,22 @@ pub(super) fn plan(
 
 pub(super) fn apply(command: &mut Command, plan: Plan) {
     if build_dir_plan_is_current(&plan.config) {
+        if let Some(target) = plan.target.parent() {
+            tag_default_target(target);
+        }
         command
             .env("CARGO_TARGET_DIR", &plan.target)
             .env("CARGO_BUILD_BUILD_DIR", &plan.target);
+    }
+}
+
+/// Cargo tags only a target directory it creates. Here it creates
+/// `target/check` and leaves `target/` an untagged parent, which kache then
+/// never tracks and never offers as an incremental seed donor. Tag it as Cargo
+/// would have; an existing tag is left alone.
+fn tag_default_target(target: &Path) {
+    if std::fs::create_dir_all(target).is_ok() {
+        crate::target_seed::tag_as_cargo_target(target);
     }
 }
 
@@ -220,6 +233,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_separate_check_target_leaves_the_default_target_tagged() {
+        use crate::invocation::InvocationEnv;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project = root.join("workspace");
+        let home = root.join("cargo-home");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let cargo = root.join("cargo");
+        let manifest = project.join("Cargo.toml");
+        kache_fs::testutil::write_executable(
+            &cargo,
+            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", manifest.display()),
+        );
+        let config = crate::test_support::test_config(root.join("cache"));
+        let env = InvocationEnv::from_parts(
+            vec![(OsString::from("CARGO_HOME"), home.into_os_string())],
+            Some(project.clone()),
+            None,
+            root.clone(),
+        );
+        let tag = project.join("target/CACHEDIR.TAG");
+
+        configure(Command::new(&cargo).arg("check"), &cargo, &config, &env);
+        assert!(crate::tree_stamp::is_cargo_build_tag(&tag));
+
+        std::fs::write(&tag, "Signature: other\n").unwrap();
+        configure(Command::new(&cargo).arg("check"), &cargo, &config, &env);
+        assert_eq!(std::fs::read_to_string(&tag).unwrap(), "Signature: other\n");
+
+        std::fs::remove_dir_all(project.join("target")).unwrap();
+        configure(Command::new(&cargo).arg("build"), &cargo, &config, &env);
+        assert!(
+            !project.join("target").exists(),
+            "only a redirected check tags"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn check_target_plans_respect_environment_configuration_and_changed_snapshots() {
         use crate::invocation::InvocationEnv;
         let temp = tempfile::tempdir().unwrap();
@@ -308,6 +361,7 @@ mod tests {
         );
         let outside = root.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
+        std::fs::remove_dir_all(project.join("target")).unwrap();
         std::os::unix::fs::symlink(&outside, project.join("target")).unwrap();
         assert!(
             get(&config, &env).is_none(),

@@ -10059,9 +10059,7 @@ fn spawn_daemon(
                 crate::platform::frontend_executable().context("locating the Kache frontend")?;
             return spawn_detached(image::command(exe, &frontend), stderr());
         }
-        // Another cache's start holds the images lock only while it copies
-        // and spawns. Waiting longer would stall this build on it.
-        let wait = deadline.min(Instant::now() + Duration::from_secs(5));
+        let wait = image::lock_deadline(Instant::now(), deadline);
         let started = root.and_then(|root| {
             let lock = image::lock(&root, wait)?;
             let staged = image::stage(exe, &root, &lock)?;

@@ -32,6 +32,13 @@ pub(super) struct Lock {
     _file: std::fs::File,
 }
 
+/// When to stop waiting for the images lock: 5 s from `now`, or the start
+/// `deadline` if that is sooner. Another cache's start holds the lock only
+/// while it copies and spawns, and waiting longer would stall this build.
+pub(super) fn lock_deadline(now: Instant, deadline: Instant) -> Instant {
+    deadline.min(now + Duration::from_secs(5))
+}
+
 /// Take the images lock, or fail at `deadline` so the caller starts the
 /// installed engine instead of waiting on another cache's daemon start.
 pub(super) fn lock(root: &Path, deadline: Instant) -> Result<Lock> {
@@ -214,6 +221,28 @@ mod tests {
         let b = stage(&engine, &root, &lock).unwrap();
         assert_ne!(a, b);
         assert_eq!(std::fs::read(&b).unwrap(), b"build B");
+    }
+
+    #[test]
+    fn the_images_lock_waits_five_seconds_at_most() {
+        let now = Instant::now();
+        let five = now + Duration::from_secs(5);
+        assert_eq!(lock_deadline(now, now + Duration::from_secs(60)), five);
+        assert_eq!(lock_deadline(now, five), five);
+        let sooner = now + Duration::from_secs(1);
+        assert_eq!(lock_deadline(now, sooner), sooner);
+    }
+
+    #[test]
+    fn a_lock_released_before_the_deadline_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock(dir.path(), later()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        lock(dir.path(), later()).unwrap();
+        release.join().unwrap();
     }
 
     #[test]

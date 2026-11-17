@@ -62,6 +62,18 @@ pub(crate) struct Pruned {
     pub(crate) used: usize,
 }
 
+impl std::ops::Add for Pruned {
+    type Output = Pruned;
+
+    fn add(self, other: Pruned) -> Pruned {
+        Pruned {
+            units: self.units + other.units,
+            bytes: self.bytes + other.bytes,
+            used: self.used + other.used,
+        }
+    }
+}
+
 /// Whether reading a file in `dir` whose access time is older than its
 /// modification time moves the access time, which is what arming relies on.
 /// An error means the probe could not run: a full volume refuses its file,
@@ -670,6 +682,140 @@ fn sweep(
         arm(&fingerprint);
     }
     (pruned, true)
+}
+
+/// Whether a fingerprint's target file names an executable target: a test
+/// build of any target, or a program, example or bench (`test-lib-foo`,
+/// `bin-foo`, ...).
+fn executable_target(stem: &str) -> bool {
+    stem.starts_with("test-")
+        || ["bin-", "example-", "bench-"]
+            .iter()
+            .any(|kind| stem.starts_with(kind))
+}
+
+/// Whether `name` is an executable's file name: a shared layout's
+/// `<name>-<hash>` with no extension or `.exe`, or a per-unit `out/` file
+/// with none or `.exe`.
+fn executable_file(name: &str) -> bool {
+    let after = hashed_name(name).map_or(name, |(stem, _)| &name[stem.len() + 17..]);
+    !after.contains('.') || after.ends_with(".exe")
+}
+
+/// The executable `unit` built, named by its fingerprint's target files, or
+/// `None` when it built none. Every build of one test binary or program has
+/// this name, whatever features, dependencies or toolchain it was built
+/// with. A check of the same target writes metadata only, so it has none.
+fn executable(unit: &Unit, outputs: &Outputs) -> Option<String> {
+    let mut targets: Vec<String> = entries(&unit.fingerprint())
+        .iter()
+        .filter_map(|file| file_name(file).strip_suffix(".json").map(str::to_owned))
+        .collect();
+    if targets.is_empty() || !targets.iter().all(|stem| executable_target(stem)) {
+        return None;
+    }
+    let files = match unit {
+        Unit::PerUnit { dir } => entries(&dir.join("out")),
+        Unit::Shared { .. } => unit.parts(outputs),
+    };
+    let built = files
+        .iter()
+        .any(|file| file.is_file() && executable_file(&file_name(file)));
+    targets.sort();
+    built.then(|| targets.join(","))
+}
+
+/// When `fingerprint` was last written, which Cargo does when it builds the
+/// unit. `None` when it has no readable file.
+fn built_at(fingerprint: &Path) -> Option<SystemTime> {
+    entries(fingerprint)
+        .iter()
+        .filter_map(|file| std::fs::metadata(file).and_then(|m| m.modified()).ok())
+        .max()
+}
+
+/// Each executable unit of `profile`, with its executable's name and when it
+/// was built.
+fn executable_builds(profile: &Path, outputs: &Outputs) -> Vec<(String, SystemTime, Unit)> {
+    units(profile)
+        .into_iter()
+        .filter_map(|unit| {
+            let name = executable(&unit, outputs)?;
+            let built = built_at(&unit.fingerprint())?;
+            Some((name, built, unit))
+        })
+        .collect()
+}
+
+/// Of `builds`, those older than the newest `keep` builds of the same
+/// executable.
+fn superseded(mut builds: Vec<(String, SystemTime, Unit)>, keep: usize) -> Vec<Unit> {
+    builds.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+    builds
+        .chunk_by(|left, right| left.0 == right.0)
+        .flat_map(|same| same.iter().skip(keep).map(|(_, _, unit)| unit.clone()))
+        .collect()
+}
+
+/// Whether superseded executables may be removed from `target_dir`: a
+/// directory Cargo tagged as its own, where no program built there runs.
+fn may_remove_superseded(target_dir: &Path, keep: usize) -> bool {
+    keep > 0
+        && crate::tree_stamp::holds_cargo_build_tag(target_dir)
+        && !crate::target_processes::ActivePrograms::default().uses(target_dir)
+}
+
+/// Remove, from every profile of `target_dir`, the builds of each test
+/// binary, program, example or bench older than its newest `keep`. Another
+/// feature set, dependency version or toolchain builds an executable under
+/// a new unit hash and leaves the old build behind; frequent `cargo test`
+/// runs pile these up. Nothing is removed while a command through kache
+/// uses a target directory, from a profile a build holds, or from a
+/// directory without Cargo's tag. A build removed that is needed again is
+/// built or restored from the cache.
+pub(crate) fn prune_superseded(cache_dir: &Path, target_dir: &Path, keep: usize) -> Pruned {
+    let mut pruned = Pruned::default();
+    if !may_remove_superseded(target_dir, keep) {
+        return pruned;
+    }
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+        return pruned;
+    };
+    for profile in profiles(target_dir) {
+        let Some(_locks) = hold(&profile) else {
+            continue;
+        };
+        let outputs = outputs(&profile);
+        for unit in superseded(executable_builds(&profile, &outputs), keep) {
+            let parts = unit.parts(&outputs);
+            let bytes = parts.iter().map(|part| size(part)).sum::<u64>();
+            if remove(&parts).is_ok() {
+                pruned.units += 1;
+                pruned.bytes += bytes;
+            }
+        }
+    }
+    pruned
+}
+
+/// What [`prune_superseded`] would remove. Reads only, and takes no lock.
+pub(crate) fn preview_superseded(target_dir: &Path, keep: usize) -> Pruned {
+    let mut pruned = Pruned::default();
+    if !may_remove_superseded(target_dir, keep) {
+        return pruned;
+    }
+    for profile in profiles(target_dir) {
+        let outputs = outputs(&profile);
+        for unit in superseded(executable_builds(&profile, &outputs), keep) {
+            pruned.units += 1;
+            pruned.bytes += unit
+                .parts(&outputs)
+                .iter()
+                .map(|part| size(part))
+                .sum::<u64>();
+        }
+    }
+    pruned
 }
 
 /// Cargo locks this process holds, released when dropped.
@@ -1776,5 +1922,189 @@ mod tests {
             support_from(Some(true), || Err(std::io::ErrorKind::StorageFull.into())),
             Support::Unknown(_)
         ));
+    }
+
+    const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+        # This file is a cache directory tag created by cargo.\n";
+    const H1: &str = "1111111111111111";
+    const H2: &str = "2222222222222222";
+    const H3: &str = "3333333333333333";
+    const CHECKED: &str = "4444444444444444";
+
+    /// `app`'s unit tests built under three unit hashes, `days` ago each, a
+    /// check of them older still, and two builds of a library.
+    fn superseded_profile(profile: &Path) {
+        for (hash, days) in [(H1, 3), (H2, 2), (H3, 1)] {
+            let fingerprint = profile.join(".fingerprint").join(format!("app-{hash}"));
+            write(&fingerprint.join("test-lib-app"), "fp");
+            write(&fingerprint.join("test-lib-app.json"), "{}");
+            write(&profile.join(format!("deps/app-{hash}")), "exe");
+            write(&profile.join(format!("deps/app-{hash}.d")), "d");
+            set_times(&fingerprint, ago(days));
+        }
+        let checked = profile.join(".fingerprint").join(format!("app-{CHECKED}"));
+        write(&checked.join("test-lib-app.json"), "{}");
+        write(
+            &profile.join(format!("deps/libapp-{CHECKED}.rmeta")),
+            "meta",
+        );
+        set_times(&checked, ago(9));
+        for hash in [OLD, NEW] {
+            write(
+                &profile.join(format!(".fingerprint/serde-{hash}/lib-serde.json")),
+                "{}",
+            );
+            write(&profile.join(format!("deps/libserde-{hash}.rlib")), "rlib");
+        }
+    }
+
+    fn tagged_target(dir: &Path) -> PathBuf {
+        let target = dir.join("target");
+        superseded_profile(&target.join("debug"));
+        write(&target.join("CACHEDIR.TAG"), CARGO_TAG);
+        target
+    }
+
+    fn remaining(profile: &Path) -> Vec<String> {
+        let mut names: Vec<String> = entries(&profile.join("deps"))
+            .iter()
+            .chain(entries(&profile.join(".fingerprint")).iter())
+            .map(|path| file_name(path))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn superseded_builds_of_an_executable_go_and_the_newest_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = tagged_target(dir.path());
+        let profile = target.join("debug");
+        let before = remaining(&profile);
+
+        let preview = preview_superseded(&target, 2);
+        assert_eq!(remaining(&profile), before, "a preview changes nothing");
+        let pruned = prune_superseded(&cache, &target, 2);
+
+        assert_eq!(pruned, preview);
+        assert_eq!(pruned.units, 1);
+        assert_eq!(
+            pruned.bytes,
+            ("fp".len() + "{}".len() + "exe".len() + "d".len()) as u64
+        );
+        let left = remaining(&profile);
+        for gone in [format!("app-{H1}"), format!("app-{H1}.d")] {
+            assert_eq!(
+                left.iter().filter(|name| **name == gone).count(),
+                0,
+                "{gone}"
+            );
+        }
+        for kept in [H2, H3] {
+            assert_eq!(
+                left.iter()
+                    .filter(|name| **name == format!("app-{kept}"))
+                    .count(),
+                2,
+                "the newest builds keep their fingerprint and executable"
+            );
+        }
+        assert!(
+            left.contains(&format!("libapp-{CHECKED}.rmeta")),
+            "a check is no build"
+        );
+        assert!(
+            left.contains(&format!("libserde-{OLD}.rlib")),
+            "libraries stay"
+        );
+    }
+
+    #[test]
+    fn keeping_one_leaves_only_the_newest_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tagged_target(dir.path());
+        assert_eq!(
+            prune_superseded(&dir.path().join("cache"), &target, 1).units,
+            2
+        );
+        let left = remaining(&target.join("debug"));
+        assert!(left.contains(&format!("app-{H3}")));
+        assert!(!left.contains(&format!("app-{H2}")));
+    }
+
+    #[test]
+    fn nothing_goes_when_off_untagged_or_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = tagged_target(dir.path());
+        let profile = target.join("debug");
+        let before = remaining(&profile);
+
+        assert_eq!(prune_superseded(&cache, &target, 0), Pruned::default());
+        let held = hold(&profile).unwrap();
+        assert_eq!(prune_superseded(&cache, &target, 2), Pruned::default());
+        drop(held);
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature: other\n").unwrap();
+        assert_eq!(preview_superseded(&target, 2), Pruned::default());
+        assert_eq!(prune_superseded(&cache, &target, 2), Pruned::default());
+        assert_eq!(remaining(&profile), before);
+    }
+
+    #[test]
+    fn per_unit_builds_of_an_executable_are_superseded_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        write(&target.join("CACHEDIR.TAG"), CARGO_TAG);
+        let profile = target.join("debug");
+        for (hash, days) in [(H1, 2), (H2, 1)] {
+            let unit = profile.join("build/app").join(hash);
+            write(&unit.join("fingerprint/bin-app.json"), "{}");
+            write(&unit.join("out/app"), "exe");
+            set_times(&unit.join("fingerprint"), ago(days));
+        }
+        let library = profile.join("build/serde").join(H1);
+        write(&library.join("fingerprint/lib-serde.json"), "{}");
+        write(&library.join("out/libserde.rlib"), "rlib");
+
+        assert_eq!(
+            prune_superseded(&dir.path().join("cache"), &target, 1).units,
+            1
+        );
+        assert!(!profile.join("build/app").join(H1).exists());
+        assert!(profile.join("build/app").join(H2).join("out/app").exists());
+        assert!(library.exists());
+    }
+
+    #[test]
+    fn a_unit_was_built_when_its_fingerprint_last_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fingerprint = dir.path().join("fp");
+        write(&fingerprint.join("test-lib-app"), "fp");
+        write(&fingerprint.join("test-lib-app.json"), "{}");
+        let older = filetime::FileTime::from_system_time(ago(2));
+        let newer = filetime::FileTime::from_system_time(ago(1));
+        filetime::set_file_times(fingerprint.join("test-lib-app"), older, older).unwrap();
+        filetime::set_file_times(fingerprint.join("test-lib-app.json"), newer, newer).unwrap();
+        assert_eq!(built_at(&fingerprint), Some(newer.into()));
+        assert_eq!(built_at(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn names_executables_by_their_target_files() {
+        assert!(executable_target("test-lib-app"));
+        assert!(executable_target("test-integration-test-it"));
+        assert!(executable_target("bin-app"));
+        assert!(executable_target("example-demo"));
+        assert!(executable_target("bench-speed"));
+        assert!(!executable_target("lib-app"));
+        assert!(!executable_target("build-script-build-script-build"));
+        assert!(!executable_target("run-build-script-build-script-build"));
+        assert!(executable_file(&format!("app-{H1}")));
+        assert!(executable_file(&format!("app-{H1}.exe")));
+        assert!(executable_file("app"));
+        assert!(!executable_file(&format!("app-{H1}.d")));
+        assert!(!executable_file(&format!("app-{H1}.pdb")));
+        assert!(!executable_file("libserde.rlib"));
     }
 }

@@ -153,6 +153,7 @@ pub(crate) fn due(
     let enabled = config.auto_clean_orphaned_targets
         || config.auto_clean_idle_targets_days > 0
         || config.auto_clean_unused_units_days > 0
+        || config.auto_clean_superseded_executables > 0
         || recovers_free_space(config);
     enabled
         && matches!(trigger, Trigger::Periodic(_))
@@ -228,6 +229,11 @@ pub(crate) struct Swept {
     pub(crate) reclaimed: Vec<(PathBuf, u64)>,
 }
 
+/// Builds kept per executable by superseded-executable cleanup, `0` when off.
+fn superseded_keep(config: &Config) -> usize {
+    usize::try_from(config.auto_clean_superseded_executables).unwrap_or(usize::MAX)
+}
+
 /// How long a unit may go unused before it is removed, `None` when
 /// unused-unit cleanup is off or the window cannot be expressed.
 pub(crate) fn unit_window(days: u64) -> Option<Duration> {
@@ -288,8 +294,15 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
         );
         let intact = intact(&tracked);
         let Some(reason) = reason(config, orphaned, idle) else {
-            if let Some(window) = window.filter(|_| intact && !tracked.discovered) {
-                let pruned = prune_units(config, &tracked, window, at);
+            if intact && !tracked.discovered {
+                let mut pruned = crate::unit_prune::prune_superseded(
+                    &config.cache_dir,
+                    &tracked.path,
+                    superseded_keep(config),
+                );
+                if let Some(window) = window {
+                    pruned = pruned + prune_units(config, &tracked, window, at);
+                }
                 if pruned.units > 0 {
                     swept.pruned.push((tracked.path, pruned));
                 }
@@ -413,11 +426,20 @@ pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Pl
             && pressure_eligible(config, tracked, now)
             && crate::cli::target_reclaimable_bytes(&tracked.path) > 0)
             .then_some(Reason::Pressure),
-        units: window
-            .filter(|_| !tracked.discovered)
-            .map_or_else(Default::default, |window| {
-                preview_units(config, tracked, window, at)
-            }),
+        units: if tracked.discovered {
+            Default::default()
+        } else {
+            // A target selected for removal but kept for now is not pruned.
+            let keep = if reason.is_some() {
+                0
+            } else {
+                superseded_keep(config)
+            };
+            crate::unit_prune::preview_superseded(&tracked.path, keep)
+                + window.map_or_else(Default::default, |window| {
+                    preview_units(config, tracked, window, at)
+                })
+        },
     }
 }
 
@@ -1199,6 +1221,84 @@ mod tests {
             assert_eq!(removed.bytes, preview.bytes);
             assert!(!graph.exists());
         }
+    }
+
+    #[test]
+    fn superseded_executable_cleanup_turns_the_check_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keep = config(dir.path(), false, 0);
+        let quiet = RequestClock::idle();
+        assert!(!due(&keep, Trigger::Periodic(&quiet), Some(0), 0, 10_000));
+        keep.auto_clean_superseded_executables = 1;
+        assert!(due(&keep, Trigger::Periodic(&quiet), Some(0), 0, 10_000));
+        assert_eq!(superseded_keep(&keep), 1);
+    }
+
+    #[test]
+    fn a_target_that_stays_loses_superseded_test_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), false, 0);
+        policy.auto_clean_superseded_executables = 2;
+        let store = Store::open(&policy).unwrap();
+        let (_, live) = tracked_target(&store, root.path(), "live");
+        std::fs::write(
+            live.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+        let now = unix_now_secs();
+        let build = |hash: &str, days: u64| {
+            let fingerprint = live.join(format!("debug/.fingerprint/app-{hash}"));
+            std::fs::create_dir_all(&fingerprint).unwrap();
+            std::fs::create_dir_all(live.join("debug/deps")).unwrap();
+            std::fs::write(fingerprint.join("test-lib-app.json"), "{}").unwrap();
+            std::fs::write(live.join(format!("debug/deps/app-{hash}")), "exe").unwrap();
+            let at = filetime::FileTime::from_unix_time((now - days * DAY_SECS) as i64, 0);
+            filetime::set_file_times(fingerprint.join("test-lib-app.json"), at, at).unwrap();
+            live.join(format!("debug/deps/app-{hash}"))
+        };
+        let oldest = build("1111111111111111", 3);
+        let kept = [build("2222222222222222", 2), build("3333333333333333", 1)];
+        let tracked = store
+            .tracked_target_roots(0)
+            .unwrap()
+            .into_iter()
+            .find(|tracked| tracked.path == live)
+            .unwrap();
+        assert_eq!(plan(&policy, &tracked, now).units.units, 1);
+
+        let swept = sweep(&policy, now).unwrap();
+
+        assert!(swept.removed.is_empty());
+        assert_eq!(swept.pruned.len(), 1);
+        assert_eq!(swept.pruned[0].1.units, 1);
+        assert!(!oldest.exists());
+        assert!(kept.iter().all(|path| path.exists()));
+        assert_eq!(plan(&policy, &tracked, now).units.units, 0);
+    }
+
+    #[test]
+    fn pruned_counts_add_up() {
+        let one = crate::unit_prune::Pruned {
+            units: 1,
+            bytes: 10,
+            used: 2,
+        };
+        let two = crate::unit_prune::Pruned {
+            units: 3,
+            bytes: 30,
+            used: 4,
+        };
+        assert_eq!(
+            one + two,
+            crate::unit_prune::Pruned {
+                units: 4,
+                bytes: 40,
+                used: 6,
+            }
+        );
     }
 
     #[test]

@@ -2735,9 +2735,7 @@ fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
 /// suffix keeps its `.` and `..`, because a record has to reproduce the
 /// spelling rustc reported.
 ///
-/// `\` separates components on Windows only, so the walk has to hold both
-/// with and without it: from `root`, `a\b/..` is one level down on Windows
-/// and back at `root` on Unix.
+/// `\` separates components on Windows only ([`walk_stays_below`]).
 fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<String> {
     let rest = value
         .as_encoded_bytes()
@@ -2746,8 +2744,19 @@ fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<S
     let Some(components) = suffix.strip_prefix(['/', '\\']) else {
         return suffix.is_empty().then(String::new);
     };
-    (stays_below(components.split(['/', '\\']), floor) && stays_below(components.split('/'), floor))
-        .then(|| suffix.to_string())
+    walk_stays_below(components, floor).then(|| suffix.to_string())
+}
+
+/// [`stays_below`] for `components` as this system reads them. `\`
+/// separates components on Windows and is part of a name elsewhere: from
+/// `root`, `a\b/..` is one level down on Windows and back at `root` on Unix.
+/// Off Windows the walk has to stay inside both ways, as before. On Windows
+/// only its own reading counts, which is how Windows resolves the path:
+/// rustc there reports `include_str!("../../../../web/a.js")` in
+/// `crates/c/src/media/mod.rs` as `crates\c\src\media\../../../../web/a.js`.
+fn walk_stays_below(components: &str, floor: usize) -> bool {
+    stays_below(components.split(['/', '\\']), floor)
+        && (cfg!(windows) || stays_below(components.split('/'), floor))
 }
 
 /// Does a walk down `components` stay inside the directory it reaches after
@@ -7990,8 +7999,7 @@ fn workspace_relative_source(source: &Path, workspace: &WorkspaceRoots) -> Optio
     let spelled = source.to_str()?;
     let from_root = format!("{}/{spelled}", workspace.cwd);
     let components = from_root.strip_prefix(['/', '\\'])?;
-    (stays_below(components.split(['/', '\\']), 0) && stays_below(components.split('/'), 0))
-        .then(|| Portable::Literal(spelled.to_string()))
+    walk_stays_below(components, 0).then(|| Portable::Literal(spelled.to_string()))
 }
 
 /// One path or env value of a workspace unit: under `OUT_DIR`, under the

@@ -245,7 +245,7 @@ mod tests {
         let manifest = project.join("Cargo.toml");
         kache_fs::testutil::write_executable(
             &cargo,
-            &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", manifest.display()),
+            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", manifest.display()),
         );
         let config = crate::test_support::test_config(root.join("cache"));
         let env = InvocationEnv::from_parts(

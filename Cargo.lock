@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "kache"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "kache-client"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "heck",
@@ -2429,7 +2429,7 @@ dependencies = [
 
 [[package]]
 name = "kache-config"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "kache-core"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "kache-e2e"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2477,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "kache-format"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "kache-fs"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "kache-ipc"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2516,11 +2516,11 @@ dependencies = [
 
 [[package]]
 name = "kache-proofs"
-version = "2.1.1"
+version = "2.2.0"
 
 [[package]]
 name = "kache-protocol"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "chrono",
  "kache-core",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "kache-service"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2559,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "kache-shims"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "kache-fs",
  "libc",
@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "kache-store"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "blake3",

@@ -62,8 +62,22 @@ impl Fixture {
 
     fn renamed_frontend(&self) -> PathBuf {
         let frontend = self.root.path().join("custom-kache");
-        std::fs::copy(FRONTEND, &frontend).unwrap();
-        std::fs::copy(ENGINE, self.root.path().join("kache-engine")).unwrap();
+        let engine = self.root.path().join("kache-engine");
+        // A child copies the binaries so a concurrent fork of this test
+        // process cannot inherit a writable executable and cause ETXTBSY.
+        for (source, destination) in [(FRONTEND, &frontend), (ENGINE, &engine)] {
+            let status = Command::new("cp")
+                .arg("-p")
+                .arg(source)
+                .arg(destination)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "copying {}: {status}",
+                destination.display()
+            );
+        }
         assert!(!self.root.path().join("kache").exists());
         frontend
     }

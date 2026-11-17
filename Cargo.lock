@@ -2330,7 +2330,6 @@ dependencies = [
  "blake3",
  "bytes",
  "bytesize",
- "chrono",
  "clap",
  "clap_complete",
  "crossterm",
@@ -2344,6 +2343,7 @@ dependencies = [
  "hex",
  "home",
  "interprocess",
+ "jiff",
  "jobserver",
  "kache-client",
  "kache-config",
@@ -2449,10 +2449,10 @@ name = "kache-e2e"
 version = "2.2.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "filetime",
  "indexmap 2.14.2",
+ "jiff",
  "kache-fs",
  "serde",
  "serde_json",
@@ -2507,7 +2507,7 @@ version = "2.2.0"
 name = "kache-protocol"
 version = "2.2.0"
 dependencies = [
- "chrono",
+ "jiff",
  "kache-core",
  "kache-format",
  "serde",

@@ -115,7 +115,7 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 zstd = "0.14"
 bytesize = "2"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = "0.2.46"
 dirs = "7"
 home = "0.5.12"
 tar = "0.4"

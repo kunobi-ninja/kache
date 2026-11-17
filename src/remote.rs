@@ -328,7 +328,7 @@ async fn publish_merged(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         let fetched = backend
             .get_versioned(object_key, Some(MAX_METADATA_BYTES))
             .await
@@ -359,7 +359,7 @@ async fn publish_merged(
         match outcome {
             ConditionalPut::Stored => return Ok(()),
             ConditionalPut::Conflict if attempt < MANIFEST_PUBLISH_ATTEMPTS => {
-                let jitter = u64::from(chrono::Utc::now().timestamp_subsec_nanos());
+                let jitter = u64::from(jiff::Timestamp::now().subsec_nanosecond().unsigned_abs());
                 tokio::time::sleep(conflict_backoff(attempt, jitter)).await;
             }
             ConditionalPut::Conflict => anyhow::bail!(
@@ -964,7 +964,7 @@ mod tests {
     }
 
     fn stored_json(keys: &[&str], commit: Option<&str>) -> Vec<u8> {
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         let manifest = stored(
             keys.iter()
                 .map(|key| (*key, Some(at(now, commit))))
@@ -1238,7 +1238,7 @@ mod tests {
         let run = format!(
             "e2e/{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap_or_default()
         );
         Some((backend, run))
     }

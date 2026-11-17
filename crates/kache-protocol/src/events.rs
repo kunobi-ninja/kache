@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 pub use kache_core::scheduler::{SchedulerDecision, SchedulerOutcome, SchedulerPhase};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +48,8 @@ impl MissReason {
 /// A single build event logged by the wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildEvent {
-    pub ts: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub ts: Timestamp,
     pub crate_name: String,
     /// Build tree/root this compiler invocation belongs to.
     ///
@@ -511,7 +512,8 @@ impl std::fmt::Display for EventResult {
 /// events by `session_id` + `cache_key` for full attribution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildSummaryEvent {
-    pub ts: DateTime<Utc>,
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub ts: Timestamp,
     pub schema: u32,
     /// Shutdown could not observe every prefetch outcome. Completed counters
     /// remain lower bounds; missing bytes and attempts must not be read as zero.
@@ -580,7 +582,7 @@ impl BuildEvent {
         cache_key: &str,
     ) -> BuildEvent {
         BuildEvent {
-            ts: Utc::now(),
+            ts: crate::time::now(),
             crate_name: crate_name.to_string(),
             root: "/work/tree".to_string(),
             version: "0.0.0".to_string(),

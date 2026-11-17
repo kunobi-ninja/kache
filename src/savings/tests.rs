@@ -1,6 +1,5 @@
 use super::*;
 use crate::events::{EventResult, log_event, read_events, rotate_events_if_needed};
-use chrono::TimeZone;
 
 #[test]
 fn rotation_keeps_events_when_the_ledger_is_busy_then_retries() {
@@ -67,15 +66,19 @@ fn rotation_keeps_events_when_the_ledger_is_busy_then_retries() {
     assert_eq!(ledger.hit_compile_time_ms, 1);
 }
 
-fn at(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, day, 12, 0, 0).unwrap()
+fn at(day: i8) -> jiff::Timestamp {
+    jiff::civil::date(2026, 9, day)
+        .at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 /// A hit whose figures identify it: `n` ms of compile work avoided, `n`
 /// reflinked, `2n` hardlinked and `3n` copied bytes.
 fn hit(n: u64, session: &str) -> BuildEvent {
     let mut event = BuildEvent::new_for_test(&format!("crate_{n}"), EventResult::LocalHit);
-    event.ts = at(1) + chrono::Duration::seconds(n as i64);
+    event.ts = at(1) + jiff::SignedDuration::from_secs(n as i64);
     event.session_id = session.to_string();
     event.compile_time_ms = n;
     event.reflinked_bytes = n;
@@ -84,7 +87,7 @@ fn hit(n: u64, session: &str) -> BuildEvent {
     event
 }
 
-fn totals(since: DateTime<Utc>) -> Totals {
+fn totals(since: jiff::Timestamp) -> Totals {
     Totals::empty(since)
 }
 
@@ -118,7 +121,7 @@ fn from_events_uses_the_stats_definitions() {
     miss.result = EventResult::Miss;
     let events = [hit(1, ""), prefetched, remote, miss];
     let t = Totals::from_events(&events).unwrap();
-    assert_eq!(t.since, at(1) + chrono::Duration::seconds(1));
+    assert_eq!(t.since, at(1) + jiff::SignedDuration::from_secs(1));
     assert_eq!(t.hits, 3, "a miss is not a hit");
     assert_eq!(t.hit_compile_time_ms, 111, "a miss avoids nothing");
     // Restores are summed over every outcome, as in the report.
@@ -266,7 +269,7 @@ fn gc_runs_split_by_who_started_them() {
         bytes_freed,
         ..Default::default()
     };
-    let started = Utc::now();
+    let started = jiff::Timestamp::now();
     crate::report::record_gc_run(&config, "daemon", SweepOrigin::Automatic, &run(100)).unwrap();
     // The daemon also runs the `kache gc` a user asks for.
     crate::report::record_gc_run(&config, "daemon", SweepOrigin::Requested, &run(30)).unwrap();
@@ -386,7 +389,13 @@ fn concurrent_updates_are_all_kept() {
             let cache_dir = dir.path().to_path_buf();
             std::thread::spawn(move || {
                 for _ in 0..20 {
-                    record_pruned(&cache_dir, SweepOrigin::Automatic, 1, Utc::now()).unwrap();
+                    record_pruned(
+                        &cache_dir,
+                        SweepOrigin::Automatic,
+                        1,
+                        jiff::Timestamp::now(),
+                    )
+                    .unwrap();
                 }
             })
         })

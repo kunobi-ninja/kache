@@ -511,11 +511,11 @@ fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
 
 fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
     let mut metrics = Vec::new();
-    if let Ok(last_run) = chrono::DateTime::parse_from_rfc3339(&gc.last_run) {
+    if let Some(last_run) = kache_protocol::time::parse_rfc3339(&gc.last_run) {
         metrics.push(gauge(
             "kache.cache.gc.last_run.time",
             "s",
-            vec![as_int(last_run.timestamp().max(0) as u64, now, &[])],
+            vec![as_int(last_run.as_second().max(0) as u64, now, &[])],
         ));
     }
     for (name, unit, value) in [
@@ -894,9 +894,9 @@ mod tests {
                 )
             })
             .collect();
-        let last_run = chrono::DateTime::parse_from_rfc3339("2026-09-12T12:11:05+00:00")
+        let last_run = kache_protocol::time::parse_rfc3339("2026-09-12T12:11:05+00:00")
             .unwrap()
-            .timestamp()
+            .as_second()
             .to_string();
         let want: Vec<(String, String)> = [
             ("kache.cache.gc.last_run.time", last_run.as_str()),

@@ -156,7 +156,7 @@ pub(crate) fn render(
     ))];
     lines.push(format!(
         "Recorded build: {}",
-        latest.last_activity.to_rfc3339()
+        kache_protocol::time::rfc3339(latest.last_activity)
     ));
     lines.push(format!(
         "Recorded with Kache {}. Installed: {}.",
@@ -388,10 +388,7 @@ const NO_BUILD: &str = "no recorded build to explain";
 
 /// List all recorded bypasses in the selected scope, without a top-N limit.
 pub fn run_all(config: &Config, root: Option<&Path>, json: bool) -> Result<()> {
-    let mut events = events::read_events_since(
-        &config.event_log_path(),
-        chrono::DateTime::<chrono::Utc>::MIN_UTC,
-    )?;
+    let mut events = events::read_events_since(&config.event_log_path(), jiff::Timestamp::MIN)?;
     let root = root.map(crate::report::normalize_filter_root);
     if let Some(root) = &root {
         events.retain(|event| event.root == *root);
@@ -586,7 +583,7 @@ pub(crate) fn json_body(
     });
     Body {
         root: builds.latest.root.clone(),
-        recorded_at: builds.latest.last_activity.to_rfc3339(),
+        recorded_at: kache_protocol::time::rfc3339(builds.latest.last_activity),
         recorded_versions: recorded_versions(builds.latest, events),
         installed_version: crate::VERSION,
         misses: analysis.misses_total,
@@ -638,7 +635,7 @@ mod tests {
         let mut event = BuildEvent::new_for_test(name, result);
         event.root = "/w".to_string();
         event.session_id = session.to_string();
-        event.ts = chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap();
+        event.ts = jiff::Timestamp::from_second(1_700_000_000 + secs).unwrap();
         event.cache_key = key.to_string();
         event.compile_time_ms = 1_000;
         event

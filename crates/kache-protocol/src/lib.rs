@@ -577,6 +577,7 @@ mod events;
 pub mod fallback;
 mod prediction;
 mod publication;
+pub mod time;
 pub use envelopes::*;
 pub use events::*;
 pub use kache_format::BlobStats;

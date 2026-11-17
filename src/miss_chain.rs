@@ -897,10 +897,9 @@ fn same_root(event: &BuildEvent, root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, TimeZone, Utc};
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000 + secs).unwrap()
     }
 
     fn event(

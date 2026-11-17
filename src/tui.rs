@@ -572,7 +572,7 @@ impl AppState {
     /// which are live and sort them every tick (a build goes from running to
     /// done by sitting idle), then reconcile the panels with the build that
     /// ends up selected.
-    fn refresh_sessions(&mut self, now: chrono::DateTime<chrono::Utc>) {
+    fn refresh_sessions(&mut self, now: jiff::Timestamp) {
         let live_roots: std::collections::HashSet<String> = self
             .in_flight_view()
             .into_iter()
@@ -746,8 +746,10 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let history = since.unwrap_or(MONITOR_HISTORY);
-    let (tailer, initial_events) =
-        load_history(config.event_log_path(), history.cutoff(chrono::Utc::now()));
+    let (tailer, initial_events) = load_history(
+        config.event_log_path(),
+        history.cutoff(jiff::Timestamp::now()),
+    );
 
     let rustc_version_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
@@ -830,7 +832,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
 
         // Sessions depend on the clock (a build goes from running to done by
         // sitting idle), so they are regrouped every tick, paused or not.
-        state.refresh_sessions(chrono::Utc::now());
+        state.refresh_sessions(jiff::Timestamp::now());
 
         // Check for completed background rustc_version
         if let Ok(mut slot) = state.rustc_version_slot.lock()
@@ -1543,8 +1545,8 @@ fn draw_now_selection(frame: &mut Frame, state: &AppState, area: Rect) {
                     session.state.label(),
                     session
                         .started
-                        .with_timezone(&chrono::Local)
-                        .format("%H:%M"),
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .strftime("%H:%M"),
                     shorten_home(std::path::Path::new(&session.root)),
                 ),
                 area.width.saturating_sub(2) as usize,
@@ -1562,8 +1564,8 @@ fn draw_now_selection(frame: &mut Frame, state: &AppState, area: Rect) {
                 session.state.label(),
                 session
                     .started
-                    .with_timezone(&chrono::Local)
-                    .format("%H:%M:%S"),
+                    .to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%H:%M:%S"),
             )),
             totals,
             Line::from(format!(
@@ -1741,8 +1743,8 @@ fn draw_now_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
                     Cell::from(
                         session
                             .started
-                            .with_timezone(&chrono::Local)
-                            .format("%H:%M:%S")
+                            .to_zoned(jiff::tz::TimeZone::system())
+                            .strftime("%H:%M:%S")
                             .to_string(),
                     )
                     .style(Style::default().fg(Color::DarkGray)),
@@ -1984,8 +1986,8 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
             session.state.label(),
             session
                 .started
-                .with_timezone(&chrono::Local)
-                .format("%H:%M:%S"),
+                .to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%H:%M:%S"),
         ),
         None => format!(" Live Build{scrolled} "),
     };
@@ -2120,7 +2122,7 @@ const MONITOR_HISTORY: SinceWindow = SinceWindow::whole_hours(1);
 /// dropped: a compile still running beats again within one cadence.
 fn load_history(
     path: std::path::PathBuf,
-    cutoff: chrono::DateTime<chrono::Utc>,
+    cutoff: jiff::Timestamp,
 ) -> (EventTailer, Vec<BuildEvent>) {
     let mut tailer = EventTailer::from_start(path);
     let events = tailer
@@ -2144,7 +2146,7 @@ const SPARK_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// every event being one step regardless of when it happened.
 fn lookup_series(
     events: &[BuildEvent],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     window: Duration,
     columns: usize,
 ) -> (Vec<u64>, Vec<u64>) {
@@ -2155,7 +2157,7 @@ fn lookup_series(
     }
     let window_ms = window.as_millis().max(1);
     for event in events {
-        let age_ms = now.signed_duration_since(event.ts).num_milliseconds();
+        let age_ms = now.duration_since(event.ts).as_millis();
         if age_ms < 0 {
             continue;
         }
@@ -2202,7 +2204,7 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
     let columns = inner.width.saturating_sub(label_width) as usize;
     let (hits, misses) = lookup_series(
         &state.events,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         state.spark_window,
         columns,
     );
@@ -3306,7 +3308,10 @@ fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
                 Span::styled(
                     format!(
                         "  {}  ",
-                        event.ts.with_timezone(&chrono::Local).format("%H:%M:%S")
+                        event
+                            .ts
+                            .to_zoned(jiff::tz::TimeZone::system())
+                            .strftime("%H:%M:%S")
                     ),
                     muted,
                 ),

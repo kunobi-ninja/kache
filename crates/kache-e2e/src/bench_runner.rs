@@ -882,7 +882,7 @@ fn default_work_dir(profile_name: &str) -> PathBuf {
 fn dated_run_id(cache_backend: CacheBackend) -> String {
     format!(
         "{}-{}-{}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ"),
         cache_backend.label(),
         std::process::id()
     )

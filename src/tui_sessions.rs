@@ -30,7 +30,6 @@
 
 use crate::events::{BuildEvent, EventResult};
 use crate::miss_chain;
-use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
@@ -188,8 +187,8 @@ pub(crate) struct Session {
     pub root: String,
     /// Grouped by idle gap rather than by a recorded id.
     pub inferred: bool,
-    pub started: DateTime<Utc>,
-    pub last_activity: DateTime<Utc>,
+    pub started: jiff::Timestamp,
+    pub last_activity: jiff::Timestamp,
     /// Indices into the monitor's event list, in log order.
     pub events: Vec<usize>,
     pub tally: Tally,
@@ -233,11 +232,11 @@ fn is_probe(event: &BuildEvent) -> bool {
             == "not-a-compile"
 }
 
-fn event_start(event: &BuildEvent) -> DateTime<Utc> {
+fn event_start(event: &BuildEvent) -> jiff::Timestamp {
     let elapsed = i64::try_from(event.elapsed_ms).unwrap_or(i64::MAX);
     event
         .ts
-        .checked_sub_signed(chrono::Duration::milliseconds(elapsed))
+        .checked_sub(jiff::SignedDuration::from_millis(elapsed))
         .unwrap_or(event.ts)
 }
 
@@ -247,7 +246,7 @@ fn event_start(event: &BuildEvent) -> DateTime<Utc> {
 #[cfg(test)]
 pub(crate) fn group_sessions(
     events: &[BuildEvent],
-    now: DateTime<Utc>,
+    now: jiff::Timestamp,
     live_roots: &HashSet<String>,
     idle_gap: Duration,
 ) -> Vec<Session> {
@@ -266,7 +265,7 @@ pub(crate) fn group(events: &[BuildEvent], idle_gap: Duration) -> Vec<Session> {
     let mut sessions: Vec<Session> = Vec::new();
     let mut by_id: HashMap<&str, usize> = HashMap::new();
     let mut inferred_by_root: HashMap<&str, usize> = HashMap::new();
-    let idle_gap = chrono::Duration::from_std(idle_gap).unwrap_or(chrono::Duration::MAX);
+    let idle_gap = jiff::SignedDuration::try_from(idle_gap).unwrap_or(jiff::SignedDuration::MAX);
 
     for (index, event) in events.iter().enumerate() {
         let slot = if !event.session_id.is_empty() {
@@ -289,9 +288,7 @@ pub(crate) fn group(events: &[BuildEvent], idle_gap: Duration) -> Vec<Session> {
                 // Same rule as `kache report`: a gap of at least the timeout
                 // is a new build. A backwards timestamp (clock step) joins
                 // the current session rather than opening a phantom one.
-                Some(slot)
-                    if event.ts.signed_duration_since(sessions[slot].last_activity) < idle_gap =>
-                {
+                Some(slot) if event.ts.duration_since(sessions[slot].last_activity) < idle_gap => {
                     slot
                 }
                 _ => {
@@ -339,7 +336,7 @@ pub(crate) fn group(events: &[BuildEvent], idle_gap: Duration) -> Vec<Session> {
 /// a running build.
 pub(crate) fn refresh_state(
     sessions: &mut [Session],
-    now: DateTime<Utc>,
+    now: jiff::Timestamp,
     live_roots: &HashSet<String>,
 ) {
     // Owned keys: the map outlives the shared borrow it is built from.
@@ -354,10 +351,10 @@ pub(crate) fn refresh_state(
             .and_modify(|newest| *newest = (*newest).max(last))
             .or_insert(last);
     }
-    let grace = chrono::Duration::from_std(LIVE_GRACE).unwrap_or(chrono::Duration::MAX);
+    let grace = jiff::SignedDuration::try_from(LIVE_GRACE).unwrap_or(jiff::SignedDuration::MAX);
     for session in sessions.iter_mut() {
-        let age = now.signed_duration_since(session.last_activity);
-        let recent = age >= chrono::Duration::zero() && age < grace;
+        let age = now.duration_since(session.last_activity);
+        let recent = age >= jiff::SignedDuration::ZERO && age < grace;
         let compiling = live_roots.contains(&session.root)
             && newest_by_root.get(&session.root) == Some(&session.last_index());
         session.state = if recent || compiling {
@@ -978,10 +975,9 @@ fn chronic_misses(events: &[BuildEvent], sessions: &[Session], root: &str) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000 + secs).unwrap()
     }
 
     fn event(
@@ -1168,7 +1164,7 @@ mod tests {
         assert_eq!(sessions[0].events, vec![4, 5], "newest first");
         assert_eq!(
             sessions[0].started,
-            ts(699) - chrono::Duration::milliseconds(100)
+            ts(699) - jiff::SignedDuration::from_millis(100)
         );
         assert_eq!(sessions[1].events, vec![0, 1, 3], "last active at 399s");
         assert_eq!(sessions[2].events, vec![2], "last active at 150s");

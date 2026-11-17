@@ -26,6 +26,9 @@ mod execution;
 #[cfg(windows)]
 #[path = "daemon_execution_windows.rs"]
 mod execution;
+#[cfg(any(windows, test))]
+#[path = "daemon_image.rs"]
+mod image;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
 use serde::{Deserialize, Serialize};
@@ -10031,7 +10034,53 @@ fn spawn_detached_daemon(
     exe: &Path,
     stderr_target: kunobi_daemon::launch::DaemonOutput,
 ) -> Result<kunobi_daemon::launch::DaemonChild> {
-    let mut command = daemon_run_command(exe);
+    spawn_detached(daemon_run_command(exe), stderr_target)
+}
+
+/// Start the daemon for the engine at `exe`, logging to what `stderr` opens.
+///
+/// On Windows the daemon runs from a copy of `exe` ([`image`]), so installing
+/// a new release can replace `exe`. When the copy cannot be made or started,
+/// the daemon runs from `exe`, as it did before.
+fn spawn_daemon(
+    exe: &Path,
+    socket: &Path,
+    stderr: impl Fn() -> kunobi_daemon::launch::DaemonOutput,
+) -> Result<kunobi_daemon::launch::DaemonChild> {
+    #[cfg(windows)]
+    {
+        let root = image::root(socket);
+        if exe.starts_with(&root) {
+            // A process the daemon started runs its copy already. That copy
+            // finds its frontend only through the envelope it was given.
+            let frontend =
+                crate::platform::frontend_executable().context("locating the Kache frontend")?;
+            return spawn_detached(image::command(exe, &frontend), stderr());
+        }
+        let started = image::stage(exe, &root).and_then(|staged| {
+            spawn_detached(
+                image::command(&staged, &kache_shims::frontend_for(exe)),
+                stderr(),
+            )
+        });
+        match started {
+            Ok(child) => return Ok(child),
+            Err(error) => tracing::warn!(
+                "starting the daemon from a copy of {} failed, so it runs that file and an \
+                 upgrade cannot replace it until the daemon stops: {error:#}",
+                exe.display()
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = socket;
+    spawn_detached_daemon(exe, stderr())
+}
+
+fn spawn_detached(
+    mut command: std::process::Command,
+    stderr_target: kunobi_daemon::launch::DaemonOutput,
+) -> Result<kunobi_daemon::launch::DaemonChild> {
     strip_ambient_remote_env(&mut command);
     let mut daemon = detached_command(&command);
     daemon.stderr(stderr_target).readiness_channel();

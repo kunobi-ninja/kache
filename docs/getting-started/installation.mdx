@@ -176,6 +176,30 @@ Follow [Upgrading to v2](/docs/getting-started/upgrade-v2). Finish active builds
 install the matching pair, keep the existing configuration, and restart the
 daemon. Custom installers and container images must include `kache-engine`.
 
+## Upgrading on Windows
+
+Windows cannot replace a program while it runs. Kache starts its daemon from a
+copy of `kache-engine.exe` kept next to the daemon socket, so `cargo install
+kache` can replace the installed engine even when the build doing the install
+started the daemon.
+
+Some daemons still run the installed file:
+
+- a daemon started by Kache 2.1.1 or earlier
+- the login task that `kache daemon install` sets up
+- a daemon you run yourself with `kache daemon run`
+- a daemon started after copying the engine failed, for example on a full disk
+
+Any of these makes `cargo install` fail at the end with `Access is denied. (os
+error 5)`. Stop the daemon and build the upgrade without Kache:
+
+```powershell
+kache daemon stop
+$env:KACHE_DISABLED = "1"
+cargo install kache --locked
+Remove-Item Env:KACHE_DISABLED
+```
+
 ## Verify the install
 
 ```bash

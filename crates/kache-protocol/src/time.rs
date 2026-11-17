@@ -113,6 +113,12 @@ mod tests {
     ];
 
     #[test]
+    fn now_reads_the_system_clock() {
+        let system = Timestamp::try_from(std::time::SystemTime::now()).unwrap();
+        assert!(now().duration_since(system).abs() < SignedDuration::from_secs(60));
+    }
+
+    #[test]
     fn text_matches_what_chrono_wrote_and_reads_back() {
         for (secs, nanos, offset, zulu) in CHRONO {
             let ts = Timestamp::new(secs, nanos).unwrap();

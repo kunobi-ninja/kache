@@ -3341,3 +3341,15 @@ fn timed_build_accepts_clean_non_utf8_output() {
         "timed build did not preserve its non-UTF-8 output"
     );
 }
+
+#[test]
+fn dated_run_id_is_utc_stamp_backend_and_pid() {
+    let id = dated_run_id(CacheBackend::Sccache);
+    let (stamp, rest) = id.split_once('-').unwrap();
+    assert_eq!(rest, format!("sccache-{}", std::process::id()));
+    let parsed = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%SZ", stamp).unwrap();
+    let now = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .datetime();
+    assert!(now.duration_since(parsed).abs() < jiff::SignedDuration::from_secs(60));
+}

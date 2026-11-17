@@ -281,7 +281,7 @@ pub(crate) fn snapshot_from_direct_reads(
 ) -> StatsSnapshot {
     let inventory = crate::store_view::read(config, include_entries, sort_by).unwrap_or_default();
 
-    let since = window.cutoff(chrono::Utc::now());
+    let since = window.cutoff(jiff::Timestamp::now());
     let es = events::event_stats_since(&config.event_log_path(), since).unwrap_or_default();
 
     let recent_summaries = if include_summaries {
@@ -997,7 +997,7 @@ pub fn stats(
     }
 
     let mut extras = StatsExtras {
-        lifetime: lifetime_rows(lifetime.as_ref(), chrono::Local::now().date_naive()),
+        lifetime: lifetime_rows(lifetime.as_ref(), jiff::Zoned::now().date()),
         ..Default::default()
     };
     extras.cache.extend(cloned_targets_row(&disk));
@@ -1039,8 +1039,8 @@ fn prefetch_session_lines(summaries: &[crate::events::BuildSummaryEvent]) -> Vec
         .take(5)
         .map(|s| {
             vec![
-                s.ts.with_timezone(&chrono::Local)
-                    .format("%m-%d %H:%M")
+                s.ts.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%m-%d %H:%M")
                     .to_string(),
                 if s.session_id.is_empty() {
                     "legacy".to_string()
@@ -1112,13 +1112,13 @@ fn machine_rows(machine: &crate::otel::MachineSnapshot) -> Vec<StatsRow> {
         } else {
             gc.source.as_str()
         };
-        let when = chrono::DateTime::parse_from_rfc3339(&gc.last_run)
+        let when = kache_protocol::time::parse_rfc3339(&gc.last_run)
             .map(|at| {
-                at.with_timezone(&chrono::Local)
-                    .format("%b %d %H:%M")
+                at.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%b %d %H:%M")
                     .to_string()
             })
-            .unwrap_or_else(|_| gc.last_run.clone());
+            .unwrap_or_else(|| gc.last_run.clone());
         let mut note = format!(
             "{source}, {} evicted",
             term::count(gc.entries_evicted as u64)
@@ -1188,7 +1188,7 @@ pub(crate) fn render_stats_with(
 /// every total is. Dates are local, like the `Last GC` row.
 fn lifetime_rows(
     totals: Option<&crate::savings::Totals>,
-    today: chrono::NaiveDate,
+    today: jiff::civil::Date,
 ) -> Vec<StatsRow> {
     let Some(totals) = totals else {
         return Vec::new();
@@ -1229,18 +1229,17 @@ fn lifetime_rows(
     if rows.is_empty() {
         return rows;
     }
-    let since = totals.since.with_timezone(&chrono::Local).date_naive();
+    let since = totals.since.to_zoned(jiff::tz::TimeZone::system()).date();
     rows.insert(0, ("Since", since_label(since, today), String::new()));
     rows
 }
 
 /// `Sep 12`, with the year when it is not this year's.
-fn since_label(since: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
-    use chrono::Datelike;
+fn since_label(since: jiff::civil::Date, today: jiff::civil::Date) -> String {
     if since.year() == today.year() {
-        since.format("%b %d").to_string()
+        since.strftime("%b %d").to_string()
     } else {
-        since.format("%b %d %Y").to_string()
+        since.strftime("%b %d %Y").to_string()
     }
 }
 
@@ -1842,9 +1841,9 @@ fn format_epoch_ms_utc(ms: u64) -> String {
     if ms == 0 {
         return "unknown time".to_string();
     }
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| "unknown time".to_string())
+    jiff::Timestamp::from_millisecond(ms as i64)
+        .map(|dt| dt.strftime("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|_| "unknown time".to_string())
 }
 
 // ── kache report ──────────────────────────────────────────────────────────
@@ -2005,16 +2004,15 @@ pub fn report(
 /// Format a SQLite datetime string (e.g. "2024-03-12 10:30:00") as a
 /// human-readable relative time like "2h ago", "3d ago", etc.
 fn format_relative_time(sqlite_dt: &str) -> String {
-    let parsed = chrono::NaiveDateTime::parse_from_str(sqlite_dt, "%Y-%m-%d %H:%M:%S")
+    let parsed = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", sqlite_dt)
         .ok()
-        .map(|naive| {
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
-        });
+        .and_then(|civil| civil.to_zoned(jiff::tz::TimeZone::UTC).ok())
+        .map(|zoned| zoned.timestamp());
 
     match parsed {
         Some(dt) => {
-            let dur = chrono::Utc::now().signed_duration_since(dt);
-            let secs = dur.num_seconds().max(0);
+            let dur = jiff::Timestamp::now().duration_since(dt);
+            let secs = dur.as_secs().max(0);
             if secs < 60 {
                 "just now".to_string()
             } else if secs < 3600 {
@@ -2814,7 +2812,7 @@ impl<'a> UncachedCompile<'a> {
             &event.passthrough_reason
         };
         Self {
-            ts: event.ts.to_rfc3339(),
+            ts: kache_protocol::time::rfc3339(event.ts),
             result: event.result.to_string(),
             cache_key: &event.cache_key,
             reason,
@@ -9666,7 +9664,7 @@ async fn upload_manifest_and_shards(
 ) -> Result<()> {
     let manifest = crate::remote::BuildManifest {
         version: 3,
-        created: chrono::Utc::now().to_rfc3339(),
+        created: kache_protocol::time::rfc3339(jiff::Timestamp::now()),
         manifest_key: key.to_string(),
         entries: entries.clone(),
     };

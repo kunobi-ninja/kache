@@ -83,7 +83,7 @@ mod tests {
 
     fn line(name: &str) -> Vec<u8> {
         let mut event = BuildEvent::new_for_test(name, EventResult::Miss);
-        event.ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        event.ts = jiff::Timestamp::from_second(1_700_000_000).unwrap();
         event.compile_time_ms = 100;
         let mut bytes = serde_json::to_vec(&event).unwrap();
         bytes.push(b'\n');

@@ -1473,9 +1473,7 @@ fn stats_rows_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
 
 fn lifetime_totals() -> crate::savings::Totals {
     crate::savings::Totals {
-        since: chrono::DateTime::parse_from_rfc3339("2026-09-12T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc),
+        since: kache_protocol::time::parse_rfc3339("2026-09-12T12:00:00Z").unwrap(),
         hits: 128_402,
         hit_compile_time_ms: 147_600_000,
         zero_copy_bytes: 3 << 30,
@@ -1486,7 +1484,7 @@ fn lifetime_totals() -> crate::savings::Totals {
 }
 
 fn lifetime_text(totals: Option<&crate::savings::Totals>) -> Vec<String> {
-    let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    let today = jiff::civil::Date::new(2026, 10, 1).unwrap();
     lifetime_rows(totals, today)
         .into_iter()
         .map(row_text)
@@ -1548,7 +1546,7 @@ fn lifetime_rows_leave_out_zero_totals() {
 
 #[test]
 fn since_label_adds_the_year_only_for_another_year() {
-    let date = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+    let date = |y, m, d| jiff::civil::Date::new(y, m, d).unwrap();
     assert_eq!(since_label(date(2026, 9, 2), date(2026, 10, 1)), "Sep 02");
     assert_eq!(
         since_label(date(2025, 9, 2), date(2026, 10, 1)),
@@ -2183,16 +2181,18 @@ fn test_format_relative_time_invalid_passes_through() {
 
 #[test]
 fn test_format_relative_time_buckets() {
-    let now = chrono::Utc::now();
-    let fmt = |dt: chrono::DateTime<chrono::Utc>| {
-        format_relative_time(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
-    };
-    assert_eq!(fmt(now - chrono::Duration::seconds(10)), "just now");
-    assert_eq!(fmt(now - chrono::Duration::minutes(5)), "5m ago");
-    assert_eq!(fmt(now - chrono::Duration::hours(3)), "3h ago");
-    assert_eq!(fmt(now - chrono::Duration::days(2)), "2d ago");
+    let now = jiff::Timestamp::now();
+    let fmt =
+        |dt: jiff::Timestamp| format_relative_time(&dt.strftime("%Y-%m-%d %H:%M:%S").to_string());
+    assert_eq!(fmt(now - jiff::SignedDuration::from_secs(10)), "just now");
+    assert_eq!(fmt(now - jiff::SignedDuration::from_mins(5)), "5m ago");
+    assert_eq!(fmt(now - jiff::SignedDuration::from_hours(3)), "3h ago");
+    assert_eq!(
+        fmt(now - jiff::SignedDuration::from_hours(24 * 2)),
+        "2d ago"
+    );
     // A future timestamp clamps to "just now" (secs.max(0)).
-    assert_eq!(fmt(now + chrono::Duration::hours(1)), "just now");
+    assert_eq!(fmt(now + jiff::SignedDuration::from_hours(1)), "just now");
 }
 
 #[test]
@@ -4269,7 +4269,7 @@ fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
     use crate::events::EventResult;
     let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
     let mut hit = build_event("dep", EventResult::LocalHit, 0, 1, 30, "fedcba9876543210");
-    hit.ts = miss.ts - chrono::Duration::seconds(5);
+    hit.ts = miss.ts - jiff::SignedDuration::from_secs(5);
     let meta = diff_meta("x86_64", "", &["a", "b"], &["lib"]);
     let rows = last_miss_rows(&miss, Some(&meta), Some(&hit), Some("salt"));
     let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
@@ -4289,7 +4289,7 @@ fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
     let mut same = hit.clone();
     same.cache_key = miss.cache_key.clone();
     let mut later = hit.clone();
-    later.ts = miss.ts + chrono::Duration::seconds(5);
+    later.ts = miss.ts + jiff::SignedDuration::from_secs(5);
     let mut simultaneous = hit.clone();
     simultaneous.ts = miss.ts;
     for hit in [&same, &later, &simultaneous] {
@@ -5875,7 +5875,7 @@ fn snapshot_from_direct_reads_reflects_store_and_events() {
 fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().join("cache"), None);
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut recent = build_event(
         "serde",
         crate::events::EventResult::LocalHit,
@@ -5884,7 +5884,7 @@ fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
         4096,
         "a",
     );
-    recent.ts = now - chrono::Duration::minutes(10);
+    recent.ts = now - jiff::SignedDuration::from_mins(10);
     let mut old = build_event(
         "tokio",
         crate::events::EventResult::Miss,
@@ -5893,7 +5893,7 @@ fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
         8192,
         "b",
     );
-    old.ts = now - chrono::Duration::hours(3);
+    old.ts = now - jiff::SignedDuration::from_hours(3);
     crate::events::log_event(&config.event_log_path(), &recent).unwrap();
     crate::events::log_event(&config.event_log_path(), &old).unwrap();
 
@@ -6285,7 +6285,7 @@ fn build_event(
     cache_key: &str,
 ) -> crate::events::BuildEvent {
     crate::events::BuildEvent {
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         session_id: String::new(),
         demands: Vec::new(),
         crate_name: crate_name.to_string(),
@@ -9227,7 +9227,7 @@ async fn save_manifest_skipped_when_remote_readonly() {
     let event_log = config.event_log_path();
     std::fs::create_dir_all(event_log.parent().unwrap()).unwrap();
     let event = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": kache_protocol::time::rfc3339(jiff::Timestamp::now()),
         "crate_name": "foo",
         "result": "Miss",
         "elapsed_ms": 100,
@@ -10711,7 +10711,7 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
 
 fn explain_event(result: events::EventResult, secs: i64, key: &str) -> events::BuildEvent {
     let mut event = events::BuildEvent::new_for_test("app", result);
-    event.ts = chrono::DateTime::from_timestamp(1_760_454_000 + secs, 0).unwrap();
+    event.ts = jiff::Timestamp::from_second(1_760_454_000 + secs).unwrap();
     event.cache_key = key.to_string();
     event.elapsed_ms = 1_989;
     event
@@ -11796,7 +11796,7 @@ fn direct_stats_include_rotated_events() {
     let log = config.event_log_path();
     let mut hit =
         crate::events::BuildEvent::new_for_test("archived", crate::events::EventResult::LocalHit);
-    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    hit.ts = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
     for _ in 0..12 {
         crate::events::log_event(&log, &hit).unwrap();
     }

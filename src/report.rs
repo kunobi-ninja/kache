@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -136,7 +135,7 @@ pub struct GcRunRecord {
 impl GcRunRecord {
     fn new(source: &str, stats: &crate::store::GcStats) -> Self {
         Self {
-            ts: Utc::now().to_rfc3339(),
+            ts: kache_protocol::time::rfc3339(jiff::Timestamp::now()),
             schema: GC_RUN_RECORD_SCHEMA,
             source: source.to_string(),
             entries_evicted: stats.entries_evicted,
@@ -179,9 +178,12 @@ pub fn record_gc_run(
     stats: &crate::store::GcStats,
 ) -> Result<()> {
     // A ledger that cannot be written costs the lifetime total, not the record.
-    if let Err(e) =
-        crate::savings::record_pruned(&config.cache_dir, origin, stats.bytes_freed, Utc::now())
-    {
+    if let Err(e) = crate::savings::record_pruned(
+        &config.cache_dir,
+        origin,
+        stats.bytes_freed,
+        jiff::Timestamp::now(),
+    ) {
         tracing::debug!("gc: could not update the savings ledger: {e:#}");
     }
     write_last_gc_run(&config.cache_dir, source, stats)?;
@@ -204,7 +206,7 @@ pub(crate) fn write_last_gc_run(
     stats: &crate::store::GcStats,
 ) -> Result<()> {
     let persisted = GcStatsPersisted {
-        last_run: Utc::now().to_rfc3339(),
+        last_run: kache_protocol::time::rfc3339(jiff::Timestamp::now()),
         entries_evicted: stats.entries_evicted,
         bytes_freed: stats.bytes_freed,
         disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
@@ -279,7 +281,7 @@ impl SessionRecord {
             .filter(|root| !root.is_empty())
             .map(|root| blake3::hash(root.as_bytes()).to_hex().as_str()[..16].to_string());
         Self {
-            ts: Utc::now().to_rfc3339(),
+            ts: kache_protocol::time::rfc3339(jiff::Timestamp::now()),
             schema: SESSION_RECORD_SCHEMA,
             kache_version: meta.kache_version.clone(),
             window,
@@ -1183,7 +1185,7 @@ pub fn generate_report_with_filter(
     top: usize,
     filter: &ReportFilter,
 ) -> Result<BuildReport> {
-    let now = Utc::now();
+    let now = jiff::Timestamp::now();
     let since = window.cutoff(now);
     let mut build_events = if filter.last_build {
         events::read_events(&config.event_log_path())?
@@ -1203,7 +1205,7 @@ pub fn generate_report_with_filter(
     };
     let window = if filter.last_build {
         let start = build_events.iter().map(event_start).min().unwrap();
-        SinceWindow::from_secs(now.signed_duration_since(start).num_seconds().max(0) as u64)
+        SinceWindow::from_secs(now.duration_since(start).as_secs().max(0) as u64)
     } else {
         window
     };
@@ -1268,7 +1270,7 @@ pub fn generate_report_with_filter(
         .map(|e| ErrorDetail {
             crate_name: e.crate_name.clone(),
             cache_key: e.cache_key.clone(),
-            timestamp: e.ts.to_rfc3339(),
+            timestamp: kache_protocol::time::rfc3339(e.ts),
         })
         .collect();
 
@@ -1357,11 +1359,11 @@ pub fn generate_report_with_filter(
     // to zeroed dedup stats rather than failing the whole report.
     let restored_bytes = stats.reflinked_bytes + stats.hardlinked_bytes + stats.copied_bytes;
     let inventory =
-        crate::store_view::read_report(config, now.timestamp(), eviction_evidence::HORIZON_SECS)
+        crate::store_view::read_report(config, now.as_second(), eviction_evidence::HORIZON_SECS)
             .unwrap_or_default();
     let eviction_evidence = Some(eviction_evidence::collect(
         inventory.eviction_evidence,
-        now.timestamp(),
+        now.as_second(),
     ));
     let blob_stats = inventory.blob_stats;
     let stores = inventory.stores;
@@ -1416,7 +1418,7 @@ pub fn generate_report_with_filter(
         schema_version: REPORT_SCHEMA_VERSION,
         meta: ReportMeta {
             kache_version: crate::VERSION.to_string(),
-            generated_at: Utc::now().to_rfc3339(),
+            generated_at: kache_protocol::time::rfc3339(jiff::Timestamp::now()),
             since_hours: window.hours(),
             since_secs: window.secs(),
             since: window.label(),
@@ -1544,8 +1546,8 @@ fn select_last_build(events: &mut Vec<BuildEvent>) -> Result<ReportSession> {
         let mut first = events.len();
         for (index, event) in events.iter().enumerate().rev() {
             if !event.session_id.is_empty()
-                || start.signed_duration_since(event.ts)
-                    >= chrono::Duration::seconds(session.inactivity_secs as i64)
+                || start.duration_since(event.ts)
+                    >= jiff::SignedDuration::from_secs(session.inactivity_secs as i64)
             {
                 break;
             }
@@ -1584,7 +1586,7 @@ fn event_matches_root(event: &BuildEvent, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(std::path::MAIN_SEPARATOR))
 }
 
-fn load_gc_summary_all(config: &Config, cutoff: DateTime<Utc>) -> Option<GcSummary> {
+fn load_gc_summary_all(config: &Config, cutoff: jiff::Timestamp) -> Option<GcSummary> {
     std::iter::once(config.clone())
         .chain(crate::store_view::shard_configs(config))
         .filter_map(|store| load_gc_summary(&store.cache_dir, cutoff))
@@ -1592,7 +1594,7 @@ fn load_gc_summary_all(config: &Config, cutoff: DateTime<Utc>) -> Option<GcSumma
             // load_gc_summary has already validated both timestamps.
             total.last_run = [total.last_run, next.last_run]
                 .into_iter()
-                .max_by_key(|time| DateTime::parse_from_rfc3339(time).unwrap())
+                .max_by_key(|time| kache_protocol::time::parse_rfc3339(time).unwrap())
                 .unwrap();
             total.entries_evicted += next.entries_evicted;
             total.bytes_freed += next.bytes_freed;
@@ -1604,13 +1606,13 @@ fn load_gc_summary_all(config: &Config, cutoff: DateTime<Utc>) -> Option<GcSumma
 }
 
 /// Load GC stats from gc_stats.json if GC ran at or after `cutoff`.
-fn load_gc_summary(cache_dir: &std::path::Path, cutoff: DateTime<Utc>) -> Option<GcSummary> {
+fn load_gc_summary(cache_dir: &std::path::Path, cutoff: jiff::Timestamp) -> Option<GcSummary> {
     let path = cache_dir.join("gc_stats.json");
     let content = std::fs::read_to_string(&path).ok()?;
     let persisted: GcStatsPersisted = serde_json::from_str(&content).ok()?;
 
     // Only include if GC ran within the report window
-    let last_run = chrono::DateTime::parse_from_rfc3339(&persisted.last_run).ok()?;
+    let last_run = kache_protocol::time::parse_rfc3339(&persisted.last_run)?;
     if last_run < cutoff {
         return None;
     }
@@ -1672,16 +1674,16 @@ fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
     }
 
     let duration_ms = end
-        .signed_duration_since(start)
-        .num_milliseconds()
+        .duration_since(start)
+        .as_millis()
         .try_into()
         .unwrap_or(0);
 
     ReportTimeline {
-        start_time: Some(start.to_rfc3339()),
-        end_time: Some(end.to_rfc3339()),
-        start_unix_ms: Some(start.timestamp_millis()),
-        end_unix_ms: Some(end.timestamp_millis()),
+        start_time: Some(kache_protocol::time::rfc3339(start)),
+        end_time: Some(kache_protocol::time::rfc3339(end)),
+        start_unix_ms: Some(start.as_millisecond()),
+        end_unix_ms: Some(end.as_millisecond()),
         duration_ms,
         event_count: events.len(),
         cacheable_count,
@@ -1711,12 +1713,12 @@ fn build_trace_events(events: &[BuildEvent]) -> Vec<TraceEvent> {
 /// `0..N` lane ids never leak OS thread ids (#456).
 fn assign_trace_lanes(events: &[BuildEvent]) -> Vec<u32> {
     let mut order: Vec<usize> = (0..events.len()).collect();
-    order.sort_by_key(|&i| (event_start(&events[i]).timestamp_micros(), i));
+    order.sort_by_key(|&i| (event_start(&events[i]).as_microsecond(), i));
 
     let mut lane_free_at: Vec<i64> = Vec::new();
     let mut lanes = vec![0u32; events.len()];
     for &i in &order {
-        let start = event_start(&events[i]).timestamp_micros();
+        let start = event_start(&events[i]).as_microsecond();
         let end = start.saturating_add(events[i].elapsed_ms.saturating_mul(1000) as i64);
         let lane = match lane_free_at.iter().position(|&free| free <= start) {
             Some(l) => {
@@ -1757,7 +1759,7 @@ fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
         name: format!("{label}: {}", event.crate_name),
         cat: "kache".to_string(),
         ph: "X".to_string(),
-        ts: start.timestamp_micros(),
+        ts: start.as_microsecond(),
         dur: event.elapsed_ms.saturating_mul(1000),
         pid: 1,
         tid: lane,
@@ -2162,7 +2164,7 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
         end_unix_ms,
         elapsed_ms: e.elapsed_ms,
         exit_code: e.exit_code,
-        timestamp: e.ts.to_rfc3339(),
+        timestamp: kache_protocol::time::rfc3339(e.ts),
     }
 }
 
@@ -2202,16 +2204,16 @@ fn bypass_reason_words(reason: &BypassReason) -> String {
 fn event_timeline(e: &BuildEvent) -> (String, String, i64, i64) {
     let start = event_start(e);
     (
-        start.to_rfc3339(),
-        e.ts.to_rfc3339(),
-        start.timestamp_millis(),
-        e.ts.timestamp_millis(),
+        kache_protocol::time::rfc3339(start),
+        kache_protocol::time::rfc3339(e.ts),
+        start.as_millisecond(),
+        e.ts.as_millisecond(),
     )
 }
 
-fn event_start(e: &BuildEvent) -> DateTime<Utc> {
+fn event_start(e: &BuildEvent) -> jiff::Timestamp {
     let elapsed_ms = i64::try_from(e.elapsed_ms).unwrap_or(i64::MAX);
-    e.ts.checked_sub_signed(chrono::Duration::milliseconds(elapsed_ms))
+    e.ts.checked_sub(jiff::SignedDuration::from_millis(elapsed_ms))
         .unwrap_or(e.ts)
 }
 
@@ -4810,13 +4812,13 @@ fn average_ms(ms: f64) -> String {
 /// An RFC 3339 time in this machine's zone, `Sep 30 01:34`; the input
 /// unchanged when it does not parse.
 fn local_time(rfc3339: &str) -> String {
-    DateTime::parse_from_rfc3339(rfc3339)
+    kache_protocol::time::parse_rfc3339(rfc3339)
         .map(|at| {
-            at.with_timezone(&chrono::Local)
-                .format("%b %d %H:%M")
+            at.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%b %d %H:%M")
                 .to_string()
         })
-        .unwrap_or_else(|_| rfc3339.to_string())
+        .unwrap_or_else(|| rfc3339.to_string())
 }
 
 /// Binary units, `1.5 MiB`: the form the text report prints.

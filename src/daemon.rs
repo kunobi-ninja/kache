@@ -3182,7 +3182,7 @@ impl Daemon {
             Err(error) => return Response::err(format!("store open failed: {error}")),
         };
 
-        let since = stats_window(req).cutoff(chrono::Utc::now());
+        let since = stats_window(req).cutoff(jiff::Timestamp::now());
         let es =
             events::event_stats_since(&self.config.event_log_path(), since).unwrap_or_default();
         let recent_summaries = if req.include_summaries {
@@ -6075,7 +6075,7 @@ impl Daemon {
         let used_bytes = plan.used_bytes();
         let downloaded_bytes: u64 = plan.downloaded.values().sum();
         let event = crate::events::BuildSummaryEvent {
-            ts: chrono::Utc::now(),
+            ts: jiff::Timestamp::now(),
             schema: 2,
             incomplete,
             session_id: plan.session_id.clone(),

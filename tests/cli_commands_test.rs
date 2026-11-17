@@ -5888,7 +5888,7 @@ fn explain_json_distinguishes_uncached_compiles_hits_and_compiler_queries() {
             "no_cache_lookups",
         ),
     ] {
-        let event = serde_json::json!({"ts": chrono::Utc::now(), "crate_name":"demo", "result":result, "elapsed_ms":1, "size":1, "passthrough_reason":reason, "schema":26});
+        let event = serde_json::json!({"ts": kache_protocol::time::rfc3339_z(jiff::Timestamp::now()), "crate_name":"demo", "result":result, "elapsed_ms":1, "size":1, "passthrough_reason":reason, "schema":26});
         std::fs::write(e.cache.join("events.jsonl"), format!("{event}\n")).unwrap();
         let output = e
             .cmd()
@@ -5911,7 +5911,7 @@ fn doctor_reports_recent_store_warning_when_database_is_healthy() {
     drop(file);
     let marker_content = std::fs::read_to_string(&marker).unwrap();
     let timestamp = marker_content.trim().parse::<i64>().unwrap();
-    let recorded_at = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
+    let recorded_at = jiff::Timestamp::from_second(timestamp).unwrap();
 
     let output = e
         .cmd()
@@ -5938,7 +5938,7 @@ fn doctor_reports_recent_store_warning_when_database_is_healthy() {
         warning["detail"]
             .as_str()
             .unwrap()
-            .contains(&recorded_at.to_rfc3339())
+            .contains(&kache_protocol::time::rfc3339(recorded_at))
     );
     assert!(
         warning["detail"]

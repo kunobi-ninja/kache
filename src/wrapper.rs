@@ -1,7 +1,6 @@
 use crate::store::StoreHashExt;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
-use chrono::Utc;
 use kache_store::eviction::HeldBytesBudget;
 pub(crate) use kache_store::markers::*;
 use std::path::{Component, Path, PathBuf};
@@ -9863,7 +9862,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
     );
     let miss_reason = events::MissReason::classify(&passthrough_reason);
     BuildEvent {
-        ts: Utc::now(),
+        ts: jiff::Timestamp::now(),
         crate_name: crate_name.to_string(),
         root: root.to_string(),
         version: crate::VERSION.to_string(),
@@ -10027,9 +10026,9 @@ fn explain_miss_diff(
         // the post-hoc folds (key salt / extra inputs).
         changed.push("salt_or_extra_inputs".to_string());
     }
-    let ago = Utc::now()
-        .signed_duration_since(last_hit.ts)
-        .num_minutes()
+    let ago = jiff::Timestamp::now()
+        .duration_since(last_hit.ts)
+        .as_mins()
         .max(0);
     crate::notice::show(&format!(
         "[kache] miss: crate {} (last hit {}m ago; key changed in: {})",

@@ -214,10 +214,9 @@ pub fn run(config: &Config, root: Option<&Path>, json: bool) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::events::EventResult;
-    use chrono::{DateTime, Utc};
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+    fn at(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000 + secs).unwrap()
     }
 
     fn ev(

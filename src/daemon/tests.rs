@@ -4913,11 +4913,11 @@ fn daemon_keeps_the_load_time_config_provenance_after_a_file_edit() {
 fn handle_stats_filters_on_event_secs_over_event_hours() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut recent = events::BuildEvent::new_for_test("serde", events::EventResult::LocalHit);
-    recent.ts = now - chrono::Duration::minutes(10);
+    recent.ts = now - jiff::SignedDuration::from_mins(10);
     let mut old = events::BuildEvent::new_for_test("tokio", events::EventResult::Miss);
-    old.ts = now - chrono::Duration::minutes(40);
+    old.ts = now - jiff::SignedDuration::from_mins(40);
     events::log_event(&config.event_log_path(), &recent).unwrap();
     events::log_event(&config.event_log_path(), &old).unwrap();
     let daemon = Daemon::new(config);
@@ -17697,7 +17697,7 @@ fn daemon_stats_include_rotated_events() {
     let config = test_config(dir.path());
     let log = config.event_log_path();
     let mut hit = events::BuildEvent::new_for_test("archived", events::EventResult::LocalHit);
-    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    hit.ts = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
     for _ in 0..12 {
         events::log_event(&log, &hit).unwrap();
     }

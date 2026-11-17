@@ -258,11 +258,11 @@ fn recent_warning_check(marker: &Path) -> Option<Check> {
     ) {
         return None;
     }
-    let timestamp = chrono::DateTime::from_timestamp(i64::try_from(timestamp).ok()?, 0)?;
+    let timestamp = jiff::Timestamp::from_second(i64::try_from(timestamp).ok()?).ok()?;
     Some(Check {
         label: "Store warning history",
         pass: false,
-        detail: format!("store-open warning recorded at {}; the record has no error details or Kache version", timestamp.to_rfc3339()),
+        detail: format!("store-open warning recorded at {}; the record has no error details or Kache version", kache_protocol::time::rfc3339(timestamp)),
         fix: Some(
             "if a build still fails, rerun it with KACHE_LOG_FILE=kache=debug,kache_store=debug and inspect kache.log; this history expires after 24 hours and requires the same temporary directory".into(),
         ),
@@ -604,8 +604,12 @@ mod tests {
         assert_eq!(check.label, "Store warning history");
         let content = fs::read_to_string(&marker).unwrap();
         let timestamp = content.trim().parse::<i64>().unwrap();
-        let recorded_at = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
-        assert!(check.detail.contains(&recorded_at.to_rfc3339()));
+        let recorded_at = jiff::Timestamp::from_second(timestamp).unwrap();
+        assert!(
+            check
+                .detail
+                .contains(&kache_protocol::time::rfc3339(recorded_at))
+        );
         assert!(check.detail.contains("no error details or Kache version"));
         let fix = check.fix.unwrap();
         assert!(fix.contains("if a build still fails"));

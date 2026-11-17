@@ -253,7 +253,7 @@ fn group_sessions(events: &[BuildEvent]) -> BTreeMap<String, SessionEvents> {
 
 /// The wrapper stamps an event when the invocation ends.
 fn event_finished_ms(event: &BuildEvent) -> u64 {
-    u64::try_from(event.ts.timestamp_millis()).unwrap_or(0)
+    u64::try_from(event.ts.as_millisecond()).unwrap_or(0)
 }
 
 /// Assign each transfer once. An explicit session is authoritative; older
@@ -700,7 +700,6 @@ mod tests {
     use super::*;
     use crate::daemon::TransferEvent;
     use crate::events::EventResult;
-    use chrono::TimeZone;
 
     fn event(
         session: &str,
@@ -713,7 +712,7 @@ mod tests {
         event.session_id = session.to_string();
         event.cache_key = key.to_string();
         event.root = "/w".to_string();
-        event.ts = chrono::Utc.timestamp_millis_opt(end_ms).unwrap();
+        event.ts = jiff::Timestamp::from_millisecond(end_ms).unwrap();
         event.elapsed_ms = elapsed_ms;
         event
     }
@@ -1459,7 +1458,7 @@ mod tests {
     #[test]
     fn daemon_used_keys_stay_the_recorded_lower_bound() {
         let summary = crate::events::BuildSummaryEvent {
-            ts: chrono::Utc.timestamp_millis_opt(6_000).unwrap(),
+            ts: jiff::Timestamp::from_millisecond(6_000).unwrap(),
             schema: 1,
             incomplete: false,
             session_id: "s1".into(),
@@ -1820,7 +1819,7 @@ mod tests {
         let events = [event("s1", "serde", "k1", 5_000, 500)];
         let summary = |last_activity_ms, plan_id: &str| BuildSummaryEvent {
             incomplete: plan_id == "new",
-            ts: chrono::Utc.timestamp_millis_opt(1).unwrap(),
+            ts: jiff::Timestamp::from_millisecond(1).unwrap(),
             schema: 2,
             session_id: "s1".to_string(),
             root: String::new(),

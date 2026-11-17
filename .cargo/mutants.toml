@@ -293,6 +293,11 @@ exclude_re = [
     # This thread-local failure fixture and its restoration Drop exist only
     # on Windows; they contain no production fingerprint or admission logic.
     "crates/kache-store/src/file_hash\\.rs:.*\\bwith_weak_windows_fingerprints_for_tests(?:::<impl Drop for Restore>::drop)?(?: ->| with|$)",
+    # The Windows boot-time call is cfg(windows), so this Linux lane never
+    # compiles it. The check of what it reads, boot_secs_from_time_of_day,
+    # stays compiled and mutation-tested here; native Windows tests run the
+    # call itself against the machine's own boot.
+    "crates/kache-store/src/file_hash\\.rs:.*\\bwindows_boot_time_secs\\b",
     # Both wrappers are cfg(target_os = "macos"); Linux cannot observe them.
     "src/invocation/unix_broker.rs:.*can_track_client",
     "src/fallback.rs:.*compiler_peer_may_delegate",

@@ -267,15 +267,18 @@ impl Driver for KacheReplacement<'_> {
                     rotate_daemon_log_if_large(&log);
                     let written = std::fs::metadata(&log).map_or(0, |meta| meta.len());
                     self.log_start = Some((log.clone(), written));
-                    let stderr = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log)
-                        .map(kunobi_daemon::launch::DaemonOutput::File)
-                        .unwrap_or(kunobi_daemon::launch::DaemonOutput::Null);
+                    let stderr = || {
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log)
+                            .map(kunobi_daemon::launch::DaemonOutput::File)
+                            .unwrap_or(kunobi_daemon::launch::DaemonOutput::Null)
+                    };
                     warn_if_remote_is_env_only(config);
-                    self.child = Some(spawn_detached_daemon(
+                    self.child = Some(spawn_daemon(
                         self.executable.as_ref().unwrap(),
+                        &socket,
                         stderr,
                     )?);
                 }

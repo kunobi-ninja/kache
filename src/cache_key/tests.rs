@@ -13585,6 +13585,54 @@ fn named_codegen_backend_is_keyed_by_its_library() {
     );
 }
 
+/// Under `cargo clippy` the outer compiler is `clippy-driver`, whose
+/// `--version --verbose` has no `host:` line. A named backend is still keyed,
+/// with the host and sysroot of the inner rustc (#1944).
+#[cfg(unix)]
+#[test]
+fn named_codegen_backend_is_keyed_under_clippy_driver() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let driver = dir.path().join("clippy-driver");
+    kache_fs::testutil::write_executable(
+        &driver,
+        "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
+    );
+    let sysroot = dir.path().join("sysroot");
+    let library = sysroot_codegen_backends(&sysroot).join(backend_library("kachetest", ""));
+    let key = || {
+        let mut args = vec![driver.to_string_lossy().into_owned()];
+        args.extend(flag_base(
+            &source,
+            &[
+                "--sysroot",
+                &sysroot.to_string_lossy(),
+                "-Zcodegen-backend=kachetest",
+            ],
+        ));
+        let mut parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.is_clippy_chain());
+        parsed.source_file = None;
+        compute_cache_key(
+            &parsed,
+            &FileHasher::new(),
+            &PathNormalizer::empty(),
+            &KeyEnv::default(),
+        )
+    };
+
+    std::fs::write(&library, b"v1").unwrap();
+    let first = key().unwrap();
+    std::fs::write(&library, b"v2 rebuilt").unwrap();
+    assert_ne!(
+        first,
+        key().unwrap(),
+        "a rebuilt backend must change the key"
+    );
+}
+
 /// Every sysroot rustc may search contributes its backend libraries; a
 /// sysroot without a `codegen-backends` directory contributes none.
 #[test]

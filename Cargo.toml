@@ -104,7 +104,7 @@ toml = "1"
 toml_edit = "0.25"
 clap = { version = "4", features = ["derive", "string"] }
 clap_complete = "4"
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 ratatui = "0.30"
 crossterm = "0.29"
 filetime = "0.2"
@@ -133,7 +133,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # `kache login` and planner bearer sessions. The -core features keep reqwest
 # on `rustls-no-provider`, so ring stays the only TLS provider (no aws-lc).
 kunobi-auth = { version = "1.1.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
-interprocess = { version = "2.4.7", features = ["tokio"] }
+interprocess = { version = "2.4.8", features = ["tokio"] }
 # Unicode tables affect persisted cache-key bytes. Keep Unicode 17 until
 # normalization changes have a reviewed cache-key compatibility migration.
 unicode-normalization = "=0.1.25"

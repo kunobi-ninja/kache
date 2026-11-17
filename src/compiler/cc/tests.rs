@@ -8394,6 +8394,17 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
     assert!(!compiler.include_dir_names_still_match(&parsed));
 }
 
+#[test]
+fn an_availability_stamp_holds_only_while_the_answer_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = temp.path().join("optional.h");
+    assert!(CcListingStamp::Available(false).holds(&candidate));
+    assert!(!CcListingStamp::Available(true).holds(&candidate));
+    fs::write(&candidate, "int x;\n").unwrap();
+    assert!(CcListingStamp::Available(true).holds(&candidate));
+    assert!(!CcListingStamp::Available(false).holds(&candidate));
+}
+
 #[cfg(unix)]
 #[test]
 fn an_absent_stamp_breaks_when_a_dangling_symlink_appears() {

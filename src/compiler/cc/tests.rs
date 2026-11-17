@@ -8362,14 +8362,23 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
     let temp = tempfile::tempdir().unwrap();
     let (parsed, source, include) =
         probing_unit(temp.path(), "#if __has_include(<optional.h>)\n#endif\n");
-    let target = temp.path().join("target");
+    // Outside every listed directory, so only the probe's own stamp can
+    // notice the target appearing.
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let target = elsewhere.join("target");
     std::os::unix::fs::symlink(&target, include.join("optional.h")).unwrap();
+    for dir in [&include, &temp.path().to_path_buf()] {
+        settle(dir);
+    }
     let names =
         cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
     let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
     assert!(
-        stamps.is_none(),
-        "a directory stamp cannot prove symlink target availability"
+        stamps.as_ref().is_some_and(|stamps| stamps
+            .iter()
+            .any(|(_, stamp)| *stamp == CcListingStamp::Available(false))),
+        "settled directories vouch for a probed unit, with the probe stamped beside them"
     );
     let compiler = CcCompiler::new();
     compiler

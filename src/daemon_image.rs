@@ -17,7 +17,6 @@ const LOCK: &str = "lock";
 /// Where daemon images live: one directory per user, so each engine is
 /// copied once however many caches its daemons serve. Pruning removes what
 /// else is there, so the directory must be one only Kache writes to.
-#[cfg(windows)]
 pub(super) fn root() -> Result<PathBuf> {
     Ok(dirs::data_local_dir()
         .context("locating the local application data directory")?
@@ -39,6 +38,11 @@ pub(super) fn lock_deadline(now: Instant, deadline: Instant) -> Instant {
     deadline.min(now + Duration::from_secs(5))
 }
 
+/// Whether a wait for the images lock may try again at `now`.
+fn keep_waiting(now: Instant, deadline: Instant) -> bool {
+    now < deadline
+}
+
 /// Take the images lock, or fail at `deadline` so the caller starts the
 /// installed engine instead of waiting on another cache's daemon start.
 pub(super) fn lock(root: &Path, deadline: Instant) -> Result<Lock> {
@@ -53,7 +57,7 @@ pub(super) fn lock(root: &Path, deadline: Instant) -> Result<Lock> {
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(Lock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Err(std::fs::TryLockError::WouldBlock) if keep_waiting(Instant::now(), deadline) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -224,6 +228,16 @@ mod tests {
     }
 
     #[test]
+    fn images_live_in_a_kache_directory_under_local_app_data() {
+        let root = root().unwrap();
+        assert!(
+            root.starts_with(dirs::data_local_dir().unwrap()),
+            "{root:?}"
+        );
+        assert!(root.ends_with(Path::new("kache").join("daemon-engines")));
+    }
+
+    #[test]
     fn the_images_lock_waits_five_seconds_at_most() {
         let now = Instant::now();
         let five = now + Duration::from_secs(5);
@@ -249,12 +263,28 @@ mod tests {
     fn a_held_images_lock_fails_at_the_deadline_instead_of_waiting() {
         let dir = tempfile::tempdir().unwrap();
         let held = lock(dir.path(), later()).unwrap();
-        let error = lock(dir.path(), Instant::now() + Duration::from_millis(50))
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("stayed locked"), "{error:#}");
+        let root = dir.path().to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let attempt = lock(&root, Instant::now() + Duration::from_millis(50));
+            let _ = sender.send(attempt.err().map(|error| error.to_string()));
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a held lock must fail at its deadline, not wait on")
+            .expect("the lock is held");
+        assert!(error.contains("stayed locked"), "{error}");
         drop(held);
         lock(dir.path(), Instant::now()).unwrap();
+    }
+
+    #[test]
+    fn a_lock_wait_stops_at_its_deadline() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(1);
+        assert!(keep_waiting(now, soon));
+        assert!(!keep_waiting(now, now));
+        assert!(!keep_waiting(soon, now));
     }
 
     #[test]

@@ -313,6 +313,15 @@ exclude_re = [
     # tests check client drive selection and invalid per-drive directories.
     # InvocationEnv's shared resolution and command policy stay in scope.
     "crates/kache-config/src/invocation.rs:.*InvocationEnv::resolve_drive_relative",
+    # A file named under two spellings is a Windows path question too:
+    # plain_spelling is cfg(windows), its stub elsewhere returns None, so
+    # hashed_under_another_spelling returns at its first line on this lane.
+    # Its decision, may_carry_over (settle rule, memo eligibility and the
+    # stamp comparison), is a pure function and stays in scope, as does
+    # hash_and_record. The Windows test
+    # a_windows_file_named_twice_in_one_closure_is_read_once covers the
+    # spellings natively.
+    "src/cache_key\\.rs:.*\\b(plain_spelling|hashed_under_another_spelling)\\b",
     # Like join_inflight_download's deadline: observing < versus <= needs
     # an exact Instant equality. The EOF/exit test covers an alive child
     # both before and beyond the deadline, including the true/== mutants.

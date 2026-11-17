@@ -8414,6 +8414,9 @@ pub struct FileHasher<'db> {
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
+    /// The hash and stamp of the first spelling hashed of each file, by its
+    /// plain spelling ([`plain_spelling`]): Windows only, empty elsewhere.
+    spellings: RefCell<HashMap<PathBuf, (String, ObservedFingerprint)>>,
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
@@ -8530,6 +8533,61 @@ const SOURCE_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
     MIN_PERSISTED_HASH_BYTES
 };
 
+/// Whether a hash read as `first` vouches for the same file seen again as
+/// `now` under another spelling. The file may have been written since, so
+/// only a settled first read and the same strong stamp (size, times, file
+/// index) carry it over, as a memo row would. The same spelling is the
+/// memo's question, not this one.
+fn may_carry_over(
+    first: &ObservedFingerprint,
+    now: &FileFingerprint,
+    requires_identity: bool,
+) -> bool {
+    let was = &first.fingerprint;
+    was.path != now.path
+        && first.settled()
+        && file_hash_memo_eligible(now.inode, requires_identity)
+        && (now.size, now.mtime_ns, now.ctime_ns, now.inode)
+            == (was.size, was.mtime_ns, was.ctime_ns, was.inode)
+}
+
+/// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
+/// `C:\a/b` and `c:\a\b` all give `C:\a\b`, the one file they name. `None`
+/// for any other path, and for one whose two spellings could name different
+/// files: a `.` or `..` (resolved by Win32, literal after `\\?\`), a name
+/// ending in a dot or a space (stripped by Win32 only), a `/` inside a
+/// verbatim name, a UNC or device path. Always `None` off Windows.
+#[cfg(windows)]
+fn plain_spelling(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut plain = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
+                    plain.push(format!("{}:", char::from(disk.to_ascii_uppercase())));
+                }
+                _ => return None,
+            },
+            Component::RootDir => plain.push("\\"),
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                if name.ends_with(['.', ' ']) || name.contains('/') {
+                    return None;
+                }
+                plain.push(name);
+            }
+            Component::CurDir | Component::ParentDir => return None,
+        }
+    }
+    plain.is_absolute().then_some(plain)
+}
+
+#[cfg(not(windows))]
+fn plain_spelling(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// [`hash_file`], for a read that follows a stat of the same file.
 fn read_file_hash(path: &Path) -> Result<String> {
     #[cfg(test)]
@@ -8593,6 +8651,7 @@ impl FileHasher<'static> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
             env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
@@ -8620,6 +8679,7 @@ impl FileHasher<'static> {
                 discovery_flight: RefCell::new(None),
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
+                spellings: RefCell::new(HashMap::new()),
                 env_dep_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
@@ -8724,6 +8784,7 @@ impl<'db> FileHasher<'db> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
             env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
@@ -9885,10 +9946,21 @@ impl<'db> FileHasher<'db> {
     fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {
         let _trace = crate::phase_trace::phase("input_hash");
         let resolved = self.resolve_path(path)?;
+        if let Some(recent) = self.hashed_under_another_spelling(&resolved) {
+            return Ok(recent);
+        }
         let path = resolved.as_path();
-        let (hash, observed) = self.hash_inner(path, true)?;
+        let (hash, observed, stamp_of_the_read) = self.hash_inner(path, true)?;
         if let Some(observed) = &observed {
             self.guard_input(observed);
+            // Only a stamp the bytes belong to may vouch for another
+            // spelling, as only such a stamp gets a memo row.
+            if stamp_of_the_read && let Some(plain) = plain_spelling(&resolved) {
+                self.spellings
+                    .borrow_mut()
+                    .entry(plain)
+                    .or_insert_with(|| (hash.clone(), observed.clone()));
+            }
         }
         let recent = RecentHash {
             hash,
@@ -9898,6 +9970,35 @@ impl<'db> FileHasher<'db> {
             .borrow_mut()
             .insert(resolved, recent.clone());
         Ok(recent)
+    }
+
+    /// The hash this process already took of the file `resolved` names,
+    /// under another spelling of it. On Windows one closure can name a file
+    /// twice: a crate that embeds a folder with rust-embed, which includes
+    /// the canonical `\\?\C:\…\assets\a.svg`, and also includes each file
+    /// as `concat!(env!("CARGO_MANIFEST_DIR"), "/assets/a.svg")`, which gives
+    /// `C:\…\pkg/assets/a.svg`. One that does so for 1,830 icons listed
+    /// 3,666 sources and read each file twice per key. This spelling takes the first one's
+    /// hash while the file keeps the settled stamp it had then, under its
+    /// own path, and joins the too-new guard with it, so the checks after
+    /// the compile stat it as they would have.
+    fn hashed_under_another_spelling(&self, resolved: &Path) -> Option<RecentHash> {
+        let plain = plain_spelling(resolved)?;
+        let (hash, first) = self.spellings.borrow().get(&plain).cloned()?;
+        let observed = ObservedFingerprint::from_path(resolved).ok()?;
+        if !may_carry_over(&first, &observed.fingerprint, cfg!(windows)) {
+            return None;
+        }
+        self.record_hit();
+        self.guard_input(&observed);
+        let recent = RecentHash {
+            hash,
+            fingerprint: Some(observed.fingerprint),
+        };
+        self.recent_hashes
+            .borrow_mut()
+            .insert(resolved.to_path_buf(), recent.clone());
+        Some(recent)
     }
 
     /// Validate and hash a compiled resource from one open file. Whole-file
@@ -10064,7 +10165,7 @@ impl<'db> FileHasher<'db> {
     /// or that moved while the file was read under the guard.
     pub(crate) fn hash_unkeyed(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
-        self.hash_inner(path, false).map(|(hash, _)| hash)
+        self.hash_inner(path, false).map(|(hash, _, _)| hash)
     }
 
     /// Small tree-guard files share one memo lookup per root. The row must
@@ -10146,11 +10247,15 @@ impl<'db> FileHasher<'db> {
     }
 
     /// With `keyed`, the file is a key input and the too-new guard sees it.
+    /// The hash of `path`, the stamp to report for it, and whether that
+    /// stamp belongs to the bytes hashed: it came with the hash (memo or
+    /// prefetch), or two stats around the read agreed, the rule a memo row
+    /// is written under.
     fn hash_inner(
         &self,
         path: &Path,
         keyed: bool,
-    ) -> Result<(String, Option<ObservedFingerprint>)> {
+    ) -> Result<(String, Option<ObservedFingerprint>, bool)> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
         let Some(cache) = &self.cache else {
@@ -10163,7 +10268,8 @@ impl<'db> FileHasher<'db> {
             };
             if !keyed || self.too_new.invocation_start_ns == 0 {
                 let hash = hash_file(path)?;
-                return Ok((hash, FileFingerprint::from_path(path).ok().map(observed)));
+                let after = FileFingerprint::from_path(path).ok().map(observed);
+                return Ok((hash, after, false));
             }
             let Ok(before) = FileFingerprint::from_path(path).map(observed) else {
                 // No stamp before the read: whatever follows it is too new.
@@ -10172,12 +10278,12 @@ impl<'db> FileHasher<'db> {
                 if after.is_some() {
                     self.too_new.saw_too_new.set(true);
                 }
-                return Ok((hash, after.map(observed)));
+                return Ok((hash, after.map(observed), false));
             };
             self.note_too_new(&before.fingerprint);
             let hash = read_file_hash(path)?;
-            let (observed, _) = self.restat_after_read(path, before, true);
-            return Ok((hash, Some(observed)));
+            let (observed, unchanged) = self.restat_after_read(path, before, true);
+            return Ok((hash, Some(observed), unchanged));
         };
 
         let observed = match ObservedFingerprint::from_path(path) {
@@ -10187,7 +10293,7 @@ impl<'db> FileHasher<'db> {
                     "file hash cache metadata lookup failed for {}: {e}",
                     path.display()
                 );
-                return hash_file(path).map(|hash| (hash, None));
+                return hash_file(path).map(|hash| (hash, None, false));
             }
         };
         let fingerprint = &observed.fingerprint;
@@ -10206,8 +10312,8 @@ impl<'db> FileHasher<'db> {
         {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
-            let (observed, _) = self.restat_after_read(path, observed, keyed);
-            return Ok((hash, Some(observed)));
+            let (observed, unchanged) = self.restat_after_read(path, observed, keyed);
+            return Ok((hash, Some(observed), unchanged));
         }
 
         // A hash from the daemon or the memo belongs to this stamp; no read
@@ -10219,13 +10325,13 @@ impl<'db> FileHasher<'db> {
                 self.record_miss_count();
                 self.record_miss_bytes(prefetched.bytes_hashed);
             }
-            return Ok((prefetched.hash.clone(), Some(observed)));
+            return Ok((prefetched.hash.clone(), Some(observed), true));
         }
 
         match cache.get(fingerprint) {
             Ok(Some(hash)) => {
                 self.record_hit();
-                return Ok((hash, Some(observed)));
+                return Ok((hash, Some(observed), true));
             }
             Ok(None) => {}
             Err(e) => {
@@ -10241,7 +10347,7 @@ impl<'db> FileHasher<'db> {
                 .borrow_mut()
                 .push((observed.clone(), hash.clone()));
         }
-        Ok((hash, Some(observed)))
+        Ok((hash, Some(observed), unchanged))
     }
 
     /// Stat `path` again after reading the bytes `before` was taken for, when

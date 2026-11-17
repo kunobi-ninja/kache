@@ -11702,7 +11702,9 @@ pub(crate) fn rustc_tool_dirs_for(
 /// content hashes, under an explicit `--sysroot` and under the toolchain's own
 /// sysroot. Both are hashed because which one rustc searches first depends on
 /// its release. Finding none is an error, so the compile is not cached under a
-/// key that describes no backend.
+/// key that describes no backend. In a double-wrapper invocation the host and
+/// sysroot are the inner rustc's: `clippy-driver --version --verbose` prints
+/// only Clippy's version.
 pub(crate) fn toolchain_codegen_backends_for(
     args: &RustcArgs,
     rustc_version: &str,
@@ -11710,12 +11712,16 @@ pub(crate) fn toolchain_codegen_backends_for(
     file_hasher: &FileHasher,
     env: &InvocationEnv,
 ) -> Result<Vec<(String, String)>> {
-    let host = rustc_host_triple(rustc_version).context("rustc -vV reports no host")?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, |rustc| {
+        get_rustc_version_for(rustc, env)
+    })?;
+    let host = rustc_host_triple(&rustc_version).context("rustc -vV reports no host")?;
+    let rustc = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
     let sysroots = args
         .sysroot
         .iter()
         .filter_map(|root| env.resolve(root))
-        .chain(default_rustc_sysroot_for(&args.rustc, env));
+        .chain(default_rustc_sysroot_for(rustc, env));
     let found = codegen_backend_libraries(sysroots, host, name, file_hasher)?;
     anyhow::ensure!(
         !found.is_empty(),
@@ -12065,7 +12071,7 @@ where
     match args.inner_rustc.as_deref() {
         Some(inner) => load_version(inner)
             .map(Cow::Owned)
-            .context("reading inner rustc version for native host link key"),
+            .context("reading the inner rustc version for its host triple"),
         None => Ok(Cow::Borrowed(outer_rustc_version)),
     }
 }

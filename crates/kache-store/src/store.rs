@@ -1390,6 +1390,17 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// megabytes.
 pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
+/// How long one transaction of the tombstone prune deletes rows before it
+/// commits: it holds the index's write lock this long, plus one row and the
+/// commit.
+const PRUNE_LOCK_HOLD: Duration = Duration::from_millis(100);
+
+/// How long the tombstone prune leaves the write lock free before each of
+/// its transactions: a little longer than the longest sleep (100 ms) of
+/// SQLite's default busy handler between tries, the poll interval of a
+/// writer that has already waited a while.
+const PRUNE_LOCK_GAP: Duration = Duration::from_millis(110);
+
 /// Default maximum wait for another process to publish a key it is building.
 pub const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -6192,17 +6203,72 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// Run from the GC sweep. A tombstone's value is the demand signal in the
     /// window after eviction; past that it is only taking up space.
+    ///
+    /// Neither table has an SQL index on its stamp, so finding the old rows
+    /// reads the whole table. That read runs outside a write transaction,
+    /// and the rows then go by key, a short transaction at a time
+    /// ([`PRUNE_LOCK_HOLD`]), each after the write lock was left free for
+    /// [`PRUNE_LOCK_GAP`], so puts get the lock while a long prune runs.
     pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
         self.refuse_write("prune tombstones")?;
         let cutoff = format!("-{keep_days} days");
-        let removed = self.db.execute(
-            "DELETE FROM eviction_tombstones WHERE evicted_at < datetime('now', ?1)",
-            params![cutoff],
-        )?;
-        self.db.execute(
-            "DELETE FROM shadow_victims WHERE swept_at < datetime('now', ?1)",
-            params![cutoff],
-        )?;
+        let removed = self.prune_rows_older_than("eviction_tombstones", "evicted_at", &cutoff)?;
+        self.prune_rows_older_than("shadow_victims", "swept_at", &cutoff)?;
+        Ok(removed)
+    }
+
+    /// Delete the rows of `table` whose `stamp` is older than `cutoff` (an
+    /// SQLite date modifier).
+    fn prune_rows_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<usize> {
+        let keys = self.keys_older_than(table, stamp, cutoff)?;
+        self.delete_old_rows_by_key(table, stamp, &keys, cutoff)
+    }
+
+    /// The keys of `table` whose `stamp` is older than `cutoff`, read
+    /// without the write lock.
+    fn keys_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT cache_key FROM {table} WHERE {stamp} < datetime('now', ?1)"
+        ))?;
+        let keys = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(keys)
+    }
+
+    /// Delete `keys` from `table`, each only while its `stamp` is still older
+    /// than `cutoff`: a key evicted again since the read has a fresh row,
+    /// which stays. Leaves the write lock free for [`PRUNE_LOCK_GAP`] before
+    /// each transaction and commits after [`PRUNE_LOCK_HOLD`].
+    fn delete_old_rows_by_key(
+        &self,
+        table: &str,
+        stamp: &str,
+        keys: &[String],
+        cutoff: &str,
+    ) -> Result<usize> {
+        let delete =
+            format!("DELETE FROM {table} WHERE cache_key = ?1 AND {stamp} < datetime('now', ?2)");
+        let mut removed = 0;
+        let mut keys = keys.iter().peekable();
+        while keys.peek().is_some() {
+            std::thread::sleep(PRUNE_LOCK_GAP);
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let started = std::time::Instant::now();
+            {
+                let mut stmt = tx.prepare_cached(&delete)?;
+                for key in keys.by_ref() {
+                    removed += stmt.execute(params![key, cutoff])?;
+                    if started.elapsed() >= PRUNE_LOCK_HOLD {
+                        break;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
         Ok(removed)
     }
 

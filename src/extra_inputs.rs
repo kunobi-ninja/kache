@@ -2114,31 +2114,13 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
         return false;
     };
     let base = Path::new(&glob_pattern[..=slash]);
-    // Unix: only absolute paths are rooted. Windows: `Path::is_absolute()` is
-    // false for a bare "/" (it expects a drive), but "/" is still the
-    // current-drive root and walks a huge tree — treat a leading RootDir as
-    // rooted there. Keeping the RootDir arm behind `cfg(windows)` makes the
-    // Linux mutation lane observe a single killable absolute check instead of
-    // an equivalent `||` / `&&` pair.
+    // On Windows a bare `/` would walk the root of the current drive.
     let rooted = path_base_is_rooted(base);
     rooted && base.parent().is_none()
 }
 
 fn path_base_is_rooted(base: &Path) -> bool {
-    if base.is_absolute() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        matches!(
-            base.components().next(),
-            Some(std::path::Component::RootDir)
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    base.has_root()
 }
 
 #[derive(Debug, Clone, Copy)]

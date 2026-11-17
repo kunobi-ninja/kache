@@ -583,20 +583,7 @@ fn build_script_runs_are_restored_and_keyed_on_their_declarations() {
     let fx = fixture();
     let out_dir_contents = |target: &Path| -> Vec<(String, String)> {
         let mut found = Vec::new();
-        for build in std::fs::read_dir(target.join("debug/build")).unwrap() {
-            let build = build.unwrap().path();
-            if !build
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("withbuild-")
-            {
-                continue;
-            }
-            let out = build.join("out");
-            if !out.is_dir() {
-                continue;
-            }
+        for out in common::cargo_build_script_out_dirs(&target.join("debug"), "withbuild") {
             for entry in walkdir(&out) {
                 if entry.is_file() {
                     found.push((
@@ -1055,10 +1042,7 @@ fn bundled_c_library_scripts_hit_in_another_target_directory() {
             &[],
         ));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let build = target.join("debug/build");
-        let out_dir = std::fs::read_dir(&build)
-            .unwrap()
-            .map(|entry| entry.unwrap().path().join("out"))
+        let out_dir = common::cargo_build_script_out_dirs(&target.join("debug"), "bundled")
             .find(|out| out.join("lib/pkgconfig/bundled.pc").is_file())
             .expect("the bundled OUT_DIR");
         assert!(
@@ -1862,7 +1846,13 @@ fn main() {
 
     // Losing Cargo's saved stdout reruns the script with unchanged inputs,
     // while OUT_DIR remains a link. The sealed run must be linked again.
-    let saved_stdout = out_dir_of(&second).parent().unwrap().join("output");
+    let out_dir = out_dir_of(&second);
+    let unit = out_dir.parent().unwrap();
+    let saved_stdout = if unit.join("run").is_dir() {
+        unit.join("run/stdout")
+    } else {
+        unit.join("output")
+    };
     std::fs::remove_file(saved_stdout).unwrap();
     let mark = event_count(&fx.cache);
     let output = run(&mut cargo(

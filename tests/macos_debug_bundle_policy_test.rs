@@ -105,17 +105,14 @@ fn check_debug_bundle_policy(split: &str, expected_bundle: bool) {
             expected_result,
             "{events:?}"
         );
-        let deps = project.target.join("debug/deps");
-        let bundles: Vec<_> = fs::read_dir(&deps)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+        let profile = project.target.join("debug");
+        let bundles: Vec<_> = common::cargo_unit_outputs(&profile)
             .filter(|path| path.extension().is_some_and(|ext| ext == "dSYM"))
             .collect();
         assert_eq!(!bundles.is_empty(), expected_bundle, "{split}: {bundles:?}");
         // The bundle is restored in place; its stored pieces stay in the store.
-        let pieces: Vec<_> = fs::read_dir(&deps)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        let pieces: Vec<_> = common::cargo_unit_outputs(&profile)
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .filter(|name| name.contains(".dsym."))
             .collect();
         assert!(pieces.is_empty(), "{split} {expected_result}: {pieces:?}");

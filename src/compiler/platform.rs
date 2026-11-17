@@ -284,6 +284,13 @@ impl Platform for MacOsPlatform {
 
 /// What to do at the dsymutil spawn for one macOS binary.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    windows,
+    allow(
+        clippy::large_enum_variant,
+        reason = "Windows Command is larger, but production only runs this plan on macOS"
+    )
+)]
 enum DebugBundleSpawn {
     /// Packed debug info left no bundle, or this output is not Mach-O.
     /// Cache the binary and do not warn.

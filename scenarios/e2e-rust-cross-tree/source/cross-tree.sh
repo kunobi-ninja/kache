@@ -73,7 +73,7 @@ shares_store_blob() {
 
 carrier=
 if [ "$(uname -s)" = "Linux" ] && [ -z "${KACHE_E2E_SKIP_HARDLINK_CHECK:-}" ]; then
-    for f in ta/release/deps/libutil-*.rlib; do
+    for f in ta/release/deps/libutil-*.rlib ta/release/build/util/*/out/libutil-*.rlib; do
         [ -e "$f" ] || continue
         if shares_store_blob "$f"; then
             carrier=$f
@@ -111,10 +111,10 @@ if [ -n "$carrier" ]; then
         exit 1
     fi
 
-    carrier_name=$(basename "$carrier")
-    tree_b_carrier="tb/release/deps/$carrier_name"
+    carrier_relative=${carrier#ta/}
+    tree_b_carrier="tb/$carrier_relative"
     if [ ! -e "$tree_b_carrier" ]; then
-        echo "cross-tree: tree B did not restore matching carrier $carrier_name"
+        echo "cross-tree: tree B did not restore matching carrier $carrier_relative"
         exit 1
     fi
     if [ "$(stat -Lc '%d:%i' "/proc/$$/fd/3")" = "$(stat -Lc '%d:%i' "$tree_b_carrier")" ]; then

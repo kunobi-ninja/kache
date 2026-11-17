@@ -214,10 +214,7 @@ fn provider_artifact(target: &Path) -> PathBuf {
     } else {
         "so"
     };
-    std::fs::read_dir(target.join("debug/deps"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
+    common::cargo_unit_outputs(&target.join("debug"))
         .find(|path| {
             path.extension().is_some_and(|ext| ext == extension)
                 && path

@@ -18,7 +18,7 @@ fn project(root: &Path, answer: u64) {
     )).unwrap();
 }
 
-fn build(root: &Path, donor: Option<&Path>, extra_flags: &str) -> Output {
+fn build(root: &Path, donor: Option<&Path>, extra_flags: &str) -> serde_json::Value {
     let cache = root.join("cache");
     let mut command = common::hermetic_command("cargo", &cache, Some(&root.join("absent.toml")));
     command
@@ -35,7 +35,7 @@ fn build(root: &Path, donor: Option<&Path>, extra_flags: &str) -> Output {
         .env("RUSTC_BOOTSTRAP", "1")
         .env(
             "RUSTFLAGS",
-            format!("-Zremap-cwd-prefix=/src -Zincremental-info {extra_flags}"),
+            format!("-Zremap-cwd-prefix=/src {extra_flags}"),
         )
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
@@ -50,7 +50,15 @@ fn build(root: &Path, donor: Option<&Path>, extra_flags: &str) -> Output {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    output
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("completely ignoring cache"), "{stderr}");
+    fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["crate_name"] == "worktree_probe")
+        .expect("worktree probe compile event")
 }
 
 fn check_binary(root: &Path, answer: u64) {
@@ -62,16 +70,6 @@ fn check_binary(root: &Path, answer: u64) {
         String::from_utf8(output.stdout).unwrap().trim(),
         format!("{answer}|{}", root.display())
     );
-}
-
-fn reused(output: &Output) -> bool {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("completely ignoring cache"), "{stderr}");
-    stderr.lines().any(|line| {
-        line.contains("session directory:")
-            && line.contains("files hard-linked")
-            && !line.contains(": 0 files")
-    })
 }
 
 fn supports_cwd_remap() -> bool {
@@ -217,11 +215,12 @@ fn thin_lto_seed_keeps_the_donor_unchanged_and_linkable() {
     );
 
     project(&receiver, 2);
-    let output = build(&receiver, Some(&donor.join("target/debug")), flags);
-    assert!(
-        reused(&output),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let profile = donor.join("target/debug");
+    let event = build(&receiver, Some(&profile), flags);
+    assert_eq!(
+        event["incremental_seed"],
+        profile.to_str().unwrap(),
+        "{event}"
     );
     check_binary(&receiver, 2);
     assert_eq!(graph_contents(&state), before);
@@ -385,17 +384,13 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
         "discarded bootstrap binary must not survive the failed native retry"
     );
     assert!(
-        !fs::read_dir(failing.join("target/debug/deps"))
-            .unwrap()
-            .any(|entry| {
-                let path = entry.unwrap().path();
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("worktree_probe-")
-                    && path.extension().is_none()
-            }),
-        "discarded rustc executable must not survive in deps either"
+        !common::cargo_unit_outputs(&failing.join("target/debug")).any(|path| {
+            path.file_stem().is_some_and(|stem| {
+                let stem = stem.to_string_lossy();
+                stem == "worktree_probe" || stem.starts_with("worktree_probe-")
+            }) && path.extension().is_none()
+        }),
+        "discarded rustc executable must not survive in the unit output directory either"
     );
 }
 
@@ -446,15 +441,12 @@ fn failed_bootstrap_dep_info_cleanup_keeps_the_native_compile_accounted() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let dep_info = fs::read_dir(root.join("target/debug/deps"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let dep_info = common::cargo_unit_outputs(&root.join("target/debug"))
         .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("worktree_probe-")
-                && path.extension().is_some_and(|extension| extension == "d")
+            path.file_stem().is_some_and(|stem| {
+                let stem = stem.to_string_lossy();
+                stem == "worktree_probe" || stem.starts_with("worktree_probe-")
+            }) && path.extension().is_some_and(|extension| extension == "d")
         })
         .unwrap();
     fs::remove_file(&dep_info).unwrap();
@@ -519,15 +511,12 @@ fn deferred_compiler_error_does_not_retry_a_stale_bootstrap_observation() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let dep_info = fs::read_dir(root.join("target/debug/deps"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let dep_info = common::cargo_unit_outputs(&root.join("target/debug"))
         .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("worktree_probe-")
-                && path.extension().is_some_and(|extension| extension == "d")
+            path.file_stem().is_some_and(|stem| {
+                let stem = stem.to_string_lossy();
+                stem == "worktree_probe" || stem.starts_with("worktree_probe-")
+            }) && path.extension().is_some_and(|extension| extension == "d")
         })
         .unwrap();
     fs::write(&dep_info, "# env-dep:RUSTC_BOOTSTRAP=stale\n").unwrap();
@@ -629,20 +618,7 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
                 .file_name()
                 .is_some_and(|name| name == "bootstrap-env-dep"))
     );
-    let deps = root.join("target/debug/deps");
-    let rlib = fs::read_dir(&deps)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("libworktree_probe-")
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "rlib")
-        })
-        .unwrap();
+    let rlib = root.join("target/debug/libworktree_probe.rlib");
     let source = root.join("consumer.rs");
     let binary = root.join("consumer");
     fs::write(
@@ -654,8 +630,6 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
         .arg(&source)
         .args(["--edition", "2024", "--extern"])
         .arg(format!("worktree_probe={}", rlib.display()))
-        .arg("-L")
-        .arg(&deps)
         .arg("-o")
         .arg(&binary)
         .output()
@@ -770,19 +744,20 @@ fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
     project(&incompatible, 3);
     project(&cold, 4);
     let profile = donor.join("target/debug");
-    assert!(!reused(&build(&donor, Some(&profile), "")));
+    assert!(build(&donor, Some(&profile), "")["incremental_seed"].is_null());
     check_binary(&donor, 1);
     let donor_graph = profile.join("incremental.kache-auto");
     let original = graph_contents(&donor_graph);
     let seeded = build(&receiver, Some(&profile), "");
-    assert!(
-        reused(&seeded),
-        "{}",
-        String::from_utf8_lossy(&seeded.stderr)
+    assert_eq!(
+        seeded["incremental_seed"],
+        profile.to_str().unwrap(),
+        "{seeded}"
     );
     check_binary(&receiver, 2);
     project(&receiver, 3);
-    assert!(reused(&build(&receiver, Some(&profile), "")));
+    let edited = build(&receiver, Some(&profile), "");
+    assert!(edited["incremental_seed"].is_null(), "{edited}");
     check_binary(&receiver, 3);
     assert_eq!(
         graph_contents(&donor_graph),
@@ -790,13 +765,13 @@ fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
         "receiver changed the donor graph"
     );
     check_binary(&donor, 1);
-    assert!(!reused(&build(
-        &incompatible,
-        Some(&profile),
-        "-Copt-level=1"
-    )));
+    let changed_flags = build(&incompatible, Some(&profile), "-Copt-level=1");
+    assert!(
+        changed_flags["incremental_seed"].is_null(),
+        "{changed_flags}"
+    );
     check_binary(&incompatible, 3);
-    assert!(!reused(&build(&cold, None, "")));
+    assert!(build(&cold, None, "")["incremental_seed"].is_null());
     check_binary(&cold, 4);
 }
 

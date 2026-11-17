@@ -23843,3 +23843,56 @@ fn a_windows_file_named_twice_in_one_closure_is_read_once() {
     assert_ne!(after, before, "the second spelling reads the new contents");
     assert_eq!(hasher.stats().cache_misses, 6);
 }
+
+#[test]
+fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
+    let stamp = |path: &str, inode| FileFingerprint {
+        path: path.to_string(),
+        size: 12,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        inode,
+    };
+    let first = |inode, observed_ns| ObservedFingerprint {
+        fingerprint: stamp(r"C:\a\b.rs", inode),
+        observed_ns,
+    };
+    let settled = first(7, 1 + HASH_SETTLE_NS);
+    let other = stamp("c:/a/b.rs", 7);
+    assert!(may_carry_over(&settled, &other, true));
+    assert!(
+        !may_carry_over(&first(7, HASH_SETTLE_NS), &other, true),
+        "the first read had not settled"
+    );
+    assert!(
+        !may_carry_over(&settled, &stamp(r"C:\a\b.rs", 7), true),
+        "the same spelling is the memo's question"
+    );
+    for moved in [
+        FileFingerprint {
+            size: 13,
+            ..other.clone()
+        },
+        FileFingerprint {
+            mtime_ns: 2,
+            ..other.clone()
+        },
+        FileFingerprint {
+            ctime_ns: 2,
+            ..other.clone()
+        },
+        FileFingerprint {
+            inode: 8,
+            ..other.clone()
+        },
+    ] {
+        assert!(!may_carry_over(&settled, &moved, true), "{moved:?}");
+    }
+    let anonymous = first(0, 1 + HASH_SETTLE_NS);
+    let anonymous_other = stamp("c:/a/b.rs", 0);
+    assert!(
+        !may_carry_over(&anonymous, &anonymous_other, true),
+        "no file index where one is required"
+    );
+    assert!(may_carry_over(&anonymous, &anonymous_other, false));
+}

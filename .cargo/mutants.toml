@@ -316,10 +316,11 @@ exclude_re = [
     # A file named under two spellings is a Windows path question too:
     # plain_spelling is cfg(windows), its stub elsewhere returns None, so
     # hashed_under_another_spelling returns at its first line on this lane.
-    # The Windows test a_windows_file_named_twice_in_one_closure_is_read_once
-    # checks the settle rule and the stamp comparison natively. The spelling
-    # filter only spares stats: a second spelling's own stamp must match.
-    # hash_and_record, which calls both, stays in scope.
+    # Its decision, may_carry_over (settle rule, memo eligibility and the
+    # stamp comparison), is a pure function and stays in scope, as does
+    # hash_and_record. The Windows test
+    # a_windows_file_named_twice_in_one_closure_is_read_once covers the
+    # spellings natively.
     "src/cache_key\\.rs:.*\\b(plain_spelling|hashed_under_another_spelling)\\b",
     # Like join_inflight_download's deadline: observing < versus <= needs
     # an exact Instant equality. The EOF/exit test covers an alive child

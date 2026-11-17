@@ -8533,6 +8533,24 @@ const SOURCE_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
     MIN_PERSISTED_HASH_BYTES
 };
 
+/// Whether a hash read as `first` vouches for the same file seen again as
+/// `now` under another spelling. The file may have been written since, so
+/// only a settled first read and the same strong stamp (size, times, file
+/// index) carry it over, as a memo row would. The same spelling is the
+/// memo's question, not this one.
+fn may_carry_over(
+    first: &ObservedFingerprint,
+    now: &FileFingerprint,
+    requires_identity: bool,
+) -> bool {
+    let was = &first.fingerprint;
+    was.path != now.path
+        && first.settled()
+        && file_hash_memo_eligible(now.inode, requires_identity)
+        && (now.size, now.mtime_ns, now.ctime_ns, now.inode)
+            == (was.size, was.mtime_ns, was.ctime_ns, was.inode)
+}
+
 /// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
 /// `C:\a/b` and `c:\a\b` all give `C:\a\b`, the one file they name. `None`
 /// for any other path, and for one whose two spellings could name different
@@ -9967,19 +9985,8 @@ impl<'db> FileHasher<'db> {
     fn hashed_under_another_spelling(&self, resolved: &Path) -> Option<RecentHash> {
         let plain = plain_spelling(resolved)?;
         let (hash, first) = self.spellings.borrow().get(&plain).cloned()?;
-        if first.fingerprint.path == resolved.to_str()? || !first.settled() {
-            return None;
-        }
-        // The file may have been written since: only the same strong stamp
-        // (size, times, NTFS file index) carries the hash over, as a memo
-        // row would.
         let observed = ObservedFingerprint::from_path(resolved).ok()?;
-        let now = &observed.fingerprint;
-        let first = &first.fingerprint;
-        if !file_hash_memo_eligible(now.inode, cfg!(windows))
-            || (now.size, now.mtime_ns, now.ctime_ns, now.inode)
-                != (first.size, first.mtime_ns, first.ctime_ns, first.inode)
-        {
+        if !may_carry_over(&first, &observed.fingerprint, cfg!(windows)) {
             return None;
         }
         self.record_hit();

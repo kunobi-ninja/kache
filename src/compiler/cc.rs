@@ -7339,7 +7339,9 @@ impl CcListingStamp {
                 Some(Self::Present(fingerprint))
             }
             Ok(_) => None,
-            Err(_) => match std::fs::metadata(directory) {
+            // Not even a dangling symlink: the include-order check reads the
+            // path without following it, so a link appearing must break this.
+            Err(_) => match std::fs::symlink_metadata(directory) {
                 Err(error) if error.kind() == ErrorKind::NotFound => Some(Self::Absent),
                 _ => None,
             },
@@ -7349,9 +7351,8 @@ impl CcListingStamp {
     /// Whether `path` still looks exactly as stamped.
     fn holds(&self, path: &Path) -> bool {
         match self {
-            Self::Absent => {
-                std::fs::metadata(path).is_err_and(|error| error.kind() == ErrorKind::NotFound)
-            }
+            Self::Absent => std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound),
             Self::Present(fingerprint) => crate::cache_key::FileFingerprint::from_path(path)
                 .is_ok_and(|now| now == *fingerprint),
             Self::Available(was) => {

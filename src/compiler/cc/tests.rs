@@ -8396,6 +8396,19 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
 
 #[cfg(unix)]
 #[test]
+fn an_absent_stamp_breaks_when_a_dangling_symlink_appears() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    let stamp = CcListingStamp::take(&missing).unwrap();
+    assert_eq!(stamp, CcListingStamp::Absent);
+    assert!(stamp.holds(&missing));
+    std::os::unix::fs::symlink(temp.path().join("nowhere"), &missing).unwrap();
+    assert!(!stamp.holds(&missing));
+    assert_eq!(CcListingStamp::take(&missing), None);
+}
+
+#[cfg(unix)]
+#[test]
 fn header_probe_availability_preserves_filesystem_errors() {
     let temp = tempfile::tempdir().unwrap();
     let link = temp.path().join("loop");

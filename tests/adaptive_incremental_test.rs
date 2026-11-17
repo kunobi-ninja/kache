@@ -69,19 +69,8 @@ fn past_mtime() -> i64 {
 }
 
 fn reset_fixture_fingerprint(target_dir: &Path) {
-    let fingerprints = target_dir.join("debug/.fingerprint");
-    if fingerprints.is_dir() {
-        for entry in fs::read_dir(&fingerprints).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("adaptive-fixture-"))
-            {
-                fs::remove_dir_all(entry.path()).unwrap();
-            }
-        }
+    for fingerprint in common::cargo_fingerprints(&target_dir.join("debug"), "adaptive-fixture") {
+        fs::remove_dir_all(fingerprint).unwrap();
     }
 }
 
@@ -175,19 +164,7 @@ fn build_variant_impl(
 
     // Execute a tiny direct consumer of the produced rlib. Event transitions
     // alone would not catch stale incremental output.
-    let deps = target_dir.join("debug/deps");
-    let rlib = fs::read_dir(&deps)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libadaptive_fixture-") && name.ends_with(".rlib")
-                })
-        })
-        .expect("fixture rlib was not produced");
+    let rlib = target_dir.join("debug/libadaptive_fixture.rlib");
     let consumer_source = project.join("consumer.rs");
     let consumer_binary = project.join("consumer");
     fs::write(
@@ -200,8 +177,6 @@ fn build_variant_impl(
         .arg("--edition=2024")
         .arg("--extern")
         .arg(format!("adaptive_fixture={}", rlib.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
         .arg("-o")
         .arg(&consumer_binary)
         .output()

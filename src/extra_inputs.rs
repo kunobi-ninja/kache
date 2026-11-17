@@ -2124,21 +2124,18 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
     rooted && base.parent().is_none()
 }
 
+#[cfg(windows)]
 fn path_base_is_rooted(base: &Path) -> bool {
-    if base.is_absolute() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        matches!(
+    base.is_absolute()
+        || matches!(
             base.components().next(),
             Some(std::path::Component::RootDir)
         )
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+}
+
+#[cfg(not(windows))]
+fn path_base_is_rooted(base: &Path) -> bool {
+    base.is_absolute()
 }
 
 #[derive(Debug, Clone, Copy)]

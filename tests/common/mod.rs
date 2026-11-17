@@ -23,15 +23,79 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// `<target>/kache-test-bootstrap`, derived from the running test binary at
-/// `<target>/<profile>/deps/<test-bin>` so it follows `CARGO_TARGET_DIR`
-/// (including `cargo llvm-cov`'s).
+/// `<target>/kache-test-bootstrap`, shared by all test binaries in the same
+/// build directory. Cargo 1.100 puts test binaries under `build/<pkg>/<hash>/out`.
 fn bootstrap_target_dir() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test binary path");
-    dir.pop(); // test binary
-    dir.pop(); // deps/
-    dir.pop(); // <profile>/
-    dir.join("kache-test-bootstrap")
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = exe.parent().expect("test output directory");
+    let levels = if out.file_name() == Some(OsStr::new("out"))
+        && out.ancestors().nth(3).and_then(Path::file_name) == Some(OsStr::new("build"))
+    {
+        5 // out, hash, package, build, profile, then the build directory
+    } else {
+        2 // deps, profile, then the build directory
+    };
+    out.ancestors()
+        .nth(levels)
+        .expect("test build directory")
+        .join("kache-test-bootstrap")
+}
+
+#[allow(dead_code)]
+pub fn dir_entries(path: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("reading {}: {error}", path.display()),
+    };
+    entries
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.unwrap().path())
+}
+
+/// Internal rustc outputs, before Cargo copies or links them to the profile root.
+#[allow(dead_code)]
+pub fn cargo_unit_outputs(profile: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    dir_entries(&profile.join("deps")).chain(
+        dir_entries(&profile.join("build"))
+            .filter(|path| path.is_dir())
+            .flat_map(|package| dir_entries(&package))
+            .filter(|path| path.is_dir())
+            .flat_map(|unit| dir_entries(&unit.join("out"))),
+    )
+}
+
+#[allow(dead_code)]
+pub fn cargo_fingerprints(profile: &Path, package: &str) -> impl Iterator<Item = PathBuf> + use<> {
+    let prefix = format!("{package}-");
+    dir_entries(&profile.join(".fingerprint"))
+        .filter(move |path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .chain(
+            dir_entries(&profile.join("build").join(package)).map(|unit| unit.join("fingerprint")),
+        )
+        .filter(|path| path.is_dir())
+}
+
+#[allow(dead_code)]
+pub fn cargo_build_script_out_dirs(
+    profile: &Path,
+    package: &str,
+) -> impl Iterator<Item = PathBuf> + use<> {
+    let build = profile.join("build");
+    let prefix = format!("{package}-");
+    dir_entries(&build)
+        .filter(move |path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .filter(|unit| unit.join("output").is_file())
+        .chain(dir_entries(&build.join(package)).filter(|unit| unit.join("run/stdout").is_file()))
+        .map(|unit| unit.join("out"))
+        .filter(|path| path.is_dir())
 }
 
 /// `KACHE_TEST_USE_CARGO_BIN_EXE=1` skips the bootstrap build and uses the

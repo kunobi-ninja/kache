@@ -391,11 +391,15 @@ fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
     );
 
     assert!(
-        host.join("target/debug/.fingerprint").is_dir(),
+        common::cargo_fingerprints(&host.join("target/debug"), "proxy_host")
+            .next()
+            .is_some(),
         "the proxied build keeps its own intermediates in the worktree"
     );
     assert!(
-        nested_target.join("debug/.fingerprint").is_dir(),
+        common::cargo_fingerprints(&nested_target.join("debug"), "proxy_guest")
+            .next()
+            .is_some(),
         "the nested build must keep its intermediates where its build script put them"
     );
     assert!(
@@ -857,13 +861,17 @@ fn cargo_proxy_isolates_fingerprints_while_sharing_final_target_and_kache() {
 
     for worktree in [&worktree_a, &worktree_b, &worktree_c] {
         assert!(
-            worktree.join("target/debug/.fingerprint").is_dir(),
+            common::cargo_fingerprints(&worktree.join("target/debug"), "proxy_shared_target")
+                .next()
+                .is_some(),
             "intermediate fingerprints must be private to {}",
             worktree.display()
         );
     }
     assert!(
-        !shared_target.join("debug/.fingerprint").exists(),
+        common::cargo_fingerprints(&shared_target.join("debug"), "proxy_shared_target")
+            .next()
+            .is_none(),
         "the shared final target must not contain Cargo fingerprint state"
     );
 
@@ -938,13 +946,12 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
     assert!(json["targets"][0]["plan"]["protected"].as_u64().unwrap() > 0);
     let planned_bytes = json["targets"][0]["plan"]["bytes"].clone();
     // Access time is intentionally misleading for every fingerprint file.
-    for unit in std::fs::read_dir(target.join("debug/.fingerprint")).unwrap() {
-        for file in std::fs::read_dir(unit.unwrap().path()).unwrap() {
-            filetime::set_file_atime(
-                file.unwrap().path(),
-                filetime::FileTime::from_unix_time(1, 0),
-            )
-            .unwrap();
+    let fingerprints: Vec<_> =
+        common::cargo_fingerprints(&target.join("debug"), "liveness_fixture").collect();
+    assert!(!fingerprints.is_empty());
+    for fingerprint in fingerprints {
+        for file in common::dir_entries(&fingerprint) {
+            filetime::set_file_atime(file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         }
     }
     let clean = run(&["clean", "--artifacts", "--json", "--yes"], true);
@@ -1724,7 +1731,11 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(target.join("check/debug/.fingerprint").is_dir());
+    assert!(
+        common::cargo_fingerprints(&target.join("check/debug"), "compiler_gc_probe")
+            .next()
+            .is_some()
+    );
     held.unlock().unwrap();
     let version = Command::new("rustc").arg("--version").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();

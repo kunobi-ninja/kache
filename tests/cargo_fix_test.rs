@@ -100,9 +100,7 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let metadata: Vec<_> = fs::read_dir(target.join("debug/deps"))
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
+                let metadata: Vec<_> = common::cargo_unit_outputs(&target.join("debug"))
                     .filter(|path| path.extension().is_some_and(|ext| ext == "rmeta"))
                     .collect();
                 assert!(!metadata.is_empty(), "cargo check must produce metadata");

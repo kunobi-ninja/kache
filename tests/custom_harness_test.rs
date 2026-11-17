@@ -62,7 +62,7 @@ fn copy_fixture() -> TempDir {
 /// Runs `cargo test --test harness` through the kache wrapper.
 fn cargo_test(project: &Path, cache_dir: &Path, target_dir: &Path) -> std::process::Output {
     hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)))
-        .args(["test", "--test", "harness"])
+        .args(["test", "--test", "harness", "--message-format=json"])
         .current_dir(project)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", target_dir)
@@ -205,16 +205,18 @@ fn custom_harness_test_binary_is_executable_after_restore() {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let binary = std::fs::read_dir(target.path().join("debug").join("deps"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.extension().is_none()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("harness-"))
+        let stdout = String::from_utf8_lossy(&warm.stdout);
+        let binary = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|message| {
+                if message["reason"] == "compiler-artifact"
+                    && message["target"]["name"] == "harness"
+                {
+                    message["executable"].as_str().map(std::path::PathBuf::from)
+                } else {
+                    None
+                }
             })
             .expect("restored harness test binary");
 

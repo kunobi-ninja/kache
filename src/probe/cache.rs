@@ -480,6 +480,14 @@ mod tests {
                 fingerprint(name, "--jobserver-auth=fifo:/tmp/b")
             );
             assert_ne!(
+                fingerprint(name, "--jobserver-auth=3,x"),
+                fingerprint(name, "--jobserver-auth=4,x")
+            );
+            assert_ne!(
+                fingerprint(name, "--jobserver-auth=x,3"),
+                fingerprint(name, "--jobserver-auth=x,4")
+            );
+            assert_ne!(
                 fingerprint(name, "--jobserver-auth=3,4"),
                 fingerprint("OTHER", "x")
             );

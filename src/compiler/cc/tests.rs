@@ -8362,14 +8362,23 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
     let temp = tempfile::tempdir().unwrap();
     let (parsed, source, include) =
         probing_unit(temp.path(), "#if __has_include(<optional.h>)\n#endif\n");
-    let target = temp.path().join("target");
+    // Outside every listed directory, so only the probe's own stamp can
+    // notice the target appearing.
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let target = elsewhere.join("target");
     std::os::unix::fs::symlink(&target, include.join("optional.h")).unwrap();
+    for dir in [&include, &temp.path().to_path_buf()] {
+        settle(dir);
+    }
     let names =
         cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
     let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
     assert!(
-        stamps.is_none(),
-        "a directory stamp cannot prove symlink target availability"
+        stamps.as_ref().is_some_and(|stamps| stamps
+            .iter()
+            .any(|(_, stamp)| *stamp == CcListingStamp::Available(false))),
+        "settled directories vouch for a probed unit, with the probe stamped beside them"
     );
     let compiler = CcCompiler::new();
     compiler
@@ -8383,6 +8392,30 @@ fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
     assert!(compiler.include_dir_names_still_match(&parsed));
     fs::write(&target, "int value;\n").unwrap();
     assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[test]
+fn an_availability_stamp_holds_only_while_the_answer_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = temp.path().join("optional.h");
+    assert!(CcListingStamp::Available(false).holds(&candidate));
+    assert!(!CcListingStamp::Available(true).holds(&candidate));
+    fs::write(&candidate, "int x;\n").unwrap();
+    assert!(CcListingStamp::Available(true).holds(&candidate));
+    assert!(!CcListingStamp::Available(false).holds(&candidate));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_absent_stamp_breaks_when_a_dangling_symlink_appears() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    let stamp = CcListingStamp::take(&missing).unwrap();
+    assert_eq!(stamp, CcListingStamp::Absent);
+    assert!(stamp.holds(&missing));
+    std::os::unix::fs::symlink(temp.path().join("nowhere"), &missing).unwrap();
+    assert!(!stamp.holds(&missing));
+    assert_eq!(CcListingStamp::take(&missing), None);
 }
 
 #[cfg(unix)]

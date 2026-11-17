@@ -7240,16 +7240,18 @@ fn digest_cc_shadowing_names_listing(
         }
         hasher.update(b"\n");
     }
-    Ok((
-        hasher.finalize().to_hex().to_string(),
-        // A directory stamp cannot prove that an existing symlink still
-        // resolves. Probe candidates are stat'ed again at publication.
-        if names.probes.is_empty() {
-            listings.stamps(&dirs)
-        } else {
-            None
-        },
-    ))
+    // A directory stamp cannot prove that an existing symlink still
+    // resolves, so each probe candidate is stamped with what it answered and
+    // stat'ed again by the check, as a fresh digest would.
+    let stamps = listings.stamps(&dirs).map(|mut stamps| {
+        stamps.extend(
+            availability
+                .into_iter()
+                .map(|(candidate, present)| (candidate, CcListingStamp::Available(present))),
+        );
+        stamps
+    });
+    Ok((hasher.finalize().to_hex().to_string(), stamps))
 }
 
 /// A probe follows symlinks, but a newly created link can make an old
@@ -7306,9 +7308,12 @@ fn cc_header_probe_available(
 enum CcListingStamp {
     Absent,
     Present(crate::cache_key::FileFingerprint),
+    /// A `__has_include` candidate, and whether it was available. Checked
+    /// the way the digest read it, so a symlink that stops resolving shows.
+    Available(bool),
 }
 
-/// Each listed directory with its stamp.
+/// Each listed directory, or probe candidate, with its stamp.
 type CcListingStamps = Vec<(PathBuf, CcListingStamp)>;
 
 /// Two seconds covers the coarsest directory timestamps in use (FAT's).
@@ -7334,21 +7339,25 @@ impl CcListingStamp {
                 Some(Self::Present(fingerprint))
             }
             Ok(_) => None,
-            Err(_) => match std::fs::metadata(directory) {
+            // Not even a dangling symlink: the include-order check reads the
+            // path without following it, so a link appearing must break this.
+            Err(_) => match std::fs::symlink_metadata(directory) {
                 Err(error) if error.kind() == ErrorKind::NotFound => Some(Self::Absent),
                 _ => None,
             },
         }
     }
 
-    /// Whether `directory` still looks exactly as stamped.
-    fn holds(&self, directory: &Path) -> bool {
+    /// Whether `path` still looks exactly as stamped.
+    fn holds(&self, path: &Path) -> bool {
         match self {
-            Self::Absent => {
-                std::fs::metadata(directory).is_err_and(|error| error.kind() == ErrorKind::NotFound)
-            }
-            Self::Present(fingerprint) => crate::cache_key::FileFingerprint::from_path(directory)
+            Self::Absent => std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound),
+            Self::Present(fingerprint) => crate::cache_key::FileFingerprint::from_path(path)
                 .is_ok_and(|now| now == *fingerprint),
+            Self::Available(was) => {
+                cc_header_probe_available(path, None).is_ok_and(|now| now == *was)
+            }
         }
     }
 }

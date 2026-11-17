@@ -74,7 +74,7 @@ Treat write credentials for any remote as trusted build credentials. The permiss
 
 On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. On GitHub Actions a **scheduled run** of a protected branch counts too: it has no actor and no inputs, and it runs that branch's own code. Pull requests, merge requests, tags, unprotected branches and `workflow_dispatch` runs are read-only even if the job has a write credential, and `KACHE_REMOTE_READONLY=0` does not turn that off. The one exception is a pull request job with a prefix of its own, described below.
 
-A push counts as protected only when GitHub sets `GITHUB_REF_PROTECTED=true` or GitLab sets `CI_COMMIT_REF_PROTECTED=true`, so a branch the CI system does not report as protected never publishes, even the default branch. When a push does not publish, the `Remote writes` row of `kache doctor` says why.
+A push, or on GitHub a scheduled run, counts as protected only when GitHub sets `GITHUB_REF_PROTECTED=true` or GitLab sets `CI_COMMIT_REF_PROTECTED=true`, so a branch the CI system does not report as protected never publishes, even the default branch. When a job does not publish, the `Remote writes` row of `kache doctor` says why.
 
 Kache recognizes only GitHub Actions (`GITHUB_ACTIONS`) and GitLab CI (`GITLAB_CI`). Every other process is left as configured, including jobs on other CI systems: they write whenever their credentials allow, so give their pull request jobs read-only credentials or set `KACHE_REMOTE_READONLY=1`. On a laptop `kache sync --push` still works; set `remote_readonly = true` under `[cache]` there when you want reads without writes.
 
@@ -113,7 +113,7 @@ pull_request_prefix = "artifacts-pr"
 - reads the base prefix first and the pull request prefix for what the base lacks;
 - writes entries, build manifests, shards and prediction rows only under the pull request prefix.
 
-Every other job ignores the setting: protected-branch pushes never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
+Every other job ignores the setting: protected-branch pushes and scheduled runs never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
 
 A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so it never hands uploads to a protected-branch job's daemon or reads through one. It still must not share a local store with trusted jobs: an artifact it compiles there would be a local hit for the next trusted build. Keep pull request jobs off the persistent disk described in [Ephemeral and persistent runners](#ephemeral-and-persistent-runners).
 

@@ -179,9 +179,9 @@ daemon. Custom installers and container images must include `kache-engine`.
 ## Upgrading on Windows
 
 Windows cannot replace a program while it runs. Kache starts its daemon from a
-copy of `kache-engine.exe` kept next to the daemon socket, so `cargo install
-kache` can replace the installed engine even when the build doing the install
-started the daemon.
+copy of `kache-engine.exe` in `%LOCALAPPDATA%\kache\daemon-engines`, so `cargo
+install kache` can replace the installed engine even when the build doing the
+install started the daemon.
 
 Some daemons still run the installed file:
 

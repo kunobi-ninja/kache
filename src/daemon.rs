@@ -10057,7 +10057,8 @@ fn spawn_daemon(
                 crate::platform::frontend_executable().context("locating the Kache frontend")?;
             return spawn_detached(image::command(exe, &frontend), stderr());
         }
-        let started = image::stage(exe, &root).and_then(|staged| {
+        let started = image::lock(&root).and_then(|lock| {
+            let staged = image::stage(exe, &root, &lock)?;
             spawn_detached(
                 image::command(&staged, &kache_shims::frontend_for(exe)),
                 stderr(),

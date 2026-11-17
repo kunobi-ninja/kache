@@ -12,50 +12,87 @@ const IMAGE: &str = if cfg!(windows) {
 } else {
     "kache-engine"
 };
+const LOCK: &str = "lock";
 
-/// Where the images of the daemon at `socket` live. Starting that daemon
-/// holds the socket's start lock, so nothing else changes this directory.
+/// Where daemon images live: one directory per user, so each engine is
+/// copied once however many caches its daemons serve.
+#[cfg(windows)]
 pub(super) fn root(socket: &Path) -> PathBuf {
-    socket.with_extension("images")
+    dirs::data_local_dir()
+        .map(|dir| dir.join("kache").join("daemon-engines"))
+        .unwrap_or_else(|| socket.with_extension("images"))
 }
 
-/// Copy `engine` to `<root>/<content hash>/kache-engine.exe` and return the
-/// copy. Images of earlier releases are removed unless a process still runs
-/// them.
-///
-/// The directory is named after the bytes copied rather than the source, so
-/// an install that replaces `engine` during the copy cannot leave an image
-/// under another release's name.
-pub(super) fn stage(engine: &Path, root: &Path) -> Result<PathBuf> {
+/// Exclusive use of an images root from staging until the daemon runs.
+/// Pruning happens under it, so no starter deletes an image another starter
+/// has placed but not yet started. A running image cannot be deleted.
+pub(super) struct Lock {
+    _file: std::fs::File,
+}
+
+pub(super) fn lock(root: &Path) -> Result<Lock> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
-    let partial = root.join(format!("{}.partial", std::process::id()));
-    let placed = (|| {
-        std::fs::copy(engine, &partial)
-            .with_context(|| format!("copying {} to {}", engine.display(), partial.display()))?;
-        let digest = kache_store::file_hash::hash_file(&partial)?;
-        let name = digest[..32].to_owned();
-        let image = root.join(&name).join(IMAGE);
-        if !image.is_file() {
-            std::fs::create_dir_all(root.join(&name))?;
+    let path = root.join(LOCK);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(Lock { _file: file })
+}
+
+/// The image name for an engine: its release, length and modification time.
+/// A copy keeps the modification time, so this names the copy too.
+fn identity(metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_nanos());
+    format!("{VERSION}-{:x}-{modified:x}", metadata.len())
+}
+
+/// Copy `engine` to `<root>/<identity>/kache-engine.exe` unless that copy
+/// exists, and return it. Images no process runs are removed. The caller
+/// holds [`lock`].
+pub(super) fn stage(engine: &Path, root: &Path, _lock: &Lock) -> Result<PathBuf> {
+    let name = identity(&std::fs::metadata(engine)?);
+    let image = root.join(&name).join(IMAGE);
+    if !image.is_file() {
+        std::fs::create_dir_all(root.join(&name))?;
+        let partial = image.with_extension("partial");
+        let placed = (|| {
+            std::fs::copy(engine, &partial).with_context(|| {
+                format!("copying {} to {}", engine.display(), partial.display())
+            })?;
+            anyhow::ensure!(
+                identity(&std::fs::metadata(engine)?) == name,
+                "{} changed while it was copied",
+                engine.display()
+            );
             std::fs::rename(&partial, &image)
-                .with_context(|| format!("placing {}", image.display()))?;
+                .with_context(|| format!("placing {}", image.display()))
+        })();
+        if placed.is_err() {
+            let _ = std::fs::remove_file(&partial);
         }
-        anyhow::Ok((name, image))
-    })();
-    let _ = std::fs::remove_file(&partial);
-    let (name, image) = placed?;
+        placed?;
+    }
     prune(root, &name);
     Ok(image)
 }
 
-/// Remove every entry of `root` but `keep`. A running image cannot be
-/// deleted on Windows, so the daemon still using it keeps it.
+/// Remove every image in `root` but `keep`. Windows refuses to delete one a
+/// process runs, so a running daemon keeps its image.
 fn prune(root: &Path, keep: &str) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_name() == keep {
+        if entry.file_name() == keep || entry.file_name() == LOCK {
             continue;
         }
         let path = entry.path();
@@ -87,26 +124,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staging_reuses_an_image_and_removes_older_ones() {
+    fn staging_copies_an_engine_once_and_removes_older_images() {
         let dir = tempfile::tempdir().unwrap();
-        let root = root(&dir.path().join("daemon.sock"));
+        let root = dir.path().join("images");
         let engine = dir.path().join("kache-engine");
         std::fs::write(&engine, "release one").unwrap();
-        let one = stage(&engine, &root).unwrap();
-        assert_eq!(std::fs::read(&one).unwrap(), b"release one");
+        let lock = lock(&root).unwrap();
+        let one = stage(&engine, &root, &lock).unwrap();
         assert_ne!(one, engine);
-        assert_eq!(stage(&engine, &root).unwrap(), one);
+        assert_eq!(std::fs::read(&one).unwrap(), b"release one");
+        std::fs::write(&one, "staged").unwrap();
+        assert_eq!(stage(&engine, &root, &lock).unwrap(), one);
+        assert_eq!(std::fs::read(&one).unwrap(), b"staged", "copied again");
 
-        std::fs::write(root.join("7.partial"), "interrupted copy").unwrap();
-        std::fs::write(&engine, "release two").unwrap();
-        let two = stage(&engine, &root).unwrap();
+        std::fs::write(root.join("left.partial"), "interrupted copy").unwrap();
+        std::fs::write(&engine, "release two, longer").unwrap();
+        let two = stage(&engine, &root, &lock).unwrap();
         assert_ne!(two.parent(), one.parent());
-        assert_eq!(std::fs::read(&two).unwrap(), b"release two");
-        let left: Vec<_> = std::fs::read_dir(&root)
+        assert_eq!(std::fs::read(&two).unwrap(), b"release two, longer");
+        let mut left: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
-        assert_eq!(left, [two.parent().unwrap()]);
+        left.sort();
+        let mut expected = vec![two.parent().unwrap().to_owned(), root.join(LOCK)];
+        expected.sort();
+        assert_eq!(left, expected);
     }
 
     #[test]

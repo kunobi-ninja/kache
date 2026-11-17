@@ -176,10 +176,14 @@ fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
 /// controls and so must stay out of the probe key.
 ///
 /// This excludes kache-internal variables (`KACHE_*`) which configure kache
-/// or tests, as well as Windows' hidden cmd.exe bookkeeping variables whose
-/// names begin with `=` (`=C:`, `=ExitCode`, …).
+/// or tests, Windows' hidden cmd.exe bookkeeping variables whose names begin
+/// with `=` (`=C:`, `=ExitCode`, …), and the make jobserver variables. Those
+/// carry descriptor numbers that differ for every compile the daemon runs,
+/// and a driver's `-###` output does not read them.
 fn is_volatile_env_name(name: &str) -> bool {
-    name.starts_with('=') || name.starts_with("KACHE_")
+    name.starts_with('=')
+        || name.starts_with("KACHE_")
+        || matches!(name, "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS")
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -411,6 +415,28 @@ mod tests {
     }
 
     #[test]
+    fn jobserver_descriptors_do_not_split_the_probe_key() {
+        let compile = |fds: &str| {
+            [
+                ("SDKROOT".to_string(), "/sdk".to_string()),
+                (
+                    "CARGO_MAKEFLAGS".to_string(),
+                    format!("-j --jobserver-fds={fds} --jobserver-auth={fds}"),
+                ),
+                (
+                    "MAKEFLAGS".to_string(),
+                    format!("-j --jobserver-auth={fds}"),
+                ),
+                ("MFLAGS".to_string(), format!("--jobserver-auth={fds}")),
+            ]
+        };
+        assert_eq!(
+            fingerprint_env(compile("82,83").into_iter()),
+            fingerprint_env(compile("120,121").into_iter()),
+        );
+    }
+
+    #[test]
     fn is_volatile_env_name_flags_equals_and_kache_internal_vars() {
         assert!(is_volatile_env_name("=C:"));
         assert!(is_volatile_env_name("=ExitCode"));
@@ -418,6 +444,10 @@ mod tests {
         assert!(is_volatile_env_name("KACHE_FAMILY_PROBE_ACTIVE"));
         assert!(is_volatile_env_name("KACHE_CACHE_DIR"));
         assert!(is_volatile_env_name("KACHE_CONFIG"));
+        assert!(is_volatile_env_name("CARGO_MAKEFLAGS"));
+        assert!(is_volatile_env_name("MAKEFLAGS"));
+        assert!(is_volatile_env_name("MFLAGS"));
+        assert!(!is_volatile_env_name("MAKELEVEL"));
         assert!(!is_volatile_env_name("PATH"));
         assert!(!is_volatile_env_name("SDKROOT"));
         assert!(!is_volatile_env_name("A=B"));

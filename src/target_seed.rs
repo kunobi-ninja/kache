@@ -925,7 +925,7 @@ const CARGO_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55
 /// Tag a target directory seeding created, as Cargo would have. Cargo tags
 /// only a target directory it creates itself, so it never tags this one, and
 /// kache neither tracks nor roots events in an untagged target directory.
-fn tag_as_cargo_target(target_dir: &Path) {
+pub(crate) fn tag_as_cargo_target(target_dir: &Path) {
     let _ = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

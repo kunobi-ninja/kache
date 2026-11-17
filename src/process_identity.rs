@@ -17,7 +17,8 @@ pub(crate) struct ProcessIdentity {
 }
 
 /// When a process started, in the OS's own units: clock ticks since boot on
-/// Linux (`/proc/<pid>/stat` field 22).
+/// Linux (`/proc/<pid>/stat` field 22), microseconds since the epoch on
+/// macOS (`proc_bsdinfo`'s start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Start {
     At(u64),
@@ -31,7 +32,7 @@ enum Start {
 /// What the OS reports for a process number now.
 #[derive(Debug, PartialEq, Eq)]
 enum Found {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Started(u64),
     /// A reserved PID or a thread ID rather than a process Kache records.
     Gone,
@@ -138,16 +139,50 @@ fn liveness_from_signal_probe(result: libc::c_int, error: impl FnOnce() -> Optio
 /// procfs entry; the fallback also rejects it and values that would become
 /// broadcasts to `kill`.
 fn found(pid: u32) -> Found {
-    if pid == 1 {
+    if pid <= 1 {
         return Found::Gone;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         found_on_this_platform(pid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Found::Unknown
+    }
+}
+
+/// The process's BSD info. Without a start, macOS answers `kill(pid, 0)` for
+/// whatever process now holds a record's number, and a record outlives its
+/// process for good: a browser or a system daemon reads as a Cargo command.
+#[cfg(target_os = "macos")]
+fn found_on_this_platform(pid: u32) -> Found {
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return Found::Gone;
+    };
+    // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is writable for `size` bytes, the size the flavor fills.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    let error = (written != size).then(|| std::io::Error::last_os_error().raw_os_error());
+    process_from_bsdinfo(&info, error)
+}
+
+/// What a `proc_pidinfo` call says: `error` is `None` when it filled `info`,
+/// otherwise the errno it left, if any.
+#[cfg(target_os = "macos")]
+fn process_from_bsdinfo(info: &libc::proc_bsdinfo, error: Option<Option<i32>>) -> Found {
+    match error {
+        None if info.pbi_status == libc::SZOMB => Found::Gone,
+        None => Found::Started(
+            info.pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(info.pbi_start_tvusec),
+        ),
+        Some(Some(libc::ESRCH)) => Found::Gone,
+        Some(_) => Found::Unknown,
     }
 }
 
@@ -222,10 +257,10 @@ fn process_from_stat(stat: &str) -> Found {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct RunningChild(std::process::Child);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl Drop for RunningChild {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -286,7 +321,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_process_runs_until_it_exits_and_only_under_its_own_start() {
         let mut child = RunningChild(
@@ -318,10 +353,33 @@ mod tests {
         assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
         // This fallback deliberately cannot distinguish a dead leader from
         // a group with live workers. The stat thread count must decide.
+        #[cfg(target_os = "linux")]
         assert!(process_may_be_running(child.0.id()));
         assert!(!running.is_running());
         child.0.wait().unwrap();
         assert!(!running.is_running());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bsd_info_gives_the_start_and_only_a_missing_process_is_gone() {
+        // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        info.pbi_start_tvsec = 2;
+        info.pbi_start_tvusec = 3;
+        assert_eq!(process_from_bsdinfo(&info, None), Found::Started(2_000_003));
+        assert_eq!(
+            process_from_bsdinfo(&info, Some(Some(libc::ESRCH))),
+            Found::Gone
+        );
+        for error in [Some(libc::EPERM), None] {
+            assert_eq!(process_from_bsdinfo(&info, Some(error)), Found::Unknown);
+        }
+        info.pbi_status = libc::SZOMB;
+        assert_eq!(process_from_bsdinfo(&info, None), Found::Gone);
+        let this = found(std::process::id());
+        assert!(matches!(this, Found::Started(_)), "{this:?}");
+        assert_eq!(found(std::process::id()), this);
     }
 
     #[cfg(target_os = "linux")]

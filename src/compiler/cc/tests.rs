@@ -3124,7 +3124,7 @@ fn opt_in_link_response_files_are_refused_without_compiler_parsing() {
 }
 
 #[test]
-fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
+fn opt_in_link_keys_preserve_soname_bytes() {
     let _lock = crate::test_support::process_state_test_lock();
     let env = InvocationEnv::capture();
     let dir = tempfile::tempdir().unwrap();
@@ -3147,8 +3147,9 @@ fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
         extra_inputs_digest: None,
         build_script_inputs_digest: None,
     };
-    // Unicode 18 assigns U+1ADE a combining class that merges these names
-    // under NFC. The linker embeds their distinct raw SONAME bytes.
+    // The linker embeds the raw SONAME bytes, so canonically equivalent
+    // names must not share a key. Unicode 18 gives U+1ADE a combining class,
+    // which makes the second pair equivalent too.
     let key = |soname: &str| {
         let argv = vec![
             compiler_program.clone(),
@@ -3162,6 +3163,7 @@ fn opt_in_link_keys_preserve_unicode17_soname_bytes() {
         assert!(compiler.refuse_reasons(&parsed).is_empty());
         compiler.cache_key(&parsed, &ctx).unwrap()
     };
+    assert_ne!(key("lib\u{00e9}.so"), key("libe\u{0301}.so"));
     assert_ne!(key("q\u{1ade}\u{0323}"), key("q\u{0323}\u{1ade}"));
 }
 

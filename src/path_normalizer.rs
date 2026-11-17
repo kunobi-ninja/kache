@@ -762,29 +762,27 @@ impl PathNormalizer {
     /// [`Self::from_env`] — see that method's docs. The matching
     /// here is a byte-literal pass over every variant.
     ///
-    /// **Unicode normalization to NFC** is applied to the input
-    /// before matching, because rule prefixes are stored in NFC
-    /// (see [`canonical_string`]). This handles the macOS HFS+/APFS
-    /// case where filesystem APIs may return paths in NFD (`é` as
-    /// `e` + combining accent) while env vars set by other tools
-    /// use NFC (`é` as a single codepoint). Same character to the
-    /// eye, different bytes — without this, a user `José` would
-    /// silently lose cross-machine cache sharing while ASCII-named
-    /// users got it for free. NFC is semantic-preserving for path
-    /// strings (composed and decomposed forms are equivalent path
-    /// representations); the normalize step is a no-op on inputs
-    /// that are already NFC (the common case).
+    /// A non-ASCII prefix also matches in its NFC and NFD forms. macOS
+    /// APIs may return `é` decomposed (`e` + combining accent) while an
+    /// env var spells it composed, so a user named `José` still gets the
+    /// rule. The input itself is never normalized: canonically
+    /// equivalent text outside a prefix keeps its bytes, because tools
+    /// copy those bytes into outputs (a SONAME, a debug path) and two
+    /// spellings must not share a key.
     pub fn normalize<S: AsRef<str>>(&self, s: S) -> String {
-        let mut out: String = s.as_ref().nfc().collect();
+        let mut out = s.as_ref().to_string();
         for rule in &self.rules {
             if rule.prefix.is_empty() || rule.key_sentinel == PROFILE_SENTINEL {
                 continue;
             }
-            out = if configured_base_dir_index(&rule.key_sentinel).is_some() {
-                replace_configured_path_prefix(&out, &rule.prefix, &rule.key_sentinel)
-            } else {
-                out.replace(&rule.prefix, &rule.key_sentinel)
-            };
+            let configured = configured_base_dir_index(&rule.key_sentinel).is_some();
+            for prefix in unicode_spellings(&rule.prefix) {
+                out = if configured {
+                    replace_configured_path_prefix(&out, &prefix, &rule.key_sentinel)
+                } else {
+                    out.replace(prefix.as_ref(), &rule.key_sentinel)
+                };
+            }
         }
         warn_if_path_leaked(&out);
         out
@@ -898,6 +896,19 @@ pub(crate) struct DiagnosticRoot {
     /// The root depends on the crate being compiled (its cwd or workspace),
     /// so another crate's file can carry the same target.
     pub per_crate: bool,
+}
+
+/// `prefix`, then its NFC and NFD forms where they differ. ASCII has one form.
+fn unicode_spellings(prefix: &str) -> Vec<std::borrow::Cow<'_, str>> {
+    let mut spellings = vec![std::borrow::Cow::Borrowed(prefix)];
+    if !prefix.is_ascii() {
+        for form in [prefix.nfc().collect::<String>(), prefix.nfd().collect()] {
+            if !spellings.iter().any(|known| *known == form) {
+                spellings.push(std::borrow::Cow::Owned(form));
+            }
+        }
+    }
+    spellings
 }
 
 /// Whether `text` may hold a path rewritten by [`PathNormalizer::remap_args`].
@@ -3063,10 +3074,9 @@ mod tests {
         //   NFC: U+00E9         → 0xC3 0xA9       (2 bytes)
         //   NFD: U+0065 U+0301  → 0x65 0xCC 0x81  (3 bytes)
         // String::replace is byte-literal so the two forms don't
-        // match each other directly. PathNormalizer normalizes both
-        // sides to NFC before matching, so a rule built from a path
-        // returned in NFD (HFS+ legacy / some macOS APIs) still
-        // matches an input string in NFC (typical env-var form).
+        // match each other directly. A non-ASCII rule prefix is tried
+        // in both forms, so an NFC rule still matches a path that a
+        // macOS API returned in NFD, and the reverse.
         let nfc_prefix = "/Users/Jos\u{00E9}/.cargo"; // single codepoint é
         let nfd_input = "/Users/Jos\u{0065}\u{0301}/.cargo/registry/foo"; // e + combining acute
 
@@ -3076,10 +3086,8 @@ mod tests {
             &nfd_input.as_bytes()[..nfc_prefix.len()]
         );
 
-        // Rule prefix in NFC form — `from_env`'s `canonical_string`
-        // would have produced this. Input arrives in NFD; normalize
-        // converts it to NFC before matching, so the substring hit
-        // fires.
+        // Rule prefix in NFC form, as `canonical_string` produces it.
+        // Input arrives in NFD.
         let n = pn_with_rules(vec![(nfc_prefix, "<CARGO_HOME>")]);
         let out = n.normalize(nfd_input);
         assert_eq!(out, "<CARGO_HOME>/registry/foo");
@@ -3147,10 +3155,8 @@ mod tests {
 
     #[test]
     fn canonical_string_normalizes_to_nfc() {
-        // Rule construction must produce NFC-form prefixes so that
-        // the NFC normalization in `normalize` can match. Even if
-        // the underlying path uses non-NFC bytes (which canonicalize
-        // may return on macOS), the stored prefix must be NFC.
+        // Rule prefixes are stored in NFC even when canonicalize
+        // returns other bytes on macOS.
         let dir = TempDir::new().unwrap();
         let nfc_name = "Jos\u{00E9}";
         let subdir = dir.path().join(nfc_name);
@@ -3162,6 +3168,20 @@ mod tests {
         assert_eq!(
             result, renormalized,
             "canonical_string output must be in NFC form, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_equivalent_spellings_apart_outside_a_prefix() {
+        let n = pn_with_rules(vec![("/Users/Jos\u{0065}\u{0301}", "<HOME>")]);
+        // An NFD rule still matches the NFC spelling of its prefix.
+        assert_eq!(n.normalize("/Users/Jos\u{00E9}/x"), "<HOME>/x");
+        // Text past the prefix keeps its bytes, so a composed and a
+        // decomposed name stay distinct.
+        assert_eq!(n.normalize("-Wl,-soname,\u{00E9}"), "-Wl,-soname,\u{00E9}");
+        assert_eq!(
+            n.normalize("/Users/Jos\u{00E9}/e\u{0301}"),
+            "<HOME>/e\u{0301}"
         );
     }
 
@@ -4234,9 +4254,9 @@ mod tests {
                 prop_assert_eq!(n.normalize(&once), once);
             }
 
-            // Expanding every sentinel back to its one root recovers the NFC input,
-            // so two inputs that differ in more than Unicode form never share an
-            // output (and so never share a key).
+            // Expanding every sentinel back to its one root recovers the input,
+            // so two different inputs never share an output (and so never share
+            // a key), even when they differ only in Unicode form.
             #[test]
             fn normalize_is_injective_when_each_sentinel_has_one_root(input in key_text()) {
                 let n = normalizer();
@@ -4249,12 +4269,12 @@ mod tests {
                 for (sentinel, prefix) in &roots {
                     restored = restored.replace(sentinel.as_str(), prefix);
                 }
-                prop_assert_eq!(restored, input.nfc().collect::<String>());
+                prop_assert_eq!(restored, input);
             }
 
             // Relocating a configured root keeps both normalized text and source
-            // identity equal, and the identity carries the path under the root
-            // byte for byte (no NFC, no `.`/`..` folding).
+            // identity equal, and both carry the path under the root byte for
+            // byte (no NFC, no `.`/`..` folding).
             #[test]
             fn configured_root_relocates_losslessly(
                 parent_a in "[a-z]{1,4}",
@@ -4272,7 +4292,7 @@ mod tests {
                 let path_a = format!("{root_a}/{tail}");
                 let path_b = format!("{root_b}/{tail}");
 
-                let expected_text = format!("<BASE_DIR_0>/{}", tail.nfc().collect::<String>());
+                let expected_text = format!("<BASE_DIR_0>/{tail}");
                 prop_assert_eq!(a.normalize(&path_a), expected_text.clone());
                 prop_assert_eq!(b.normalize(&path_b), expected_text);
 

@@ -159,7 +159,13 @@ pub fn probe_key_isolated(prober_id: &str, program: &str) -> Option<String> {
 /// change at worst forces one extra, cheap re-probe, while a relevant
 /// one can never be served a stale record.
 fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
-    let mut vars: Vec<(String, String)> = vars.filter(|(k, _)| !is_volatile_env_name(k)).collect();
+    let mut vars: Vec<(String, String)> = vars
+        .filter(|(k, _)| !is_volatile_env_name(k))
+        .map(|(k, v)| {
+            let v = fingerprint_env_value(&k, v);
+            (k, v)
+        })
+        .collect();
     vars.sort();
     let mut h = blake3::Hasher::new();
     for (k, v) in vars {
@@ -176,14 +182,37 @@ fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
 /// controls and so must stay out of the probe key.
 ///
 /// This excludes kache-internal variables (`KACHE_*`) which configure kache
-/// or tests, Windows' hidden cmd.exe bookkeeping variables whose names begin
-/// with `=` (`=C:`, `=ExitCode`, …), and the make jobserver variables. Those
-/// carry descriptor numbers that differ for every compile the daemon runs,
-/// and a driver's `-###` output does not read them.
+/// or tests, as well as Windows' hidden cmd.exe bookkeeping variables whose
+/// names begin with `=` (`=C:`, `=ExitCode`, …).
 fn is_volatile_env_name(name: &str) -> bool {
-    name.starts_with('=')
-        || name.starts_with("KACHE_")
-        || matches!(name, "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS")
+    name.starts_with('=') || name.starts_with("KACHE_")
+}
+
+/// The value a jobserver variable contributes to the key, with its
+/// descriptor numbers blanked. The daemon hands every compile it runs new
+/// descriptors, so `--jobserver-auth=82,83` became `120,121` on the next
+/// file and each compile got its own probe. Everything else in the value
+/// (`-j`, FIFO paths, other flags) still counts: a GCC specs file can read
+/// these variables with `%:getenv`.
+fn fingerprint_env_value(name: &str, value: String) -> String {
+    if !matches!(name, "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS") {
+        return value;
+    }
+    value
+        .split(' ')
+        .map(|token| {
+            ["--jobserver-auth=", "--jobserver-fds="]
+                .iter()
+                .find_map(|flag| {
+                    let (read, write) = token.strip_prefix(flag)?.split_once(',')?;
+                    let numeric =
+                        |fd: &str| !fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit());
+                    (numeric(read) && numeric(write)).then(|| format!("{flag}fds"))
+                })
+                .unwrap_or_else(|| token.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -425,14 +454,39 @@ mod tests {
                 ),
                 (
                     "MAKEFLAGS".to_string(),
-                    format!("-j --jobserver-auth={fds}"),
+                    format!("-j4 --jobserver-auth={fds}"),
                 ),
-                ("MFLAGS".to_string(), format!("--jobserver-auth={fds}")),
+                ("MFLAGS".to_string(), format!("-j4 --jobserver-auth={fds}")),
             ]
         };
         assert_eq!(
             fingerprint_env(compile("82,83").into_iter()),
             fingerprint_env(compile("120,121").into_iter()),
+        );
+    }
+
+    #[test]
+    fn jobserver_variables_still_key_everything_but_descriptors() {
+        let fingerprint = |name: &str, value: &str| {
+            fingerprint_env([(name.to_string(), value.to_string())].into_iter())
+        };
+        for name in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
+            assert_ne!(
+                fingerprint(name, "-j2 --jobserver-auth=3,4"),
+                fingerprint(name, "-j4 --jobserver-auth=3,4")
+            );
+            assert_ne!(
+                fingerprint(name, "--jobserver-auth=fifo:/tmp/a"),
+                fingerprint(name, "--jobserver-auth=fifo:/tmp/b")
+            );
+            assert_ne!(
+                fingerprint(name, "--jobserver-auth=3,4"),
+                fingerprint("OTHER", "x")
+            );
+        }
+        assert_ne!(
+            fingerprint("PROBE_FLAGS", "--jobserver-auth=3,4"),
+            fingerprint("PROBE_FLAGS", "--jobserver-auth=5,6")
         );
     }
 
@@ -444,10 +498,6 @@ mod tests {
         assert!(is_volatile_env_name("KACHE_FAMILY_PROBE_ACTIVE"));
         assert!(is_volatile_env_name("KACHE_CACHE_DIR"));
         assert!(is_volatile_env_name("KACHE_CONFIG"));
-        assert!(is_volatile_env_name("CARGO_MAKEFLAGS"));
-        assert!(is_volatile_env_name("MAKEFLAGS"));
-        assert!(is_volatile_env_name("MFLAGS"));
-        assert!(!is_volatile_env_name("MAKELEVEL"));
         assert!(!is_volatile_env_name("PATH"));
         assert!(!is_volatile_env_name("SDKROOT"));
         assert!(!is_volatile_env_name("A=B"));

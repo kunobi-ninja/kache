@@ -107,6 +107,13 @@ or failed identity queries, keep caching artifacts but read bytes on each key. E
 `/DEFAULTLIB` requests still validate and hash the selected archive together.
 An unavailable or older daemon uses the synchronous path too.
 
+Keep the workspace, its `target` directory and Cargo home on NTFS. Rust sources,
+dependency crates and registry files reuse the same memos, so an unchanged file
+is hashed once. On ReFS (including Dev Drive), FAT or exFAT every cache key
+reads its inputs again, and on-access antivirus scanning makes those reads slow.
+ReFS still gives copy-on-write restores. `kache doctor` names any of these
+directories that is not on NTFS.
+
 Record the slow build with phase tracing:
 
 ```powershell

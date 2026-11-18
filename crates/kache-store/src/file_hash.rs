@@ -747,6 +747,20 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
     ensure_input_predictions_last_used(db, unix_now())
 }
 
+/// Why no file under `path` can be served from the hash memo, or `None` when
+/// files there can be. Only Windows needs handle evidence (NTFS) for that.
+pub fn memo_identity_problem(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    return windows_fingerprint(path)
+        .err()
+        .map(|error| format!("{error:#}"));
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 impl FileFingerprint {
     /// Identity of a file as the memo sees it. Also the cheapest available
     /// proof that an external tool did NOT rewrite a file across some
@@ -865,7 +879,16 @@ fn windows_fingerprint_from_parts(
     change_time: i64,
 ) -> Result<FileFingerprint> {
     if !filesystem.starts_with(&[b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0]) {
-        anyhow::bail!("filesystem does not provide a supported strong file identity");
+        let end = filesystem.iter().position(|&unit| unit == 0);
+        let name = String::from_utf16_lossy(&filesystem[..end.unwrap_or(filesystem.len())]);
+        anyhow::bail!(
+            "{} gives no file identity the hash memo can trust",
+            if name.is_empty() {
+                "this filesystem"
+            } else {
+                &name
+            }
+        );
     }
     let index = (u64::from(file_index.0) << 32) + u64::from(file_index.1);
     let changed = u64::try_from(change_time).context("invalid NTFS change time")?;
@@ -1260,6 +1283,20 @@ mod tests {
         assert_eq!(empty.size, 0);
         assert_eq!(empty.mtime_ns, i64::MAX);
         assert_eq!(empty.ctime_ns, i64::MAX);
+    }
+
+    #[test]
+    fn an_unsupported_filesystem_is_named_in_the_rejection() {
+        let error = windows_fingerprint_from_parts(
+            Path::new("runtime.lib"),
+            &[82, 101, 70, 83, 0, 0],
+            (0, 1),
+            (0, 1),
+            116_444_736_000_000_001,
+            116_444_736_000_000_001,
+        )
+        .unwrap_err();
+        assert!(error.to_string().starts_with("ReFS "), "{error}");
     }
 
     #[test]

@@ -2121,6 +2121,32 @@ mod tests {
     }
 
     #[test]
+    fn per_unit_same_named_executables_of_other_packages_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        write(&target.join("CACHEDIR.TAG"), CARGO_TAG);
+        let profile = target.join("debug");
+        for (package, days) in [("alpha", 2), ("beta", 1)] {
+            let unit = profile.join("build").join(package).join(H1);
+            write(
+                &unit.join("fingerprint/test-integration-test-stack.json"),
+                "{}",
+            );
+            write(&unit.join("out/stack"), "exe");
+            set_times(&unit.join("fingerprint"), ago(days));
+        }
+
+        assert_eq!(
+            prune_superseded(&dir.path().join("cache"), &target, 1),
+            Pruned::default()
+        );
+        for package in ["alpha", "beta"] {
+            let unit = profile.join("build").join(package).join(H1);
+            assert!(unit.join("out/stack").exists(), "{package}");
+        }
+    }
+
+    #[test]
     fn a_unit_was_built_when_its_fingerprint_last_changed() {
         let dir = tempfile::tempdir().unwrap();
         let fingerprint = dir.path().join("fp");

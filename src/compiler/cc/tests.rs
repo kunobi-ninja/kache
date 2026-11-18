@@ -11875,3 +11875,77 @@ fn only_the_nix_store_and_profiles_are_system_paths() {
         assert_eq!(cc_system_path(path), system, "{path}");
     }
 }
+
+/// #1946: gcc's first cc1 line for `-c t.S` is the `-E -lang-asm`
+/// preprocess that `-E t.S` runs, so the resolved tokens match. The mode
+/// must still separate the keys: one entry holds an object, the other
+/// preprocessor output.
+#[cfg(unix)]
+#[test]
+fn preprocess_and_compile_of_one_source_never_share_a_key() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(root.join("t.S"), ".text\n").unwrap();
+    let program = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###) printf '"cc1" "-E" "-lang-asm" "t.S"\n' >&2; exit 0 ;;
+esac
+exit 1
+"#,
+    );
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let hasher = crate::cache_key::FileHasher::new_for(&env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let cache = tempfile::tempdir().unwrap();
+    let key = |args: &[&str]| {
+        let mut argv = vec![program.to_string_lossy().into_owned()];
+        argv.extend(args.iter().map(|arg| arg.to_string()));
+        let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+        let maps = cc_prefix_maps(&parsed, &[]);
+        let source = root.join("t.S");
+        let fingerprints = hasher
+            .cc_preprocess_fingerprints(
+                &[(cc_mapped_path(&source, &maps), source.clone())],
+                &cc_prefix_maps_key(&maps),
+                &|path| cc_mapped_content_hash(path, &maps),
+            )
+            .unwrap();
+        let outcome = CcCompiler::new()
+            .with_invocation_env(&env)
+            .cache_key_with(
+                &parsed,
+                &KeyCtx {
+                    invocation_env: &env,
+                    file_hasher: &hasher,
+                    path_normalizer: &normalizer,
+                    cache_dir: cache.path(),
+                    key_salt: None,
+                    key_env_vars: &[],
+                    extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
+                },
+                CcKeyDiscovery::Captured(CcCapturedInputs {
+                    fingerprints,
+                    path_bound: false,
+                    inputs_changed: false,
+                }),
+            )
+            .unwrap();
+        match outcome {
+            CcKeyOutcome::Key(key) => key,
+            CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+        }
+    };
+    let compile = key(&["-c", "t.S", "-o", "t.o"]);
+    assert_eq!(compile, key(&["-c", "t.S", "-o", "t.o"]));
+    assert_ne!(key(&["-E", "t.S"]), compile);
+}

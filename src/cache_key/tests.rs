@@ -839,6 +839,73 @@ fn a_new_linker_behind_the_same_driver_changes_the_native_link_key() {
     assert_ne!(key(), old, "an upgraded linker must re-key the link");
 }
 
+/// Two wrapper scripts that `-C linker` names answer `--version` and place
+/// the CRT objects as the compiler they wrap does, but link differently (one
+/// adds `-no-pie`, one asks for RELR relocations): their links key apart, by
+/// the wrappers' bytes. A link through the `cc` on PATH folds no driver
+/// bytes, so its key stays what it was.
+#[cfg(unix)]
+#[test]
+fn a_wrapper_named_by_linker_keys_its_links_by_its_own_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    for file in ["crt1.o", "crti.o", "libc.so"] {
+        std::fs::write(root.join("lib").join(file), file).unwrap();
+    }
+    let compiler = |extra: &str| {
+        format!(
+            r#"#!/bin/sh
+# {extra}
+case "$1" in
+    --version) echo "cc (GCC) 15.2.0" ;;
+    -print-search-dirs) printf 'libraries: =%s/lib\n' "$PWD" ;;
+    -print-file-name=*)
+        name=${{1#-print-file-name=}}
+        if [ -f "$PWD/lib/$name" ]; then printf '%s\n' "$PWD/lib/$name"; else printf '%s\n' "$name"; fi ;;
+esac
+"#
+        )
+    };
+    kache_fs::testutil::write_executable(&bin.join("cc"), compiler("the compiler"));
+    let no_pie = root.join("cc-no-pie");
+    let relr = root.join("cc-relr");
+    kache_fs::testutil::write_executable(&no_pie, compiler("adds -no-pie"));
+    kache_fs::testutil::write_executable(&relr, compiler("adds -Wl,-z,pack-relative-relocs"));
+    let env = InvocationEnv::from_parts(
+        [("PATH", bin.to_str().unwrap())],
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let memo = root.join("probes");
+    let hash = |path: &Path| -> Result<String> {
+        Ok(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
+    };
+    let objects = |driver: &Path| native_linux_link_objects_for(&memo, driver, hash, &env).unwrap();
+
+    assert_eq!(objects(&no_pie)["crt1.o"], objects(&relr)["crt1.o"]);
+    assert_ne!(
+        objects(&no_pie),
+        objects(&relr),
+        "two wrappers with one banner must not share a link key"
+    );
+    let through_cc = objects(&bin.join("cc"));
+    assert_eq!(
+        through_cc,
+        crate::native_link_key::probe_linux_crt_objects_memoized_for(
+            &memo,
+            &bin.join("cc"),
+            hash,
+            &env
+        )
+        .unwrap(),
+        "a link through the PATH's cc keeps its key"
+    );
+}
+
 #[test]
 fn cross_target_and_library_outputs_place_no_linker() {
     for args in [

@@ -18,6 +18,7 @@ use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store, StoreLock};
 
 mod doctor_daemon;
+mod doctor_keys;
 mod doctor_probe;
 mod doctor_storage;
 pub mod login;
@@ -7455,6 +7456,8 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == "Install path"
         || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
+        || label == doctor_keys::FILE_HASH_MEMO
+        || label == doctor_keys::KEY_TIME
         || label == "Store warning history"
         || label == "Store file limits"
         || label == "Store volume probe"
@@ -7815,6 +7818,21 @@ fn cargo_output_dir_from(
         env.build_dir.as_deref(),
     )?;
     closest_existing(output)
+}
+
+/// Where a Rust build's key inputs live: the workspace, Cargo's registry
+/// sources, and the output directory dependencies are read from.
+fn doctor_memo_roots() -> Vec<(&'static str, std::path::PathBuf)> {
+    let workspace = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cargo_workspace_root(&cwd));
+    let mut roots: Vec<_> = workspace
+        .map(|path| ("workspace", path))
+        .into_iter()
+        .collect();
+    roots.push(("Cargo home", cargo_home_dir()));
+    roots.extend(cargo_output_dir().map(|path| ("target directory", path)));
+    roots
 }
 
 /// `$CARGO_HOME`, falling back to the platform's home directory (cargo's
@@ -8197,6 +8215,9 @@ pub fn doctor(
             cfg.target_liveness,
             cargo_output_dir().as_deref(),
         ));
+        if cfg!(windows) {
+            checks.push(doctor_keys::memo_volume_check(&doctor_memo_roots()));
+        }
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {
             checks.push(Check {
@@ -8464,6 +8485,11 @@ pub fn doctor(
 
     if let Some(ref cfg) = config
         && let Some(check) = doctor_checkout_check(&cfg.event_log_path())
+    {
+        checks.push(check);
+    }
+    if let Some(ref cfg) = config
+        && let Some(check) = doctor_keys::key_time_check(&cfg.event_log_path())
     {
         checks.push(check);
     }

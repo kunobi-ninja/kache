@@ -8518,20 +8518,9 @@ struct RecentHash {
     fingerprint: Option<FileFingerprint>,
 }
 
-/// The smallest key input whose hash [`FileHasher::hash`] memoises (other
-/// reads, such as a tree guard's, keep [`MIN_PERSISTED_HASH_BYTES`]). Off
-/// Windows a small file is read about as fast as its memo row is looked up,
-/// so only files of [`MIN_PERSISTED_HASH_BYTES`] and more get rows. On
-/// Windows every key input with a strong stamp does: reading one opens it
-/// for its data, which an antivirus filter may scan, while the stamp the
-/// memo needs comes from an attribute-only open. A warm build of a
-/// 1,200-unit desktop app read about 20,500 small sources per build on a 4
-/// vCPU Windows 11 VM.
-const SOURCE_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
-    0
-} else {
-    MIN_PERSISTED_HASH_BYTES
-};
+/// The smallest key input whose hash [`FileHasher::hash`] memoises. Other
+/// reads, such as a tree guard's, keep [`MIN_PERSISTED_HASH_BYTES`].
+const SOURCE_MEMO_MIN_BYTES: i64 = kache_store::file_hash::KEY_INPUT_MEMO_MIN_BYTES;
 
 /// Whether a hash read as `first` vouches for the same file seen again as
 /// `now` under another spelling. The file may have been written since, so

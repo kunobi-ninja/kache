@@ -904,6 +904,13 @@ esac
         .unwrap(),
         "a link through the PATH's cc keeps its key"
     );
+    let alias = root.join("gcc");
+    std::os::unix::fs::symlink(bin.join("cc"), &alias).unwrap();
+    assert_eq!(
+        objects(&alias),
+        through_cc,
+        "a symlink to the PATH's cc is that cc"
+    );
 }
 
 #[test]

@@ -12680,9 +12680,11 @@ fn is_path_cc(driver: &Path, env: &InvocationEnv) -> bool {
     let Some(cc) = env.resolve_program(Path::new("cc")) else {
         return false;
     };
+    // A path that does not resolve is not known to be that `cc`, so its bytes
+    // are keyed (or the hash fails and the link passes through).
     match (std::fs::canonicalize(driver), std::fs::canonicalize(&cc)) {
         (Ok(driver), Ok(cc)) => driver == cc,
-        _ => driver == cc,
+        _ => false,
     }
 }
 

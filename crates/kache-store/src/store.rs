@@ -1191,7 +1191,9 @@ impl EvictedTrash {
     }
 }
 
-fn remove_trash_item(path: &Path) {
+/// Remove one trash item. True when it is gone, including when something
+/// else removed it first.
+fn remove_trash_item(path: &Path) -> bool {
     let result = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             #[cfg(windows)]
@@ -1217,13 +1219,15 @@ fn remove_trash_item(path: &Path) {
         }
         Err(e) => Err(e),
     };
-    if let Err(e) = result
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            "gc: could not remove {} from the trash, left for the next sweep: {e}",
-            path.display()
-        );
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "gc: could not remove {} from the trash, left for the next sweep: {e}",
+                path.display()
+            );
+            false
+        }
+        _ => true,
     }
 }
 

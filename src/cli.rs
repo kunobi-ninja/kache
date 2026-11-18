@@ -7823,21 +7823,15 @@ fn cargo_output_dir_from(
 /// Where a Rust build's key inputs live: the workspace, Cargo's registry
 /// sources, and the output directory dependencies are read from.
 fn doctor_memo_roots() -> Vec<(&'static str, std::path::PathBuf)> {
-    let mut roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(workspace) = cargo_workspace_root(&cwd) {
-            roots.push(("workspace", workspace));
-        }
-        let env = CargoEnvironment {
-            cargo_home: std::env::var_os("CARGO_HOME"),
-            home: dirs::home_dir().unwrap_or_default(),
-            ..CargoEnvironment::default()
-        };
-        roots.push(("Cargo home", cargo_home_dir_from(&env, &cwd)));
-    }
-    if let Some(target) = cargo_output_dir() {
-        roots.push(("target directory", target));
-    }
+    let workspace = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cargo_workspace_root(&cwd));
+    let mut roots: Vec<_> = workspace
+        .map(|path| ("workspace", path))
+        .into_iter()
+        .collect();
+    roots.push(("Cargo home", cargo_home_dir()));
+    roots.extend(cargo_output_dir().map(|path| ("target directory", path)));
     roots
 }
 

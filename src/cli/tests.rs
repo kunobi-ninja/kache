@@ -533,6 +533,17 @@ fn doctor_check_optionality_truth_table() {
     assert!(doctor_check_is_optional("Install path", false, false));
     // So is a build that could reuse another checkout with a setting changed.
     assert!(doctor_check_is_optional(OTHER_CHECKOUTS, false, false));
+    // Volumes and key time are performance advice.
+    assert!(doctor_check_is_optional(
+        doctor_keys::FILE_HASH_MEMO,
+        false,
+        false
+    ));
+    assert!(doctor_check_is_optional(
+        doctor_keys::KEY_TIME,
+        false,
+        false
+    ));
     // Daemon labels downgrade exactly when the daemon is optional.
     assert!(doctor_check_is_optional("Daemon version", true, false));
     assert!(!doctor_check_is_optional("Daemon version", false, false));
@@ -11915,4 +11926,19 @@ fn compact_stats_label_scheduler_evidence_as_recorded_history() {
     assert!(legacy.longest_scheduler_wait.is_none());
     assert_eq!(legacy.total_flight_wait_ms, 0);
     assert_eq!(legacy.total_permit_wait_ms, 0);
+}
+
+#[test]
+fn doctor_memo_roots_name_this_workspace_and_cargo_home() {
+    // Unit tests run from the package root, which is the workspace root.
+    let roots = doctor_memo_roots();
+    let names: Vec<_> = roots.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["workspace", "Cargo home", "target directory"]);
+    assert_eq!(
+        roots[0].1.canonicalize().unwrap(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap()
+    );
+    assert_eq!(roots[1].1, cargo_home_dir());
 }

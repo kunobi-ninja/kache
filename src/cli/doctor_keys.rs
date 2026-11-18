@@ -134,6 +134,30 @@ mod tests {
     }
 
     #[test]
+    fn the_lower_median_is_reported() {
+        let events: Vec<_> = (0..20).map(|i| keyed(EventResult::Miss, i * 10)).collect();
+        let check = key_time_result(&events.iter().collect::<Vec<_>>()).unwrap();
+        assert!(
+            check.detail.starts_with("median 90 ms over 20 units"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn key_time_reads_the_latest_build_from_the_event_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let lines: Vec<_> = (0..MIN_KEYED_UNITS)
+            .map(|_| serde_json::to_string(&keyed(EventResult::Miss, 1048)).unwrap())
+            .collect();
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let check = key_time_check(&log).unwrap();
+        assert!(!check.pass, "{}", check.detail);
+        assert!(key_time_check(&dir.path().join("missing.jsonl")).is_none());
+    }
+
+    #[test]
     fn key_time_threshold_and_sample_size() {
         let build = |key_ms: u64, units: usize| -> Option<Check> {
             let events: Vec<_> = (0..units)
@@ -184,6 +208,17 @@ mod tests {
             check.detail
         );
         assert!(check.fix.unwrap().contains("Dev Drive"));
+    }
+
+    #[test]
+    fn a_local_temporary_directory_has_file_identity() {
+        // Test machines keep temporary files on NTFS on Windows; elsewhere
+        // every filesystem passes.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            kache_store::file_hash::memo_identity_problem(dir.path()),
+            None
+        );
     }
 
     #[test]

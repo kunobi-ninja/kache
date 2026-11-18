@@ -1286,6 +1286,14 @@ mod tests {
     }
 
     #[test]
+    fn a_local_temporary_directory_has_memo_identity() {
+        // Test machines keep temporary files on NTFS on Windows; elsewhere
+        // every filesystem passes.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(memo_identity_problem(dir.path()), None);
+    }
+
+    #[test]
     fn an_unsupported_filesystem_is_named_in_the_rejection() {
         let error = windows_fingerprint_from_parts(
             Path::new("runtime.lib"),

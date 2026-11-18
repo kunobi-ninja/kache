@@ -211,17 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn a_local_temporary_directory_has_file_identity() {
-        // Test machines keep temporary files on NTFS on Windows; elsewhere
-        // every filesystem passes.
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            kache_store::file_hash::memo_identity_problem(dir.path()),
-            None
-        );
-    }
-
-    #[test]
     fn missing_roots_are_skipped() {
         let check = memo_volume_check(&[("target directory", PathBuf::from("/no/such/kache/dir"))]);
         assert!(check.pass);

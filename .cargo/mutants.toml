@@ -292,7 +292,7 @@ exclude_re = [
     "crates/kache-store/src/file_hash\\.rs:.*\\bwindows_fingerprint\\b",
     # Off Windows memo_identity_problem always returns None, so replacing it
     # with None changes nothing Linux can see. The Windows test lane checks a
-    # temporary NTFS directory passes; Some(...) replacements stay in scope.
+    # temporary NTFS directory passes; a kache-store test catches Some(...).
     "crates/kache-store/src/file_hash\\.rs:.*\\bmemo_identity_problem -> Option<String> with None$",
     # This thread-local failure fixture and its restoration Drop exist only
     # on Windows; they contain no production fingerprint or admission logic.

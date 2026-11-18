@@ -278,7 +278,7 @@ impl Driver for KacheReplacement<'_> {
                     warn_if_remote_is_env_only(config);
                     self.child = Some(spawn_daemon(
                         self.executable.as_ref().unwrap(),
-                        &socket,
+                        deadline,
                         stderr,
                     )?);
                 }

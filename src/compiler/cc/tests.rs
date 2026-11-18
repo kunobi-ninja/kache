@@ -5545,6 +5545,11 @@ fn assembler_file_reads_and_macros_are_refused() {
     assert_eq!(found(".macro blob f\n.incbin \\f\n.endm"), Some(".incbin"));
     assert_eq!(found(".include \"macros.s\""), Some(".include"));
     assert_eq!(found(".include\"macros.s\""), Some(".include"));
+    // The assembler skips a comment before the operand.
+    assert_eq!(
+        found(r#"__asm__(".incbin/**/\"p.bin\"\n");"#),
+        Some(".incbin")
+    );
 
     assert_eq!(found("opts.include(\"x\");"), None);
     assert_eq!(found("cfg.include = \"x\";"), None);
@@ -5566,14 +5571,51 @@ fn assembler_file_reads_and_macros_are_refused() {
     assert_eq!(found(r#"__asm__(".macro emit\n.endm\n");"#), Some(".macro"));
     assert_eq!(found(".macros x"), None);
     assert_eq!(found("cfg.macro(x);"), None);
-    assert_eq!(found(".endm"), None);
 
     // `.rept` bodies take `\()`, which splits a directive name in two.
     assert_eq!(
         found(".rept 1\n.inc\\()bin \"p.bin\"\n.endr"),
         Some(".rept")
     );
-    assert_eq!(found(".inc\\()bin \"p.bin\""), Some(r"\()"));
+
+    // Openers have spellings the list above lacks, but every body needs its
+    // closing directive: `.irep` is GNU as for `.irp`, `.rep` is `.rept`,
+    // and a count may follow the name with no blank.
+    assert_eq!(
+        found(".irep op,incbin\n.\\op \"p.bin\"\n.endr"),
+        Some(".endr")
+    );
+    for opener in [
+        ".IREPC c,ab",
+        ".irp\"op\",x",
+        ".rept(1)",
+        ".rept-1+2",
+        ".rep~-2",
+        ".REP!0",
+    ] {
+        assert_eq!(
+            found(&format!("{opener}\n.endr")),
+            Some(".endr"),
+            "{opener}"
+        );
+    }
+    assert_eq!(
+        found(".rep(1)\n.rep(1)\n.inc\\\\()()bin \"p.bin\"\n.endr\n.endr"),
+        Some(".endr")
+    );
+    assert_eq!(found(".macro\"emit\"\n.endmacro"), Some(".endmacro"));
+    assert_eq!(found(".endm"), Some(".endm"));
+    // The opener may come from another file; the body still closes here.
+    assert_eq!(found("OPEN\\()bin \"p.bin\"\n.ENDR"), Some(".endr"));
+    assert_eq!(found(".endrx"), None);
+
+    // Outside a body the assembler rejects `\()`, so it is not refused on
+    // its own: libstdc++'s <regex> scanner spells it.
+    assert_eq!(found(".inc\\()bin \"p.bin\""), None);
+    assert_eq!(found(r#"const char* s = ".[\\()*+?{|^$";"#), None);
+    // zstd's sequence fields and comments.
+    assert_eq!(found("outSeqs[i].rep = 0;"), None);
+    assert_eq!(found(" * ZSTD_Sequence.rep is effectively unused."), None);
     assert_eq!(found(".altmacro\n"), Some(".altmacro"));
     assert_eq!(found(".altmacro_x"), None);
 
@@ -5587,6 +5629,23 @@ fn assembler_file_reads_and_macros_are_refused() {
         Some(".incbin")
     );
     assert_eq!(found("void f() { asm((text())); }"), Some("asm((...))"));
+}
+
+/// The compile-first path scans each file as written, before the
+/// preprocessor joins a line that ends in a backslash to the next one.
+#[test]
+fn raw_scan_reads_continued_lines_both_ways() {
+    let found = |text: &str| cc_raw_assembler_hidden_input(text.as_bytes());
+    assert_eq!(found(".inc\\\nbin \"p.bin\""), Some(".incbin"));
+    assert_eq!(found(".inc\\ \t\r\nbin \"p.bin\""), Some(".incbin"));
+    assert_eq!(found(".rep(1)\n.end\\\nr"), Some(".endr"));
+    assert_eq!(
+        found("__asm__(\".inc\\\nbin \\\"p.bin\\\"\");"),
+        Some(".incbin")
+    );
+    // A plain `.s` file is not preprocessed: `.endr` closes a body there.
+    assert_eq!(found(".endr\\\nx"), Some(".endr"));
+    assert_eq!(found("#define F(x) \\\n  ((x) + 1)\n"), None);
 }
 
 /// C23 delimited escapes survive `-E` as written, so only the string
@@ -5750,6 +5809,14 @@ fn real_probe_refuses_sources_that_incbin_a_file() {
     let repeated = write("rept.S", ".rept 1\n.inc\\()bin \"payload.bin\"\n.endr\n");
     let refused = probe(repeated).unwrap_err().to_string();
     assert!(refused.contains(".rept"), "{refused}");
+
+    let counted = write("count.S", ".rept(1)\n.inc\\()bin \"payload.bin\"\n.endr\n");
+    let refused = probe(counted).unwrap_err().to_string();
+    assert!(refused.contains(".endr"), "{refused}");
+
+    // libstdc++'s <regex> scanner spells this string.
+    let regex = write("regex.c", "const char *special = \".[\\\\()*+?{|^$\";\n");
+    assert!(probe(regex).is_ok());
 
     let split = write(
         "split.c",

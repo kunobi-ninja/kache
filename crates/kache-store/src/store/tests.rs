@@ -460,9 +460,11 @@ fn the_cc_memo_rule_columns_arrive_once_and_older_rows_are_never_served() {
         INDEX_SCHEMA_GENERATION,
         "the schema ran again"
     );
+    // Verdicts are keyed per scan rule set, so the older release's verdict
+    // for `c` sits beside this release's instead of being ignored.
     assert_eq!(
         rows(&db),
-        [2, 1, 2, 2, 2],
+        [2, 1, 2, 2, 3],
         "nothing was dropped the second time"
     );
     let cache = crate::file_hash::FileHashCache::Borrowed(&db);

@@ -1747,6 +1747,12 @@ const CC_ASSEMBLER_FILE_DIRECTIVES: [&str; 2] = [".incbin", ".include"];
 /// invoked as `emit incbin, payload.bin`, or `.inc\()bin` inside `.rept`).
 const CC_ASSEMBLER_MACRO_DIRECTIVES: [&str; 4] = [".macro", ".irp", ".irpc", ".rept"];
 
+/// The directives that close those bodies. Openers have more spellings than
+/// the list above: `.rep`, GNU's `.irep` and `.irepc`, and counts with no
+/// blank, as in `.rept(1)`. Neither clang nor GNU as assembles a body
+/// without its closing directive, and that has one spelling per kind.
+const CC_ASSEMBLER_BODY_ENDS: [&str; 3] = [".endr", ".endm", ".endmacro"];
+
 /// Why the assembler may read a file the key cannot see, if it may.
 ///
 /// `.incbin` and assembler `.include` run after preprocessing, so no depfile
@@ -1774,16 +1780,22 @@ fn cc_assembler_hidden_input(expansion: &[u8]) -> Option<&'static str> {
 ///
 /// Directives are matched ignoring case, as the assembler does, and must end
 /// at a word boundary. A file directive counts when the next non-blank byte
-/// opens its operand: a quote, or a backslash for an escaped quote in a C
-/// string or a macro argument. That keeps C++ member access such as
+/// opens its operand: a quote, a backslash for an escaped quote in a C
+/// string or a macro argument, or a slash for a comment the assembler skips
+/// (`.incbin/**/"f"`). That keeps C++ member access such as
 /// `opts.include(` out. A macro facility counts when a blank follows it;
-/// `.altmacro` and the `\()` separator count anywhere.
+/// `.altmacro` and the directives that close a body count anywhere.
+///
+/// `\()` joins pieces of a name only inside a body, so it does not count on
+/// its own, and libstdc++'s regex string `".[\\()*+?"` stays cacheable. A
+/// body's pieces may sit in different files, which the compile-first path
+/// scans one at a time, but its closing directive is spelled in one of them.
 fn cc_assembler_text_hidden_input(text: &[u8]) -> Option<&'static str> {
     let file = CC_ASSEMBLER_FILE_DIRECTIVES.into_iter().find(|directive| {
         cc_directive_operands(text, directive.as_bytes()).any(|rest| {
             rest.iter()
                 .find(|byte| !matches!(byte, b' ' | b'\t'))
-                .is_some_and(|byte| matches!(byte, b'"' | b'\\'))
+                .is_some_and(|byte| matches!(byte, b'"' | b'\\' | b'/'))
         })
     });
     file.or_else(|| {
@@ -1795,14 +1807,14 @@ fn cc_assembler_text_hidden_input(text: &[u8]) -> Option<&'static str> {
         })
     })
     .or_else(|| {
-        cc_directive_operands(text, b".altmacro")
-            .next()
-            .map(|_| ".altmacro")
-    })
-    .or_else(|| {
-        text.windows(3)
-            .any(|window| window == br"\()")
-            .then_some(r"\()")
+        [".altmacro"]
+            .into_iter()
+            .chain(CC_ASSEMBLER_BODY_ENDS)
+            .find(|directive| {
+                cc_directive_operands(text, directive.as_bytes())
+                    .next()
+                    .is_some()
+            })
     })
 }
 
@@ -8398,14 +8410,50 @@ fn cc_inputs_hide_assembler_input(paths: &[PathBuf]) -> Option<&'static str> {
 /// definition, as in every libc's symbol-aliasing headers, not a hidden
 /// string.
 fn cc_raw_assembler_hidden_input(text: &[u8]) -> Option<&'static str> {
-    if let Some(found) = cc_assembler_text_hidden_input(text) {
-        return Some(found);
+    // The preprocessor joins a line ending in a backslash to the next one
+    // before anything else, so `.inc\` and `bin` on two lines are `.incbin`.
+    // A plain `.s` file is not preprocessed, so both readings are checked.
+    let joined = cc_join_continued_lines(text);
+    std::iter::once(text)
+        .chain(joined.as_deref())
+        .find_map(|text| {
+            cc_assembler_text_hidden_input(text).or_else(|| {
+                let literals = cc_string_literals(text);
+                if literals.named_escape {
+                    return Some(r"\N{...}");
+                }
+                cc_assembler_text_hidden_input(&literals.text)
+            })
+        })
+}
+
+/// `text` with each backslash-newline removed, or `None` when it has none.
+fn cc_join_continued_lines(text: &[u8]) -> Option<Vec<u8>> {
+    // GCC and clang also join when blanks sit between the two.
+    let continued = |at: usize| {
+        let blanks = text[at + 1..]
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        match &text[at + 1 + blanks..] {
+            [b'\n', ..] => Some(blanks + 2),
+            [b'\r', b'\n', ..] => Some(blanks + 3),
+            _ => None,
+        }
+    };
+    let first = (0..text.len()).find(|&at| text[at] == b'\\' && continued(at).is_some())?;
+    let mut joined = text[..first].to_vec();
+    let mut at = first;
+    while at < text.len() {
+        match (text[at], continued(at)) {
+            (b'\\', Some(skip)) => at += skip,
+            (byte, _) => {
+                joined.push(byte);
+                at += 1;
+            }
+        }
     }
-    let literals = cc_string_literals(text);
-    if literals.named_escape {
-        return Some(r"\N{...}");
-    }
-    cc_assembler_text_hidden_input(&literals.text)
+    Some(joined)
 }
 
 pub struct CcCompiler {

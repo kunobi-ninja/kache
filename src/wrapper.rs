@@ -4157,7 +4157,10 @@ fn run_parsed_rustc(
         &args.all_args,
         args.invocation_env(),
     );
-    let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+    // A check or clippy of a binary or a test emits metadata only, no
+    // executable, so it is cached whatever `cache_executables` says.
+    let skip_user_facing =
+        args.is_user_facing_executable() && args.emits_link() && !config.cache_executables;
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
         precompiled.is_some(),

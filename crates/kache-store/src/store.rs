@@ -1320,6 +1320,24 @@ struct ShadowSelection {
     victims: std::collections::HashSet<String>,
 }
 
+/// What a size sweep's probe found live files outside the store holding, as
+/// bytes of last-reference blobs per entry.
+#[derive(Debug, Default)]
+struct HeldByLiveFiles {
+    /// Every last reference the entry holds is retained outside: removing it
+    /// frees nothing, and the removal is refused.
+    refused: std::collections::HashMap<String, u64>,
+    /// The entry also holds the last reference to a blob nothing else keeps,
+    /// so removing it frees those bytes and goes ahead.
+    partly: std::collections::HashMap<String, u64>,
+}
+
+impl HeldByLiveFiles {
+    fn total(&self) -> u64 {
+        self.refused.values().chain(self.partly.values()).sum()
+    }
+}
+
 /// The shadow's victims the live sweep left in the store, minus those any
 /// policy would have kept: a durable upload's backing entry, a recent
 /// access or import, or blobs a live file still holds. Those are kept by
@@ -5743,7 +5761,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
-        held: &std::collections::HashMap<String, u64>,
+        held: &HeldByLiveFiles,
         stop: &mut dyn FnMut() -> bool,
     ) -> GcStats {
         // What a removal cut short (a crash, a kill) left between taking a
@@ -5758,6 +5776,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None => (0, None),
         };
         let mut evicted = std::collections::HashSet::new();
+        let mut held_released = 0u64;
         // The shadow's victims are stamped with the sweep's start, so the
         // sweep's own tombstones are never older than them.
         let swept_at: Option<String> = shadow.and_then(|_| {
@@ -5796,7 +5815,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             // Found held by this sweep's probe, and counted there: its
             // removal would be refused.
-            if held.contains_key(key) {
+            if held.refused.contains_key(key) {
                 continue;
             }
             let write_started = std::time::Instant::now();
@@ -5823,7 +5842,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     stats.bytes_freed += reclaim.freed_bytes;
                     stats.disk_bytes_reclaimed += reclaim.disk_bytes_reclaimed;
                     stats.blobs_removed += reclaim.blobs_unlinked;
-                    current_size = current_size.saturating_sub(reclaim.freed_bytes);
+                    // The held part of a partly held entry was already left
+                    // out of `current_size`; only its private part counts.
+                    let held_part = held.partly.get(key).copied().unwrap_or(0);
+                    held_released += held_part;
+                    current_size =
+                        current_size.saturating_sub(reclaim.freed_bytes.saturating_sub(held_part));
                     // Telemetry, deliberately outside remove_entry_guarded so
                     // the removal mechanism stays free of it (#595). Recorded
                     // after the fact rather than in the delete transaction: a
@@ -5861,8 +5885,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         stats.evict_write_ms = eviction_writes.as_millis() as u64;
+        stats.bytes_held = held.total().saturating_sub(held_released);
+        stats.entries_unreclaimable += held.refused.len();
         if let (Some(shadow), Some(swept_at)) = (shadow, swept_at) {
-            let kept = shadow_only_victims(shadow, &evicted, by_key, durable_upload_keys, held);
+            let kept =
+                shadow_only_victims(shadow, &evicted, by_key, durable_upload_keys, &held.refused);
             self.record_shadow_victims(shadow.policy, &swept_at, &kept);
         }
         stats
@@ -5926,9 +5953,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let held = if probe_held_bytes {
             self.held_by_live_files(&candidates)?
         } else {
-            std::collections::HashMap::new()
+            HeldByLiveFiles::default()
         };
-        let bytes_held: u64 = held.values().sum();
+        let bytes_held = held.total();
         let left_out = self.config.held_bytes_budget.left_out(bytes_held);
         let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(left_out), target));
         // An automatic sweep is asked for by the store's size less what
@@ -5947,7 +5974,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             );
             return Ok(GcStats {
                 bytes_held,
-                entries_unreclaimable: held.len(),
+                entries_unreclaimable: held.refused.len(),
                 ..GcStats::default()
             });
         }
@@ -5967,7 +5994,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
             candidates.iter().map(|e| (e.key.as_str(), e)).collect();
         let durable_upload_keys = self.durable_upload_keys()?;
-        let mut stats = self.apply_eviction(
+        Ok(self.apply_eviction(
             &order,
             &by_key,
             policy.name(),
@@ -5976,10 +6003,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &durable_upload_keys,
             &held,
             stop,
-        );
-        stats.bytes_held = bytes_held;
-        stats.entries_unreclaimable += held.len();
-        Ok(stats)
+        ))
     }
 
     /// Per entry, the bytes of blobs it holds the last reference to that a
@@ -5993,8 +6017,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     fn held_by_live_files(
         &self,
         candidates: &[crate::eviction::EntryFeatures],
-    ) -> Result<std::collections::HashMap<String, u64>> {
-        let mut held = std::collections::HashMap::new();
+    ) -> Result<HeldByLiveFiles> {
+        let mut held = HeldByLiveFiles::default();
         if self.config.gc_evict_shared {
             return Ok(held);
         }
@@ -6028,9 +6052,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .map(|(_, hash, _, _, _)| self.blob_path(hash))
             .collect();
         let retained = probe_external_retainers(&paths);
+        let mut held_bytes: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut frees_some = std::collections::HashSet::new();
         for ((key, _, size, _, _), retained) in last_refs.into_iter().zip(retained) {
             if retained {
-                *held.entry(key).or_insert(0) += size.max(0) as u64;
+                *held_bytes.entry(key).or_insert(0) += size.max(0) as u64;
+            } else {
+                frees_some.insert(key);
+            }
+        }
+        for (key, bytes) in held_bytes {
+            if frees_some.contains(&key) {
+                held.partly.insert(key, bytes);
+            } else {
+                held.refused.insert(key, bytes);
             }
         }
         Ok(held)
@@ -6143,7 +6179,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
-            &std::collections::HashMap::new(),
+            &HeldByLiveFiles::default(),
             &mut || false,
         ))
     }
@@ -6967,29 +7003,39 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             hook();
         }
 
-        // Eviction only: refuse to drop an entry whose last-ref blobs are
+        // Eviction only: refuse to drop an entry whose last-ref blobs are all
         // still cloned into a worktree (kunobi-ninja/kache#725). Unlinking
-        // those names frees no disk and destroys a still-usable hit.
+        // those names frees no disk and destroys a still-usable hit. An entry
+        // that also holds the last reference to a blob nothing else keeps is
+        // removed: refusing it would strand those bytes, and a size sweep
+        // over its budget would find nothing to evict.
         // Explicit `remove_entry` (purge / doctor) passes `skip_if_idle_lt =
         // None` and still unlinks. The filesystem probe runs before the write
         // lock is taken: the lock does not stop a restore from linking a
         // blob, so probing under it adds no safety and keeps builds waiting.
-        let retained_blobs: Vec<(&str, i64)> =
-            if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
-                let mut held_refs: std::collections::HashMap<&str, i64> =
-                    std::collections::HashMap::new();
-                for hash in &hashes {
-                    *held_refs.entry(hash.as_str()).or_insert(0) += 1;
-                }
-                held_refs
-                    .into_iter()
-                    .filter(|(hash, _)| {
-                        crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
-                    })
-                    .collect()
+        let probed_blobs: Vec<(&str, i64, bool)> = if skip_if_idle_lt.is_some()
+            && !self.config.gc_evict_shared
+        {
+            let mut refs: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+            for hash in &hashes {
+                *refs.entry(hash.as_str()).or_insert(0) += 1;
+            }
+            let probed: Vec<(&str, i64, bool)> = refs
+                .into_iter()
+                .map(|(hash, refs)| {
+                    let retained =
+                        crate::filesystem::blob_has_external_retainer(&self.blob_path(hash));
+                    (hash, refs, retained)
+                })
+                .collect();
+            if probed.iter().any(|(_, _, retained)| *retained) {
+                probed
             } else {
                 Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
 
         // IMMEDIATE takes the write lock before the first read. A DEFERRED
         // transaction would read first and upgrade to a writer at the DELETE,
@@ -7019,17 +7065,29 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // A blob found retained above blocks the removal only while this
-        // entry holds its last references, and that needs the lock.
-        for (hash, held) in retained_blobs {
-            let rc: i64 = tx.query_row(
-                "SELECT refcount FROM blobs WHERE hash = ?1",
-                params![hash],
-                |row| row.get(0),
-            )?;
-            if holds_last_reference(rc, held) {
-                return Ok(RemovalAttempt::Unreclaimable);
+        // Which last references this entry holds needs the lock: the removal
+        // is refused only when every one of them is retained outside.
+        let mut last_ref_retained = false;
+        let mut last_ref_free = false;
+        for (hash, refs, retained) in probed_blobs {
+            let rc: i64 = tx
+                .query_row(
+                    "SELECT refcount FROM blobs WHERE hash = ?1",
+                    params![hash],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if holds_last_reference(rc, refs) {
+                if retained {
+                    last_ref_retained = true;
+                } else {
+                    last_ref_free = true;
+                }
             }
+        }
+        if last_ref_retained && !last_ref_free {
+            return Ok(RemovalAttempt::Unreclaimable);
         }
 
         // Delete the entry row first. If rows_affected is 0, another remover

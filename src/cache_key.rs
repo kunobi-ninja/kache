@@ -282,6 +282,12 @@ mod apple_install_name;
 // `-L native=` directory in its own `OUT_DIR` is keyed below the profile
 // directory instead of the target directory.
 //
+// No bump: a native Linux link through a driver other than the PATH's `cc`
+// also folds that driver's bytes (`link_driver` among the CRT objects), so a
+// wrapper script named by `-C linker` keys by its content, not only by the
+// banner it forwards. Links through `cc` keep their keys; those through
+// another driver change once.
+//
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or an `OUT_DIR` the compile reads from
 // sits under it. Those are the paths rustc writes into the rmeta; `--out-dir`
@@ -4844,7 +4850,7 @@ fn compute_key_into(
             // are unchanged; content hashes are still reused only with an
             // unchanged file fingerprint, through the same guards as other
             // key inputs.
-            crate::native_link_key::probe_linux_crt_objects_memoized_for(
+            native_linux_link_objects_for(
                 &crate::config::probe_memo_dir_for(invocation)?,
                 driver,
                 |path| file_hasher.hash(path),
@@ -12642,6 +12648,42 @@ where
         identity.replace('\n', ",")
     );
     Ok(())
+}
+
+/// The files a native Linux link through `driver` depends on beyond its
+/// inputs, by content: the CRT objects and libc it places and, for a driver
+/// other than the `cc` on PATH, the driver itself. `-C linker` names that
+/// driver and the key leaves its path out (`codegen_inputs`), and `linker:`
+/// folds only its `--version` banner, which a wrapper script answers as the
+/// compiler it wraps does: two wrappers that link differently (one adding
+/// `-no-pie`, one asking for RELR relocations) shared one key, and a build
+/// restored the programs the other linked. The plain `cc` keeps its key (no
+/// key bump: the goldens link through it); another driver's key changes once.
+fn native_linux_link_objects_for(
+    memo_dir: &Path,
+    driver: &Path,
+    hash: impl Fn(&Path) -> Result<String>,
+    invocation: &InvocationEnv,
+) -> Result<BTreeMap<String, String>> {
+    let mut objects = crate::native_link_key::probe_linux_crt_objects_memoized_for(
+        memo_dir, driver, &hash, invocation,
+    )?;
+    if !is_path_cc(driver, invocation) {
+        objects.insert("link_driver".to_owned(), hash(driver)?);
+    }
+    Ok(objects)
+}
+
+/// Whether `driver` is the `cc` a bare name finds on the client's PATH,
+/// symlinks followed: the driver a link without `-C linker` runs.
+fn is_path_cc(driver: &Path, env: &InvocationEnv) -> bool {
+    let Some(cc) = env.resolve_program(Path::new("cc")) else {
+        return false;
+    };
+    match (std::fs::canonicalize(driver), std::fs::canonicalize(&cc)) {
+        (Ok(driver), Ok(cc)) => driver == cc,
+        _ => driver == cc,
+    }
 }
 
 pub(crate) fn resolve_link_driver_for(args: &RustcArgs, env: &InvocationEnv) -> Option<PathBuf> {

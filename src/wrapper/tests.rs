@@ -7377,6 +7377,7 @@ fn remote_demand_wait_includes_success_and_failed_reply() {
             &key,
             "foo.c",
             NegativeReply::ContinueCompile,
+            |_| None,
         );
         assert_eq!(result.is_some(), ok);
         let demands = crate::demand::take();
@@ -7400,7 +7401,8 @@ fn remote_disabled_does_not_create_a_demand_or_wait() {
             &store,
             "key",
             "foo.c",
-            NegativeReply::ContinueCompile
+            NegativeReply::ContinueCompile,
+            |_| None,
         )
         .is_none()
     );
@@ -7456,7 +7458,7 @@ fn remote_acquisition_preserves_negative_reply_policy_and_provenance() {
             serde_json::json!({ "ok": true, "found": found, "prefetched": prefetched }),
         );
         wait_until_reachable(&config.socket_path());
-        let result = acquire_entry(&config, &store, &key, "foo.c", policy);
+        let result = acquire_entry(&config, &store, &key, "foo.c", policy, |_| None);
         assert_eq!(result.as_ref().map(|(_, origin)| *origin), expected);
         if let Some((meta, _)) = result {
             assert_eq!(meta.cache_key, key);
@@ -7482,7 +7484,8 @@ fn remote_acquisition_requires_a_reply_and_readable_entry() {
             &store,
             &key,
             "foo.c",
-            NegativeReply::CheckConcurrentEntry
+            NegativeReply::CheckConcurrentEntry,
+            |_| None,
         )
         .is_none()
     );
@@ -7495,7 +7498,8 @@ fn remote_acquisition_requires_a_reply_and_readable_entry() {
             &store,
             &missing,
             "foo.c",
-            NegativeReply::ContinueCompile
+            NegativeReply::ContinueCompile,
+            |_| None,
         )
         .is_none()
     );
@@ -7506,7 +7510,8 @@ fn remote_acquisition_requires_a_reply_and_readable_entry() {
             &store,
             &key,
             "foo.c",
-            NegativeReply::ContinueCompile
+            NegativeReply::ContinueCompile,
+            |_| None,
         )
         .is_none()
     );
@@ -7630,6 +7635,104 @@ fn cc_try_remote_hit_does_not_restore_on_a_remote_miss() {
         !output.exists(),
         "found=false must not restore even when the local store already has the entry"
     );
+}
+
+/// #1946: an `-E` call stores only preprocessor stdout. A `-c` call that
+/// reaches the same entry through the remote must compile, not exit 0
+/// without writing its object.
+#[test]
+fn cc_remote_entry_without_the_object_is_evicted_not_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"cc-remote-preprocess-only")
+        .to_hex()
+        .to_string();
+    let stdout = dir.path().join("stdout.i");
+    std::fs::write(&stdout, b"# 1 \"t.S\"\n").unwrap();
+    store
+        .put_with_compile_time_independent(
+            &key,
+            "foo.c",
+            &[],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "",
+            &[(
+                stdout,
+                crate::compiler::cc::CC_STDOUT_STORE_NAME.to_string(),
+            )],
+            "",
+            "",
+            12,
+        )
+        .unwrap();
+
+    let output = dir.path().join("out.o");
+    let output_arg = output.to_string_lossy().into_owned();
+    let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", &output_arg]);
+    let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+    wait_until_reachable(&config.socket_path());
+
+    assert_eq!(try_cc_remote_hit(&config, &store, &parsed, &key), None);
+    assert!(daemon.request_count() >= 1);
+    assert!(!output.exists());
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "the rejected entry is evicted, as a rejected local entry is"
+    );
+}
+
+/// The nvcc remote path applies the local rule too: an entry without the
+/// requested dep-info compiles instead of restoring the object alone.
+#[test]
+fn nvcc_remote_entry_without_requested_depinfo_is_not_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+    let store = Store::open(&config).unwrap();
+    let key = blake3::hash(b"nvcc-remote-missing-depinfo")
+        .to_hex()
+        .to_string();
+    seed_cc_object_entry(&store, &key, dir.path());
+
+    let output = dir.path().join("out.o");
+    let depinfo = dir.path().join("out.d");
+    let argv: Vec<String> = [
+        "nvcc",
+        "-c",
+        "k.cu",
+        "-o",
+        output.to_str().unwrap(),
+        "-MF",
+        depinfo.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let parsed = NvccCompiler::with_extra_allowlist_flags(Vec::new())
+        .parse(&argv)
+        .unwrap();
+    let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+    wait_until_reachable(&config.socket_path());
+
+    let exit = nvcc_try_remote_hit(
+        &config,
+        &store,
+        &parsed,
+        &key,
+        "k.cu",
+        "/nvcc-root",
+        std::time::Instant::now(),
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(exit, None);
+    assert!(daemon.request_count() >= 1);
+    assert!(!output.exists());
+    assert!(store.get(&key).unwrap().is_none());
 }
 
 fn cc_handoff<'a>(

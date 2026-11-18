@@ -9179,6 +9179,20 @@ impl CcCompiler {
             hasher.update(b"\n");
         }
 
+        // The mode decides what the entry holds (an object, or preprocessor
+        // output). The resolved tokens cannot tell them apart: gcc's first
+        // cc1 line for `-c t.S` is the same `-E -lang-asm` preprocess that
+        // `-E t.S` runs (#1946).
+        hasher.update(b"mode:");
+        hasher.update(format!("{:?}", parsed.mode).as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] mode={:?}",
+            trace_name,
+            parsed.mode
+        );
+
         // Target architecture.
         let arch = cc_target_arch(parsed);
         hasher.update(b"arch:");

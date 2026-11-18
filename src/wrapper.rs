@@ -2020,6 +2020,7 @@ fn nvcc_try_remote_hit(
         cache_key,
         crate_name,
         NegativeReply::ContinueCompile,
+        |meta| nvcc_cache_entry_rejection_reason(parsed, meta),
     ) else {
         return Ok(None);
     };
@@ -3583,6 +3584,7 @@ fn cc_try_remote_hit(
         cache_key,
         crate_name,
         NegativeReply::ContinueCompile,
+        |meta| cc_cache_entry_rejection_reason(parsed, meta),
     ) else {
         return Ok(None);
     };
@@ -7708,6 +7710,7 @@ fn try_rustc_remote_hit(
             &entry_key.key,
             hit.crate_name,
             NegativeReply::CheckConcurrentEntry,
+            |_| None,
         ) else {
             continue;
         };

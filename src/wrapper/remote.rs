@@ -38,12 +38,15 @@ pub(super) enum NegativeReply {
 
 /// Reload validated metadata after the daemon's reply. The result describes
 /// availability, not a completed hit; callers must restore before reporting it.
+/// `rejects` is the caller's local-lookup rule: a fetched entry it rejects is
+/// evicted and the caller compiles, as a rejected local entry would.
 pub(super) fn acquire_entry(
     config: &Config,
     store: &Store,
     cache_key: &str,
     crate_name: &str,
     negative_reply: NegativeReply,
+    rejects: impl FnOnce(&EntryMeta) -> Option<&'static str>,
 ) -> Option<(EntryMeta, EventResult)> {
     config.remote.as_ref()?;
     let entry_dir = store.entry_dir(cache_key);
@@ -63,6 +66,15 @@ pub(super) fn acquire_entry(
         return None;
     }
     let meta = store.get(cache_key).ok()??;
+    if let Some(reason) = rejects(&meta) {
+        tracing::warn!(
+            crate_name,
+            cache_key,
+            "entry after remote check cannot satisfy this invocation ({reason}), evicting"
+        );
+        let _ = store.remove_entry(cache_key);
+        return None;
+    }
     let origin = if !reply.found {
         // A negative remote reply cannot establish remote or prefetch provenance.
         EventResult::LocalHit

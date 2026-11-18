@@ -183,7 +183,7 @@ Kache currently passes through:
 - precompiled headers and modules
 - coverage and split-DWARF builds
 - assembly, including inline `asm` in C, that reads another file with `.incbin` or `.include`
-- assembly that uses macros or repetitions (`.macro`, `.irp`, `.irpc`, `.rept`, `.altmacro`) able to generate those directives
+- assembly that uses macros or repetitions (any body closed by `.endm` or `.endr`, or `.altmacro`), since they can generate those directives
 - inline `asm` whose text is a computed expression rather than a string literal
 - header availability probes with macro header names, quoted probes inside macro bodies, wrappers that transform the argument, or trigraph line continuations
 - flags it has not classified

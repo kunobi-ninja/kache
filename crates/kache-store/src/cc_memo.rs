@@ -50,6 +50,16 @@ pub const UNPROVEN_SIZE: i64 = -1;
 ///    content hash.
 pub const CC_MEMO_RULE: i64 = 1;
 
+/// The prefix on a content hash keying an assembler verdict, one per set of
+/// scan rules. A release reads only its own set: rules differ in both
+/// directions, so a verdict from another set can refuse a file this set
+/// keeps or keep one it refuses.
+///
+/// `asm2:`: a closing `.endr`, `.endm` or `.endmacro` refuses a file, `\()`
+/// alone no longer does, a comment may open an operand, and continued lines
+/// are joined. Releases before it key on the bare hash.
+const CC_ASM_SCAN_KEY: &str = "asm2:";
+
 /// What an input row's `proof` holds for `stamp` under [`CC_MEMO_RULE`].
 ///
 /// An older release records the same bytes under the same name by
@@ -456,13 +466,17 @@ impl FileHashCache<'_> {
                 "SELECT content, construct FROM cc_asm_scans
                  WHERE content IN ({placeholders}) AND rule >= {CC_MEMO_RULE}"
             ))?;
-            let rows = stmt
-                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
+            let keys = chunk
+                .iter()
+                .map(|content| format!("{CC_ASM_SCAN_KEY}{content}"));
+            let rows = stmt.query_map(rusqlite::params_from_iter(keys), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for row in rows {
-                let (content, construct) = row?;
-                found.insert(content, construct);
+                let (key, construct) = row?;
+                if let Some(content) = key.strip_prefix(CC_ASM_SCAN_KEY) {
+                    found.insert(content.to_string(), construct);
+                }
             }
         }
         Ok(found)
@@ -483,7 +497,7 @@ impl FileHashCache<'_> {
                  WHERE cc_asm_scans.rule < excluded.rule"
             ))?;
             for (content, construct) in pairs {
-                put.execute(params![content, construct])?;
+                put.execute(params![format!("{CC_ASM_SCAN_KEY}{content}"), construct])?;
             }
         }
         tx.commit()
@@ -1358,6 +1372,40 @@ mod tests {
         assert_eq!(mapped.get("c").map(String::as_str), Some("current"));
         let verdicts = cache.get_cc_asm_scans(&["c"]).unwrap();
         assert_eq!(verdicts.get("c").map(String::as_str), Some(""));
+    }
+
+    /// Verdicts under other scan rules are kept apart in both directions: an
+    /// older release's `\()` refusal is scanned again, and it never reads a
+    /// verdict this release records.
+    #[test]
+    fn assembler_verdicts_from_other_scan_rules_are_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let older = |cache: &FileHashCache<'_>| -> Option<String> {
+            cache
+                .db()
+                .query_row(
+                    "SELECT construct FROM cc_asm_scans WHERE content = 'c' AND rule >= 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+        };
+        cache
+            .db()
+            .execute(
+                "INSERT INTO cc_asm_scans(content, construct, rule) VALUES ('c', ?1, 1)",
+                [r"\()"],
+            )
+            .unwrap();
+        assert!(cache.get_cc_asm_scans(&["c"]).unwrap().is_empty());
+
+        cache
+            .put_cc_asm_scans(&[("c".into(), String::new())])
+            .unwrap();
+        let verdicts = cache.get_cc_asm_scans(&["c"]).unwrap();
+        assert_eq!(verdicts.get("c").map(String::as_str), Some(""));
+        assert_eq!(older(&cache).as_deref(), Some(r"\()"));
     }
 
     #[test]

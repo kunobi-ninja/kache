@@ -7457,6 +7457,7 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
         || label == doctor_keys::FILE_HASH_MEMO
+        || label == doctor_keys::KEY_TIME
         || label == "Store warning history"
         || label == "Store file limits"
         || label == "Store volume probe"
@@ -8490,6 +8491,11 @@ pub fn doctor(
 
     if let Some(ref cfg) = config
         && let Some(check) = doctor_checkout_check(&cfg.event_log_path())
+    {
+        checks.push(check);
+    }
+    if let Some(ref cfg) = config
+        && let Some(check) = doctor_keys::key_time_check(&cfg.event_log_path())
     {
         checks.push(check);
     }

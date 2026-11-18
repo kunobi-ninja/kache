@@ -114,7 +114,8 @@ reads its inputs again, and on-access antivirus scanning makes those reads slow.
 ReFS still gives copy-on-write restores. `kache doctor` names any of these
 directories that is not on NTFS.
 
-Record the slow build with phase tracing:
+`kache doctor` also reports the median key time of the latest build. If it
+fails, record the slow build with phase tracing:
 
 ```powershell
 $env:KACHE_PHASE_TRACE_DIR = Join-Path $env:TEMP 'kache-phases'

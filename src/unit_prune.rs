@@ -734,15 +734,26 @@ fn built_at(fingerprint: &Path) -> Option<SystemTime> {
         .max()
 }
 
-/// Each executable unit of `profile`, with its executable's name and when it
-/// was built.
+/// The package that built `unit`: a shared layout's fingerprint prefix, a
+/// per-unit layout's `build/<package>/` folder.
+fn package(unit: &Unit) -> String {
+    match unit {
+        Unit::Shared { package, .. } => package.clone(),
+        Unit::PerUnit { dir } => dir.parent().map(file_name).unwrap_or_default(),
+    }
+}
+
+/// Each executable unit of `profile`, named by its package and executable,
+/// with when it was built. Target names repeat across packages (every
+/// crate's `tests/stack/main.rs` is `test-integration-test-stack`), so the
+/// package keeps one package's builds from superseding another's.
 fn executable_builds(profile: &Path, outputs: &Outputs) -> Vec<(String, SystemTime, Unit)> {
     units(profile)
         .into_iter()
         .filter_map(|unit| {
             let name = executable(&unit, outputs)?;
             let built = built_at(&unit.fingerprint())?;
-            Some((name, built, unit))
+            Some((format!("{}/{name}", package(&unit)), built, unit))
         })
         .collect()
 }
@@ -2049,6 +2060,39 @@ mod tests {
         assert_eq!(preview_superseded(&target, 2), Pruned::default());
         assert_eq!(prune_superseded(&cache, &target, 2), Pruned::default());
         assert_eq!(remaining(&profile), before);
+    }
+
+    #[test]
+    fn same_named_executables_of_other_packages_are_not_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        write(&target.join("CACHEDIR.TAG"), CARGO_TAG);
+        let profile = target.join("debug");
+        for (package, hash, days) in [("alpha", H1, 3), ("beta", H2, 2), ("gamma", H3, 1)] {
+            let fingerprint = profile
+                .join(".fingerprint")
+                .join(format!("{package}-{hash}"));
+            write(&fingerprint.join("test-integration-test-stack.json"), "{}");
+            write(&profile.join(format!("deps/stack-{hash}")), "exe");
+            set_times(&fingerprint, ago(days));
+        }
+        let older = profile.join(".fingerprint").join(format!("alpha-{OLD}"));
+        write(&older.join("test-integration-test-stack.json"), "{}");
+        write(&profile.join(format!("deps/stack-{OLD}")), "exe");
+        set_times(&older, ago(4));
+
+        assert_eq!(preview_superseded(&target, 1).units, 1);
+        assert_eq!(
+            prune_superseded(&dir.path().join("cache"), &target, 1).units,
+            1
+        );
+        assert!(!profile.join(format!("deps/stack-{OLD}")).exists());
+        for hash in [H1, H2, H3] {
+            assert!(
+                profile.join(format!("deps/stack-{hash}")).exists(),
+                "{hash}"
+            );
+        }
     }
 
     #[test]

@@ -229,6 +229,19 @@ impl Outcome {
 fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Outcome> {
     let started = Instant::now();
     let cache_dir = &config.cache_dir;
+    // Only a quiet machine repairs, so ask that first: the probe joins both
+    // blob tables over the whole index, and on a long-lived store that is
+    // most of the pass's cost, paid every check while builds run and no
+    // repair could follow. What it would find waits for the next quiet pass.
+    if let Decision::Skip(reason) = decide_for(
+        trigger,
+        true,
+        false,
+        crate::scheduler::permits_in_use(cache_dir),
+        0,
+    ) {
+        return Ok(Outcome::Skipped(reason));
+    }
     // Own connection, like GC: the rebuild must not sit on the daemon's Store
     // mutex.
     let store = Store::open(config)?;
@@ -775,6 +788,32 @@ mod tests {
         assert_untouched(&drifted);
         assert!(!state_path(&drifted.config.cache_dir).exists());
         drop(permit);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_pass_that_could_not_repair_reads_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: plain libc call with no arguments.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let drifted = drifted_store(dir.path());
+        // An index nobody can open: a pass that touched it would fail.
+        let index = drifted.config.index_db_path();
+        let mode = std::fs::metadata(&index).unwrap().permissions();
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let recent = RequestClock::new();
+        let busy = attempt(&drifted.config, Trigger::Periodic(&recent), NOW);
+        let permit = hold_permit(&drifted.config);
+        let idle = RequestClock::idle();
+        let held = attempt(&drifted.config, Trigger::Periodic(&idle), NOW);
+        drop(permit);
+        std::fs::set_permissions(&index, mode).unwrap();
+        assert_eq!(busy.unwrap(), Outcome::Skipped(SkipReason::Busy));
+        assert_eq!(held.unwrap(), Outcome::Skipped(SkipReason::Busy));
+        assert_untouched(&drifted);
     }
 
     #[test]

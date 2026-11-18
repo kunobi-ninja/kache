@@ -224,6 +224,13 @@ where
     Some(unit)
 }
 
+/// Whether `cache_executables = false` sends this compile through uncached:
+/// it links a binary or a test. A check or clippy of one emits metadata only,
+/// no executable, so it is cached whatever `cache_executables` says.
+fn skips_uncached_executable(args: &RustcArgs, cache_executables: bool) -> bool {
+    args.is_user_facing_executable() && args.emits_link() && !cache_executables
+}
+
 /// Whether the pre-key incremental lanes may run. Never on a re-entry after a
 /// deferred compile: that compile already ran, and with a result it already
 /// reached Cargo, so no lane may start a second one.
@@ -4157,10 +4164,7 @@ fn run_parsed_rustc(
         &args.all_args,
         args.invocation_env(),
     );
-    // A check or clippy of a binary or a test emits metadata only, no
-    // executable, so it is cached whatever `cache_executables` says.
-    let skip_user_facing =
-        args.is_user_facing_executable() && args.emits_link() && !config.cache_executables;
+    let skip_user_facing = skips_uncached_executable(args, config.cache_executables);
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
         precompiled.is_some(),

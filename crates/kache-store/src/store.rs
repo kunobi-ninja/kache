@@ -2609,8 +2609,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if self.read_only {
             return;
         }
-        if let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) =
-            self.file_hash_cache().lookup_cached(path)
+        if let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) = self
+            .file_hash_cache()
+            .lookup_cached_from(path, crate::file_hash::KEY_INPUT_MEMO_MIN_BYTES)
         {
             self.file_hash_cache().record_cached(&fingerprint, hash);
         }

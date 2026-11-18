@@ -3649,6 +3649,46 @@ fn put_records_known_hash_only_for_stable_outputs() {
     ));
 }
 
+/// A small `.rmeta` is a key input downstream. Windows key reads look it up in
+/// the memo, so a put that knows its hash records it there; elsewhere the
+/// file is read instead and no row is kept.
+#[test]
+fn put_records_a_small_output_where_key_reads_look_it_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let metadata = dir.path().join("libsmall.rmeta");
+    std::fs::write(&metadata, vec![b'm'; 4096]).unwrap();
+    let expected = crate::file_hash::hash_file(&metadata).unwrap();
+
+    store
+        .put(
+            "known-hash-small",
+            "small",
+            &["lib".to_string()],
+            &[],
+            "host",
+            "dev",
+            &[(metadata.clone(), "libsmall.rmeta".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    let lookup = store
+        .file_hash_cache()
+        .lookup_cached_from(&metadata, crate::file_hash::KEY_INPUT_MEMO_MIN_BYTES);
+    if cfg!(windows) {
+        assert!(matches!(
+            lookup,
+            crate::file_hash::FileHashLookup::Hit(actual) if actual == expected
+        ));
+    } else {
+        assert!(matches!(
+            lookup,
+            crate::file_hash::FileHashLookup::Uncacheable
+        ));
+    }
+}
+
 #[test]
 fn test_store_put_and_get() {
     let dir = tempfile::tempdir().unwrap();

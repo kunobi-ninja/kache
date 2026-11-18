@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
+/// The smallest key input whose hash is memoised: looked up when a key reads
+/// it, and recorded when a store or restore already knows it. Off Windows a
+/// small file is read about as fast as its row is looked up, so this is
+/// [`MIN_PERSISTED_HASH_BYTES`]. On Windows reading a file opens it for its
+/// data, which an antivirus filter may scan, while the stamp comes from an
+/// attribute-only open, so any size is memoised. A warm build of a 1,200-unit
+/// desktop app read about 20,500 small sources per build on a 4 vCPU Windows
+/// 11 VM.
+pub const KEY_INPUT_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
+    0
+} else {
+    MIN_PERSISTED_HASH_BYTES
+};
+
 /// Windows metadata without a handle-derived ID cannot prove unchanged bytes.
 /// Other platforms retain their existing file-hash memo policy.
 pub fn file_hash_memo_eligible(inode: i64, requires_identity: bool) -> bool {
@@ -1110,9 +1124,14 @@ impl FileHashCache<'_> {
     /// release it before the expensive file read and re-take it only for the
     /// short record (#281). Mirrors `FileHasher::hash`'s fingerprint + min-size +
     /// cache-get logic, so the cache key is identical. The floor here is
-    /// always `MIN_PERSISTED_HASH_BYTES`: the smaller key inputs that
+    /// `MIN_PERSISTED_HASH_BYTES`: the smaller key inputs that
     /// `FileHasher::hash` memoises on Windows are looked up in process.
     pub fn lookup_cached(&self, path: &Path) -> FileHashLookup {
+        self.lookup_cached_from(path, MIN_PERSISTED_HASH_BYTES)
+    }
+
+    /// [`Self::lookup_cached`] for files of `floor` bytes and more.
+    pub(crate) fn lookup_cached_from(&self, path: &Path, floor: i64) -> FileHashLookup {
         let cache = self;
         let fingerprint = match FileFingerprint::from_path(path) {
             Ok(fp) => fp,
@@ -1124,7 +1143,7 @@ impl FileHashCache<'_> {
                 return FileHashLookup::Uncacheable;
             }
         };
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < floor {
             return FileHashLookup::Uncacheable;
         }
         match cache.get(&fingerprint) {
@@ -1156,10 +1175,10 @@ impl FileHashCache<'_> {
     /// path here instead would pair the new file's fingerprint with the old
     /// file's hash.
     ///
-    /// Honors `MIN_PERSISTED_HASH_BYTES`, the floor `FileHasher::hash` keeps
-    /// for every file off Windows; a smaller file is just not recorded here.
+    /// Honors [`KEY_INPUT_MEMO_MIN_BYTES`], the floor a key read looks rows
+    /// up from; a smaller file is just not recorded here.
     pub fn record_verified(&self, fingerprint: &FileFingerprint, hash: &str) {
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+        if fingerprint.size < KEY_INPUT_MEMO_MIN_BYTES {
             return;
         }
         self.record_cached(fingerprint, hash);
@@ -2613,10 +2632,10 @@ mod tests {
     }
 
     #[test]
-    fn record_verified_honors_the_persistence_floor() {
+    fn record_verified_honors_the_key_input_floor() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
-        let below = dir.path().join("below.rlib");
+        let below = dir.path().join("below.rmeta");
         let at_floor = dir.path().join("at-floor.rlib");
         std::fs::write(&below, vec![1u8; 65_535]).unwrap();
         std::fs::write(&at_floor, vec![2u8; 65_536]).unwrap();
@@ -2625,10 +2644,14 @@ mod tests {
         hasher.record_verified(&FileFingerprint::from_path(&below).unwrap(), "below");
         hasher.record_verified(&FileFingerprint::from_path(&at_floor).unwrap(), "at-floor");
 
-        assert!(matches!(
-            hasher.lookup_cached(&below),
-            FileHashLookup::Uncacheable
-        ));
+        // A key read on Windows looks up a small output, so a restore or store
+        // that knows its hash records it there and nowhere else.
+        let below_lookup = hasher.lookup_cached_from(&below, KEY_INPUT_MEMO_MIN_BYTES);
+        if cfg!(windows) {
+            assert!(matches!(below_lookup, FileHashLookup::Hit(hash) if hash == "below"));
+        } else {
+            assert!(matches!(below_lookup, FileHashLookup::Uncacheable));
+        }
         assert!(matches!(
             hasher.lookup_cached(&at_floor),
             FileHashLookup::Hit(hash) if hash == "at-floor"
@@ -2638,6 +2661,6 @@ mod tests {
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM file_hashes", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(rows, 1, "sub-threshold fingerprints must not be stored");
+        assert_eq!(rows, if cfg!(windows) { 2 } else { 1 });
     }
 }

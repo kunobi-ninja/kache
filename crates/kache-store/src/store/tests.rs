@@ -2594,6 +2594,46 @@ fn deferred_durability_verifies_pending_hits_until_the_flush() {
     assert!(strict.try_durability_flush_lock().unwrap().is_some());
 }
 
+/// A lookup reads an entry's row twice: [`Store::contains`] finds it
+/// committed, then its durable flag decides whether the blobs are hashed.
+/// Another build can evict the entry in between, and the blob outlives the
+/// row while another entry still holds it (or until the eviction's unlink,
+/// which follows its commit). A pending entry evicted in that window is still
+/// verified: a blob whose size is right and whose bytes are not is a miss.
+#[test]
+fn a_pending_entry_evicted_between_a_lookups_two_reads_is_verified() {
+    let _env_lock = crate::test_support::process_state_test_lock();
+    let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "evicted", 64);
+    put_test_entry(&store, dir.path(), "sharing", 64);
+    assert_eq!(store.pending_durability().unwrap(), 2);
+    let blob = store.blob_path(&store.stored_meta("evicted").unwrap().files[0].hash);
+    // What a crash before the flush can leave: the right size, other bytes.
+    let mut perms = fs::metadata(&blob).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&blob, perms).unwrap();
+    fs::write(&blob, vec![b'x'; 64]).unwrap();
+
+    let evictor = Store::open(&config).unwrap();
+    DURABLE_READ_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || evictor.remove_entry("evicted").unwrap()));
+    });
+    let hit = store.get("evicted").unwrap();
+    assert!(
+        DURABLE_READ_HOOK.with(|slot| slot.borrow().is_none()),
+        "the lookup reached its durable read"
+    );
+    assert!(blob.exists(), "the shared blob outlived the evicted row");
+    assert!(
+        hit.is_none(),
+        "a pending entry evicted between the reads is verified, not served"
+    );
+}
+
 /// Deferred durability covers downloaded entries too: both import paths
 /// leave the entry pending, so a hit verifies its bytes until the flush.
 /// With the feature off, an import is durable at once.

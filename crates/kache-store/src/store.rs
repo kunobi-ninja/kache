@@ -51,6 +51,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once, just before a lookup reads an entry's durable flag: the
+    /// window in which another build can evict the entry the lookup found.
+    static DURABLE_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(all(test, windows))]
 type DurabilityOpenHook = Box<dyn FnOnce(bool)>;
 
@@ -4569,16 +4577,30 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Whether an entry's blobs and metadata have reached disk. Unknown rows
-    /// read as durable: the size check and the verification policy still apply.
+    /// Whether an entry's blobs and metadata have reached disk. A lookup reads
+    /// this after [`Self::contains`] found the entry committed.
     fn entry_is_durable(&self, cache_key: &str) -> bool {
-        self.db
+        #[cfg(test)]
+        if let Some(hook) = DURABLE_READ_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        match self
+            .db
             .query_row(
                 "SELECT durable FROM entries WHERE cache_key = ?1",
                 params![cache_key],
                 |row| row.get::<_, bool>(0),
             )
-            .unwrap_or(true)
+            .optional()
+        {
+            Ok(Some(durable)) => durable,
+            // Gone since `contains` found it: another build evicted it, and
+            // its blob may still be on disk. Hash it rather than trust its size.
+            Ok(None) => false,
+            // An index that cannot say: the size check and the verification
+            // policy still apply.
+            Err(_) => true,
+        }
     }
 
     /// Entries stored without an fsync that no flush has reached yet.

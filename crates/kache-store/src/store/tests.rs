@@ -10488,13 +10488,15 @@ fn republication_during_removal_cleanup_is_never_stranded() {
     assert_eq!(refcount, 1, "B's refcounts must be intact");
 }
 
-/// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
-/// lost-the-race case ONLY — a cleanup failure while the directory still
-/// exists (permissions, open handles) must surface as an error, not be
-/// swallowed as if the competitor had won.
+/// A directory the cleanup cannot remove (an unwritable folder inside it)
+/// no longer fails the removal: under the write lock the entry's directory
+/// only leaves the store's names, into the trash, and its removal after the
+/// lock fails there, logged, for the next sweep to try again. The logical
+/// removal stays committed (#670) and the store keeps no residue under the
+/// entry's name.
 #[cfg(unix)]
 #[test]
-fn persistent_directory_cleanup_failure_is_an_error() {
+fn persistent_directory_cleanup_failure_stays_in_the_trash() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -10516,49 +10518,46 @@ fn persistent_directory_cleanup_failure_is_an_error() {
             "",
         )
         .unwrap();
-
-    // An unwritable directory with a file inside makes remove_dir_all
-    // fail with a persistent, non-race error. Nested one level down:
-    // cleanup's readonly-clearing pass covers entry_dir's immediate
-    // children, so a top-level readonly dir would simply be repaired.
     let entry_dir = store.entry_dir("stuck");
     let inner = entry_dir.join("legacy").join("inner");
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("artifact"), b"x").unwrap();
     std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    // Stash the blob hash BEFORE the removal: remove_dir_all deletes
-    // children in unspecified order, so meta.json may or may not survive
-    // the failed cleanup.
-    let stashed_hash = {
+    let hash = {
         let meta: EntryMeta =
             serde_json::from_str(&std::fs::read_to_string(entry_dir.join("meta.json")).unwrap())
                 .unwrap();
         meta.files[0].hash.clone()
     };
 
-    let err = store.remove_entry("stuck");
-    // Restore permissions so the tempdir can be dropped regardless.
-    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let removed = store.remove_entry("stuck");
+
+    let trash = config.store_dir().join(EVICTED_TRASH_DIR);
+    let left: Vec<_> = std::fs::read_dir(&trash)
+        .unwrap()
+        .flatten()
+        .map(|item| item.path())
+        .collect();
+    for item in &left {
+        let stuck = item.join("legacy").join("inner");
+        if stuck.exists() {
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    removed.unwrap();
+    assert!(!store.contains("stuck"));
+    assert!(!entry_dir.exists(), "nothing stays under the entry's name");
     assert!(
-        err.is_err(),
-        "a persistent cleanup failure must not be swallowed as a lost race"
+        !store.blob_path(&hash).exists(),
+        "the blob only that entry held is freed"
     );
-    // The failure direction matters (#670): the logical removal commits
-    // BEFORE cleanup, so a cleanup failure leaves a deleted row plus
-    // partially deleted, unindexed residue — recoverable. Rolling the row
-    // back after files were already deleted would manufacture a committed
-    // row without artifacts, which is the phantom this function must
-    // never produce.
-    assert!(
-        !store.contains("stuck"),
-        "the logical removal must stay committed across a cleanup failure"
+    assert_eq!(
+        left.len(),
+        1,
+        "the stuck directory waits in the trash: {left:?}"
     );
-    assert!(
-        store.blob_path(&stashed_hash).is_file(),
-        "blob unlinks run only after directory cleanup succeeds; a failed \
-             cleanup leaves the file for the orphan sweep"
-    );
+    EvictedTrash::new(&config.store_dir()).empty_leftovers();
+    assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 0);
 }
 
 /// kunobi-ninja/kache#510: two removers racing on the SAME entry must not
@@ -10699,6 +10698,71 @@ fn evict_does_not_fire_while_physical_size_is_within_budget() {
         "physical 200 <= max 300 (the trigger): nothing to evict"
     );
     assert!(store.contains("dup_a") && store.contains("dup_b"));
+}
+
+/// An evicted entry's directory and last-reference blob leave the store's
+/// names under the write lock and their files go after it: none is left in
+/// the store or in its trash, and a leftover of a removal cut short goes at
+/// the next sweep.
+#[test]
+fn evict_frees_files_through_the_trash_and_empties_its_leftovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100 * 1024;
+    let store = Store::open(&config).unwrap();
+    let src = dir.path().join("gone.rlib");
+    std::fs::write(&src, vec![b'g'; 300 * 1024]).unwrap();
+    store
+        .put(
+            "gone",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src);
+    store
+        .db
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    let trash = config.store_dir().join(EVICTED_TRASH_DIR);
+    std::fs::create_dir_all(trash.join("left.1.2")).unwrap();
+    std::fs::write(trash.join("left.1.2").join("meta.json"), b"{}").unwrap();
+    std::fs::write(trash.join("blob.1.3"), b"x").unwrap();
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.entries_evicted, 1);
+    assert_eq!(stats.disk_bytes_reclaimed, 300 * 1024);
+    assert!(!store.entry_dir("gone").exists());
+    let blobs: Vec<_> = walkdir_files(&config.store_dir().join("blobs"));
+    assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
+    let left: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
+    assert!(left.is_empty(), "the trash kept {left:?}");
+}
+
+fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(items) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for item in items.flatten() {
+        let path = item.path();
+        if path.is_dir() {
+            files.extend(walkdir_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// kunobi-ninja/kache#608 (ranking + stop condition): entries whose blobs

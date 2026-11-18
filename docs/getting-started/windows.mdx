@@ -32,7 +32,8 @@ cache_executables = true
 
 For one PowerShell session, set `$env:KACHE_CACHE_EXECUTABLES = "1"` before the
 build. If you use the GitHub Action, configure its `cache-executables` input
-instead of relying on the CLI default.
+instead of relying on the CLI default. `cargo check` and `cargo clippy` of
+binaries and tests write no executable, so they are cached either way.
 
 V2 pairs a cached MSVC PE executable with the sibling PDB named by its debug
 record, checking that their identities agree. Missing/mismatched PDBs, unsupported

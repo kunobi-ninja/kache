@@ -8433,8 +8433,11 @@ fn cc_join_continued_lines(text: &[u8]) -> Option<Vec<u8>> {
     let mut joined = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.iter().position(|byte| *byte == b'\\') {
-        joined.extend_from_slice(&rest[..at]);
-        let after = &rest[at + 1..];
+        let (before, from) = rest.split_at(at);
+        joined.extend_from_slice(before);
+        let Some((_, after)) = from.split_first() else {
+            break;
+        };
         let blanks = after
             .iter()
             .take_while(|byte| matches!(byte, b' ' | b'\t'))

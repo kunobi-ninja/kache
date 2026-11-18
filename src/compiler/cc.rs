@@ -8428,32 +8428,27 @@ fn cc_raw_assembler_hidden_input(text: &[u8]) -> Option<&'static str> {
 }
 
 /// `text` with each backslash-newline removed, or `None` when it has none.
+/// GCC and clang also join when blanks sit between the two.
 fn cc_join_continued_lines(text: &[u8]) -> Option<Vec<u8>> {
-    // GCC and clang also join when blanks sit between the two.
-    let continued = |at: usize| {
-        let blanks = text[at + 1..]
+    let mut joined = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.iter().position(|byte| *byte == b'\\') {
+        joined.extend_from_slice(&rest[..at]);
+        let after = &rest[at + 1..];
+        let blanks = after
             .iter()
             .take_while(|byte| matches!(byte, b' ' | b'\t'))
             .count();
-        match &text[at + 1 + blanks..] {
-            [b'\n', ..] => Some(blanks + 2),
-            [b'\r', b'\n', ..] => Some(blanks + 3),
-            _ => None,
-        }
-    };
-    let first = (0..text.len()).find(|&at| text[at] == b'\\' && continued(at).is_some())?;
-    let mut joined = text[..first].to_vec();
-    let mut at = first;
-    while at < text.len() {
-        match (text[at], continued(at)) {
-            (b'\\', Some(skip)) => at += skip,
-            (byte, _) => {
-                joined.push(byte);
-                at += 1;
+        rest = match &after[blanks..] {
+            [b'\n', next @ ..] | [b'\r', b'\n', next @ ..] => next,
+            _ => {
+                joined.push(b'\\');
+                after
             }
-        }
+        };
     }
-    Some(joined)
+    joined.extend_from_slice(rest);
+    (joined.len() != text.len()).then_some(joined)
 }
 
 pub struct CcCompiler {

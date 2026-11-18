@@ -5646,6 +5646,11 @@ fn raw_scan_reads_continued_lines_both_ways() {
     // A plain `.s` file is not preprocessed: `.endr` closes a body there.
     assert_eq!(found(".endr\\\nx"), Some(".endr"));
     assert_eq!(found("#define F(x) \\\n  ((x) + 1)\n"), None);
+
+    let join = |text: &str| cc_join_continued_lines(text.as_bytes()).map(String::from_utf8);
+    assert_eq!(join("a\\\nb\\ \t\r\nc\\\\\nd"), Some(Ok("abc\\d".into())));
+    assert_eq!(join(r"a\b \ c\"), None);
+    assert_eq!(join("a\\ \rb"), None);
 }
 
 /// C23 delimited escapes survive `-E` as written, so only the string

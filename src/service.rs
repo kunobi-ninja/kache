@@ -876,6 +876,7 @@ fn start_scheduled_task(
 
 /// Bound the manager client process, preserving a capped diagnostic on failure.
 /// Killing a timed-out client does not undo a manager operation already accepted.
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn command_output_until(
     command: &mut std::process::Command,
     deadline: std::time::Instant,

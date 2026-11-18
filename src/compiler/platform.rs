@@ -155,7 +155,7 @@ pub fn current_for(env: &InvocationEnv) -> Box<dyn Platform> {
     {
         Box::new(MacOsPlatform { env: env.clone() })
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Box::new(LinuxPlatform)
     }

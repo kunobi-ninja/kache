@@ -913,6 +913,180 @@ esac
     );
 }
 
+/// The SDK identity the macOS link tests start from.
+#[cfg(unix)]
+const MACOS_SDK_IDENTITY: &str = "15.0 (24A348)";
+
+/// A temporary root whose `bin`, the snapshot PATH, holds a `cc`. Nothing
+/// runs it: the key reads the drivers' bytes only.
+#[cfg(unix)]
+fn macos_link_fixture() -> (tempfile::TempDir, PathBuf, InvocationEnv) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    kache_fs::testutil::write_executable(
+        &bin.join("cc"),
+        "#!/bin/sh\necho 'Apple clang version 17.0.0'\n",
+    );
+    let env = InvocationEnv::from_parts(
+        [("PATH", bin.to_str().unwrap())],
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    (directory, root, env)
+}
+
+#[cfg(unix)]
+fn content_hash(path: &Path) -> Result<String> {
+    Ok(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
+}
+
+/// What a native macOS link of a bin crate folds as its SDK identity, with
+/// `-C linker` naming `linker` when given.
+#[cfg(unix)]
+fn macos_link_identity(linker: Option<&str>, env: &InvocationEnv) -> Result<String> {
+    let mut argv = ["rustc", "--crate-name", "app", "--crate-type", "bin"]
+        .map(String::from)
+        .to_vec();
+    argv.push("src/main.rs".to_string());
+    if let Some(linker) = linker {
+        argv.push(format!("-Clinker={linker}"));
+    }
+    let args = RustcArgs::parse_for(&argv, env).unwrap();
+    native_macos_link_identity_for(MACOS_SDK_IDENTITY.to_string(), &args, content_hash, env)
+}
+
+/// The case in #1966: two wrappers that `-C linker` names answer `--version`
+/// as the `cc` they run does and differ only in what they pass it, one making
+/// clang run a linker that does not exist. Their links key apart from each
+/// other and from a link through `cc`, by the wrappers' bytes.
+#[cfg(unix)]
+#[test]
+fn a_wrapper_named_by_linker_keys_its_macos_links_by_its_own_bytes() {
+    let (_directory, root, env) = macos_link_fixture();
+    let bin = root.join("bin");
+    kache_fs::testutil::write_executable(
+        &bin.join("cc-bogus"),
+        "#!/bin/sh\nexec cc --ld-path=/nonexistent/ld \"$@\"\n",
+    );
+    kache_fs::testutil::write_executable(&bin.join("cc-plain"), "#!/bin/sh\nexec cc \"$@\"\n");
+
+    let bogus = macos_link_identity(Some("cc-bogus"), &env).unwrap();
+    let plain = macos_link_identity(Some("cc-plain"), &env).unwrap();
+    assert_eq!(
+        bogus,
+        format!(
+            "{MACOS_SDK_IDENTITY}\nlink_driver={}",
+            content_hash(&bin.join("cc-bogus")).unwrap()
+        ),
+        "the wrapper's bytes follow the SDK identity"
+    );
+    assert_ne!(
+        bogus, plain,
+        "two wrappers with one banner must not share a link key"
+    );
+    assert_ne!(
+        plain, MACOS_SDK_IDENTITY,
+        "a wrapper must not key as the cc it runs"
+    );
+}
+
+/// A link without `-C linker` runs the `cc` on PATH and folds the SDK
+/// identity alone, as it did before #1966, so no macOS link key changes.
+#[cfg(unix)]
+#[test]
+fn a_macos_link_through_the_path_cc_keeps_its_sdk_identity() {
+    let (_directory, _root, env) = macos_link_fixture();
+    assert_eq!(macos_link_identity(None, &env).unwrap(), MACOS_SDK_IDENTITY);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_the_path_cc_keeps_the_macos_sdk_identity() {
+    let (_directory, root, env) = macos_link_fixture();
+    let alias = root.join("clang");
+    std::os::unix::fs::symlink(root.join("bin").join("cc"), &alias).unwrap();
+    assert_eq!(
+        macos_link_identity(Some(alias.to_str().unwrap()), &env).unwrap(),
+        MACOS_SDK_IDENTITY,
+        "a symlink to the PATH's cc is that cc"
+    );
+}
+
+/// A driver the key cannot read passes the link through: a path that names
+/// no file, or a name the client's PATH does not hold.
+#[cfg(unix)]
+#[test]
+fn a_macos_link_through_a_missing_driver_is_not_keyed() {
+    let (_directory, root, env) = macos_link_fixture();
+    let missing = root.join("cc-missing");
+    let error = macos_link_identity(Some(missing.to_str().unwrap()), &env).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("hashing the native macOS link driver"),
+        "{error:#}"
+    );
+    let error = macos_link_identity(Some("cc-missing"), &env).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no cc/linker driver"),
+        "{error:#}"
+    );
+}
+
+/// The whole key on a Mac, with the real SDK: `compute_key_into` hands the
+/// SDK identity through `native_macos_link_identity_for`, so the #1966
+/// wrapper keys apart from a link through `cc` and from another wrapper,
+/// and naming the PATH's `cc` keys as a link without `-C linker` does.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_macos_bin_keys_a_linker_wrapper_by_its_bytes() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    std::fs::write(&source, b"fn main() {}").unwrap();
+    let bogus = dir.path().join("cc-bogus");
+    let plain = dir.path().join("cc-plain");
+    kache_fs::testutil::write_executable(
+        &bogus,
+        "#!/bin/sh\nexec cc --ld-path=/nonexistent/ld \"$@\"\n",
+    );
+    kache_fs::testutil::write_executable(&plain, "#!/bin/sh\nexec cc \"$@\"\n");
+    let invocation = client_invocation(dir.path(), &[]);
+    let fh = FileHasher::new_for(&invocation);
+    let pn = PathNormalizer::empty();
+    let key = |linker: Option<&str>| {
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "app".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+        ];
+        argv.extend(linker.map(|linker| format!("-Clinker={linker}")));
+        let mut parsed = RustcArgs::parse_for(&argv, &invocation).unwrap();
+        parsed.source_file = None;
+        compute_cache_key(&parsed, &fh, &pn, &KeyEnv::default()).unwrap()
+    };
+    let through_cc = key(None);
+    assert_eq!(
+        key(Some("cc")),
+        through_cc,
+        "naming the PATH's cc keeps the key"
+    );
+    let bogus = key(Some(bogus.to_str().unwrap()));
+    assert_ne!(
+        bogus, through_cc,
+        "a wrapper must not key as the cc it runs"
+    );
+    assert_ne!(
+        bogus,
+        key(Some(plain.to_str().unwrap())),
+        "two wrappers with one banner must not share a link key"
+    );
+}
+
 #[test]
 fn cross_target_and_library_outputs_place_no_linker() {
     for args in [

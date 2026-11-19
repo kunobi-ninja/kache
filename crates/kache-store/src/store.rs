@@ -1188,14 +1188,15 @@ impl EvictedTrash {
         }
     }
 
-    /// Remove everything in the trash folder.
-    pub(crate) fn empty_leftovers(&self) {
+    /// Remove everything in the trash folder. Returns how many items went.
+    pub(crate) fn empty_leftovers(&self) -> usize {
         let Ok(items) = fs::read_dir(&self.dir) else {
-            return;
+            return 0;
         };
-        for item in items.flatten() {
-            remove_trash_item(&item.path());
-        }
+        items
+            .flatten()
+            .filter(|item| remove_trash_item(&item.path()))
+            .count()
     }
 }
 
@@ -4557,6 +4558,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         Ok(())
+    }
+
+    /// Remove what an entry removal left in the trash: a crash between taking
+    /// a name and removing it, or a delete Windows refused. An eviction also
+    /// does this when it starts, but a sweep that evicts nothing never gets
+    /// there, and the store's size does not count these files. Returns how
+    /// many items went.
+    pub fn sweep_evicted_trash(&self) -> usize {
+        if self.read_only {
+            return 0;
+        }
+        EvictedTrash::new(&self.config.store_dir()).empty_leftovers()
     }
 
     /// Reclaim crash-orphaned staging files older than `min_age`. A put killed

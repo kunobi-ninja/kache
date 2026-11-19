@@ -14488,3 +14488,26 @@ fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
         );
     }
 }
+
+#[test]
+fn only_a_linking_executable_skips_the_cache_when_executables_are_off() {
+    let rustc = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "--crate-name", "app", "src/main.rs"];
+        argv.extend_from_slice(extra);
+        RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    let check_bin = rustc(&["--crate-type", "bin", "--emit=dep-info,metadata"]);
+    let check_test = rustc(&["--test", "--emit=dep-info,metadata"]);
+    let build_bin = rustc(&["--crate-type", "bin", "--emit=dep-info,link"]);
+    let build_test = rustc(&["--test", "--emit=link=target/app"]);
+    let default_emit = rustc(&["--crate-type", "bin"]);
+    let check_lib = rustc(&["--crate-type", "lib", "--emit=dep-info,metadata"]);
+
+    for args in [&build_bin, &build_test, &default_emit] {
+        assert!(skips_uncached_executable(args, false), "{:?}", args.emit);
+        assert!(!skips_uncached_executable(args, true), "{:?}", args.emit);
+    }
+    for args in [&check_bin, &check_test, &check_lib] {
+        assert!(!skips_uncached_executable(args, false), "{:?}", args.emit);
+    }
+}

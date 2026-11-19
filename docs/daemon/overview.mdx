@@ -33,7 +33,7 @@ and daemon entry points.
 - When a build session that used a writable remote has been idle for five minutes, publish its build manifest.
 - Track running compiles for `kache monitor`.
 - On macOS, exclude the cache directory from Spotlight and Time Machine.
-- Exit when its config file changes, so the next start loads the new settings.
+- Exit once its config file has changed and no request is running, so compiles that are running finish and the next start loads the new settings.
 
 For delegated compiles, the daemon's pipeline already owns publication. A local
 C/C++ engine can also hand its private output snapshots to the daemon when

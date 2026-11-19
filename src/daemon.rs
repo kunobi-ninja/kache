@@ -7155,6 +7155,54 @@ pub(crate) async fn drain_publications_then_close_uploads(
     daemon.close_upload_queue();
 }
 
+/// Close admission once the config file has changed and no request is running,
+/// so the daemon exits and its next start loads the new config. Returns as soon
+/// as admission closes for another reason. `changed` is called once per
+/// `interval`, starting one interval in, until it first returns true. Kept out
+/// of `server_main` so tests can drive it.
+async fn reload_when_config_changes(
+    lifecycle: Arc<Lifecycle>,
+    interval: Duration,
+    mut changed: impl FnMut() -> bool,
+) {
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticks.tick().await;
+    let mut change_seen = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = lifecycle.draining() => return,
+            _ = ticks.tick() => {}
+        }
+        if !change_seen {
+            if !changed() {
+                continue;
+            }
+            change_seen = true;
+            tracing::info!(
+                active = lifecycle.snapshot().active,
+                "config file changed on disk, restarting to reload it once running requests finish"
+            );
+        }
+        // A drain aborts handlers that outlive the drain timeout, and that
+        // fails a compile the daemon has already accepted (#1987), so wait
+        // until no request is running. `Lifecycle` cannot check and close
+        // admission in one step, so a request can still be admitted between
+        // the check and `start_drain`, and it is handled as any drain handles
+        // it. A short request finishes within the drain timeout. On Unix a
+        // compile admitted then is normally sent back to compile locally
+        // before `Prepared`; on Windows the daemon sends `Prepared` before it
+        // looks at the drain, so that compile can fail.
+        if lifecycle.snapshot().active == 0 {
+            if lifecycle.start_drain() {
+                tracing::info!("no request running, restarting to reload the changed config");
+            }
+            return;
+        }
+    }
+}
+
 async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
@@ -7416,31 +7464,17 @@ async fn server_main(
     // Config watchdog: the daemon loads its config once at startup, so an edit
     // to the config file (e.g. `local_max_size`) would otherwise require a
     // manual `kache daemon stop`. Periodically re-fingerprint the active config
-    // file; on a change, schedule a graceful restart so the service manager (or
-    // the next build's auto-spawn) brings the daemon back up with the new
-    // config. This watches only the file the daemon itself resolved — it sends
-    // no per-client signal, so it can't thrash across projects.
+    // file; on a change, wait until no request is running, then schedule a
+    // graceful restart so the service manager (or the next build's auto-spawn)
+    // brings the daemon back up with the new config. A compile that is running
+    // finishes first. This watches only the file the daemon itself resolved and
+    // sends no per-client signal, so it can't thrash across projects.
     let config_provenance = provenance.clone();
-    let config_watch_lifecycle = Arc::clone(&lifecycle);
-
-    let config_watch_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(DAEMON_CONFIG_WATCH_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                _ = config_watch_lifecycle.draining() => break,
-                _ = interval.tick() => {}
-            }
-            if crate::config::config_file_has_changed(&config_provenance) {
-                tracing::info!("config file changed on disk, scheduling restart to reload it");
-                config_watch_lifecycle.start_drain();
-
-                break;
-            }
-        }
-    });
+    let config_watch_handle = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        DAEMON_CONFIG_WATCH_INTERVAL,
+        move || crate::config::config_file_has_changed(&config_provenance),
+    ));
 
     // Idle watchdog: exit if no connections received for this duration.
     // Prevents zombie daemons from accumulating when the user isn't building.

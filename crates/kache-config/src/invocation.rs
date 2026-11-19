@@ -15,7 +15,14 @@ pub struct InvocationEnv {
     home: Option<PathBuf>,
     temp: PathBuf,
     cache: Option<PathBuf>,
+    /// Paths derived from this invocation that stay fixed while it runs,
+    /// shared by its clones: a tool's version-cache path costs a toolchain
+    /// scan, and one compile asks for it several times.
+    derived_paths: DerivedPaths,
 }
+
+type DerivedPaths =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(PathBuf, String), Option<PathBuf>>>>;
 
 impl std::fmt::Debug for InvocationEnv {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -28,6 +35,30 @@ impl std::fmt::Debug for InvocationEnv {
 }
 
 impl InvocationEnv {
+    /// `derive()` for `(path, kind)`, computed once per invocation.
+    pub fn derived_path(
+        &self,
+        path: &Path,
+        kind: &str,
+        derive: impl FnOnce() -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let key = (path.to_path_buf(), kind.to_owned());
+        if let Some(found) = self
+            .derived_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
+            return found.clone();
+        }
+        let derived = derive();
+        self.derived_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, derived.clone());
+        derived
+    }
+
     pub fn capture() -> Self {
         Self::from_parts(
             std::env::vars_os(),
@@ -40,6 +71,7 @@ impl InvocationEnv {
 
     pub fn with_cache_dir(mut self, cache: Option<PathBuf>) -> Self {
         self.cache = cache;
+        self.derived_paths = DerivedPaths::default();
         self
     }
 
@@ -59,6 +91,7 @@ impl InvocationEnv {
             home,
             temp,
             cache: None,
+            derived_paths: DerivedPaths::default(),
         };
         if let Some(temp) = invocation.resolve(&invocation.temp) {
             invocation.temp = temp;
@@ -194,6 +227,9 @@ impl InvocationEnv {
         let vars = std::sync::Arc::make_mut(&mut self.vars);
         vars.retain(|(key, _)| !name_matches_os(key, name));
         vars.push((name.to_owned(), value));
+        // What was derived from the old variables no longer holds; clones
+        // made before the change keep theirs.
+        self.derived_paths = DerivedPaths::default();
     }
 
     /// Search the client's PATH after rooting relative entries in its cwd.
@@ -257,6 +293,28 @@ pub fn is_manifest_dir_var(var: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_derived_path_is_computed_once_and_forgotten_when_a_variable_changes() {
+        let mut env = InvocationEnv::from_parts(
+            std::iter::empty::<(OsString, OsString)>(),
+            None,
+            None,
+            std::env::temp_dir(),
+        );
+        let calls = std::cell::Cell::new(0);
+        let derive = || {
+            calls.set(calls.get() + 1);
+            Some(PathBuf::from(format!("/derived/{}", calls.get())))
+        };
+        let tool = Path::new("/bin/tool");
+        let first = env.derived_path(tool, "ver", derive);
+        assert_eq!(env.clone().derived_path(tool, "ver", derive), first);
+        assert_eq!(calls.get(), 1);
+        env.set("RUSTUP_TOOLCHAIN", "nightly");
+        assert_ne!(env.derived_path(tool, "ver", derive), first);
+        assert_eq!(calls.get(), 2);
+    }
     use super::*;
 
     #[test]

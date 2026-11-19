@@ -7343,6 +7343,12 @@ async fn server_main(
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.
+    // The index's pages, back in the page cache while the machine has room
+    // for them (`index_residency`): a hit reads them before anything else,
+    // and an evicted page waits for a busy disk.
+    #[cfg(target_os = "linux")]
+    crate::index_residency::spawn(&daemon.config.index_db_path());
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));

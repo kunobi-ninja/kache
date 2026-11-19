@@ -3674,6 +3674,50 @@ fn a_gc_hint_leaves_bytes_held_by_target_directories_alone() {
     ));
 }
 
+/// An automatic sweep starts from the held figure the last sweep recorded,
+/// or from none: the first sweep, and every one once that figure is six
+/// hours old, is due on the store's full size. Its probe then measures the
+/// held bytes again: a store whose own part fits under `max_size` gives
+/// nothing back, however far the full size is over the trigger.
+#[test]
+fn a_sweep_due_without_a_recent_held_figure_evicts_nothing_from_a_store_that_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    for i in 0..6 {
+        let key = format!("held_{i}");
+        put_upload_evict_entry(&store, dir.path(), &key, 100, false);
+        hold_in_target_dir(&store, dir.path(), &key);
+    }
+    put_upload_evict_entry(&store, dir.path(), "a", 500, false);
+    put_upload_evict_entry(&store, dir.path(), "b", 450, false);
+    // 1,550 bytes, 600 of them held: 950 of the store's own.
+    let size = store.physical_size().unwrap();
+    assert_eq!(size, 1550);
+    assert!(
+        crate::wrapper::auto_gc_sweep_due(&config, size),
+        "no held figure on record yet"
+    );
+
+    let daemon = Daemon::new(config.clone());
+    daemon.sweep_under_size_pressure().unwrap();
+    assert!(store.contains("a") && store.contains("b"), "first sweep");
+    assert!(!crate::wrapper::auto_gc_sweep_due(&config, size));
+
+    crate::wrapper::age_auto_gc_record_for_test(dir.path(), 6 * 3600 + 1);
+    assert!(
+        crate::wrapper::auto_gc_sweep_due(&config, size),
+        "the held figure has expired"
+    );
+    daemon.sweep_under_size_pressure().unwrap();
+    assert!(
+        store.contains("a") && store.contains("b"),
+        "after six hours"
+    );
+    assert!(!crate::wrapper::auto_gc_sweep_due(&config, size));
+}
+
 /// Every upload used to start another full sweep of a store the last
 /// sweep had already failed to bring under budget.
 #[test]

@@ -245,13 +245,82 @@ fn probe(parsed: &CcArgs) -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn dependency_capture_probe_checks_object_generation_and_time_macros() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = temp.path().join("cl.exe");
+        kache_fs::testutil::write_executable(
+            &driver,
+            r#"#!/bin/sh
+case " $* " in
+    *" /EP "*)
+        if [ "$MODE" = preprocess_error ]; then exit 1; fi
+        if [ "$MODE" = time_macros ]; then
+            printf 'const char *stamp[] = {"Nov 19 2026", "20:30:00", "Nov 19"};\n'
+        else
+            printf 'const char *stamp[] = {"1", "1", "1"};\n'
+        fi
+        ;;
+    *)
+        if [ "$MODE" = compile_error ]; then exit 1; fi
+        if [ "$MODE" != no_object ]; then printf object > probe.obj; fi
+        printf '{"Version":"1.2","Data":{"Source":"%s/probe.c","Includes":[]}}' "$PWD" > inputs.json
+        ;;
+esac
+"#,
+        );
+        for (mode, supported) in [
+            ("complete", true),
+            ("compile_error", false),
+            ("no_object", false),
+            ("preprocess_error", false),
+            ("time_macros", false),
+        ] {
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [("MODE", mode)],
+                Some(temp.path().into()),
+                None,
+                temp.path().into(),
+            );
+            let parsed = CcArgs::parse_for(&[driver.to_str().unwrap().to_owned()], &env).unwrap();
+            assert_eq!(probe(&parsed).unwrap(), supported, "{mode}");
+        }
+    }
+
     #[test]
     fn native_msvc_accepts_one_object_and_declines_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            std::iter::empty::<(&str, &str)>(),
+            Some(dir.path().into()),
+            None,
+            dir.path().into(),
+        );
+        let parse = |args: &[String]| CcArgs::parse_for(args, &env).unwrap();
         let arguments = ["CL.EXE", "/c", "/Brepro", "/Z7", "/Foa.obj", "a.c"].map(str::to_owned);
-        let parsed = CcArgs::parse(&arguments).unwrap();
+        let parsed = parse(&arguments);
         assert_eq!(parsed.family, super::super::ToolFamily::Msvc);
         assert!(admits(&parsed));
+        for (output, accepted) in [("/Foa.o", true), ("/Foa.pdb", false)] {
+            let mut args = arguments.clone();
+            args[4] = output.to_owned();
+            assert_eq!(admits(&parse(&args)), accepted, "{output}");
+        }
 
+        for option in ["I", "D", "U"] {
+            for (value, accepted) in [
+                ("value", true),
+                ("", false),
+                ("@response", false),
+                ("/Zi", false),
+                ("-Zi", false),
+            ] {
+                let mut args = arguments.to_vec();
+                args.extend([format!("/{option}"), value.to_owned()]);
+                assert_eq!(admits(&parse(&args)), accepted, "{args:?}");
+            }
+        }
         for unsupported in [
             "/Zi",
             "/ZI",
@@ -266,7 +335,7 @@ mod tests {
         ] {
             let mut args = arguments.to_vec();
             args.push(unsupported.to_owned());
-            assert!(!admits(&CcArgs::parse(&args).unwrap()), "{unsupported}");
+            assert!(!admits(&parse(&args)), "{unsupported}");
         }
         for removed in ["/c", "/Brepro", "/Foa.obj", "a.c"] {
             let args = arguments
@@ -274,7 +343,7 @@ mod tests {
                 .filter(|arg| arg.as_str() != removed)
                 .cloned()
                 .collect::<Vec<_>>();
-            assert!(!admits(&CcArgs::parse(&args).unwrap()), "{removed}");
+            assert!(!admits(&parse(&args)), "{removed}");
         }
         for name in ["CL", "_CL_"] {
             let mut parsed = parsed.clone();
@@ -289,6 +358,8 @@ mod tests {
         let source = temp.path().join("source.cpp");
         let header = temp.path().join("header with spaces.h");
         std::fs::write(&source, "").unwrap();
+        let other_source = temp.path().join("other.cpp");
+        std::fs::write(&other_source, "").unwrap();
         let report = serde_json::json!({
             "Version": "1.2",
             "Data": {
@@ -305,6 +376,7 @@ mod tests {
         );
         for (key, value) in [
             ("Source", serde_json::json!("other.c")),
+            ("Source", serde_json::json!(other_source)),
             ("Includes", serde_json::json!(["relative.h"])),
             ("ProvidedModule", serde_json::json!("module")),
             ("PCH", serde_json::json!("header.pch")),

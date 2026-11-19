@@ -9820,13 +9820,7 @@ impl CcCompiler {
         };
         let private_path = private
             .as_ref()
-            .map(|dir| {
-                dir.path().join(if parsed.family == ToolFamily::Msvc {
-                    "inputs.json"
-                } else {
-                    "inputs.d"
-                })
-            })
+            .map(|dir| dir.path().join("inputs.d"))
             .filter(|path| path.to_str().is_some());
         let private_path = if parsed.family == ToolFamily::Msvc
             && !msvc::supports_capture(parsed, file_hasher).unwrap_or(false)

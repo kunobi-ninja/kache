@@ -275,7 +275,8 @@ mod tests {
             .expect("the lock is held");
         assert!(error.contains("stayed locked"), "{error}");
         drop(held);
-        lock(dir.path(), Instant::now()).unwrap();
+        // A concurrent fork can keep the file description alive until exec.
+        lock(dir.path(), later()).unwrap();
     }
 
     #[test]

@@ -7538,18 +7538,20 @@ fn clang_cl_debug_does_not_bypass_local_admission() {
 }
 
 #[test]
-fn cc_remote_publication_skips_clang_cl_debug_only() {
+fn cc_remote_publication_skips_clang_cl_debug_and_native_msvc() {
     let gnu = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
     let gnu_debug = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o", "-g2"]);
     let cl = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj"]);
     let cl_debug = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
     let cl_g = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-g"]);
+    let msvc = parse_cc(&["cl.exe", "/c", "foo.c", "/Fofoo.obj", "/Brepro"]);
 
     assert!(cc_publishes_to_remote(&gnu));
     assert!(cc_publishes_to_remote(&gnu_debug));
     assert!(cc_publishes_to_remote(&cl));
     assert!(!cc_publishes_to_remote(&cl_debug));
     assert!(!cc_publishes_to_remote(&cl_g));
+    assert!(!cc_publishes_to_remote(&msvc));
 }
 
 #[test]
@@ -12079,6 +12081,185 @@ fn a_deferred_cc_compile_is_stored_unless_a_peer_beat_it_or_an_input_moved() {
         "never over a compile's own outputs"
     );
     assert!(!cc_restore_committed(true, false));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_msvc_read_set_restores_an_object_and_detects_a_shadowing_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let compiler = root.join("cl.exe");
+    let object = root.join("unit.obj");
+    let calls = root.join("compiles");
+    let earlier = root.join("earlier");
+    let later = root.join("later");
+    for include in [&earlier, &later] {
+        std::fs::create_dir(include).unwrap();
+    }
+    std::fs::write(later.join("value.h"), "#define VALUE 1\n").unwrap();
+    std::fs::write(
+        root.join("unit.c"),
+        "#include <value.h>\nint value = VALUE;\n",
+    )
+    .unwrap();
+    for name in ["c1.dll", "c1xx.dll", "c2.dll"] {
+        std::fs::write(root.join(name), name).unwrap();
+    }
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+deps= output= source= includes=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        /EP)
+            if [ "$(cat "${0%/*}/c2.dll")" = unsupported ]; then
+                printf 'const char *stamp[] = {"Nov 19", "20:30", "2026"};\n'
+            else
+                printf 'const char *stamp[] = {"1", "1", "1"};\n'
+            fi
+            exit 0
+            ;;
+        /sourceDependencies) shift; deps=$1 ;;
+        /Fo*) output=${1#/Fo} ;;
+        *.c) source=$1 ;;
+    esac
+    shift
+done
+case "$source" in
+    probe.c) printf 'probe' > "$output" ;;
+    unit.c)
+        if [ -n "$deps" ] && [ -f reject-capture ]; then exit 9; fi
+        if [ -f reject-plain ]; then printf 'run\n' >> errors; exit 11; fi
+        header="$PWD/later/value.h"
+        if [ -f "$PWD/earlier/value.h" ]; then header="$PWD/earlier/value.h"; fi
+        includes="\"$header\""
+        printf 'run\n' >> compiles
+        cat "$header" > "$output"
+        ;;
+    *) exit 1 ;;
+esac
+if [ -n "$deps" ]; then
+    printf '{"Version":"1.2","Data":{"Source":"%s/%s","Includes":[%s]}}' "$PWD" "$source" "$includes" > "$deps"
+fi
+"#,
+    );
+
+    let mut config = test_config(root.join("cache"));
+    config.deferred_discovery = true;
+    config.min_store_compile_ms = 0;
+    config.remote = Some(crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
+        prefix: "artifacts".to_owned(),
+        backend: crate::config::RemoteBackendConfig::Filesystem(
+            crate::config::FilesystemRemoteConfig {
+                root: root.join("remote"),
+                atomic_write_dir: root.join("staging"),
+            },
+        ),
+    });
+    let env = crate::invocation::InvocationEnv::from_parts(
+        [
+            ("PATH", std::ffi::OsString::from("/usr/bin:/bin")),
+            ("INCLUDE", std::env::join_paths([&earlier, &later]).unwrap()),
+            ("KACHE_CACHE_DIR", config.cache_dir.as_os_str().to_owned()),
+        ],
+        Some(root.clone()),
+        None,
+        root.clone(),
+    );
+    let args = [
+        compiler.to_str().unwrap(),
+        "/c",
+        "/Brepro",
+        "/Z7",
+        "/Founit.obj",
+        "unit.c",
+    ]
+    .map(str::to_owned);
+    let compile = || assert_eq!(run_cc_for(&config, &args, &env).unwrap(), 0);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 1\n"
+    );
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 1\n"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n");
+
+    std::fs::write(earlier.join("value.h"), "#define VALUE 2\n").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 2\n"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\nrun\n");
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "run\nrun\n",
+        "the cached capture capability allows recording the new read set"
+    );
+
+    std::fs::write(root.join("c2.dll"), "updated compiler pass").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\nrun\nrun\n");
+
+    std::fs::write(root.join("reject-capture"), "").unwrap();
+    std::fs::write(earlier.join("value.h"), "#define VALUE 3\n").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&object).unwrap(),
+        "#define VALUE 3\n",
+        "an injection failure retries the original compile"
+    );
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "run\nrun\nrun\nrun\nrun\n",
+        "a compile without a captured read set must not be cached"
+    );
+
+    std::fs::remove_file(root.join("reject-capture")).unwrap();
+    std::fs::write(root.join("c2.dll"), "unsupported").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    compile();
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "run\n".repeat(7),
+        "an unsupported toolset must not cache objects"
+    );
+    std::fs::write(root.join("reject-plain"), "").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    assert_eq!(run_cc_for(&config, &args, &env).unwrap(), 11);
+    assert_eq!(
+        std::fs::read_to_string(root.join("errors")).unwrap(),
+        "run\n",
+        "an uninstrumented failure must not run the compiler twice"
+    );
+
+    let fallback = root.join("fallback");
+    kache_fs::testutil::write_executable(&fallback, "#!/bin/sh\nprintf attempted > fallback-ran\n");
+    config.fallback = Some(fallback.to_str().unwrap().to_owned());
+    let mut unsupported = args.to_vec();
+    unsupported.push("/Zi".to_owned());
+    assert_eq!(run_cc_for(&config, &unsupported, &env).unwrap(), 11);
+    assert!(!root.join("fallback-ran").exists());
 }
 
 #[test]

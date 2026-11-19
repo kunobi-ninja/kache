@@ -1276,6 +1276,7 @@ mod tests {
             "/toolchain/bin/cl.exe",
             r"C:\Program Files\Microsoft Visual Studio\VC\bin\cl.exe",
         ] {
+            assert_eq!(cc::CcCompiler::recognizes_name(program), cfg!(windows));
             assert_eq!(
                 is_passthrough_compiler_invocation_with(&s(&[program, "-c", "file.c"]), None),
                 !cfg!(windows),

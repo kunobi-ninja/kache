@@ -14925,6 +14925,59 @@ fn a_size_sweep_leaves_bytes_held_by_target_directories_out_of_its_budget() {
     assert!(!store.contains("held"));
 }
 
+/// An automatic sweep is asked for by the store's size less what target
+/// directories held at the last sweep, a figure up to a sweep old. Once its
+/// probe has measured them again, a store whose own part is not over the
+/// trigger evicts nothing; one whose own part is over it still goes down to
+/// the target. A requested sweep keeps the band.
+#[test]
+fn an_automatic_sweep_evicts_nothing_when_its_probe_finds_the_store_under_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    // Trigger at 1,000 bytes, target 900.
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 500);
+    put_idle_entry(&store, dir.path(), "b", 450);
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    assert_eq!(store.physical_size().unwrap(), 1150);
+
+    // 1,150 less 200 held: 950 of its own, under the trigger, over the target.
+    let under = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert_eq!(under.entries_evicted, 0, "{under:?}");
+    assert_eq!(under.bytes_held, 200, "{under:?}");
+    assert!(store.contains("a") && store.contains("b") && store.contains("held"));
+
+    // 100 more of its own: 1,050, over the trigger, so down to the target.
+    put_idle_entry(&store, dir.path(), "c", 100);
+    let over = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert!(over.entries_evicted >= 1, "{over:?}");
+    assert_eq!(over.bytes_held, 200, "{over:?}");
+    assert!(store.contains("held"));
+    let own = store.physical_size().unwrap() - over.bytes_held;
+    assert!(own <= 900, "stops at the target: {own}");
+}
+
+/// A requested sweep of a store whose own part is between the target and the
+/// trigger still evicts down to the target.
+#[test]
+fn a_requested_sweep_keeps_the_band_when_the_store_is_under_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 500);
+    put_idle_entry(&store, dir.path(), "b", 450);
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+
+    let stats = store.evict().unwrap();
+    assert!(stats.entries_evicted >= 1, "{stats:?}");
+    let own = store.physical_size().unwrap() - stats.bytes_held;
+    assert!(own <= 900, "stops at the target: {own}");
+}
+
 /// Counted toward `max_size`, held bytes stay (evicting them frees no
 /// disk) and the sweep evicts other entries, least valuable first, until the
 /// whole store is under its target.

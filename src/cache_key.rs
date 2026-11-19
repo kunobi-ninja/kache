@@ -8735,10 +8735,11 @@ impl<'db> FileHasher<'db> {
     /// observed is left out: its hash was right for this process, but a
     /// second write in the same timestamp tick would leave a row that no
     /// stamp check could catch. Flushing later does not change that, since
-    /// the bytes were read back then. The rows are an optimisation, so a busy
-    /// index (another process holds the write lock for longer than the short
-    /// wait here) drops them rather than stalling a hit; the next process
-    /// hashes those files again.
+    /// the bytes were read back then. In the daemon the rows go to one writer
+    /// thread that waits out a busy index ([`crate::memo_writer`]). Elsewhere,
+    /// or when that queue is full, a busy index (another process holds the
+    /// write lock for longer than the short wait here) drops them rather than
+    /// stalling a hit; the next process hashes those files again.
     pub fn flush_memo(&self) {
         let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
         pending.retain(|(observed, _)| observed.settled());
@@ -8750,20 +8751,19 @@ impl<'db> FileHasher<'db> {
             return;
         };
         let db = cache.db();
+        let rows: crate::memo_writer::MemoRows = pending
+            .into_iter()
+            .map(|(observed, hash)| (observed.fingerprint, hash))
+            .collect();
+        let rows = match crate::memo_writer::submit(Path::new(db.path().unwrap_or("")), rows) {
+            Ok(()) => return,
+            Err(rows) => rows,
+        };
         let _ = db.busy_timeout(std::time::Duration::from_millis(100));
-        let written = (|| -> rusqlite::Result<()> {
-            db.execute_batch("BEGIN IMMEDIATE")?;
-            for (observed, hash) in &pending {
-                if let Err(error) = cache.put(&observed.fingerprint, hash) {
-                    let _ = db.execute_batch("ROLLBACK");
-                    return Err(error);
-                }
-            }
-            db.execute_batch("COMMIT")
-        })();
+        let written = crate::memo_writer::write(db, &rows);
         let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
         if let Err(error) = written {
-            tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
+            tracing::debug!(rows = rows.len(), "file hash memo not written: {error}");
         }
     }
 

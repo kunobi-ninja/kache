@@ -286,7 +286,8 @@ mod apple_install_name;
 // also folds that driver's bytes (`link_driver` among the CRT objects), so a
 // wrapper script named by `-C linker` keys by its content, not only by the
 // banner it forwards. Links through `cc` keep their keys; those through
-// another driver change once.
+// another driver change once. A native macOS link folds such a driver's bytes
+// the same way, after its SDK identity (#1966), also with no bump.
 //
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or an `OUT_DIR` the compile reads from
@@ -4882,7 +4883,12 @@ fn compute_key_into(
             file_hasher.hash(&linker)
         },
         |sdkroot| match crate::native_link_key::sdk_identity_for_invocation(sdkroot, invocation)? {
-            Some(identity) => Ok(identity),
+            Some(identity) => native_macos_link_identity_for(
+                identity,
+                args,
+                |path| file_hasher.hash(path),
+                invocation,
+            ),
             None => anyhow::bail!("the macOS SDK could not be identified"),
         },
         env,
@@ -12690,6 +12696,31 @@ fn native_linux_link_objects_for(
         objects.insert("link_driver".to_owned(), hash(driver)?);
     }
     Ok(objects)
+}
+
+/// What a native macOS link folds as its SDK identity: `sdk_identity` and,
+/// for a driver other than the `cc` on PATH, the driver's content hash. As on
+/// Linux, `-C linker` names the driver, the key leaves its path out, and
+/// `linker:` folds only its `--version` banner, which a wrapper script around
+/// `cc` forwards unchanged. A build whose wrapper made clang run another
+/// linker (`--ld-path`) restored the program the default linker had made
+/// (#1966). A driver that does not resolve or hash passes the link through.
+/// The plain `cc` keeps its key (no key bump); another driver's key changes
+/// once.
+fn native_macos_link_identity_for(
+    sdk_identity: String,
+    args: &RustcArgs,
+    hash: impl FnOnce(&Path) -> Result<String>,
+    invocation: &InvocationEnv,
+) -> Result<String> {
+    let driver = resolve_link_driver_for(args, invocation)
+        .context("native macOS link has no cc/linker driver; cannot key the link")?;
+    let mut identity = sdk_identity;
+    if !is_path_cc(&driver, invocation) {
+        identity.push_str("\nlink_driver=");
+        identity.push_str(&hash(&driver).context("hashing the native macOS link driver")?);
+    }
+    Ok(identity)
 }
 
 /// Whether `driver` is the `cc` a bare name finds on the client's PATH,

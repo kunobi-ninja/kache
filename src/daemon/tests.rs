@@ -16969,11 +16969,6 @@ async fn write_breaker_deferrals_do_not_spend_the_upload_attempt_limit() {
     let mut daemon = resilience_test_daemon(dir.path(), backend.clone());
     daemon.config.remote_upload_max_attempts = 1;
     daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(1)));
-    daemon
-        .remote_breaker
-        .try_acquire(RemoteOperation::UploadPut)
-        .unwrap()
-        .failure(RemoteErrorClass::Transient, "test outage");
     let daemon = Arc::new(daemon);
     let key = test_cache_key("breaker-defers-upload");
     seed_store_entry(&daemon.config, &key, "serde", dir.path());
@@ -16989,6 +16984,14 @@ async fn write_breaker_deferrals_do_not_spend_the_upload_attempt_limit() {
     )
     .unwrap();
     daemon.pending_uploads.write().await.insert(key.clone());
+    // Open the breaker only now: its one-second cooldown starts here, so a
+    // setup slowed by a loaded machine (the store's first open) cannot use
+    // it up before the worker first asks for a permit.
+    daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::UploadPut)
+        .unwrap()
+        .failure(RemoteErrorClass::Transient, "test outage");
     let task_daemon = daemon.clone();
     let mut worker =
         tokio::spawn(

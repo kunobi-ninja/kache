@@ -1086,7 +1086,9 @@ fn stamp_one_root(
     max_entries: usize,
     collect_small_files: bool,
 ) -> StampOutcome {
+    let _trace = crate::phase_trace::phase("stamp_flight");
     STAMP_WALKS.run(&(root.clone(), max_entries, collect_small_files), || {
+        let _trace = crate::phase_trace::phase("stamp_walk");
         walk_one_root(root, max_entries, collect_small_files)
     })
 }
@@ -1545,7 +1547,10 @@ fn root_digest(
 ) -> Option<String> {
     let stamp = &stamped.stamp;
     let memo = tree_digest_memo(memo_dir, root);
-    if let Some(digest) = crate::tree_stamp::memoised_digest(&memo, stamp.memo_key())
+    let trace_lookup = crate::phase_trace::phase("tree_memo_lookup");
+    let memoised = crate::tree_stamp::memoised_digest(&memo, stamp.memo_key());
+    drop(trace_lookup);
+    if let Some(digest) = memoised
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         crate::phase_trace::decision("tree_memo", "hit");
@@ -1554,7 +1559,9 @@ fn root_digest(
     crate::phase_trace::decision("tree_memo", "miss");
     // A batch result is keyed by path; retain the exact queried fingerprint
     // as well, so the later content walk cannot use a row for another stamp.
+    let trace_batch = crate::phase_trace::phase("tree_memo_batch");
     let mut hashes = file_hasher.memoised_hashes(stamped.small_files.iter());
+    drop(trace_batch);
     let memoised: HashMap<FileFingerprint, String> = stamped
         .small_files
         .iter()
@@ -1568,6 +1575,7 @@ fn root_digest(
         fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
     }
     let excluded = root.excluded();
+    let _trace_fold = crate::phase_trace::phase("tree_fold");
     let read_every_file = crate_tree_fold(
         &root.path,
         &root.path,

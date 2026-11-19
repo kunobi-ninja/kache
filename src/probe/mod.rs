@@ -93,9 +93,10 @@ pub struct ProbeRequest<'a> {
     /// driver resolves exactly what the real compile would.
     pub args: &'a [String],
     /// The configuration-identifying subset of `args` — per-TU noise
-    /// (source files, `-o`, dep-file flags) removed. The probe cache
-    /// is keyed on this, so every TU of a build that shares a flag set
-    /// shares one resolved-invocation record.
+    /// (source paths, `-o`, dep-file flags) removed. For cc, each source
+    /// stays as a marker of its suffix, which picks the language. The
+    /// probe cache is keyed on this, so every TU of a build that shares a
+    /// flag set and a source suffix shares one resolved-invocation record.
     pub key_args: &'a [String],
     /// Per-TU path strings (this invocation's source, output, dep-file
     /// paths) to blank out of the resolved tokens. Because the record is

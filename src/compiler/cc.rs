@@ -1099,13 +1099,16 @@ impl CcArgs {
     }
 
     /// The subset of `rest` that identifies the *compile configuration*
-    /// — per-translation-unit noise removed: source files, the `-o`
+    /// — per-translation-unit noise removed: source paths, the `-o`
     /// output path, and (under the Gnu dialect only) dependency-file
     /// flags (`-MF`/`-MT`/`-MQ`) with their values. Under the Cl dialect
     /// those `-M*` spellings are CRT selection (codegen), so they are
-    /// kept. The resolved-invocation probe (`cc -###`) is memoized on
-    /// this, so every TU of a build that shares a flag set reuses one
-    /// probe record instead of re-resolving per file.
+    /// kept. Each source is reduced to its suffix, in place
+    /// (`source_suffix_marker`), since the suffix picks the language the
+    /// driver compiles. The resolved-invocation probe (`cc -###`) is
+    /// memoized on this, so every TU of a build that shares a flag set
+    /// and a source suffix reuses one probe record instead of
+    /// re-resolving per file.
     pub fn config_args(&self) -> Vec<String> {
         let mut out = Vec::new();
         let probe_args = self.probe_args();
@@ -1135,7 +1138,8 @@ impl CcArgs {
                 .iter()
                 .any(|s| s.to_str() == Some(arg.as_str()))
             {
-                // source file — per-TU
+                // source file: the path is per-TU, the suffix is not (#1981)
+                out.push(source_suffix_marker(arg));
             } else {
                 out.push(arg.clone());
             }
@@ -1175,6 +1179,23 @@ fn cc_terminal_diagnostic_flag(arg: &str) -> bool {
         arg,
         "-fcolor-diagnostics" | "-fno-color-diagnostics" | "-fansi-escape-codes"
     ) || arg.starts_with("-fdiagnostics-")
+}
+
+/// What [`CcArgs::config_args`] keeps of a source file: its suffix.
+///
+/// Without `-x`, the driver picks the input language from the suffix, so
+/// `cc -### -c t.S` and `cc -### -c t.c` resolve different `cc1` lines.
+/// Keying the probe record on the suffix gives each language its own
+/// record, and every TU of one language still shares one (#1981). The case
+/// is kept: `S` and `s` are different languages, and so are `C` and `c`.
+/// The NUL byte keeps the marker apart from every real argument, since argv
+/// cannot carry one.
+fn source_suffix_marker(source: &str) -> String {
+    let suffix = Path::new(source)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    format!("\0source-suffix={suffix}")
 }
 
 pub(crate) fn output_path_requires_compiler_semantics(path: &Path) -> bool {
@@ -4406,8 +4427,9 @@ fn cl_debug_present(parsed: &CcArgs) -> bool {
 /// token stream and MUST be kept out of the cache key.
 ///
 /// The resolved-invocation probe is memoized per *flag set* — `config_args`
-/// strips the source, `-o`/`-Fo` output, and dep-file values so ONE probe
-/// record serves every TU of a build. Absolute paths in the resolved tokens
+/// strips the source path (keeping only its suffix), `-o`/`-Fo` output, and
+/// dep-file values so ONE probe record serves every TU of a build that
+/// shares a source suffix. Absolute paths in the resolved tokens
 /// are already blanked to a sentinel ([`crate::probe`]), and the trailing
 /// source input token too — but a RELATIVE per-TU path that appears as a
 /// flag *value* (`-main-file-name u00.c`, `-o build/u00.o`) survives,
@@ -9143,7 +9165,8 @@ impl CcCompiler {
         // Compiler probe, memoized: the version line (`cc --version`,
         // compiler identity) and the resolved invocation (`cc -###`,
         // the driver's fully-expanded `-cc1` line). One probe per build
-        // per flag set; the rest of the build reads the record.
+        // per flag set and source suffix. The rest of the build reads the
+        // record.
         let config_args = key_parsed.config_args();
         let probe_args = key_parsed.probe_args();
         // Per-TU paths to blank from the shared probe record's resolved

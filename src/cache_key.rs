@@ -11862,6 +11862,16 @@ fn tool_version_cache_path_for(
     prefix: &str,
     env: &InvocationEnv,
 ) -> Option<PathBuf> {
+    env.derived_path(binary, prefix, || {
+        derive_tool_version_cache_path(binary, prefix, env)
+    })
+}
+
+fn derive_tool_version_cache_path(
+    binary: &Path,
+    prefix: &str,
+    env: &InvocationEnv,
+) -> Option<PathBuf> {
     let canon = std::fs::canonicalize(env.resolve_program(binary)?).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?

@@ -10253,6 +10253,10 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
             swept_staging.removed,
             ByteSize(swept_staging.bytes_reclaimed)
         );
+        println!(
+            "Repairing: removed {} items left in the eviction trash",
+            store.sweep_evicted_trash()
+        );
         let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(config, STAGING_SWEEP_GRACE);
         println!(
             "Repairing: reclaimed {} abandoned cc handoffs ({})",

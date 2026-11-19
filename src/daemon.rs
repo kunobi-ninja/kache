@@ -6755,6 +6755,10 @@ impl Daemon {
                         crate::report::format_bytes(handoffs.bytes_reclaimed)
                     );
                 }
+                let trash_removed = store.sweep_evicted_trash();
+                if trash_removed > 0 {
+                    tracing::info!("removed {trash_removed} items left in the eviction trash");
+                }
                 if staging_stats.removed > 0 {
                     tracing::info!(
                         "swept {} stale staging files ({})",

@@ -10927,6 +10927,50 @@ fn a_trash_item_is_removed_unless_the_delete_is_refused() {
     }
 }
 
+/// The GC sweep empties what a removal left in the trash even when nothing
+/// is evicted. A read-only store leaves it alone.
+#[test]
+fn the_sweep_empties_the_trash_without_an_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let trash_dir = config.store_dir().join(EVICTED_TRASH_DIR);
+    std::fs::create_dir_all(trash_dir.join("entry.1.0")).unwrap();
+    std::fs::write(trash_dir.join("entry.1.0").join("lib.rlib"), b"x").unwrap();
+    std::fs::write(trash_dir.join("blob.1.1"), b"x").unwrap();
+
+    let read_only = Store::open_read_only(&config).unwrap();
+    assert_eq!(read_only.sweep_evicted_trash(), 0);
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 2);
+
+    assert_eq!(store.sweep_evicted_trash(), 2);
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 0);
+    assert_eq!(store.sweep_evicted_trash(), 0);
+}
+
+/// A put that brings a blob back after a removal took its name, and before
+/// the trash is emptied, keeps its blob: emptying only touches the trash.
+#[test]
+fn a_blob_put_back_before_the_trash_empties_survives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "first", 64);
+    let hash = store.get("first").unwrap().unwrap().files[0].hash.clone();
+    let blob = store.blob_path(&hash);
+
+    let mut trash = EvictedTrash::new(&config.store_dir());
+    assert!(trash.take(&blob));
+    assert!(!blob.exists());
+    put_test_entry(&store, dir.path(), "second", 64);
+    assert!(blob.exists(), "the put brings the blob back");
+    trash.empty();
+
+    assert_eq!(crate::file_hash::hash_file(&blob).unwrap(), hash);
+    let trash_dir = config.store_dir().join(EVICTED_TRASH_DIR);
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 0);
+}
+
 fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(items) = std::fs::read_dir(dir) else {

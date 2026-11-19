@@ -555,18 +555,19 @@ pub(super) fn collect_files_recursively(
     Ok(())
 }
 
-/// Linux implementation. The kernel doesn't enforce signatures on
-/// ELF binaries, so [`Platform::ensure_binary_loadable`] is a no-op.
+/// Linux implementation, also used on other Unixes such as FreeBSD. Their
+/// kernels don't enforce signatures on ELF binaries, so
+/// [`Platform::ensure_binary_loadable`] is a no-op.
 /// Lives as a concrete struct (not a unit `()`) so it can grow
 /// methods independently of the macOS impl when Linux-specific
 /// concerns appear.
 ///
 /// Cross-platform unit tests construct `LinuxPlatform` from a macOS host
 /// (and vice versa) to exercise the dispatch shape without spawning real
-/// `codesign` / `signtool`. On a non-Linux production build no caller
-/// constructs it, but having the struct compile keeps the test surface
-/// symmetric.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// `codesign` / `signtool`. On a macOS or Windows production build no
+/// caller constructs it, but having the struct compile keeps the test
+/// surface symmetric.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 pub struct LinuxPlatform;
 
 impl Platform for LinuxPlatform {
@@ -816,14 +817,11 @@ pub(crate) mod tests {
         let platform = current();
         let expected = if cfg!(target_os = "macos") {
             "macos"
-        } else if cfg!(target_os = "linux") {
-            "linux"
         } else if cfg!(target_os = "windows") {
             "windows"
         } else {
-            // The cfg cascade in `current` covers exactly these three.
-            // If this branch fires, `current` needs a new arm.
-            panic!("unsupported host OS in test")
+            // Linux and every other Unix share the Linux platform.
+            "linux"
         };
         assert_eq!(platform.name(), expected);
     }

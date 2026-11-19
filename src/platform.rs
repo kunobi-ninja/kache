@@ -44,8 +44,12 @@ fn open_file_limits() -> Option<kache_protocol::OpenFileLimits> {
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "rlim_t is u64 on Linux and macOS, i64 on FreeBSD"
+)]
 fn finite_file_limit(limit: libc::rlim_t) -> Option<u64> {
-    (limit != libc::RLIM_INFINITY).then_some(limit)
+    (limit != libc::RLIM_INFINITY).then_some(limit as u64)
 }
 
 pub(crate) fn set_frontend_image(image: kache_shims::FrontendImage) -> anyhow::Result<()> {

@@ -162,6 +162,8 @@ Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rus
 
 Other Rust-supported targets may work through `cargo install`, but they are not release-tested targets.
 
+FreeBSD (x86_64) installs from source with `cargo install kache`. CI checks that it compiles, but there are no prebuilt binaries and the tests do not run on FreeBSD.
+
 ## Shell completions
 
 `kache init` installs completions for your login shell on Unix: Bash, Zsh, or Fish. Open a new terminal after setup. Run `kache init` again after an upgrade to refresh the scripts; `--check` previews changes and `--no-shell` skips them.

@@ -31,6 +31,8 @@ mod heartbeat;
 mod identity;
 mod incremental_policy;
 mod index_compact;
+#[cfg(target_os = "linux")]
+mod index_residency;
 #[cfg(unix)]
 mod init_completions;
 #[cfg(unix)]

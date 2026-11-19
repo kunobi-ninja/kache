@@ -4882,6 +4882,22 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 verified.push(blob);
             }
         }
+        // The metadata and its directory are flushed before the writer lock
+        // too: on macOS each flush is an F_FULLFSYNC, and every lookup and
+        // store waits on the lock. Under the lock the identity checks below
+        // prove the flushed handle is still the published file; `meta.json`
+        // is only ever replaced by a rename, never rewritten in place.
+        let mut metadata_file = match open_published_file(&meta_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        let mut current_meta = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
+        if current_meta != meta_bytes {
+            return Ok(false);
+        }
+        sync_file(&metadata_file).context("flushing entry metadata")?;
+        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         before_promotion();
         let tx = self.begin_immediate_writer()?;
         let current_hash: Option<String> = tx
@@ -4893,15 +4909,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )
             .optional()?;
         if current_hash.as_deref() != Some(content_hash.as_str()) {
-            return Ok(false);
-        }
-        let mut metadata_file = match open_published_file(&meta_path) {
-            Ok(file) => file,
-            Err(_) => return Ok(false),
-        };
-        let mut current_meta = Vec::new();
-        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
-        if current_meta != meta_bytes {
             return Ok(false);
         }
         if sequential {
@@ -4922,8 +4929,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        sync_file(&metadata_file).context("flushing entry metadata")?;
-        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         if kache_fs::file_identity(&meta_path).ok()
             != Some(kache_fs::handle_identity(&metadata_file)?)
         {

@@ -10791,6 +10791,48 @@ fn evict_frees_files_through_the_trash_and_empties_its_leftovers() {
     assert!(left.is_empty(), "the trash kept {left:?}");
 }
 
+/// With no trash to move them into, an evicted entry's directory and its
+/// last blob are removed under the lock, as before the trash.
+#[test]
+fn evict_removes_files_in_place_when_the_trash_cannot_be_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100 * 1024;
+    let store = Store::open(&config).unwrap();
+    let src = dir.path().join("gone.rlib");
+    std::fs::write(&src, vec![b'g'; 300 * 1024]).unwrap();
+    store
+        .put(
+            "gone",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src);
+    store
+        .db
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    // A file where the trash folder goes: the folder cannot be made.
+    std::fs::write(config.store_dir().join(EVICTED_TRASH_DIR), b"").unwrap();
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.entries_evicted, 1);
+    assert!(!store.entry_dir("gone").exists());
+    let blobs: Vec<_> = walkdir_files(&config.store_dir().join("blobs"));
+    assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
+}
+
 /// `take` reports a name that is already gone as taken without making the
 /// trash, moves an existing name into the trash, and leaves to the caller a
 /// name it cannot read.

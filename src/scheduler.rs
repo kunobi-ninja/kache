@@ -220,6 +220,21 @@ enum Discovery {
     OtherTree,
 }
 
+/// Whether a holder's note (a digest, then the roots it walked, one per
+/// line) names another tree than `mine`: another digest, and no root in
+/// common. Two builds of one checkout into different target directories
+/// each see the other's target directory, so their digests differ; the
+/// waiter still shares the holder's key and restores its entry.
+pub(crate) fn is_another_tree(holder: &str, mine: &str) -> bool {
+    let mut holder = holder.lines();
+    let mut mine = mine.lines();
+    if holder.next() == mine.next() {
+        return false;
+    }
+    let roots: Vec<&str> = mine.collect();
+    !holder.any(|root| roots.contains(&root))
+}
+
 /// Take the flight at `path`, waiting up to `timeout` for its holder, or
 /// only up to `grace` when the holder noted a tree other than `tree`. Past
 /// the grace, each poll reads the note again (a few bytes, at most every
@@ -242,8 +257,9 @@ fn acquire_discovery(
     });
     let other_tree = |waited: Duration| {
         waited >= grace
-            && tree
-                .is_some_and(|tree| StoreLock::held_note(path).is_some_and(|holder| holder != tree))
+            && tree.is_some_and(|tree| {
+                StoreLock::held_note(path).is_some_and(|holder| is_another_tree(&holder, tree))
+            })
     };
     Ok(
         match acquire_within_unless(path, timeout, poll, other_tree)? {
@@ -3918,6 +3934,15 @@ mod tests {
         assert!(
             matches!(join(None), Discovery::Busy),
             "an unguarded unit waits"
+        );
+        owner.mark_note(Some("a\n/work"));
+        assert!(
+            matches!(join(Some("b\n/work")), Discovery::Busy),
+            "another digest of the holder's checkout waits"
+        );
+        assert!(
+            matches!(join(Some("b\n/other")), Discovery::OtherTree),
+            "another checkout with another digest stops"
         );
         drop(owner);
         assert!(

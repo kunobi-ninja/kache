@@ -912,6 +912,18 @@ impl TreeGuard {
         crate::phase_trace::decision("tree_recheck", if held { "held" } else { "moved" });
         held
     }
+
+    /// What a discovery flight's holder notes about its tree: the digest,
+    /// then each root the guard walked, one per line
+    /// ([`crate::scheduler::is_another_tree`]).
+    pub(crate) fn flight_note(&self) -> String {
+        let mut note = self.digest.clone();
+        for walk in &self.walks {
+            note.push('\n');
+            note.push_str(&walk.root.path.to_string_lossy());
+        }
+        note
+    }
 }
 
 #[cfg(test)]
@@ -3770,9 +3782,12 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let tree = out.tree_guard.as_ref().map(|guard| guard.digest.as_str());
-            let flight =
-                crate::scheduler::join_discovery_flight_of_tree(cache_dir, &identity, tree);
+            let tree = out.tree_guard.as_ref().map(TreeGuard::flight_note);
+            let flight = crate::scheduler::join_discovery_flight_of_tree(
+                cache_dir,
+                &identity,
+                tree.as_deref(),
+            );
             let mut lock = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The

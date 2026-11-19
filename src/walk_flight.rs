@@ -125,6 +125,111 @@ impl<K: Eq + Hash + Clone, V: Clone> NextFlight<K, V> {
     }
 }
 
+/// One run of a computation for every caller that asks while it runs: a
+/// caller arriving mid-run takes that run's result. Only for a key that
+/// fixes the result, such as a tree's settled stamp; [`NextFlight`] is for
+/// a walk whose answer depends on when it started. Nothing is kept once the
+/// last caller leaves, and a run that unwinds hands the work to a waiter.
+pub(crate) struct JoinFlight<K, V> {
+    slots: Mutex<HashMap<K, Arc<JoinSlot<V>>>>,
+}
+
+struct JoinSlot<V> {
+    state: Mutex<JoinState<V>>,
+    finished: Condvar,
+}
+
+enum JoinState<V> {
+    Running,
+    Done(V),
+    Abandoned,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> JoinFlight<K, V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn run(&self, key: &K, compute: impl FnOnce() -> V) -> V {
+        loop {
+            let (slot, leader) = {
+                let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+                match slots.get(key) {
+                    Some(slot) => (Arc::clone(slot), false),
+                    None => {
+                        let slot = Arc::new(JoinSlot {
+                            state: Mutex::new(JoinState::Running),
+                            finished: Condvar::new(),
+                        });
+                        slots.insert(key.clone(), Arc::clone(&slot));
+                        (slot, true)
+                    }
+                }
+            };
+            if leader {
+                let mut running = Leading {
+                    flights: self,
+                    key,
+                    slot: &slot,
+                    done: false,
+                };
+                let result = compute();
+                *slot.state.lock().unwrap_or_else(PoisonError::into_inner) =
+                    JoinState::Done(result.clone());
+                running.done = true;
+                return result;
+            }
+            let mut state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
+            while matches!(*state, JoinState::Running) {
+                state = slot
+                    .finished
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            if let JoinState::Done(result) = &*state {
+                return result.clone();
+            }
+            // The leader unwound: run again, as a leader if nobody else is.
+        }
+    }
+}
+
+/// Publishes the leader's outcome, abandoned if it unwinds, and removes the
+/// slot so the next caller after the run computes afresh.
+struct Leading<'a, K: Eq + Hash + Clone, V> {
+    flights: &'a JoinFlight<K, V>,
+    key: &'a K,
+    slot: &'a Arc<JoinSlot<V>>,
+    done: bool,
+}
+
+impl<K: Eq + Hash + Clone, V> Drop for Leading<'_, K, V> {
+    fn drop(&mut self) {
+        let mut slots = self
+            .flights
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slots
+            .get(self.key)
+            .is_some_and(|slot| Arc::ptr_eq(slot, self.slot))
+        {
+            slots.remove(self.key);
+        }
+        drop(slots);
+        if !self.done {
+            *self
+                .slot
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = JoinState::Abandoned;
+        }
+        self.slot.finished.notify_all();
+    }
+}
+
 #[cfg(test)]
 fn park<V>(state: &mut SlotState<V>) {
     state.parked += 1;
@@ -293,5 +398,58 @@ mod tests {
             "the waiter walks once the panicking walk unwinds"
         );
         assert!(flights.slots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn callers_during_a_join_flight_share_its_one_run() {
+        let flights = Arc::new(JoinFlight::<u8, u32>::new());
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let leader = {
+            let (flights, runs) = (Arc::clone(&flights), Arc::clone(&runs));
+            std::thread::spawn(move || {
+                flights.run(&1, || {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    7
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        let followers: Vec<_> = (0..4)
+            .map(|_| {
+                let (flights, runs) = (Arc::clone(&flights), Arc::clone(&runs));
+                std::thread::spawn(move || {
+                    flights.run(&1, || {
+                        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        9
+                    })
+                })
+            })
+            .collect();
+        while flights.slots.lock().unwrap().get(&1).map(Arc::strong_count) != Some(6) {
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(leader.join().unwrap(), 7);
+        for follower in followers {
+            assert_eq!(follower.join().unwrap(), 7);
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(flights.slots.lock().unwrap().is_empty());
+        assert_eq!(flights.run(&1, || 3), 3, "a later caller computes afresh");
+    }
+
+    #[test]
+    fn a_join_flight_that_unwinds_hands_the_run_to_a_caller() {
+        let flights = JoinFlight::<u8, u32>::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flights.run(&2, || panic!("fold failed"))
+        }));
+        assert!(unwound.is_err());
+        assert!(flights.slots.lock().unwrap().is_empty());
+        assert_eq!(flights.run(&2, || 5), 5);
     }
 }

@@ -194,6 +194,60 @@ jobs:
           path: tmp/llvm-cov/html
           retention-days: 14
 
+  freebsd:
+    # FreeBSD builds from source but ships no release artifact. Clippy checks
+    # the workspace against a pinned FreeBSD base system so it keeps
+    # compiling. Nothing runs on FreeBSD itself. The C dependencies (aws-lc,
+    # ring, SQLite, zstd) compile even under clippy, hence clang and the
+    # sysroot. The archive URL serves releases after their end of life.
+    name: Check (FreeBSD)
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
+    timeout-minutes: 40
+    env:
+      FREEBSD_RELEASE: 14.5-RELEASE
+      FREEBSD_BASE_SHA256: d16b68fe0e9e136ce67ab1084042c848bbffecd1eb295f206bd1c6785deb45a4
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: zondax/actions/setup-mise@14e656f2dcc6012c36298e3a6e95dc4ae0f022f0 # v1.5.3
+        with:
+          install: true
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - name: Prepare the FreeBSD sysroot
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/freebsd-base.txz"
+          curl -fsSL --retry 3 -o "$base" \
+            "https://download.freebsd.org/releases/amd64/$FREEBSD_RELEASE/base.txz" ||
+            curl -fsSL --retry 3 -o "$base" \
+              "https://archive.freebsd.org/old-releases/amd64/$FREEBSD_RELEASE/base.txz"
+          echo "$FREEBSD_BASE_SHA256  $base" | sha256sum -c -
+          sysroot="$RUNNER_TEMP/freebsd-sysroot"
+          mkdir -p "$sysroot"
+          tar -xf "$base" -C "$sysroot" ./lib ./usr/include ./usr/lib
+          rm "$base"
+          echo "FREEBSD_SYSROOT=$sysroot" >> "$GITHUB_ENV"
+        timeout-minutes: 10
+      - name: Clippy for x86_64-unknown-freebsd
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTC_WORKSPACE_WRAPPER: ""
+          CC_x86_64_unknown_freebsd: clang
+          CXX_x86_64_unknown_freebsd: clang++
+          AR_x86_64_unknown_freebsd: ar
+        run: |
+          set -euo pipefail
+          flags="--target=x86_64-unknown-freebsd${FREEBSD_RELEASE%%-*} --sysroot=$FREEBSD_SYSROOT"
+          export CFLAGS_x86_64_unknown_freebsd="$flags"
+          export CXXFLAGS_x86_64_unknown_freebsd="$flags"
+          rustup target add x86_64-unknown-freebsd
+          cargo clippy --locked --workspace --all-targets \
+            --target x86_64-unknown-freebsd -- -D warnings
+        timeout-minutes: 30
+
   # Plan a bounded changed-line mutation matrix. Large Rust PRs can expose
   # hundreds of mutants; one in-place cargo-mutants process is deliberately
   # serial and cannot finish that scope inside a useful CI timeout.

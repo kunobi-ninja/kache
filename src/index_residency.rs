@@ -22,6 +22,21 @@
 //! the machine's available memory is many times the index's size: on a
 //! machine with little room the builds need the memory more than the index
 //! needs the speed, and the kernel's choice stands.
+//!
+//! The active list does not keep a page for good, though. The kernel moves
+//! file pages off its tail whatever their use (only mapped executables are
+//! spared), and a page that is not read twice during its minute or two on
+//! the inactive list then goes. Pages read back in one pass reach that tail
+//! together, one turnover of the active list later (15-25 minutes on a busy
+//! evening of the same machine), so the keeper found 3-6 GB of the index
+//! gone at once several times an hour and read 18-24 GB an hour back from
+//! the disk. So each pass also reads one byte of every page that is still
+//! resident, twice, from memory: a page the builds pushed to the inactive
+//! list moves back to the active list before it is evicted, and the disk is
+//! read only for what slipped out anyway. (Faulting the pages into a fresh mapping with
+//! `MADV_POPULATE_READ` costs a third as much but did not keep them: on the
+//! same machine a 1 GiB file marked that way lost 97 % in its wave, one read
+//! a page 5 %.)
 
 use std::fs::File;
 use std::io;
@@ -53,6 +68,8 @@ pub(crate) struct Pass {
     pub(crate) missing_bytes: u64,
     /// Bytes read back (at most [`PASS_BUDGET_BYTES`]).
     pub(crate) read_bytes: u64,
+    /// Bytes of the resident pages touched (one byte read of each).
+    pub(crate) touched_bytes: u64,
 }
 
 /// Why a pass did nothing.
@@ -117,9 +134,11 @@ pub(crate) fn keep_resident(files: &[PathBuf], available: Option<u64>) -> Result
     let mut budget = PASS_BUDGET_BYTES;
     for (file, len) in &sizes {
         pass.file_bytes += len;
-        let Ok(runs) = missing_runs(file, *len) else {
+        let Ok(found) = residency(file, *len) else {
             continue;
         };
+        pass.touched_bytes += found.touched;
+        let runs = runs_of(&found.pages, found.page);
         for (offset, run) in merge(&runs, MERGE_GAP_BYTES) {
             pass.missing_bytes += run;
             if budget == 0 {
@@ -184,6 +203,7 @@ pub(crate) fn spawn(db_path: &Path) {
                         index_mib = pass.file_bytes >> 20,
                         missing_mib = pass.missing_bytes >> 20,
                         read_mib = pass.read_bytes >> 20,
+                        touched_mib = pass.touched_bytes >> 20,
                         "index pages read back into memory"
                     );
                 }
@@ -195,10 +215,80 @@ pub(crate) fn spawn(db_path: &Path) {
 }
 
 /// Runs of `file`'s pages not in the page cache, as (offset, length) in
-/// bytes. Reads none of them.
+/// bytes. Reads none of them from the disk (and marks the resident ones
+/// used, as every look does).
+#[cfg(test)]
 fn missing_runs(file: &File, len: u64) -> io::Result<Vec<(u64, u64)>> {
+    let found = residency(file, len)?;
+    Ok(runs_of(&found.pages, found.page))
+}
+
+/// Read one byte of each page of `file` that `resident` (one byte a page of
+/// `page` bytes, `mincore`'s answer) says is in the page cache, in two
+/// sweeps, and return how many bytes of pages that was. A read marks its
+/// page used, and a page on the inactive list marked twice moves back to
+/// the active list at once; the kernel marks a page only once for reads of
+/// the same page in a row, hence two sweeps rather than two reads. (One
+/// sweep a pass lost 40 % of a file in a wave where the inactive list held a
+/// page for about two passes: marked once there, it was evicted before the
+/// next.) `RWF_NOWAIT`: a page evicted since `mincore` looked is left to the
+/// read-back, never read from the disk here. A read, not a load through a
+/// mapping: a load past the end of a file that shrank meanwhile (a
+/// `VACUUM`) would raise `SIGBUS`; a read there reads nothing. Where the
+/// file system cannot read without waiting (tmpfs answers `EOPNOTSUPP`), it
+/// stops at the first refusal: nothing is marked there, and a failing call a
+/// page would only cost.
+fn touch_resident(file: &File, resident: &[u8], page: u64) -> u64 {
+    let mut byte = 0u8;
+    let mut touched = 0;
+    for sweep in 0..2 {
+        for (index, flags) in resident.iter().enumerate() {
+            if flags & 1 == 0 {
+                continue;
+            }
+            let Ok(offset) = libc::off_t::try_from(index as u64 * page) else {
+                break;
+            };
+            let iov = libc::iovec {
+                iov_base: (&raw mut byte).cast(),
+                iov_len: 1,
+            };
+            // SAFETY: `iov` names the one writable byte `byte` for the
+            // call's length, and the descriptor is the caller's open file.
+            let read =
+                unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, offset, libc::RWF_NOWAIT) };
+            if read == 1 {
+                if sweep == 0 {
+                    touched += page;
+                }
+            } else if read < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                return touched;
+            }
+        }
+    }
+    touched
+}
+
+/// What [`residency`] found.
+struct Residency {
+    /// One byte per page of the file; the lowest bit says it is cached.
+    pages: Vec<u8>,
+    /// The page size.
+    page: u64,
+    /// Bytes of the resident pages marked used.
+    touched: u64,
+}
+
+/// Which pages of `file` (its first `len` bytes) are in the page cache,
+/// reading none from the disk, and each resident one read once from memory
+/// ([`touch_resident`]).
+fn residency(file: &File, len: u64) -> io::Result<Residency> {
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok(Residency {
+            pages: Vec::new(),
+            page: 4096,
+            touched: 0,
+        });
     }
     // SAFETY: sysconf has no preconditions.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
@@ -207,8 +297,9 @@ fn missing_runs(file: &File, len: u64) -> io::Result<Vec<(u64, u64)>> {
         .unwrap_or(4096);
     let map_len = usize::try_from(len).map_err(|_| io::Error::other("index too large to map"))?;
     // SAFETY: a fresh read-only shared mapping of an open file the caller
-    // owns for the call; nothing reads through it, so a concurrent writer
-    // or truncation cannot fault here, and it is unmapped below.
+    // owns for the call; nothing loads through it (mincore only asks the
+    // kernel about it), so a concurrent writer or truncation cannot fault
+    // here, and it is unmapped below.
     let addr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -227,16 +318,24 @@ fn missing_runs(file: &File, len: u64) -> io::Result<Vec<(u64, u64)>> {
     // SAFETY: `addr` is the page-aligned start of the `map_len`-byte mapping
     // made above, and `vec` holds one byte per page of it, as mincore needs.
     let rc = unsafe { libc::mincore(addr, map_len, vec.as_mut_ptr().cast()) };
-    let result = if rc == 0 {
-        Ok(runs_of(&vec, page))
-    } else {
-        Err(io::Error::last_os_error())
-    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: the mapping made above, unmapped once; nothing refers to it.
+        unsafe {
+            libc::munmap(addr, map_len);
+        }
+        return Err(error);
+    }
     // SAFETY: the mapping made above, unmapped once; nothing refers to it.
     unsafe {
         libc::munmap(addr, map_len);
     }
-    result
+    let touched = touch_resident(file, &vec, page);
+    Ok(Residency {
+        pages: vec,
+        page,
+        touched,
+    })
 }
 
 /// The (offset, length) runs of pages whose resident bit is clear.
@@ -369,6 +468,33 @@ mod tests {
         assert_eq!(pass.file_bytes, (1 << 16) + (1 << 14));
         assert!(pass.read_bytes <= pass.missing_bytes);
         assert!(pass.missing_bytes <= pass.file_bytes);
+        let resident = pass.file_bytes - pass.missing_bytes;
+        if reads_without_waiting(&path) {
+            assert_eq!(
+                pass.touched_bytes, resident,
+                "every resident page is touched"
+            );
+        } else {
+            assert_eq!(
+                pass.touched_bytes, 0,
+                "a file system that refuses touches nothing"
+            );
+        }
+    }
+
+    /// Whether `path`'s file system reads a cached page with `RWF_NOWAIT`
+    /// (tmpfs, where a test's temporary directory may be, does not).
+    fn reads_without_waiting(path: &Path) -> bool {
+        let file = File::open(path).expect("the file opens");
+        let mut byte = 0u8;
+        let iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        // SAFETY: `iov` names the one writable byte `byte` for the call's
+        // length, and the descriptor is `file`'s, open for the call.
+        let read = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, 0, libc::RWF_NOWAIT) };
+        read == 1 || (read < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN))
     }
 
     #[test]

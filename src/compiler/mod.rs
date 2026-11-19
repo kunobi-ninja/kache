@@ -836,8 +836,7 @@ pub(crate) use kache_shims::resolve_program_on_path_with;
 
 /// Detect a real compiler invocation that must run uncached.
 ///
-/// MSVC `cl.exe` has no cache adapter and runs through this path when cc-rs
-/// selects it through `RUSTC_WRAPPER`.
+/// A `cl` invocation outside Windows keeps the generic passthrough.
 /// Cargo preserves `RUSTC` when it invokes `RUSTC_WRAPPER`, which identifies
 /// custom drivers such as Kani's `kani-compiler` without maintaining a list of
 /// tool names. (`nvcc` used to live here; since kunobi-ninja/kache#1024 it has
@@ -863,9 +862,10 @@ pub(crate) fn is_passthrough_compiler_invocation_with(
     if is_kache_subcommand_or_flag(program) {
         return false;
     }
-    command_basename(program)
-        .map(strip_windows_exe_suffix)
-        .is_some_and(|name| name.eq_ignore_ascii_case("cl"))
+    (!cfg!(windows)
+        && command_basename(program)
+            .map(strip_windows_exe_suffix)
+            .is_some_and(|name| name.eq_ignore_ascii_case("cl")))
         || configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
 }
 
@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn msvc_runs_uncached_without_a_configured_rustc() {
+    fn msvc_is_a_cc_adapter_on_windows() {
         for program in [
             "cl",
             "cl.exe",
@@ -1276,8 +1276,10 @@ mod tests {
             "/toolchain/bin/cl.exe",
             r"C:\Program Files\Microsoft Visual Studio\VC\bin\cl.exe",
         ] {
-            assert!(
+            assert_eq!(cc::CcCompiler::recognizes_name(program), cfg!(windows));
+            assert_eq!(
                 is_passthrough_compiler_invocation_with(&s(&[program, "-c", "file.c"]), None),
+                !cfg!(windows),
                 "{program}"
             );
         }
@@ -2669,7 +2671,7 @@ mod shim_tests {
             assert_eq!(&rewritten[1..], &argv[1..]);
             assert_eq!(
                 super::is_passthrough_compiler_invocation_for(&rewritten, &env),
-                driver == "cl"
+                driver == "cl" && !cfg!(windows)
             );
             std::fs::remove_file(&real).unwrap();
             let error = wrapper_args_for(&argv, &env, None).unwrap().unwrap_err();

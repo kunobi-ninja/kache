@@ -827,9 +827,58 @@ fn concurrent_cache_pipelines_keep_each_clients_environment_and_store() {
 
 #[test]
 #[cfg(target_env = "msvc")]
-fn parallel_msvc_debug_compiles_complete_through_warm_frontends() {
-    use kache_protocol::execution::{NativeString, windows::Discovery};
+fn native_msvc_caches_z7_objects_and_invalidates_changed_headers() {
     let fixture = Fixture::new();
+    let (compiler, environment) = native_msvc_compiler(&fixture);
+    let source = fixture.path("work/native.c");
+    let header = fixture.path("work/value.h");
+    let object = fixture.path("work/native.obj");
+    std::fs::write(
+        &source,
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    std::fs::write(&header, "#define VALUE 1\n").unwrap();
+    let compile = || {
+        fixture.success(
+            fixture
+                .command(fixture.path("install/kache.exe"))
+                .arg(&compiler)
+                .args([
+                    "/nologo",
+                    "/c",
+                    "/Brepro",
+                    "/Z7",
+                    "/Fonative.obj",
+                    "native.c",
+                ])
+                .envs(environment.iter().cloned())
+                .env_remove("CL")
+                .env_remove("_CL_")
+                .env("KACHE_DEFERRED_DISCOVERY", "1"),
+        )
+    };
+    let first = compile();
+    let original = std::fs::read(&object).unwrap();
+    std::fs::remove_file(&object).unwrap();
+    let hit = compile();
+    assert_eq!(original, std::fs::read(&object).unwrap());
+    assert_eq!(first.stdout, hit.stdout);
+    assert_eq!(first.stderr, hit.stderr);
+
+    std::fs::write(&header, "#define VALUE 2\n").unwrap();
+    std::fs::remove_file(&object).unwrap();
+    compile();
+    assert_ne!(original, std::fs::read(&object).unwrap());
+    let events = fixture.events("native.c", 3);
+    assert_eq!(events[0]["result"], "miss", "{events:?}");
+    assert_eq!(events[1]["result"], "local_hit", "{events:?}");
+    assert_eq!(events[2]["result"], "miss", "{events:?}");
+}
+
+#[cfg(target_env = "msvc")]
+fn native_msvc_compiler(fixture: &Fixture) -> (OsString, Vec<(OsString, OsString)>) {
+    use kache_protocol::execution::{NativeString, windows::Discovery};
     let tools = kache_ipc::windows_msvc::discover(&Discovery {
         architecture: std::env::consts::ARCH.to_owned(),
         env: fixture
@@ -842,12 +891,19 @@ fn parallel_msvc_debug_compiles_complete_through_warm_frontends() {
     let compiler = tools
         .compiler
         .expect("native MSVC acceptance requires cl.exe");
-    let compiler_path = compiler.path.decode().unwrap();
-    let compiler_env = compiler
+    let environment = compiler
         .env
         .iter()
         .map(|(key, value)| (key.decode().unwrap(), value.decode().unwrap()))
-        .collect::<Vec<_>>();
+        .collect();
+    (compiler.path.decode().unwrap(), environment)
+}
+
+#[test]
+#[cfg(target_env = "msvc")]
+fn parallel_msvc_debug_compiles_complete_through_warm_frontends() {
+    let fixture = Fixture::new();
+    let (compiler_path, compiler_env) = native_msvc_compiler(&fixture);
     std::fs::write(
         fixture.path("work/short.c"),
         "int short_compile(void) {return 1;}\n",

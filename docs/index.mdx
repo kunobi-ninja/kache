@@ -66,7 +66,7 @@ For the details, read [cache keys](/docs/how-it-works/cache-key),
 | --- | --- |
 | Rust libraries | Linux, macOS, and Windows |
 | Rust executables, test binaries and build scripts | Cached by default on Linux and macOS, off by default on Windows (`cache_executables`). Build-script runs are cached on Linux and macOS |
-| C and C++ object compilation | GCC, Clang, Apple Clang, and clang-cl. MSVC `cl.exe` is not cached |
+| C and C++ object compilation | GCC, Clang, Apple Clang, clang-cl, and supported MSVC `cl.exe` invocations |
 | CUDA object compilation | Single-source `nvcc -c` and `-dc` |
 | Rust documentation | Unix with compatible Cargo versions and [unstable rustdoc flags](/docs/getting-started/rustdoc). Rust 1.99 and Windows pass through |
 | Local cache | Content-addressed storage with automatic garbage collection |

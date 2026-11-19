@@ -1,4 +1,4 @@
-//! MSVC selected by cc-rs must run even though Kache has no MSVC cache adapter.
+//! Unsupported MSVC invocations still run with the caller's exact arguments.
 
 use std::fs;
 use std::process::Command;
@@ -95,7 +95,7 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
     assert_eq!(
         cache_entry_count(&cache).unwrap(),
         0,
-        "MSVC must not publish a cache entry"
+        "an MSVC invocation using a response file must stay uncached"
     );
 }
 

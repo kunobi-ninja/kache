@@ -72,7 +72,11 @@ pub enum ToolFamily {
     Clang,
     /// clang in MSVC driver mode (`clang-cl` or `--driver-mode=cl`).
     ClangCl,
+    /// Microsoft's native compiler.
+    Msvc,
 }
+
+mod msvc;
 
 /// Store name for a `-E` expansion that went to stdout (no `-o`).
 pub(crate) const CC_STDOUT_STORE_NAME: &str = "stdout.i";
@@ -98,7 +102,7 @@ impl ToolFamily {
     pub fn dialect(self) -> Dialect {
         match self {
             ToolFamily::Gnu | ToolFamily::Clang => Dialect::Gnu,
-            ToolFamily::ClangCl => Dialect::Cl,
+            ToolFamily::ClangCl | ToolFamily::Msvc => Dialect::Cl,
         }
     }
 
@@ -109,9 +113,12 @@ impl ToolFamily {
     /// `clang`/`clang++`/`clang-<n>` basename is `Clang`.
     /// `zigcc` wrappers (cargo-zigbuild) are also `Clang` — zig's cc is
     /// clang-based.
-    /// Everything else (gcc, cc, g++, c++) is `Gnu`. Bare `cl` is NOT
-    /// special-cased — real MSVC `cl.exe` stays out of scope.
+    /// Microsoft's `cl.exe` has its own family. Everything else (gcc, cc,
+    /// g++, c++) is `Gnu`.
     pub fn detect(program: &str, rest: &[String]) -> ToolFamily {
+        if msvc::is_driver(program) {
+            return ToolFamily::Msvc;
+        }
         let name = super::command_basename(program)
             .map(super::strip_windows_exe_suffix)
             .unwrap_or(program)
@@ -756,6 +763,15 @@ impl CcArgs {
     /// - **Assemble mode**: `-S` is still refused. `-E` to a named file
     ///   or to stdout is cached.
     pub fn refuse_reasons(&self, extra_allowlist_flags: &[String]) -> Vec<RefuseReason> {
+        if self.family == ToolFamily::Msvc {
+            return if msvc::admits(self) && !self.requires_compiler_output_semantics() {
+                Vec::new()
+            } else {
+                vec![RefuseReason::Unsupported(
+                    "unsupported native MSVC compile shape",
+                )]
+            };
+        }
         let mut reasons = Vec::new();
 
         // ── Non-`-c` mode refusals (short-circuit) ──
@@ -7993,6 +8009,13 @@ fn cc_user_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
     for include in &parsed.includes {
         push(include.clone());
     }
+    if parsed.family == ToolFamily::Msvc
+        && let Some(includes) = parsed.invocation_env.var_os("INCLUDE")
+    {
+        for include in std::env::split_paths(&includes) {
+            push(include);
+        }
+    }
     dirs
 }
 
@@ -8275,6 +8298,11 @@ const CC_DIRECT_CAPTURE_TARGET: &str = "__kache_direct_capture";
 /// expansion: the invocation has the right shape and the driver is known
 /// to accept the flags the capture adds.
 pub(crate) fn cc_direct_key_eligible(parsed: &CcArgs) -> bool {
+    if parsed.family == ToolFamily::Msvc {
+        // The native key path verifies the toolset once before injecting
+        // /sourceDependencies. The wrapper has already admitted the shape.
+        return true;
+    }
     cc_direct_key_shape_ok(parsed)
         && crate::config::probe_memo_dir_for(&parsed.invocation_env).is_ok_and(|memo| {
             cc_driver_captures_dependencies_for(&parsed.program, &memo, &parsed.invocation_env)
@@ -8760,7 +8788,7 @@ impl CcCompiler {
 
     /// Compiler names accepted without executing a family probe.
     pub(crate) fn recognizes_name(program: &str) -> bool {
-        kache_shims::is_cc_compiler_name(program)
+        (cfg!(windows) && msvc::is_driver(program)) || kache_shims::is_cc_compiler_name(program)
     }
 
     pub(crate) fn recognizes_for(args: &[String], env: &InvocationEnv) -> bool {
@@ -9174,33 +9202,38 @@ impl CcCompiler {
         // parallel builds don't race on whose paths it holds (#keyrace).
         let per_tu_paths = cc_resolved_per_tu_paths(key_parsed);
         let trace_probe = crate::phase_trace::phase("cc_probe");
-        let resolved = crate::probe::probe_for(
-            ctx.cache_dir,
-            &crate::probe::CcProber,
-            &crate::probe::ProbeRequest {
-                compiler: &parsed.program,
-                args: &probe_args,
-                key_args: &config_args,
-                per_tu_paths: &per_tu_paths,
-                // Sentinel Windows paths only for gnu/clang (objects are
-                // remapped via -ffile-prefix-map). clang-cl keeps raw
-                // native paths → key stays path-literal (#299/#312).
-                windows_aware: parsed.family.dialect() != Dialect::Cl,
-            },
-            &parsed.invocation_env,
-        )?;
+        let native_msvc = parsed.family == ToolFamily::Msvc;
+        let (version_line, resolved_tokens) = if native_msvc {
+            let identity = msvc::identity(parsed, ctx.file_hasher)?;
+            (identity, None)
+        } else {
+            let resolved = crate::probe::probe_for(
+                ctx.cache_dir,
+                &crate::probe::CcProber,
+                &crate::probe::ProbeRequest {
+                    compiler: &parsed.program,
+                    args: &probe_args,
+                    key_args: &config_args,
+                    per_tu_paths: &per_tu_paths,
+                    // clang-cl keeps native paths (#299/#312).
+                    windows_aware: parsed.family.dialect() != Dialect::Cl,
+                },
+                &parsed.invocation_env,
+            )?;
+            (resolved.version_line, resolved.resolved_tokens)
+        };
         drop(trace_probe);
-        if resolved.resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
+        if !native_msvc && resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
             anyhow::bail!("cc: resolved invocation unavailable for probe-captured flags");
         }
         hasher.update(b"compiler_version:");
-        hasher.update(resolved.version_line.as_bytes());
+        hasher.update(version_line.as_bytes());
         hasher.update(b"\n");
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] compiler_version={}",
             trace_name,
-            resolved.version_line
+            version_line
         );
 
         // Resolved compiler invocation: the `cc -###` `-cc1` line with
@@ -9221,7 +9254,7 @@ impl CcCompiler {
         // that happen to resolve to the same object (same tokens,
         // different order) get different keys — a cache miss, never a
         // miscache. That is the safe direction.
-        if let Some(tokens) = &resolved.resolved_tokens {
+        if let Some(tokens) = &resolved_tokens {
             hasher.update(b"resolved:");
             for tok in tokens {
                 // Resolved `cc -###` tokens carry absolute build paths —
@@ -9468,7 +9501,7 @@ impl CcCompiler {
         let memo_key = ctx
             .file_hasher
             .supports_cc_preprocess_memo()
-            .then(|| cc_preprocess_memo_key(key_parsed, &prefix_maps, &resolved.version_line))
+            .then(|| cc_preprocess_memo_key(key_parsed, &prefix_maps, &version_line))
             .flatten();
         drop(trace_memo_key);
         // A content-matching read set is not enough: a formerly absent
@@ -9558,6 +9591,11 @@ impl CcCompiler {
                 trace_name
             );
             (memo_hash.to_string(), Some(satisfied))
+        } else if native_msvc {
+            let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (discovery, memo_key) else {
+                anyhow::bail!("native MSVC requires compile-first dependency capture");
+            };
+            return Ok(CcKeyOutcome::Deferred(CcDeferredKey { memo_key }));
         } else if let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (&discovery, &memo_key)
             && cc_direct_key_eligible(parsed)
             && parsed
@@ -9784,7 +9822,15 @@ impl CcCompiler {
             .as_ref()
             .map(|dir| dir.path().join("inputs.d"))
             .filter(|path| path.to_str().is_some());
+        let private_path = if parsed.family == ToolFamily::Msvc
+            && !msvc::supports_capture(parsed, file_hasher).unwrap_or(false)
+        {
+            None
+        } else {
+            private_path
+        };
         let extra = match &private_path {
+            Some(path) if parsed.family == ToolFamily::Msvc => msvc::capture_args(path),
             Some(path) => vec![
                 "-MD".to_string(),
                 "-MF".to_string(),
@@ -9796,6 +9842,11 @@ impl CcCompiler {
         };
         let (result, path_bound) = self.execute_with_extra_args(parsed, extra, true)?;
         if result.exit_code != 0 {
+            if parsed.family == ToolFamily::Msvc && private_path.is_some() {
+                // Older toolsets or unusual build settings can reject the
+                // injected switch. Only report the original command's result.
+                return Ok((self.execute(parsed)?, None));
+            }
             return Ok((result, None));
         }
         let depfile = match (caller_depfile, private_path) {
@@ -9833,7 +9884,12 @@ impl CcCompiler {
             }
         };
         let cwd = parsed.invocation_env.cwd()?;
-        let mut paths = match parse_preprocess_dependencies(&raw, cwd) {
+        let dependencies = if parsed.family == ToolFamily::Msvc {
+            msvc::read_dependencies(&raw, &absolutize_path(cwd, &parsed.sources[0]))
+        } else {
+            parse_preprocess_dependencies(&raw, cwd)
+        };
+        let mut paths = match dependencies {
             Ok(paths) => paths,
             Err(error) => {
                 tracing::debug!("cc capture depfile unusable: {error:#}");
@@ -9848,6 +9904,9 @@ impl CcCompiler {
             .map(|source| absolutize_path(cwd, source))
             .collect();
         paths.extend(sources.iter().cloned());
+        if parsed.family == ToolFamily::Msvc && msvc::has_external_dependencies(&paths) {
+            return None;
+        }
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
         let mapped: Vec<(String, PathBuf)> = paths
             .into_iter()
@@ -9917,7 +9976,9 @@ impl CcCompiler {
         // normalization (we already rewrite paths via -ffile-prefix-map); pinning
         // the date is the same stance. Opt out with
         // KACHE_CC_SOURCE_DATE_EPOCH=passthrough (#423).
-        if let Some(epoch) = effective_source_date_epoch_for(&parsed.invocation_env) {
+        if parsed.family != ToolFamily::Msvc
+            && let Some(epoch) = effective_source_date_epoch_for(&parsed.invocation_env)
+        {
             command.env("SOURCE_DATE_EPOCH", epoch);
         }
         let output = command

@@ -14976,6 +14976,7 @@ fn an_automatic_sweep_evicts_nothing_when_its_own_part_is_at_the_trigger() {
     let stats = store.evict_for(SweepOrigin::Automatic).unwrap();
     assert_eq!(stats.entries_evicted, 0, "{stats:?}");
     assert_eq!(stats.bytes_held, 200, "{stats:?}");
+    assert_eq!(stats.entries_unreclaimable, 1, "the held entry: {stats:?}");
 }
 
 /// A requested sweep of a store whose own part is between the target and the

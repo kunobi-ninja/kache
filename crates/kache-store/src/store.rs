@@ -1548,6 +1548,10 @@ pub fn lock_poll_interval(attempt: u32) -> Duration {
 /// locked, and starts over when it does not.
 pub struct StoreLock {
     file: fs::File,
+    path: PathBuf,
+    /// The note this holder left beside the lock ([`StoreLock::mark_note`]),
+    /// removed before the lock is released.
+    note: Option<PathBuf>,
 }
 
 /// Lock guard for a cache key. Dropping it releases the OS lock.
@@ -1555,6 +1559,12 @@ pub type KeyLock = StoreLock;
 
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
 pub type GcLock = StoreLock;
+
+/// The note beside a lock file ([`StoreLock::mark_note`]): a file of its own
+/// because Windows refuses other processes a read of a locked file's bytes.
+fn note_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("note")
+}
 
 /// How often one acquisition reopens a lock file that was unlinked under it.
 /// Each retry needs the sweep to unlink the same path again, and a file this
@@ -1605,13 +1615,17 @@ impl StoreLock {
             .open(path)?)
     }
 
-    fn finish(mut file: fs::File) -> Result<Self> {
+    fn finish(mut file: fs::File, path: &Path) -> Result<Self> {
         // Diagnostic only: lock ownership is determined exclusively by the OS.
         use std::io::{Seek, SeekFrom, Write};
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         write!(file, "{}", std::process::id())?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            note: None,
+        })
     }
 
     /// Open, lock, then confirm the locked file is the one at `path`.
@@ -1634,7 +1648,7 @@ impl StoreLock {
                 kache_fs::handle_identity(&file),
                 kache_fs::file_identity(path),
             ) {
-                return Ok(Some(Self::finish(file)?));
+                return Ok(Some(Self::finish(file, path)?));
             }
             // Closing the handle releases the lock on the unlinked file.
         }
@@ -1670,6 +1684,43 @@ impl StoreLock {
         Self::acquire_current(path, Self::try_lock_file, || {})
     }
 
+    /// Leave `note` beside the lock for peers that find it held
+    /// ([`StoreLock::held_note`]), in place of any note a holder killed
+    /// earlier left there; `None` removes such a note. The note goes when the
+    /// lock is released. Best effort: a note that cannot be written reads as
+    /// none.
+    ///
+    /// Only the scheduler's discovery flights write notes; key and GC locks
+    /// never do. Lock-file sweeps remove lock files only, so a killed
+    /// holder's note stays until the next holder of the same lock replaces
+    /// or removes it, and the temp file of one killed between its write and
+    /// rename stays: small files, left only by holders that died holding.
+    pub fn mark_note(&mut self, note: Option<&str>) {
+        let path = note_path(&self.path);
+        let Some(note) = note else {
+            let _ = fs::remove_file(&path);
+            return;
+        };
+        let tmp = path.with_extension(format!("note.{}", std::process::id()));
+        if fs::write(&tmp, note).is_ok() && fs::rename(&tmp, &path).is_ok() {
+            self.note = Some(path);
+        } else {
+            // A killed holder's note must not stand in for this holder's.
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    /// The note the holder of the lock at `path` left
+    /// ([`StoreLock::mark_note`]), if any. Read while the lock is held, it is
+    /// the current holder's, none yet, or one a holder killed earlier left
+    /// until the current holder replaces it.
+    pub fn held_note(path: &Path) -> Option<String> {
+        fs::read_to_string(note_path(path))
+            .ok()
+            .filter(|note| !note.is_empty())
+    }
+
     fn wait_until_available(
         path: &Path,
         timeout: Duration,
@@ -1696,6 +1747,9 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
+        if let Some(note) = self.note.take() {
+            let _ = fs::remove_file(note);
+        }
         let _ = self.file.unlock();
     }
 }

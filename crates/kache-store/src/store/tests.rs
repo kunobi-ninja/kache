@@ -14959,6 +14959,25 @@ fn an_automatic_sweep_evicts_nothing_when_its_probe_finds_the_store_under_the_tr
     assert!(own <= 900, "stops at the target: {own}");
 }
 
+/// An own part exactly at the trigger is not over it: the automatic sweep
+/// evicts nothing.
+#[test]
+fn an_automatic_sweep_evicts_nothing_when_its_own_part_is_at_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "a", 500);
+    put_idle_entry(&store, dir.path(), "b", 500);
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    assert_eq!(store.physical_size().unwrap(), 1200);
+
+    let stats = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert_eq!(stats.entries_evicted, 0, "{stats:?}");
+    assert_eq!(stats.bytes_held, 200, "{stats:?}");
+}
+
 /// A requested sweep of a store whose own part is between the target and the
 /// trigger still evicts down to the target.
 #[test]

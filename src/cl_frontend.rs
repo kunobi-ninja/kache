@@ -1,2 +1,2 @@
-// MSVC uses the existing uncached compiler passthrough after alias resolution.
+// Resolve the native MSVC compiler before entering the shared frontend.
 include!("frontend.rs");

@@ -381,7 +381,7 @@ fn probe_args_strip_terminal_formatting_and_preserve_operands() {
         ] {
             let parsed = CcArgs::parse(&s(&[driver, "-c", flag, "a.c", "-O2"])).unwrap();
             assert_eq!(parsed.probe_args(), s(&["-c", "a.c", "-O2"]));
-            assert_eq!(parsed.config_args(), s(&["-c", "-O2"]));
+            assert_eq!(parsed.config_args(), s(&["-c", "\0source-suffix=c", "-O2"]));
             assert!(parsed.rest.iter().any(|arg| arg == flag));
         }
     }
@@ -414,6 +414,66 @@ fn probe_args_strip_terminal_formatting_and_preserve_operands() {
             "-Xclang",
         ])
     );
+}
+
+/// #1981: the `cc -###` record is keyed by `config_args`, and without `-x`
+/// the driver picks the language from the source suffix. A `.S` file and a
+/// `.c` file with the same flags must not share one record.
+#[test]
+fn config_args_separate_sources_of_different_languages() {
+    let config = |source: &str| {
+        CcArgs::parse(&s(&["cc", "-c", source, "-O2"]))
+            .unwrap()
+            .config_args()
+    };
+    assert_eq!(config("t.c"), s(&["-c", "\0source-suffix=c", "-O2"]));
+    assert_eq!(config("t.S"), s(&["-c", "\0source-suffix=S", "-O2"]));
+    assert_ne!(config("t.c"), config("t.S"));
+    // The marker stands where the source stood, so a `-x` keeps applying
+    // only to the inputs after it.
+    let config_of = |args: &[&str]| CcArgs::parse(&s(args)).unwrap().config_args();
+    assert_eq!(
+        config_of(&["cc", "-c", "-x", "c", "t.S"]),
+        s(&["-c", "-x", "c", "\0source-suffix=S"])
+    );
+    assert_eq!(
+        config_of(&["cc", "-c", "t.S", "-x", "c"]),
+        s(&["-c", "\0source-suffix=S", "-x", "c"])
+    );
+}
+
+/// The suffix is kept with its case: `.S` is assembly the preprocessor
+/// runs over, `.s` is plain assembly, `.C` is C++ and `.c` is C.
+#[test]
+fn config_args_keep_the_source_suffix_case() {
+    let config = |source: &str| {
+        CcArgs::parse(&s(&["cc", "-c", source, "-O2"]))
+            .unwrap()
+            .config_args()
+    };
+    assert_ne!(config("t.S"), config("t.s"));
+    assert_ne!(config("t.C"), config("t.c"));
+}
+
+/// One record still serves every TU of a language: only the suffix of a
+/// source path enters `config_args`.
+#[test]
+fn config_args_share_one_record_across_sources_of_one_language() {
+    let config = |source: &str| {
+        CcArgs::parse(&s(&["cc", "-c", source, "-O2"]))
+            .unwrap()
+            .config_args()
+    };
+    assert_eq!(config("a.c"), config("dir/b.c"));
+    assert_eq!(config("x.y/a.cpp"), config("b.cpp"));
+}
+
+/// The marker reads the extension the way `looks_like_source` does: a dot
+/// in a directory name is not a suffix.
+#[test]
+fn source_suffix_marker_keeps_only_the_file_extension() {
+    assert_eq!(source_suffix_marker("dir/t.S"), "\0source-suffix=S");
+    assert_eq!(source_suffix_marker("x.y/unit"), "\0source-suffix=");
 }
 
 #[cfg(unix)]
@@ -12020,4 +12080,133 @@ exit 1
     let compile = key(&["-c", "t.S", "-o", "t.o"]);
     assert_eq!(compile, key(&["-c", "t.S", "-o", "t.o"]));
     assert_ne!(key(&["-E", "t.S"]), compile);
+}
+
+/// #1981: the `cc -###` record used to be keyed without the source, so a
+/// store that had resolved `t.S` first served its `-lang-asm` line to a later
+/// `t.c` with the same flags. `t.c`'s key then depended on what the store had
+/// seen before. Each suffix now resolves its own record.
+#[cfg(unix)]
+#[test]
+fn a_c_compile_keys_alike_whatever_language_the_store_probed_first() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(root.join("t.S"), ".text\n").unwrap();
+    fs::write(root.join("t.c"), "int t;\n").unwrap();
+    let program = root.join("cc");
+    // The loop visits each argument once and every branch exits.
+    kache_fs::testutil::write_executable(
+        &program,
+        r#"#!/bin/sh
+case "$1" in
+    --version) printf 'fixture gcc 1.0\n'; exit 0 ;;
+    -###)
+        for arg in "$@"; do
+            case "$arg" in
+                *.S) printf '"cc1" "-E" "-lang-asm" "%s"\n' "$arg" >&2; exit 0 ;;
+                *.c) printf '"cc1" "-quiet" "%s"\n' "$arg" >&2; exit 0 ;;
+            esac
+        done
+        exit 1 ;;
+esac
+exit 1
+"#,
+    );
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let hasher = crate::cache_key::FileHasher::new_for(&env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let key = |cache: &Path, source: &str| {
+        let argv = s(&[&program.to_string_lossy(), "-c", source, "-o", "t.o"]);
+        let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+        let maps = cc_prefix_maps(&parsed, &[]);
+        let source = root.join(source);
+        let fingerprints = hasher
+            .cc_preprocess_fingerprints(
+                &[(cc_mapped_path(&source, &maps), source.clone())],
+                &cc_prefix_maps_key(&maps),
+                &|path| cc_mapped_content_hash(path, &maps),
+            )
+            .unwrap();
+        let outcome = CcCompiler::new()
+            .with_invocation_env(&env)
+            .cache_key_with(
+                &parsed,
+                &KeyCtx {
+                    invocation_env: &env,
+                    file_hasher: &hasher,
+                    path_normalizer: &normalizer,
+                    cache_dir: cache,
+                    key_salt: None,
+                    key_env_vars: &[],
+                    extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
+                },
+                CcKeyDiscovery::Captured(CcCapturedInputs {
+                    fingerprints,
+                    path_bound: false,
+                    inputs_changed: false,
+                }),
+            )
+            .unwrap();
+        match outcome {
+            CcKeyOutcome::Key(key) => key,
+            CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+        }
+    };
+    let c_only = tempfile::tempdir().unwrap();
+    let assembly_first = tempfile::tempdir().unwrap();
+    let fresh = key(c_only.path(), "t.c");
+    key(assembly_first.path(), "t.S");
+    assert_eq!(
+        key(assembly_first.path(), "t.c"),
+        fresh,
+        "t.c must not be keyed from the record t.S filled"
+    );
+
+    // If the fixture's `-###` lines stopped resolving, both records would
+    // hold no tokens and the keys above would agree on any code. Load each
+    // stored record with the request the cc key builds. A fresh accounting
+    // scope counts a probe that runs instead of loading.
+    let stored_tokens = |source: &str| {
+        let argv = s(&[&program.to_string_lossy(), "-c", source, "-o", "t.o"]);
+        let parsed = CcArgs::parse_for(&argv, &env).unwrap();
+        let _scope = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        let record = crate::probe::probe_for(
+            assembly_first.path(),
+            &crate::probe::CcProber,
+            &crate::probe::ProbeRequest {
+                compiler: &parsed.program,
+                args: &parsed.probe_args(),
+                key_args: &parsed.config_args(),
+                per_tu_paths: &cc_resolved_per_tu_paths(&parsed),
+                windows_aware: true,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::opcounts::probe_runs(),
+            0,
+            "the {source} request must load the stored record"
+        );
+        record.resolved_tokens
+    };
+    let assembly = stored_tokens("t.S").expect("the t.S record holds resolved tokens");
+    assert!(
+        assembly.iter().any(|token| token == "-lang-asm"),
+        "the t.S record holds the assembler line: {assembly:?}"
+    );
+    let c = stored_tokens("t.c").expect("the t.c record holds resolved tokens");
+    assert!(
+        !c.iter().any(|token| token == "-lang-asm"),
+        "the t.c record holds its own line: {c:?}"
+    );
+    // `-quiet` is dropped from gnu cc1 lines, so only the blanked source
+    // survives.
+    assert_eq!(c, s(&["<path>"]));
 }

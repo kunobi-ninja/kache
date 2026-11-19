@@ -308,6 +308,9 @@ fn acquire_within_unless(
         if waited >= timeout {
             return Ok(Acquired::TimedOut);
         }
+        // Progress: a wait that goes on has time left. A broken deadline
+        // check fails here instead of polling forever.
+        debug_assert!(waited < timeout, "a wait past its timeout kept polling");
         if stop(waited) {
             return Ok(Acquired::Stopped);
         }

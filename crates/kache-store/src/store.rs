@@ -5543,13 +5543,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut || false)
+        self.evict_with_stop(policy, stop_at, None, probe_held_bytes, origin, &mut || {
+            false
+        })
     }
 
     fn evict_with_stop(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        evict_over: Option<u64>,
         probe_held_bytes: bool,
         origin: SweepOrigin,
         stop: &mut dyn FnMut() -> bool,
@@ -5586,6 +5589,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let bytes_held: u64 = held.values().sum();
         let left_out = self.config.held_bytes_budget.left_out(bytes_held);
         let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(left_out), target));
+        // An automatic sweep is asked for by the store's size less what
+        // target directories held at the last sweep, or by the full size when
+        // no recent figure is on record. Target directories take and let go
+        // of many GB between sweeps. Measured again, a store whose own part
+        // is not over `evict_over` has nothing to give back: evicting down to
+        // the target there only throws away entries early.
+        if let (Some(over), Some((own, _))) = (evict_over, stop_at)
+            && probe_held_bytes
+            && own <= over
+        {
+            tracing::info!(
+                "gc: the store's own part is {own} bytes once {bytes_held} held by target \
+                 directories are left out, not over the trigger ({over}): nothing evicted"
+            );
+            return Ok(GcStats {
+                bytes_held,
+                entries_unreclaimable: held.len(),
+                ..GcStats::default()
+            });
+        }
         let shadow = stop_at.map(|(current, target)| {
             use crate::eviction::EvictionPolicy as _;
             let candidate = crate::eviction::ValueDensityPolicy;
@@ -5699,11 +5722,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // store without re-querying. A removal that frees less than its
         // ranked `reclaimable_bytes` promised (a twin evicted earlier in the
         // same sweep) only makes the sweep continue longer — never stop early.
-        self.evict_with(
+        // An automatic sweep evicts only while the store's own part, as the
+        // probe measures it, is over the trigger; a requested one keeps the
+        // band.
+        self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
+            (origin == SweepOrigin::Automatic).then_some(self.config.max_size),
             true,
             origin,
+            &mut || false,
         )
     }
 
@@ -5718,6 +5746,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
+            None,
             None,
             false,
             SweepOrigin::Automatic,

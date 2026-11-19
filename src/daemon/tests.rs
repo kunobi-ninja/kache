@@ -1279,6 +1279,139 @@ async fn test_shutdown_request_sets_flag_and_stores_notify_permit() {
         .expect("stop request must wake a later drain observer");
 }
 
+const CONFIG_WATCH_TICK: Duration = Duration::from_millis(10);
+const CONFIG_WATCH_BOUND: Duration = Duration::from_secs(5);
+
+/// A config check that counts its calls and always answers `changed`.
+fn counted_config_check(calls: &Arc<AtomicUsize>, changed: bool) -> impl FnMut() -> bool + use<> {
+    let calls = Arc::clone(calls);
+    move || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        changed
+    }
+}
+
+async fn wait_for_config_checks(calls: &AtomicUsize, at_least: usize) {
+    tokio::time::timeout(CONFIG_WATCH_BOUND, async {
+        while calls.load(Ordering::SeqCst) < at_least {
+            tokio::time::sleep(CONFIG_WATCH_TICK).await;
+        }
+    })
+    .await
+    .expect("the config watcher must keep checking the config file");
+}
+
+#[tokio::test]
+async fn config_change_restarts_only_after_running_requests_finish() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let compile = lifecycle.begin().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        CONFIG_WATCH_TICK,
+        counted_config_check(&calls, true),
+    ));
+
+    wait_for_config_checks(&calls, 1).await;
+    tokio::time::sleep(CONFIG_WATCH_TICK * 20).await;
+    assert!(
+        lifecycle.accepting_calls(),
+        "a config change must not drain the daemon while a request is running"
+    );
+    assert!(!watcher.is_finished());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a change already seen must not be checked again"
+    );
+
+    drop(compile);
+    tokio::time::timeout(CONFIG_WATCH_BOUND, watcher)
+        .await
+        .expect("the daemon must restart once no request is running")
+        .unwrap();
+    assert!(!lifecycle.accepting_calls());
+}
+
+#[tokio::test]
+async fn config_change_restarts_an_idle_daemon() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        CONFIG_WATCH_TICK,
+        || true,
+    ));
+    tokio::time::timeout(CONFIG_WATCH_BOUND, watcher)
+        .await
+        .expect("an idle daemon must restart on a config change")
+        .unwrap();
+    assert!(!lifecycle.accepting_calls());
+}
+
+#[tokio::test]
+async fn unchanged_config_keeps_the_daemon_running() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        CONFIG_WATCH_TICK,
+        counted_config_check(&calls, false),
+    ));
+
+    wait_for_config_checks(&calls, 20).await;
+    assert!(
+        lifecycle.accepting_calls(),
+        "an unchanged config must not drain the daemon"
+    );
+    assert!(!watcher.is_finished());
+    watcher.abort();
+}
+
+#[tokio::test]
+async fn config_watcher_stops_when_the_daemon_drains_for_another_reason() {
+    for change in [false, true] {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let _compile = lifecycle.begin().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let watcher = tokio::spawn(reload_when_config_changes(
+            Arc::clone(&lifecycle),
+            CONFIG_WATCH_TICK,
+            counted_config_check(&calls, change),
+        ));
+
+        wait_for_config_checks(&calls, 1).await;
+        assert!(
+            lifecycle.start_drain(),
+            "the watcher must not drain while a request is running (change: {change})"
+        );
+        tokio::time::timeout(CONFIG_WATCH_BOUND, watcher)
+            .await
+            .unwrap_or_else(|_| panic!("another drain must stop the watcher (change: {change})"))
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn config_watcher_skips_its_first_tick() {
+    let lifecycle = Arc::new(Lifecycle::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let watcher = tokio::spawn(reload_when_config_changes(
+        Arc::clone(&lifecycle),
+        Duration::from_secs(3600),
+        counted_config_check(&calls, true),
+    ));
+
+    // Lets the watcher run until it waits for its next tick, an hour away.
+    tokio::time::sleep(CONFIG_WATCH_TICK * 5).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the config is first checked one interval after the daemon starts"
+    );
+    assert!(lifecycle.accepting_calls());
+    watcher.abort();
+}
+
 struct GatedMissBackend {
     get_started: Arc<Notify>,
     release_get: Arc<tokio::sync::Semaphore>,

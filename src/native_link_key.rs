@@ -1876,17 +1876,30 @@ fn validate_tool_banner(tool: WindowsTool, output: &str) -> Result<String> {
                         .next()
                         .is_some_and(|word| word.bytes().any(|byte| byte.is_ascii_digit()))
             }
+            // A localized Visual Studio translates the words around the
+            // version (kunobi-ninja/kache#1979), and a console code page
+            // other than UTF-8 turns them into replacement characters and
+            // stray letters. `Microsoft`, `C/C++` and the version number
+            // are left in ASCII, so the line is found by those alone.
             WindowsTool::Cl => {
-                line.contains("microsoft")
-                    && line.contains("c/c++")
-                    && line.contains("compiler")
-                    && line.contains("version")
+                line.contains("microsoft") && line.contains("c/c++") && holds_dotted_version(&line)
             }
         }
     });
     version_line
         .map(str::to_owned)
         .with_context(|| format!("{} returned an unrecognized version banner", tool.name()))
+}
+
+/// Whether `line` holds a version number of at least three dotted parts,
+/// such as `19.43.34809` or `19.44.35207.1`. The class is ASCII `[0-9]`:
+/// the version prints in ASCII digits, and the lossy decode of a banner in
+/// another code page leaves ASCII bytes as they are.
+fn holds_dotted_version(line: &str) -> bool {
+    static DOTTED_VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"[0-9]+\.[0-9]+\.[0-9]+").expect("the version pattern compiles")
+    });
+    DOTTED_VERSION.is_match(line)
 }
 
 #[cfg(test)]
@@ -5178,6 +5191,11 @@ esac
         );
         let cl = compiler_banner("ARM64");
         assert_eq!(validate_tool_banner(WindowsTool::Cl, &cl).unwrap(), cl);
+        let four_part = "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207.1 for x64";
+        assert_eq!(
+            validate_tool_banner(WindowsTool::Cl, four_part).unwrap(),
+            four_part
+        );
 
         for (tool, near_miss) in [
             (
@@ -5195,11 +5213,103 @@ esac
                 WindowsTool::Cl,
                 "C/C++ Compiler Version 19.44.35207 for x64",
             ),
+            (WindowsTool::Cl, LINK_BANNER),
+            (
+                WindowsTool::Cl,
+                "Microsoft (R) C/C++ Optimizing Compiler Version 19.43 for x64",
+            ),
         ] {
             let error = validate_tool_banner(tool, near_miss).unwrap_err();
             assert!(
                 error.to_string().contains(tool.name()),
                 "{tool:?}: {error:#}"
+            );
+        }
+    }
+
+    /// A localized Visual Studio prints `cl.exe /Bv` in its own language
+    /// (kunobi-ninja/kache#1979). These are the Simplified Chinese banner
+    /// and copyright line in code page 936, the bytes a Chinese console
+    /// hands back. Production decodes them with `String::from_utf8_lossy`,
+    /// so the ASCII parts survive (`x64`, `Microsoft (R) C/C++` and
+    /// `19.43.34809`) and the rest turns into replacement characters and
+    /// stray letters. The same text from a UTF-8 console survives whole.
+    /// `/Bv` also lists the compiler passes on stdout, which production
+    /// reads before stderr. A pass line names Microsoft in its path and
+    /// holds a version, so only the `C/C++` check keeps it out.
+    #[test]
+    fn windows_cl_banner_is_recognised_in_a_localized_install() {
+        const CP936_BANNER: &[u8] = b"\xd3\xc3\xd3\xda x64 \xb5\xc4 Microsoft (R) C/C++ \
+            \xd3\xc5\xbb\xaf\xb1\xe0\xd2\xeb\xc6\xf7 19.43.34809 \xb0\xe6";
+        const CP936_COPYRIGHT: &[u8] = b"\xb0\xe6\xc8\xa8\xcb\xf9\xd3\xd0(C) Microsoft Corporation\
+            \xa1\xa3\xb1\xa3\xc1\xf4\xcb\xf9\xd3\xd0\xc8\xa8\xc0\xfb\xa1\xa3";
+        const CP936_LINE: &str = "\u{fffd}\u{fffd}\u{fffd}\u{fffd} x64 \u{fffd}\u{fffd} \
+            Microsoft (R) C/C++ \u{fffd}\u{17b}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\
+            \u{fffd} 19.43.34809 \u{fffd}\u{fffd}";
+        const UTF8_BANNER: &str = "用于 x64 的 Microsoft (R) C/C++ 优化编译器 19.43.34809 版";
+        const UTF8_COPYRIGHT: &str = "版权所有(C) Microsoft Corporation。保留所有权利。";
+        const PASS_PATH: &str = concat!(
+            r" C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools",
+            r"\MSVC\14.43.34808\bin\HostX64\x64\c1xx.dll:"
+        );
+        // `版本` ("version") in code page 936, then in UTF-8.
+        let cp936_pass = [PASS_PATH.as_bytes(), b" \xb0\xe6\xb1\xbe 19.43.34809.0"].concat();
+        let utf8_pass = format!("{PASS_PATH} 版本 19.43.34809.0");
+        // `run_windows_tool_in_for` decodes stdout and stderr and joins them
+        // with a newline, so the pass line comes before the banner.
+        let decoded = |stdout: &[&[u8]], stderr: &[&[u8]]| {
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&stdout.join(&b"\r\n"[..])),
+                String::from_utf8_lossy(&stderr.join(&b"\r\n"[..]))
+            )
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        for (output, line) in [
+            (
+                decoded(
+                    &[cp936_pass.as_slice(), b""],
+                    &[CP936_BANNER, CP936_COPYRIGHT, b""],
+                ),
+                CP936_LINE,
+            ),
+            (
+                decoded(
+                    &[utf8_pass.as_bytes(), b""],
+                    &[UTF8_BANNER.as_bytes(), UTF8_COPYRIGHT.as_bytes(), b""],
+                ),
+                UTF8_BANNER,
+            ),
+        ] {
+            assert_eq!(
+                validate_tool_banner(WindowsTool::Cl, &output).unwrap(),
+                line
+            );
+
+            // The architecture check reads the same localized line.
+            let probe = |architecture: &str| {
+                probe_windows_msvc_identity_with(
+                    None,
+                    architecture,
+                    &[],
+                    &windows_environment(directory.path(), architecture),
+                    |tool, _| {
+                        Ok(match tool {
+                            WindowsTool::Link => LINK_BANNER.to_owned(),
+                            WindowsTool::Cl => output.clone(),
+                            WindowsTool::LldLink => unreachable!(),
+                        })
+                    },
+                )
+            };
+            let identity = probe("x64").unwrap();
+            assert_eq!(identity.compiler, line);
+            assert_eq!(identity.architecture, "x64");
+            let error = probe("arm64").unwrap_err();
+            assert!(
+                error.to_string().contains("selected arm64 architecture"),
+                "{error:#}"
             );
         }
     }

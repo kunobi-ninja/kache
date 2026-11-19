@@ -46,6 +46,7 @@ mod embedded_checkout;
 mod link_probe;
 mod machine;
 mod maintenance;
+mod memo_writer;
 mod miss_chain;
 mod native_archive;
 mod native_link_key;

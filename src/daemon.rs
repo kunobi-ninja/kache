@@ -6972,6 +6972,8 @@ pub fn run_server(
         .enable_all()
         .build()?;
 
+    // Here and not in `server_main`, which tests run inside a shared process.
+    crate::memo_writer::enable();
     run_daemon_runtime(
         rt,
         server_main(

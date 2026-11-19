@@ -1540,7 +1540,7 @@ fn root_digest(
     root: &TreeRoot<'_>,
     walk: &GuardWalk,
     stamped: &StampedRoot,
-    mut budget: usize,
+    budget: usize,
     file_hasher: &FileHasher<'_>,
     memo_dir: &Path,
     now: std::time::SystemTime,
@@ -1557,48 +1557,65 @@ fn root_digest(
         return Some(digest);
     }
     crate::phase_trace::decision("tree_memo", "miss");
-    // A batch result is keyed by path; retain the exact queried fingerprint
-    // as well, so the later content walk cannot use a row for another stamp.
-    let trace_batch = crate::phase_trace::phase("tree_memo_batch");
-    let mut hashes = file_hasher.memoised_hashes(stamped.small_files.iter());
-    drop(trace_batch);
-    let memoised: HashMap<FileFingerprint, String> = stamped
-        .small_files
-        .iter()
-        .filter_map(|stamp| hashes.remove(&stamp.path).map(|hash| (stamp.clone(), hash)))
-        .collect();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(TREE_DIGEST_VERSION);
-    fold_field(&mut hasher, b"root:", root.role);
-    // Only when set, so a tree without exclusions keeps its digest.
-    for name in &root.excluded_dirs {
-        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+    let fold_key = (memo.clone(), stamp.memo_key().to_owned(), budget);
+    let fold = move || -> Option<String> {
+        let mut budget = budget;
+        // A batch result is keyed by path; retain the exact queried fingerprint
+        // as well, so the later content walk cannot use a row for another stamp.
+        let trace_batch = crate::phase_trace::phase("tree_memo_batch");
+        let mut hashes = file_hasher.memoised_hashes(stamped.small_files.iter());
+        drop(trace_batch);
+        let memoised: HashMap<FileFingerprint, String> = stamped
+            .small_files
+            .iter()
+            .filter_map(|stamp| hashes.remove(&stamp.path).map(|hash| (stamp.clone(), hash)))
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(TREE_DIGEST_VERSION);
+        fold_field(&mut hasher, b"root:", root.role);
+        // Only when set, so a tree without exclusions keeps its digest.
+        for name in &root.excluded_dirs {
+            fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+        }
+        let excluded = root.excluded();
+        let _trace_fold = crate::phase_trace::phase("tree_fold");
+        let read_every_file = crate_tree_fold(
+            &root.path,
+            &root.path,
+            GuardSkips {
+                paths: &excluded,
+                dir_names: &root.excluded_dirs,
+            },
+            root.skips_build_dirs,
+            &GuardFileHashes {
+                hasher: file_hasher,
+                memoised,
+            },
+            &mut hasher,
+            &mut budget,
+        )?;
+        let digest = hasher.finalize().to_hex().to_string();
+        // The stamp shows a directory becoming listable, but not a file becoming
+        // readable where there is no change time.
+        if read_every_file {
+            memoise_tree_digest(&memo, walk, stamp, &digest, now);
+        }
+        Some(digest)
+    };
+    // Units of one workspace miss together when its tree changes. With the
+    // stamp settled, every one of them would fold the same bytes, so they
+    // share one fold: the same key and rule a memoised digest is served by.
+    if stamp.settled_at(now) {
+        TREE_FOLDS.run(&fold_key, fold)
+    } else {
+        fold()
     }
-    let excluded = root.excluded();
-    let _trace_fold = crate::phase_trace::phase("tree_fold");
-    let read_every_file = crate_tree_fold(
-        &root.path,
-        &root.path,
-        GuardSkips {
-            paths: &excluded,
-            dir_names: &root.excluded_dirs,
-        },
-        root.skips_build_dirs,
-        &GuardFileHashes {
-            hasher: file_hasher,
-            memoised,
-        },
-        &mut hasher,
-        &mut budget,
-    )?;
-    let digest = hasher.finalize().to_hex().to_string();
-    // The stamp shows a directory becoming listable, but not a file becoming
-    // readable where there is no change time.
-    if read_every_file {
-        memoise_tree_digest(&memo, walk, stamp, &digest, now);
-    }
-    Some(digest)
 }
+
+/// Content folds under way, keyed by memo file, stamp and entry budget.
+static TREE_FOLDS: std::sync::LazyLock<
+    crate::walk_flight::JoinFlight<(PathBuf, String, usize), Option<String>>,
+> = std::sync::LazyLock::new(crate::walk_flight::JoinFlight::new);
 
 /// Record `digest` at `memo` under the memo key of `stamp`, the stamp `walk`
 /// gave before the files were read. A tree written in the last moments could

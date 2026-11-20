@@ -1558,7 +1558,7 @@ fn root_digest(
     }
     crate::phase_trace::decision("tree_memo", "miss");
     let fold_key = (memo.clone(), stamp.memo_key().to_owned(), budget);
-    let fold = move || -> Option<String> {
+    let fold = move || -> TreeFold {
         let mut budget = budget;
         // A batch result is keyed by path; retain the exact queried fingerprint
         // as well, so the later content walk cannot use a row for another stamp.
@@ -1579,7 +1579,7 @@ fn root_digest(
         }
         let excluded = root.excluded();
         let _trace_fold = crate::phase_trace::phase("tree_fold");
-        let read_every_file = crate_tree_fold(
+        let Some(read_every_file) = crate_tree_fold(
             &root.path,
             &root.path,
             GuardSkips {
@@ -1593,28 +1593,49 @@ fn root_digest(
             },
             &mut hasher,
             &mut budget,
-        )?;
+        ) else {
+            return TreeFold {
+                digest: None,
+                recorded: false,
+            };
+        };
         let digest = hasher.finalize().to_hex().to_string();
         // The stamp shows a directory becoming listable, but not a file becoming
         // readable where there is no change time.
-        if read_every_file {
-            memoise_tree_digest(&memo, walk, stamp, &digest, now);
+        let recorded = read_every_file && memoise_tree_digest(&memo, walk, stamp, &digest, now);
+        TreeFold {
+            digest: Some(digest),
+            recorded,
         }
-        Some(digest)
     };
-    // Units of one workspace miss together when its tree changes. With the
-    // stamp settled, every one of them would fold the same bytes, so they
-    // share one fold: the same key and rule a memoised digest is served by.
-    if stamp.settled_at(now) {
-        TREE_FOLDS.run(&fold_key, fold)
+    // Units of one workspace miss together when its tree changes, and each
+    // would fold the same bytes. A unit that arrives while another folds
+    // waits for that fold and takes its digest when the memo took it too: the
+    // memo would have answered the unit with the same digest a moment later.
+    // A fold the memo refused, of a tree that moved or of a file that could
+    // not be read, is its unit's alone, and the others fold as they always
+    // have.
+    let folded = if stamp.settled_at(now) {
+        TREE_FOLDS.run(&fold_key, fold, |folded| folded.recorded)
     } else {
         fold()
-    }
+    };
+    folded.digest
+}
+
+/// What one content fold of a root gave.
+#[derive(Clone)]
+struct TreeFold {
+    /// `None` when the root could not be listed or ran past its budget.
+    digest: Option<String>,
+    /// Whether the digest was one for the memo ([`memoise_tree_digest`]):
+    /// every file was read, and the tree kept its stamp while they were.
+    recorded: bool,
 }
 
 /// Content folds under way, keyed by memo file, stamp and entry budget.
 static TREE_FOLDS: std::sync::LazyLock<
-    crate::walk_flight::JoinFlight<(PathBuf, String, usize), Option<String>>,
+    crate::walk_flight::JoinFlight<(PathBuf, String, usize), TreeFold>,
 > = std::sync::LazyLock::new(crate::walk_flight::JoinFlight::new);
 
 /// Record `digest` at `memo` under the memo key of `stamp`, the stamp `walk`
@@ -1628,16 +1649,20 @@ static TREE_FOLDS: std::sync::LazyLock<
 /// On Unix a lookup needs only the same entries. The root's own times also
 /// move when a name it leaves out, such as the target directory, is created
 /// or removed, and every entry the digest read stays as it was.
+///
+/// Returns whether the digest met that rule, and so was recorded.
 fn memoise_tree_digest(
     memo: &Path,
     walk: &GuardWalk,
     stamp: &crate::tree_stamp::TreeStamp,
     digest: &str,
     now: std::time::SystemTime,
-) {
-    if stamp.settled_at(now) && walk.holds() {
+) -> bool {
+    let recorded = stamp.settled_at(now) && walk.holds();
+    if recorded {
         crate::tree_stamp::record_digest(memo, stamp.memo_key(), digest);
     }
+    recorded
 }
 
 /// Where the digest of `root` is memoised: one file per root, so every unit

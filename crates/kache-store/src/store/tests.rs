@@ -2996,9 +2996,15 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                 .flush_entry_durability_with(
                     "many-artifacts",
                     |file| {
-                        let metadata_sync = calls == count;
+                        // An entry past the handle bound flushes its metadata
+                        // first and verifies its blobs under the writer lock.
+                        let metadata_sync = if count == 65 {
+                            calls == 0
+                        } else {
+                            calls == count
+                        };
                         calls += 1;
-                        let must_hold_writer = count == 65 || metadata_sync;
+                        let must_hold_writer = count == 65 && !metadata_sync;
                         let competing = rusqlite::Transaction::new_unchecked(
                             &peer.db,
                             rusqlite::TransactionBehavior::Immediate,
@@ -3358,6 +3364,36 @@ fn durability_flush_rechecks_the_verified_cas_inode() {
     );
     assert!(!store.entry_is_durable("same-generation"));
     assert!(store.flush_entry_durability("same-generation").unwrap());
+}
+
+/// An entry within the handle bound flushes its blobs, metadata and
+/// directory before the writer lock: on macOS each flush is an F_FULLFSYNC,
+/// and lookups and stores wait on that lock. A larger entry still flushes its
+/// blobs under it.
+#[test]
+fn durability_flush_syncs_blobs_and_metadata_before_taking_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = true;
+    let store = Store::open(&config).unwrap();
+    put_test_entry(&store, dir.path(), "outside-lock", 29);
+    let blobs = store.get("outside-lock").unwrap().unwrap().files.len();
+    let synced = std::cell::Cell::new(0);
+    let synced_before_lock = std::cell::Cell::new(None);
+    assert!(
+        store
+            .flush_entry_durability_with(
+                "outside-lock",
+                |file| {
+                    synced.set(synced.get() + 1);
+                    file.sync_all()
+                },
+                || synced_before_lock.set(Some(synced.get())),
+            )
+            .unwrap()
+    );
+    assert_eq!(synced_before_lock.get(), Some(blobs + 1));
+    assert_eq!(synced.get(), blobs + 1);
 }
 
 #[test]
@@ -16343,4 +16379,29 @@ fn a_lock_note_is_readable_while_held_and_goes_with_its_holder() {
         None,
         "an empty note reads as none"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_retainer_probes_answer_in_the_order_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let paths: Vec<PathBuf> = (0..1100)
+        .map(|i| {
+            let path = dir.path().join(format!("blob-{i}"));
+            std::fs::write(&path, format!("content {i}")).unwrap();
+            if i % 7 == 0 {
+                std::fs::hard_link(&path, outside.join(format!("link-{i}"))).unwrap();
+            }
+            path
+        })
+        .collect();
+    let retained = super::probe_external_retainers(&paths);
+    let expected: Vec<bool> = (0..paths.len()).map(|i| i % 7 == 0).collect();
+    assert_eq!(retained, expected);
+    // Too few for a second thread, and none at all: a sweep of a store with
+    // no last-reference blob.
+    assert_eq!(super::probe_external_retainers(&paths[..8]), expected[..8]);
+    assert!(super::probe_external_retainers(&[]).is_empty());
 }

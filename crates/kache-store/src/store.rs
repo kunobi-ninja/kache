@@ -4882,6 +4882,22 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 verified.push(blob);
             }
         }
+        // The metadata and its directory are flushed before the writer lock
+        // too: on macOS each flush is an F_FULLFSYNC, and every lookup and
+        // store waits on the lock. Under the lock the identity checks below
+        // prove the flushed handle is still the published file; `meta.json`
+        // is only ever replaced by a rename, never rewritten in place.
+        let mut metadata_file = match open_published_file(&meta_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        let mut current_meta = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
+        if current_meta != meta_bytes {
+            return Ok(false);
+        }
+        sync_file(&metadata_file).context("flushing entry metadata")?;
+        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         before_promotion();
         let tx = self.begin_immediate_writer()?;
         let current_hash: Option<String> = tx
@@ -4893,15 +4909,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )
             .optional()?;
         if current_hash.as_deref() != Some(content_hash.as_str()) {
-            return Ok(false);
-        }
-        let mut metadata_file = match open_published_file(&meta_path) {
-            Ok(file) => file,
-            Err(_) => return Ok(false),
-        };
-        let mut current_meta = Vec::new();
-        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
-        if current_meta != meta_bytes {
             return Ok(false);
         }
         if sequential {
@@ -4922,8 +4929,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        sync_file(&metadata_file).context("flushing entry metadata")?;
-        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         if kache_fs::file_identity(&meta_path).ok()
             != Some(kache_fs::handle_identity(&metadata_file)?)
         {
@@ -5890,8 +5895,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             })
             .collect::<Vec<_>>()
         };
-        for (key, hash, size, _, _) in last_refs {
-            if crate::filesystem::blob_has_external_retainer(&self.blob_path(&hash)) {
+        let paths: Vec<PathBuf> = last_refs
+            .iter()
+            .map(|(_, hash, _, _, _)| self.blob_path(hash))
+            .collect();
+        let retained = probe_external_retainers(&paths);
+        for ((key, _, size, _, _), retained) in last_refs.into_iter().zip(retained) {
+            if retained {
                 *held.entry(key).or_insert(0) += size.max(0) as u64;
             }
         }
@@ -7472,6 +7482,49 @@ fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> 
     }
     Ok(())
 }
+
+/// Probe each blob for a live file outside the store holding its blocks.
+/// A sweep probes every last-reference blob of the store, each probe a
+/// filesystem round trip; spread over a few threads the sweep holds
+/// `gc.lock` for a fraction of the time.
+fn probe_external_retainers(paths: &[PathBuf]) -> Vec<bool> {
+    const MAX_PROBE_THREADS: usize = 8;
+    const MIN_PROBES_PER_THREAD: usize = 256;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_PROBE_THREADS)
+        .min(paths.len().div_ceil(MIN_PROBES_PER_THREAD))
+        .max(1);
+    if threads == 1 {
+        return paths
+            .iter()
+            .map(|path| crate::filesystem::blob_has_external_retainer(path))
+            .collect();
+    }
+    let chunk = paths.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = paths
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|path| crate::filesystem::blob_has_external_retainer(path))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests;
 

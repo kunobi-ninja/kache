@@ -167,7 +167,7 @@ pub fn retainer_from_meta(path: &Path) -> Option<BlobRetainer> {
         return None;
     }
     let size = meta.len();
-    let (sharing, links) = crate::sharing::probe_with_links(path, size);
+    let (sharing, links) = crate::sharing::probe_with_links_and_metadata(path, &meta);
     // A blob a build's target directory still hardlinks frees nothing when the
     // store drops its own name (kunobi-ninja/kache#725). This used to read
     // `MetadataExt::nlink` behind `#[cfg(unix)]`, so on Windows the guard did

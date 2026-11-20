@@ -18363,6 +18363,178 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     );
 }
 
+/// What a [`tree_unit`] gave: its digest, and how many files it read.
+#[cfg(unix)]
+struct TreeUnit(std::sync::mpsc::Receiver<(Option<String>, u64)>);
+
+#[cfg(unix)]
+impl TreeUnit {
+    /// A timeout, not a join: a unit left waiting on a fold must fail the
+    /// test, not hang it.
+    fn finish(self) -> (Option<String>, u64) {
+        self.0
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the unit was left waiting")
+    }
+}
+
+/// One unit's digest of `tree`, taken on its own thread with its own memo
+/// database, and how many files it read for it. A unit given `hold` says
+/// when its fold is about to read its first file, and waits there until it
+/// is released.
+///
+/// Unix only, as are the tests that use it: elsewhere the guard does not
+/// read every file through the hook this holds a fold with.
+#[cfg(unix)]
+fn tree_unit(
+    tree: &Path,
+    memo: &Path,
+    now: std::time::SystemTime,
+    hold: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+) -> TreeUnit {
+    let (tree, memo) = (tree.to_path_buf(), memo.to_path_buf());
+    let (finished, wait_finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let mut hold = hold;
+        set_before_read(Some(Box::new(move |_| {
+            if let Some((reading, release)) = hold.take() {
+                reading.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        })));
+        let roots = vec![TreeRoot::new(tree, b"workspace", &[])];
+        let digest = tree_digest_memoised(roots, &hasher, 10, &memo, now);
+        set_before_read(None);
+        finished.send((digest, hasher.stats().cache_misses))
+    });
+    TreeUnit(wait_finished)
+}
+
+/// Wait until `units` units are in one fold of `tree`: the unit reading it
+/// and the units waiting for that.
+#[cfg(unix)]
+fn wait_for_units_in_one_fold(tree: &Path, memo: &Path, units: usize) {
+    let root = TreeRoot::new(tree.to_path_buf(), b"workspace", &[]);
+    let stamp = stamp_root(&root.walked(), 10).unwrap();
+    let fold = (
+        tree_digest_memo(memo, &root),
+        stamp.memo_key().to_owned(),
+        10,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while TREE_FOLDS.callers(&fold) != units {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the units never met in one fold"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// A unit that reads `tree` and is held at its first file, and the channels
+/// that say it got there and release it.
+#[cfg(unix)]
+fn held_tree_unit(
+    tree: &Path,
+    memo: &Path,
+    now: std::time::SystemTime,
+) -> (TreeUnit, std::sync::mpsc::Sender<()>) {
+    let (reading, wait_reading) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    let unit = tree_unit(tree, memo, now, Some((reading, wait_release)));
+    wait_reading
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the unit reads the tree");
+    (unit, release)
+}
+
+/// Units of one workspace that miss the tree memo together share one fold: a
+/// unit that arrives while another reads the tree waits for it, and takes
+/// the digest the memo recorded without reading a file.
+#[cfg(unix)]
+#[test]
+fn units_that_miss_a_settled_tree_together_share_one_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (memo, tree) = (dir.path().join("memo"), dir.path().join("tree"));
+    write_file(&tree.join("src/lib.rs"), "pub fn a() {}\n");
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+
+    let (reader, release) = held_tree_unit(&tree, &memo, settled);
+    let waiter = tree_unit(&tree, &memo, settled, None);
+    wait_for_units_in_one_fold(&tree, &memo, 2);
+    release.send(()).unwrap();
+
+    let (digest, read) = reader.finish();
+    assert!(digest.is_some());
+    assert_eq!(read, 1);
+    assert_eq!(waiter.finish(), (digest, 0), "took the fold under way");
+}
+
+/// A fold of a tree that moved while it was read is the reading unit's
+/// alone. A name that came and went directly under the root leaves every
+/// entry as it was, so a unit that stamps the tree afterwards waits on that
+/// fold. The memo refuses its digest, and the unit reads the tree itself.
+#[cfg(unix)]
+#[test]
+fn a_unit_reads_a_tree_itself_when_it_moved_under_the_fold_it_waited_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (memo, tree) = (dir.path().join("memo"), dir.path().join("tree"));
+    write_file(&tree.join("a.txt"), "a");
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(tree.join("a.txt"), old).unwrap();
+    filetime::set_file_mtime(&tree, old).unwrap();
+    // Settled for the unit that stamps the root after the name went, too.
+    let settled = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+
+    let (reader, release) = held_tree_unit(&tree, &memo, settled);
+    write_file(&tree.join("transient.txt"), "t");
+    std::fs::remove_file(tree.join("transient.txt")).unwrap();
+    let waiter = tree_unit(&tree, &memo, settled, None);
+    wait_for_units_in_one_fold(&tree, &memo, 2);
+    release.send(()).unwrap();
+
+    let (digest, _) = reader.finish();
+    assert!(digest.is_some());
+    assert_eq!(waiter.finish(), (digest, 1), "the same bytes, read again");
+}
+
+/// A fold that could not read a file is its unit's alone too: only a change
+/// time would show the file becoming readable, so the memo refuses the
+/// digest, and a unit that waited on the fold reads the tree itself.
+#[cfg(unix)]
+#[test]
+fn a_unit_reads_a_tree_itself_when_the_fold_it_waited_for_could_not_read_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (memo, tree) = (dir.path().join("memo"), dir.path().join("tree"));
+    write_file(&tree.join("a.txt"), "a");
+    let secret = tree.join("secret.env");
+    write_file(&secret, "A=1");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&secret).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE;
+
+    let (reader, release) = held_tree_unit(&tree, &memo, settled);
+    let waiter = tree_unit(&tree, &memo, settled, None);
+    wait_for_units_in_one_fold(&tree, &memo, 2);
+    release.send(()).unwrap();
+
+    let (digest, read) = reader.finish();
+    assert!(digest.is_some());
+    assert_eq!(read, 1, "all but the file it cannot read");
+    assert_eq!(
+        waiter.finish(),
+        (digest, 1),
+        "the same marker, from its own read"
+    );
+}
+
 /// A guard holds while the trees it read keep their stamps. A file removed
 /// and put back with the same bytes and times leaves the digest as it was,
 /// not the stamp: the file has a new inode and change time.

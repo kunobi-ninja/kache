@@ -11780,6 +11780,25 @@ fn refresh_session_marker_extends_own_session_but_never_clobbers_newer() {
 }
 
 #[test]
+fn refresh_session_marker_leaves_a_recently_touched_marker_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = test_config(dir.path().to_path_buf());
+    let root = "/ws";
+    let marker = session_marker_path(&config, root);
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let recent = now_epoch_secs() - (SESSION_REFRESH_SECS - 5);
+    std::fs::write(&marker, format!("v1 {recent} mine")).unwrap();
+    refresh_session_marker(&config, root, "mine");
+    let (ts, _) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(ts, recent);
+    let stale = now_epoch_secs() - SESSION_REFRESH_SECS;
+    std::fs::write(&marker, format!("v1 {stale} mine")).unwrap();
+    refresh_session_marker(&config, root, "mine");
+    let (ts, _) = parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert!(ts > stale);
+}
+
+#[test]
 fn mint_session_id_is_opaque_and_distinct() {
     // A tight loop is the point: it drives the interval between calls below
     // the clock's resolution, which is exactly the case where the old

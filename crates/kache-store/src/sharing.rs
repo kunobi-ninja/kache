@@ -42,7 +42,19 @@ pub fn probe(path: &Path, size: u64) -> Sharing {
 /// "assume every byte is private", and claiming extra links would make the
 /// store refuse to evict blobs it can free.
 pub fn probe_with_links(path: &Path, size: u64) -> (Sharing, u64) {
-    match kache_fs::measure_file(path) {
+    sharing_and_links(kache_fs::measure_file(path), size)
+}
+
+/// [`probe_with_links`] for a caller that has just read `metadata` for `path`.
+pub fn probe_with_links_and_metadata(path: &Path, metadata: &std::fs::Metadata) -> (Sharing, u64) {
+    sharing_and_links(
+        kache_fs::measure_file_with_metadata(path, metadata),
+        metadata.len(),
+    )
+}
+
+fn sharing_and_links(measured: std::io::Result<kache_fs::FileSizing>, size: u64) -> (Sharing, u64) {
+    match measured {
         Ok(s) => (
             from_measurement(s.sharing, s.unique, s.snapshot_held(), size),
             s.nlink,

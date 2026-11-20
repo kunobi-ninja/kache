@@ -475,37 +475,7 @@ impl SizeProbe for ApfsProbe {
             Err(_) => return crate::fallback::FallbackProbe.measure_file(path),
         };
         let md = std::fs::symlink_metadata(path)?;
-
-        let allocated = r
-            .allocsize
-            .and_then(|v| u64::try_from(v).ok())
-            .unwrap_or_else(|| md.blocks().saturating_mul(512));
-        let logical = r
-            .datalength
-            .and_then(|v| u64::try_from(v).ok())
-            .unwrap_or(md.len());
-        let unique = r.privatesize.and_then(|v| u64::try_from(v).ok());
-        let sharing = sharing_of(
-            r.ext_flags.is_some(),
-            r.ext_flags.unwrap_or(0),
-            unique,
-            allocated,
-        );
-        let unique = crate::apfs_values::private_bytes(unique, sharing, allocated);
-
-        Ok(FileSizing {
-            logical,
-            allocated,
-            unique,
-            sharing,
-            inode: InodeId {
-                dev: md.dev(),
-                ino: md.ino(),
-            },
-            nlink: md.nlink(),
-            clone_id: r.cloneid,
-            clone_refcount: r.clone_refcount,
-        })
+        Ok(sizing_from(r, &md))
     }
 
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<DirEntry>> {
@@ -521,6 +491,54 @@ impl SizeProbe for ApfsProbe {
             clone_refcount: true,
             name: "apfs",
         }
+    }
+}
+
+/// A file's sizing from its attribute reply and the metadata of the same file.
+fn sizing_from(r: Reply, md: &std::fs::Metadata) -> FileSizing {
+    let allocated = r
+        .allocsize
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or_else(|| md.blocks().saturating_mul(512));
+    let logical = r
+        .datalength
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(md.len());
+    let unique = r.privatesize.and_then(|v| u64::try_from(v).ok());
+    let sharing = sharing_of(
+        r.ext_flags.is_some(),
+        r.ext_flags.unwrap_or(0),
+        unique,
+        allocated,
+    );
+    let unique = crate::apfs_values::private_bytes(unique, sharing, allocated);
+
+    FileSizing {
+        logical,
+        allocated,
+        unique,
+        sharing,
+        inode: InodeId {
+            dev: md.dev(),
+            ino: md.ino(),
+        },
+        nlink: md.nlink(),
+        clone_id: r.cloneid,
+        clone_refcount: r.clone_refcount,
+    }
+}
+
+/// [`measure_file`] for a caller that has just read `md` for the same path.
+pub(crate) fn measure_file_with_metadata(
+    path: &Path,
+    md: &std::fs::Metadata,
+) -> io::Result<FileSizing> {
+    let probe = ApfsProbe {
+        unique_supported: true,
+    };
+    match probe.raw(path) {
+        Ok(r) => Ok(sizing_from(r, md)),
+        Err(_) => crate::fallback::FallbackProbe.measure_file(path),
     }
 }
 

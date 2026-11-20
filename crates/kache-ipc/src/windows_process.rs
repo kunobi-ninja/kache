@@ -5,18 +5,13 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command};
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-};
+use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
 
 pub struct Job(OwnedHandle);
 
@@ -131,31 +126,7 @@ fn spawn_in_jobs(command: &mut Command, jobs: &[&Job]) -> io::Result<Child> {
                 return Err(io::Error::last_os_error());
             }
         }
-        // std::Child does not expose the primary thread on stable Rust. The
-        // suspended process cannot create another thread before this resume.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-        let mut entry: THREADENTRY32 = unsafe { zeroed() };
-        entry.dwSize = size_of::<THREADENTRY32>() as u32;
-        let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
-        while found {
-            if entry.th32OwnerProcessID == child.id() {
-                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if thread.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-                if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-                    return Err(io::Error::last_os_error());
-                }
-                return Ok(());
-            }
-            found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
-        }
-        Err(io::Error::other("suspended compiler thread unavailable"))
+        resume_suspended(&child)
     };
     if let Err(error) = start() {
         // Assignment/resume failures must never leave a suspended process or
@@ -165,6 +136,33 @@ fn spawn_in_jobs(command: &mut Command, jobs: &[&Job]) -> io::Result<Child> {
         return Err(error);
     }
     Ok(child)
+}
+
+/// Resume a child spawned with `CREATE_SUSPENDED`, through its own process
+/// handle. A suspended process has only its primary thread and cannot create
+/// another before this resume, so resuming the process resumes exactly that
+/// thread.
+///
+/// `std::process::Child` does not expose the primary thread on stable Rust.
+/// Finding it with a Toolhelp thread snapshot reads every thread on the
+/// machine: with a few hundred compilers starting at once on a 128-thread
+/// host, each snapshot took seconds and its compiler sat suspended meanwhile,
+/// doubling a cold workspace build.
+fn resume_suspended(child: &Child) -> io::Result<()> {
+    // Resume every thread of `process`. Exported by ntdll since Windows XP;
+    // the process handle needs `PROCESS_SUSPEND_RESUME`. Imported the way
+    // `windows-sys` imports, so no `ntdll.lib` is needed at link time.
+    windows_link::link!("ntdll.dll" "system" fn NtResumeProcess(process: HANDLE) -> i32);
+    // SAFETY: `child` owns a live handle to the process it spawned, which
+    // `CreateProcessW` opened with full access, `PROCESS_SUSPEND_RESUME`
+    // included; the call reads nothing else.
+    let status = unsafe { NtResumeProcess(child.as_raw_handle()) };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "resuming the suspended compiler failed: NTSTATUS {status:#010x}"
+        )));
+    }
+    Ok(())
 }
 
 impl std::os::windows::io::AsHandle for Job {

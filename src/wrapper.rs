@@ -10390,6 +10390,14 @@ pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &s
     let marker = session_marker_path(config, root);
     match std::fs::read_to_string(&marker) {
         Ok(content) => match parse_session_marker(&content) {
+            // Touched recently enough: rewriting it on every compile cost a
+            // create and a rename in one shared directory per cache hit.
+            Some((touched, id))
+                if id == session_id
+                    && now_epoch_secs().saturating_sub(touched) < SESSION_REFRESH_SECS =>
+            {
+                return;
+            }
             Some((_, id)) if id == session_id => {}
             _ => return, // superseded or unreadable — never clobber
         },
@@ -10484,6 +10492,11 @@ pub(crate) fn prune_session_markers(
 
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
+
+/// How stale a session marker may grow before an event refreshes it. A
+/// session can end up to this much sooner than [`BUILD_SESSION_SECS`] of
+/// inactivity.
+const SESSION_REFRESH_SECS: u64 = 30;
 
 /// Remove the directory passed as `-C incremental`. Cargo passes
 /// `<profile>/incremental`, which every unit of the profile shares. Normal

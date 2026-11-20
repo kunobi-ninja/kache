@@ -1293,6 +1293,65 @@ fn native_windows_msvc_ignores_unrelated_generic_cc_identity() {
     assert_ne!(generic.finalize(), fold("anything"));
 }
 
+/// Run `f` under a subscriber that records every level, and return its
+/// result with the log text.
+fn with_key_trace<R>(f: impl FnOnce() -> R) -> (R, String) {
+    // While the capture is the only live dispatcher, tracing registers a
+    // callsite against the default of whichever thread reaches it first. A
+    // parallel test thread with no subscriber then caches it as disabled,
+    // and the capture loses its events. A second dispatcher, kept for the
+    // whole run, makes registration ask every dispatcher, this one included.
+    static PEER: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    PEER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = std::sync::Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(std::sync::Arc::clone(&writer)))
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    (result, log)
+}
+
+/// The key trace shows the linker banner a linked output folds, and no
+/// banner for a native MSVC link, which does not fold it.
+#[test]
+fn generic_linker_identity_is_traced_as_folded() {
+    let bin = parsed_crate_type("bin", None);
+    let banner = "Apple clang version 17.0.0 (clang-1700.0.13.5)";
+    let trace = |native_windows_msvc: bool| {
+        with_key_trace(|| {
+            fold_generic_linker_identity(
+                &mut blake3::Hasher::new(),
+                &bin,
+                native_windows_msvc,
+                |_| Some(banner.to_string()),
+            )
+        })
+        .1
+    };
+    let log = trace(false);
+    assert!(
+        log.contains(&format!("[key:probe] linker={banner}")),
+        "{log}"
+    );
+    let log = trace(true);
+    assert!(!log.contains("linker="), "{log}");
+}
+
 /// The probe gets the linker `-C linker` names, the MSVC architecture and
 /// rustc's host, whose tool directory rustc searches for that linker.
 #[test]
@@ -11702,6 +11761,41 @@ fn apple_dylib_and_framework_install_names_bind_link_keys() {
         .unwrap();
         assert_ne!(before, fold(), "{}", file.display());
         std::fs::remove_file(file).unwrap();
+    }
+}
+
+/// The key trace shows each install name entry the link key folds, with the
+/// search directory's index, under the unit's crate name.
+#[test]
+fn apple_install_names_are_traced_as_folded() {
+    let tree = native_tree();
+    let normalizer = PathNormalizer::empty();
+    let context = unix_context("aarch64-apple-darwin", &normalizer);
+    std::fs::write(
+        tree.elsewhere.join("libfoo.dylib"),
+        apple_install_name::tests::dylib("/target/one/libfoo.dylib", false, true),
+    )
+    .unwrap();
+    let bundle = tree.out.join("Foo.framework");
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("Foo"),
+        apple_install_name::tests::dylib("@rpath/Foo.framework/Foo", false, true),
+    )
+    .unwrap();
+    let argv = unit_args("bin", &tree.deps, &[]);
+    let native = [tree.out.clone(), tree.elsewhere.clone()];
+    let (folded, log) =
+        with_key_trace(|| fold_inputs(&argv, &native, std::slice::from_ref(&tree.out), &context));
+    folded.unwrap();
+    for line in [
+        "[key:mylib] apple_install_name:1/libfoo.dylib=/target/one/libfoo.dylib".to_string(),
+        format!(
+            "[key:mylib] apple_install_name:0/{}=@rpath/Foo.framework/Foo",
+            Path::new("Foo.framework").join("Foo").display()
+        ),
+    ] {
+        assert!(log.contains(&line), "{line}\n{log}");
     }
 }
 
@@ -22194,6 +22288,35 @@ mod build_script_target_paths {
             b.1.fields.unwrap()["link"],
             "{why}"
         );
+    }
+
+    /// The key trace shows the profile-relative OUT_DIR an rlib's own native
+    /// search path folds as, in place of its `link_search:` line.
+    #[cfg(unix)]
+    #[test]
+    fn own_out_dir_native_search_is_traced_as_folded() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let target = unit.workspace.join("target");
+        let out = Unit::out_dir(&target);
+        let (_, log) = with_key_trace(|| {
+            unit.key(
+                Some(&target),
+                Some(&out),
+                &[native(&out)],
+                "rlib",
+                &[],
+                None,
+            )
+        });
+        assert!(
+            log.contains(
+                "[key:mylib] link_search_native_out_dir:build/foo-sys-0123456789abcdef/out"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("[key:mylib] link_search:"), "{log}");
     }
 
     #[test]

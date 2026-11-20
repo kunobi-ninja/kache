@@ -314,4 +314,6 @@ For individual components, run the trace command `kache explain my_crate` sugges
 KACHE_LOG=trace cargo build -p my_crate 2>&1 | grep '\[key:my_crate\]'
 ```
 
+To compare a crate's trace between two checkouts, build both with `KACHE_SEED_NEW_TARGETS=0`. [Seeding](/docs/getting-started/configuration#new-checkouts) copies registry and git units into a new or cleaned target directory, Cargo then runs no compile for them, and no key is traced.
+
 With `KACHE_LOG=warn`, the wrapper also logs `residual absolute path detected in ...` when a keyed value still names a home or temporary directory after normalization.

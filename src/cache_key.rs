@@ -4570,6 +4570,11 @@ fn compute_key_into(
             // A separate length-prefixed namespace avoids both old key-only
             // aliases and separator ambiguity in a literal Unix filename.
             fold_field(&mut hasher, b"link_search_native_out_dir.v1:", &identity);
+            tracing::trace!(
+                "[key:{}] link_search_native_out_dir:{}",
+                crate_name,
+                String::from_utf8_lossy(&identity).escape_debug()
+            );
             continue;
         }
         let normalized = path_normalizer.normalize(path);
@@ -6187,7 +6192,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                         .extension()
                         .is_some_and(|ext| matches!(ext.to_str(), Some("tbd" | "dylib" | "so")))
                 {
-                    fold_apple_install_name(hasher, &path, dir, index)?;
+                    fold_apple_install_name(hasher, &path, dir, index, crate_name)?;
                 }
             }
         }
@@ -6206,7 +6211,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 };
                 for binary in [path.join(format!("{name}.tbd")), path.join(name)] {
                     if binary.is_file() && !crate::native_archive::has_archive_magic(&binary)? {
-                        fold_apple_install_name(hasher, &binary, dir, index)?;
+                        fold_apple_install_name(hasher, &binary, dir, index, crate_name)?;
                     }
                 }
             }
@@ -6235,7 +6240,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                         .is_empty()
                         && !crate::native_archive::has_archive_magic(&path)?
                     {
-                        fold_apple_install_name(hasher, &path, dir, index)?;
+                        fold_apple_install_name(hasher, &path, dir, index, crate_name)?;
                     }
                     break;
                 }
@@ -6412,14 +6417,13 @@ fn fold_apple_install_name<H: KeyFold>(
     path: &Path,
     dir: &Path,
     index: usize,
+    crate_name: &str,
 ) -> Result<()> {
     let name = apple_install_name::read(path)?;
     let file = path.strip_prefix(dir).unwrap_or(path).to_string_lossy();
-    fold_field(
-        hasher,
-        b"apple_install_name.v1:",
-        format!("{index}/{file}={name}").as_bytes(),
-    );
+    let entry = format!("{index}/{file}={name}");
+    fold_field(hasher, b"apple_install_name.v1:", entry.as_bytes());
+    tracing::trace!("[key:{}] apple_install_name:{}", crate_name, entry);
     Ok(())
 }
 
@@ -12529,6 +12533,11 @@ fn fold_generic_linker_identity<H, Get>(
         hasher.update(b"linker:");
         hasher.update(linker_id.as_bytes());
         hasher.update(b"\n");
+        tracing::trace!(
+            "[key:{}] linker={}",
+            args.crate_name.as_deref().unwrap_or("unknown"),
+            linker_id
+        );
     }
 }
 

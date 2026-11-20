@@ -82,7 +82,8 @@ const MERGE_GAP_BYTES: u64 = 256 << 10;
 pub(crate) struct Pass {
     /// Bytes of the files looked at.
     pub(crate) file_bytes: u64,
-    /// Of those, bytes not in the page cache.
+    /// Of those, bytes of the spans not in the page cache, with the cached
+    /// gaps under [`MERGE_GAP_BYTES`] between them that a read-back reads.
     pub(crate) missing_bytes: u64,
     /// Bytes read back (at most [`PASS_BUDGET_BYTES`]).
     pub(crate) read_bytes: u64,
@@ -156,7 +157,8 @@ struct Held {
 pub(crate) struct Keeper {
     paths: [PathBuf; 2],
     held: [Option<Held>; 2],
-    /// Descriptors of files since replaced, never closed (module docs).
+    /// Descriptors of index files since replaced, never closed (module
+    /// docs).
     retired: Vec<File>,
     interval: Duration,
     last: Option<Pass>,
@@ -193,8 +195,8 @@ impl Keeper {
     }
 
     /// The held files that exist, by index, with their lengths. A path that
-    /// names another inode than the one held is opened again; the old
-    /// descriptor is retired, not closed.
+    /// names another inode than the one held is opened again, and the old
+    /// descriptor goes to [`retire`].
     fn refresh(&mut self) -> Vec<(usize, u64)> {
         let mut found = Vec::new();
         for (index, path) in self.paths.iter().enumerate() {
@@ -209,7 +211,7 @@ impl Keeper {
                     continue;
                 };
                 let Ok(opened) = file.metadata() else {
-                    self.retired.push(file);
+                    retire(&mut self.retired, index, file);
                     continue;
                 };
                 let held = Held {
@@ -218,7 +220,7 @@ impl Keeper {
                     ino: opened.ino(),
                 };
                 if let Some(old) = self.held[index].replace(held) {
-                    self.retired.push(old.file);
+                    retire(&mut self.retired, index, old.file);
                 }
             }
             if let Some(held) = &self.held[index]
@@ -255,10 +257,10 @@ impl Keeper {
             let Some(held) = &self.held[index] else {
                 continue;
             };
-            pass.file_bytes += len;
             let Ok(found) = residency(&held.file, len) else {
                 continue;
             };
+            pass.file_bytes += len;
             pass.touched_bytes += found.touched;
             let runs = merge(&runs_of(&found.pages, found.page), MERGE_GAP_BYTES);
             pass.missing_bytes += runs.iter().map(|(_, run)| run).sum::<u64>();
@@ -268,6 +270,16 @@ impl Keeper {
         }
         pass.read_bytes = read_twice(&reads);
         Ok(pass)
+    }
+}
+
+/// Put away the descriptor of a replaced file: the index's (`index` 0) is
+/// kept open in `retired`, since closing it would drop SQLite's locks; the
+/// WAL's is closed, since SQLite takes no lock on the WAL file itself and a
+/// kept descriptor would hold a deleted log's blocks.
+fn retire(retired: &mut Vec<File>, index: usize, file: File) {
+    if index == 0 {
+        retired.push(file);
     }
 }
 
@@ -297,7 +309,9 @@ const KEEPER_NICE: libc::c_int = 10;
 /// pass is [`Keeper::tick`], which the tests drive.
 #[mutants::skip]
 pub(crate) fn spawn(db_path: &Path) {
-    let mut keeper = Keeper::new(db_path);
+    // Never dropped, even if the thread unwinds: dropping it would close the
+    // index's descriptors (module docs).
+    let mut keeper = std::mem::ManuallyDrop::new(Keeper::new(db_path));
     let started = std::thread::Builder::new()
         .name("kache-index-keeper".into())
         .spawn(move || {
@@ -628,6 +642,11 @@ mod tests {
             merge(&runs, 4095),
             vec![(0, 4096), (8192, 4096), (1 << 20, 4096)]
         );
+        assert_eq!(
+            merge(&[(4096, 4096), (8192, 8192)], 0),
+            vec![(4096, 12288)],
+            "a run joined to one past the start of the file"
+        );
     }
 
     #[test]
@@ -771,6 +790,22 @@ mod tests {
         assert_ne!(now, first);
         assert_eq!(now, std::fs::metadata(&path).expect("the index").ino());
         assert_eq!(keeper.retired.len(), 1, "the old descriptor is kept open");
+        let wal = index_files(&path)[1].clone();
+        std::fs::write(&wal, vec![1u8; 1 << 14]).expect("a log");
+        keeper.tick(Some(64 << 30));
+        let log = keeper.held[1].as_ref().expect("the log is held").ino;
+        std::fs::write(&next, vec![2u8; 1 << 14]).expect("a new log");
+        std::fs::rename(&next, &wal).expect("it replaces the old one");
+        keeper.tick(Some(64 << 30));
+        assert_ne!(
+            keeper.held[1].as_ref().expect("the new log is held").ino,
+            log
+        );
+        assert_eq!(
+            keeper.retired.len(),
+            1,
+            "a replaced log's descriptor is closed"
+        );
     }
 
     #[test]

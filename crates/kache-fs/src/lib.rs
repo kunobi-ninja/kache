@@ -539,6 +539,23 @@ pub fn measure_file(path: &Path) -> io::Result<FileSizing> {
     }
 }
 
+/// [`measure_file`] for a caller that has just read `metadata` for the same
+/// path, saving a lookup where the platform probe would read it again.
+pub fn measure_file_with_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> io::Result<FileSizing> {
+    #[cfg(target_os = "macos")]
+    {
+        apfs::measure_file_with_metadata(path, metadata)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = metadata;
+        measure_file(path)
+    }
+}
+
 /// Filesystem fixtures for tests.
 ///
 /// Behind a feature rather than `#[cfg(test)]` because `consumer`'s own tests

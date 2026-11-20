@@ -16378,3 +16378,24 @@ fn a_lock_note_is_readable_while_held_and_goes_with_its_holder() {
         "an empty note reads as none"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn parallel_retainer_probes_answer_in_the_order_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let paths: Vec<PathBuf> = (0..1100)
+        .map(|i| {
+            let path = dir.path().join(format!("blob-{i}"));
+            std::fs::write(&path, format!("content {i}")).unwrap();
+            if i % 7 == 0 {
+                std::fs::hard_link(&path, outside.join(format!("link-{i}"))).unwrap();
+            }
+            path
+        })
+        .collect();
+    let retained = super::probe_external_retainers(&paths);
+    let expected: Vec<bool> = (0..paths.len()).map(|i| i % 7 == 0).collect();
+    assert_eq!(retained, expected);
+}

@@ -3366,8 +3366,10 @@ fn durability_flush_rechecks_the_verified_cas_inode() {
     assert!(store.flush_entry_durability("same-generation").unwrap());
 }
 
-/// Every flush happens before the writer lock: on macOS each one is an
-/// F_FULLFSYNC, and lookups and stores wait on that lock.
+/// An entry within the handle bound flushes its blobs, metadata and
+/// directory before the writer lock: on macOS each flush is an F_FULLFSYNC,
+/// and lookups and stores wait on that lock. A larger entry still flushes its
+/// blobs under it.
 #[test]
 fn durability_flush_syncs_blobs_and_metadata_before_taking_the_writer_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -16398,4 +16400,8 @@ fn parallel_retainer_probes_answer_in_the_order_asked() {
     let retained = super::probe_external_retainers(&paths);
     let expected: Vec<bool> = (0..paths.len()).map(|i| i % 7 == 0).collect();
     assert_eq!(retained, expected);
+    // Too few for a second thread, and none at all: a sweep of a store with
+    // no last-reference blob.
+    assert_eq!(super::probe_external_retainers(&paths[..8]), expected[..8]);
+    assert!(super::probe_external_retainers(&[]).is_empty());
 }

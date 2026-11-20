@@ -12108,11 +12108,13 @@ fn native_msvc_read_set_restores_an_object_and_detects_a_shadowing_header() {
     kache_fs::testutil::write_executable(
         &compiler,
         r#"#!/bin/sh
+# Shell builtins only: the Nix build sandbox has no cat.
 deps= output= source= includes=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         /EP)
-            if [ "$(cat "${0%/*}/c2.dll")" = unsupported ]; then
+            pass=; read -r pass < "${0%/*}/c2.dll" || :
+            if [ "$pass" = unsupported ]; then
                 printf 'const char *stamp[] = {"Nov 19", "20:30", "2026"};\n'
             else
                 printf 'const char *stamp[] = {"1", "1", "1"};\n'
@@ -12134,7 +12136,8 @@ case "$source" in
         if [ -f "$PWD/earlier/value.h" ]; then header="$PWD/earlier/value.h"; fi
         includes="\"$header\""
         printf 'run\n' >> compiles
-        cat "$header" > "$output"
+        IFS= read -r line < "$header"
+        printf '%s\n' "$line" > "$output"
         ;;
     *) exit 1 ;;
 esac

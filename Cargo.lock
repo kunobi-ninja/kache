@@ -2496,6 +2496,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "windows-link",
  "windows-sys 0.61.2",
 ]
 

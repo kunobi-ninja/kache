@@ -149,12 +149,10 @@ fn spawn_in_jobs(command: &mut Command, jobs: &[&Job]) -> io::Result<Child> {
 /// host, each snapshot took seconds and its compiler sat suspended meanwhile,
 /// doubling a cold workspace build.
 fn resume_suspended(child: &Child) -> io::Result<()> {
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        /// Resume every thread of `process`. Exported by ntdll since Windows
-        /// XP; the process handle needs `PROCESS_SUSPEND_RESUME`.
-        fn NtResumeProcess(process: HANDLE) -> i32;
-    }
+    // Resume every thread of `process`. Exported by ntdll since Windows XP;
+    // the process handle needs `PROCESS_SUSPEND_RESUME`. Imported the way
+    // `windows-sys` imports, so no `ntdll.lib` is needed at link time.
+    windows_link::link!("ntdll.dll" "system" fn NtResumeProcess(process: HANDLE) -> i32);
     // SAFETY: `child` owns a live handle to the process it spawned, which
     // `CreateProcessW` opened with full access, `PROCESS_SUSPEND_RESUME`
     // included; the call reads nothing else.

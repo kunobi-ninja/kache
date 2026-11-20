@@ -262,7 +262,7 @@ impl Keeper {
             };
             pass.file_bytes += len;
             pass.touched_bytes += found.touched;
-            let runs = merge(&runs_of(&found.pages, found.page), MERGE_GAP_BYTES);
+            let runs = spans(&found.pages, found.page);
             pass.missing_bytes += runs.iter().map(|(_, run)| run).sum::<u64>();
             for (offset, ask) in take(&mut budget, &runs) {
                 reads.push((&held.file, offset, ask));
@@ -501,6 +501,12 @@ fn runs_of(vec: &[u8], page: u64) -> Vec<(u64, u64)> {
     runs
 }
 
+/// The spans a pass reads back: the runs of missing pages, those less than
+/// [`MERGE_GAP_BYTES`] apart joined.
+fn spans(pages: &[u8], page: u64) -> Vec<(u64, u64)> {
+    merge(&runs_of(pages, page), MERGE_GAP_BYTES)
+}
+
 /// `runs` with gaps under `gap` bytes between them joined.
 fn merge(runs: &[(u64, u64)], gap: u64) -> Vec<(u64, u64)> {
     let mut merged: Vec<(u64, u64)> = Vec::new();
@@ -647,6 +653,19 @@ mod tests {
             vec![(4096, 12288)],
             "a run joined to one past the start of the file"
         );
+    }
+
+    #[test]
+    fn holes_up_to_256_kib_apart_are_read_as_one_span() {
+        let page = 4096;
+        let holes = |apart: usize| {
+            let mut pages = vec![0u8];
+            pages.extend(std::iter::repeat_n(1u8, apart));
+            pages.push(0);
+            pages
+        };
+        assert_eq!(spans(&holes(64), page), vec![(0, 66 * page)]);
+        assert_eq!(spans(&holes(65), page), vec![(0, page), (66 * page, page)]);
     }
 
     #[test]

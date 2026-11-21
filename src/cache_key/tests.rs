@@ -18235,10 +18235,34 @@ fn a_root_read_after_the_stamps_spends_what_the_others_leave() {
     assert!(tree_digest_memoised(roots(), &hasher, 3, &memo, settled).is_some());
 }
 
+/// Gives a path its mode back when a test ends, so its directory can be
+/// removed.
+#[cfg(unix)]
+struct Mode(PathBuf, u32);
+
+#[cfg(unix)]
+impl Mode {
+    fn set(path: PathBuf, mode: u32, restored: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self(path, restored)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
 /// What the tree guard cannot read counts as unreadable instead of
 /// withholding the digest: a proc macro the build starts cannot read it
-/// either. A file it cannot read keeps the digest out of the memo, since only
-/// a change time would show the file becoming readable.
+/// either. A directory it cannot list stays in the memo, as the stamp walk
+/// could not list it either and the stamp changes once it can. A file it
+/// cannot read keeps the digest out, since only a change time would show the
+/// file becoming readable.
 #[cfg(unix)]
 #[test]
 fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
@@ -18249,12 +18273,6 @@ fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
     write_file(&tree.join("src/lib.rs"), "");
     write_file(&tree.join("pgdata/PG_VERSION"), "16");
     write_file(&tree.join("secret.env"), "A=1");
-    struct Mode(PathBuf, u32);
-    impl Drop for Mode {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
-        }
-    }
     let _pgdata = Mode(tree.join("pgdata"), 0o755);
     let _secret = Mode(tree.join("secret.env"), 0o644);
     let mode = |path: &str, mode| {
@@ -18265,19 +18283,21 @@ fn what_the_tree_guard_cannot_read_counts_as_unreadable() {
     let settled = || std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE * 2;
     let digest = || tree_digest_memoised(roots(), &hasher, 10, &memo, settled());
     let readable = digest().unwrap();
+    let file = tree_digest_memo(&memo, &roots()[0]);
 
     mode("pgdata", 0o000);
     if std::fs::read_dir(tree.join("pgdata")).is_ok() {
         eprintln!("skipped: this user reads past permissions");
         return;
     }
+    let _ = std::fs::remove_file(&file);
     let unlisted = digest().expect("a directory it cannot list");
     assert_ne!(unlisted, readable);
+    assert!(file.exists(), "memoised: the stamp walk could not list it");
     mode("pgdata", 0o755);
     assert_eq!(digest().as_ref(), Some(&readable));
 
     mode("secret.env", 0o000);
-    let file = tree_digest_memo(&memo, &roots()[0]);
     let _ = std::fs::remove_file(&file);
     let unread = digest().expect("a file it cannot read");
     assert_ne!(unread, readable);
@@ -18314,8 +18334,127 @@ fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
             &mut budget,
         )
     };
-    assert_eq!(fold(dir.path()), Some(true), "a directory below the root");
+    let unlisted = Unread {
+        entries: 1,
+        files: 0,
+    };
+    assert_eq!(
+        fold(dir.path()),
+        Some(unlisted),
+        "a directory below the root"
+    );
     assert_eq!(fold(&gone), None, "the root");
+}
+
+/// The content fold counts the directories it cannot list and the entries it
+/// cannot stat as the stamp walk does, at any depth. The files it cannot
+/// read it counts apart: a stamp walk opens none.
+#[cfg(unix)]
+#[test]
+fn the_tree_fold_counts_what_it_cannot_read_as_the_stamp_walk_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    write_file(&tree.join("src/lib.rs"), "");
+    write_file(&tree.join("deep/unlisted/a"), "");
+    write_file(&tree.join("deep/listed/a"), "");
+    write_file(&tree.join("deep/listed/b"), "");
+    write_file(&tree.join("deep/secret.env"), "A=1");
+    let _unlisted = Mode::set(tree.join("deep/unlisted"), 0o000, 0o755);
+    // Listed, but its entries cannot be stat'ed.
+    let _listed = Mode::set(tree.join("deep/listed"), 0o444, 0o755);
+    let _secret = Mode::set(tree.join("deep/secret.env"), 0o000, 0o644);
+    if std::fs::read_dir(tree.join("deep/unlisted")).is_ok() {
+        eprintln!("skipped: this user reads past permissions");
+        return;
+    }
+    let root = TreeRoot::new(tree.clone(), b"workspace", &[]);
+    let stamp = stamp_root(&root.walked(), 20).unwrap();
+    let hasher = FileHasher::new();
+    let mut budget = 20;
+    let unread = crate_tree_fold(
+        &tree,
+        &tree,
+        GuardSkips {
+            paths: &[],
+            dir_names: &[],
+        },
+        false,
+        &GuardFileHashes {
+            hasher: &hasher,
+            memoised: HashMap::new(),
+        },
+        &mut blake3::Hasher::new(),
+        &mut budget,
+    );
+    let expected = Unread {
+        entries: 3,
+        files: 1,
+    };
+    assert_eq!(unread, Some(expected), "`unlisted` and what `listed` holds");
+    assert_eq!(stamp.unreadable, 3);
+}
+
+/// A failure the content fold alone met keeps its digest out of the memo:
+/// the stamp walks before and after it read that entry, so the stamp cannot
+/// show it. Here the root is a link that names another directory while the
+/// fold stats `src/m.txt`. That directory holds the same two other files and
+/// no `m.txt`, and the tree itself is never touched.
+#[cfg(unix)]
+#[test]
+fn a_failure_only_the_tree_fold_met_keeps_its_digest_out_of_the_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let memo = dir.path().join("memo");
+    let (real, other) = (dir.path().join("real"), dir.path().join("other"));
+    let tree = dir.path().join("tree");
+    for name in ["a.txt", "m.txt", "z.txt"] {
+        write_file(&real.join("src").join(name), name);
+    }
+    std::fs::create_dir_all(other.join("src")).unwrap();
+    for name in ["src/a.txt", "src/z.txt"] {
+        std::fs::hard_link(real.join(name), other.join(name)).unwrap();
+    }
+    let point_at = {
+        let tree = tree.clone();
+        move |target: &Path| {
+            let _ = std::fs::remove_file(&tree);
+            std::os::unix::fs::symlink(target, &tree).unwrap();
+        }
+    };
+    point_at(&real);
+    let roots = || vec![TreeRoot::new(tree.clone(), b"workspace", &[])];
+    let file = tree_digest_memo(&memo, &roots()[0]);
+    let stamp = || stamp_root(&roots()[0].walked(), 10).unwrap().digest;
+    let stamped = stamp();
+    // Only a hasher with a memo reads through the hook.
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+    let settled = std::time::SystemTime::now() + crate::tree_stamp::TreeStamp::SETTLE * 2;
+
+    // From the read of `a.txt` to the read of `z.txt`.
+    let elsewhere = {
+        let (real, other, point_at) = (real.clone(), other.clone(), point_at.clone());
+        move |path: &Path| {
+            point_at(if path.ends_with("a.txt") {
+                &other
+            } else {
+                &real
+            })
+        }
+    };
+    set_before_read(Some(Box::new(elsewhere)));
+    let digest = tree_digest_memoised(roots(), &hasher, 10, &memo, settled);
+    set_before_read(None);
+    assert!(digest.is_some(), "the unit still has its digest");
+    assert_eq!(hasher.stats().cache_misses, 2, "both other files were read");
+    assert_eq!(stamp(), stamped, "and the tree kept its stamp");
+    assert!(!file.exists(), "the stamp walk had read `m.txt`");
+
+    assert_ne!(
+        tree_digest_memoised(roots(), &hasher, 10, &memo, settled),
+        digest
+    );
+    assert!(file.exists(), "every entry read");
 }
 
 /// A digest is memoised only while the tree still has the stamp it had

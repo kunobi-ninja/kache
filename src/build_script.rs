@@ -109,10 +109,6 @@ const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
 const OUT_PREFIX: &str = "out/";
 pub(crate) const CRATE_NAME: &str = "build_script_run";
-/// Above this an `OUT_DIR` is left uncached: a directory this size is a build
-/// tree, not a build-script product, and restoring it would not be cheaper
-/// than the run.
-const MAX_OUT_DIR_BYTES: u64 = 1 << 30;
 /// Non-empty files and symlinks together: each costs a manifest entry and a
 /// restore.
 const MAX_OUT_DIR_FILES: usize = 50_000;
@@ -2057,11 +2053,20 @@ impl Run {
             empty_files,
             symlinks,
             rooted_symlinks,
-        } = collect_out_dir_with_environment(&self.environment, MAX_OUT_DIR_FILES)?;
+        } = collect_out_dir_with_environment(
+            &self.environment,
+            self.config.build_script_out_dir_max_size,
+            MAX_OUT_DIR_FILES,
+        )?;
         let (used_bytes, used_entries) =
             outside::out_dir_share(&files, &symlinks, rooted_symlinks.len())?;
-        let mut outside_outputs =
-            outside::collect(stdout_text, &self.environment, used_bytes, used_entries)?;
+        let mut outside_outputs = outside::collect(
+            stdout_text,
+            &self.environment,
+            self.config.build_script_out_dir_max_size,
+            used_bytes,
+            used_entries,
+        )?;
         let has_outside = !outside_outputs.is_empty();
         let mut files = files;
         files.extend(std::mem::take(&mut outside_outputs.files));
@@ -2352,18 +2357,32 @@ fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
 /// [`collect_out_dir`] with `max_entries` for its file and symlink cap.
 #[cfg(test)]
 fn collect_out_dir_capped(out_dir: &Path, max_entries: usize) -> Result<OutDirContents> {
-    collect_out_dir_inner(out_dir, max_entries, None)
+    collect_out_dir_inner(
+        out_dir,
+        kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+        max_entries,
+        None,
+    )
 }
 
 fn collect_out_dir_with_environment(
     environment: &Environment,
+    max_bytes: u64,
     max_entries: usize,
 ) -> Result<OutDirContents> {
-    collect_out_dir_inner(&environment.out_dir, max_entries, Some(environment))
+    collect_out_dir_inner(
+        &environment.out_dir,
+        max_bytes,
+        max_entries,
+        Some(environment),
+    )
 }
 
+/// Fails when the regular files pass `max_bytes` or the files and symlinks
+/// pass `max_entries`: such a run is left uncached.
 fn collect_out_dir_inner(
     out_dir: &Path,
+    max_bytes: u64,
     max_entries: usize,
     environment: Option<&Environment>,
 ) -> Result<OutDirContents> {
@@ -2425,9 +2444,9 @@ fn collect_out_dir_inner(
                     });
                     continue;
                 }
-                total += metadata.len();
+                total = total.saturating_add(metadata.len());
                 anyhow::ensure!(
-                    total <= MAX_OUT_DIR_BYTES
+                    total <= max_bytes
                         && files.len() + symlinks.len() + rooted_symlinks.len() < max_entries,
                     "OUT_DIR is too large to record"
                 );
@@ -3843,20 +3862,26 @@ mod tests {
 
     #[test]
     fn an_out_dir_past_the_byte_cap_is_not_recorded() {
+        const CAP: u64 = 1 << 20;
+        let collect = |out: &Path, cap| collect_out_dir_inner(out, cap, MAX_OUT_DIR_FILES, None);
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         std::fs::create_dir(&out).unwrap();
         // Sparse: the cap is judged on the size the metadata reports.
         let big = std::fs::File::create(out.join("big.bin")).unwrap();
-        big.set_len(MAX_OUT_DIR_BYTES + 1).unwrap();
-        assert!(collect_out_dir(&out).is_err());
-        big.set_len(MAX_OUT_DIR_BYTES / 2).unwrap();
+        big.set_len(CAP + 1).unwrap();
+        assert!(collect(&out, CAP).is_err());
+        assert!(
+            collect(&out, CAP + 1).is_ok(),
+            "the cap is the configured one"
+        );
+        big.set_len(CAP / 2).unwrap();
         let second = std::fs::File::create(out.join("second.bin")).unwrap();
-        second.set_len(MAX_OUT_DIR_BYTES / 2 + 1).unwrap();
-        assert!(collect_out_dir(&out).is_err(), "sizes add up across files");
-        second.set_len(MAX_OUT_DIR_BYTES / 2).unwrap();
+        second.set_len(CAP / 2 + 1).unwrap();
+        assert!(collect(&out, CAP).is_err(), "sizes add up across files");
+        second.set_len(CAP / 2).unwrap();
         assert_eq!(
-            collect_out_dir(&out).unwrap().files.len(),
+            collect(&out, CAP).unwrap().files.len(),
             2,
             "the cap is inclusive"
         );
@@ -4586,6 +4611,35 @@ mod tests {
         assert!(run.store.get(&key).unwrap().is_some());
         std::fs::write(common.join("refs/heads/topic"), "2222\n").unwrap();
         assert_ne!(key, run.action_key(&prediction).unwrap());
+    }
+
+    /// A run is recorded only while its output fits the configured limit.
+    #[test]
+    fn a_run_is_recorded_only_within_the_configured_output_limit() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let package = dir.as_path().join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        for (limit, recorded) in [(15, false), (16, true)] {
+            let mut config =
+                crate::test_support::test_config(dir.as_path().join(format!("cache-{limit}")));
+            config.build_script_out_dir_max_size = limit;
+            let run = Run {
+                store: Store::open(&config).unwrap(),
+                config,
+                binary_hash: "aaaa".to_string(),
+                environment: environment(&dir.as_path().join(format!("out-{limit}")), &package),
+                start: std::time::Instant::now(),
+            };
+            std::fs::create_dir_all(&run.environment.out_dir).unwrap();
+            std::fs::write(run.environment.out_dir.join("generated.rs"), [b'x'; 16]).unwrap();
+            let result = run.record(b"", b"", 5, after);
+            assert_eq!(result.is_ok(), recorded, "{limit}: {result:?}");
+            if !recorded {
+                assert!(format!("{:#}", result.unwrap_err()).contains("too large to record"));
+            }
+        }
     }
 
     /// Cargo reruns a path package's script on every build while a path it

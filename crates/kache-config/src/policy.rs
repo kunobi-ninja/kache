@@ -34,6 +34,12 @@ pub fn forced_remote_readonly_with(
 fn github_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<ForcedReadonly> {
     let event = display_env(get_env("GITHUB_EVENT_NAME"));
     let ref_type = display_env(get_env("GITHUB_REF_TYPE"));
+    // GitHub starts a merge group only for a branch whose rules require a merge
+    // queue. The group's own ref, `gh-readonly-queue/<base>/...`, is never
+    // protected, so the protected-branch check cannot apply to it.
+    if event == "merge_group" && env_truthy(get_env("KACHE_GITHUB_MERGE_GROUP_WRITES")) {
+        return None;
+    }
     let event_allows_writes = event == "push"
         || (event == "schedule" && env_truthy(get_env("KACHE_GITHUB_SCHEDULE_WRITES")));
     if event_allows_writes && ref_type == "branch" && env_truthy(get_env("GITHUB_REF_PROTECTED")) {
@@ -45,6 +51,8 @@ fn github_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<F
             "GitHub Actions schedule ({ref_type}) needs a protected branch and \
              KACHE_GITHUB_SCHEDULE_WRITES=1"
         )
+    } else if event == "merge_group" {
+        format!("GitHub Actions merge_group ({ref_type}) needs KACHE_GITHUB_MERGE_GROUP_WRITES=1")
     } else {
         format!("GitHub Actions {event} ({ref_type}) is not a protected-branch push")
     };
@@ -222,6 +230,38 @@ mod tests {
                 assert_eq!(
                     forced.reason.contains("KACHE_GITHUB_SCHEDULE_WRITES=1"),
                     event == "schedule"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn github_merge_group_write_opt_in_is_limited_to_merge_groups() {
+        for (event, flag, readonly) in [
+            ("merge_group", None, true),
+            ("merge_group", Some("0"), true),
+            ("merge_group", Some("1"), false),
+            ("push", None, true),
+            ("push", Some("1"), true),
+        ] {
+            let mut vars = github(&[
+                ("GITHUB_EVENT_NAME", event),
+                (
+                    "GITHUB_REF",
+                    "refs/heads/gh-readonly-queue/main/pr-7-0123abcd",
+                ),
+                ("GITHUB_REF_TYPE", "branch"),
+                ("GITHUB_REF_PROTECTED", "false"),
+            ]);
+            if let Some(flag) = flag {
+                vars.insert("KACHE_GITHUB_MERGE_GROUP_WRITES".into(), flag.into());
+            }
+            let forced = forced_remote_readonly_with(lookup(&vars));
+            assert_eq!(forced.is_some(), readonly, "{vars:?}");
+            if let Some(forced) = forced {
+                assert_eq!(
+                    forced.reason.contains("KACHE_GITHUB_MERGE_GROUP_WRITES=1"),
+                    event == "merge_group"
                 );
             }
         }

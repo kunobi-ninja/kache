@@ -5469,6 +5469,39 @@ fn protected_branch_push_keeps_configured_writable() {
 }
 
 #[test]
+fn protected_branch_schedule_respects_readonly_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let load_readonly = |extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            ("KACHE_CONFIG", config_path.to_str().unwrap()),
+            ("KACHE_HOST_CONFIG", ""),
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", "schedule"),
+            ("GITHUB_REF_TYPE", "branch"),
+            ("GITHUB_REF_PROTECTED", "true"),
+        ];
+        vars.extend_from_slice(extra);
+        let invocation = InvocationEnv::from_parts(
+            vars,
+            Some(dir.path().into()),
+            Some(dir.path().into()),
+            dir.path().into(),
+        );
+        Config::load_for(&invocation).unwrap().remote_readonly
+    };
+
+    let opt_in = ("KACHE_GITHUB_SCHEDULE_WRITES", "1");
+    assert!(load_readonly(&[("KACHE_REMOTE_READONLY", "0")]));
+    assert!(load_readonly(&[("KACHE_GITHUB_SCHEDULE_WRITES", "0")]));
+    assert!(!load_readonly(&[opt_in]));
+    assert!(load_readonly(&[opt_in, ("KACHE_REMOTE_READONLY", "1")]));
+
+    std::fs::write(&config_path, "[cache]\nremote_readonly = true\n").unwrap();
+    assert!(load_readonly(&[opt_in]));
+}
+
+#[test]
 fn local_shell_keeps_configured_writable() {
     let _guard = config_path_lock();
     let dir = tempfile::tempdir().unwrap();

@@ -32,16 +32,23 @@ pub fn forced_remote_readonly_with(
 }
 
 fn github_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<ForcedReadonly> {
-    if is_trusted_github_writer(get_env) {
-        return None;
-    }
     let event = display_env(get_env("GITHUB_EVENT_NAME"));
     let ref_type = display_env(get_env("GITHUB_REF_TYPE"));
-    Some(ForcedReadonly {
-        reason: format!(
-            "GitHub Actions {event} ({ref_type}) is not a protected-branch push or scheduled run"
-        ),
-    })
+    let event_allows_writes = event == "push"
+        || (event == "schedule" && env_truthy(get_env("KACHE_GITHUB_SCHEDULE_WRITES")));
+    if event_allows_writes && ref_type == "branch" && env_truthy(get_env("GITHUB_REF_PROTECTED")) {
+        return None;
+    }
+
+    let reason = if event == "schedule" {
+        format!(
+            "GitHub Actions schedule ({ref_type}) needs a protected branch and \
+             KACHE_GITHUB_SCHEDULE_WRITES=1"
+        )
+    } else {
+        format!("GitHub Actions {event} ({ref_type}) is not a protected-branch push")
+    };
+    Some(ForcedReadonly { reason })
 }
 
 fn gitlab_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<ForcedReadonly> {
@@ -52,17 +59,6 @@ fn gitlab_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<F
     Some(ForcedReadonly {
         reason: format!("GitLab CI {source} is not a protected-branch push"),
     })
-}
-
-fn is_trusted_github_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
-    // A scheduled run has no actor and no inputs, and always runs the default
-    // branch's own code, so on a protected branch it is as trusted as a push.
-    // `workflow_dispatch` stays out: a person triggers it and can pass inputs.
-    matches!(
-        get_env("GITHUB_EVENT_NAME").as_deref(),
-        Some("push" | "schedule")
-    ) && get_env("GITHUB_REF_TYPE").as_deref() == Some("branch")
-        && env_truthy(get_env("GITHUB_REF_PROTECTED"))
 }
 
 fn is_trusted_gitlab_writer(get_env: &impl Fn(&str) -> Option<String>) -> bool {
@@ -202,34 +198,33 @@ mod tests {
     }
 
     #[test]
-    fn github_protected_branch_schedule_may_write() {
-        let vars = github(&[
-            ("GITHUB_EVENT_NAME", "schedule"),
-            ("GITHUB_REF_TYPE", "branch"),
-            ("GITHUB_REF_PROTECTED", "true"),
-        ]);
-        assert_eq!(forced_remote_readonly_with(lookup(&vars)), None);
-    }
-
-    #[test]
-    fn github_unprotected_schedule_is_readonly() {
-        let vars = github(&[
-            ("GITHUB_EVENT_NAME", "schedule"),
-            ("GITHUB_REF_TYPE", "branch"),
-            ("GITHUB_REF_PROTECTED", "false"),
-        ]);
-        let forced = forced_remote_readonly_with(lookup(&vars)).expect("unprotected is untrusted");
-        assert!(forced.reason.contains("schedule"), "{}", forced.reason);
-    }
-
-    #[test]
-    fn github_tag_schedule_is_readonly() {
-        let vars = github(&[
-            ("GITHUB_EVENT_NAME", "schedule"),
-            ("GITHUB_REF_TYPE", "tag"),
-            ("GITHUB_REF_PROTECTED", "true"),
-        ]);
-        assert!(forced_remote_readonly_with(lookup(&vars)).is_some());
+    fn github_schedule_write_opt_in_is_limited_to_protected_branch_schedules() {
+        for (event, ref_type, protected, flag, readonly) in [
+            ("schedule", "branch", "true", None, true),
+            ("schedule", "branch", "true", Some("0"), true),
+            ("schedule", "branch", "true", Some("1"), false),
+            ("schedule", "branch", "false", Some("1"), true),
+            ("schedule", "tag", "true", Some("1"), true),
+            ("workflow_dispatch", "branch", "true", Some("1"), true),
+            ("pull_request_target", "branch", "true", Some("1"), true),
+        ] {
+            let mut vars = github(&[
+                ("GITHUB_EVENT_NAME", event),
+                ("GITHUB_REF_TYPE", ref_type),
+                ("GITHUB_REF_PROTECTED", protected),
+            ]);
+            if let Some(flag) = flag {
+                vars.insert("KACHE_GITHUB_SCHEDULE_WRITES".into(), flag.into());
+            }
+            let forced = forced_remote_readonly_with(lookup(&vars));
+            assert_eq!(forced.is_some(), readonly, "{vars:?}");
+            if let Some(forced) = forced {
+                assert_eq!(
+                    forced.reason.contains("KACHE_GITHUB_SCHEDULE_WRITES=1"),
+                    event == "schedule"
+                );
+            }
+        }
     }
 
     #[test]

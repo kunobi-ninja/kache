@@ -72,9 +72,18 @@ The `save-cache` input above belongs to kache-action. maturin-action has no equi
 
 Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.
 
-On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. On GitHub Actions a **scheduled run** of a protected branch counts too: it has no actor and no inputs, and it runs that branch's own code. Pull requests, merge requests, tags, unprotected branches and `workflow_dispatch` runs are read-only even if the job has a write credential, and `KACHE_REMOTE_READONLY=0` does not turn that off. The one exception is a pull request job with a prefix of its own, described below.
+On GitHub Actions and GitLab CI, a **push to a protected branch** can write to the remote cache. Other jobs are read-only by default. `KACHE_REMOTE_READONLY=0` still respects this policy. The exceptions are scheduled GitHub Actions jobs that opt in and pull request jobs with a prefix of their own.
 
-A push, or on GitHub a scheduled run, counts as protected only when GitHub sets `GITHUB_REF_PROTECTED=true` or GitLab sets `CI_COMMIT_REF_PROTECTED=true`, so a branch the CI system does not report as protected never publishes, even the default branch. When a job does not publish, the `Remote writes` row of `kache doctor` says why.
+To warm the remote cache from a scheduled GitHub Actions job, set this in that job's environment:
+
+```yaml
+env:
+  KACHE_GITHUB_SCHEDULE_WRITES: "1"
+```
+
+GitHub runs scheduled workflows on the default branch. The branch must be protected and the job must have write access to the remote. `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` still suppresses uploads. GitLab schedules remain read-only.
+
+For a branch to count as protected, GitHub must set `GITHUB_REF_PROTECTED=true` or GitLab must set `CI_COMMIT_REF_PROTECTED=true`. Check the `Remote writes` row of `kache doctor` for the effective mode.
 
 Kache recognizes only GitHub Actions (`GITHUB_ACTIONS`) and GitLab CI (`GITLAB_CI`). Every other process is left as configured, including jobs on other CI systems: they write whenever their credentials allow, so give their pull request jobs read-only credentials or set `KACHE_REMOTE_READONLY=1`. On a laptop `kache sync --push` still works; set `remote_readonly = true` under `[cache]` there when you want reads without writes.
 

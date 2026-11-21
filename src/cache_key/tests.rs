@@ -18502,6 +18502,62 @@ fn a_tree_that_moved_while_it_was_read_is_not_memoised() {
     );
 }
 
+/// A guard's check asks for the walk a unit stamping the root asks for, so
+/// the two share walks: behind a walk that is under way, both wait for the
+/// next one.
+#[test]
+fn a_guard_check_and_a_unit_wait_for_the_same_stamp_walk() {
+    let patience = std::time::Duration::from_secs(10);
+    let dir = tempfile::tempdir().unwrap();
+    write_file(&dir.path().join("src/lib.rs"), "");
+    let root = TreeRoot::new(dir.path().to_path_buf(), b"workspace", &[]).walked();
+    let guard = GuardWalk {
+        root: root.clone(),
+        max_entries: 10,
+        stamp: stamp_root(&root, 10).unwrap().digest,
+    };
+    let key = (root.clone(), 10);
+    let (walking, wait_walking) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    // A walk of the root, held under way until it is released or the test
+    // has failed.
+    let held = std::thread::spawn({
+        let (key, root) = (key.clone(), root.clone());
+        move || {
+            STAMP_WALKS.run(&key, || {
+                walking.send(()).unwrap();
+                let _ = wait_release.recv();
+                walk_one_root(&root, 10)
+            })
+        }
+    });
+    wait_walking
+        .recv_timeout(patience)
+        .expect("the walk starts");
+    let (answered, wait_answered) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let answered = answered.clone();
+        move || answered.send(guard.holds())
+    });
+    std::thread::spawn({
+        let root = root.clone();
+        move || answered.send(stamp_roots(&[root], 10).is_ok())
+    });
+    let deadline = std::time::Instant::now() + patience;
+    while STAMP_WALKS.parked(&key) != 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the check and the unit never waited for one walk"
+        );
+        std::thread::yield_now();
+    }
+    release.send(()).unwrap();
+    for _ in 0..2 {
+        assert_eq!(wait_answered.recv_timeout(patience), Ok(true));
+    }
+    assert!(held.join().unwrap().is_ok());
+}
+
 /// What a [`tree_unit`] gave: its digest, and how many files it read.
 #[cfg(unix)]
 struct TreeUnit(std::sync::mpsc::Receiver<(Option<String>, u64)>);
@@ -18768,7 +18824,7 @@ fn guard_stamp_collection_respects_kinds_exclusions_and_build_tags() {
     let root = TreeRoot::new(dir.path().to_path_buf(), b"workspace", &["excluded"])
         .skipping_build_dirs()
         .walked();
-    let stamped = stamp_roots(std::slice::from_ref(&root), 20, true)
+    let stamped = stamp_roots(std::slice::from_ref(&root), 20)
         .unwrap()
         .pop()
         .unwrap();
@@ -18794,15 +18850,8 @@ fn guard_stamp_collection_respects_kinds_exclusions_and_build_tags() {
     } else {
         assert!(collected.is_empty());
     }
-    let default = stamp_roots(std::slice::from_ref(&root), 20, false)
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert!(default.small_files.is_empty());
-    assert_eq!(stamped.stamp.digest, default.stamp.digest);
-    assert_eq!(stamped.entries, default.entries);
     assert!(matches!(
-        stamp_roots(&[root], 1, true),
+        stamp_roots(&[root], 1),
         Err(StampRefusal::TooLarge(0))
     ));
 }
@@ -18833,11 +18882,7 @@ fn guard_file_memos_do_not_merge_lossy_path_spellings() {
     write_file(&paths[0], "first");
     write_file(&paths[1], "other");
     let roots = [TreeRoot::new(dir.path().to_path_buf(), b"workspace", &[]).walked()];
-    assert!(
-        stamp_roots(&roots, 10, true).unwrap()[0]
-            .small_files
-            .is_empty()
-    );
+    assert!(stamp_roots(&roots, 10).unwrap()[0].small_files.is_empty());
     let db = rusqlite::Connection::open_in_memory().unwrap();
     ensure_file_hash_cache_schema(&db).unwrap();
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));

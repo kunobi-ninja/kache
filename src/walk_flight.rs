@@ -76,6 +76,16 @@ impl<K: Eq + Hash + Clone, V: Clone> NextFlight<K, V> {
         slot
     }
 
+    /// How many callers wait for a walk of `key` to end.
+    #[cfg(test)]
+    pub(crate) fn parked(&self, key: &K) -> usize {
+        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        slots.get(key).map_or(0, |slot| {
+            let state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.parked
+        })
+    }
+
     fn leave(&self, key: &K, slot: &Arc<Slot<V>>) {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let mut callers = slot.callers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -309,13 +319,9 @@ mod tests {
     use std::sync::{Barrier, mpsc};
     use std::time::Duration;
 
-    fn wait_for_parked<V>(flights: &Arc<NextFlight<u32, V>>, key: &u32, parked: usize) {
+    fn wait_for_parked<V: Clone>(flights: &Arc<NextFlight<u32, V>>, key: &u32, parked: usize) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let slot = Arc::clone(&flights.slots.lock().unwrap()[key]);
-            if slot.state.lock().unwrap().parked == parked {
-                return;
-            }
+        while flights.parked(key) != parked {
             assert!(std::time::Instant::now() < deadline, "callers never parked");
             std::thread::yield_now();
         }

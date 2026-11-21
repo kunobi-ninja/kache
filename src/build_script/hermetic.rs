@@ -53,7 +53,7 @@ const ROOT: &str = "out-dirs/v2";
 const SEALED: &str = ".kache-sealed";
 /// In the sandbox: where the script binary runs from.
 const BIN: &str = ".kache-bin";
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 
 /// What a sealed run printed. Its paths name the shared `OUT_DIR`.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,6 +61,15 @@ struct Record {
     version: u32,
     stdout: String,
     stderr: String,
+}
+
+/// Keep the version and script output at the top level so older readers
+/// recognize a newer seal and leave its existing links alone.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Seal<T> {
+    #[serde(flatten)]
+    record: T,
+    tree: String,
 }
 
 /// Where one key's run lives.
@@ -530,8 +539,17 @@ fn sealed(sandbox: &Sandbox) -> Result<Option<Record>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let record: Record = serde_json::from_slice(&bytes)?;
-    Ok((record.version == RECORD_VERSION && sandbox.out_dir.is_dir()).then_some(record))
+    let Ok(seal) = serde_json::from_slice::<Seal<Record>>(&bytes) else {
+        // Old records do not describe the original files. A damaged record
+        // cannot vouch for them either.
+        return Ok(None);
+    };
+    if seal.record.version != RECORD_VERSION {
+        return Ok(None);
+    }
+    Ok(output_digest(&sandbox.out_dir)
+        .is_ok_and(|digest| digest == seal.tree)
+        .then_some(seal.record))
 }
 
 /// Run the script in `sandbox`. `None` when the result must not be shared.
@@ -655,6 +673,9 @@ fn escape(sandbox: &Sandbox) -> Result<Option<PathBuf>> {
             let path = entry?.path();
             let kind = std::fs::symlink_metadata(&path)?.file_type();
             if path.starts_with(&sandbox.out_dir) {
+                if !(kind.is_file() || kind.is_symlink() || kind.is_dir()) {
+                    return Ok(Some(path));
+                }
                 if kind.is_symlink()
                     && !super::link_stays_inside(
                         path.strip_prefix(&sandbox.out_dir)?,
@@ -683,9 +704,54 @@ fn escape(sandbox: &Sandbox) -> Result<Option<PathBuf>> {
 fn seal(sandbox: &Sandbox, record: &Record) -> Result<()> {
     read_only(&sandbox.out_dir)?;
     let temporary = sandbox.root.join(format!("{SEALED}.tmp"));
-    std::fs::write(&temporary, serde_json::to_vec(record)?)?;
+    let seal = Seal {
+        record,
+        tree: output_digest(&sandbox.out_dir)?,
+    };
+    std::fs::write(&temporary, serde_json::to_vec(&seal)?)?;
     std::fs::rename(&temporary, sandbox.root.join(SEALED))?;
     Ok(())
+}
+
+/// Hash the actual sealed files on every reuse. A same-length edit can keep
+/// its timestamp. Record link text without following it and include empty
+/// directories and file modes, which can affect a later build.
+fn output_digest(root: &Path) -> Result<String> {
+    anyhow::ensure!(
+        std::fs::symlink_metadata(root)?.is_dir(),
+        "missing output directory"
+    );
+    let mut hash = blake3::Hasher::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let meta = std::fs::symlink_metadata(&path)?;
+        let name = path.strip_prefix(root)?.as_os_str().as_encoded_bytes();
+        if meta.is_dir() {
+            fold(&mut hash, "directory", name);
+            let mut entries = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
+            pending.extend(entries.into_iter().map(|entry| entry.path()));
+        } else if meta.is_symlink() {
+            fold(&mut hash, "symlink", name);
+            fold(
+                &mut hash,
+                "target",
+                std::fs::read_link(path)?.as_os_str().as_encoded_bytes(),
+            );
+        } else {
+            anyhow::ensure!(meta.is_file(), "unsupported shared output");
+            fold(&mut hash, "file", name);
+            let mut content = blake3::Hasher::new();
+            content.update_reader(std::fs::File::open(path)?)?;
+            fold(&mut hash, "content", content.finalize().as_bytes());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fold(&mut hash, "mode", &meta.permissions().mode().to_le_bytes());
+        }
+    }
+    Ok(hash.finalize().to_hex().to_string())
 }
 
 fn read_only(path: &Path) -> Result<()> {
@@ -1353,7 +1419,7 @@ mod tests {
 
         std::fs::write(
             sandbox.root.join(SEALED),
-            br#"{"version":99,"stdout":"","stderr":""}"#,
+            serde_json::to_vec(&serde_json::json!({"version": 99, "stdout": "", "stderr": "", "tree": output_digest(&sandbox.out_dir).unwrap()})).unwrap(),
         )
         .unwrap();
         assert_eq!(sealed(&sandbox).unwrap(), None, "another record version");
@@ -1361,6 +1427,50 @@ mod tests {
         remove_sandbox(&sandbox.root).unwrap();
         assert!(!sandbox.root.exists());
         remove_sandbox(&sandbox.root).unwrap();
+    }
+
+    #[test]
+    fn seal_covers_tree_contents_names_modes_and_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_in(dir.path());
+        let root = &sandbox.out_dir;
+        let file = root.join("generated");
+        let empty = root.join("empty");
+        let link = root.join("link");
+        std::fs::write(&file, "before").unwrap();
+        std::fs::create_dir(&empty).unwrap();
+        symlink("generated", &link).unwrap();
+        let identity = || output_digest(root).unwrap();
+        let initial = identity();
+        std::fs::write(&file, "edited").unwrap();
+        assert_ne!(identity(), initial);
+        std::fs::write(&file, "before").unwrap();
+        assert_eq!(identity(), initial);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+        assert_ne!(identity(), initial);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink("empty", &link).unwrap();
+        assert_ne!(identity(), initial);
+        std::fs::remove_file(&link).unwrap();
+        symlink("generated", &link).unwrap();
+        std::fs::rename(&empty, root.join("renamed")).unwrap();
+        assert_ne!(identity(), initial);
+        std::fs::remove_dir(root.join("renamed")).unwrap();
+        assert_ne!(identity(), initial);
+        let socket = root.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&socket)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(output_digest(root).is_err());
+        assert_eq!(escape(&sandbox).unwrap(), Some(socket));
+        assert!(output_digest(&link).is_err());
     }
 
     /// A link's own mode is its target's, so sealing through it would make

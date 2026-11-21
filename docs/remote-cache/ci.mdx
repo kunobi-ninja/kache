@@ -72,7 +72,7 @@ The `save-cache` input above belongs to kache-action. maturin-action has no equi
 
 Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.
 
-On GitHub Actions and GitLab CI, a **push to a protected branch** can write to the remote cache. Other jobs are read-only by default. `KACHE_REMOTE_READONLY=0` still respects this policy. The exceptions are scheduled GitHub Actions jobs that opt in and pull request jobs with a prefix of their own.
+On GitHub Actions and GitLab CI, a **push to a protected branch** can write to the remote cache. Other jobs are read-only by default. `KACHE_REMOTE_READONLY=0` still respects this policy. The exceptions are scheduled and merge group GitHub Actions jobs that opt in, and pull request jobs with a prefix of their own.
 
 To warm the remote cache from a scheduled GitHub Actions job, set this in that job's environment:
 
@@ -82,6 +82,15 @@ env:
 ```
 
 GitHub runs scheduled workflows on the default branch. The branch must be protected and the job must have write access to the remote. `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` still suppresses uploads. GitLab schedules remain read-only.
+
+To warm the remote cache from a GitHub merge queue, set this in the environment of the jobs that run on `merge_group`:
+
+```yaml
+env:
+  KACHE_GITHUB_MERGE_GROUP_WRITES: "1"
+```
+
+GitHub starts a merge group only for a branch whose rules require a merge queue. The group's own `gh-readonly-queue/...` branch is never protected, so Kache does not check protection for it. A push to a branch with that name is not a merge group and follows the push rule. Other events ignore the setting. The job must have write access to the remote. `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` still suppresses uploads.
 
 For a branch to count as protected, GitHub must set `GITHUB_REF_PROTECTED=true` or GitLab must set `CI_COMMIT_REF_PROTECTED=true`. Check the `Remote writes` row of `kache doctor` for the effective mode.
 
@@ -122,7 +131,7 @@ pull_request_prefix = "artifacts-pr"
 - reads the base prefix first and the pull request prefix for what the base lacks;
 - writes entries, build manifests, shards and prediction rows only under the pull request prefix.
 
-Every other job ignores the setting: protected-branch pushes and scheduled runs never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
+Every other job ignores the setting: protected-branch pushes, scheduled runs and merge groups never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
 
 A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so it never hands uploads to a protected-branch job's daemon or reads through one. It still must not share a local store with trusted jobs: an artifact it compiles there would be a local hit for the next trusted build. Keep pull request jobs off the persistent disk described in [Ephemeral and persistent runners](#ephemeral-and-persistent-runners).
 

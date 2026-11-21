@@ -1579,7 +1579,7 @@ fn root_digest(
         }
         let excluded = root.excluded();
         let _trace_fold = crate::phase_trace::phase("tree_fold");
-        let Some(read_every_file) = crate_tree_fold(
+        let Some(unread) = crate_tree_fold(
             &root.path,
             &root.path,
             GuardSkips {
@@ -1600,9 +1600,14 @@ fn root_digest(
             };
         };
         let digest = hasher.finalize().to_hex().to_string();
-        // The stamp shows a directory becoming listable, but not a file becoming
-        // readable where there is no change time.
-        let recorded = read_every_file && memoise_tree_digest(&memo, walk, stamp, &digest, now);
+        // The stamp counts what its walk could not list or stat, and changes
+        // once that can be read. It shows neither a failure the fold alone
+        // met, nor a file becoming readable where there is no change time.
+        let stamped = Unread {
+            entries: stamp.unreadable,
+            files: 0,
+        };
+        let recorded = unread == stamped && memoise_tree_digest(&memo, walk, stamp, &digest, now);
         TreeFold {
             digest: Some(digest),
             recorded,
@@ -1612,9 +1617,9 @@ fn root_digest(
     // would fold the same bytes. A unit that arrives while another folds
     // waits for that fold and takes its digest when the memo took it too: the
     // memo would have answered the unit with the same digest a moment later.
-    // A fold the memo refused, of a tree that moved or of a file that could
-    // not be read, is its unit's alone, and the others fold as they always
-    // have.
+    // A fold the memo refused, of a tree that moved or of something the stamp
+    // walk had read and the fold could not, is its unit's alone, and the
+    // others fold as they always have.
     let folded = if stamp.settled_at(now) {
         TREE_FOLDS.run(&fold_key, fold, |folded| folded.recorded)
     } else {
@@ -1629,7 +1634,8 @@ struct TreeFold {
     /// `None` when the root could not be listed or ran past its budget.
     digest: Option<String>,
     /// Whether the digest was one for the memo ([`memoise_tree_digest`]):
-    /// every file was read, and the tree kept its stamp while they were.
+    /// the fold read what the stamp walk had and every file, and the tree
+    /// kept its stamp meanwhile.
     recorded: bool,
 }
 
@@ -1742,13 +1748,23 @@ struct GuardFileHashes<'a, 'db> {
     memoised: HashMap<FileFingerprint, String>,
 }
 
+/// What a content fold of a tree could not read.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Unread {
+    /// Directories it could not list and entries it could not stat, as the
+    /// stamp walk counts them ([`crate::tree_stamp::TreeStamp::unreadable`]).
+    entries: usize,
+    /// Files whose content it could not read. A stamp walk opens none.
+    files: usize,
+}
+
 /// Fold the entries under `directory` by path, kind and content. A symlink
 /// counts by its text and is not followed. With `skips_build_dirs`, a
 /// directory below `root` that Cargo tagged as its build directory counts by
 /// its tag alone. Below `root`, what cannot be read counts as unreadable: a
-/// proc macro this process starts cannot read it either. `Some(false)` when
-/// that includes a file: where there is no change time, a file that becomes
-/// readable keeps its stamp.
+/// proc macro this process starts cannot read it either. The fold says how
+/// much that was, and gives `None` for a root it could not list or a tree
+/// past `budget`.
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
@@ -1757,14 +1773,17 @@ fn crate_tree_fold(
     files: &GuardFileHashes<'_, '_>,
     hasher: &mut blake3::Hasher,
     budget: &mut usize,
-) -> Option<bool> {
+) -> Option<Unread> {
     let listed = std::fs::read_dir(directory)
         .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
     let mut entries = match listed {
         Ok(entries) => entries,
         Err(_) if directory != root => {
             fold_field(hasher, b"unreadable:", b"");
-            return Some(true);
+            return Some(Unread {
+                entries: 1,
+                files: 0,
+            });
         }
         Err(_) => return None,
     };
@@ -1772,7 +1791,7 @@ fn crate_tree_fold(
     if skips_build_dirs && directory != root {
         crate::tree_stamp::keep_only_build_tag(&mut entries);
     }
-    let mut read_every_file = true;
+    let mut unread = Unread::default();
     for entry in entries {
         let path = entry.path();
         if excluded.skips(&path, &entry) {
@@ -1784,20 +1803,26 @@ fn crate_tree_fold(
         // A memo row settles against the clock before this content walk's
         // fresh stat, never against metadata from the earlier stamp walk.
         let observed_ns = wall_clock_ns();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        // An entry's stat and link read fail as one, as the stamp walk counts
+        // them.
+        let read = std::fs::symlink_metadata(&path).and_then(|metadata| {
+            let link = metadata
+                .file_type()
+                .is_symlink()
+                .then(|| std::fs::read_link(&path))
+                .transpose()?;
+            Ok((metadata, link))
+        });
+        let Ok((metadata, link)) = read else {
             fold_field(hasher, b"unreadable:", b"");
+            unread.entries += 1;
             continue;
         };
-        if metadata.file_type().is_symlink() {
-            match std::fs::read_link(&path) {
-                Ok(target) => {
-                    fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
-                }
-                Err(_) => fold_field(hasher, b"unreadable:", b""),
-            }
+        if let Some(target) = link {
+            fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
         } else if metadata.is_dir() {
             fold_field(hasher, b"dir:", b"");
-            read_every_file &= crate_tree_fold(
+            let below = crate_tree_fold(
                 root,
                 &path,
                 excluded,
@@ -1806,6 +1831,8 @@ fn crate_tree_fold(
                 hasher,
                 budget,
             )?;
+            unread.entries += below.entries;
+            unread.files += below.files;
         } else if metadata.is_file() {
             match files.hasher.guard_file_hash_from_metadata(
                 &path,
@@ -1816,14 +1843,14 @@ fn crate_tree_fold(
                 Ok(hash) => fold_field(hasher, b"file:", hash.as_bytes()),
                 Err(_) => {
                     fold_field(hasher, b"unreadable:", b"");
-                    read_every_file = false;
+                    unread.files += 1;
                 }
             }
         } else {
             fold_field(hasher, b"other:", b"");
         }
     }
-    Some(read_every_file)
+    Some(unread)
 }
 
 thread_local! {

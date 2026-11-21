@@ -15,6 +15,10 @@ pub(crate) struct TreeStamp {
     /// [`Self::digest`] without the roots' own metadata
     /// ([`StampRules::root_metadata`]): the same where none was stamped.
     pub(crate) entries: String,
+    /// How many directories the walk could not list and entries it could not
+    /// stat ([`StampRules::unreadable_entries`]). A content digest that met
+    /// more or fewer met a failure this stamp does not show.
+    pub(crate) unreadable: usize,
     /// The newest modification time seen in the walk.
     newest: std::time::SystemTime,
 }
@@ -88,6 +92,7 @@ pub(crate) struct Stamper {
     hasher: blake3::Hasher,
     /// The roots' own metadata, kept apart from the entries.
     roots: Option<blake3::Hasher>,
+    unreadable: usize,
     newest: std::time::SystemTime,
 }
 
@@ -96,6 +101,7 @@ impl Stamper {
         Self {
             hasher: blake3::Hasher::new(),
             roots: None,
+            unreadable: 0,
             newest: std::time::SystemTime::UNIX_EPOCH,
         }
     }
@@ -192,6 +198,7 @@ impl Stamper {
                         "unlisted",
                         relative.as_os_str().as_encoded_bytes(),
                     );
+                    self.unreadable += 1;
                     continue;
                 }
                 Err(error)
@@ -237,6 +244,7 @@ impl Stamper {
                             "unreadable",
                             relative.as_os_str().as_encoded_bytes(),
                         );
+                        self.unreadable += 1;
                         continue;
                     }
                     Err(_) => return WalkOutcome::Unreadable,
@@ -298,6 +306,7 @@ impl Stamper {
         TreeStamp {
             digest: digest.to_hex().to_string(),
             entries: entries.to_hex().to_string(),
+            unreadable: self.unreadable,
             newest: self.newest,
         }
     }
@@ -575,6 +584,7 @@ mod tests {
         let stamp = TreeStamp {
             digest: String::new(),
             entries: String::new(),
+            unreadable: 0,
             newest,
         };
         assert!(stamp.settled_at(newest + TreeStamp::SETTLE));
@@ -718,7 +728,8 @@ mod tests {
     }
 
     /// A directory that cannot be listed, or an entry that cannot be stat'ed,
-    /// refuses the tree unless the rules stamp it as unreadable.
+    /// refuses the tree unless the rules stamp it as unreadable. The stamp
+    /// then counts it.
     #[cfg(unix)]
     #[test]
     fn what_cannot_be_read_is_stamped_as_unreadable_or_refuses_the_tree() {
@@ -744,6 +755,11 @@ mod tests {
             unreadable_entries: true,
             ..StampRules::default()
         };
+        let counted = || {
+            let mut stamper = Stamper::new();
+            stamper.walk(dir.path(), &[], unreadable, &mut 10);
+            stamper.finish().unreadable
+        };
         assert_eq!(
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Unreadable
@@ -754,6 +770,7 @@ mod tests {
             (WalkOutcome::Fits, 3),
             "`src`, its file, `data`"
         );
+        assert_eq!(counted(), 1, "`data`");
 
         // Listed, but its entries cannot be stat'ed.
         mode(0o444).unwrap();
@@ -764,11 +781,13 @@ mod tests {
         let (outcome, unstated, spent) = walk(dir.path(), unreadable, 10);
         assert_eq!((outcome, spent), (WalkOutcome::Fits, 4));
         assert_ne!(unstated, unlisted);
+        assert_eq!(counted(), 1, "`PG_VERSION`");
 
         mode(0o755).unwrap();
         let (outcome, readable, _) = walk(dir.path(), unreadable, 10);
         assert_eq!(outcome, WalkOutcome::Fits);
         assert_ne!(readable, unstated);
+        assert_eq!(counted(), 0);
         assert_eq!(
             walk(dir.path(), StampRules::default(), 10).0,
             WalkOutcome::Fits

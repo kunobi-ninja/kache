@@ -100,8 +100,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
 pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let cargo = real_cargo_program(true)?;
     let env = crate::invocation::InvocationEnv::capture();
-    let shims_above = cargo_shims_above(env.var_os(CARGO_SHIM_DEPTH_ENV).as_deref());
-    check_cargo_shim_depth(shims_above, &cargo)?;
+    let depth = cargo_child_depth(&env, &cargo)?;
     let config =
         crate::config::Config::load_for(&env).context("loading the cache configuration")?;
     let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
@@ -122,7 +121,7 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     }
     let mut command = Command::new(&cargo);
     command.args(&cargo_args);
-    command.env(CARGO_SHIM_DEPTH_ENV, next_cargo_shim_depth(shims_above));
+    command.env(CARGO_SHIM_DEPTH_ENV, depth);
     check_targets::configure(&mut command, &cargo, &config, &env);
     crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
     run_cargo_and_exit(command, &cargo, lease, &config)
@@ -174,10 +173,19 @@ fn check_cargo_shim_depth(above: u32, cargo: &Path) -> Result<()> {
     )
 }
 
+/// Both the shim and the explicit proxy can be reached through another
+/// Cargo launcher. Count every child, including Cargo discovery probes.
+fn cargo_child_depth(env: &crate::invocation::InvocationEnv, cargo: &Path) -> Result<String> {
+    let above = cargo_shims_above(env.var_os(CARGO_SHIM_DEPTH_ENV).as_deref());
+    check_cargo_shim_depth(above, cargo)?;
+    Ok(next_cargo_shim_depth(above))
+}
+
 fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     let cargo = real_cargo_program(false)?;
     let env = crate::invocation::InvocationEnv::capture();
+    let depth = cargo_child_depth(&env, &cargo)?;
     let config = crate::config::Config::load_for(&env)?;
     let check_target = check_targets::plan(&cwd, &cargo_args, &cargo, &config, &env);
 
@@ -243,10 +251,11 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
     }
 
     let overrides = cargo_overrides(rustflags.as_deref(), isolate_build_dir, || {
-        cargo_version(&cargo, &cargo_args, &cwd)
+        cargo_version(&cargo, &cargo_args, &cwd, &depth)
     });
     let mut command = Command::new(&cargo);
     command
+        .env(CARGO_SHIM_DEPTH_ENV, depth)
         .args(cargo_invocation_args(&cargo_args, &overrides.config))
         .current_dir(&cwd);
     if let Some(flags) = &overrides.encoded_rustflags {
@@ -828,9 +837,15 @@ fn cargo_at_least(version: Option<CargoVersion>, minimum: CargoVersion) -> bool 
 
 /// Ask the Cargo that will run the build for its version, through the same
 /// launcher and toolchain selector.
-fn cargo_version(cargo: &Path, cargo_args: &[OsString], cwd: &Path) -> Option<CargoVersion> {
+fn cargo_version(
+    cargo: &Path,
+    cargo_args: &[OsString],
+    cwd: &Path,
+    depth: &str,
+) -> Option<CargoVersion> {
     let (selector, _) = split_toolchain_selector(cargo_args);
     let output = Command::new(cargo)
+        .env(CARGO_SHIM_DEPTH_ENV, depth)
         .args(selector)
         .arg("-V")
         .current_dir(cwd)

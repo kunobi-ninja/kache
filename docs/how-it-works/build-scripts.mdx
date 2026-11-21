@@ -358,8 +358,10 @@ The regular cache cannot check for such values.
   and then only descend (`lib/foo -> sub/../libfoo.so.1` does not). Otherwise
   the script runs as usual.
 - A kept run is made read-only, and Cargo's `OUT_DIR` becomes a symlink to it.
-  A hit creates that link: nothing is copied, and every worktree shares one
-  copy. `rustc-link-search` lines are replayed with Cargo's own `OUT_DIR`, so
+  Before linking an existing run, Kache checks its contents against the digest
+  recorded when the script finished. A missing or changed file, or an older
+  run without a digest, sends the build through the regular build-script cache.
+  `rustc-link-search` lines are replayed with Cargo's own `OUT_DIR`, so
   `cargo run` and `cargo test` still find libraries there.
 - The first run of a script records what it declares, so hermetic runs start
   with the second.

@@ -179,6 +179,51 @@ fn changed_timestamp(hermetic: bool, directory: bool) {
 }
 
 #[test]
+fn damaged_sealed_output_falls_back_to_the_original_generated_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    fixture(&source, false);
+    std::fs::write(
+        source.join("build.rs"),
+        r#"fn main() {
+        println!("cargo:rerun-if-changed=build.rs");
+        let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        std::fs::write(out.join("generated"), "original").unwrap();
+    }"#,
+    )
+    .unwrap();
+    let consumer = source.join("src/main.rs");
+    let print =
+        r#"fn main() { println!("{}", include_str!(concat!(env!("OUT_DIR"), "/generated"))); }"#;
+    std::fs::write(&consumer, print).unwrap();
+    let cache = root.join("cache");
+    configure(&cache);
+    let _daemon = DaemonGuard::new(kache_binary(), &cache);
+    build(&source, &root.join("t0"), &cache, true, false, "original");
+    build(&source, &root.join("t1"), &cache, true, false, "original");
+    let tree = cache.join("out-dirs/v2");
+    let pattern = format!(
+        "{}/**/generated",
+        glob::Pattern::escape(tree.to_str().unwrap())
+    );
+    let shared = glob::glob(&pattern).unwrap().next().unwrap().unwrap();
+    let permissions = shared.metadata().unwrap().permissions();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&shared, "modified").unwrap();
+    std::fs::set_permissions(&shared, permissions).unwrap();
+    // Make rustc consume the generated file again in a fresh target.
+    std::fs::write(&consumer, format!("{print}\n// new consumer")).unwrap();
+    build(&source, &root.join("t2"), &cache, true, false, "original");
+    assert_eq!(
+        std::fs::read(&shared).unwrap(),
+        b"modified",
+        "existing consumers keep their tree"
+    );
+}
+
+#[test]
 fn declared_file_timestamp_changes_do_not_replay_stale_outputs() {
     changed_timestamp(false, false);
 }

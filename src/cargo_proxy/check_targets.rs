@@ -54,6 +54,7 @@ pub(super) fn plan(
     // workspace discovery, including members with an explicit workspace path.
     let mut locate = env.command(cargo).ok()?;
     locate
+        .env(CARGO_SHIM_DEPTH_ENV, cargo_child_depth(env, cargo).ok()?)
         .current_dir(cwd)
         .args(split_toolchain_selector(args).0)
         .args(["locate-project", "--workspace", "--message-format", "plain"]);
@@ -245,7 +246,10 @@ mod tests {
         let manifest = project.join("Cargo.toml");
         kache_fs::testutil::write_executable(
             &cargo,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", manifest.display()),
+            format!(
+                "#!/bin/sh\n[ \"$KACHE_CARGO_SHIM_DEPTH\" = 1 ] || exit 1\nprintf '%s\\n' '{}'\n",
+                manifest.display()
+            ),
         );
         let config = crate::test_support::test_config(root.join("cache"));
         let env = InvocationEnv::from_parts(

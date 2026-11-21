@@ -443,6 +443,55 @@ fn collapsed_single_use_rustc_option_passes_cargo_target_probe() {
     );
 }
 
+#[test]
+fn explicit_cargo_checks_depth_before_probing_and_passes_it_to_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cache = dir.path().join("cache");
+    let cargo = dir.path().join("cargo");
+    let calls = dir.path().join("calls");
+    std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    kache_fs::testutil::write_executable(
+        &cargo,
+        r#"#!/bin/sh
+echo "$KACHE_CARGO_SHIM_DEPTH $*" >> "$CALLS"
+echo 'cargo 1.99.0'
+"#,
+    );
+    let run = |depth| {
+        let mut command = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")));
+        command
+            .current_dir(&home)
+            .args(["cargo", "--", "build"])
+            .env("HOME", &home)
+            .env("CARGO_HOME", home.join(".cargo"))
+            .env("CALLS", &calls)
+            .env("KACHE_REAL_CARGO", &cargo)
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env("KACHE_CARGO_SHIM_DEPTH", depth)
+            .output()
+            .unwrap()
+    };
+    let blocked = run("8");
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("8 levels deep"));
+    assert!(!calls.exists());
+    let allowed = run("7");
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(calls.lines().any(|line| line == "8 -V"), "{calls}");
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.starts_with("8 ") && line.ends_with(" build")),
+        "{calls}"
+    );
+}
+
 /// A stand-in Cargo that reports 1.91.0 under the `+new` selector and
 /// `version` otherwise, and records the arguments of any other command.
 fn versioned_fake_cargo(path: &Path, version: &str) {

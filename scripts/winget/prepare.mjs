@@ -51,11 +51,10 @@ function yamlFiles(directory) {
 }
 
 function checkCommands(commands) {
+  const allowed = ['["kache"]', '["kache","kache-cl","kache-clang-cl"]'];
   assert(
-    [
-      '["kache"]',
-      '["kache","kache-clang-cl","kache-cl"]',
-    ].includes(JSON.stringify(commands)),
+    Array.isArray(commands) &&
+      allowed.includes(JSON.stringify([...commands].sort())),
     "unexpected command aliases",
   );
 }

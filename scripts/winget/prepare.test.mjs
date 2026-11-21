@@ -124,6 +124,10 @@ for (const unstable of [false, true]) {
 
 test("native compiler launchers get portable aliases and survive later base manifests", (t) => {
   const f = fixture(t, { launchers: true });
+  f.data.installer.Commands = ["kache", "kache-cl", "kache-clang-cl"];
+  f.base.Commands = [...f.data.installer.Commands];
+  f.write();
+  f.writeBase();
   prepare(f.args);
   const installer = f.read();
   assert.deepEqual(installer.Commands, ["kache", "kache-clang-cl", "kache-cl"]);

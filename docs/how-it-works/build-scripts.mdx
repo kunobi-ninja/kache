@@ -226,7 +226,8 @@ a `passthrough` whose reason says `build-script cache bypassed` or
   more on the tree it left and records that run instead; Cargo sees only the
   second run's output. A script whose second run writes into its inputs again
   is not run twice after that.
-- An `OUT_DIR` and named target files that together pass 1 GiB or 50,000
+- An `OUT_DIR` and named target files that together pass
+  `cache.build_script_out_dir_max_size` (5 GiB by default) or 50,000
   non-empty files and symlinks, a named target path that is itself a symlink,
   or an `OUT_DIR` link whose resolved target is outside the roots listed
   above. A relative link confined to `OUT_DIR`, or a link in a named target

@@ -229,7 +229,9 @@ fn size_key(key: &str) -> Option<bool> {
         | "cache.event_archive_max_size"
         | "cache.prefetch_max_bytes"
         | "cache.auto_recover_min_free_bytes" => Some(true),
-        "cache.restore_max_size" | "cache.remote_upload_memory_bytes" => Some(false),
+        "cache.restore_max_size"
+        | "cache.remote_upload_memory_bytes"
+        | "cache.build_script_out_dir_max_size" => Some(false),
         _ => None,
     }
 }
@@ -375,6 +377,7 @@ mod tests {
             "auto_recover_min_free_bytes",
             "restore_max_size",
             "remote_upload_memory_bytes",
+            "build_script_out_dir_max_size",
         ] {
             let dotted = format!("cache.{key}");
             for raw in ["1.5 GiB", "500MB", "4096"] {
@@ -403,7 +406,10 @@ mod tests {
                 assert!(edit(&path, &dotted, Some(raw)).is_err(), "{dotted}={raw}");
                 assert_eq!(fs::read_to_string(&path).unwrap(), original);
             }
-            if matches!(key, "restore_max_size" | "remote_upload_memory_bytes") {
+            if matches!(
+                key,
+                "restore_max_size" | "remote_upload_memory_bytes" | "build_script_out_dir_max_size"
+            ) {
                 assert!(edit(&path, &dotted, Some("0B")).is_err());
                 assert_eq!(fs::read_to_string(&path).unwrap(), original);
             } else {

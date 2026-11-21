@@ -76,14 +76,15 @@ pub(super) fn manifest_version(has_symlinks: bool, rewrites_text: bool, has_outs
     }
 }
 
-/// Bytes and entries still available after `OUT_DIR` took its share of the cap.
-pub(super) fn budget(used_bytes: u64, used_entries: usize) -> Result<(u64, usize)> {
+/// Bytes and entries still available after `OUT_DIR` took its share of the
+/// cap of `max_bytes` and [`super::MAX_OUT_DIR_FILES`].
+pub(super) fn budget(max_bytes: u64, used_bytes: u64, used_entries: usize) -> Result<(u64, usize)> {
     anyhow::ensure!(
-        used_bytes <= super::MAX_OUT_DIR_BYTES && used_entries <= super::MAX_OUT_DIR_FILES,
+        used_bytes <= max_bytes && used_entries <= super::MAX_OUT_DIR_FILES,
         "OUT_DIR is too large to record"
     );
     Ok((
-        super::MAX_OUT_DIR_BYTES - used_bytes,
+        max_bytes - used_bytes,
         super::MAX_OUT_DIR_FILES - used_entries,
     ))
 }
@@ -92,7 +93,7 @@ pub(super) fn budget(used_bytes: u64, used_entries: usize) -> Result<(u64, usize
 pub(super) fn file_bytes(files: &[(PathBuf, String)]) -> Result<u64> {
     let mut total = 0u64;
     for (path, _) in files {
-        total += std::fs::metadata(path)?.len();
+        total = total.saturating_add(std::fs::metadata(path)?.len());
     }
     Ok(total)
 }
@@ -134,10 +135,11 @@ impl Budget {
 pub(super) fn collect(
     stdout: &str,
     environment: &Environment,
+    max_bytes: u64,
     used_bytes: u64,
     used_entries: usize,
 ) -> Result<OutsideContents> {
-    let (bytes_left, entries_left) = budget(used_bytes, used_entries)?;
+    let (bytes_left, entries_left) = budget(max_bytes, used_bytes, used_entries)?;
     let mut budget = Budget {
         bytes_left,
         entries_left,
@@ -900,11 +902,16 @@ mod tests {
 
     #[test]
     fn the_remaining_budget_is_what_out_dir_did_not_use() {
-        assert_eq!(budget(0, 0).unwrap(), (1 << 30, 50_000));
-        assert_eq!(budget(1, 2).unwrap(), ((1 << 30) - 1, 50_000 - 2));
-        assert_eq!(budget(1 << 30, 50_000).unwrap(), (0, 0));
-        assert!(budget((1 << 30) + 1, 0).is_err(), "bytes over the cap");
-        assert!(budget(0, 50_001).is_err(), "entries over the cap");
+        assert_eq!(budget(1 << 30, 0, 0).unwrap(), (1 << 30, 50_000));
+        assert_eq!(budget(1 << 30, 1, 2).unwrap(), ((1 << 30) - 1, 50_000 - 2));
+        assert_eq!(budget(1 << 30, 1 << 30, 50_000).unwrap(), (0, 0));
+        assert!(
+            budget(1 << 30, (1 << 30) + 1, 0).is_err(),
+            "bytes over the cap"
+        );
+        assert!(budget(1 << 30, 0, 50_001).is_err(), "entries over the cap");
+        assert_eq!(budget(10, 4, 0).unwrap(), (6, 50_000), "the configured cap");
+        assert!(budget(10, 11, 0).is_err());
     }
 
     #[test]
@@ -935,10 +942,10 @@ mod tests {
         assert_eq!(out_dir_share(&files, &[], 0).unwrap(), (6, 2));
         assert_eq!(out_dir_share(&files, &symlinks, 2).unwrap(), (6, 5));
         let (bytes, entries) = out_dir_share(&files, &symlinks, 49_997).unwrap();
-        assert_eq!(budget(bytes, entries).unwrap(), ((1 << 30) - 6, 0));
+        assert_eq!(budget(1 << 30, bytes, entries).unwrap(), ((1 << 30) - 6, 0));
         let (bytes, entries) = out_dir_share(&files, &symlinks, 49_998).unwrap();
         assert!(
-            budget(bytes, entries).is_err(),
+            budget(1 << 30, bytes, entries).is_err(),
             "rooted links share the cap"
         );
     }
@@ -1024,7 +1031,7 @@ mod tests {
             "cargo:rustc-link-search=native={}\n",
             lib.parent().unwrap().display()
         );
-        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 0, 0).unwrap();
         assert_eq!(
             contents
                 .files
@@ -1110,7 +1117,7 @@ mod tests {
             let stdout = format!("cargo:rustc-link-search=native={}\n", path.display());
             assert!(validate_named_paths(&stdout, &env).is_err());
             assert!(
-                collect(&stdout, &env, 0, 0).is_err(),
+                collect(&stdout, &env, 1 << 30, 0, 0).is_err(),
                 "record must refuse the whole run"
             );
             for broad in ["target", "target/debug/build"] {
@@ -1126,7 +1133,7 @@ mod tests {
             )]);
             validate_named_paths(&stdout, &env).unwrap();
             assert!(
-                collect(&stdout, &env, 0, 0).unwrap().is_empty(),
+                collect(&stdout, &env, 1 << 30, 0, 0).unwrap().is_empty(),
                 "the dependency owns this output"
             );
             env.dependency_roots = vec![path.join("too-specific")];
@@ -1173,7 +1180,7 @@ mod tests {
                     validate_named_paths(&stdout, &env).is_err(),
                     "{target_name}/{unit}"
                 );
-                assert!(collect(&stdout, &env, 0, 0).is_err());
+                assert!(collect(&stdout, &env, 1 << 30, 0, 0).is_err());
                 let build_stdout = format!("cargo:rustc-link-search={}\n", build.display());
                 assert!(validate_named_paths(&build_stdout, &env).is_err());
                 if unit.contains('/') {
@@ -1190,7 +1197,7 @@ mod tests {
                     dependency_roots([("DEP_Z_ROOT".into(), dependency.into_os_string())]);
                 validate_named_paths(&stdout, &env).unwrap();
                 assert!(
-                    collect(&stdout, &env, 0, 0).unwrap().is_empty(),
+                    collect(&stdout, &env, 1 << 30, 0, 0).unwrap().is_empty(),
                     "Cargo's dependency output is an input, never ours to restore"
                 );
                 let triple_stdout = format!(
@@ -1198,7 +1205,7 @@ mod tests {
                     directory.path().join("target").join(target_name).display()
                 );
                 assert!(
-                    collect(&triple_stdout, &env, 0, 0)
+                    collect(&triple_stdout, &env, 1 << 30, 0, 0)
                         .unwrap()
                         .files
                         .is_empty(),
@@ -1282,7 +1289,7 @@ mod tests {
                         "{alias}: {}",
                         path.display()
                     );
-                    assert!(collect(&stdout, &env, 0, 0).is_err());
+                    assert!(collect(&stdout, &env, 1 << 30, 0, 0).is_err());
                 }
                 let metadata = directory.path().join("metadata-outside-target");
                 std::os::unix::fs::symlink(&canonical_dependency, &metadata).unwrap();
@@ -1292,7 +1299,7 @@ mod tests {
                     let stdout =
                         format!("cargo:rustc-link-search={}\n", path.join("lib").display());
                     validate_named_paths(&stdout, &env).unwrap();
-                    assert!(collect(&stdout, &env, 0, 0).unwrap().is_empty());
+                    assert!(collect(&stdout, &env, 1 << 30, 0, 0).unwrap().is_empty());
                 }
                 let other = physical_profile
                     .join("build")
@@ -1384,7 +1391,7 @@ mod tests {
             std::fs::write(build.join("libdemo.a"), "archive").unwrap();
             let stdout = format!("cargo:rustc-link-search={}\n", build.display());
             assert!(validate_named_paths(&stdout, &env).is_err());
-            assert!(collect(&stdout, &env, 0, 0).is_err());
+            assert!(collect(&stdout, &env, 1 << 30, 0, 0).is_err());
             env.dependency_roots =
                 dependency_roots([("DEP_BROAD_ROOT".into(), build.into_os_string())]);
             assert!(
@@ -1533,7 +1540,7 @@ mod tests {
             lib.parent().unwrap().display(),
             deps.parent().unwrap().display(),
         );
-        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 0, 0).unwrap();
         assert_eq!(
             contents
                 .files
@@ -1562,7 +1569,7 @@ mod tests {
             "cargo:rustc-link-search={}\ncargo:rustc-link-search=/usr/lib\n",
             inside.display()
         );
-        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 0, 0).unwrap();
         assert!(contents.is_empty(), "{contents:?}");
     }
 
@@ -1597,7 +1604,7 @@ mod tests {
             "cargo:rustc-link-search={}\n",
             env.out_dir.join("lib.a").display()
         );
-        assert!(collect(&stdout, &env, 0, 0).unwrap().is_empty());
+        assert!(collect(&stdout, &env, 1 << 30, 0, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -1632,7 +1639,7 @@ mod tests {
             canonical.join("lib.a").display()
         );
         assert!(
-            collect(&stdout, &env, 0, 0).unwrap().is_empty(),
+            collect(&stdout, &env, 1 << 30, 0, 0).unwrap().is_empty(),
             "the canonical spelling is still OUT_DIR"
         );
     }
@@ -1643,7 +1650,7 @@ mod tests {
         let env = sample_env(dir.path());
         let lib = write_lib(dir.path());
         let stdout = "cargo:rustc-link-search=../target/debug/../debug/gn_out/obj\n";
-        let contents = collect(stdout, &env, 0, 0).unwrap();
+        let contents = collect(stdout, &env, 1 << 30, 0, 0).unwrap();
         assert_eq!(contents.files.len(), 1, "{contents:?}");
         assert_eq!(
             std::fs::read(&contents.files[0].0).unwrap(),
@@ -1651,14 +1658,14 @@ mod tests {
         );
 
         let missing = "cargo:rustc-link-search=../target/debug/gn_out/missing\n";
-        assert!(collect(missing, &env, 0, 0).unwrap().is_empty());
+        assert!(collect(missing, &env, 1 << 30, 0, 0).unwrap().is_empty());
 
         let root = format!(
             "cargo:rustc-link-search={}\n",
             dir.path().join("target").display()
         );
         assert!(
-            collect(&root, &env, 0, 0).unwrap().is_empty(),
+            collect(&root, &env, 1 << 30, 0, 0).unwrap().is_empty(),
             "the target directory itself is not a script output"
         );
     }
@@ -1681,7 +1688,7 @@ mod tests {
             obj.display(),
             other.display(),
         );
-        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 0, 0).unwrap();
         let names: Vec<_> = contents
             .files
             .iter()
@@ -1734,24 +1741,24 @@ mod tests {
         std::fs::write(&lib, "abcd").unwrap();
         let stdout = format!("cargo:rustc-link-search={}\n", lib.display());
         assert!(
-            collect(&stdout, &env, (1 << 30) - 4, 0).is_ok(),
+            collect(&stdout, &env, 1 << 30, (1 << 30) - 4, 0).is_ok(),
             "the cap is inclusive"
         );
-        assert!(collect(&stdout, &env, (1 << 30) - 3, 0).is_err());
-        assert!(collect(&stdout, &env, 0, 50_000 - 1).is_ok());
-        assert!(collect(&stdout, &env, 0, 50_000).is_err());
+        assert!(collect(&stdout, &env, 1 << 30, (1 << 30) - 3, 0).is_err());
+        assert!(collect(&stdout, &env, 1 << 30, 0, 50_000 - 1).is_ok());
+        assert!(collect(&stdout, &env, 1 << 30, 0, 50_000).is_err());
 
         let second = lib.parent().unwrap().join("second.a");
         std::fs::write(&second, "efg").unwrap();
         let parent = lib.parent().unwrap();
         let both = format!("cargo:rustc-link-search={}\n", parent.display());
-        assert!(collect(&both, &env, (1 << 30) - 7, 0).is_ok());
+        assert!(collect(&both, &env, 1 << 30, (1 << 30) - 7, 0).is_ok());
         assert!(
-            collect(&both, &env, (1 << 30) - 6, 0).is_err(),
+            collect(&both, &env, 1 << 30, (1 << 30) - 6, 0).is_err(),
             "sizes add up"
         );
-        assert!(collect(&both, &env, 0, 50_000 - 2).is_ok());
-        assert!(collect(&both, &env, 0, 50_000 - 1).is_err());
+        assert!(collect(&both, &env, 1 << 30, 0, 50_000 - 2).is_ok());
+        assert!(collect(&both, &env, 1 << 30, 0, 50_000 - 1).is_err());
     }
 
     #[test]
@@ -1761,7 +1768,7 @@ mod tests {
         let empty_dir = dir.path().join("target/debug/gn_out/empty");
         std::fs::create_dir_all(&empty_dir).unwrap();
         let stdout = format!("cargo:rustc-link-search={}\n", empty_dir.display());
-        let contents = collect(&stdout, &env, 1 << 30, 50_000).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 1 << 30, 50_000).unwrap();
         assert!(contents.files.is_empty());
         assert!(
             contents
@@ -1774,7 +1781,7 @@ mod tests {
         std::fs::create_dir_all(empty_file.parent().unwrap()).unwrap();
         std::fs::write(&empty_file, "").unwrap();
         let stdout = format!("cargo:rustc-link-arg={}\n", empty_file.display());
-        let contents = collect(&stdout, &env, 1 << 30, 50_000).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 1 << 30, 50_000).unwrap();
         assert!(contents.files.is_empty());
         assert_eq!(contents.empty_files.len(), 1);
     }
@@ -1791,7 +1798,7 @@ mod tests {
             "cargo:rustc-link-search={}\n",
             dir.path().join("target/debug").display()
         );
-        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 0, 0).unwrap();
         assert!(
             contents
                 .files
@@ -1816,15 +1823,17 @@ mod tests {
         std::fs::write(obj.join("librusty_v8.so.1"), "so").unwrap();
         std::os::unix::fs::symlink("librusty_v8.so.1", obj.join("librusty_v8.so")).unwrap();
         let stdout = format!("cargo:rustc-link-search={}\n", obj.display());
-        let contents = collect(&stdout, &env, 0, 0).unwrap();
+        let contents = collect(&stdout, &env, 1 << 30, 0, 0).unwrap();
         assert_eq!(contents.symlinks.len(), 1);
         assert_eq!(contents.symlinks[0].target, "librusty_v8.so.1");
         // The entry cap counts the symlink and the file, not the directory.
-        assert!(collect(&stdout, &env, 0, 50_000 - 2).is_ok());
-        assert!(collect(&stdout, &env, 0, 50_000 - 1).is_err());
+        assert!(collect(&stdout, &env, 1 << 30, 0, 50_000 - 2).is_ok());
+        assert!(collect(&stdout, &env, 1 << 30, 0, 50_000 - 1).is_err());
 
         std::os::unix::fs::symlink("/usr/lib/libz.so", obj.join("escape")).unwrap();
-        let error = collect(&stdout, &env, 0, 0).unwrap_err().to_string();
+        let error = collect(&stdout, &env, 1 << 30, 0, 0)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("escape"), "{error}");
     }
 
@@ -1838,10 +1847,10 @@ mod tests {
         std::os::unix::fs::symlink("missing", obj.join("lib.so")).unwrap();
         let stdout = format!("cargo:rustc-link-search={}\n", obj.display());
         assert!(
-            collect(&stdout, &env, 1 << 30, 50_000 - 1).is_ok(),
+            collect(&stdout, &env, 1 << 30, 1 << 30, 50_000 - 1).is_ok(),
             "no bytes left still fits a symlink"
         );
-        assert!(collect(&stdout, &env, 0, 50_000).is_err());
+        assert!(collect(&stdout, &env, 1 << 30, 0, 50_000).is_err());
     }
 
     #[cfg(unix)]
@@ -1855,7 +1864,9 @@ mod tests {
         let link = dir.path().join("target/debug/alias");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let stdout = format!("cargo:rustc-link-search={}\n", link.display());
-        let error = collect(&stdout, &env, 0, 0).unwrap_err().to_string();
+        let error = collect(&stdout, &env, 1 << 30, 0, 0)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("symlink"), "{error}");
     }
 
@@ -1875,7 +1886,9 @@ mod tests {
                 .success()
         );
         let stdout = format!("cargo:rustc-link-search={}\n", obj.display());
-        let error = collect(&stdout, &env, 0, 0).unwrap_err().to_string();
+        let error = collect(&stdout, &env, 1 << 30, 0, 0)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("pipe"), "{error}");
     }
 }

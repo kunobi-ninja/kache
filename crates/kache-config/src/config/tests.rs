@@ -5473,6 +5473,32 @@ fn protected_branch_push_keeps_configured_writable() {
 }
 
 #[test]
+fn process_write_diagnostic_uses_the_event_and_selected_config() {
+    let _guard = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[cache]\ngithub_writes = []\n").unwrap();
+    let _config = set_kache_config_for_test(&path);
+    let _host = NamedEnvGuard::set("KACHE_HOST_CONFIG", "");
+    let _github = NamedEnvGuard::set("GITHUB_ACTIONS", "true");
+    let _ref_type = NamedEnvGuard::set("GITHUB_REF_TYPE", "branch");
+    let _protected = NamedEnvGuard::set("GITHUB_REF_PROTECTED", "true");
+    let _writes = NamedEnvGuard::remove("KACHE_GITHUB_WRITES");
+    let _readonly = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
+    for (event, branch) in [
+        ("schedule", "protected branch"),
+        ("merge_group", "queue branch"),
+    ] {
+        let _event = NamedEnvGuard::set("GITHUB_EVENT_NAME", event);
+        let forced = crate::policy::forced_remote_readonly().expect("empty list disables writes");
+        assert!(forced.reason.contains(branch), "{}", forced.reason);
+    }
+    std::fs::write(&path, "[cache]\ngithub_writes = ['merge_group']\n").unwrap();
+    let _event = NamedEnvGuard::set("GITHUB_EVENT_NAME", "merge_group");
+    assert_eq!(crate::policy::forced_remote_readonly(), None);
+}
+
+#[test]
 fn protected_branch_schedule_respects_readonly_settings() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

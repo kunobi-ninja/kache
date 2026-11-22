@@ -1742,6 +1742,10 @@ fn run_compiler_invocation_inner(
     let _heartbeat = heartbeat::InvocationHeartbeatScope::enter();
     let _restore_policy = link::InvocationLinkScope::enter();
     let _accounting = opcounts::InvocationScope::enter(started_at);
+    #[cfg(unix)]
+    let mise_shim = args
+        .first()
+        .is_some_and(|compiler| compiler::shim::prepare_mise_path(compiler, &mut env));
     // Re-entrancy guard. If a child compiler kache spawns is itself a
     // kache wrapper — e.g. `cc` on PATH shadowed by `kache cc` — the
     // nested invocation must run the real compiler directly instead of
@@ -1783,6 +1787,12 @@ fn run_compiler_invocation_inner(
         // per-crate force list is a managed-cache policy and is inactive here;
         // only the explicit global preservation mode may retain incremental.
         return run_compiler_directly_for(&config, args, config.preserve_incremental, &env);
+    }
+
+    // mise can select a different compiler without changing the shim on disk.
+    #[cfg(unix)]
+    if mise_shim {
+        return wrapper::run_mise_compiler_for(&config, args, &env);
     }
 
     // Compiler-family probe (`kache -E <file>` from the `cc` Rust

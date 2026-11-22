@@ -57,12 +57,14 @@
           "type": ["string", "null"],
           "description": "Root path filter; for --last-build, the exact selected root."
         },
+        "commands": { "$ref": "#/definitions/CargoCommands" },
         "session": {
           "type": ["object", "null"],
           "description": "Selection for --last-build. May span Cargo commands and only covers retained, completed compiler events. When present, since_secs is the lookback to the earliest selected compiler start, not the selection rule.",
           "required": ["root", "inferred", "inactivity_secs"],
           "properties": {
             "root": { "type": "string", "description": "Exact root of the selected session." },
+            "commands": { "$ref": "#/definitions/CargoCommands" },
             "session_id": { "type": "string", "description": "Recorded ID; absent for inferred sessions." },
             "inferred": { "type": "boolean", "description": "True when events without IDs were grouped by activity." },
             "inactivity_secs": { "type": "integer", "minimum": 1, "description": "Idle gap that separates activity sessions." }
@@ -387,6 +389,20 @@
     }
   },
   "definitions": {
+    "CargoCommands": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/CargoCommand" }
+    },
+    "CargoCommand": {
+      "type": "object",
+      "required": ["started_at", "launcher_pid", "argv", "cwd"],
+      "properties": {
+        "started_at": { "type": "string", "format": "date-time" },
+        "launcher_pid": { "type": "integer", "minimum": 0 },
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" }
+      }
+    },
     "SchedulerDecision": {
       "type": "object",
       "required": ["phase", "outcome", "elapsed_ms"],
@@ -437,6 +453,7 @@
         "unattributed_ms"
       ],
       "properties": {
+        "cargo_command": { "$ref": "#/definitions/CargoCommand" },
         "crate_name": { "type": "string" },
         "root": { "type": "string" },
         "result": {

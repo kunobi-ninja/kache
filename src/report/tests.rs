@@ -512,6 +512,7 @@ fn test_event(
     BuildEvent {
         ts: jiff::Timestamp::now(),
         session_id: String::new(),
+        cargo_command: None,
         demands: Vec::new(),
         rebuilt_package: None,
         rebuilt_fingerprint: None,
@@ -1404,6 +1405,42 @@ fn session_event(root: &str, session: &str, second: i64, elapsed_ms: u64) -> Bui
     event.session_id = session.to_string();
     event.ts = jiff::Timestamp::from_second(1_700_000_000 + second).unwrap();
     event
+}
+
+#[test]
+fn cargo_commands_follow_the_selected_events_in_launch_order() {
+    let event = |session, second, launch, pid| {
+        let mut event = session_event("/repo", session, second, 10);
+        event.cargo_command = Some(kache_protocol::CargoCommand {
+            started_at: jiff::Timestamp::from_second(launch).unwrap(),
+            launcher_pid: pid,
+            argv: vec!["cargo".into(), "check".into()],
+            cwd: "/repo".into(),
+        });
+        event
+    };
+    let first = event("new", 98, 50, 1);
+    let second = event("new", 96, 60, 2);
+    let other = event("old", 95, 40, 3);
+    let legacy = session_event("/repo", "new", 97, 10);
+    let mut events = vec![
+        second.clone(),
+        legacy.clone(),
+        other,
+        first.clone(),
+        second.clone(),
+    ];
+    assert_eq!(observed_commands(&events).len(), 3);
+    let session = select_last_build(&mut events).unwrap();
+    assert_eq!(
+        session.commands,
+        vec![
+            first.cargo_command.unwrap(),
+            second.cargo_command.clone().unwrap()
+        ]
+    );
+    assert_eq!(to_crate_detail(&second).cargo_command, second.cargo_command);
+    assert!(to_crate_detail(&legacy).cargo_command.is_none());
 }
 
 #[test]

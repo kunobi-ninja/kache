@@ -1281,6 +1281,52 @@ mod tests {
     }
 
     #[test]
+    fn cargo_launch_recognizes_build_after_global_options() {
+        for option in [
+            "--locked",
+            "--offline",
+            "--frozen",
+            "-v",
+            "--verbose",
+            "-q",
+            "--quiet",
+            "+stable",
+            "--config=net.offline=true",
+            "--color=never",
+        ] {
+            let args = [option, "build", "--workspace"];
+            assert_eq!(
+                report_argv(args.into_iter().map(OsStr::new)).unwrap(),
+                ["cargo", "build", "--workspace"],
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_launch_accepts_only_sanitized_recorded_arguments() {
+        for (argv, valid) in [
+            (vec!["cargo", "test", "--no-run"], true),
+            (vec!["other", "test", "--no-run"], false),
+            (vec!["cargo", "test", "--", "private-value"], false),
+        ] {
+            let raw = serde_json::json!({
+                "argv": argv,
+                "cwd": "/workspace",
+                "launcher_pid": 123,
+                "started_at": "2026-01-01T00:00:00Z"
+            });
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [(CARGO_COMMAND_ENV, raw.to_string())],
+                None,
+                None,
+                std::env::temp_dir(),
+            );
+            assert_eq!(recorded_command(&env).is_some(), valid, "{argv:?}");
+        }
+    }
+
+    #[test]
     fn cargo_command_label_names_the_subcommand() {
         let label = |args: &[&str]| cargo_command_label(args.iter().map(OsStr::new));
         assert_eq!(label(&["run", "--features", "x"]), "cargo run");

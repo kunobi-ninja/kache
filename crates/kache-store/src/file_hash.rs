@@ -2352,6 +2352,15 @@ mod tests {
         assert!(prediction_last_used(&cache, "new") > 1_700_000_999);
     }
 
+    /// The busy timeout of the connections that race an upgrade. These tests
+    /// check that eight connections opening an old index at once all end on
+    /// the new schema, not how fast the disk is. Their upgrade transactions,
+    /// and the payload test's puts after them, queue for the one writer lock
+    /// and each commit that writes flushes the WAL, so on a loaded disk the
+    /// last connection in the queue could wait out a 5 s timeout and fail
+    /// with "database is locked".
+    const UPGRADE_RACE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     #[test]
     fn schema_upgrade_survives_many_connections_opening_at_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -2368,7 +2377,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let db = Connection::open(&db_path).unwrap();
-                    db.pragma_update(None, "busy_timeout", "5000").unwrap();
+                    db.busy_timeout(UPGRADE_RACE_BUSY_TIMEOUT).unwrap();
                     barrier.wait();
                     ensure_input_predictions_last_used(&db, 1_700_000_000)
                 })
@@ -2403,7 +2412,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let db = Connection::open(&db_path).unwrap();
-                    db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    db.busy_timeout(UPGRADE_RACE_BUSY_TIMEOUT).unwrap();
                     barrier.wait();
                     ensure_input_predictions_payload(&db).unwrap();
                     let cache = FileHashCache::Borrowed(&db);

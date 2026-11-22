@@ -1,4 +1,4 @@
-//! Effective remote-write permission from the process environment.
+//! Effective remote-write permission from the CI context and cache configuration.
 //!
 //! Configured `remote_readonly` still wins when it is on. This module only
 //! *adds* read-only: untrusted CI must not publish, even if the job was given
@@ -16,14 +16,21 @@ pub struct ForcedReadonly {
 
 /// If this process is untrusted CI, remote writes must be suppressed.
 pub fn forced_remote_readonly() -> Option<ForcedReadonly> {
-    forced_remote_readonly_with(|name| std::env::var(name).ok())
+    crate::config::Config::ci_readonly()
 }
 
 pub fn forced_remote_readonly_with(
     get_env: impl Fn(&str) -> Option<String>,
 ) -> Option<ForcedReadonly> {
+    ci_readonly_with(get_env, None)
+}
+
+pub(crate) fn ci_readonly_with(
+    get_env: impl Fn(&str) -> Option<String>,
+    file_events: Option<&[String]>,
+) -> Option<ForcedReadonly> {
     if env_truthy(get_env("GITHUB_ACTIONS")) {
-        return github_forced_readonly(&get_env);
+        return github_forced_readonly(&get_env, file_events);
     }
     if env_truthy(get_env("GITLAB_CI")) {
         return gitlab_forced_readonly(&get_env);
@@ -31,32 +38,72 @@ pub fn forced_remote_readonly_with(
     None
 }
 
-fn github_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<ForcedReadonly> {
+fn github_forced_readonly(
+    get_env: &impl Fn(&str) -> Option<String>,
+    file_events: Option<&[String]>,
+) -> Option<ForcedReadonly> {
     let event = display_env(get_env("GITHUB_EVENT_NAME"));
     let ref_type = display_env(get_env("GITHUB_REF_TYPE"));
-    // GitHub starts a merge group only for a branch whose rules require a merge
-    // queue. The group's own ref, `gh-readonly-queue/<base>/...`, is never
-    // protected, so the protected-branch check cannot apply to it.
-    if event == "merge_group" && env_truthy(get_env("KACHE_GITHUB_MERGE_GROUP_WRITES")) {
-        return None;
-    }
-    let event_allows_writes = event == "push"
-        || (event == "schedule" && env_truthy(get_env("KACHE_GITHUB_SCHEDULE_WRITES")));
-    if event_allows_writes && ref_type == "branch" && env_truthy(get_env("GITHUB_REF_PROTECTED")) {
+    let protected = ref_type == "branch" && env_truthy(get_env("GITHUB_REF_PROTECTED"));
+    if event == "push" && protected {
         return None;
     }
 
-    let reason = if event == "schedule" {
+    let reason = if matches!(event.as_str(), "schedule" | "merge_group") {
+        let enabled = match get_env("KACHE_GITHUB_WRITES") {
+            Some(list) if list.trim().is_empty() => Ok(false),
+            Some(list) => github_event_enabled(list.split(',').map(str::trim), &event),
+            None => match file_events {
+                Some(list) => github_event_enabled(list.iter().map(String::as_str), &event),
+                None => {
+                    Ok(event == "schedule" && env_truthy(get_env("KACHE_GITHUB_SCHEDULE_WRITES")))
+                }
+            },
+        };
+        let enabled = match enabled {
+            Ok(enabled) => enabled,
+            Err(reason) => return Some(ForcedReadonly { reason }),
+        };
+        let eligible = match event.as_str() {
+            "schedule" => protected,
+            _ => ref_type == "branch",
+        };
+        if enabled && eligible {
+            if env_truthy(get_env("KACHE_REMOTE_READONLY")) {
+                return Some(ForcedReadonly {
+                    reason: "KACHE_REMOTE_READONLY is enabled".into(),
+                });
+            }
+            return None;
+        }
+        let branch = if event == "schedule" {
+            "protected branch"
+        } else {
+            "queue branch"
+        };
         format!(
-            "GitHub Actions schedule ({ref_type}) needs a protected branch and \
-             KACHE_GITHUB_SCHEDULE_WRITES=1"
+            "GitHub Actions {event} ({ref_type}) needs a {branch} and {event} in KACHE_GITHUB_WRITES or cache.github_writes"
         )
-    } else if event == "merge_group" {
-        format!("GitHub Actions merge_group ({ref_type}) needs KACHE_GITHUB_MERGE_GROUP_WRITES=1")
     } else {
         format!("GitHub Actions {event} ({ref_type}) is not a protected-branch push")
     };
     Some(ForcedReadonly { reason })
+}
+
+fn github_event_enabled<'a>(
+    events: impl Iterator<Item = &'a str>,
+    current: &str,
+) -> Result<bool, String> {
+    let mut enabled = false;
+    for event in events {
+        if !matches!(event, "schedule" | "merge_group") {
+            return Err(format!(
+                "unknown GitHub write event {event:?}; expected schedule or merge_group"
+            ));
+        }
+        enabled |= event == current;
+    }
+    Ok(enabled)
 }
 
 fn gitlab_forced_readonly(get_env: &impl Fn(&str) -> Option<String>) -> Option<ForcedReadonly> {
@@ -97,7 +144,7 @@ pub fn running_in_ci_with(get_env: impl Fn(&str) -> Option<String>) -> bool {
         .any(|name| env_truthy(get_env(name)))
 }
 
-fn env_truthy(value: Option<String>) -> bool {
+pub(crate) fn env_truthy(value: Option<String>) -> bool {
     value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
@@ -228,7 +275,7 @@ mod tests {
             assert_eq!(forced.is_some(), readonly, "{vars:?}");
             if let Some(forced) = forced {
                 assert_eq!(
-                    forced.reason.contains("KACHE_GITHUB_SCHEDULE_WRITES=1"),
+                    forced.reason.contains("KACHE_GITHUB_WRITES"),
                     event == "schedule"
                 );
             }
@@ -239,10 +286,10 @@ mod tests {
     fn github_merge_group_write_opt_in_is_limited_to_merge_groups() {
         for (event, flag, readonly) in [
             ("merge_group", None, true),
-            ("merge_group", Some("0"), true),
-            ("merge_group", Some("1"), false),
+            ("merge_group", Some(""), true),
+            ("merge_group", Some("merge_group"), false),
             ("push", None, true),
-            ("push", Some("1"), true),
+            ("push", Some("merge_group"), true),
         ] {
             let mut vars = github(&[
                 ("GITHUB_EVENT_NAME", event),
@@ -254,17 +301,29 @@ mod tests {
                 ("GITHUB_REF_PROTECTED", "false"),
             ]);
             if let Some(flag) = flag {
-                vars.insert("KACHE_GITHUB_MERGE_GROUP_WRITES".into(), flag.into());
+                vars.insert("KACHE_GITHUB_WRITES".into(), flag.into());
             }
             let forced = forced_remote_readonly_with(lookup(&vars));
             assert_eq!(forced.is_some(), readonly, "{vars:?}");
             if let Some(forced) = forced {
                 assert_eq!(
-                    forced.reason.contains("KACHE_GITHUB_MERGE_GROUP_WRITES=1"),
+                    forced.reason.contains("KACHE_GITHUB_WRITES"),
                     event == "merge_group"
                 );
             }
         }
+    }
+
+    #[test]
+    fn unknown_list_item_explains_why_the_job_is_read_only() {
+        let vars = github(&[
+            ("GITHUB_EVENT_NAME", "merge_group"),
+            ("GITHUB_REF_TYPE", "branch"),
+            ("KACHE_GITHUB_WRITES", "merge_group,pull_request"),
+        ]);
+        let forced = forced_remote_readonly_with(lookup(&vars)).unwrap();
+        assert!(forced.reason.contains("unknown GitHub write event"));
+        assert!(forced.reason.contains("pull_request"));
     }
 
     #[test]

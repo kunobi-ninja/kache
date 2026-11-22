@@ -2462,7 +2462,7 @@ fn every_env_var_config_reads_maps_to_a_config_key() {
             &name[..end]
         })
         .collect();
-    let mapped: std::collections::BTreeSet<&str> =
+    let mut mapped: std::collections::BTreeSet<&str> =
         ENV_FILE_KEYS.iter().map(|(var, _)| *var).collect();
     assert_eq!(
         mapped.len(),
@@ -2478,10 +2478,12 @@ fn every_env_var_config_reads_maps_to_a_config_key() {
     for var in &mapped {
         assert!(read.contains(var), "{var} is listed but never read");
     }
+    // A checkout cannot override the permission set by its CI job.
+    assert!(mapped.remove("KACHE_GITHUB_WRITES"));
     let gated: std::collections::BTreeSet<&str> = IGNORE_ENV_GATED_VARS.iter().copied().collect();
     assert_eq!(
         gated, mapped,
-        "ignore_env gates exactly the file-backed variables"
+        "ignore_env gates all other file-backed variables"
     );
     // KACHE_PULL_REQUEST_PREFIX modifies a remote but does not describe one,
     // so it must not make the host's [cache.remote] table yield to the
@@ -3361,6 +3363,7 @@ fn test_file_config_roundtrip() {
             bypass_crates: None,
             local_only: None,
             remote_readonly: None,
+            github_writes: None,
             volumes: None,
             modified_input_guard: None,
             input_predictions: None,
@@ -5100,6 +5103,7 @@ fn test_save_and_load_file_config() {
             bypass_crates: None,
             local_only: None,
             remote_readonly: None,
+            github_writes: None,
             volumes: None,
             modified_input_guard: None,
             input_predictions: None,
@@ -5499,6 +5503,119 @@ fn protected_branch_schedule_respects_readonly_settings() {
 
     std::fs::write(&config_path, "[cache]\nremote_readonly = true\n").unwrap();
     assert!(load_readonly(&[opt_in]));
+}
+
+#[test]
+fn github_write_list_resolves_job_and_file_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let load = |event, ref_type, protected, extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            ("KACHE_CONFIG", path.to_str().unwrap()),
+            ("KACHE_HOST_CONFIG", ""),
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", event),
+            ("GITHUB_REF_TYPE", ref_type),
+            ("GITHUB_REF_PROTECTED", protected),
+        ];
+        vars.extend_from_slice(extra);
+        let context = InvocationEnv::from_parts(
+            vars,
+            Some(dir.path().into()),
+            Some(dir.path().into()),
+            dir.path().into(),
+        );
+        Config::load_for(&context).unwrap().remote_readonly
+    };
+    let both = "[cache]\ngithub_writes = ['schedule', 'merge_group']\n";
+    std::fs::write(&path, both).unwrap();
+    for (event, kind, protected, readonly) in [
+        ("schedule", "branch", "true", false),
+        ("schedule", "branch", "false", true),
+        ("schedule", "tag", "true", true),
+        ("merge_group", "branch", "false", false),
+        ("merge_group", "tag", "true", true),
+        ("workflow_dispatch", "branch", "true", true),
+        ("pull_request_target", "branch", "true", true),
+        ("pull_request", "branch", "true", true),
+    ] {
+        assert_eq!(
+            load(event, kind, protected, &[]),
+            readonly,
+            "{event} {kind}"
+        );
+    }
+    let key = "KACHE_GITHUB_WRITES";
+    assert!(!load(
+        "schedule",
+        "branch",
+        "true",
+        &[(key, "merge_group, schedule")]
+    ));
+    for list in ["", "merge_group", "schedule,typo", "*,schedule"] {
+        assert!(load(
+            "schedule",
+            "branch",
+            "true",
+            &[(key, list), ("KACHE_GITHUB_SCHEDULE_WRITES", "1")]
+        ));
+    }
+    assert!(load(
+        "merge_group",
+        "branch",
+        "false",
+        &[("KACHE_REMOTE_READONLY", "1")]
+    ));
+    std::fs::write(&path, format!("{both}remote_readonly = true\n")).unwrap();
+    assert!(load("merge_group", "branch", "false", &[]));
+    std::fs::write(&path, "[cache]\ngithub_writes = []\n").unwrap();
+    assert!(load(
+        "schedule",
+        "branch",
+        "true",
+        &[("KACHE_GITHUB_SCHEDULE_WRITES", "1")]
+    ));
+    std::fs::write(&path, "[cache]\ngithub_writes = ['schedule', 'unknown']\n").unwrap();
+    assert!(load("schedule", "branch", "true", &[]));
+    assert!(!load("push", "branch", "true", &[]));
+}
+
+#[test]
+fn queue_checkout_cannot_grant_itself_write_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let project = checkout.join(".kache.toml");
+    let host = dir.path().join("runner.toml");
+    let allow = "[cache]\ngithub_writes = ['schedule', 'merge_group']\nignore_env = true\n";
+    std::fs::write(&project, allow).unwrap();
+    let load = |event, extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            ("KACHE_HOST_CONFIG", host.to_str().unwrap()),
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", event),
+            ("GITHUB_REF_TYPE", "branch"),
+            ("GITHUB_REF_PROTECTED", "true"),
+        ];
+        vars.extend_from_slice(extra);
+        let context = InvocationEnv::from_parts(
+            vars,
+            Some(checkout.clone()),
+            Some(dir.path().into()),
+            dir.path().into(),
+        );
+        Config::load_for(&context).unwrap().remote_readonly
+    };
+    assert!(load("merge_group", &[]));
+    assert!(!load("schedule", &[]));
+    assert!(!load(
+        "merge_group",
+        &[("KACHE_GITHUB_WRITES", "merge_group")]
+    ));
+    std::fs::write(&host, "[cache]\ngithub_writes = ['merge_group']\n").unwrap();
+    assert!(!load("merge_group", &[]));
+    assert!(load("merge_group", &[("KACHE_GITHUB_WRITES", "")]));
+    assert!(load("merge_group", &[("KACHE_REMOTE_READONLY", "1")]));
 }
 
 #[test]

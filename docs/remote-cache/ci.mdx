@@ -74,23 +74,26 @@ Treat write credentials for any remote as trusted build credentials. The permiss
 
 On GitHub Actions and GitLab CI, a **push to a protected branch** can write to the remote cache. Other jobs are read-only by default. `KACHE_REMOTE_READONLY=0` still respects this policy. The exceptions are scheduled and merge group GitHub Actions jobs that opt in, and pull request jobs with a prefix of their own.
 
-To warm the remote cache from a scheduled GitHub Actions job, set this in that job's environment:
+To warm the shared cache from GitHub Actions, choose the events your workflow uses. Set the list on the job:
 
 ```yaml
 env:
-  KACHE_GITHUB_SCHEDULE_WRITES: "1"
+  KACHE_GITHUB_WRITES: "schedule,merge_group"
 ```
 
-GitHub runs scheduled workflows on the default branch. The branch must be protected and the job must have write access to the remote. `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` still suppresses uploads. GitLab schedules remain read-only.
+Or set it in the runner's TOML config:
 
-To warm the remote cache from a GitHub merge queue, set this in the environment of the jobs that run on `merge_group`:
-
-```yaml
-env:
-  KACHE_GITHUB_MERGE_GROUP_WRITES: "1"
+```toml
+[cache]
+github_writes = ["schedule", "merge_group"]
 ```
 
-GitHub starts a merge group only for a branch whose rules require a merge queue. The group's own `gh-readonly-queue/...` branch is never protected, so Kache does not check protection for it. A push to a branch with that name is not a merge group and follows the push rule. Other events ignore the setting. The job must have write access to the remote. `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` still suppresses uploads.
+- `schedule` allows scheduled runs on a protected branch.
+- `merge_group` allows merge queue jobs on their temporary branch. An ordinary push to a branch named `gh-readonly-queue/...` still follows the push rule.
+
+For a merge queue, Kache ignores `github_writes` in an automatically discovered project `.kache.toml` because the checkout contains the proposed changes. Use the job environment or the runner's host config. A user config also works when it is the selected file. To select a file explicitly, point `KACHE_CONFIG` at a file managed by the workflow outside the checkout.
+
+The job environment replaces the TOML list. An empty list disables both exceptions. An unknown event disables both exceptions and `kache doctor` reports the invalid name on a schedule or merge group job. Existing workflows can keep `KACHE_GITHUB_SCHEDULE_WRITES=1` until they switch to the list. An explicit read-only mode still suppresses uploads, and the job needs credentials that can write to the remote.
 
 For a branch to count as protected, GitHub must set `GITHUB_REF_PROTECTED=true` or GitLab must set `CI_COMMIT_REF_PROTECTED=true`. Check the `Remote writes` row of `kache doctor` for the effective mode.
 

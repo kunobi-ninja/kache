@@ -45,6 +45,16 @@ impl MissReason {
     }
 }
 
+/// The Cargo launch that a completed compiler event came from.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CargoCommand {
+    #[serde(with = "crate::time::serde_rfc3339")]
+    pub started_at: Timestamp,
+    pub launcher_pid: u32,
+    pub argv: Vec<String>,
+    pub cwd: String,
+}
+
 /// A single build event logged by the wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildEvent {
@@ -109,6 +119,7 @@ pub struct BuildEvent {
     /// 26 = successful compilation outputs and captured package identity.
     /// 27 = recorded scheduler decisions and admission outcomes.
     /// 28 = local hits served from the read-only store.
+    /// 29 = Cargo launch metadata on attributed compiler events.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -120,6 +131,8 @@ pub struct BuildEvent {
     /// session marker (never fails a build).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_command: Option<CargoCommand>,
     /// Observed at the first lookup, including locally consumed prefetches.
     /// Recorded in memory, then appended with this event; no extra daemon call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -587,6 +600,7 @@ impl BuildEvent {
             root: "/work/tree".to_string(),
             version: "0.0.0".to_string(),
             session_id: String::new(),
+            cargo_command: None,
             demands: Vec::new(),
             result,
             elapsed_ms,

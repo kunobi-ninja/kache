@@ -120,11 +120,84 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
         ));
     }
     let mut command = Command::new(&cargo);
+    record_launch(&mut command, &cargo_args, env.cwd());
     command.args(&cargo_args);
     command.env(CARGO_SHIM_DEPTH_ENV, depth);
     check_targets::configure(&mut command, &cargo, &config, &env);
     crate::target_seed::configure_cargo_seed(&mut command, &cargo_args, false);
     run_cargo_and_exit(command, &cargo, lease, &config)
+}
+
+const CARGO_COMMAND_ENV: &str = "KACHE_CARGO_COMMAND";
+
+/// Retain known build commands and switches. Values, aliases and arguments to
+/// the compiled program can contain credentials and stay out of the event log.
+fn report_argv<'a>(mut args: impl Iterator<Item = &'a OsStr>) -> Option<Vec<String>> {
+    let subcommand = loop {
+        let arg = args.next()?.to_str()?;
+        match arg {
+            "--config" | "--color" | "-Z" | "-C" => {
+                args.next()?;
+            }
+            "build" | "b" | "check" | "c" | "clippy" | "test" | "t" | "run" | "r" | "bench"
+            | "doc" | "rustdoc" | "rustc" | "install" => break arg,
+            "--locked" | "--offline" | "--frozen" | "-v" | "--verbose" | "-q" | "--quiet" => {}
+            _ if arg.starts_with('+')
+                || arg.starts_with("--config=")
+                || arg.starts_with("--color=") => {}
+            _ => return None,
+        }
+    };
+    let mut argv = vec!["cargo".into(), subcommand.into()];
+    for arg in args {
+        match arg.to_str() {
+            Some(
+                flag @ ("--workspace"
+                | "--release"
+                | "--all-targets"
+                | "--all-features"
+                | "--no-default-features"
+                | "--locked"
+                | "--offline"
+                | "--frozen"
+                | "--lib"
+                | "--tests"
+                | "--no-run"
+                | "--timings"),
+            ) => argv.push(flag.into()),
+            // Once an unknown argument occurs, its values have unknown arity.
+            _ => break,
+        }
+    }
+    Some(argv)
+}
+
+fn record_launch(command: &mut Command, args: &[OsString], cwd: Option<&Path>) {
+    // A nested Cargo launch must never inherit the attribution of its parent.
+    command.env_remove(CARGO_COMMAND_ENV);
+    if let (Some(argv), Some(cwd)) = (
+        report_argv(args.iter().map(OsString::as_os_str)),
+        cwd.and_then(Path::to_str),
+    ) {
+        let launch = kache_protocol::CargoCommand {
+            started_at: jiff::Timestamp::now(),
+            launcher_pid: std::process::id(),
+            argv,
+            cwd: cwd.to_owned(),
+        };
+        if let Ok(value) = serde_json::to_string(&launch) {
+            command.env(CARGO_COMMAND_ENV, value);
+        }
+    }
+}
+
+pub(crate) fn recorded_command(
+    env: &crate::invocation::InvocationEnv,
+) -> Option<kache_protocol::CargoCommand> {
+    let raw = env.var(CARGO_COMMAND_ENV).ok()?;
+    let launch: kache_protocol::CargoCommand = serde_json::from_str(&raw).ok()?;
+    let (name, args) = launch.argv.split_first()?;
+    (name == "cargo" && report_argv(args.iter().map(OsStr::new))? == launch.argv).then_some(launch)
 }
 
 /// Environment variable kache's Cargo shim sets on the Cargo it runs. The
@@ -254,6 +327,7 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
         cargo_version(&cargo, &cargo_args, &cwd, &depth)
     });
     let mut command = Command::new(&cargo);
+    record_launch(&mut command, &cargo_args, Some(&cwd));
     command
         .env(CARGO_SHIM_DEPTH_ENV, depth)
         .args(cargo_invocation_args(&cargo_args, &overrides.config))
@@ -1172,6 +1246,38 @@ mod tests {
                     Some("compiler-artifact" | "build-finished" | "compiler-message")
                 )
             })
+    }
+
+    #[test]
+    fn launch_metadata_retains_only_known_cargo_arguments() {
+        let recorded = |args: &[&str]| report_argv(args.iter().map(OsStr::new));
+        assert_eq!(
+            recorded(&[
+                "+stable",
+                "--config",
+                "token=secret",
+                "clippy",
+                "--workspace",
+                "--",
+                "--release"
+            ])
+            .unwrap(),
+            ["cargo", "clippy", "--workspace"]
+        );
+        assert_eq!(
+            recorded(&["build", "--release", "--config=secret", "--locked"]).unwrap(),
+            ["cargo", "build", "--release"]
+        );
+        assert_eq!(
+            recorded(&["test", "secret", "--workspace"]).unwrap(),
+            ["cargo", "test"]
+        );
+        assert_eq!(
+            recorded(&["install", "--token", "secret"]).unwrap(),
+            ["cargo", "install"]
+        );
+        assert!(recorded(&["--config", "build"]).is_none());
+        assert!(recorded(&["unknown-alias", "test"]).is_none());
     }
 
     #[test]

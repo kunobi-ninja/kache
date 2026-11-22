@@ -9415,7 +9415,7 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].schema, 28);
+    assert_eq!(events[0].schema, 29);
     let demands = &events[0].demands;
     assert_eq!(demands.len(), 1);
     assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -9464,7 +9464,7 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
     assert_eq!(event.compile_time_ms, 20);
     assert_eq!(event.size, 30);
     assert_eq!(event.cache_key, "cache-key");
-    assert_eq!(event.schema, 28);
+    assert_eq!(event.schema, 29);
     assert_eq!(event.key_ms, 40);
     assert_eq!(event.key_hash_hits, 4);
     assert_eq!(event.key_hash_misses, 5);
@@ -9582,7 +9582,7 @@ fn log_event_records_the_wrapper_phase_accumulators() {
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     let event = &events[0];
-    assert_eq!(event.schema, 28);
+    assert_eq!(event.schema, 29);
     // Whatever other tests add is real time, far under the next band.
     for (name, value, floor, fed) in [
         ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -9718,7 +9718,7 @@ fn log_event_persists_same_key_lookup_rejection() {
     let event = &events[0];
     assert_eq!(event.result, EventResult::Miss);
     assert_eq!(event.cache_key, "same-key");
-    assert_eq!(event.schema, 28);
+    assert_eq!(event.schema, 29);
     assert_eq!(
         event.lookup_rejection,
         "matching entry lacks dep-info required by this invocation"
@@ -9788,7 +9788,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
             .keyed("hit-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
-    assert_eq!(events[0].schema, 28);
+    assert_eq!(events[0].schema, 29);
     assert_eq!(events[0].result, EventResult::LocalHit);
     assert!(
         events[0].verify_compare.is_empty(),
@@ -9806,7 +9806,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].schema, 28);
+    assert_eq!(events[1].schema, 29);
     assert_eq!(
         events[1].verify_compare,
         "content: libfoo.rlib (byte mismatch)"
@@ -12907,7 +12907,7 @@ fn a_passthrough_reason_is_classified_on_the_event() {
         EventInputs::new("/repo", "foo.c", EventResult::Passthrough, 10)
             .passthrough_reason("unsupported|cc link mode".to_string()),
     );
-    assert_eq!(event.schema, 28);
+    assert_eq!(event.schema, 29);
     assert_eq!(event.miss_reason, crate::events::MissReason::Unsupported);
     let hit = super::build_event_details(
         &config,
@@ -13234,7 +13234,7 @@ fn rebuilt_event_uses_actual_outputs_for_success_even_without_store() {
                 .store_error("cannot store".into())
                 .rebuilt(true, &artifacts, Some("cargo-package-name".into())),
         );
-        assert_eq!(event.schema, 28);
+        assert_eq!(event.schema, 29);
         assert_eq!(event.rebuilt_package.as_deref(), Some("cargo-package-name"));
         assert_eq!(
             event.rebuilt_fingerprint.as_deref(),
@@ -14538,7 +14538,7 @@ fn cancelled_scheduler_waits_reach_error_events_without_spawning_compilers() {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.result, EventResult::Error);
-        assert_eq!(event.schema, 28);
+        assert_eq!(event.schema, 29);
         assert_eq!(event.exit_code, None, "there was no compiler exit");
         assert!(event.passthrough_reason.is_empty());
         assert!(

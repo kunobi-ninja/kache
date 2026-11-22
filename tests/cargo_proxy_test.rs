@@ -2039,3 +2039,90 @@ fn nested_cargo_shims_hand_cargo_one_more_level() {
         );
     }
 }
+
+#[test]
+fn stats_attribute_crate_compiles_to_the_cargo_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let project = root.join("project");
+    let cache = root.join("cache");
+    let target = project.join("target");
+    let _daemon = common::DaemonGuard::new(KACHE_BIN, &cache);
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='attributed'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("src/lib.rs"), "pub const N: u32 = 1;").unwrap();
+    let shim = root.join("cargo");
+    std::os::unix::fs::symlink(KACHE_BIN, &shim).unwrap();
+    for (exe, prefix, verb) in [
+        (Path::new(KACHE_BIN), &["cargo", "--"][..], "check"),
+        (shim.as_path(), &[][..], "build"),
+    ] {
+        let output = hermetic_command(exe, &cache, Some(&cache.join("config.toml")))
+            .current_dir(&project)
+            .args(prefix)
+            .args([
+                verb,
+                "--workspace",
+                "--config",
+                "env.FIXTURE_PRIVATE_VALUE='private-argument'",
+            ])
+            .env("RUSTC_WRAPPER", KACHE_BIN)
+            .env("KACHE_REAL_CARGO", env!("CARGO"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", &target)
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for flags in [&["--last-build"][..], &["--since", "1h"][..]] {
+        let output = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
+            .current_dir(&project)
+            .args(["stats", "--format", "json"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let redacted = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
+            .current_dir(&project)
+            .args(["stats", "--format", "json", "--redact"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(redacted.status.success());
+        assert!(!String::from_utf8_lossy(&redacted.stdout).contains(project.to_str().unwrap()));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let meta = &report["meta"];
+        let scope = meta.get("session").unwrap_or(meta);
+        let commands = scope["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        for (command, verb) in commands.iter().zip(["check", "build"]) {
+            assert_eq!(
+                command["argv"],
+                serde_json::json!(["cargo", verb, "--workspace"])
+            );
+            assert_eq!(command["cwd"], project.to_str().unwrap());
+            assert!(
+                report["all_events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["crate_name"] == "attributed"
+                        && e.get("cargo_command") == Some(command))
+            );
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-argument"));
+    }
+}

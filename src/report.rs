@@ -366,6 +366,9 @@ pub struct ReportMeta {
     /// Present when the report selects one activity session instead of a window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ReportSession>,
+    /// Commands represented in a time window. Single-session reports list them on the session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<kache_protocol::CargoCommand>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,6 +379,9 @@ pub struct ReportSession {
     /// Local and older events lack session IDs; group their activity by idle gap.
     pub inferred: bool,
     pub inactivity_secs: u64,
+    /// Oldest observed launch first. Unattributed events have no entry here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<kache_protocol::CargoCommand>,
 }
 
 impl ReportSession {
@@ -1015,6 +1021,8 @@ pub struct TracePhaseArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrateDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_command: Option<kache_protocol::CargoCommand>,
     pub crate_name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
@@ -1423,6 +1431,11 @@ pub fn generate_report_with_filter(
             since_secs: window.secs(),
             since: window.label(),
             root_filter: root_filter.clone(),
+            commands: if session.is_none() {
+                observed_commands(&build_events)
+            } else {
+                Vec::new()
+            },
             session,
         },
         summary: ReportSummary {
@@ -1521,6 +1534,16 @@ pub fn generate_report_with_filter(
     })
 }
 
+fn observed_commands(events: &[BuildEvent]) -> Vec<kache_protocol::CargoCommand> {
+    events
+        .iter()
+        .filter_map(|event| event.cargo_command.as_ref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 /// Select by completion timestamp, not append order: wrappers finish in parallel.
 /// Session IDs belong to a root. Events without IDs can only support an inferred
 /// activity group; they cannot identify individual Cargo invocations.
@@ -1533,7 +1556,8 @@ fn select_last_build(events: &mut Vec<BuildEvent>) -> Result<ReportSession> {
         !latest.root.is_empty(),
         "The latest compiler event has no recorded root; use --root to select a known build tree."
     );
-    let session = ReportSession {
+    let mut session = ReportSession {
+        commands: Vec::new(),
         root: latest.root.clone(),
         session_id: latest.session_id.clone(),
         inferred: latest.session_id.is_empty(),
@@ -1558,6 +1582,7 @@ fn select_last_build(events: &mut Vec<BuildEvent>) -> Result<ReportSession> {
     } else {
         events.retain(|event| event.session_id == session.session_id);
     }
+    session.commands = observed_commands(events);
     Ok(session)
 }
 
@@ -1930,6 +1955,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
     let overhead = e.overhead_ms();
     let (start_time, end_time, start_unix_ms, end_unix_ms) = event_timeline(e);
     CrateDetail {
+        cargo_command: e.cargo_command.clone(),
         crate_name: e.crate_name.clone(),
         root: e.root.clone(),
         result: e.result.to_string(),
@@ -3179,6 +3205,12 @@ pub fn redaction_terms(report: &BuildReport, extra: &[&std::path::Path]) -> Vec<
     }
     if let Some(session) = &report.meta.session {
         add(&session.root);
+        for command in &session.commands {
+            add(&command.cwd);
+        }
+    }
+    for command in &report.meta.commands {
+        add(&command.cwd);
     }
     for detail in report
         .top_misses
@@ -3240,6 +3272,12 @@ pub fn redact_report(report: &mut BuildReport) {
     }
     if let Some(session) = report.meta.session.as_mut() {
         redact_owned(&mut session.root);
+        for command in &mut session.commands {
+            redact_owned(&mut command.cwd);
+        }
+    }
+    for command in &mut report.meta.commands {
+        redact_owned(&mut command.cwd);
     }
     for event in &mut report.trace_events {
         redact_trace_args(&mut event.args);
@@ -3253,6 +3291,9 @@ pub fn redact_report(report: &mut BuildReport) {
         redact_owned(&mut detail.root);
         redact_owned(&mut detail.cache_key);
         redact_owned(&mut detail.object_output);
+        if let Some(command) = &mut detail.cargo_command {
+            redact_owned(&mut command.cwd);
+        }
     }
     for error in &mut report.errors_detail {
         redact_owned(&mut error.cache_key);

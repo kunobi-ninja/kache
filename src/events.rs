@@ -1607,6 +1607,7 @@ mod tests {
             root: "/work/tree".to_string(),
             version: "1.0.210".to_string(),
             session_id: String::new(),
+            cargo_command: None,
             demands: Vec::new(),
             result: EventResult::LocalHit,
             elapsed_ms: 2,

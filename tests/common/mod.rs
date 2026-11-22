@@ -259,6 +259,7 @@ pub fn hermetic_command(
         .env_remove("KACHE_ACTIVE")
         // Left behind when the suite itself runs through kache's Cargo shim.
         .env_remove("KACHE_CARGO_SHIM_DEPTH")
+        .env_remove("KACHE_CARGO_COMMAND")
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME")
         .env_remove("KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE")

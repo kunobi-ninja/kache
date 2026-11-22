@@ -589,14 +589,15 @@ conditions failed next to the `env_dep:` line.
 A crate that includes generated code through another crate's macro, such as
 `tonic::include_proto!` or `lalrpop_mod!`, never spells `env!("OUT_DIR")`
 itself, so the check finds no proof and the absolute path stays in the key.
-That crate then rebuilds in every checkout. Assert it per crate, using rustc's
-crate name (underscores):
+For example, `wgsl-parse` 0.4.0 loads its generated parsers with
+`lalrpop_mod!`. Use rustc's crate name with underscores to scope the setting.
 
 ```toml
 [cache]
-path_only_env_vars = ["my_proto_crate:OUT_DIR"]
+path_only_env_vars = ["wgsl_parse:OUT_DIR"]
 ```
 
+Changing the contents of an included parser still changes the cache key.
 A `crate:VAR` entry skips the source checks for that crate and variable only,
 so use it when you have read the crate and know it never bakes the value into
 its artifacts. `CARGO_MANIFEST_DIR` is never accepted, in either form: rustc

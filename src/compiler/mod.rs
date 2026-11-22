@@ -2241,6 +2241,39 @@ pub(crate) mod shim {
         )
     }
 
+    /// mise searches PATH again when the current project has no active compiler.
+    /// Hide Kache's marked farms from that search while preserving mise activation.
+    #[cfg(unix)]
+    pub(crate) fn prepare_mise_path(compiler: &str, env: &mut super::InvocationEnv) -> bool {
+        if !kache_shims::is_cc_compiler_name(compiler) {
+            return false;
+        }
+        let path = env.var_os("PATH");
+        let program = Path::new(compiler);
+        let resolved = if program.components().count() == 1 {
+            path.as_ref().and_then(|path| {
+                let dirs = std::env::split_paths(path)
+                    .filter_map(|dir| env.resolve(&dir))
+                    .collect::<Vec<_>>();
+                resolve_real_compiler_on(compiler, &dirs, None)
+            })
+        } else {
+            env.resolve(program)
+        };
+        let real = resolved.and_then(|p| p.canonicalize().ok());
+        if real.as_deref().and_then(Path::file_name) != Some("mise".as_ref()) {
+            return false;
+        }
+        if let Some(path) = path {
+            let dirs = std::env::split_paths(&path)
+                .filter(|dir| !env.resolve(dir).is_some_and(|dir| farm::has_marker(&dir)));
+            if let Ok(filtered) = std::env::join_paths(dirs) {
+                env.set("PATH", filtered);
+            }
+        }
+        true
+    }
+
     /// Live wiring for [`resolve_real_compiler`].
     pub(crate) fn resolve_real_compiler_from_env(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
@@ -2481,6 +2514,34 @@ pub(crate) mod shim {
 mod shim_tests {
     use super::shim::*;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    #[test]
+    fn only_mise_compiler_shims_hide_marked_farms_from_the_child_path() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path();
+        std::fs::create_dir(cwd.join("farm")).unwrap();
+        std::fs::write(cwd.join("farm/.kache-shims"), "").unwrap();
+        std::fs::write(cwd.join("mise"), "").unwrap();
+        std::fs::write(cwd.join("gcc"), "").unwrap();
+        for name in ["clang", "cargo"] {
+            std::os::unix::fs::symlink("mise", cwd.join(name)).unwrap();
+        }
+        for (program, expected) in [
+            ("clang", "extras::bin"),
+            ("cargo", "extras:farm::bin"),
+            ("gcc", "extras:farm::bin"),
+        ] {
+            let mut env = super::InvocationEnv::from_parts(
+                [("PATH", "extras:farm::bin")],
+                Some(cwd.into()),
+                None,
+                cwd.into(),
+            );
+            prepare_mise_path(cwd.join(program).to_str().unwrap(), &mut env);
+            assert_eq!(env.var("PATH").unwrap(), expected, "{program}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

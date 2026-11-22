@@ -141,3 +141,87 @@ fn init_detects_projected_fallback_loops_and_real_overrides_repair_both_tools() 
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("rustdoc 1.99.0"));
 }
+
+#[test]
+fn clang_through_mise_uses_the_active_tool_or_the_system_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path();
+    for dir in ["farm", "manager", "system", "pinned"] {
+        std::fs::create_dir(base.join(dir)).unwrap();
+    }
+    let kache = env!("CARGO_BIN_EXE_kache");
+    let cache = base.join("cache");
+    let _daemon = common::DaemonGuard::new(kache, &cache);
+    std::fs::write(base.join("farm/.kache-shims"), "").unwrap();
+    std::os::unix::fs::symlink(kache, base.join("farm/clang")).unwrap();
+    std::os::unix::fs::symlink("../mise", base.join("manager/clang")).unwrap();
+    executable(
+        &base.join("mise"),
+        r#"#!/bin/sh
+if [ -f selected ]; then exec ./pinned/clang "$@"; fi
+IFS=:
+for dir in $PATH; do
+    if [ "$dir" != "$SHIM_DIR" ] && [ -x "$dir/clang" ]; then
+        exec "$dir/clang" "$@"
+    fi
+done
+exit 127
+"#,
+    );
+    for dir in ["system", "pinned"] {
+        executable(
+            &base.join(dir).join("clang"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = -c ]; then echo {dir} > \"$4\"; else echo {dir} \"$@\"; fi\n"
+            ),
+        );
+    }
+    std::fs::write(base.join("unit.c"), "int unit;").unwrap();
+    let path =
+        std::env::join_paths(["farm", "manager", "system"].map(|dir| base.join(dir))).unwrap();
+    for expected in ["system", "pinned"] {
+        if expected == "pinned" {
+            std::fs::write(base.join("selected"), "").unwrap();
+        }
+        for args in [&["--version"][..], &["-c", "unit.c", "-o", "unit.o"][..]] {
+            let output = common::hermetic_command(base.join("farm/clang"), &cache, None)
+                .args(args)
+                .current_dir(base)
+                .env("PATH", &path)
+                .env("SHIM_DIR", base.join("manager"))
+                .env_remove("CARGO_PKG_NAME")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if args == ["--version"] {
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap().trim(),
+                    format!("{expected} --version")
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(base.join("unit.o")).unwrap().trim(),
+                    expected
+                );
+            }
+        }
+    }
+    let log = std::fs::read_to_string(cache.join("events.jsonl")).unwrap();
+    let compiles: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["crate_name"] == "unit.c")
+        .collect();
+    assert_eq!(compiles.len(), 2);
+    for event in compiles {
+        assert_eq!(event["result"], "passthrough");
+        assert_eq!(
+            event["passthrough_reason"],
+            "unsupported|mise selects the compiler at runtime"
+        );
+    }
+}

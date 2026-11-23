@@ -1058,6 +1058,53 @@ fn local_hit_on_an_entry_prefetch_imported_counts_as_a_prefetch_hit() {
     assert_eq!(report.prefetch.total_hits, 5);
 }
 
+/// A declined store counts the time its compile took, or its elapsed time
+/// when the event recorded no compile time.
+#[test]
+fn a_declined_store_without_a_compile_time_counts_its_elapsed_time() {
+    let timed = test_event("gen", EventResult::Skipped, 51_000, 50_000, 0, "aaa111");
+    let untimed = test_event("other", EventResult::Skipped, 30_000, 0, 0, "bbb222");
+    assert_eq!(declined_store_totals(&[timed, untimed]), (2, 80_000));
+}
+
+/// Prefetch is credited for a local hit only when a completed import with a
+/// finish time brought that key in at or before the hit.
+#[test]
+fn prefetch_credit_needs_a_completed_import_finished_by_the_hit() {
+    let hit_at = jiff::Timestamp::now();
+    let hit_ms = hit_at.as_millisecond() as u64;
+    let hit = |cache_key: &str| {
+        let mut event = test_event("crate", EventResult::LocalHit, 5, 300, 10, cache_key);
+        event.ts = hit_at;
+        event
+    };
+    let import = |cache_key: &str, outcome: &str, finished_at_unix_ms: u64| {
+        let mut transfer = test_transfer("crate", TransferDirection::Download, "v3", 10, 5, true);
+        transfer.cache_key = cache_key.to_string();
+        transfer.prefetch = Some(kache_core::timeline::PrefetchOrigin::default());
+        transfer.outcome = outcome.to_string();
+        transfer.ok = outcome == "completed";
+        transfer.started_at_unix_ms = finished_at_unix_ms.saturating_sub(5);
+        transfer.finished_at_unix_ms = finished_at_unix_ms;
+        transfer
+    };
+    let events = [
+        hit("earlier"),
+        hit("same-moment"),
+        hit("later"),
+        hit("not-found"),
+        hit("unfinished"),
+    ];
+    let transfers = [
+        import("earlier", "completed", hit_ms - 1_000),
+        import("same-moment", "completed", hit_ms),
+        import("later", "completed", hit_ms + 1_000),
+        import("not-found", "not_found", hit_ms - 1_000),
+        import("unfinished", "completed", 0),
+    ];
+    assert_eq!(prefetch_served_local_hits(&events, &transfers), 2);
+}
+
 #[test]
 fn test_generate_report_with_all_result_types() {
     let dir = tempfile::tempdir().unwrap();

@@ -872,6 +872,36 @@ fn write_test_events(dir: &std::path::Path) -> Config {
     config
 }
 
+/// A compile that looked its key up, missed and ran, and whose store kache
+/// then declined, missed the cache like any other: both hit rates count it.
+/// A skip without a key never looked anything up and stays out.
+#[test]
+fn a_declined_store_counts_against_both_hit_rates() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    let before = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+
+    let mut declined = test_event("gen", EventResult::Skipped, 51_000, 50_000, 0, "aaa111");
+    declined.skip_reason = "`libgen.rlib` names this checkout's directory".to_string();
+    events::log_event(&config.event_log_path(), &declined).unwrap();
+    let mut keyless = test_event("probe", EventResult::Skipped, 9_000, 8_000, 0, "");
+    keyless.skip_reason = "missing-dep-info".to_string();
+    events::log_event(&config.event_log_path(), &keyless).unwrap();
+    let after = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+
+    let (b, a) = (&before.summary, &after.summary);
+    assert_eq!(a.total_crates, b.total_crates + 1);
+    let hits = a.total_hits() as f64;
+    let expected = (hits / a.total_crates as f64 * 1000.0).round() / 10.0;
+    assert_eq!(a.hit_rate_pct, expected);
+    let saved = a.time_saved_ms as f64;
+    let compiled = (after.timing.miss_compile_time_ms + 50_000) as f64;
+    let expected = (saved / (saved + compiled) * 1000.0).round() / 10.0;
+    assert_eq!(a.weighted_hit_rate_pct, Some(expected));
+    assert_eq!(a.cache_efficiency_pct, expected);
+    assert!(a.hit_rate_pct < b.hit_rate_pct);
+}
+
 /// A compile kache failed to store stays a miss (so the hit rate keeps
 /// counting it and the miss table keeps showing it) and is additionally
 /// broken out as a store failure, named in the suggestions and flagged in
@@ -981,6 +1011,51 @@ fn readonly_store_hits_are_counted_inside_local_hits() {
     assert!(format_markdown(&report).contains("| Read-only store hits | 1 (included in local) |"));
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["summary"]["readonly_hits"], 1);
+}
+
+/// Prefetch imports an entry before the wrapper asks for it, so the wrapper
+/// finds it in its own store and logs a local hit. The report must still
+/// credit prefetch for it, but only for an import that completed before that
+/// hit.
+#[test]
+fn local_hit_on_an_entry_prefetch_imported_counts_as_a_prefetch_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_test_events(dir.path());
+    for key in ["late-key", "not-found-key"] {
+        events::log_event(
+            &config.event_log_path(),
+            &test_event("late", EventResult::LocalHit, 5, 300, 10, key),
+        )
+        .unwrap();
+    }
+    let now_ms = jiff::Timestamp::now().as_millisecond() as u64;
+    let prefetch = |cache_key: &str, outcome: &str, finished_at_unix_ms: u64| {
+        let mut transfer = test_transfer("serde", TransferDirection::Download, "v3", 10, 5, true);
+        transfer.cache_key = cache_key.to_string();
+        transfer.prefetch = Some(kache_core::timeline::PrefetchOrigin::default());
+        transfer.outcome = outcome.to_string();
+        transfer.ok = outcome == "completed";
+        transfer.started_at_unix_ms = finished_at_unix_ms.saturating_sub(5);
+        transfer.finished_at_unix_ms = finished_at_unix_ms;
+        transfer
+    };
+    for transfer in [
+        // `write_test_events` logs a local hit on this key.
+        prefetch("abc123def456", "completed", now_ms - 60_000),
+        prefetch("late-key", "completed", now_ms + 3_600_000),
+        prefetch("not-found-key", "not_found", now_ms - 60_000),
+    ] {
+        events::log_transfer(&config.transfer_log_path(), &transfer).unwrap();
+    }
+
+    let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+    assert_eq!(
+        report.summary.prefetch_hits, 2,
+        "label plus one imported key"
+    );
+    assert_eq!(report.summary.local_hits, 2);
+    assert_eq!(report.prefetch.prefetch_hits, 2);
+    assert_eq!(report.prefetch.total_hits, 5);
 }
 
 #[test]

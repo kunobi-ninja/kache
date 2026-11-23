@@ -85,11 +85,11 @@ The Cargo shim holds a target-use lease for the whole command, including a
 long-running `cargo run`. Cleanup can therefore retain targets until that
 command exits.
 
-Since v2.1.0, Linux builds include process start times in
-waiting-command records, so a reused PID does not name an unrelated command.
-Older records and unreadable process metadata use conservative liveness checks.
-The shared lock controls removal; records supply the command names shown while
-it is busy.
+On Linux and macOS, Kache records each command's PID and start time. If the OS
+reuses the PID, cleanup drops the stale record from the list of waiting
+commands. If a record lacks a start time or the OS denies access to it, Kache
+keeps the command listed while the PID appears live. The shared lock controls
+when cleanup may remove a target.
 
 Without a terminal, a removal requiring confirmation exits
 nonzero unless you explicitly select a supported noninteractive mode. A failed

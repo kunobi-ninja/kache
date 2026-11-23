@@ -135,9 +135,7 @@ fn liveness_from_signal_probe(result: libc::c_int, error: impl FnOnce() -> Optio
     result == 0 || error() != Some(libc::ESRCH)
 }
 
-/// PID 1 names init, which Kache excludes from its records. PID 0 has no
-/// procfs entry; the fallback also rejects it and values that would become
-/// broadcasts to `kill`.
+/// Kache never records the kernel (PID 0) or init (PID 1) as holders.
 fn found(pid: u32) -> Found {
     if pid <= 1 {
         return Found::Gone;
@@ -152,9 +150,9 @@ fn found(pid: u32) -> Found {
     }
 }
 
-/// The process's BSD info. Without a start, macOS answers `kill(pid, 0)` for
-/// whatever process now holds a record's number, and a record outlives its
-/// process for good: a browser or a system daemon reads as a Cargo command.
+#[cfg(target_os = "macos")]
+const BSD_INFO_SIZE: libc::c_int = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+
 #[cfg(target_os = "macos")]
 fn found_on_this_platform(pid: u32) -> Found {
     let Ok(pid) = libc::c_int::try_from(pid) else {
@@ -162,27 +160,37 @@ fn found_on_this_platform(pid: u32) -> Found {
     };
     // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is writable for `size` bytes, the size the flavor fills.
-    let written =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    let error = (written != size).then(|| std::io::Error::last_os_error().raw_os_error());
-    process_from_bsdinfo(&info, error)
+    // SAFETY: the buffer is a writable proc_bsdinfo of the requested size.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            BSD_INFO_SIZE,
+        )
+    };
+    process_from_bsdinfo(&info, written, || {
+        std::io::Error::last_os_error().raw_os_error()
+    })
 }
 
-/// What a `proc_pidinfo` call says: `error` is `None` when it filled `info`,
-/// otherwise the errno it left, if any.
+/// libproc returns zero on error. A positive short result carries no errno.
 #[cfg(target_os = "macos")]
-fn process_from_bsdinfo(info: &libc::proc_bsdinfo, error: Option<Option<i32>>) -> Found {
-    match error {
-        None if info.pbi_status == libc::SZOMB => Found::Gone,
-        None => Found::Started(
+fn process_from_bsdinfo(
+    info: &libc::proc_bsdinfo,
+    written: libc::c_int,
+    errno: impl FnOnce() -> Option<i32>,
+) -> Found {
+    match written {
+        0 if errno() == Some(libc::ESRCH) => Found::Gone,
+        BSD_INFO_SIZE if info.pbi_status == libc::SZOMB => Found::Gone,
+        BSD_INFO_SIZE => Found::Started(
             info.pbi_start_tvsec
                 .saturating_mul(1_000_000)
                 .saturating_add(info.pbi_start_tvusec),
         ),
-        Some(Some(libc::ESRCH)) => Found::Gone,
-        Some(_) => Found::Unknown,
+        _ => Found::Unknown,
     }
 }
 
@@ -314,6 +322,8 @@ mod tests {
 
     #[test]
     fn this_process_is_running_and_numbers_kache_never_records_are_not() {
+        assert_eq!(found(0), Found::Gone);
+        assert_eq!(found(1), Found::Gone);
         assert!(ProcessIdentity::current().is_running());
         for pid in [0, 1, u32::MAX] {
             assert!(!ProcessIdentity::of(pid).is_running(), "pid {pid}");
@@ -367,16 +377,27 @@ mod tests {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         info.pbi_start_tvsec = 2;
         info.pbi_start_tvusec = 3;
-        assert_eq!(process_from_bsdinfo(&info, None), Found::Started(2_000_003));
+        let no_errno = || panic!("errno only belongs to a failed call");
         assert_eq!(
-            process_from_bsdinfo(&info, Some(Some(libc::ESRCH))),
+            process_from_bsdinfo(&info, BSD_INFO_SIZE, no_errno),
+            Found::Started(2_000_003)
+        );
+        assert_eq!(
+            process_from_bsdinfo(&info, 0, || Some(libc::ESRCH)),
             Found::Gone
         );
         for error in [Some(libc::EPERM), None] {
-            assert_eq!(process_from_bsdinfo(&info, Some(error)), Found::Unknown);
+            assert_eq!(process_from_bsdinfo(&info, 0, || error), Found::Unknown);
         }
         info.pbi_status = libc::SZOMB;
-        assert_eq!(process_from_bsdinfo(&info, None), Found::Gone);
+        assert_eq!(
+            process_from_bsdinfo(&info, BSD_INFO_SIZE - 1, no_errno),
+            Found::Unknown
+        );
+        assert_eq!(
+            process_from_bsdinfo(&info, BSD_INFO_SIZE, no_errno),
+            Found::Gone
+        );
         let this = found(std::process::id());
         assert!(matches!(this, Found::Started(_)), "{this:?}");
         assert_eq!(found(std::process::id()), this);

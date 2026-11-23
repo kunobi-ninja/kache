@@ -427,6 +427,31 @@ mod tests {
         assert!(!is_quiet(&["run", "--", "-q"]));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_holder_records_distinguish_starts_and_keep_live_legacy_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lease = shared(dir.path(), "cargo build", &mut io::sink()).unwrap();
+        let current = crate::process_identity::ProcessIdentity::current();
+        let start = current.start().expect("macOS reports the holder's start");
+        let records = holders_dir(dir.path());
+        let stale = records.join(format!("{}-1-{}", current.pid(), start ^ 1));
+        let legacy = records.join(format!("{}-2", current.pid()));
+        std::fs::write(&stale, "0\tstale cargo").unwrap();
+        std::fs::write(&legacy, "0\tlegacy cargo").unwrap();
+
+        let named = holders(dir.path());
+        assert_eq!(named.len(), 2);
+        assert!(
+            named
+                .iter()
+                .any(|h| h.what == "cargo build" && h.process == current)
+        );
+        assert!(named.iter().any(|h| h.what == "legacy cargo"));
+        assert!(legacy.exists());
+        assert!(!stale.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn closing_a_lease_releases_an_inherited_descriptor() {

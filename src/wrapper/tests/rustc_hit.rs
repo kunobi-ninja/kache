@@ -488,8 +488,9 @@ fn shared_width_remote_and_prefetch_unsafe_entries_are_policy_misses() {
             )
             .is_none()
         );
-        // The shared key, then this width's key, which holds nothing.
-        assert_eq!(daemon.request_count(), 2);
+        // The shared key, then this width's key, which holds nothing, then
+        // both bound to this checkout.
+        assert_eq!(daemon.request_count(), 4);
         assert!(!fixture.args.out_dir.as_ref().unwrap().exists());
         assert!(!fixture.config.event_log_path().exists());
         assert!(fixture.args.incremental.as_ref().unwrap().exists());

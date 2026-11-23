@@ -5146,15 +5146,21 @@ fn run_parsed_rustc(
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
     // A proc macro can write the checkout path into generated code where the
-    // key cannot see it (kunobi-ninja/kache#1914).
+    // key cannot see it (kunobi-ninja/kache#1914). Such outputs are stored
+    // under a key bound to this checkout.
     let key_binds_manifest_dir =
         crate::embedded_checkout::key_binds_manifest_dir(key_outputs.env_deps.as_ref());
-    let names_checkout = || {
-        crate::embedded_checkout::embedded_checkout_reason(
-            args,
-            &result.artifacts,
-            key_binds_manifest_dir,
-        )
+    let mut bound_checkout = None;
+    let names_checkout = || match crate::embedded_checkout::embedded_checkout(
+        args,
+        &result.artifacts,
+        key_binds_manifest_dir,
+    ) {
+        Ok(checkout) => {
+            bound_checkout = checkout;
+            None
+        }
+        Err(reason) => Some(reason),
     };
     if let Some(reason) = unaudited.or(degraded).or(unpaired).or_else(names_checkout) {
         tracing::warn!("not caching {crate_name}: {reason}");
@@ -5177,6 +5183,10 @@ fn run_parsed_rustc(
     // Rendered diagnostics from a terminal-width invocation go under that
     // width's key; everything else under the shared key.
     let entry_key = rustc_diagnostics::store_key(args, &cache_key, &result.stdout, &result.stderr);
+    let entry_key = match &bound_checkout {
+        Some(checkout) => entry_key.bound_to_checkout(checkout),
+        None => entry_key,
+    };
     key_record.note_entry_key(&entry_key);
 
     // Put-side admission control: the compile already ran and its outputs are

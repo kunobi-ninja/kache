@@ -1152,6 +1152,21 @@ fn prefetch_credit_requires_a_matching_import_by_first_demand() {
     assert_eq!(credit(&hit, &get), 0);
     get.finished_at_unix_ms = 900;
     assert_eq!(credit(&hit, &get), 1);
+    // The wrapper started at 800, but only asked for its final key at 900.
+    // Importing at 900 qualifies even when no other key was requested.
+    let mut one_demand = hit.clone();
+    one_demand.demands = vec![KeyDemand {
+        cache_key: "key".into(),
+        first_demand_at_ms: 900,
+        ..Default::default()
+    }];
+    assert_eq!(credit(&one_demand, &get), 1);
+    // If the only recorded demand was for a prediction, the final key still
+    // uses the invocation start as its fallback.
+    one_demand.demands[0].cache_key = "predicted".into();
+    get.finished_at_unix_ms = 800;
+    assert_eq!(credit(&one_demand, &get), 1);
+    get.finished_at_unix_ms = 900;
     // A miss can be logged after a later hit. Its earlier demand still
     // determines whether the import arrived in time.
     let mut earlier = hit.clone();

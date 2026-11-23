@@ -5529,6 +5529,33 @@ fn an_empty_private_output_cannot_pay_for_evicting_a_held_archive() {
 }
 
 #[test]
+fn a_missing_empty_blob_cannot_pay_for_evicting_a_held_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let retainer = put_partly_held_entry(&store, dir.path(), 30_000, 0);
+
+    // The index still names the empty .rmeta, but a probe cannot find it.
+    let empty_blob = store.blob_path(blake3::hash(b"").to_hex().as_str());
+    assert_eq!(fs::metadata(&empty_blob).unwrap().len(), 0);
+    unlink_blob(&empty_blob);
+    assert!(!empty_blob.try_exists().unwrap());
+
+    let candidates = store
+        .eviction_candidates_for(SweepOrigin::Requested)
+        .unwrap();
+    let held = store.held_by_live_files(&candidates).unwrap();
+    assert_eq!(held.refused.get("partly"), Some(&30_000));
+    assert!(matches!(
+        store
+            .remove_entry_guarded("partly", Some(EVICTION_IDLE_GRACE))
+            .unwrap(),
+        GuardedRemoval::Unreclaimable
+    ));
+    assert!(store.contains("partly"));
+    assert_eq!(fs::read(retainer).unwrap(), vec![1; 30_000]);
+}
+
+#[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));
     assert!(holds_last_reference(2, 2));

@@ -1712,14 +1712,21 @@ fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
     };
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
     let mut config = test_config(&store);
-    chmod(&store, 0o2750);
+    // Linux Nix seccomp denies chmod(S_ISGID). Both kinds of shared store
+    // must retain every permission bit that the filesystem actually granted.
+    if let Err(err) = std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o2750)) {
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        chmod(&store, 0o750);
+    }
+    let shared_mode = mode(&store);
+    assert!(matches!(shared_mode, 0o750 | 0o2750));
     let socket = config.socket_path();
     prepare_daemon_socket_dir(&config, &socket).unwrap();
-    assert_eq!(mode(&store), 0o2750);
+    assert_eq!(mode(&store), shared_mode);
     assert_eq!(mode(socket.parent().unwrap()) & 0o777, 0o700);
     config.socket_path_override = Some(store.join("custom.sock"));
     assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
-    assert_eq!(mode(&store), 0o2750);
+    assert_eq!(mode(&store), shared_mode);
 
     let dedicated = temp.path().join("runtime");
     std::fs::create_dir(&dedicated).unwrap();
@@ -1728,7 +1735,7 @@ fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
     config.socket_path_override = None;
     prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
     assert_eq!(mode(&dedicated), 0o700);
-    assert_eq!(mode(&store), 0o2750);
+    assert_eq!(mode(&store), shared_mode);
 
     chmod(&dedicated, 0o770);
     assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
@@ -1748,22 +1755,50 @@ fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
     symlink(&store, &alias).unwrap();
     config.runtime_dir = alias;
     assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
-    assert_eq!(mode(&store), 0o2750);
+    assert_eq!(mode(&store), shared_mode);
 }
 
 #[cfg(unix)]
 #[test]
 fn ipc_path_owners_and_sticky_permissions() {
     let me = 1001;
+    let store = Path::new("/parent/store");
+    let parent = store.parent().unwrap();
     for owner in [0, me] {
-        assert!(ipc_ancestor_is_safe(owner, 0o755, me, true));
-        assert!(ipc_ancestor_is_safe(owner, 0o1777, me, false));
-        assert!(!ipc_ancestor_is_safe(owner, 0o1777, me, true));
-        assert!(!ipc_ancestor_is_safe(owner, 0o775, me, false));
-        assert!(!ipc_ancestor_is_safe(owner, 0o707, me, true));
+        assert!(ipc_ancestor_is_safe(owner, 0o755, me, store, store));
+        assert!(ipc_ancestor_is_safe(owner, 0o1777, me, parent, store));
+        assert!(!ipc_ancestor_is_safe(owner, 0o1777, me, store, store));
+        assert!(!ipc_ancestor_is_safe(owner, 0o775, me, parent, store));
+        assert!(!ipc_ancestor_is_safe(owner, 0o707, me, store, store));
     }
-    assert!(!ipc_ancestor_is_safe(1002, 0o700, me, true));
-    assert!(!ipc_ancestor_is_safe(1002, 0o1777, me, false));
+    assert!(!ipc_ancestor_is_safe(1002, 0o700, me, store, store));
+    assert!(!ipc_ancestor_is_safe(1002, 0o1777, me, parent, store));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_foreign_namespace_root_needs_a_direct_mount_for_ipc() {
+    use std::os::unix::fs::symlink;
+    let root = Path::new("/");
+    let procfs = Path::new("/proc");
+    let nested = procfs.join("self");
+    assert!(ipc_ancestor_is_safe(65_534, 0o750, 1000, root, &nested));
+    assert!(!ipc_ancestor_is_safe(65_534, 0o770, 1000, root, &nested));
+    assert!(!ipc_ancestor_is_safe(65_534, 0o750, 1000, procfs, &nested));
+    assert!(!ipc_ancestor_is_safe(65_534, 0o750, 1000, root, root));
+    assert!(!ipc_ancestor_is_safe(
+        65_534,
+        0o750,
+        1000,
+        root,
+        Path::new("/no-such-kache-fixture")
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("proc");
+    symlink(procfs, &link).unwrap();
+    assert!(!is_ipc_mount_root(&link));
+    assert!(!is_ipc_mount_root(dir.path()));
 }
 
 #[cfg(unix)]

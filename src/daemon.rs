@@ -372,9 +372,29 @@ impl Drop for DaemonCoordGuard {
 }
 
 #[cfg(unix)]
-fn ipc_ancestor_is_safe(owner: u32, mode: u32, uid: u32, is_store: bool) -> bool {
-    let sticky_parent = !is_store && mode & 0o1000 != 0;
-    (owner == uid || owner == 0) && (mode & 0o022 == 0 || sticky_parent)
+fn ipc_ancestor_is_safe(owner: u32, mode: u32, uid: u32, ancestor: &Path, store: &Path) -> bool {
+    if owner == uid || owner == 0 {
+        return mode & 0o022 == 0 || (ancestor != store && mode & 0o1000 != 0);
+    }
+    // In a Linux user namespace the host's root UID can be unmapped. A
+    // direct mount beneath /, such as Nix's /build, cannot be renamed or
+    // unlinked by its parent owner. Check the mount entry itself, not a link.
+    #[cfg(target_os = "linux")]
+    if ancestor == Path::new("/") && mode & 0o022 == 0 {
+        return store
+            .ancestors()
+            .find(|path| path.parent() == Some(ancestor))
+            .is_some_and(is_ipc_mount_root);
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_ipc_mount_root(path: &Path) -> bool {
+    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags, statx};
+    statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE).is_ok_and(|stat| {
+        (stat.stx_attributes & stat.stx_attributes_mask).contains(StatxAttributes::MOUNT_ROOT)
+    })
 }
 
 /// Create a missing socket parent privately before opening daemon locks. The
@@ -403,7 +423,7 @@ pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Resul
                 for ancestor in root.ancestors() {
                     let meta = std::fs::metadata(ancestor)?;
                     anyhow::ensure!(
-                        ipc_ancestor_is_safe(meta.uid(), meta.mode(), uid, ancestor == root),
+                        ipc_ancestor_is_safe(meta.uid(), meta.mode(), uid, ancestor, root),
                         "daemon IPC path {} can be changed by another user; set KACHE_RUNTIME_DIR to a private directory",
                         ancestor.display()
                     );

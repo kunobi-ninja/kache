@@ -4355,8 +4355,19 @@ fn fresh_and_existing_daemon_endpoints_are_stable_per_scope() {
     std::fs::write(flat.with_extension("run.lock"), "").unwrap();
     // A stale legacy lock cannot force the owner to chmod a shared root.
     for mode in [0o750, 0o2700, 0o2750] {
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
-        assert_eq!(socket(None), nested);
+        match std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)) {
+            Ok(()) => {}
+            // Some builders disallow assigning the setgid bit to directories.
+            Err(error)
+                if mode & 0o2000 != 0 && error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                continue;
+            }
+            Err(error) => panic!("cannot set store mode {mode:o}: {error}"),
+        }
+        if std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777 == mode {
+            assert_eq!(socket(None), nested);
+        }
     }
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::create_dir(root.join("ipc")).unwrap();

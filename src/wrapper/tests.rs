@@ -468,6 +468,26 @@ fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> Rust
 }
 
 #[test]
+fn store_unavailable_message_names_the_os_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().to_path_buf());
+    let index = config.index_db_path();
+    std::fs::create_dir(&index).unwrap();
+
+    let err =
+        match Store::open_with_options(&config, crate::store::StoreOptions::from_env(|_| None)) {
+            Ok(_) => panic!("a directory is not an index"),
+            Err(err) => err,
+        };
+    let msg = store_unavailable_message(&err);
+    let expected = format!(
+        "(a direct check reports: opening {} read/write: ",
+        index.display()
+    );
+    assert!(msg.contains(&expected), "msg = {msg}");
+}
+
+#[test]
 fn store_unavailable_message_is_actionable() {
     let err = anyhow::anyhow!("disk I/O error")
         .context("opening index database /mnt/c/Users/x/kache/index.db");

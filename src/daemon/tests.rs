@@ -3572,7 +3572,10 @@ fn periodic_gc_opens_the_main_store_but_leaves_an_empty_shard_alone() {
 
     let store = Store::open(&daemon.config).unwrap();
     let _lock = store.try_gc_lock().unwrap().unwrap();
-    assert_eq!(daemon.periodic_gc(None), [daemon.config.cache_dir.clone()]);
+    assert_eq!(
+        daemon.periodic_gc(None).as_slice(),
+        std::slice::from_ref(&daemon.config.cache_dir)
+    );
 }
 
 #[test]
@@ -3599,7 +3602,7 @@ fn periodic_gc_keeps_sweeping_shards_when_the_main_store_fails() {
     let held = store.try_gc_lock().unwrap().unwrap();
     let daemon = Daemon::new(config);
     let pending = daemon.periodic_gc(None);
-    assert_eq!(pending, [busy.cache_dir.clone()]);
+    assert_eq!(pending.as_slice(), std::slice::from_ref(&busy.cache_dir));
     assert!(!healthy_lock.exists());
     assert!(busy_lock.exists());
 

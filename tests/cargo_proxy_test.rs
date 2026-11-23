@@ -99,7 +99,7 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
         matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "the cargo shim released the target while its test was running"
     );
-    // Only its own workspace: the store-wide lock stays free for cleanup.
+    // Older cleaners request a whole-file lock, even on a scoped workspace.
     let everything = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -107,8 +107,10 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
         .truncate(false)
         .open(cache.join("target-use.lock"))
         .unwrap();
-    everything.try_lock().unwrap();
-    everything.unlock().unwrap();
+    assert!(matches!(
+        everything.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     assert!(target.join("debug/output").exists());
 
     std::fs::write(&go, "").unwrap();
@@ -717,11 +719,21 @@ fn assert_cargo_lease_gone(holders: &Path) {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "records left behind: {left:?}");
-    for lock in std::fs::read_dir(holders.parent().unwrap().join("target-use.d")).unwrap() {
+    let cache = holders.parent().unwrap();
+    let mut paths = vec![cache.join("target-use.lock")];
+    let scoped = cache.join("target-use.d");
+    if scoped.exists() {
+        paths.extend(
+            std::fs::read_dir(scoped)
+                .unwrap()
+                .map(|entry| entry.unwrap().path()),
+        );
+    }
+    for path in paths {
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(lock.unwrap().path())
+            .open(path)
             .unwrap();
         lock.try_lock().unwrap();
         lock.unlock().unwrap();

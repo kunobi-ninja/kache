@@ -513,6 +513,9 @@ pub fn stop_daemon(stop: &mut Command, runtime_dir: &Path) {
 /// exclusively while it removes a target in or around `dir`.
 #[allow(dead_code)]
 pub fn target_use_lock(cache_dir: &Path, dir: &Path) -> PathBuf {
+    if !cfg!(any(target_os = "macos", windows)) {
+        return cache_dir.join("target-use.lock");
+    }
     let dir = dir.canonicalize().unwrap();
     let hash = blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex();
     cache_dir

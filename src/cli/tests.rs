@@ -8446,10 +8446,13 @@ fn remove_targets_removes_what_a_running_command_does_not_use() {
     let paths = [mine.as_path(), other.as_path()];
     let notes = removal_notes(&cache, &paths);
     assert_eq!(notes.len(), 1, "{notes:?}");
+    let scoped = crate::target_use::SCOPED_LOCKS;
+    let count = if scoped { "1 target." } else { "2 targets." };
     assert!(
-        notes[0].starts_with("Not now: waiting for `hub`") && notes[0].ends_with("skips 1 target."),
+        notes[0].starts_with("Not now: waiting for `hub`"),
         "{notes:?}"
     );
+    assert!(notes[0].ends_with(count), "{notes:?}");
     assert_eq!(waiting_for(&cache, &paths).len(), 1);
     let mut skipped = Vec::new();
     let mut waiting = Vec::new();
@@ -8462,9 +8465,10 @@ fn remove_targets_removes_what_a_running_command_does_not_use() {
         &mut waiting,
         &mut Vec::new(),
     );
-    assert_eq!(removed.0, 1);
-    assert!(mine.exists() && !other.exists());
-    assert_eq!(skipped.len(), 1);
+    assert_eq!(removed.0, usize::from(scoped));
+    assert!(mine.exists());
+    assert_eq!(other.exists(), !scoped);
+    assert_eq!(skipped.len(), if scoped { 1 } else { 2 });
     assert_eq!(skipped[0].path, mine.display().to_string());
     assert_eq!(waiting.len(), 1);
     assert_eq!(waiting[0].what, "hub");

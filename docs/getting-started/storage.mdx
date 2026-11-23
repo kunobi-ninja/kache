@@ -82,8 +82,10 @@ a removal request. Previews show selected and retained targets, recent use,
 freeable estimates, and active-command blockers.
 
 The Cargo shim holds a target-use lease for the whole command, including a
-long-running `cargo run`. Cleanup can therefore retain targets until that
-command exits.
+long-running `cargo run`. On macOS and Windows, cleanup can reclaim unrelated
+targets while the command runs. If Kache cannot determine which directories
+the command might use, it protects all targets. Other platforms keep the
+cache-wide lease so older and newer Kache processes can safely share a cache.
 
 On Linux and macOS, Kache records each command's PID and start time. If the OS
 reuses the PID, cleanup drops the stale record from the list of waiting

@@ -24,14 +24,10 @@ use crate::compiler::{ArtifactKind, ArtifactSet};
 const CHUNK: usize = 1 << 20;
 /// Bytes past a match the target-directory check may read.
 const PATH_TAIL: usize = 512;
-/// Bytes before a match the remap-root check may read: `/rustc/` and a
-/// 40-digit commit hash is the longest root.
-const LOOKBEHIND: usize = 64;
-
 /// Whether this compile's outputs name its checkout.
 ///
 /// `Ok(Some(checkout))` when one does: the entry may only be stored under a
-/// key bound to [`checkout_identity`], which a build in another checkout
+/// key bound to that checkout, which a build in another checkout
 /// never looks up. `Err` with the reason when an output cannot be read, and
 /// the entry is not stored.
 ///
@@ -49,13 +45,9 @@ pub(crate) fn embedded_checkout(
     if key_binds_manifest_dir {
         return Ok(None);
     }
-    let Some(identity) = checkout_identity(args) else {
+    let Some(checkout) = Checkout::for_args(args) else {
         return Ok(None);
     };
-    let Some(manifest_dir) = args.invocation_env().var_os("CARGO_MANIFEST_DIR") else {
-        return Ok(None);
-    };
-    let checkout = checkout_spellings(Path::new(&manifest_dir), args.path_normalization_root());
     let target = args
         .target_dir()
         .map(|dir| spellings(&dir))
@@ -78,14 +70,14 @@ pub(crate) fn embedded_checkout(
         {
             continue;
         }
-        match file_names_checkout(&artifact.path, &checkout, &target) {
+        match file_names_checkout(&artifact.path, &checkout.spellings, &target) {
             Ok(false) => {}
             Ok(true) => {
                 tracing::debug!(
                     "`{}` names this checkout's directory; storing it for this checkout only",
                     artifact.store_name
                 );
-                return Ok(Some(identity));
+                return Ok(Some(checkout.identity));
             }
             Err(error) => {
                 return Err(format!(
@@ -98,21 +90,36 @@ pub(crate) fn embedded_checkout(
     Ok(None)
 }
 
-/// The checkout a key is bound to when an output names it: the manifest dir
-/// and the path normalization root, as this invocation spells them. `None`
-/// for a compile without path remapping, whose key already folds them, or
-/// one outside Cargo.
-pub(crate) fn checkout_identity(args: &RustcArgs) -> Option<Vec<u8>> {
-    if args.skip_path_remap() {
-        return None;
+/// Use the same snapshot of the checkout's paths for scanning and keying.
+pub(crate) struct Checkout {
+    pub(crate) identity: Vec<u8>,
+    spellings: Vec<Vec<u8>>,
+}
+
+impl Checkout {
+    pub(crate) fn for_args(args: &RustcArgs) -> Option<Self> {
+        if args.skip_path_remap() {
+            return None;
+        }
+        let manifest = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
+        let root = args.path_normalization_root();
+        let spellings = checkout_spellings(Path::new(&manifest), root);
+        // Keep the manifest and root distinct even when their normalized
+        // spellings overlap. A retargeted symlink changes the canonical form.
+        let mut identity = manifest.as_encoded_bytes().to_vec();
+        identity.push(0);
+        if let Some(root) = root {
+            identity.extend_from_slice(root.as_os_str().as_encoded_bytes());
+        }
+        for spelling in &spellings {
+            identity.push(0);
+            identity.extend_from_slice(spelling);
+        }
+        Some(Self {
+            identity,
+            spellings,
+        })
     }
-    let manifest_dir = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
-    let mut identity = manifest_dir.as_encoded_bytes().to_vec();
-    identity.push(0);
-    if let Some(root) = args.path_normalization_root() {
-        identity.extend_from_slice(root.as_os_str().as_encoded_bytes());
-    }
-    Some(identity)
 }
 
 /// Whether `path` is a `staticlib` output, which the file-name classifier
@@ -211,9 +218,7 @@ fn reader_names_checkout(
     target: &[Vec<u8>],
     tail: usize,
 ) -> std::io::Result<bool> {
-    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + tail + LOOKBEHIND);
-    // Matches that start before this offset were decided in the last window.
-    let mut from = 0;
+    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + tail);
     loop {
         // `read_to_end` retries an interrupted read.
         let read = (&mut file).take(CHUNK as u64).read_to_end(&mut window)?;
@@ -222,17 +227,15 @@ fn reader_names_checkout(
             complete || read > 0,
             "a chunk that is not the last reads bytes"
         );
-        if names_checkout(&window, from, checkout, target, complete, tail) {
+        if names_checkout(&window, checkout, target, complete, tail) {
             return Ok(true);
         }
         if complete {
             return Ok(false);
         }
-        // Keep the bytes a match near the end still needs, and the bytes
-        // before it that say whether Kache wrote the path it sits in.
-        let keep_from = window.len().saturating_sub(tail + LOOKBEHIND);
+        // Keep the bytes a match near the end still needs.
+        let keep_from = window.len().saturating_sub(tail);
         window.drain(..keep_from);
-        from = LOOKBEHIND + 1;
     }
 }
 
@@ -241,10 +244,8 @@ fn reader_names_checkout(
 /// need not end at a path boundary: string literals sit side by side with
 /// nothing between them. Unless the window is `complete`, a match within
 /// `tail` bytes of its end is left for the next window, which keeps them.
-/// A match that starts before `from` was decided in the previous window.
 fn names_checkout(
     bytes: &[u8],
-    from: usize,
     checkout: &[Vec<u8>],
     target: &[Vec<u8>],
     complete: bool,
@@ -252,41 +253,13 @@ fn names_checkout(
 ) -> bool {
     checkout.iter().any(|needle| {
         memchr::memmem::find_iter(bytes, needle).any(|at| {
-            if at < from {
-                return false;
-            }
             let rest = &bytes[at..];
             if !complete && rest.len() < tail {
                 return false;
             }
-            !follows_remap_root(&bytes[..at])
-                && !target.iter().any(|dir| inside_target(rest, dir, complete))
+            !target.iter().any(|dir| inside_target(rest, dir, complete))
         })
     })
-}
-
-/// Whether `before` ends with a root that path remapping writes, such as
-/// `/kache/profile` or `/proc/self/cwd`. A checkout path that starts right
-/// there is part of a path Kache wrote, like
-/// `/kache/profile/build/<pkg>/<hash>/out/gen.rs` for a checkout at `/build`.
-/// No remapped string ends at a bare root, so an adjacent string literal
-/// cannot hide a real checkout path this way.
-fn follows_remap_root(before: &[u8]) -> bool {
-    if before.ends_with(b"/proc/self/cwd") {
-        return true;
-    }
-    let Some(slash) = before.iter().rposition(|byte| *byte == b'/') else {
-        return false;
-    };
-    let (parent, name) = (&before[..=slash], &before[slash + 1..]);
-    if name.is_empty() {
-        return false;
-    }
-    (parent.ends_with(b"/kache/")
-        && name
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
-        || (parent.ends_with(b"/rustc/") && name.iter().all(u8::is_ascii_hexdigit))
 }
 
 /// Whether `rest` is a path below `dir` that does not climb back out of it.
@@ -319,68 +292,13 @@ mod tests {
     fn found(bytes: &[u8], checkout: &[&[u8]], target: &[&[u8]]) -> bool {
         let checkout: Vec<Vec<u8>> = checkout.iter().map(|path| path.to_vec()).collect();
         let target: Vec<Vec<u8>> = target.iter().map(|path| path.to_vec()).collect();
-        names_checkout(bytes, 0, &checkout, &target, true, 0)
-    }
-
-    /// Whether `bytes`, written to an output file, name `checkout`.
-    fn file_found(bytes: &[u8], checkout: &[u8]) -> bool {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("out.rlib");
-        std::fs::write(&file, bytes).unwrap();
-        file_names_checkout(&file, &[checkout.to_vec()], &[]).unwrap()
+        names_checkout(bytes, &checkout, &target, true, 0)
     }
 
     #[test]
-    fn a_checkout_path_inside_a_remapped_path_is_not_counted() {
-        // The length byte before a metadata string is arbitrary; `7` is real.
-        assert!(!file_found(
-            b"7/kache/profile/build/pkg/0123abcd/out/gen.rs\0",
-            b"/build"
-        ));
-        assert!(!file_found(
-            b"/kache/profile/build/pkg-name/0123/out/gen.rs",
-            b"/build/pkg"
-        ));
-        assert!(!file_found(b"/proc/self/cwd/build/src/lib.rs", b"/build"));
-        let std_path = format!("/rustc/{}/build/x.rs", "0a".repeat(20));
-        assert!(!file_found(std_path.as_bytes(), b"/build"));
-        assert!(!file_found(b"/kache/base-dir-0/build/x.rs", b"/build"));
-    }
-
-    #[test]
-    fn a_checkout_path_after_a_remapped_path_still_counts() {
-        // A literal packed after a remapped path, deeper inside one, or
-        // after a root-like path that is not one.
-        assert!(file_found(
-            b"/kache/profile/out/gen.rs/build/assets",
-            b"/build"
-        ));
-        assert!(file_found(b"/kache/profile/x/build/assets", b"/build"));
-        assert!(file_found(b"/kache/build/assets", b"/build"));
-        assert!(file_found(b"/kache//build/assets", b"/build"));
-        assert!(file_found(b"/rustc/xyz/build/assets", b"/build"));
-        assert!(file_found(b"/notkache/profile/build/assets", b"/build"));
-        assert!(file_found(b"/proc/self/cwdx/build", b"/build"));
-        assert!(file_found(b"/build/assets", b"/build"));
-    }
-
-    #[test]
-    fn a_remap_root_cut_off_by_the_chunk_edge_still_exempts() {
-        for before_edge in [1, 6, 14, 20] {
-            let mut bytes = vec![b'x'; CHUNK - before_edge];
-            bytes.extend_from_slice(b"\0/kache/profile/build/pkg/0123/out/gen.rs\0");
-            bytes.extend(std::iter::repeat_n(b'y', 100));
-            assert!(!file_found(&bytes, b"/build"), "{before_edge}");
-        }
-        // The first window exempts this match. The second keeps only five
-        // bytes before it, and must not decide it again without its root.
-        let kept_from = CHUNK - (b"/build".len() + PATH_TAIL) - LOOKBEHIND;
-        let root = b"\0/kache/profile";
-        let mut bytes = vec![b'x'; kept_from + 5 - root.len()];
-        bytes.extend_from_slice(root);
-        bytes.extend_from_slice(b"/build/pkg/0123/out/gen.rs\0");
-        bytes.extend(std::iter::repeat_n(b'y', CHUNK));
-        assert!(!file_found(&bytes, b"/build"));
+    fn adjacent_literals_after_a_remap_root_are_checkout_bound() {
+        assert!(found(b"/kache/workspace/build/assets", &[b"/build"], &[]));
+        assert!(found(b"/kache/profile/src/lib.rs", &[b"/src"], &[]));
     }
 
     #[test]
@@ -537,7 +455,7 @@ mod tests {
             &named_exe,
             ArtifactKind::Other("extensionless"),
         )]);
-        let identity = checkout_identity(&args).unwrap();
+        let identity = Checkout::for_args(&args).unwrap().identity;
         assert_eq!(
             embedded_checkout(&args, &exe_set, false),
             Ok(Some(identity.clone()))
@@ -550,7 +468,7 @@ mod tests {
         let mut unremapped = args.clone();
         unremapped.path_normalize_disabled = true;
         assert_eq!(embedded_checkout(&unremapped, &named_set, false), Ok(None));
-        assert_eq!(checkout_identity(&unremapped), None);
+        assert!(Checkout::for_args(&unremapped).is_none());
 
         let missing = ArtifactSet::new(vec![artifact(
             &dir.path().join("gone.rlib"),
@@ -575,7 +493,7 @@ mod tests {
                 &invocation,
             )
             .unwrap();
-            checkout_identity(&args)
+            Checkout::for_args(&args).map(|checkout| checkout.identity)
         };
         let here = identity("/w/one/a", "/w/one");
         assert!(here.is_some());
@@ -584,6 +502,29 @@ mod tests {
         assert_ne!(here, identity("/w/one/a", "/w/two"));
         // The separator keeps a moved boundary from spelling the same bytes.
         assert_ne!(identity("/w/a", "/x/y"), identity("/w/a/x", "/y"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeting_a_checkout_symlink_changes_the_bound_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let alias = dir.path().join("current");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let env = kache_config::InvocationEnv::from_parts(
+            [("CARGO_MANIFEST_DIR", alias.as_os_str())],
+            Some(alias.clone()),
+            None,
+            dir.path().into(),
+        );
+        let args = RustcArgs::parse_for(&["rustc".into(), "lib.rs".into()], &env).unwrap();
+        let before = Checkout::for_args(&args).unwrap().identity;
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(second, alias).unwrap();
+        assert_ne!(before, Checkout::for_args(&args).unwrap().identity);
     }
 
     #[test]
@@ -673,23 +614,15 @@ mod tests {
     fn a_match_exactly_tail_bytes_from_an_open_end_is_decided_now() {
         let checkout = vec![b"/work/a".to_vec()];
         let bytes = b"/work/a/assets";
-        assert!(names_checkout(bytes, 0, &checkout, &[], false, bytes.len()));
+        assert!(names_checkout(bytes, &checkout, &[], false, bytes.len()));
         assert!(!names_checkout(
             bytes,
-            0,
             &checkout,
             &[],
             false,
             bytes.len() + 1
         ));
-        assert!(names_checkout(
-            bytes,
-            0,
-            &checkout,
-            &[],
-            true,
-            bytes.len() + 1
-        ));
+        assert!(names_checkout(bytes, &checkout, &[], true, bytes.len() + 1));
     }
 
     #[test]
@@ -732,11 +665,10 @@ mod tests {
         let checkout = vec![b"/work/a".to_vec()];
         let target = vec![b"/work/a/target".to_vec()];
         let cut = b"/work/a/target/debug/deps/x";
-        assert!(names_checkout(cut, 0, &checkout, &target, false, 0));
-        assert!(!names_checkout(cut, 0, &checkout, &target, true, 0));
+        assert!(names_checkout(cut, &checkout, &target, false, 0));
+        assert!(!names_checkout(cut, &checkout, &target, true, 0));
         assert!(!names_checkout(
             b"/work/a/target/x.o\0",
-            0,
             &checkout,
             &target,
             false,

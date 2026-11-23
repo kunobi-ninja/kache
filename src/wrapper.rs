@@ -1261,7 +1261,7 @@ fn claim_rustc_build(store: &Store, args: &RustcArgs, cache_key: &str) -> Result
     let Some(lock) = store.try_lock(cache_key)? else {
         return Ok(RustcClaim::Contended);
     };
-    for entry_key in rustc_diagnostics::lookup_keys(args, cache_key) {
+    for entry_key in rustc_diagnostics::local_lookup_keys(args, cache_key) {
         match store.get(&entry_key.key)? {
             Some(meta) if meta.files.is_empty() => {
                 tracing::warn!(
@@ -4647,7 +4647,7 @@ fn run_parsed_rustc(
         // every hit would be a database write per compile for no new information.
         // A re-derivation is the opposite case: its closure is what the record
         // should have said, so writing it is what repairs a stale row.
-        for entry_key in rustc_diagnostics::lookup_keys(args, &cache_key) {
+        for entry_key in rustc_diagnostics::local_lookup_keys(args, &cache_key) {
             let lookup_start = std::time::Instant::now();
             let lookup_result =
                 lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
@@ -5428,7 +5428,13 @@ fn run_parsed_rustc(
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     // 6. Queue remote publication through the shared durable upload path.
-    maybe_enqueue_upload(config, &store, &entry_key.key, crate_name, true);
+    maybe_enqueue_upload(
+        config,
+        &store,
+        &entry_key.key,
+        crate_name,
+        bound_checkout.is_none(),
+    );
 
     record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
 

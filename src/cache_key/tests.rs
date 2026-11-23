@@ -23044,6 +23044,31 @@ mod build_script_target_paths {
 }
 
 #[test]
+fn old_shared_archive_keys_are_retired_for_static_and_import_libraries() {
+    let linux = Some("x86_64-unknown-linux-gnu");
+    let windows = Some("x86_64-pc-windows-msvc");
+    assert!(checkout_archive_admission(&[], linux, false));
+    for (kind, target, custom, expected) in [
+        ("rlib,staticlib", linux, false, true),
+        ("staticlib", linux, false, true),
+        ("staticlib", windows, false, true),
+        ("cdylib", windows, false, true),
+        ("dylib", windows, false, true),
+        ("proc-macro", windows, false, true),
+        ("cdylib", linux, true, true),
+        ("cdylib", None, false, true),
+        ("cdylib", linux, false, false),
+        ("rlib", windows, false, false),
+    ] {
+        assert_eq!(
+            checkout_archive_admission(&[kind.to_owned()], target, custom),
+            expected,
+            "{kind} {target:?} {custom}"
+        );
+    }
+}
+
+#[test]
 fn pdb_pairing_admission_is_scoped_to_windows_or_custom_linked_executables() {
     let _lock = key_test_lock();
     let invocation = InvocationEnv::capture();
@@ -23154,6 +23179,50 @@ fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
         output.fields.unwrap().contains_key("pe_pdb_admission"),
         "legacy producers cannot write this namespace"
     );
+}
+
+#[test]
+fn archive_keys_record_the_checkout_scan_admission() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn value() {}").unwrap();
+    let invocation = client_invocation(dir.path(), &[("OUT_DIR", None)]);
+    for (kind, emit, expected) in [
+        ("staticlib", "link", true),
+        ("rlib", "link", false),
+        ("staticlib", "metadata", false),
+    ] {
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-name=app".into(),
+                format!("--crate-type={kind}"),
+                format!("--emit={emit}"),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: vec![],
+            },
+            None,
+        );
+        let (key, output) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new_for(&invocation),
+            &PathNormalizer::from_invocation(Some(dir.path()), &invocation),
+            &KeyEnv::from_invocation(&invocation),
+        );
+        key.unwrap();
+        assert_eq!(
+            output.fields.unwrap().contains_key("checkout_archive"),
+            expected
+        );
+    }
 }
 
 #[test]

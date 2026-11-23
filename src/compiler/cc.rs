@@ -3121,9 +3121,11 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // the specific Firefox value (per #115's evidence) so a wildcard
         // `Prefix("-Wa,")` doesn't silently accept unmodeled assembler
         // flags. `--noexecstack` sets a section flag on the object.
+        // Raw-keyed: gcc's `-###` puts it only on the separate `as` line, so
+        // the hashed `cc1` line of a `.S` compile is the same without it.
         matcher: Matcher::Exact("-Wa,--noexecstack"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse.",
+        class: FlagClass::RawKeyed,
+        source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse. Raw-keyed because gcc's cc1 probe line omits it.",
         dialect: None,
     },
     FlagSpec {
@@ -3253,6 +3255,17 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-fuse-ld="),
         class: FlagClass::RawKeyed,
         source: "linker selection; unused-argument diagnostics can change compile success.",
+        dialect: None,
+    },
+    FlagSpec {
+        // clang's driver consumes it, so it never reaches `cc1`, but it turns
+        // off the unused-argument warning that `-Werror` makes fatal. Keyed
+        // like `-fuse-ld=` so an entry stored with it cannot answer a build
+        // that would fail without it. gcc rejects the flag, so no gcc entry
+        // is ever stored.
+        matcher: Matcher::Exact("-Qunused-arguments"),
+        class: FlagClass::RawKeyed,
+        source: "clang unused-argument warning switch; changes compile success under -Werror, never object bytes.",
         dialect: None,
     },
     FlagSpec {
@@ -9279,7 +9292,31 @@ impl CcCompiler {
                 );
             }
             hasher.update(b"\n");
+        } else if !native_msvc {
+            // No `cc1` line to stand for the argv. The read-set digest below
+            // cannot see a `-D` value or any other argv-only input, so key the
+            // configuration arguments themselves, through the same maps.
+            hasher.update(b"unresolved_args:");
+            for arg in &config_args {
+                let mapped = apply_cc_prefix_maps_to_bytes(arg.clone().into_bytes(), &prefix_maps);
+                hasher.update(&(mapped.len() as u64).to_le_bytes());
+                hasher.update(&mapped);
+            }
+            hasher.update(b"\n");
         }
+
+        // `__DATE__` and `__TIME__` expand from this value in the real
+        // compile. The read-set digest that stands for the expansion does not
+        // contain it, so fold it here. With the pin turned off the object
+        // bakes the wall clock, so the key does too and never hits.
+        hasher.update(b"source_date_epoch:");
+        match effective_source_date_epoch_for(&parsed.invocation_env) {
+            Some(epoch) => hasher.update(&crate::cache_key::env_os_key_bytes(&epoch)),
+            None => {
+                hasher.update(format!("wallclock:{:?}", std::time::SystemTime::now()).as_bytes())
+            }
+        };
+        hasher.update(b"\n");
 
         // The mode decides what the entry holds (an object, or preprocessor
         // output). The resolved tokens cannot tell them apart: gcc's first

@@ -409,15 +409,28 @@ fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
             .create(dir)?;
         let meta = std::fs::symlink_metadata(dir)?;
         anyhow::ensure!(
-            meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0,
-            "daemon socket directory {} must be owned by this user and private; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
+            meta.is_dir() && meta.uid() == uid,
+            "daemon socket directory {} must be a directory owned by this user",
             dir.display()
         );
-        // Avoid resetting any special bits on an explicitly selected store root.
-        anyhow::ensure!(
-            dir != config.cache_dir || meta.mode() & 0o7000 == 0,
-            "daemon socket shares a cache directory with special permissions; set KACHE_RUNTIME_DIR to a private directory"
-        );
+        let is_store = std::fs::metadata(&config.cache_dir)
+            .is_ok_and(|store| store.dev() == meta.dev() && store.ino() == meta.ino());
+        if is_store {
+            anyhow::ensure!(
+                meta.mode() & 0o7077 == 0,
+                "daemon socket shares a cache directory with non-private permissions; set KACHE_RUNTIME_DIR to a private directory"
+            );
+        } else if dir == config.runtime_dir && meta.mode() & 0o022 == 0 {
+            // An explicitly separate runtime belongs exclusively to the daemon.
+            // Preserve the transport's handling of an ordinary mkdir (0755).
+            kunobi_daemon::ensure_private_dir(dir)?;
+        } else {
+            anyhow::ensure!(
+                meta.mode() & 0o077 == 0,
+                "daemon socket directory {} must be private; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
+                dir.display()
+            );
+        }
     }
     #[cfg(not(unix))]
     {

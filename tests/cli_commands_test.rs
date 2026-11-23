@@ -86,6 +86,10 @@ impl Drop for Env {
 }
 
 impl Env {
+    fn socket(&self) -> std::path::PathBuf {
+        kache_config::config::default_daemon_socket(&self.cache, &self.cache, None)
+    }
+
     fn cmd(&self) -> Command {
         kache(&self.home, &self.cache)
     }
@@ -718,7 +722,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
     e.cmd()
         .env("KACHE_CONFIG", &other)
         .env("KACHE_CACHE_DIR", &unusable_store)
-        .env("KACHE_SOCKET_PATH", e.cache.join("daemon.sock"))
+        .env("KACHE_SOCKET_PATH", e.socket())
         .arg("stats")
         .assert()
         .success()
@@ -1976,7 +1980,7 @@ fn json_init_previews_without_writes_and_applies_without_prompts() {
     );
     let service_installed = body["service_installed"].clone();
     assert!(!e.home.join(".cargo/config.toml").exists());
-    assert!(!e.cache.join("daemon.sock").exists());
+    assert!(!e.socket().exists());
     let applied = e.cmd().args(args).arg("--yes").output().unwrap();
     assert!(applied.status.success(), "{applied:?}");
     let body: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
@@ -2692,7 +2696,7 @@ fn init_check_is_a_dry_run() {
     assert!(!e.home.join(".bashrc").exists());
     assert!(!e.home.join(".bash_profile").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
-    assert!(!e.cache.join("daemon.sock").exists());
+    assert!(!e.socket().exists());
 }
 
 #[test]
@@ -2715,7 +2719,7 @@ fn init_eof_does_not_accept_changes() {
     assert!(!e.home.join(".cargo/config.toml").exists());
     assert!(!e.home.join(".bashrc").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
-    assert!(!e.cache.join("daemon.sock").exists());
+    assert!(!e.socket().exists());
 }
 
 /// A retiring daemon answers once, then keeps its run lock without a socket.
@@ -2726,9 +2730,15 @@ fn init_rejects_unavailable_daemon_replacement() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     let e = env();
-    let socket = e.cache.join("daemon.sock");
+    let socket = e.socket();
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(socket.parent().unwrap())
+        .unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
-    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
+    let run_lock = std::fs::File::create(e.socket().with_extension("run.lock")).unwrap();
     run_lock.lock().unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -2781,9 +2791,12 @@ fn compiler_upgrades_a_legacy_daemon_without_another_init() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     let e = env();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&e.cache, std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = e.cache.join("daemon.sock");
+    let run_lock = std::fs::File::create(socket.with_extension("run.lock")).unwrap();
+    assert_eq!(e.socket(), socket);
     let listener = UnixListener::bind(&socket).unwrap();
-    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
     run_lock.lock().unwrap();
     let done = Arc::new(AtomicBool::new(false));
     let server_done = Arc::clone(&done);
@@ -2975,7 +2988,13 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
     let e = env();
-    let socket = e.cache.join("daemon.sock");
+    let socket = e.socket();
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(socket.parent().unwrap())
+        .unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -3051,7 +3070,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .unwrap();
     drop(std::os::unix::net::UnixStream::connect(&socket));
     server.join().unwrap();
-    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    let state = std::fs::read(e.socket().with_extension("state.json"));
     e.cmd().args(["daemon", "stop"]).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("Background cache: running"));
@@ -3116,7 +3135,7 @@ fn a_private_xdg_config_starts_its_own_daemon_beside_the_login_service() {
         .timeout(std::time::Duration::from_secs(60))
         .output()
         .unwrap();
-    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    let state = std::fs::read(e.socket().with_extension("state.json"));
     e.cmd().args(["daemon", "stop"]).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let calls = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -3135,19 +3154,20 @@ fn daemon_restart_preserves_another_cache_daemon() {
     let a = env();
     let b = env();
     b.cmd().args(["daemon", "start"]).assert().success();
-    let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
+    let before = std::fs::read(b.socket().with_extension("state.json")).unwrap();
     let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
     a.cmd().args(["daemon", "start"]).assert().success();
     let own_before: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(a.cache.join("daemon.state.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(a.socket().with_extension("state.json")).unwrap())
+            .unwrap();
     let restart = a.cmd().args(["daemon", "restart"]).output().unwrap();
     let other = b
         .cmd()
         .args(["daemon", "status", "--json"])
         .output()
         .unwrap();
-    let after = std::fs::read(b.cache.join("daemon.state.json"));
-    let own_after = std::fs::read(a.cache.join("daemon.state.json"));
+    let after = std::fs::read(b.socket().with_extension("state.json"));
+    let own_after = std::fs::read(a.socket().with_extension("state.json"));
     // Clean both fixtures before assertions so failures leave no background work.
     a.cmd().args(["daemon", "stop"]).output().unwrap();
     b.cmd().args(["daemon", "stop"]).output().unwrap();
@@ -3177,7 +3197,7 @@ fn a_failing_test_still_stops_its_daemon() {
         e.cmd().args(["daemon", "start"]).assert().success();
         let run_lock = std::fs::OpenOptions::new()
             .write(true)
-            .open(e.cache.join("daemon.run.lock"))
+            .open(e.socket().with_extension("run.lock"))
             .expect("opening the live daemon's lifetime lock");
         assert!(
             matches!(run_lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),

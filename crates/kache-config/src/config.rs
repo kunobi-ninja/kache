@@ -5210,15 +5210,17 @@ pub fn default_daemon_socket(cache: &Path, runtime: &Path, scope: Option<&str>) 
     #[cfg(unix)]
     if runtime == cache {
         use std::os::unix::fs::PermissionsExt;
-        let ipc = runtime.join("ipc");
+        let ipc = runtime
+            .join("ipc")
+            .join(socket.file_name().expect("daemon socket has a name"));
         // Older daemons leave the run lock behind when they stop. A fresh
         // store always chooses ipc, even before the store directory exists.
         let legacy = std::fs::symlink_metadata(runtime)
             .is_ok_and(|meta| meta.is_dir() && meta.permissions().mode() & 0o7077 == 0)
             && socket.with_extension("run.lock").is_file()
-            && !ipc.is_dir();
+            && !ipc.with_extension("run.lock").is_file();
         if !legacy {
-            return ipc.join(socket.file_name().expect("daemon socket has a name"));
+            return ipc;
         }
     }
     #[cfg(not(unix))]

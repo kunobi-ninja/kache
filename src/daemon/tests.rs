@@ -1699,6 +1699,65 @@ async fn test_send_request_with_timeout_bounds_unresponsive_daemon() {
     server.abort();
 }
 
+#[cfg(unix)]
+#[test]
+fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("store");
+    std::fs::create_dir(&store).unwrap();
+    let chmod = |p: &Path, mode| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let mut config = test_config(&store);
+    chmod(&store, 0o2750);
+    let socket = config.socket_path();
+    prepare_daemon_socket_dir(&config, &socket).unwrap();
+    assert_eq!(mode(&store), 0o2750);
+    assert_eq!(mode(socket.parent().unwrap()) & 0o777, 0o700);
+    config.socket_path_override = Some(store.join("custom.sock"));
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&store), 0o2750);
+
+    let dedicated = temp.path().join("runtime");
+    std::fs::create_dir(&dedicated).unwrap();
+    chmod(&dedicated, 0o755);
+    config.runtime_dir = dedicated.clone();
+    config.socket_path_override = None;
+    prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
+    assert_eq!(mode(&dedicated), 0o700);
+    assert_eq!(mode(&store), 0o2750);
+
+    let alias = temp.path().join("alias");
+    symlink(&store, &alias).unwrap();
+    config.runtime_dir = alias;
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&store), 0o2750);
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_writers_cannot_replace_the_ipc_directory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let container = temp.path().join("container");
+    let root = container.join("store");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = test_config(&root);
+    for writable in [&root, &container] {
+        std::fs::set_permissions(writable, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap_err();
+        assert!(error.to_string().contains("KACHE_RUNTIME_DIR"));
+        std::fs::set_permissions(writable, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    let alias = temp.path().join("aliased-store");
+    symlink(&root, &alias).unwrap();
+    let config = test_config(&alias);
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert!(!root.join("ipc").exists());
+}
+
 pub(super) fn test_config(dir: &Path) -> Config {
     Config {
         blaze: false,

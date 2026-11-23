@@ -105,8 +105,14 @@ fn miss_and_verified_hit_emit_metadata_once_and_preserve_large_diagnostics() {
         assert_eq!(hit_diagnostics, diagnostics);
     }
 
-    let state: Value =
-        serde_json::from_slice(&fs::read(cache.path().join("daemon.state.json")).unwrap()).unwrap();
+    let state: Value = serde_json::from_slice(
+        &fs::read(
+            kache_config::config::default_daemon_socket(cache.path(), cache.path(), None)
+                .with_extension("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let pid =
         kunobi_daemon::ProcessId::new(state["pid"].as_u64().unwrap().try_into().unwrap()).unwrap();
     let mut process = kunobi_daemon::local::ProcessHandle::open(pid).unwrap();

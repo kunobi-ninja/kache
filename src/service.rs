@@ -1532,12 +1532,20 @@ mod tests {
         let store = root.path().join("cache");
         let file = root.path().join("config.toml");
         assert!(
-            configured_instance_matches(&store.join("daemon.sock"), store.clone(), [file.clone()])
-                .unwrap()
+            configured_instance_matches(
+                &crate::config::default_daemon_socket(&store, &store, None),
+                store.clone(),
+                [file.clone()]
+            )
+            .unwrap()
         );
         std::fs::create_dir(&file).unwrap();
-        let error =
-            configured_instance_matches(&store.join("daemon.sock"), store, [file]).unwrap_err();
+        let error = configured_instance_matches(
+            &crate::config::default_daemon_socket(&store, &store, None),
+            store,
+            [file],
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1578,7 +1586,7 @@ mod tests {
         // The user's own instance stays the service's.
         assert!(
             configured_instance_matches(
-                &service_store.join("daemon.sock"),
+                &crate::config::default_daemon_socket(&service_store, &service_store, None),
                 service_store,
                 [home.join(".config/kache/config.toml")]
             )
@@ -1598,7 +1606,12 @@ mod tests {
         );
         std::fs::write(&file, text).unwrap();
         assert!(
-            configured_instance_matches(&store.join("daemon.sock"), store.clone(), []).unwrap()
+            configured_instance_matches(
+                &crate::config::default_daemon_socket(&store, &store, None),
+                store.clone(),
+                []
+            )
+            .unwrap()
         );
         assert!(
             !configured_instance_matches(&configured.join("daemon.sock"), store.clone(), [])
@@ -1613,11 +1626,22 @@ mod tests {
             .unwrap()
         );
         assert!(
-            !configured_instance_matches(&store.join("daemon.sock"), store.clone(), [file.clone()])
-                .unwrap()
+            !configured_instance_matches(
+                &crate::config::default_daemon_socket(&store, &store, None),
+                store.clone(),
+                [file.clone()]
+            )
+            .unwrap()
         );
         std::fs::write(&file, "malformed = [").unwrap();
-        assert!(configured_instance_matches(&store.join("daemon.sock"), store, [file]).is_err());
+        assert!(
+            configured_instance_matches(
+                &crate::config::default_daemon_socket(&store, &store, None),
+                store,
+                [file]
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

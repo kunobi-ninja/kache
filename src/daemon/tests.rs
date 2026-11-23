@@ -13508,89 +13508,106 @@ async fn abandoned_compile_download_does_not_take_a_later_permit() {
     );
 }
 
-/// HTTP/1.1 keep-alive server: `/slow` answers after 400 ms, every other path
-/// at once. Returns the base URL and the number of accepted connections.
-async fn keep_alive_http_server() -> (String, Arc<AtomicUsize>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&accepted);
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            counter.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    let Ok(read) = socket.read(&mut buffer).await else {
-                        return;
-                    };
-                    if read == 0 {
-                        return;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    while let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..end]).into_owned();
-                        request.drain(..end + 4);
-                        if head.starts_with("GET /slow ") {
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                        }
-                        if socket
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-    });
-    (format!("http://{address}"), accepted)
-}
-
-/// The S3 operator shares one HTTP connection pool across the daemon. A
-/// connection a demand download opens is reused by other remote work after
-/// that download returns, so it must not die with the download's thread.
+/// Hold a second request open on the demand download's connection while
+/// the download finishes. The response must survive its worker's exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compile_download_connection_survives_the_download_thread() {
+    use axum::{Router, extract::ConnectInfo, routing::get};
+    use std::net::SocketAddr;
+    use tokio::sync::{Notify, oneshot, watch};
+
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let (base, accepted) = keep_alive_http_server().await;
-    let client = reqwest::Client::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let second_started = Arc::new(Notify::new());
+    let second_seen = Arc::clone(&second_started);
+    let (release, released) = watch::channel(false);
+    let app = Router::new()
+        .route(
+            "/first",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        )
+        .route(
+            "/second",
+            get(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                let second_seen = Arc::clone(&second_seen);
+                let mut released = released.clone();
+                async move {
+                    second_seen.notify_one();
+                    released
+                        .wait_for(|done| *done)
+                        .await
+                        .expect("release the response");
+                    peer.to_string()
+                }
+            }),
+        );
+    let (shutdown, stop) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stop.await;
+        })
+        .await
+        .expect("serve test requests");
+    });
+
+    let timeout = Duration::from_secs(10);
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .unwrap();
     let worker_client = client.clone();
-    let worker_url = format!("{base}/fast");
+    let (first_read, idle) = oneshot::channel();
     let download = tokio::spawn(finish_compile_remote_download(
-        RemoteDeadline::from_millis(5_000),
+        RemoteDeadline::from_millis(10_000),
         async move {
-            let body = worker_client.get(worker_url).send().await?.bytes().await?;
-            assert_eq!(&body[..], b"ok");
-            // Extraction runs inside the same future after the GET, while the
-            // connection already sits idle in the shared pool.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            Ok::<(), anyhow::Error>(())
+            let first = worker_client
+                .get(format!("http://{address}/first"))
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            first_read.send(()).expect("announce the idle connection");
+            second_started.notified().await;
+            Ok(first)
         },
     ));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Prefetch, predictions and uploads run on the daemon runtime and take
-    // that idle connection. The download finishes while this GET is in flight.
-    let slow = client.get(format!("{base}/slow")).send().await;
-    download
+    tokio::time::timeout(timeout, idle)
+        .await
+        .expect("first GET deadline")
+        .expect("first GET finished");
+    let second = tokio::spawn(client.get(format!("http://{address}/second")).send());
+    let first_peer = download
         .await
         .expect("download task")
         .expect("demand download");
-    let body = slow
-        .expect("a pooled connection must outlive the download that opened it")
+    release.send(true).expect("release the second response");
+    let second_peer = second
+        .await
+        .expect("second GET task")
+        .expect("pooled connection after worker exit")
+        .error_for_status()
+        .unwrap()
         .bytes()
         .await
-        .expect("a pooled connection must outlive the download that opened it");
-    assert_eq!(&body[..], b"ok");
+        .unwrap();
+
+    drop(client);
+    shutdown.send(()).expect("request server shutdown");
+    tokio::time::timeout(timeout, server)
+        .await
+        .expect("server shutdown deadline")
+        .expect("server task");
     assert_eq!(
-        accepted.load(Ordering::SeqCst),
-        1,
-        "the second GET must reuse the pooled connection"
+        first_peer, second_peer,
+        "both requests must use the same TCP connection"
     );
 }
 

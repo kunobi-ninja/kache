@@ -10,13 +10,21 @@
 //! exclusive `intent` lock on the target. A lease and a reservation conflict
 //! exactly when one path contains the other. A command whose directories
 //! cannot be worked out leases everything through the one cache-wide lock,
-//! which every reservation also takes.
+//! which every reservation also takes. Platforms where whole-file locks do
+//! not interoperate with byte locks keep every lease cache-wide.
+
+mod guard;
+
+use guard::{Held, Region};
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+/// These platforms can protect a scoped command from both new and old cleanup.
+pub(crate) const SCOPED_LOCKS: bool = cfg!(any(target_os = "macos", windows));
 
 /// The directories a command may read or write build output in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,12 +38,29 @@ pub(crate) enum Scope {
 impl Scope {
     /// The scope of `paths`, normalized; no paths at all is [`Scope::Everything`].
     pub(crate) fn within(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let paths: BTreeSet<PathBuf> = paths.into_iter().map(|path| normalize(&path)).collect();
+        let Some(paths) = paths
+            .into_iter()
+            .map(|path| normalize(&path))
+            .collect::<Option<BTreeSet<_>>>()
+        else {
+            return Self::Everything;
+        };
         if paths.is_empty() {
-            Self::Everything
-        } else {
-            Self::Within(paths.into_iter().collect())
+            return Self::Everything;
         }
+        // A workspace already covers its target and build directories. Keep
+        // redirected directories when normalization locates them elsewhere.
+        let roots = paths
+            .iter()
+            .filter(|path| {
+                !path
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| paths.contains(parent))
+            })
+            .cloned()
+            .collect();
+        Self::Within(roots)
     }
 
     /// Whether removing `target` could take something this scope uses.
@@ -43,9 +68,13 @@ impl Scope {
         match self {
             Self::Everything => true,
             Self::Within(paths) => {
-                let target = normalize(target);
+                let Some(target) = normalize(target) else {
+                    return true;
+                };
+                let target = comparison_path(&target);
                 paths
                     .iter()
+                    .map(|path| comparison_path(path))
                     .any(|path| path.starts_with(&target) || target.starts_with(path))
             }
         }
@@ -55,24 +84,58 @@ impl Scope {
 /// `path` made absolute, with every existing prefix resolved the way the
 /// filesystem names it, so a lease and a reservation spell one directory the
 /// same: `/tmp` and `/private/tmp` on macOS, or a symlinked checkout.
-pub(crate) fn normalize(path: &Path) -> PathBuf {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+fn normalize(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
     let mut existing = absolute.as_path();
     let mut missing = Vec::new();
     loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            return missing
-                .iter()
-                .rev()
-                .fold(real, |path, name| path.join(name));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name.to_os_string());
-                existing = parent;
+        match std::fs::canonicalize(existing) {
+            Ok(real) => {
+                let path = missing
+                    .into_iter()
+                    .rev()
+                    .fold(real, |path, name| path.join(name));
+                // Bytewise keys cannot represent every Unicode equivalence on a
+                // case-insensitive volume. A newline cannot round-trip in a holder record.
+                // APFS exposes the boot data volume under a second name.
+                // realpath preserves both spellings of e.g. /Users/alice.
+                #[cfg(target_os = "macos")]
+                if comparison_path(&path).starts_with("/system/volumes/data") {
+                    return None;
+                }
+                let name = path.as_os_str().as_encoded_bytes();
+                return ((!SCOPED_LOCKS || name.is_ascii()) && !name.contains(&b'\n'))
+                    .then_some(path);
             }
-            _ => return absolute,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
+        // A dangling symlink already names another path. Wait for a known
+        // target under the global guard rather than guessing where it will lead.
+        match std::fs::symlink_metadata(existing) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        let name = existing.file_name()?;
+        #[cfg(windows)]
+        if name.as_encoded_bytes().ends_with(b".")
+            || name.as_encoded_bytes().ends_with(b" ")
+            || name.as_encoded_bytes().contains(&b'~')
+        {
+            return None;
+        }
+        missing.push(name.to_owned());
+        existing = existing.parent()?;
+    }
+}
+
+fn comparison_path(path: &Path) -> PathBuf {
+    if SCOPED_LOCKS {
+        // Both systems support case-insensitive volumes. Existing and future
+        // paths must hash identically even before their on-disk case is known.
+        path.as_os_str().to_ascii_lowercase().into()
+    } else {
+        path.to_owned()
     }
 }
 
@@ -81,7 +144,7 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
 /// leaves a record naming its command, so cleanup can say what it waits for.
 #[derive(Default)]
 pub(crate) struct Lease {
-    files: Vec<File>,
+    files: Vec<Held>,
     record: Option<PathBuf>,
 }
 
@@ -89,9 +152,6 @@ impl Drop for Lease {
     fn drop(&mut self) {
         if let Some(record) = &self.record {
             let _ = std::fs::remove_file(record);
-        }
-        for file in &self.files {
-            let _ = file.unlock();
         }
     }
 }
@@ -147,37 +207,30 @@ fn locks_dir(cache_dir: &Path) -> PathBuf {
 
 /// The `use` (`u`) or `intent` (`i`) lock of one normalized path.
 fn path_lock(cache_dir: &Path, kind: char, path: &Path) -> PathBuf {
-    let hash = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+    let hash = blake3::hash(comparison_path(path).as_os_str().as_encoded_bytes()).to_hex();
     locks_dir(cache_dir).join(format!("{kind}-{}.lock", &hash.as_str()[..32]))
 }
 
 /// The locks a lease on `scope` shares, in one global order.
-fn lease_locks(cache_dir: &Path, scope: &Scope) -> BTreeSet<PathBuf> {
-    match scope {
-        Scope::Everything => BTreeSet::from([everything_lock(cache_dir)]),
-        Scope::Within(paths) => paths
-            .iter()
-            .flat_map(|path| {
-                std::iter::once(path_lock(cache_dir, 'u', path)).chain(
-                    path.ancestors()
-                        .skip(1)
-                        .map(|ancestor| path_lock(cache_dir, 'i', ancestor)),
-                )
-            })
-            .collect(),
-    }
+fn lease_locks(cache_dir: &Path, paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+    paths
+        .iter()
+        .flat_map(|path| {
+            std::iter::once(path_lock(cache_dir, 'u', path)).chain(
+                path.ancestors()
+                    .skip(1)
+                    .map(|ancestor| path_lock(cache_dir, 'i', ancestor)),
+            )
+        })
+        .collect()
 }
 
-/// The locks a reservation on the normalized `target` takes, in one order.
-fn reservation_locks(cache_dir: &Path, target: &Path) -> Vec<PathBuf> {
-    let mut locks = vec![everything_lock(cache_dir)];
-    locks.extend(
-        target
-            .ancestors()
-            .map(|ancestor| path_lock(cache_dir, 'u', ancestor)),
-    );
-    locks.push(path_lock(cache_dir, 'i', target));
-    locks
+/// The locks a reservation on the normalized target takes after the legacy guard.
+fn reservation_locks(cache_dir: &Path, target: &Path) -> impl Iterator<Item = PathBuf> {
+    target
+        .ancestors()
+        .map(|ancestor| path_lock(cache_dir, 'u', ancestor))
+        .chain(std::iter::once(path_lock(cache_dir, 'i', target)))
 }
 
 /// Whether `file` is still the file at `path`. A pruned lock file is gone,
@@ -201,43 +254,44 @@ fn still_named(_: &File, _: &Path) -> bool {
 /// keeps the notice to one line per lease.
 fn lock_shared(
     path: &Path,
+    region: Region,
     cache_dir: &Path,
     notice: &mut dyn Write,
     said: &mut bool,
-) -> io::Result<File> {
+) -> io::Result<Held> {
     loop {
         let file = open_lock(path)?;
-        match file.try_lock_shared() {
+        match region.try_shared(&file) {
             Ok(()) => {}
             // One write, so the line stays whole beside other processes' output.
             Err(TryLockError::WouldBlock) => {
                 if !std::mem::replace(said, true) {
                     let _ = notice.write_all(waiting(cache_dir).as_bytes());
                 }
-                file.lock_shared()?;
+                region.shared(&file)?;
             }
             Err(TryLockError::Error(error)) => return Err(error),
         }
-        if still_named(&file, path) {
-            return Ok(file);
+        let held = Held { file, region };
+        if still_named(&held.file, path) {
+            return Ok(held);
         }
-        let _ = file.unlock();
     }
 }
 
 /// Take the lock at `path` without waiting: `None` when someone holds it.
-fn try_lock_exclusive(path: &Path) -> io::Result<Option<File>> {
+fn try_lock_exclusive(path: &Path, region: Region) -> io::Result<Option<Held>> {
     loop {
         let file = open_lock(path)?;
-        match file.try_lock() {
+        match region.try_exclusive(&file) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Error(error)) => return Err(error),
         }
-        if still_named(&file, path) {
-            return Ok(Some(file));
+        let held = Held { file, region };
+        if still_named(&held.file, path) {
+            return Ok(Some(held));
         }
-        let _ = file.unlock();
     }
 }
 
@@ -340,9 +394,9 @@ pub(crate) fn holders(cache_dir: &Path) -> Vec<Holder> {
 /// record, such as another cleanup or an older Kache). The probe takes the
 /// locks for an instant and records nothing.
 pub(crate) fn blockers(cache_dir: &Path, target: &Path) -> Option<Vec<Holder>> {
-    match reserve(cache_dir, &normalize(target)) {
-        Ok(Some(_)) | Err(_) => None,
-        Ok(None) => Some(holders_covering(cache_dir, target)),
+    match reserve(cache_dir, target) {
+        Ok(Some(_)) => None,
+        Ok(None) | Err(_) => Some(holders_covering(cache_dir, target)),
     }
 }
 
@@ -373,10 +427,32 @@ pub(crate) fn shared_in(
 ) -> io::Result<Lease> {
     let mut lease = Lease::default();
     let mut said = false;
-    for lock in lease_locks(cache_dir, scope) {
-        lease
-            .files
-            .push(lock_shared(&lock, cache_dir, notice, &mut said)?);
+    let scope = if SCOPED_LOCKS {
+        scope
+    } else {
+        &Scope::Everything
+    };
+    let guard = match scope {
+        Scope::Everything => Region::Whole,
+        Scope::Within(_) => Region::COMMAND,
+    };
+    lease.files.push(lock_shared(
+        &everything_lock(cache_dir),
+        guard,
+        cache_dir,
+        notice,
+        &mut said,
+    )?);
+    if let Scope::Within(paths) = scope {
+        for lock in lease_locks(cache_dir, paths) {
+            lease.files.push(lock_shared(
+                &lock,
+                Region::Whole,
+                cache_dir,
+                notice,
+                &mut said,
+            )?);
+        }
     }
     lease.record = record_holder(cache_dir, scope, what);
     Ok(lease)
@@ -420,10 +496,26 @@ fn waiting(cache_dir: &Path) -> String {
 /// when a lease that covers it holds one.
 fn reserve(cache_dir: &Path, target: &Path) -> io::Result<Option<Lease>> {
     let mut lease = Lease::default();
-    for lock in reservation_locks(cache_dir, target) {
-        match try_lock_exclusive(&lock)? {
-            Some(file) => lease.files.push(file),
-            None => return Ok(None),
+    let target = if SCOPED_LOCKS {
+        normalize(target)
+    } else {
+        None
+    };
+    let region = if target.is_some() {
+        Region::CLEANUP
+    } else {
+        Region::Whole
+    };
+    let Some(guard) = try_lock_exclusive(&everything_lock(cache_dir), region)? else {
+        return Ok(None);
+    };
+    lease.files.push(guard);
+    if let Some(target) = target {
+        for lock in reservation_locks(cache_dir, &target) {
+            let Some(file) = try_lock_exclusive(&lock, Region::Whole)? else {
+                return Ok(None);
+            };
+            lease.files.push(file);
         }
     }
     Ok(Some(lease))
@@ -432,7 +524,7 @@ fn reserve(cache_dir: &Path, target: &Path) -> io::Result<Option<Lease>> {
 /// Reserve deleting `target`, or changing build output inside it, without
 /// waiting for a running command.
 pub(crate) fn try_exclusive(cache_dir: &Path, target: &Path) -> io::Result<Option<Reservation>> {
-    let Some(lease) = reserve(cache_dir, &normalize(target))? else {
+    let Some(lease) = reserve(cache_dir, target)? else {
         return Ok(None);
     };
     let holder = holder_record(cache_dir);
@@ -509,7 +601,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let cache = dir.path().join("cache");
-            let root = normalize(dir.path()).join("work");
+            let root = normalize(dir.path()).unwrap().join("work");
             std::fs::create_dir_all(&root).unwrap();
             Self {
                 _dir: dir,
@@ -570,8 +662,8 @@ mod tests {
         assert!(!fx.free("ws"));
         assert!(!fx.free(""));
         // A sibling workspace, and one whose name only starts the same.
-        assert!(fx.free("other/target"));
-        assert!(fx.free("ws2/target"));
+        assert_eq!(fx.free("other/target"), SCOPED_LOCKS);
+        assert_eq!(fx.free("ws2/target"), SCOPED_LOCKS);
         drop(lease);
         assert!(fx.free("ws/target"));
     }
@@ -588,8 +680,8 @@ mod tests {
         .unwrap();
         assert!(!fx.free("ws/target"));
         assert!(!fx.free("ws/target/debug"));
-        assert!(fx.free("ws/target/release"));
-        assert!(fx.free("ws/crates/target"));
+        assert_eq!(fx.free("ws/target/release"), SCOPED_LOCKS);
+        assert_eq!(fx.free("ws/crates/target"), SCOPED_LOCKS);
         drop(lease);
     }
 
@@ -622,13 +714,148 @@ mod tests {
         .unwrap();
         let named = |target: &str| {
             blockers(&fx.cache, &fx.at(target))
-                .map(|holders| holders.into_iter().map(|h| h.what).collect::<Vec<_>>())
+                .map(|holders| holders.into_iter().map(|h| h.what).collect::<BTreeSet<_>>())
         };
-        assert_eq!(named("ws/target"), Some(vec!["cargo test".to_owned()]));
-        assert_eq!(named("other/target"), Some(vec!["cargo build".to_owned()]));
-        assert_eq!(named("third/target"), None);
+        if SCOPED_LOCKS {
+            assert_eq!(
+                named("ws/target"),
+                Some(BTreeSet::from(["cargo test".to_owned()]))
+            );
+            assert_eq!(
+                named("other/target"),
+                Some(BTreeSet::from(["cargo build".to_owned()]))
+            );
+            assert_eq!(named("third/target"), None);
+        } else {
+            let all = Some(BTreeSet::from([
+                "cargo build".to_owned(),
+                "cargo test".to_owned(),
+            ]));
+            assert_eq!(named("ws/target"), all);
+            assert_eq!(named("other/target"), all);
+            assert_eq!(named("third/target"), all);
+        }
         drop((here, there));
         assert_eq!(named("ws/target"), None);
+    }
+
+    #[test]
+    fn whole_file_locks_from_old_versions_protect_commands_and_cleanup_in_both_directions() {
+        let fx = Fixture::new();
+        let legacy = open_lock(&everything_lock(&fx.cache)).unwrap();
+        let scope = fx.within(&["one"]);
+        let modern = shared_in(&fx.cache, &scope, "new cargo", &mut io::sink()).unwrap();
+        assert!(matches!(legacy.try_lock(), Err(TryLockError::WouldBlock)));
+        // An old Cargo command can run alongside a new one, but it blocks
+        // cleanup in *every* workspace, even one outside the new scope.
+        legacy.try_lock_shared().unwrap();
+        assert!(!fx.free("two"));
+        legacy.unlock().unwrap();
+        assert_eq!(fx.free("two"), SCOPED_LOCKS);
+        drop(modern);
+
+        let cleaning = try_exclusive(&fx.cache, &fx.at("one")).unwrap().unwrap();
+        assert!(matches!(
+            legacy.try_lock_shared(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(matches!(legacy.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(
+            !fx.free("two"),
+            "only one cleanup may own the holder record"
+        );
+        drop(cleaning);
+
+        legacy.try_lock().unwrap();
+        let (said, heard) = std::sync::mpsc::channel();
+        let cache = fx.cache.clone();
+        let command = std::thread::spawn(move || {
+            shared_in(&cache, &scope, "new cargo", &mut Said(said)).unwrap()
+        });
+        assert_eq!(
+            heard
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .as_slice(),
+            b"kache: waiting for target cleanup to finish\n"
+        );
+        assert!(!command.is_finished());
+        legacy.unlock().unwrap();
+        let lease = command.join().unwrap();
+        assert!(!fx.free("one"));
+        drop(lease);
+        assert!(fx.free("one"));
+    }
+
+    #[test]
+    fn a_lock_error_keeps_the_dry_run_and_cleanup_from_promising_removal() {
+        let fx = Fixture::new();
+        std::fs::write(&fx.cache, b"not a directory").unwrap();
+        let target = fx.at("one");
+        assert!(try_exclusive(&fx.cache, &target).is_err());
+        assert_eq!(blockers(&fx.cache, &target), Some(Vec::new()));
+        assert!(shared_in(&fx.cache, &fx.within(&["one"]), "build", &mut io::sink()).is_err());
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn the_global_fallback_needs_no_path_lock_files() {
+        let fx = Fixture::new();
+        let scoped = shared_in(
+            &fx.cache,
+            &fx.within(&["one"]),
+            "cargo build",
+            &mut io::sink(),
+        )
+        .unwrap();
+        assert!(!fx.free("two"));
+        assert!(!locks_dir(&fx.cache).exists());
+        drop(scoped);
+        assert!(fx.free("two"));
+        assert!(!locks_dir(&fx.cache).exists());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn case_aliases_of_future_paths_overlap_and_name_the_holder() {
+        let fx = Fixture::new();
+        let scoped = shared_in(
+            &fx.cache,
+            &fx.within(&["work/Target"]),
+            "cargo build",
+            &mut io::sink(),
+        )
+        .unwrap();
+        assert_eq!(
+            blockers(&fx.cache, &fx.at("WORK/target/deps"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(fx.free("worker/target"));
+        assert_eq!(fx.within(&["work/é"]), Scope::Everything);
+        assert!(
+            !fx.free("other/é"),
+            "an ambiguous cleanup requires the whole guard"
+        );
+        drop(scoped);
+        assert!(fx.free("WORK/target/deps"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_boot_data_volume_alias_takes_the_global_guard() {
+        let alias = PathBuf::from("/System/Volumes/Data/private/tmp");
+        assert_eq!(Scope::within([alias]), Scope::Everything);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_or_unresolved_parent_requires_the_global_guard() {
+        let fx = Fixture::new();
+        std::os::unix::fs::symlink(fx.at("future"), fx.at("link")).unwrap();
+        assert_eq!(fx.within(&["link/target"]), Scope::Everything);
+        assert_eq!(fx.within(&["unmade/../outside"]), Scope::Everything);
     }
 
     #[test]
@@ -636,7 +863,7 @@ mod tests {
         let fx = Fixture::new();
         assert_eq!(Scope::within(Vec::new()), Scope::Everything);
         assert!(Scope::Everything.covers(&fx.at("anything")));
-        let scope = fx.within(&["ws", "ws", "out/target"]);
+        let scope = fx.within(&["ws/target/debug", "ws", "ws", "out/target"]);
         let Scope::Within(paths) = &scope else {
             panic!("{scope:?}")
         };
@@ -654,8 +881,11 @@ mod tests {
         let fx = Fixture::new();
         std::fs::create_dir_all(fx.at("real/ws")).unwrap();
         std::os::unix::fs::symlink(fx.at("real"), fx.at("link")).unwrap();
-        assert_eq!(normalize(&fx.at("link/ws/target")), fx.at("real/ws/target"));
-        assert_eq!(normalize(&fx.at("link/ws")), fx.at("real/ws"));
+        assert_eq!(
+            normalize(&fx.at("link/ws/target")).unwrap(),
+            fx.at("real/ws/target")
+        );
+        assert_eq!(normalize(&fx.at("link/ws")).unwrap(), fx.at("real/ws"));
         let lease = shared_in(
             &fx.cache,
             &fx.within(&["link/ws"]),
@@ -675,7 +905,14 @@ mod tests {
         let named = holders(&fx.cache);
         assert_eq!(named.len(), 1);
         assert_eq!(named[0].what, "cargo build");
-        assert_eq!(named[0].scope, scope);
+        assert_eq!(
+            named[0].scope,
+            if SCOPED_LOCKS {
+                scope
+            } else {
+                Scope::Everything
+            }
+        );
         drop(lease);
     }
 
@@ -800,10 +1037,12 @@ mod tests {
         let cleanup = try_exclusive(&fx.cache, &fx.at("ws/target"))
             .unwrap()
             .unwrap();
-        // A command elsewhere starts at once and says nothing.
-        let mut said = Vec::new();
-        drop(shared_in(&fx.cache, &fx.within(&["other"]), "cargo build", &mut said).unwrap());
-        assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
+        if SCOPED_LOCKS {
+            // A scoped command elsewhere can start right away.
+            let mut said = Vec::new();
+            drop(shared_in(&fx.cache, &fx.within(&["other"]), "cargo build", &mut said).unwrap());
+            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
+        }
 
         let (said, heard) = std::sync::mpsc::channel();
         let cache = fx.cache.clone();
@@ -896,30 +1135,72 @@ mod tests {
             &mut io::sink(),
         )
         .unwrap();
-        let inherited: Vec<File> = lease.files.iter().map(|f| f.try_clone().unwrap()).collect();
+        let inherited: Vec<File> = lease
+            .files
+            .iter()
+            .map(|f| f.file.try_clone().unwrap())
+            .collect();
+        let legacy = open_lock(&everything_lock(&fx.cache)).unwrap();
+        assert!(matches!(legacy.try_lock(), Err(TryLockError::WouldBlock)));
         drop(lease);
+        legacy.try_lock().unwrap();
+        legacy.unlock().unwrap();
         assert!(fx.free("ws/target"));
         drop(inherited);
     }
 
     #[cfg(unix)]
     #[test]
-    fn pruning_keeps_held_lock_files_and_a_lease_survives_it() {
+    fn pruning_keeps_held_path_locks_and_removes_unused_files() {
         let fx = Fixture::new();
-        let scope = fx.within(&["ws"]);
-        drop(try_exclusive(&fx.cache, &fx.at("other/target")).unwrap());
-        let lease = shared_in(&fx.cache, &scope, "cargo build", &mut io::sink()).unwrap();
-        let held: BTreeSet<PathBuf> = lease_locks(&fx.cache, &scope);
-        assert!(prune_locks(&fx.cache) > 0);
+        let held = lease_locks(&fx.cache, &[fx.at("ws")]);
+        let mut guards = Vec::new();
+        let mut said = false;
+        for lock in &held {
+            guards.push(
+                lock_shared(lock, Region::Whole, &fx.cache, &mut io::sink(), &mut said).unwrap(),
+            );
+        }
+        // Obtain this file before pruning, as a cleanup in another workspace does.
+        drop(
+            try_lock_exclusive(&path_lock(&fx.cache, 'u', &fx.at("other")), Region::Whole)
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(prune_locks(&fx.cache), 1);
         for lock in &held {
             assert!(lock.exists(), "{} pruned while held", lock.display());
         }
-        assert!(!fx.free("ws/target"));
-        drop(lease);
-        assert!(prune_locks(&fx.cache) >= held.len());
+        drop(guards);
+        assert_eq!(prune_locks(&fx.cache), held.len());
         assert_eq!(std::fs::read_dir(locks_dir(&fx.cache)).unwrap().count(), 0);
         assert_eq!(prune_locks(&fx.cache), 0);
         assert_eq!(prune_locks(&fx.at("no-cache")), 0);
+    }
+
+    #[test]
+    fn path_locks_conflict_on_ancestors_and_descendants_only() {
+        let fx = Fixture::new();
+        let held = lease_locks(&fx.cache, &[fx.at("a/b"), fx.at("elsewhere/x")]);
+        for target in [
+            "",
+            "a",
+            "a/b",
+            "a/b/deps",
+            "elsewhere",
+            "elsewhere/x/release",
+        ] {
+            assert!(
+                reservation_locks(&fx.cache, &fx.at(target)).any(|lock| held.contains(&lock)),
+                "{target:?} should be held"
+            );
+        }
+        for target in ["a/another", "a/bb", "elsewhere/y", "c"] {
+            assert!(
+                !reservation_locks(&fx.cache, &fx.at(target)).any(|lock| held.contains(&lock)),
+                "{target:?} should be free"
+            );
+        }
     }
 
     /// A lock file pruned between a lease opening it and locking it guards
@@ -937,11 +1218,12 @@ mod tests {
         assert!(!still_named(&stale, &lock));
         assert!(still_named(&fresh, &lock));
         let mut said = false;
-        let taken = lock_shared(&lock, &fx.cache, &mut io::sink(), &mut said).unwrap();
-        assert!(still_named(&taken, &lock));
+        let taken =
+            lock_shared(&lock, Region::Whole, &fx.cache, &mut io::sink(), &mut said).unwrap();
+        assert!(still_named(&taken.file, &lock));
         drop(taken);
-        let taken = try_lock_exclusive(&lock).unwrap().unwrap();
-        assert!(still_named(&taken, &lock));
-        assert!(try_lock_exclusive(&lock).unwrap().is_none());
+        let taken = try_lock_exclusive(&lock, Region::Whole).unwrap().unwrap();
+        assert!(still_named(&taken.file, &lock));
+        assert!(try_lock_exclusive(&lock, Region::Whole).unwrap().is_none());
     }
 }

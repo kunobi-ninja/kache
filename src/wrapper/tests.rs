@@ -12213,6 +12213,23 @@ fi
     );
     assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n");
 
+    // /Brepro fixes time independently of the environment. Both lookups must
+    // restore the existing object without another compiler or read-set capture.
+    for (name, value) in [
+        ("SOURCE_DATE_EPOCH", "1700000000"),
+        ("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough"),
+    ] {
+        let mut changed = env.clone();
+        changed.set(name, value);
+        std::fs::remove_file(&object).unwrap();
+        assert_eq!(run_cc_for(&config, &args, &changed).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&object).unwrap(),
+            "#define VALUE 1\n"
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n", "{name}");
+    }
+
     std::fs::write(earlier.join("value.h"), "#define VALUE 2\n").unwrap();
     std::fs::remove_file(&object).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));

@@ -4894,6 +4894,17 @@ fn effective_source_date_epoch_for(env: &InvocationEnv) -> Option<std::ffi::OsSt
     )
 }
 
+/// Native MSVC's admitted /Brepro mode fixes time macros independently of
+/// SOURCE_DATE_EPOCH. Other compilers need a fixed epoch to cache an object.
+fn cc_key_epoch(parsed: &CcArgs) -> std::result::Result<Option<std::ffi::OsString>, CcHiddenInput> {
+    if parsed.family == ToolFamily::Msvc {
+        return Ok(None);
+    }
+    effective_source_date_epoch_for(&parsed.invocation_env)
+        .map(Some)
+        .ok_or(CcHiddenInput::WallClock)
+}
+
 /// Pure resolution of the effective `SOURCE_DATE_EPOCH` (env read separately so
 /// this stays unit-testable). A build-exported value is honored **verbatim** —
 /// the raw bytes, untrimmed — so kache never normalizes a value the compiler
@@ -5100,7 +5111,7 @@ fn cc_preprocess_memo_key_as(
     prefix_maps: &[CcPrefixMap],
     compiler_version: &str,
 ) -> Option<String> {
-    let epoch = effective_source_date_epoch_for(&parsed.invocation_env)?;
+    let epoch = cc_key_epoch(parsed).ok()?;
     let cwd = parsed.invocation_env.cwd()?;
     let compiler_path = parsed
         .invocation_env
@@ -5151,11 +5162,13 @@ fn cc_preprocess_memo_key_as(
         b"cwd",
         cc_mapped_path(cwd, prefix_maps).as_bytes(),
     );
-    fold_cc_memo_field(
-        &mut hasher,
-        b"source-date-epoch",
-        crate::cache_key::env_os_key_bytes(&epoch).as_slice(),
-    );
+    if let Some(epoch) = &epoch {
+        fold_cc_memo_field(
+            &mut hasher,
+            b"source-date-epoch",
+            &crate::cache_key::env_os_key_bytes(epoch),
+        );
+    }
     // Likewise the argv: `-I` and the source path carry the checkout root.
     // The maps are folded below, so two trees agree here only when they agree
     // about what the mapping means.
@@ -5198,7 +5211,8 @@ fn cc_preprocess_memo_key_as(
     let mut environment: Vec<(Vec<u8>, Vec<u8>)> = parsed
         .invocation_env
         .vars_os()
-        .filter(|(name, _)| cc_memo_env_is_keyed(name))
+        // The effective epoch, when the compiler uses one, is already keyed above.
+        .filter(|(name, _)| name != "SOURCE_DATE_EPOCH" && cc_memo_env_is_keyed(name))
         .map(|(name, value)| {
             // Mapped as text, then encoded like every other memo field: on
             // Windows the field encoding is UTF-16 and the maps are UTF-8.
@@ -9111,8 +9125,7 @@ impl CcCompiler {
         }
         // Without a fixed date, lookup and execution can observe different
         // times. Refuse before probing the compiler or reading a memo.
-        let epoch = effective_source_date_epoch_for(&parsed.invocation_env)
-            .ok_or(CcHiddenInput::WallClock)?;
+        let epoch = cc_key_epoch(parsed)?;
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         self.pending_preprocess_memo.borrow_mut().take();
@@ -9307,11 +9320,13 @@ impl CcCompiler {
 
         // The read-set digest covers the source of date macros, while the
         // effective epoch determines the value that reaches the object.
-        fold_cc_memo_field(
-            &mut hasher,
-            b"source_date_epoch",
-            &crate::cache_key::env_os_key_bytes(&epoch),
-        );
+        if let Some(epoch) = epoch {
+            fold_cc_memo_field(
+                &mut hasher,
+                b"source_date_epoch",
+                &crate::cache_key::env_os_key_bytes(&epoch),
+            );
+        }
 
         // The mode decides what the entry holds (an object, or preprocessor
         // output). The resolved tokens cannot tell them apart: gcc's first

@@ -345,7 +345,7 @@ fn watch_with(
     shows_reads: impl FnOnce(&Path) -> std::io::Result<bool>,
     write: impl FnOnce(&Path, SystemTime) -> anyhow::Result<()>,
 ) {
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target_dir) else {
         return;
     };
     let record = armed_record(cache_dir, target_dir);
@@ -463,7 +463,7 @@ fn prune_with(
     if crate::target_processes::ActivePrograms::default().uses(target_dir) {
         return Pruned::default();
     }
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target_dir) else {
         return Pruned::default();
     };
     if !can_arm(
@@ -789,7 +789,7 @@ pub(crate) fn prune_superseded(cache_dir: &Path, target_dir: &Path, keep: usize)
     if !may_remove_superseded(target_dir, keep) {
         return pruned;
     }
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target_dir) else {
         return pruned;
     };
     for profile in profiles(target_dir) {

@@ -83,7 +83,7 @@ fn repair_with_scan(
         !in_use(&target),
         "target directory is in use; stop its builds and programs before repairing launchers"
     );
-    let _reservation = crate::target_use::try_exclusive(&config.cache_dir)?
+    let _reservation = crate::target_use::try_exclusive(&config.cache_dir, &target)?
         .context("target directory is in use by a Kache command")?;
     ensure!(
         matches!(

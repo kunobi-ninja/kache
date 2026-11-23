@@ -98,6 +98,16 @@ fn binary_label(binary: &OsStr) -> String {
     }
 }
 
+/// The directory the binary runs from: removing any target that holds it
+/// would take the binary and the files it reads beside it.
+fn binary_scope(binary: &OsStr) -> crate::target_use::Scope {
+    let path = Path::new(binary);
+    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => crate::target_use::Scope::within([dir.to_path_buf()]),
+        None => crate::target_use::Scope::Everything,
+    }
+}
+
 /// Run `args` (the test binary, then its arguments) and return the exit code
 /// for the runner. Returns only when the binary could not be run or has
 /// exited; a binary killed by a signal kills the runner with it.
@@ -122,7 +132,14 @@ pub fn run(args: &[OsString]) -> i32 {
     let cache_dir = config.as_ref().map(|config| config.cache_dir.as_path());
     let test_args = args[1..].iter().map(OsString::as_os_str);
     let target_use = match cache_dir
-        .map(|dir| crate::target_use::shared_for(dir, &binary_label(&args[0]), test_args))
+        .map(|dir| {
+            crate::target_use::shared_for(
+                dir,
+                &binary_scope(&args[0]),
+                &binary_label(&args[0]),
+                test_args,
+            )
+        })
         .transpose()
     {
         Ok(lease) => lease,

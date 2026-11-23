@@ -10,7 +10,7 @@ pub(crate) fn prune_stale(
     window: Duration,
     at: SystemTime,
 ) -> Pruned {
-    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir) else {
+    let Ok(Some(_reservation)) = crate::target_use::try_exclusive(cache_dir, target) else {
         return Pruned::default();
     };
     sweep(

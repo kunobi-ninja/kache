@@ -508,3 +508,14 @@ pub fn stop_daemon(stop: &mut Command, runtime_dir: &Path) {
     // teardown; wait for it before the fixture removes that directory.
     let _ = wait_for_daemon_lock_release(&lock_path, Duration::from_secs(45));
 }
+
+/// The lock a command shares while it uses `dir`, and that cleanup takes
+/// exclusively while it removes a target in or around `dir`.
+#[allow(dead_code)]
+pub fn target_use_lock(cache_dir: &Path, dir: &Path) -> PathBuf {
+    let dir = dir.canonicalize().unwrap();
+    let hash = blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex();
+    cache_dir
+        .join("target-use.d")
+        .join(format!("u-{}.lock", &hash.as_str()[..32]))
+}

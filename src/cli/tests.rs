@@ -8416,6 +8416,62 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
     assert!(!target.exists());
 }
 
+/// A command keeps the targets of its own workspace, and clean removes the
+/// rest: one long test run must not keep every target on the machine.
+#[test]
+fn remove_targets_removes_what_a_running_command_does_not_use() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let mine = root.path().join("mine/target");
+    let other = root.path().join("other/target");
+    let to_remove: Vec<_> = [&mine, &other]
+        .into_iter()
+        .map(|path| {
+            std::fs::create_dir_all(path).unwrap();
+            RemovalTarget {
+                path: path.clone(),
+                scanned_identity: directory_identity(path),
+                estimated_reclaimable: 10,
+                apparent_gap: 0,
+            }
+        })
+        .collect();
+    let command = crate::target_use::shared_in(
+        &cache,
+        &crate::target_use::Scope::within([mine.join("debug/deps")]),
+        "hub",
+        &mut std::io::sink(),
+    )
+    .unwrap();
+    let paths = [mine.as_path(), other.as_path()];
+    let notes = removal_notes(&cache, &paths);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("Not now: waiting for `hub`") && notes[0].ends_with("skips 1 target."),
+        "{notes:?}"
+    );
+    assert_eq!(waiting_for(&cache, &paths).len(), 1);
+    let mut skipped = Vec::new();
+    let mut waiting = Vec::new();
+    let removed = remove_targets(
+        &to_remove,
+        root.path(),
+        &cache,
+        true,
+        &mut skipped,
+        &mut waiting,
+        &mut Vec::new(),
+    );
+    assert_eq!(removed.0, 1);
+    assert!(mine.exists() && !other.exists());
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].path, mine.display().to_string());
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].what, "hub");
+    drop(command);
+    assert!(waiting_for(&cache, &paths).is_empty());
+}
+
 /// A link inside a target goes as a link: what it points to stays.
 #[cfg(unix)]
 #[test]
@@ -8500,6 +8556,7 @@ fn held_reason_names_each_command_and_how_long_it_ran() {
         process: crate::process_identity::ProcessIdentity::unrecorded(pid),
         what: what.to_owned(),
         since,
+        scope: crate::target_use::Scope::Everything,
     };
     assert_eq!(
         held_reason(&[], 100),

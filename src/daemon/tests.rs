@@ -13514,7 +13514,21 @@ async fn abandoned_compile_download_does_not_take_a_later_permit() {
 async fn compile_download_connection_survives_the_download_thread() {
     use axum::{Router, extract::ConnectInfo, routing::get};
     use std::net::SocketAddr;
-    use tokio::sync::{Notify, oneshot, watch};
+    use tokio::sync::{Notify, Semaphore, oneshot, watch};
+
+    // Hyper races a fresh dial against a connection returning to the pool.
+    // Admit just the first dial so scheduling cannot choose a second socket.
+    struct SingleDial(SocketAddr, Arc<Semaphore>);
+    impl reqwest::dns::Resolve for SingleDial {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let address = self.0;
+            let permits = Arc::clone(&self.1);
+            Box::pin(async move {
+                permits.acquire().await?.forget();
+                Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs)
+            })
+        }
+    }
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -13556,19 +13570,21 @@ async fn compile_download_connection_survives_the_download_thread() {
     });
 
     let timeout = Duration::from_secs(10);
+    let dials = Arc::new(Semaphore::new(1));
     let client = reqwest::Client::builder()
+        .dns_resolver(SingleDial(address, Arc::clone(&dials)))
         .http1_only()
         .no_proxy()
         .timeout(timeout)
         .build()
         .unwrap();
-    let worker_client = client.clone();
+    let base = format!("http://fixture.invalid:{}", address.port());
+    let first_request = client.get(format!("{base}/first"));
     let (first_read, idle) = oneshot::channel();
     let download = tokio::spawn(finish_compile_remote_download(
         RemoteDeadline::from_millis(10_000),
         async move {
-            let first = worker_client
-                .get(format!("http://{address}/first"))
+            let first = first_request
                 .send()
                 .await?
                 .error_for_status()?
@@ -13583,7 +13599,7 @@ async fn compile_download_connection_survives_the_download_thread() {
         .await
         .expect("first GET deadline")
         .expect("first GET finished");
-    let second = tokio::spawn(client.get(format!("http://{address}/second")).send());
+    let second = tokio::spawn(client.get(format!("{base}/second")).send());
     let first_peer = download
         .await
         .expect("download task")
@@ -13599,6 +13615,7 @@ async fn compile_download_connection_survives_the_download_thread() {
         .await
         .unwrap();
 
+    dials.close();
     drop(client);
     shutdown.send(()).expect("request server shutdown");
     tokio::time::timeout(timeout, server)

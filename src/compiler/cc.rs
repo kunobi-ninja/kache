@@ -2228,25 +2228,25 @@ fn cc_unsafe_to_store(
     }
 }
 
-/// The key cannot see a file the assembler would read (kunobi-ninja/kache#1015).
-///
-/// Its own type so the wrapper can tell it from other key failures: this TU
-/// is unsafe for any cache keyed on the preprocessor output, so it must run
-/// the compiler directly rather than through a configured fallback wrapper.
+/// An input that neither Kache nor a fallback keyed on preprocessor output
+/// can track. The wrapper sends this compile directly to the compiler.
 #[derive(Debug)]
-pub(crate) struct CcHiddenInput {
-    pub(crate) construct: &'static str,
+pub(crate) enum CcHiddenInput {
+    AssemblerFile(&'static str),
+    WallClock,
 }
 
 impl std::fmt::Display for CcHiddenInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The fixed text leads so one `known_passthrough` prefix in the bench
-        // scenarios covers every construct.
-        write!(
-            f,
-            "cc: the assembler may read a file the cache key cannot see (`{}`)",
-            self.construct
-        )
+        match self {
+            Self::AssemblerFile(construct) => write!(
+                f,
+                "cc: the assembler may read a file the cache key cannot see (`{construct}`)"
+            ),
+            Self::WallClock => f.write_str(
+                "cc: wall-clock compilation requested without an exported SOURCE_DATE_EPOCH",
+            ),
+        }
     }
 }
 
@@ -2329,7 +2329,7 @@ fn preprocess_hash(
     if let Some(construct) = cc_assembler_hidden_input(&output.stdout) {
         // Refuse before the memo can record this TU: a memo hit skips the
         // probe, and the file the assembler reads is in no fingerprint.
-        return Err(CcHiddenInput { construct }.into());
+        return Err(CcHiddenInput::AssemblerFile(construct).into());
     }
     let CcExpansionHash { hash, path_bound } = hash_cc_expansion(output.stdout, prefix_maps);
     // A path-bound expansion is never memoized. The memo is read from other
@@ -3121,9 +3121,11 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // the specific Firefox value (per #115's evidence) so a wildcard
         // `Prefix("-Wa,")` doesn't silently accept unmodeled assembler
         // flags. `--noexecstack` sets a section flag on the object.
+        // Raw-keyed: gcc's `-###` puts it only on the separate `as` line, so
+        // the hashed `cc1` line of a `.S` compile is the same without it.
         matcher: Matcher::Exact("-Wa,--noexecstack"),
-        class: FlagClass::CapturedByProbe,
-        source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse.",
+        class: FlagClass::RawKeyed,
+        source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse. Raw-keyed because gcc's cc1 probe line omits it.",
         dialect: None,
     },
     FlagSpec {
@@ -3253,6 +3255,17 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-fuse-ld="),
         class: FlagClass::RawKeyed,
         source: "linker selection; unused-argument diagnostics can change compile success.",
+        dialect: None,
+    },
+    FlagSpec {
+        // clang's driver consumes it, so it never reaches `cc1`, but it turns
+        // off the unused-argument warning that `-Werror` makes fatal. Keyed
+        // like `-fuse-ld=` so an entry stored with it cannot answer a build
+        // that would fail without it. gcc rejects the flag, so no gcc entry
+        // is ever stored.
+        matcher: Matcher::Exact("-Qunused-arguments"),
+        class: FlagClass::RawKeyed,
+        source: "clang unused-argument warning switch; changes compile success under -Werror, never object bytes.",
         dialect: None,
     },
     FlagSpec {
@@ -4873,15 +4886,23 @@ fn parse_cc_normalize_toggle(value: Option<&str>) -> bool {
 ///   so warm rebuilds hit;
 /// - `None` only when the build set nothing *and* the user opted out via
 ///   `KACHE_CC_SOURCE_DATE_EPOCH=passthrough` — then kache pins nothing and the
-///   object bakes wall-clock. The unpinned `-E` probe then produces a
-///   time-dependent key, so a stale wall-clock object is very unlikely to be
-///   reused (best-effort, not a guarantee: two probes landing in the same
-///   second expand identically, so a cross-second cold store can still be hit).
+///   compiler sees the wall clock. These compiles bypass the cache.
 fn effective_source_date_epoch_for(env: &InvocationEnv) -> Option<std::ffi::OsString> {
     resolve_source_date_epoch(
         env.var_os("SOURCE_DATE_EPOCH"),
         source_date_epoch_passthrough_for(env),
     )
+}
+
+/// Native MSVC's admitted /Brepro mode fixes time macros independently of
+/// SOURCE_DATE_EPOCH. Other compilers need a fixed epoch to cache an object.
+fn cc_key_epoch(parsed: &CcArgs) -> std::result::Result<Option<std::ffi::OsString>, CcHiddenInput> {
+    if parsed.family == ToolFamily::Msvc {
+        return Ok(None);
+    }
+    effective_source_date_epoch_for(&parsed.invocation_env)
+        .map(Some)
+        .ok_or(CcHiddenInput::WallClock)
 }
 
 /// Pure resolution of the effective `SOURCE_DATE_EPOCH` (env read separately so
@@ -5090,7 +5111,7 @@ fn cc_preprocess_memo_key_as(
     prefix_maps: &[CcPrefixMap],
     compiler_version: &str,
 ) -> Option<String> {
-    let epoch = effective_source_date_epoch_for(&parsed.invocation_env)?;
+    let epoch = cc_key_epoch(parsed).ok()?;
     let cwd = parsed.invocation_env.cwd()?;
     let compiler_path = parsed
         .invocation_env
@@ -5141,11 +5162,13 @@ fn cc_preprocess_memo_key_as(
         b"cwd",
         cc_mapped_path(cwd, prefix_maps).as_bytes(),
     );
-    fold_cc_memo_field(
-        &mut hasher,
-        b"source-date-epoch",
-        crate::cache_key::env_os_key_bytes(&epoch).as_slice(),
-    );
+    if let Some(epoch) = &epoch {
+        fold_cc_memo_field(
+            &mut hasher,
+            b"source-date-epoch",
+            &crate::cache_key::env_os_key_bytes(epoch),
+        );
+    }
     // Likewise the argv: `-I` and the source path carry the checkout root.
     // The maps are folded below, so two trees agree here only when they agree
     // about what the mapping means.
@@ -5188,7 +5211,8 @@ fn cc_preprocess_memo_key_as(
     let mut environment: Vec<(Vec<u8>, Vec<u8>)> = parsed
         .invocation_env
         .vars_os()
-        .filter(|(name, _)| cc_memo_env_is_keyed(name))
+        // The effective epoch, when the compiler uses one, is already keyed above.
+        .filter(|(name, _)| name != "SOURCE_DATE_EPOCH" && cc_memo_env_is_keyed(name))
         .map(|(name, value)| {
             // Mapped as text, then encoded like every other memo field: on
             // Windows the field encoding is UTF-16 and the maps are UTF-8.
@@ -9099,6 +9123,9 @@ impl CcCompiler {
         if parsed.mode == CompileMode::Link {
             return self.cache_key_for_link(parsed, ctx).map(CcKeyOutcome::Key);
         }
+        // Without a fixed date, lookup and execution can observe different
+        // times. Refuse before probing the compiler or reading a memo.
+        let epoch = cc_key_epoch(parsed)?;
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         self.pending_preprocess_memo.borrow_mut().take();
@@ -9279,6 +9306,26 @@ impl CcCompiler {
                 );
             }
             hasher.update(b"\n");
+        } else if !native_msvc {
+            // No `cc1` line to stand for the argv. The read-set digest below
+            // cannot see a `-D` value or any other argv-only input, so key the
+            // configuration arguments verbatim. A macro can bake an absolute
+            // path as an ordinary string unaffected by compiler prefix maps.
+            hasher.update(b"unresolved_args:");
+            for arg in &config_args {
+                fold_cc_memo_field(&mut hasher, b"arg", arg.as_bytes());
+            }
+            hasher.update(b"\n");
+        }
+
+        // The read-set digest covers the source of date macros, while the
+        // effective epoch determines the value that reaches the object.
+        if let Some(epoch) = epoch {
+            fold_cc_memo_field(
+                &mut hasher,
+                b"source_date_epoch",
+                &crate::cache_key::env_os_key_bytes(&epoch),
+            );
         }
 
         // The mode decides what the entry holds (an object, or preprocessor

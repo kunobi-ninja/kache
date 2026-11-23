@@ -12210,3 +12210,284 @@ exit 1
     // survives.
     assert_eq!(c, s(&["<path>"]));
 }
+
+/// A stand-in driver whose `-###` prints what gcc prints for each source:
+/// the `cc1` line, which never carries assembler (`-Wa,`) options. With
+/// `resolves = false` its `-###` fails, like a driver kache cannot resolve.
+#[cfg(unix)]
+fn gcc_like_driver(root: &Path, resolves: bool) -> PathBuf {
+    let program = root.join("cc");
+    let dry_run = if resolves {
+        r#"-###)
+        for arg in "$@"; do
+            case "$arg" in
+                *.S) printf '"cc1" "-E" "-lang-asm" "%s"\n' "$arg" >&2; exit 0 ;;
+                *.c) printf '"cc1" "-quiet" "%s"\n' "$arg" >&2; exit 0 ;;
+            esac
+        done
+        exit 1 ;;"#
+    } else {
+        "-###) exit 1 ;;"
+    };
+    kache_fs::testutil::write_executable(
+        &program,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n    --version) printf 'fixture gcc 1.0\\n'; exit 0 ;;\n    {dry_run}\nesac\nexit 1\n"
+        ),
+    );
+    program
+}
+
+/// The key of a compile-first run of `args` whose read set is `source`.
+#[cfg(unix)]
+fn captured_key(
+    program: &Path,
+    env: &InvocationEnv,
+    cache: &Path,
+    args: &[&str],
+    source: &str,
+) -> String {
+    let hasher = crate::cache_key::FileHasher::new_for(env);
+    let normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let mut argv = vec![program.to_string_lossy().into_owned()];
+    argv.extend(args.iter().map(|arg| arg.to_string()));
+    let parsed = CcArgs::parse_for(&argv, env).unwrap();
+    let maps = cc_prefix_maps(&parsed, &[]);
+    let source = env.cwd().unwrap().join(source);
+    let fingerprints = hasher
+        .cc_preprocess_fingerprints(
+            &[(cc_mapped_path(&source, &maps), source.clone())],
+            &cc_prefix_maps_key(&maps),
+            &|path| cc_mapped_content_hash(path, &maps),
+        )
+        .unwrap();
+    let outcome = CcCompiler::new()
+        .with_invocation_env(env)
+        .cache_key_with(
+            &parsed,
+            &KeyCtx {
+                invocation_env: env,
+                file_hasher: &hasher,
+                path_normalizer: &normalizer,
+                cache_dir: cache,
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+                build_script_inputs_digest: None,
+            },
+            CcKeyDiscovery::Captured(CcCapturedInputs {
+                fingerprints,
+                path_bound: false,
+                inputs_changed: false,
+            }),
+        )
+        .unwrap();
+    match outcome {
+        CcKeyOutcome::Key(key) => key,
+        CcKeyOutcome::Deferred(_) => panic!("a captured read set must produce a key"),
+    }
+}
+
+/// gcc hands `-Wa,` options to the separate `as` subprocess only, so its
+/// `cc1` line for `-c t.S` is the same with and without
+/// `-Wa,--noexecstack`. The objects still differ: one has a
+/// `.note.GNU-stack` section, the other asks the linker for an executable
+/// stack. The key must not depend on the probe to tell them apart.
+#[cfg(unix)]
+#[test]
+fn assembler_noexecstack_keys_an_assembler_source_under_gcc() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(root.join("t.S"), ".text\nf:\n ret\n").unwrap();
+    let program = gcc_like_driver(root, true);
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let plain = captured_key(
+        &program,
+        &env,
+        cache.path(),
+        &["-c", "t.S", "-o", "t.o"],
+        "t.S",
+    );
+    let hardened = captured_key(
+        &program,
+        &env,
+        cache.path(),
+        &["-Wa,--noexecstack", "-c", "t.S", "-o", "t.o"],
+        "t.S",
+    );
+    assert_ne!(plain, hardened);
+}
+
+/// A compile-first key is the digest of what the compile read, so the
+/// date the build pins for `__DATE__` / `__TIME__` reaches it only if the
+/// key folds it. Two builds exporting different dates must not share an
+/// object that bakes one of them.
+#[cfg(unix)]
+#[test]
+fn exported_source_date_epoch_keys_a_compile_first_object() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    fs::write(
+        root.join("t.c"),
+        "const char *built = __DATE__ \" \" __TIME__;\n",
+    )
+    .unwrap();
+    let program = gcc_like_driver(root, true);
+    let env_with = |epoch: &str| {
+        InvocationEnv::from_parts(
+            [("SOURCE_DATE_EPOCH", epoch)],
+            Some(root.to_path_buf()),
+            None,
+            root.to_path_buf(),
+        )
+    };
+    let cache = tempfile::tempdir().unwrap();
+    let args = ["-c", "t.c", "-o", "t.o"];
+    let first = captured_key(
+        &program,
+        &env_with("1700000000"),
+        cache.path(),
+        &args,
+        "t.c",
+    );
+    let second = captured_key(
+        &program,
+        &env_with("1800000000"),
+        cache.path(),
+        &args,
+        "t.c",
+    );
+    assert_ne!(first, second);
+    let mut passthrough = env_with("1700000000");
+    passthrough.set("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough");
+    assert_eq!(
+        first,
+        captured_key(&program, &passthrough, cache.path(), &args, "t.c")
+    );
+}
+
+/// The wrapper sends a hidden-input refusal directly to the compiler, even
+/// when a fallback cache is configured. No time-dependent entry is created.
+#[test]
+fn an_unpinned_wall_clock_compile_has_no_cache_key() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let env = InvocationEnv::from_parts(
+        [("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough")],
+        Some(dir.to_owned()),
+        None,
+        dir.to_owned(),
+    );
+    let compiler = CcCompiler::for_invocation(Vec::new(), &env);
+    let parsed = compiler
+        .parse(&s(&["cc", "-c", "t.c", "-o", "t.o"]))
+        .unwrap();
+    let file_hasher = crate::cache_key::FileHasher::new_for(&env);
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let ctx = KeyCtx {
+        invocation_env: &env,
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: dir,
+        key_salt: None,
+        key_env_vars: &[],
+        extra_inputs_digest: None,
+        build_script_inputs_digest: None,
+    };
+    let error = compiler.cache_key(&parsed, &ctx).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CcHiddenInput>(),
+        Some(CcHiddenInput::WallClock)
+    ));
+    assert!(error.to_string().contains("SOURCE_DATE_EPOCH"));
+}
+
+/// Without a resolved `cc1` line the read-set digest is all that stands
+/// for the preprocessor, and it cannot see a `-D` value. Two compiles of
+/// one source that differ only in a define must not share a key.
+#[cfg(unix)]
+#[test]
+fn defines_key_a_compile_first_object_when_the_probe_does_not_resolve() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkout = temp.path().join("work/checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let root = checkout.as_path();
+    fs::write(root.join("t.c"), "int value = VALUE;\n").unwrap();
+    let program = gcc_like_driver(root, false);
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(&str, &str)>(),
+        Some(root.to_path_buf()),
+        None,
+        root.to_path_buf(),
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let one = captured_key(
+        &program,
+        &env,
+        cache.path(),
+        &["-DVALUE=1", "-c", "t.c", "-o", "t.o"],
+        "t.c",
+    );
+    let two = captured_key(
+        &program,
+        &env,
+        cache.path(),
+        &["-DVALUE=2", "-c", "t.c", "-o", "t.o"],
+        "t.c",
+    );
+    assert_ne!(one, two);
+
+    // Prefix maps rewrite paths in compiler metadata, but a macro can embed
+    // either spelling as literal data in the object.
+    let parsed = CcArgs::parse_for(&s(&["gcc", "-c", "t.c", "-o", "t.o"]), &env).unwrap();
+    let maps = cc_prefix_maps(&parsed, &[]);
+    let map = maps
+        .iter()
+        .find(|map| map.from == root.to_string_lossy())
+        .unwrap();
+    let literal_key = |value: &str| {
+        let define = format!("-DVALUE=\"{value}/lib\"");
+        captured_key(
+            &program,
+            &env,
+            cache.path(),
+            &[&define, "-c", "t.c", "-o", "t.o"],
+            "t.c",
+        )
+    };
+    assert_ne!(literal_key(&map.from), literal_key(&map.to));
+}
+
+/// clang's `-Qunused-arguments` never reaches `cc1`, but it decides whether
+/// `-Werror` fails a compile on an unused driver argument. Like
+/// `-fuse-ld=`, it is cacheable once keyed by its spelling.
+#[test]
+fn unused_arguments_switch_is_raw_keyed_and_cacheable() {
+    let args = [
+        "clang",
+        "-Werror",
+        "-Qunused-arguments",
+        "-c",
+        "foo.c",
+        "-o",
+        "foo.o",
+    ];
+    let descs = refuse_descriptions(&args);
+    assert!(
+        descs.is_empty(),
+        "-Qunused-arguments should cache: {descs:?}"
+    );
+    let raw = |args: &[&str]| cc_raw_flags_for_key(&CcArgs::parse(&s(args)).unwrap(), &[]);
+    let without: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "-Qunused-arguments")
+        .collect();
+    assert_ne!(raw(&args), raw(&without));
+}

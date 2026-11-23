@@ -9239,15 +9239,15 @@ fn nvcc_depinfo_rewrite_root_anchors() {
     assert_eq!(nvcc_depinfo_rewrite_root_from_cwd(&parsed, cwd), None);
 }
 
-/// #1015: a fallback wrapper such as sccache keys on the same preprocessor
-/// output, so it would serve the stale object kache just refused to cache.
-/// Only that refusal skips it; other key failures keep the fallback.
 #[test]
 fn only_hidden_input_key_failures_skip_the_fallback() {
-    let hidden = anyhow::Error::new(crate::compiler::cc::CcHiddenInput {
-        construct: ".incbin",
-    });
-    assert!(cc_key_error_skips_fallback(&hidden));
+    use crate::compiler::cc::CcHiddenInput;
+    for input in [
+        CcHiddenInput::AssemblerFile(".incbin"),
+        CcHiddenInput::WallClock,
+    ] {
+        assert!(cc_key_error_skips_fallback(&anyhow::Error::new(input)));
+    }
     assert!(!cc_key_error_skips_fallback(&anyhow::anyhow!(
         "cc -E key probe exited 1"
     )));
@@ -12212,6 +12212,23 @@ fi
         "#define VALUE 1\n"
     );
     assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n");
+
+    // /Brepro fixes time independently of the environment. Both lookups must
+    // restore the existing object without another compiler or read-set capture.
+    for (name, value) in [
+        ("SOURCE_DATE_EPOCH", "1700000000"),
+        ("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough"),
+    ] {
+        let mut changed = env.clone();
+        changed.set(name, value);
+        std::fs::remove_file(&object).unwrap();
+        assert_eq!(run_cc_for(&config, &args, &changed).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&object).unwrap(),
+            "#define VALUE 1\n"
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n", "{name}");
+    }
 
     std::fs::write(earlier.join("value.h"), "#define VALUE 2\n").unwrap();
     std::fs::remove_file(&object).unwrap();

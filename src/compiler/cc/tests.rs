@@ -12231,7 +12231,7 @@ fn gcc_like_driver(root: &Path, resolves: bool) -> PathBuf {
     };
     kache_fs::testutil::write_executable(
         &program,
-        &format!(
+        format!(
             "#!/bin/sh\ncase \"$1\" in\n    --version) printf 'fixture gcc 1.0\\n'; exit 0 ;;\n    {dry_run}\nesac\nexit 1\n"
         ),
     );

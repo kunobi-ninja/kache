@@ -127,6 +127,14 @@ impl Fixture {
 }
 
 fn shared_width_fixture() -> Fixture {
+    shared_width_fixture_with(false)
+}
+
+/// `cargo test` sets `CARGO_MANIFEST_DIR` for the test process and other
+/// tests remove it while they run, so the fixture never reads the live value.
+/// `in_checkout` makes the unit a Cargo unit of the fixture's directory, which
+/// also looks up the keys bound to that checkout.
+fn shared_width_fixture_with(in_checkout: bool) -> Fixture {
     let mut fixture = Fixture::new();
     let mut argv = vec![fixture.args.rustc.display().to_string()];
     argv.extend_from_slice(&fixture.args.all_args);
@@ -135,7 +143,19 @@ fn shared_width_fixture() -> Fixture {
         "--json=artifacts,future-incompat".to_string(),
         "--diagnostic-width=80".to_string(),
     ]);
-    fixture.args = RustcArgs::parse(&argv).unwrap();
+    let captured = kache_config::invocation::InvocationEnv::capture();
+    let mut invocation = kache_config::invocation::InvocationEnv::from_parts(
+        captured
+            .vars_os()
+            .filter(|(name, _)| name.as_os_str() != std::ffi::OsStr::new("CARGO_MANIFEST_DIR")),
+        captured.cwd().map(std::path::Path::to_path_buf),
+        captured.home_dir().map(std::path::Path::to_path_buf),
+        captured.temp_dir().to_path_buf(),
+    );
+    if in_checkout {
+        invocation.set("CARGO_MANIFEST_DIR", fixture.dir.path().as_os_str());
+    }
+    fixture.args = RustcArgs::parse_for(&argv, &invocation).unwrap();
     fixture
 }
 
@@ -464,7 +484,7 @@ fn shared_width_safe_legacy_entry_still_restores() {
 fn shared_width_remote_and_prefetch_unsafe_entries_are_policy_misses() {
     let _lock = crate::test_support::process_state_test_lock();
     for prefetched in [false, true] {
-        let mut fixture = shared_width_fixture();
+        let mut fixture = shared_width_fixture_with(true);
         fixture.config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
         fixture.meta.stdout.clear();
         fixture.meta.stderr =

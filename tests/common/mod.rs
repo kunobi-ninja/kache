@@ -517,7 +517,7 @@ pub fn target_use_lock(cache_dir: &Path, dir: &Path) -> PathBuf {
         return cache_dir.join("target-use.lock");
     }
     let dir = dir.canonicalize().unwrap();
-    let hash = blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex();
+    let hash = blake3::hash(dir.as_os_str().to_ascii_lowercase().as_encoded_bytes()).to_hex();
     cache_dir
         .join("target-use.d")
         .join(format!("u-{}.lock", &hash.as_str()[..32]))

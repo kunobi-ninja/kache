@@ -36,6 +36,22 @@ fn proxied_cargo(home: &Path, cache: &Path, target: &Path) -> Command {
     command
 }
 
+fn lease_test_command(shim: &Path, cache: &Path) -> Command {
+    let mut command = hermetic_command(shim, cache, None);
+    command
+        .env("CARGO_HOME", cache.join("cargo-home"))
+        .env("KACHE_BLAZE", "false")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("CARGO_UNSTABLE_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 #[test]
 fn cargo_shim_holds_target_lease_for_whole_test() {
     let dir = tempfile::tempdir().unwrap();
@@ -69,7 +85,7 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
             .chain(std::env::split_paths(&base_path)),
     )
     .unwrap();
-    let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+    let mut command = lease_test_command(&shims.join("cargo"), &cache);
     let mut child = command
         .arg("test")
         .current_dir(&project)
@@ -158,7 +174,7 @@ fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
                 .chain(std::env::split_paths(&base_path)),
         )
         .unwrap();
-        let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+        let mut command = lease_test_command(&shims.join("cargo"), &cache);
         command
             .arg("build")
             .args(quiet.then_some("-q"))

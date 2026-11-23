@@ -106,6 +106,7 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
     let lease = crate::target_use::shared_for(
         &config.cache_dir,
+        &crate::target_use::Scope::Everything,
         &what,
         cargo_args.iter().map(OsString::as_os_str),
     )
@@ -348,14 +349,19 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
             .any(|value| value == WORKTREE_BUILD_DIR_CONFIG),
     );
 
-    run_cargo_with_target_protection(command, &cargo)
+    run_cargo_with_target_protection(command, &cargo, &crate::target_use::Scope::Everything)
 }
 
-fn run_cargo_with_target_protection(command: Command, cargo: &Path) -> Result<()> {
+fn run_cargo_with_target_protection(
+    command: Command,
+    cargo: &Path,
+    scope: &crate::target_use::Scope,
+) -> Result<()> {
     let config = crate::config::Config::load().context("loading the cache configuration")?;
     let what = cargo_command_label(command.get_args());
-    let target_use = crate::target_use::shared_for(&config.cache_dir, &what, command.get_args())
-        .context("protecting target directories while Cargo runs")?;
+    let target_use =
+        crate::target_use::shared_for(&config.cache_dir, scope, &what, command.get_args())
+            .context("protecting target directories while Cargo runs")?;
     run_cargo_and_exit(command, cargo, target_use, &config)
 }
 

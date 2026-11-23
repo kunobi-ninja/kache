@@ -347,6 +347,7 @@ pub(crate) fn sweep(config: &Config, now: u64) -> anyhow::Result<Swept> {
     }
     let used = prune_under_pressure(config, &store, at, &mut swept, &programs)?;
     recover_under_pressure(config, &store, now, &unused, &used, &mut swept, &programs)?;
+    crate::target_use::prune_locks(&config.cache_dir);
     Ok(swept)
 }
 
@@ -849,7 +850,7 @@ fn remove_after_rename(
     after_rename: impl FnOnce(&Path),
     delete: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
-    let Some(reservation) = crate::target_use::try_exclusive(cache_dir)? else {
+    let Some(reservation) = crate::target_use::try_exclusive(cache_dir, target)? else {
         return Ok(false);
     };
     if crate::machine::directory_identity(target) != Some(expected) || recorded() {
@@ -2315,7 +2316,8 @@ mod tests {
             || false,
             |_| {},
             |aside| {
-                deleted_unlocked = crate::target_use::try_exclusive(cache.path())?.is_some();
+                deleted_unlocked =
+                    crate::target_use::try_exclusive(cache.path(), &target)?.is_some();
                 std::fs::remove_dir_all(aside)
             },
         )

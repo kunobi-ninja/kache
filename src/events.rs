@@ -1406,10 +1406,31 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
     compute_stats_onto(EventStats::default(), events)
 }
 
+/// A keyed skip records a completed compile whose output kache declined to
+/// store. It counts as a miss while the raw event retains the skip reason.
+pub(crate) fn cache_outcome(event: &BuildEvent) -> EventResult {
+    if event.result == EventResult::Skipped
+        && !event.cache_key.is_empty()
+        && !event.skip_reason.is_empty()
+    {
+        EventResult::Miss
+    } else {
+        event.result
+    }
+}
+
+pub(crate) fn miss_compile_ms(event: &BuildEvent) -> u64 {
+    if event.compile_time_ms > 0 {
+        event.compile_time_ms
+    } else {
+        event.elapsed_ms
+    }
+}
+
 /// [`compute_stats`], adding `events` to `stats`.
 pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> EventStats {
     for event in events {
-        match event.result {
+        match cache_outcome(event) {
             EventResult::LocalHit => {
                 stats.local_hits += 1;
                 if event.readonly_store {
@@ -1431,20 +1452,12 @@ pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> Event
             EventResult::Dup => {
                 stats.dups += 1;
                 stats.miss_elapsed_ms += event.elapsed_ms;
-                stats.miss_compile_time_ms += if event.compile_time_ms > 0 {
-                    event.compile_time_ms
-                } else {
-                    event.elapsed_ms
-                };
+                stats.miss_compile_time_ms += miss_compile_ms(event);
             }
             EventResult::Miss => {
                 stats.misses += 1;
                 stats.miss_elapsed_ms += event.elapsed_ms;
-                stats.miss_compile_time_ms += if event.compile_time_ms > 0 {
-                    event.compile_time_ms
-                } else {
-                    event.elapsed_ms
-                };
+                stats.miss_compile_time_ms += miss_compile_ms(event);
             }
             EventResult::Error => stats.errors += 1,
             EventResult::Passthrough | EventResult::Skipped => continue,
@@ -2924,6 +2937,10 @@ mod tests {
 
     #[test]
     fn test_compute_stats() {
+        let mut declined = test_event("f", EventResult::Skipped, 21, 0, 0, "k5");
+        declined.skip_reason = "admission-threshold".into();
+        let mut keyless = test_event("keyless", EventResult::Skipped, 80, 70, 0, "");
+        keyless.skip_reason = "missing-dep-info".into();
         let events = vec![
             test_event("a", EventResult::LocalHit, 10, 300, 100, "k1"),
             test_event("b", EventResult::PrefetchHit, 5, 250, 150, "k1b"),
@@ -2931,7 +2948,9 @@ mod tests {
             test_event("dup", EventResult::Dup, 700, 650, 400, "kdup"),
             test_event("d", EventResult::Miss, 1000, 950, 500, "k3"),
             test_event("e", EventResult::Error, 5, 0, 0, "k4"),
-            test_event("f", EventResult::Skipped, 0, 0, 0, "k5"),
+            declined,
+            keyless,
+            test_event("legacy", EventResult::Skipped, 45, 40, 0, "k6"),
             test_event("g", EventResult::Passthrough, 25, 0, 0, ""),
         ];
 
@@ -2940,14 +2959,14 @@ mod tests {
         assert_eq!(stats.prefetch_hits, 1);
         assert_eq!(stats.remote_hits, 1);
         assert_eq!(stats.dups, 1);
-        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.misses, 2);
         assert_eq!(stats.errors, 1);
         assert_eq!(stats.total_size, 1350);
-        assert_eq!(stats.total_elapsed_ms, 1770);
+        assert_eq!(stats.total_elapsed_ms, 1791);
         assert_eq!(stats.hit_elapsed_ms, 65);
-        assert_eq!(stats.miss_elapsed_ms, 1700);
+        assert_eq!(stats.miss_elapsed_ms, 1721);
         assert_eq!(stats.hit_compile_time_ms, 1450);
-        assert_eq!(stats.miss_compile_time_ms, 1600);
+        assert_eq!(stats.miss_compile_time_ms, 1621);
     }
 
     #[test]

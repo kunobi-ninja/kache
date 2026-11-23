@@ -2166,7 +2166,7 @@ fn lookup_series(
             continue;
         }
         let index = columns - 1 - (age_ms * columns as u128 / window_ms) as usize;
-        match event.result {
+        match crate::events::cache_outcome(event) {
             EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => {
                 hits[index] += 1;
             }

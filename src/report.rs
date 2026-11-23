@@ -856,6 +856,12 @@ pub struct BypassAnalysis {
     /// Wrapper time of `uncached_compiles`.
     #[serde(default)]
     pub uncached_compile_time_ms: u64,
+    /// Uncached compiles already counted among the cache misses.
+    #[serde(default)]
+    pub declined_stores: usize,
+    /// Wrapper time of those misses, also included in the miss timing.
+    #[serde(default)]
+    pub declined_store_elapsed_ms: u64,
     /// First private compiles that looked for another checkout's
     /// incremental state.
     #[serde(default)]
@@ -865,6 +871,12 @@ pub struct BypassAnalysis {
     pub direct_passthroughs: usize,
     pub reasons: Vec<BypassReason>,
     pub slowest: Vec<BypassDetail>,
+}
+
+impl BypassAnalysis {
+    fn compiles_outside_lookup(&self) -> usize {
+        self.uncached_compiles.saturating_sub(self.declined_stores)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1226,9 +1238,8 @@ pub fn generate_report_with_filter(
 
     let stats = events::compute_stats(&build_events);
     let total_compiled = stats.dups + stats.misses;
-    let total_cacheable =
-        stats.local_hits + stats.prefetch_hits + stats.remote_hits + total_compiled;
     let total_hits = stats.local_hits + stats.prefetch_hits + stats.remote_hits;
+    let total_cacheable = total_hits + total_compiled;
     let bypass = build_bypass_analysis(&build_events, top);
     let timeline = build_report_timeline(&build_events);
     let trace_events = build_trace_events(&build_events);
@@ -1249,13 +1260,23 @@ pub fn generate_report_with_filter(
     // Build CrateDetail list
     let all_events: Vec<CrateDetail> = build_events
         .iter()
-        .filter(|e| !matches!(e.result, EventResult::Skipped | EventResult::Passthrough))
+        .filter(|e| {
+            !matches!(
+                events::cache_outcome(e),
+                EventResult::Skipped | EventResult::Passthrough
+            )
+        })
         .map(to_crate_detail)
         .collect();
 
     let mut misses: Vec<CrateDetail> = build_events
         .iter()
-        .filter(|e| matches!(e.result, EventResult::Dup | EventResult::Miss))
+        .filter(|e| {
+            matches!(
+                events::cache_outcome(e),
+                EventResult::Dup | EventResult::Miss
+            )
+        })
         .map(to_crate_detail)
         .collect();
     misses.sort_by_key(|entry| std::cmp::Reverse(entry.compile_time_ms));
@@ -1313,12 +1334,12 @@ pub fn generate_report_with_filter(
         Some(analysis)
     };
 
-    // Prefetch
+    let credited_hits = stats.prefetch_hits + prefetch_served_local_hits(&build_events, &transfers);
     let prefetch = PrefetchAnalysis {
-        prefetch_hits: stats.prefetch_hits,
+        prefetch_hits: credited_hits,
         total_hits,
         contribution_pct: if total_hits > 0 {
-            (stats.prefetch_hits as f64 / total_hits as f64) * 100.0
+            (credited_hits as f64 / total_hits as f64) * 100.0
         } else {
             0.0
         },
@@ -1456,15 +1477,7 @@ pub fn generate_report_with_filter(
             store_failures: stats.store_failures,
             fallbacks: bypass.fallbacks,
             total_duration_ms: stats.total_elapsed_ms,
-            cache_efficiency_pct: {
-                let denom = stats.hit_compile_time_ms + stats.miss_compile_time_ms;
-                if denom > 0 {
-                    let raw = (stats.hit_compile_time_ms as f64 / denom as f64) * 100.0;
-                    (raw * 10.0).round() / 10.0
-                } else {
-                    0.0
-                }
-            },
+            cache_efficiency_pct: weighted.map_or(0.0, |w| (w * 10.0).round() / 10.0),
         },
         timeline,
         timing: TimingBreakdown {
@@ -1672,7 +1685,7 @@ fn build_report_timeline(events: &[BuildEvent]) -> ReportTimeline {
     for event in events {
         start = start.min(event_start(event));
         end = end.max(event.ts);
-        match event.result {
+        match events::cache_outcome(event) {
             EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => {
                 cacheable_count += 1;
                 hit_count += 1;
@@ -2024,8 +2037,6 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
                 && passthrough_category(&detail.reason) != "not-a-compile"
         })
         .count();
-    let (uncached_compiles, edit_rebuilds, uncached_compile_time_ms) =
-        uncached_compile_totals(events);
     let skipped = details
         .iter()
         .filter(|detail| detail.result == "skipped")
@@ -2084,31 +2095,35 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
     BypassAnalysis {
         passthroughs,
         probes,
-        edit_rebuilds,
-        uncached_compiles,
-        uncached_compile_time_ms,
         seeds: seed_summary(events),
         skipped,
         fallbacks,
         direct_passthroughs,
         reasons,
         slowest: details,
+        ..uncached_compile_totals(events)
     }
 }
 
-/// Uncached compiles, the edit rebuilds among them, and their wrapper time.
-fn uncached_compile_totals(events: &[BuildEvent]) -> (usize, usize, u64) {
-    let mut compiles = 0;
-    let mut edit_rebuilds = 0;
-    let mut elapsed_ms = 0u64;
+/// Count compiles without a stored output and their overlap with cache misses.
+fn uncached_compile_totals(events: &[BuildEvent]) -> BypassAnalysis {
+    let mut bypass = BypassAnalysis::default();
     for event in events.iter().filter(|event| ran_compiler_uncached(event)) {
-        compiles += 1;
+        bypass.uncached_compiles += 1;
+        bypass.uncached_compile_time_ms = bypass
+            .uncached_compile_time_ms
+            .saturating_add(event.elapsed_ms);
         if is_edit_rebuild(&event.passthrough_reason) {
-            edit_rebuilds += 1;
+            bypass.edit_rebuilds += 1;
         }
-        elapsed_ms = elapsed_ms.saturating_add(event.elapsed_ms);
+        if events::cache_outcome(event) == EventResult::Miss {
+            bypass.declined_stores += 1;
+            bypass.declined_store_elapsed_ms = bypass
+                .declined_store_elapsed_ms
+                .saturating_add(event.elapsed_ms);
+        }
     }
-    (compiles, edit_rebuilds, elapsed_ms)
+    bypass
 }
 
 /// A compile kache ran and did not store: a passthrough it ran directly, or
@@ -2235,6 +2250,117 @@ fn event_timeline(e: &BuildEvent) -> (String, String, i64, i64) {
         start.as_millisecond(),
         e.ts.as_millisecond(),
     )
+}
+
+/// Local hits on keys a prefetch download imported before the hit, each key
+/// once per prefetch session. The wrapper finds these entries locally and
+/// records a `local_hit`.
+fn prefetch_served_local_hits<'a>(
+    build_events: &[BuildEvent],
+    transfers: &'a [TransferEvent],
+) -> usize {
+    use kache_core::timeline::PrefetchOperation;
+    use std::collections::{HashMap, HashSet};
+
+    let mut imported_at = HashMap::new();
+    let mut record = |key: &'a str, session: &'a str, at: u64| {
+        if !key.is_empty() && at > 0 {
+            let earliest = imported_at.entry((key, session)).or_insert(at);
+            *earliest = (*earliest).min(at);
+        }
+    };
+    for transfer in transfers {
+        if transfer.direction != TransferDirection::Download {
+            continue;
+        }
+        if let Some(accounting) = &transfer.accounting {
+            if accounting.operation == PrefetchOperation::List {
+                continue;
+            }
+            if !accounting.entries.is_empty() {
+                for entry in &accounting.entries {
+                    if entry.outcome == "completed" {
+                        record(
+                            entry.cache_key.as_str(),
+                            entry.prefetch.session_id.as_str(),
+                            entry.finished_at_ms,
+                        );
+                    }
+                }
+                continue;
+            }
+        }
+        if let Some(origin) = &transfer.prefetch
+            && transfer.ok
+            && matches!(transfer.outcome.as_str(), "completed" | "")
+        {
+            record(
+                transfer.cache_key.as_str(),
+                origin.session_id.as_str(),
+                transfer.finished_at_unix_ms,
+            );
+        }
+    }
+    if imported_at.is_empty() {
+        return 0;
+    }
+    // Compiler events arrive in completion order. A later local hit cannot
+    // make a download timely if this build had already asked for the key.
+    let mut first_demands = HashMap::new();
+    for event in build_events {
+        let session = event.session_id.as_str();
+        let key = event.cache_key.as_str();
+        let fallback = if (event.is_hit()
+            || matches!(
+                events::cache_outcome(event),
+                EventResult::Miss | EventResult::Dup
+            ))
+            && !event.demands.iter().any(|demand| demand.cache_key == key)
+        {
+            Some((
+                key,
+                u64::try_from(event_start(event).as_millisecond()).unwrap_or(0),
+            ))
+        } else {
+            None
+        };
+        for (candidate, at) in event
+            .demands
+            .iter()
+            .map(|d| (d.cache_key.as_str(), d.first_demand_at_ms))
+            .chain(fallback)
+        {
+            if imported_at.contains_key(&(candidate, session))
+                || imported_at.contains_key(&(candidate, ""))
+            {
+                let first = first_demands.entry((candidate, session)).or_insert(at);
+                *first = (*first).min(at);
+            }
+        }
+    }
+    let mut local = HashSet::new();
+    let mut explicit = HashSet::new();
+    for event in build_events {
+        let served = match event.result {
+            EventResult::PrefetchHit => &mut explicit,
+            // Older local hits did not identify which store served them.
+            EventResult::LocalHit if event.schema >= 28 && !event.readonly_store => &mut local,
+            _ => continue,
+        };
+        let key = event.cache_key.as_str();
+        let Some(demand) = first_demands.get(&(key, event.session_id.as_str())) else {
+            continue;
+        };
+        // Prefer a receipt from this build. Unscoped prefetches also warm the
+        // shared writable store, and may be credited once across sessions.
+        if let Some(receipt) = [(key, event.session_id.as_str()), (key, "")]
+            .into_iter()
+            .find(|receipt| imported_at.get(receipt).is_some_and(|at| at <= demand))
+        {
+            served.insert(receipt);
+        }
+    }
+    local.difference(&explicit).count()
 }
 
 fn event_start(e: &BuildEvent) -> jiff::Timestamp {
@@ -4322,7 +4448,7 @@ pub fn format_text(report: &BuildReport) -> String {
             total_hits,
             s.total_crates,
             s.dups + s.misses,
-            report.bypass.uncached_compiles,
+            report.bypass.compiles_outside_lookup(),
             report.bypass.uncached_compiles + s.store_failures,
         ),
     )];
@@ -4750,7 +4876,7 @@ pub fn format_text(report: &BuildReport) -> String {
 
 /// The `Hit rate` detail: hits over cacheable crates, and every crate the
 /// compiler ran for. `uncached_compiles` ran outside a lookup (an edit
-/// rebuild, a declined store), so an edit rebuild does not read as
+/// rebuild or keyless skip), so an edit rebuild does not read as
 /// `0 compiled`. `not_cached` adds the misses whose store failed.
 fn hit_rate_detail(
     hits: usize,
@@ -4780,7 +4906,7 @@ fn hit_rate_detail(
 /// `5 compiled`, with how many of them were not cached: the markdown and
 /// GitHub headlines.
 fn compiled_note(summary: &ReportSummary, bypass: &BypassAnalysis) -> String {
-    let compiled = summary.dups + summary.misses + bypass.uncached_compiles;
+    let compiled = summary.dups + summary.misses + bypass.compiles_outside_lookup();
     let not_cached = bypass.uncached_compiles + summary.store_failures;
     if not_cached > 0 {
         format!("{compiled} compiled, {not_cached} not cached")
@@ -4796,10 +4922,12 @@ fn compiles_timing_row(
     timing: &TimingBreakdown,
     bypass: &BypassAnalysis,
 ) -> Vec<String> {
-    let total_ms = timing
-        .miss_time_ms
-        .saturating_add(bypass.uncached_compile_time_ms);
-    let compiled = summary.dups + summary.misses + bypass.uncached_compiles;
+    let total_ms = timing.miss_time_ms.saturating_add(
+        bypass
+            .uncached_compile_time_ms
+            .saturating_sub(bypass.declined_store_elapsed_ms),
+    );
+    let compiled = summary.dups + summary.misses + bypass.compiles_outside_lookup();
     let average = if compiled == 0 {
         0.0
     } else {

@@ -41,6 +41,9 @@ pub(crate) fn latest_builds<'a>(sessions: &'a [Session], root: Option<&str>) -> 
 /// What would remove a cause, in one line.
 pub(crate) fn fix(cause: &Cause, max_size: u64) -> String {
     match cause {
+        Cause::StoreDeclined(_) => {
+            "`kache explain <crate>` shows why this compile was left out of the cache".to_string()
+        }
         Cause::StoreFailed(_) => {
             "the result could not be written; check free space and run `kache doctor`".to_string()
         }
@@ -668,6 +671,7 @@ mod tests {
     #[test]
     fn every_cause_says_what_would_help() {
         let max = 5 << 30;
+        assert!(fix(&Cause::StoreDeclined("x".into()), max).contains("kache explain <crate>"));
         assert!(fix(&Cause::StoreFailed("x".into()), max).contains("kache doctor"));
         assert!(fix(&Cause::LookupRejected("x".into()), max).contains("--verify"));
         assert!(fix(&Cause::Evicted, max).contains("larger than 5.0 GiB"));

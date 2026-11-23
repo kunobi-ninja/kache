@@ -371,6 +371,12 @@ impl Drop for DaemonCoordGuard {
     }
 }
 
+#[cfg(unix)]
+fn ipc_ancestor_is_safe(owner: u32, mode: u32, uid: u32, is_store: bool) -> bool {
+    let sticky_parent = !is_store && mode & 0o1000 != 0;
+    (owner == uid || owner == 0) && (mode & 0o022 == 0 || sticky_parent)
+}
+
 /// Create a missing socket parent privately before opening daemon locks. The
 /// transport also verifies the owner and binds the socket with mode 0600.
 pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
@@ -392,15 +398,16 @@ pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Resul
                 std::fs::symlink_metadata(&config.cache_dir)?.is_dir(),
                 "daemon IPC needs a real cache directory; set KACHE_RUNTIME_DIR to a private directory"
             );
-            for ancestor in config.cache_dir.ancestors() {
-                let meta = std::fs::metadata(ancestor)?;
-                let sticky_parent = ancestor != config.cache_dir && meta.mode() & 0o1000 != 0;
-                anyhow::ensure!(
-                    (meta.uid() == uid || meta.uid() == 0)
-                        && (meta.mode() & 0o022 == 0 || sticky_parent),
-                    "daemon IPC path {} can be changed by another user; set KACHE_RUNTIME_DIR to a private directory",
-                    ancestor.display()
-                );
+            let canonical = std::fs::canonicalize(&config.cache_dir)?;
+            for root in [config.cache_dir.as_path(), canonical.as_path()] {
+                for ancestor in root.ancestors() {
+                    let meta = std::fs::metadata(ancestor)?;
+                    anyhow::ensure!(
+                        ipc_ancestor_is_safe(meta.uid(), meta.mode(), uid, ancestor == root),
+                        "daemon IPC path {} can be changed by another user; set KACHE_RUNTIME_DIR to a private directory",
+                        ancestor.display()
+                    );
+                }
             }
         }
         std::fs::DirBuilder::new()
@@ -408,11 +415,6 @@ pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Resul
             .mode(0o700)
             .create(dir)?;
         let meta = std::fs::symlink_metadata(dir)?;
-        anyhow::ensure!(
-            meta.is_dir() && meta.uid() == uid,
-            "daemon socket directory {} must be a directory owned by this user",
-            dir.display()
-        );
         let is_store = std::fs::metadata(&config.cache_dir)
             .is_ok_and(|store| store.dev() == meta.dev() && store.ino() == meta.ino());
         if is_store {
@@ -420,17 +422,16 @@ pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Resul
                 meta.mode() & 0o7777 == 0o700,
                 "daemon socket shares a cache directory with non-private permissions; set KACHE_RUNTIME_DIR to a private directory"
             );
-        } else if dir == config.runtime_dir && meta.mode() & 0o022 == 0 {
-            // An explicitly separate runtime belongs exclusively to the daemon.
-            // Preserve the transport's handling of an ordinary mkdir (0755).
-            kunobi_daemon::ensure_private_dir(dir)?;
         } else {
             anyhow::ensure!(
-                meta.mode() & 0o077 == 0,
-                "daemon socket directory {} must be private; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
+                meta.mode() & 0o022 == 0,
+                "daemon socket directory {} is writable by other users; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
                 dir.display()
             );
         }
+        // The library checks the directory owner and rejects symlinks.
+        // It also secures a separate socket parent created with an ordinary mkdir.
+        kunobi_daemon::ensure_private_dir(dir)?;
     }
     #[cfg(not(unix))]
     {

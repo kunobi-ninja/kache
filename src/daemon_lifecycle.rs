@@ -429,14 +429,14 @@ fn written_since(path: &Path, start: u64) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A daemon another process started while this one waited for the
-    /// coordinator lock was already running; this call started nothing.
     fn fixture_config(root: &Path) -> Config {
         let config = super::super::tests::test_config(root);
         prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
         config
     }
 
+    /// A daemon another process started while this one waited for the
+    /// coordinator lock was already running; this call started nothing.
     #[test]
     fn an_unchanged_replacement_reports_the_running_daemon() {
         use replacement::Outcome;

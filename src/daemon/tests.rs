@@ -1730,11 +1730,40 @@ fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
     assert_eq!(mode(&dedicated), 0o700);
     assert_eq!(mode(&store), 0o2750);
 
+    chmod(&dedicated, 0o770);
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&dedicated), 0o770);
+    let custom = temp.path().join("custom");
+    std::fs::create_dir(&custom).unwrap();
+    config.socket_path_override = Some(custom.join("kache.sock"));
+    chmod(&custom, 0o755);
+    prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
+    assert_eq!(mode(&custom), 0o700);
+    chmod(&custom, 0o707);
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&custom), 0o707);
+    config.socket_path_override = None;
+
     let alias = temp.path().join("alias");
     symlink(&store, &alias).unwrap();
     config.runtime_dir = alias;
     assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
     assert_eq!(mode(&store), 0o2750);
+}
+
+#[cfg(unix)]
+#[test]
+fn ipc_path_owners_and_sticky_permissions() {
+    let me = 1001;
+    for owner in [0, me] {
+        assert!(ipc_ancestor_is_safe(owner, 0o755, me, true));
+        assert!(ipc_ancestor_is_safe(owner, 0o1777, me, false));
+        assert!(!ipc_ancestor_is_safe(owner, 0o1777, me, true));
+        assert!(!ipc_ancestor_is_safe(owner, 0o775, me, false));
+        assert!(!ipc_ancestor_is_safe(owner, 0o707, me, true));
+    }
+    assert!(!ipc_ancestor_is_safe(1002, 0o700, me, true));
+    assert!(!ipc_ancestor_is_safe(1002, 0o1777, me, false));
 }
 
 #[cfg(unix)]
@@ -1752,6 +1781,14 @@ fn shared_writers_cannot_replace_the_ipc_directory() {
         assert!(error.to_string().contains("KACHE_RUNTIME_DIR"));
         std::fs::set_permissions(writable, std::fs::Permissions::from_mode(0o750)).unwrap();
     }
+    let bridge = temp.path().join("bridge");
+    let hidden = container.join("nested");
+    std::fs::create_dir_all(hidden.join("another")).unwrap();
+    symlink(&hidden, &bridge).unwrap();
+    std::fs::set_permissions(&container, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let bridged = test_config(&bridge.join("another"));
+    assert!(prepare_daemon_socket_dir(&bridged, &bridged.socket_path()).is_err());
+    std::fs::set_permissions(&container, std::fs::Permissions::from_mode(0o750)).unwrap();
     let alias = temp.path().join("aliased-store");
     symlink(&root, &alias).unwrap();
     let config = test_config(&alias);

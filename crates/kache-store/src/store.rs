@@ -5842,12 +5842,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     stats.bytes_freed += reclaim.freed_bytes;
                     stats.disk_bytes_reclaimed += reclaim.disk_bytes_reclaimed;
                     stats.blobs_removed += reclaim.blobs_unlinked;
-                    // The held part of a partly held entry was already left
-                    // out of `current_size`; only its private part counts.
                     let held_part = held.partly.get(key).copied().unwrap_or(0);
                     held_released += held_part;
+                    // Only a budget that excluded these bytes on entry must
+                    // exclude them from the removal credit as well.
+                    let excluded = self.config.held_bytes_budget.left_out(held_part);
                     current_size =
-                        current_size.saturating_sub(reclaim.freed_bytes.saturating_sub(held_part));
+                        current_size.saturating_sub(reclaim.freed_bytes.saturating_sub(excluded));
                     // Telemetry, deliberately outside remove_entry_guarded so
                     // the removal mechanism stays free of it (#595). Recorded
                     // after the fact rather than in the delete transaction: a
@@ -6008,10 +6009,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Per entry, the bytes of blobs it holds the last reference to that a
     /// live file outside the store (a clone or hardlink in a target
-    /// directory) holds as well. Evicting the entry would unlink those
-    /// names and free nothing (kunobi-ninja/kache#725), so a size-driven
-    /// sweep counts them apart instead of evicting everything else trying to
-    /// get under a budget they keep it over (kunobi-ninja/kache#1206).
+    /// directory) holds as well. Unlinking those names frees no disk blocks.
+    /// An entry that also owns private blobs can still reclaim their bytes.
     ///
     /// Empty under `gc_evict_shared`, which evicts such entries anyway.
     fn held_by_live_files(
@@ -6052,21 +6051,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .map(|(_, hash, _, _, _)| self.blob_path(hash))
             .collect();
         let retained = probe_external_retainers(&paths);
-        let mut held_bytes: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
-        let mut frees_some = std::collections::HashSet::new();
-        for ((key, _, size, _, _), retained) in last_refs.into_iter().zip(retained) {
-            if retained {
-                *held_bytes.entry(key).or_insert(0) += size.max(0) as u64;
-            } else {
-                frees_some.insert(key);
+        // Only entries with external retainers need a map entry. A large
+        // store may have many private blobs and no retained ones.
+        for ((key, _, size, _, _), retained) in last_refs.iter().zip(&retained) {
+            if *retained {
+                *held.refused.entry(key.clone()).or_default() += (*size).max(0) as u64;
             }
         }
-        for (key, bytes) in held_bytes {
-            if frees_some.contains(&key) {
+        for ((key, _, size, _, _), retained) in last_refs.into_iter().zip(retained) {
+            if !retained
+                && size > 0
+                && let Some(bytes) = held.refused.remove(&key)
+            {
                 held.partly.insert(key, bytes);
-            } else {
-                held.refused.insert(key, bytes);
             }
         }
         Ok(held)
@@ -7067,27 +7064,30 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
         // Which last references this entry holds needs the lock: the removal
         // is refused only when every one of them is retained outside.
-        let mut last_ref_retained = false;
-        let mut last_ref_free = false;
-        for (hash, refs, retained) in probed_blobs {
-            let rc: i64 = tx
-                .query_row(
-                    "SELECT refcount FROM blobs WHERE hash = ?1",
-                    params![hash],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            if holds_last_reference(rc, refs) {
-                if retained {
-                    last_ref_retained = true;
-                } else {
-                    last_ref_free = true;
+        if !probed_blobs.is_empty() {
+            let mut refs_and_size =
+                tx.prepare_cached("SELECT refcount, size FROM blobs WHERE hash = ?1")?;
+            let mut only_retained = false;
+            for (hash, refs, retained) in probed_blobs {
+                let Some((rc, size)) = refs_and_size
+                    .query_row([hash], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .optional()?
+                else {
+                    continue;
+                };
+                if holds_last_reference(rc, refs) {
+                    if !retained && size > 0 {
+                        only_retained = false;
+                        break;
+                    }
+                    only_retained |= retained;
                 }
             }
-        }
-        if last_ref_retained && !last_ref_free {
-            return Ok(RemovalAttempt::Unreclaimable);
+            if only_retained {
+                return Ok(RemovalAttempt::Unreclaimable);
+            }
         }
 
         // Delete the entry row first. If rows_affected is 0, another remover

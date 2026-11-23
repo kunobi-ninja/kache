@@ -1656,21 +1656,25 @@ impl Run {
     /// and miss in turn.
     fn record_prediction(&self, prediction: &Prediction) -> Result<()> {
         let json = serde_json::to_string(prediction)?;
-        let cache = self.store.file_hash_cache();
         let checkout = self.checkout_identity();
         if prediction.names_its_checkout() {
-            cache.put_input_prediction(&checkout, PREDICTION_SCHEMA, Some(CRATE_NAME), &json)?;
+            self.store.record_input_prediction(
+                None,
+                &checkout,
+                PREDICTION_SCHEMA,
+                Some(CRATE_NAME),
+                &json,
+            )
         } else {
             // An older one of this package's own would win the next lookup.
-            cache.delete_input_prediction(&checkout)?;
-            cache.put_input_prediction(
+            self.store.record_input_prediction(
+                Some(&checkout),
                 &self.identity(),
                 PREDICTION_SCHEMA,
                 Some(CRATE_NAME),
                 &json,
-            )?;
+            )
         }
-        Ok(())
     }
 
     /// The key a recorded run is stored under: everything Cargo would compare

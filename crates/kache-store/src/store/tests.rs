@@ -2698,6 +2698,60 @@ fn deferred_durability_leaves_imported_entries_pending_until_the_flush() {
     assert_eq!(strict.pending_durability().unwrap(), 0);
 }
 
+/// A packed prefetch imports a whole round of entries in one write
+/// transaction, and every wrapper waiting for that lock gives up after its
+/// 5 s busy timeout. The per-entry blob cleanup inside that transaction must
+/// be an indexed lookup: a scan of `blobs` per entry holds the lock for
+/// (entries x blobs) row visits.
+#[test]
+fn entry_blob_cleanup_does_not_scan_the_blob_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let mut plan = store
+        .db
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {DELETE_ENTRY_UNREFERENCED_BLOBS}"
+        ))
+        .unwrap();
+    let steps: Vec<String> = plan
+        .query_map(params!["key"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        !steps.is_empty() && !steps.iter().any(|step| step.starts_with("SCAN")),
+        "the entry blob cleanup scans a table: {steps:?}"
+    );
+}
+
+/// A build-script prediction is written after its run is stored. A writer
+/// that keeps the index busy for longer than one busy timeout must delay
+/// it, as it delays a compile store, rather than fail it.
+#[test]
+fn an_input_prediction_waits_out_a_writer_like_a_compile_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    store.db.busy_timeout(Duration::from_millis(200)).unwrap();
+    store
+        .record_input_prediction(None, "old", 1, Some("build_script_run"), "{}")
+        .unwrap();
+
+    let side = Connection::open(dir.path().join("index.db")).unwrap();
+    side.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        side.execute_batch("COMMIT").unwrap();
+    });
+    let recorded =
+        store.record_input_prediction(Some("old"), "new", 1, Some("build_script_run"), "{}");
+    holder.join().unwrap();
+    recorded.unwrap();
+
+    let cache = store.file_hash_cache();
+    assert!(cache.get_input_prediction("old").unwrap().is_none());
+    assert!(cache.get_input_prediction("new").unwrap().is_some());
+}
+
 struct DurabilitySyncObserver {
     previous: Option<Vec<kache_fs::InodeId>>,
 }

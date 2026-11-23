@@ -1224,10 +1224,17 @@ pub fn generate_report_with_filter(
         events::read_transfers_since(&config.transfer_log_path(), since_ts).unwrap_or_default()
     };
 
-    let stats = events::compute_stats(&build_events);
+    let mut stats = events::compute_stats(&build_events);
+    let prefetch_served = prefetch_served_local_hits(&build_events, &transfers);
+    stats.local_hits -= prefetch_served;
+    stats.prefetch_hits += prefetch_served;
     let total_compiled = stats.dups + stats.misses;
-    let total_cacheable =
-        stats.local_hits + stats.prefetch_hits + stats.remote_hits + total_compiled;
+    let (declined_stores, declined_compile_time_ms) = declined_store_totals(&build_events);
+    let total_cacheable = stats.local_hits
+        + stats.prefetch_hits
+        + stats.remote_hits
+        + total_compiled
+        + declined_stores;
     let total_hits = stats.local_hits + stats.prefetch_hits + stats.remote_hits;
     let bypass = build_bypass_analysis(&build_events, top);
     let timeline = build_report_timeline(&build_events);
@@ -1239,7 +1246,8 @@ pub fn generate_report_with_filter(
         0.0
     };
 
-    let total_compile = stats.hit_compile_time_ms + stats.miss_compile_time_ms;
+    let total_compile =
+        stats.hit_compile_time_ms + stats.miss_compile_time_ms + declined_compile_time_ms;
     let weighted = if total_compile > 0 {
         Some((stats.hit_compile_time_ms as f64 / total_compile as f64) * 100.0)
     } else {
@@ -1456,15 +1464,7 @@ pub fn generate_report_with_filter(
             store_failures: stats.store_failures,
             fallbacks: bypass.fallbacks,
             total_duration_ms: stats.total_elapsed_ms,
-            cache_efficiency_pct: {
-                let denom = stats.hit_compile_time_ms + stats.miss_compile_time_ms;
-                if denom > 0 {
-                    let raw = (stats.hit_compile_time_ms as f64 / denom as f64) * 100.0;
-                    (raw * 10.0).round() / 10.0
-                } else {
-                    0.0
-                }
-            },
+            cache_efficiency_pct: weighted.map_or(0.0, |w| (w * 10.0).round() / 10.0),
         },
         timeline,
         timing: TimingBreakdown {
@@ -2096,6 +2096,23 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
     }
 }
 
+/// Compiles that looked their key up, missed and ran, whose store kache then
+/// declined, and their compile time. Each is a cache miss like any other, so
+/// the hit rates count it. A skip without a key never looked anything up.
+fn declined_store_totals(events: &[BuildEvent]) -> (usize, u64) {
+    events
+        .iter()
+        .filter(|event| event.result == EventResult::Skipped && !event.cache_key.is_empty())
+        .fold((0, 0u64), |(count, ms), event| {
+            let compile_ms = if event.compile_time_ms > 0 {
+                event.compile_time_ms
+            } else {
+                event.elapsed_ms
+            };
+            (count + 1, ms.saturating_add(compile_ms))
+        })
+}
+
 /// Uncached compiles, the edit rebuilds among them, and their wrapper time.
 fn uncached_compile_totals(events: &[BuildEvent]) -> (usize, usize, u64) {
     let mut compiles = 0;
@@ -2235,6 +2252,66 @@ fn event_timeline(e: &BuildEvent) -> (String, String, i64, i64) {
         start.as_millisecond(),
         e.ts.as_millisecond(),
     )
+}
+
+/// Local hits on keys a prefetch download imported before the hit, each key
+/// once. The wrapper finds such an entry in its own store and never asks the
+/// daemon, so the event itself says `local_hit`.
+fn prefetch_served_local_hits(build_events: &[BuildEvent], transfers: &[TransferEvent]) -> usize {
+    let mut imported_at: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for transfer in transfers {
+        if transfer.direction != TransferDirection::Download {
+            continue;
+        }
+        let packed = transfer
+            .accounting
+            .as_ref()
+            .map(|accounting| accounting.entries.as_slice())
+            .unwrap_or_default();
+        let payloads: Vec<(&str, &str, u64)> = if packed.is_empty() {
+            if transfer.prefetch.is_none() {
+                continue;
+            }
+            vec![(
+                transfer.cache_key.as_str(),
+                transfer.outcome.as_str(),
+                transfer.finished_at_unix_ms,
+            )]
+        } else {
+            packed
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.cache_key.as_str(),
+                        entry.outcome.as_str(),
+                        entry.finished_at_ms,
+                    )
+                })
+                .collect()
+        };
+        for (cache_key, outcome, finished_at_ms) in payloads {
+            if outcome != "completed" || cache_key.is_empty() || finished_at_ms == 0 {
+                continue;
+            }
+            imported_at
+                .entry(cache_key)
+                .and_modify(|at| *at = (*at).min(finished_at_ms))
+                .or_insert(finished_at_ms);
+        }
+    }
+    let mut served = std::collections::HashSet::new();
+    for event in build_events {
+        if !matches!(event.result, EventResult::LocalHit) {
+            continue;
+        }
+        let Some(&imported) = imported_at.get(event.cache_key.as_str()) else {
+            continue;
+        };
+        if event.ts.as_millisecond() >= imported as i64 {
+            served.insert(event.cache_key.as_str());
+        }
+    }
+    served.len()
 }
 
 fn event_start(e: &BuildEvent) -> jiff::Timestamp {

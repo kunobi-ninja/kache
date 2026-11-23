@@ -12364,6 +12364,48 @@ fn exported_source_date_epoch_keys_a_compile_first_object() {
         "t.c",
     );
     assert_ne!(first, second);
+    let mut passthrough = env_with("1700000000");
+    passthrough.set("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough");
+    assert_eq!(
+        first,
+        captured_key(&program, &passthrough, cache.path(), &args, "t.c")
+    );
+}
+
+/// The wrapper sends a hidden-input refusal directly to the compiler, even
+/// when a fallback cache is configured. No time-dependent entry is created.
+#[test]
+fn an_unpinned_wall_clock_compile_has_no_cache_key() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let env = InvocationEnv::from_parts(
+        [("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough")],
+        Some(dir.to_owned()),
+        None,
+        dir.to_owned(),
+    );
+    let compiler = CcCompiler::for_invocation(Vec::new(), &env);
+    let parsed = compiler
+        .parse(&s(&["cc", "-c", "t.c", "-o", "t.o"]))
+        .unwrap();
+    let file_hasher = crate::cache_key::FileHasher::new_for(&env);
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let ctx = KeyCtx {
+        invocation_env: &env,
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: dir,
+        key_salt: None,
+        key_env_vars: &[],
+        extra_inputs_digest: None,
+        build_script_inputs_digest: None,
+    };
+    let error = compiler.cache_key(&parsed, &ctx).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CcHiddenInput>(),
+        Some(CcHiddenInput::WallClock)
+    ));
+    assert!(error.to_string().contains("SOURCE_DATE_EPOCH"));
 }
 
 /// Without a resolved `cc1` line the read-set digest is all that stands
@@ -12372,8 +12414,10 @@ fn exported_source_date_epoch_keys_a_compile_first_object() {
 #[cfg(unix)]
 #[test]
 fn defines_key_a_compile_first_object_when_the_probe_does_not_resolve() {
-    let root = tempfile::tempdir().unwrap();
-    let root = root.path();
+    let temp = tempfile::tempdir().unwrap();
+    let checkout = temp.path().join("work/checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let root = checkout.as_path();
     fs::write(root.join("t.c"), "int value = VALUE;\n").unwrap();
     let program = gcc_like_driver(root, false);
     let env = InvocationEnv::from_parts(
@@ -12398,6 +12442,26 @@ fn defines_key_a_compile_first_object_when_the_probe_does_not_resolve() {
         "t.c",
     );
     assert_ne!(one, two);
+
+    // Prefix maps rewrite paths in compiler metadata, but a macro can embed
+    // either spelling as literal data in the object.
+    let parsed = CcArgs::parse_for(&s(&["gcc", "-c", "t.c", "-o", "t.o"]), &env).unwrap();
+    let maps = cc_prefix_maps(&parsed, &[]);
+    let map = maps
+        .iter()
+        .find(|map| map.from == root.to_string_lossy())
+        .unwrap();
+    let literal_key = |value: &str| {
+        let define = format!("-DVALUE=\"{value}/lib\"");
+        captured_key(
+            &program,
+            &env,
+            cache.path(),
+            &[&define, "-c", "t.c", "-o", "t.o"],
+            "t.c",
+        )
+    };
+    assert_ne!(literal_key(&map.from), literal_key(&map.to));
 }
 
 /// clang's `-Qunused-arguments` never reaches `cc1`, but it decides whether

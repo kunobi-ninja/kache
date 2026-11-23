@@ -2874,9 +2874,7 @@ fn run_cc_with_store(
     Ok(result.exit_code)
 }
 
-/// Whether a failed cc key must bypass the fallback wrapper: the key could not
-/// see a file the assembler reads, and a wrapper keyed on the same
-/// preprocessor output cannot see it either (kunobi-ninja/kache#1015).
+/// Whether an untracked compile input requires running the compiler directly.
 fn cc_key_error_skips_fallback(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::compiler::cc::CcHiddenInput>()

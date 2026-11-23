@@ -9239,15 +9239,15 @@ fn nvcc_depinfo_rewrite_root_anchors() {
     assert_eq!(nvcc_depinfo_rewrite_root_from_cwd(&parsed, cwd), None);
 }
 
-/// #1015: a fallback wrapper such as sccache keys on the same preprocessor
-/// output, so it would serve the stale object kache just refused to cache.
-/// Only that refusal skips it; other key failures keep the fallback.
 #[test]
 fn only_hidden_input_key_failures_skip_the_fallback() {
-    let hidden = anyhow::Error::new(crate::compiler::cc::CcHiddenInput {
-        construct: ".incbin",
-    });
-    assert!(cc_key_error_skips_fallback(&hidden));
+    use crate::compiler::cc::CcHiddenInput;
+    for input in [
+        CcHiddenInput::AssemblerFile(".incbin"),
+        CcHiddenInput::WallClock,
+    ] {
+        assert!(cc_key_error_skips_fallback(&anyhow::Error::new(input)));
+    }
     assert!(!cc_key_error_skips_fallback(&anyhow::anyhow!(
         "cc -E key probe exited 1"
     )));

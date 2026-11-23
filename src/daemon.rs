@@ -2408,6 +2408,53 @@ impl GcRunReport {
     }
 }
 
+/// How long a periodic sweep that found a store's `gc.lock` held waits
+/// before it asks again: ten minutes. The holder is mostly an automatic size sweep, which
+/// ranks and removes for minutes and runs none of the periodic sweep's age
+/// pass or housekeeping (tombstones, memos, session markers, key locks).
+const PERIODIC_GC_RETRY: Duration = Duration::from_secs(600);
+
+/// How many times a periodic sweep asks again for the stores it found held,
+/// [`PERIODIC_GC_RETRY`] apart: an hour, well inside the six-hour interval.
+const PERIODIC_GC_RETRIES: u32 = 6;
+
+/// One periodic sweep: `sweep(None)` sweeps every store and returns those
+/// another GC held; while any are left, `pause(retry)`, then
+/// `sweep(Some(left))` sweeps just those, at most `retries` more times.
+/// Returns how many sweeps it started.
+async fn run_periodic_gc<T, S, SF, P, PF>(
+    mut sweep: S,
+    mut pause: P,
+    retry: Duration,
+    retries: u32,
+) -> u32
+where
+    S: FnMut(Option<Vec<T>>) -> SF,
+    SF: std::future::Future<Output = Vec<T>>,
+    P: FnMut(Duration) -> PF,
+    PF: std::future::Future<Output = ()>,
+{
+    let mut started = 1;
+    let mut held = sweep(None).await;
+    while !held.is_empty() {
+        if started > retries {
+            tracing::info!(
+                stores = held.len(),
+                "periodic GC: gc.lock still held after {retries} more tries; the next sweep is on the timer"
+            );
+            break;
+        }
+        tracing::info!(
+            stores = held.len(),
+            "periodic GC: gc.lock held; trying again in {retry:?} ({started}/{retries})"
+        );
+        pause(retry).await;
+        held = sweep(Some(held)).await;
+        started += 1;
+    }
+    started
+}
+
 fn identity_publish_context(
     identity_key: Option<&str>,
     session_id: &str,
@@ -6644,11 +6691,78 @@ impl Daemon {
     /// Each store's `gc.lock` is its own: a shard another GC holds is skipped,
     /// and a busy main store does not stop the shards from being swept.
     fn run_gc(&self, policy: GcPolicy, driver: GcDriver) -> Result<GcRunReport> {
+        Ok(self.run_gc_stores(policy, driver)?.0)
+    }
+
+    /// [`Self::run_gc`], with each shard it swept and that shard's report.
+    fn run_gc_stores(
+        &self,
+        policy: GcPolicy,
+        driver: GcDriver,
+    ) -> Result<(GcRunReport, Vec<(Config, GcRunReport)>)> {
         let report = self.run_gc_store(&self.config, policy, driver)?;
-        crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
+        let shards = crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
             self.run_gc_store(shard, policy, driver)
         });
-        Ok(report)
+        Ok((report, shards))
+    }
+
+    /// One periodic sweep: of every store (the main store, then each shard)
+    /// when `stores` is `None`, else of just those. Returns the stores whose
+    /// `gc.lock` another GC held, for [`run_periodic_gc`] to ask again. A
+    /// store whose sweep failed is logged and not asked again.
+    fn periodic_gc(&self, stores: Option<Vec<Config>>) -> Vec<Config> {
+        let policy = GcPolicy::Automatic {
+            max_age_hours: self.config.gc_max_age_hours,
+        };
+        let swept: Vec<(Config, GcRunReport)> = match stores {
+            None => match self.run_gc_stores(policy, GcDriver::Periodic) {
+                Ok((main, shards)) => std::iter::once((self.config.clone(), main))
+                    .chain(shards)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("periodic GC failed: {e}");
+                    Vec::new()
+                }
+            },
+            Some(stores) => stores
+                .into_iter()
+                .filter(|store| self.can_ask_again(store))
+                .filter_map(
+                    |store| match self.run_gc_store(&store, policy, GcDriver::Periodic) {
+                        Ok(report) => Some((store, report)),
+                        Err(e) => {
+                            tracing::warn!(
+                                store = %store.cache_dir.display(),
+                                "periodic GC failed: {e}"
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect(),
+        };
+        swept
+            .into_iter()
+            .filter(|(_, report)| report.total.skipped)
+            .map(|(store, _)| store)
+            .collect()
+    }
+
+    /// Whether a retry may sweep `store`. A shard is swept again only while
+    /// its index is there: its volume may have been unmounted since the first
+    /// sweep, and opening the store would create it on the bare mount point
+    /// (the guard the first sweep takes in `volume_gc::shard_gc_configs`).
+    fn can_ask_again(&self, store: &Config) -> bool {
+        let gone = store.cache_dir != self.config.cache_dir
+            && !crate::volume_gc::shard_has_index(&store.cache_dir);
+        if gone {
+            tracing::info!(
+                store = %store.cache_dir.display(),
+                "periodic GC: the shard has no index any more; not asking again"
+            );
+        }
+        !gone
     }
 
     /// Core GC logic for the store of `config` with an explicit policy and
@@ -7437,23 +7551,26 @@ async fn server_main(
         loop {
             interval.tick().await;
             tracing::info!("periodic GC sweep starting");
-            // Offload the blocking sweep so it never stalls an async worker —
-            // the accept loop and in-flight RemoteCheck stay responsive (#281).
-            let gc = gc_daemon.clone();
-            match tokio::task::spawn_blocking(move || {
-                gc.run_gc(
-                    GcPolicy::Automatic {
-                        max_age_hours: gc.config.gc_max_age_hours,
-                    },
-                    GcDriver::Periodic,
-                )
-            })
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("periodic GC failed: {e}"),
-                Err(e) => tracing::warn!("periodic GC task panicked: {e}"),
-            }
+            let sweep = |stores| {
+                // Offload the blocking sweep so it never stalls an async worker —
+                // the accept loop and in-flight RemoteCheck stay responsive (#281).
+                let gc = gc_daemon.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || gc.periodic_gc(stores))
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("periodic GC task panicked: {e}");
+                            Vec::new()
+                        })
+                }
+            };
+            run_periodic_gc(
+                sweep,
+                tokio::time::sleep,
+                PERIODIC_GC_RETRY,
+                PERIODIC_GC_RETRIES,
+            )
+            .await;
         }
     });
 

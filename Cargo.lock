@@ -2376,6 +2376,7 @@ dependencies = [
  "reqsign-core",
  "reqwest 0.13.5",
  "rusqlite",
+ "rustix",
  "rustls",
  "semver",
  "serde",

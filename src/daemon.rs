@@ -2408,6 +2408,51 @@ impl GcRunReport {
     }
 }
 
+/// How long a periodic sweep that found a store's `gc.lock` held waits
+/// before it asks again. Size-pressure sweeps take the same lock.
+const PERIODIC_GC_RETRY: Duration = Duration::from_secs(600);
+
+/// How many times a periodic sweep asks again for the stores it found held,
+/// [`PERIODIC_GC_RETRY`] apart: an hour, well inside the six-hour interval.
+const PERIODIC_GC_RETRIES: u32 = 6;
+
+/// One periodic sweep: `sweep(None)` sweeps every store and returns those
+/// another GC held; while any are left, `pause(retry)`, then
+/// `sweep(Some(left))` sweeps just those, at most `retries` more times.
+/// Returns how many sweeps it started.
+async fn run_periodic_gc<S, SF, P, PF>(
+    mut sweep: S,
+    mut pause: P,
+    retry: Duration,
+    retries: u32,
+) -> u32
+where
+    S: FnMut(Option<Vec<PathBuf>>) -> SF,
+    SF: std::future::Future<Output = Vec<PathBuf>>,
+    P: FnMut(Duration) -> PF,
+    PF: std::future::Future<Output = ()>,
+{
+    let mut started = 1;
+    let mut held = sweep(None).await;
+    while !held.is_empty() {
+        if started > retries {
+            tracing::info!(
+                stores = held.len(),
+                "periodic GC: gc.lock still held after {retries} more tries; the next sweep is on the timer"
+            );
+            break;
+        }
+        tracing::info!(
+            stores = held.len(),
+            "periodic GC: gc.lock held; trying again in {retry:?} ({started}/{retries})"
+        );
+        pause(retry).await;
+        held = sweep(Some(held)).await;
+        started += 1;
+    }
+    started
+}
+
 fn identity_publish_context(
     identity_key: Option<&str>,
     session_id: &str,
@@ -6651,6 +6696,43 @@ impl Daemon {
         Ok(report)
     }
 
+    /// Sweep each store independently. Only lock contention schedules a retry.
+    fn periodic_gc(&self, pending: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
+        let stores = pending.unwrap_or_else(|| {
+            let mut seen = HashSet::new();
+            std::iter::once(&self.config.cache_dir)
+                .chain(self.config.volume_stores.iter().map(|shard| &shard.store))
+                .filter(|path| seen.insert(*path))
+                .cloned()
+                .collect()
+        });
+        let policy = GcPolicy::Automatic {
+            max_age_hours: self.config.gc_max_age_hours,
+        };
+        let mut held = Vec::new();
+        for path in stores {
+            // A volume can disappear or change between attempts. Check before
+            // opening its store and compute its budget on the mounted filesystem.
+            let config = if path == self.config.cache_dir {
+                self.config.clone()
+            } else if crate::volume_gc::shard_has_index(&path) {
+                self.config
+                    .for_store_dir(&path, crate::volume_gc::filesystem_bytes)
+            } else {
+                tracing::info!(store = %path.display(), "periodic GC: skipping volume shard with no index");
+                continue;
+            };
+            match self.run_gc_store(&config, policy, GcDriver::Periodic) {
+                Ok(report) if report.total.skipped => held.push(path),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(store = %path.display(), "periodic GC failed: {error:#}")
+                }
+            }
+        }
+        held
+    }
+
     /// Core GC logic for the store of `config` with an explicit policy and
     /// per-policy result accounting. Holds that store's `gc.lock`.
     fn run_gc_store(
@@ -6706,13 +6788,6 @@ impl Daemon {
                     Ok((memos, inputs)) => tracing::debug!(memos, inputs, "gc: pruned C/C++ memos"),
                     Err(error) => tracing::warn!("gc: C/C++ memo pruning failed: {error}"),
                 }
-                let markers = crate::wrapper::prune_session_markers(
-                    &self.config,
-                    crate::wrapper::SESSION_MARKER_RETENTION,
-                    std::time::SystemTime::now(),
-                );
-                tracing::debug!(markers, "gc: pruned build-session markers");
-
                 // Bound the post-eviction demand log, and report what it says
                 // so far: a high demand rate means eviction is discarding
                 // entries the build still wants (#594).
@@ -6800,7 +6875,6 @@ impl Daemon {
                 } else {
                     0
                 };
-                crate::build_script::sweep_hermetic_out_dirs_for_gc(&self.config.cache_dir);
 
                 // Reclaim orphaned blob files (crash mid-put, or a meta-less
                 // remove_entry that couldn't decrement refcounts). The grace
@@ -6812,19 +6886,6 @@ impl Daemon {
                 // Same grace for put-phase staging snapshots abandoned by a
                 // crash between staging and publish (review finding #3).
                 let staging_stats = store.sweep_stale_staging(crate::store::STAGING_SWEEP_GRACE);
-                // Handoff request directories the staging sweep does not
-                // enter: a daemon that died with publications queued.
-                let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(
-                    &self.config,
-                    crate::store::STAGING_SWEEP_GRACE,
-                );
-                if handoffs.removed > 0 {
-                    tracing::info!(
-                        "swept {} abandoned cc handoffs ({})",
-                        handoffs.removed,
-                        crate::report::format_bytes(handoffs.bytes_reclaimed)
-                    );
-                }
                 let trash_removed = store.sweep_evicted_trash();
                 if trash_removed > 0 {
                     tracing::info!("removed {trash_removed} items left in the eviction trash");
@@ -6854,10 +6915,6 @@ impl Daemon {
                 ))
             })()?;
 
-        // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
-        // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
-        Self::clean_tool_version_caches(&self.config.cache_dir);
-
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
         let mut housekeeping = gc_store.sweep_housekeeping();
@@ -6867,8 +6924,9 @@ impl Daemon {
             housekeeping.flights_removed = flights.removed;
             housekeeping.flights_remaining = flights.remaining;
         }
-        let prestage_pruned =
-            crate::prestage::prune(&self.config.cache_dir, std::time::SystemTime::now());
+        if config.cache_dir == self.config.cache_dir {
+            self.sweep_daemon_housekeeping();
+        }
         tracing::info!(
             key_locks_removed = housekeeping.key_locks_removed,
             key_locks_remaining = housekeeping.key_locks_remaining,
@@ -6876,7 +6934,6 @@ impl Daemon {
             flights_remaining = housekeeping.flights_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
-            prestage_pruned,
             "gc: housekeeping"
         );
 
@@ -6960,6 +7017,31 @@ impl Daemon {
             size: evict_stats,
             total: stats,
         })
+    }
+
+    /// These files belong to the daemon's main cache or runtime. Only the
+    /// sweep holding the main gc.lock may remove them.
+    fn sweep_daemon_housekeeping(&self) {
+        let now = std::time::SystemTime::now();
+        let markers = crate::wrapper::prune_session_markers(
+            &self.config,
+            crate::wrapper::SESSION_MARKER_RETENTION,
+            now,
+        );
+        crate::build_script::sweep_hermetic_out_dirs_for_gc(&self.config.cache_dir);
+        let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(
+            &self.config,
+            crate::store::STAGING_SWEEP_GRACE,
+        );
+        Self::clean_tool_version_caches(&self.config.cache_dir);
+        let prestage_pruned = crate::prestage::prune(&self.config.cache_dir, now);
+        tracing::info!(
+            markers,
+            prestage_pruned,
+            handoffs_removed = handoffs.removed,
+            handoff_bytes_reclaimed = handoffs.bytes_reclaimed,
+            "gc: pruned daemon files"
+        );
     }
 
     /// Remove tool-version cache files older than 7 days.
@@ -7437,23 +7519,26 @@ async fn server_main(
         loop {
             interval.tick().await;
             tracing::info!("periodic GC sweep starting");
-            // Offload the blocking sweep so it never stalls an async worker —
-            // the accept loop and in-flight RemoteCheck stay responsive (#281).
-            let gc = gc_daemon.clone();
-            match tokio::task::spawn_blocking(move || {
-                gc.run_gc(
-                    GcPolicy::Automatic {
-                        max_age_hours: gc.config.gc_max_age_hours,
-                    },
-                    GcDriver::Periodic,
-                )
-            })
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("periodic GC failed: {e}"),
-                Err(e) => tracing::warn!("periodic GC task panicked: {e}"),
-            }
+            let sweep = |stores| {
+                // Offload the blocking sweep so it never stalls an async worker —
+                // the accept loop and in-flight RemoteCheck stay responsive (#281).
+                let gc = gc_daemon.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || gc.periodic_gc(stores))
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("periodic GC task panicked: {e}");
+                            Vec::new()
+                        })
+                }
+            };
+            run_periodic_gc(
+                sweep,
+                tokio::time::sleep,
+                PERIODIC_GC_RETRY,
+                PERIODIC_GC_RETRIES,
+            )
+            .await;
         }
     });
 

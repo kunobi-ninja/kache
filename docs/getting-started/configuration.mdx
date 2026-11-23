@@ -312,6 +312,8 @@ Each shard has its own budget. An explicit `local_max_size` or `KACHE_MAX_SIZE` 
 
 A shard keeps its own `gc.lock`, `auto-gc-backoff.json`, `gc_stats.json` and `savings.json` in its store dir, so its trigger, backoff and held bytes do not mix with the main store's. `kache gc` prints one line per shard after the main store's.
 
+When another GC holds a store’s lock, the daemon’s six-hour sweep continues with the other stores. It retries the busy store every ten minutes, up to six times. A volume shard must still have an index when the retry runs.
+
 GC skips a shard whose store dir has no `index.db`: a missing directory, an unmounted volume, or a shard no build has written to yet. It never creates a shard directory. A shard that fails to open or sweep is logged, and GC carries on with the others and the main store.
 
 `kache stats` and `kache stats --full` include every configured store. Entry counts count each cache key once; stored bytes count every copy across stores. JSON includes per-store paths, sizes, budgets and errors. The `stats --json` filesystem `disk` and index measurements still describe the main store; use `stores` for shard measurements.

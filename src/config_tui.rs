@@ -2155,6 +2155,7 @@ mod tests {
                 bypass_crates: None,
                 local_only: None,
                 remote_readonly: None,
+                github_writes: None,
                 volumes: Some(
                     [("D:".to_string(), "D:/kache-store".to_string())]
                         .into_iter()

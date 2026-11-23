@@ -72,16 +72,28 @@ The `save-cache` input above belongs to kache-action. maturin-action has no equi
 
 Treat write credentials for any remote as trusted build credentials. The permissions they grant depend on the backend.
 
-On GitHub Actions and GitLab CI, a **push to a protected branch** can write to the remote cache. Other jobs are read-only by default. `KACHE_REMOTE_READONLY=0` still respects this policy. The exceptions are scheduled GitHub Actions jobs that opt in and pull request jobs with a prefix of their own.
+On GitHub Actions and GitLab CI, a **push to a protected branch** can write to the remote cache. Other jobs are read-only by default. `KACHE_REMOTE_READONLY=0` still respects this policy. The exceptions are scheduled and merge group GitHub Actions jobs that opt in, and pull request jobs with a prefix of their own.
 
-To warm the remote cache from a scheduled GitHub Actions job, set this in that job's environment:
+To warm the shared cache from GitHub Actions, choose the events your workflow uses. Set the list on the job:
 
 ```yaml
 env:
-  KACHE_GITHUB_SCHEDULE_WRITES: "1"
+  KACHE_GITHUB_WRITES: "schedule,merge_group"
 ```
 
-GitHub runs scheduled workflows on the default branch. The branch must be protected and the job must have write access to the remote. `KACHE_REMOTE_READONLY=1` or `remote_readonly = true` still suppresses uploads. GitLab schedules remain read-only.
+Or set it in the runner's TOML config:
+
+```toml
+[cache]
+github_writes = ["schedule", "merge_group"]
+```
+
+- `schedule` allows scheduled runs on a protected branch.
+- `merge_group` allows merge queue jobs on their temporary branch. An ordinary push to a branch named `gh-readonly-queue/...` still follows the push rule.
+
+For a merge queue, Kache ignores `github_writes` in an automatically discovered project `.kache.toml` because the checkout contains the proposed changes. Use the job environment or the runner's host config. A user config also works when it is the selected file. To select a file explicitly, point `KACHE_CONFIG` at a file managed by the workflow outside the checkout.
+
+The job environment replaces the TOML list. An empty list disables both exceptions. An unknown event disables both exceptions and `kache doctor` reports the invalid name on a schedule or merge group job. Existing workflows can keep `KACHE_GITHUB_SCHEDULE_WRITES=1` until they switch to the list. An explicit read-only mode still suppresses uploads, and the job needs credentials that can write to the remote.
 
 For a branch to count as protected, GitHub must set `GITHUB_REF_PROTECTED=true` or GitLab must set `CI_COMMIT_REF_PROTECTED=true`. Check the `Remote writes` row of `kache doctor` for the effective mode.
 
@@ -122,7 +134,7 @@ pull_request_prefix = "artifacts-pr"
 - reads the base prefix first and the pull request prefix for what the base lacks;
 - writes entries, build manifests, shards and prediction rows only under the pull request prefix.
 
-Every other job ignores the setting: protected-branch pushes and scheduled runs never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
+Every other job ignores the setting: protected-branch pushes, scheduled runs and merge groups never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
 
 A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so it never hands uploads to a protected-branch job's daemon or reads through one. It still must not share a local store with trusted jobs: an artifact it compiles there would be a local hit for the next trusted build. Keep pull request jobs off the persistent disk described in [Ephemeral and persistent runners](#ephemeral-and-persistent-runners).
 

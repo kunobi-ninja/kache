@@ -1017,6 +1017,8 @@ pub struct CacheFileConfig {
     pub volumes: Option<HashMap<String, String>>,
     /// Read-only remote consumer mode. See [`Config::remote_readonly`].
     pub remote_readonly: Option<bool>,
+    /// Additional GitHub Actions events allowed to write the shared remote cache.
+    pub github_writes: Option<Vec<String>>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub modified_input_guard: Option<bool>,
     /// Input-set predictions. See [`Config::input_predictions`].
@@ -1450,7 +1452,7 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
 /// setting. Deliberately excludes bootstrap/operational vars that have no file
 /// representation — `KACHE_CONFIG` and `KACHE_HOST_CONFIG` (locate the files
 /// themselves), `KACHE_DISABLED`
-/// (operational kill switch), `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`
+/// (operational kill switch), `KACHE_GITHUB_WRITES` (CI job permission), `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`
 /// (trusted node-local store isolation; fail-open),
 /// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
 /// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
@@ -1634,6 +1636,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_S3_USER_AGENT", "cache.remote.user_agent"),
     ("KACHE_LOCAL_ONLY", "cache.local_only"),
     ("KACHE_REMOTE_READONLY", "cache.remote_readonly"),
+    ("KACHE_GITHUB_WRITES", "cache.github_writes"),
     ("KACHE_MODIFIED_INPUT_GUARD", "cache.modified_input_guard"),
     ("KACHE_INPUT_PREDICTIONS", "cache.input_predictions"),
     ("KACHE_RECORD_SESSIONS", "cache.record_sessions"),
@@ -2456,9 +2459,7 @@ impl Config {
         // The planner is suppressed symmetrically in `load_planner_config`.
         let local_only = Self::local_only_enabled_for(invocation, &file_config);
         let mut remote_readonly = Self::remote_readonly_enabled_for(invocation, &file_config);
-        if let Some(forced) =
-            crate::policy::forced_remote_readonly_with(|name| invocation.var(name).ok())
-        {
+        if let Some(forced) = Self::ci_readonly_for(invocation, &file_config) {
             tracing::debug!(
                 reason = %forced.reason,
                 "remote writes suppressed by CI policy"
@@ -2889,7 +2890,12 @@ impl Config {
                 let parsed = std::str::from_utf8(&bytes)
                     .context("reading kache config file as UTF-8")
                     .and_then(|content| {
-                        parse_layered_file_config_for(invocation, content, host_layer)
+                        parse_layered_file_config_for(
+                            invocation,
+                            &provenance.path,
+                            content,
+                            host_layer,
+                        )
                     });
                 (parsed, provenance)
             }
@@ -2925,9 +2931,12 @@ impl Config {
     /// Legacy file-only load used by config helpers that do not need to carry
     /// provenance beyond this call. Includes the host layer.
     pub fn load_file_config() -> Result<FileConfig> {
-        let invocation = InvocationEnv::capture();
-        let path = resolve_config_path_for(&invocation)?;
-        Self::load_file_config_with_provenance_for(&invocation, path).0
+        Self::load_file_config_for(&InvocationEnv::capture())
+    }
+
+    fn load_file_config_for(invocation: &InvocationEnv) -> Result<FileConfig> {
+        let path = resolve_config_path_for(invocation)?;
+        Self::load_file_config_with_provenance_for(invocation, path).0
     }
 
     /// `[cache.remote] type = "gcs"`: a bucket, and optionally a prefix and an
@@ -3251,6 +3260,24 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.local_only)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn ci_readonly() -> Option<crate::policy::ForcedReadonly> {
+        let invocation = InvocationEnv::capture();
+        let file = Self::load_file_config_for(&invocation);
+        Self::ci_readonly_for(&invocation, &file)
+    }
+
+    fn ci_readonly_for(
+        invocation: &InvocationEnv,
+        file: &Result<FileConfig>,
+    ) -> Option<crate::policy::ForcedReadonly> {
+        let file_events = file
+            .as_ref()
+            .ok()
+            .and_then(|config| config.cache.as_ref())
+            .and_then(|cache| cache.github_writes.as_deref());
+        crate::policy::ci_readonly_with(|name| invocation.var(name).ok(), file_events)
     }
 
     fn remote_readonly_enabled_for(
@@ -4805,17 +4832,34 @@ pub fn unusable_config_file() -> Option<(PathBuf, String)> {
     Some((path, reason))
 }
 
+fn queue_checkout_config(invocation: &InvocationEnv, path: &Path) -> bool {
+    // A queue checkout contains the proposed changes. Its auto-discovered
+    // project file cannot grant that candidate permission to upload.
+    invocation.var("GITHUB_EVENT_NAME").as_deref() == Ok("merge_group")
+        && crate::policy::env_truthy(invocation.var("GITHUB_ACTIONS").ok())
+        && invocation.var("KACHE_CONFIG").is_err()
+        && path
+            .file_name()
+            .is_some_and(|name| name == PROJECT_CONFIG_NAME)
+}
+
 /// Parse the chosen file's content, laid over the host layer when there is
 /// one. With no host layer this is exactly the single-file parse.
 fn parse_layered_file_config_for(
     invocation: &InvocationEnv,
+    path: &Path,
     content: &str,
     host: Option<toml::Table>,
 ) -> Result<FileConfig> {
-    let Some(mut merged) = host else {
+    let queue_project = queue_checkout_config(invocation, path);
+    if host.is_none() && !queue_project {
         return toml::from_str(content).context("parsing kache config file");
-    };
-    let chosen: toml::Table = toml::from_str(content).context("parsing kache config file")?;
+    }
+    let mut merged = host.unwrap_or_default();
+    let mut chosen: toml::Table = toml::from_str(content).context("parsing kache config file")?;
+    if queue_project {
+        remove_config_key(&mut chosen, &["cache", "github_writes"]);
+    }
     yield_host_tables_to_env_for(invocation, &mut merged, Some(&chosen));
     merge_config_tables(&mut merged, chosen);
     toml::Value::Table(merged)
@@ -4877,10 +4921,13 @@ pub fn host_config_status() -> HostConfigStatus {
         }
     };
     let chosen_path = normalize_config_path(resolve_config_path());
-    let chosen: toml::Table = std::fs::read_to_string(&chosen_path)
+    let mut chosen: toml::Table = std::fs::read_to_string(&chosen_path)
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
         .unwrap_or_default();
+    if queue_checkout_config(&InvocationEnv::capture(), &chosen_path) {
+        remove_config_key(&mut chosen, &["cache", "github_writes"]);
+    }
     let ignore_env = Config::ignore_env_enabled(&Config::load_file_config());
     let mut keys = Vec::new();
     collect_host_keys(
@@ -4938,10 +4985,10 @@ fn collect_host_keys(
 /// [`ENV_FILE_KEYS`]. A table replaced whole, such as `cache.remote`, is
 /// overridden by the variable of any key inside it.
 fn env_override_for(path: &[String], ignore_env: bool) -> Option<&'static str> {
-    if ignore_env {
+    let key = path.join(".");
+    if ignore_env && key != "cache.github_writes" {
         return None;
     }
-    let key = path.join(".");
     let inside = format!("{key}.");
     let whole_table = is_host_atomic_table(path);
     ENV_FILE_KEYS

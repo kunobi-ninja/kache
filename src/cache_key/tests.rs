@@ -23045,9 +23045,19 @@ mod build_script_target_paths {
 
 #[test]
 fn old_shared_archive_keys_are_retired_for_static_and_import_libraries() {
+    let _lock = key_test_lock();
+    let invocation = InvocationEnv::capture();
+    let parse = |flags: &[&str]| {
+        let argv = ["rustc", "src/lib.rs"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        RustcArgs::parse_for(&argv, &invocation).unwrap()
+    };
     let linux = Some("x86_64-unknown-linux-gnu");
     let windows = Some("x86_64-pc-windows-msvc");
-    assert!(checkout_archive_admission(&[], linux, false));
+    assert!(checkout_archive_admission(&parse(&[]), linux, false));
     for (kind, target, custom, expected) in [
         ("rlib,staticlib", linux, false, true),
         ("staticlib", linux, false, true),
@@ -23059,13 +23069,46 @@ fn old_shared_archive_keys_are_retired_for_static_and_import_libraries() {
         ("cdylib", None, false, true),
         ("cdylib", linux, false, false),
         ("rlib", windows, false, false),
+        ("bin", windows, false, true),
+        ("bin", Some("x86_64-pc-windows-gnu"), false, true),
+        ("bin", linux, false, false),
+        ("bin", None, false, true),
+        ("bin", linux, true, true),
     ] {
+        let args = parse(&["--crate-type", kind]);
         assert_eq!(
-            checkout_archive_admission(&[kind.to_owned()], target, custom),
+            checkout_archive_admission(&args, target, custom),
             expected,
             "{kind} {target:?} {custom}"
         );
     }
+    for (flags, expected) in [
+        (
+            ["--crate-type=rlib", "--emit=link", "-o", "custom.LIB"],
+            true,
+        ),
+        (
+            ["--crate-type=rlib", "--emit=metadata", "-o", "custom.A"],
+            true,
+        ),
+        (
+            ["--crate-type=bin", "--emit=metadata", "-o", "app.rmeta"],
+            false,
+        ),
+        (
+            ["--crate-type=rlib", "--emit=link", "-o", "custom.rlib"],
+            false,
+        ),
+    ] {
+        assert_eq!(
+            checkout_archive_admission(&parse(&flags), linux, false),
+            expected,
+            "{flags:?}"
+        );
+    }
+    let harness = parse(&["--crate-type", "lib", "--test"]);
+    assert!(checkout_archive_admission(&harness, windows, false));
+    assert!(!checkout_archive_admission(&harness, linux, false));
 }
 
 #[test]
@@ -23134,7 +23177,7 @@ fn pdb_pairing_admission_is_scoped_to_windows_or_custom_linked_executables() {
 }
 
 #[test]
-fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
+fn a_windows_executable_full_key_carries_pdb_and_archive_admission_namespaces() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().canonicalize().unwrap();
@@ -23175,9 +23218,11 @@ fn a_windows_executable_full_key_carries_the_pdb_admission_namespace() {
         &KeyEnv::from_invocation(&invocation),
     );
     key.unwrap();
+    let fields = output.fields.unwrap();
+    assert!(fields.contains_key("pe_pdb_admission"));
     assert!(
-        output.fields.unwrap().contains_key("pe_pdb_admission"),
-        "legacy producers cannot write this namespace"
+        fields.contains_key("checkout_archive"),
+        "a producer that checked the EXE/PDB pair could still store an unscanned import library"
     );
 }
 

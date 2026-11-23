@@ -124,11 +124,6 @@ pub fn is_checkout_key(key: &str) -> bool {
         .is_some_and(is_valid_cache_key)
 }
 
-/// Entry keys accepted by local store maintenance.
-pub fn is_valid_store_key(key: &str) -> bool {
-    is_valid_cache_key(key) || is_checkout_key(key)
-}
-
 /// Is `s` a crate name safe to use as an S3 object-key path component?
 ///
 /// Permissive enough for real crate names and cc source basenames
@@ -220,11 +215,10 @@ mod tests {
         let digest = "a".repeat(64);
         let checkout = format!("checkout-{digest}");
         assert!(is_checkout_key(&checkout));
-        assert!(is_valid_store_key(&checkout));
-        assert!(is_valid_store_key(&digest));
+        assert!(!is_checkout_key(&digest));
         assert!(!is_valid_cache_key(&checkout));
         for invalid in ["checkout-", "checkout-../abc", "checkout-digest"] {
-            assert!(!is_valid_store_key(invalid));
+            assert!(!is_checkout_key(invalid));
         }
     }
 

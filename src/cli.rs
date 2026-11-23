@@ -2463,6 +2463,9 @@ fn stored_entry_row(
             details.push(format!("features [{}]", meta.features.join(", ")));
         }
     }
+    if kache_format::is_checkout_key(&entry.cache_key) {
+        details.push("local only (artifact contains a checkout path)".to_string());
+    }
     if missed == Some(entry.cache_key.as_str()) {
         details.push("the missed key, stored after the compile".to_string());
     }

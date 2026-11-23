@@ -66,7 +66,7 @@ pub(crate) fn embedded_checkout(
                 | ArtifactKind::WasmModule
                 // A Unix executable has no extension.
                 | ArtifactKind::Other("extensionless")
-        ) && !is_static_archive(&artifact.path)
+        ) && !crate::cache_key::is_native_archive_path(&artifact.path)
         {
             continue;
         }
@@ -122,18 +122,15 @@ impl Checkout {
     }
 }
 
-/// Whether `path` is a `staticlib` output, which the file-name classifier
-/// leaves without a kind of its own: `.a`, or `.lib` on Windows.
-fn is_static_archive(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == "a" || extension == "lib")
-}
-
 /// The spellings of the manifest dir and, when it differs, the workspace
 /// root, which a member's proc macro can embed without its manifest dir.
 fn checkout_spellings(manifest_dir: &Path, workspace_root: Option<&Path>) -> Vec<Vec<u8>> {
     let mut checkout = spellings(manifest_dir);
-    for spelling in workspace_root.map(spellings).unwrap_or_default() {
+    for spelling in workspace_root
+        .filter(|root| root.as_os_str() != manifest_dir.as_os_str())
+        .map(spellings)
+        .unwrap_or_default()
+    {
         if !checkout.contains(&spelling) {
             checkout.push(spelling);
         }
@@ -550,7 +547,7 @@ mod tests {
         .unwrap();
         let mut bytes = b"!<arch>\n".to_vec();
         bytes.extend_from_slice(checkout.join("assets").to_str().unwrap().as_bytes());
-        for name in ["libnamed.a", "named.lib"] {
+        for name in ["libnamed.a", "named.lib", "libnamed.A", "named.LIB"] {
             let archive = dir.path().join(name);
             std::fs::write(&archive, &bytes).unwrap();
             let kind = crate::compiler::classify_by_filename(name);

@@ -13508,6 +13508,92 @@ async fn abandoned_compile_download_does_not_take_a_later_permit() {
     );
 }
 
+/// HTTP/1.1 keep-alive server: `/slow` answers after 400 ms, every other path
+/// at once. Returns the base URL and the number of accepted connections.
+async fn keep_alive_http_server() -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    while let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).into_owned();
+                        request.drain(..end + 4);
+                        if head.starts_with("GET /slow ") {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                        }
+                        if socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{address}"), accepted)
+}
+
+/// The S3 operator shares one HTTP connection pool across the daemon. A
+/// connection a demand download opens is reused by other remote work after
+/// that download returns, so it must not die with the download's thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compile_download_connection_survives_the_download_thread() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (base, accepted) = keep_alive_http_server().await;
+    let client = reqwest::Client::new();
+    let worker_client = client.clone();
+    let worker_url = format!("{base}/fast");
+    let download = tokio::spawn(finish_compile_remote_download(
+        RemoteDeadline::from_millis(5_000),
+        async move {
+            let body = worker_client.get(worker_url).send().await?.bytes().await?;
+            assert_eq!(&body[..], b"ok");
+            // Extraction runs inside the same future after the GET, while the
+            // connection already sits idle in the shared pool.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok::<(), anyhow::Error>(())
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Prefetch, predictions and uploads run on the daemon runtime and take
+    // that idle connection. The download finishes while this GET is in flight.
+    let slow = client.get(format!("{base}/slow")).send().await;
+    download
+        .await
+        .expect("download task")
+        .expect("demand download");
+    let body = slow
+        .expect("a pooled connection must outlive the download that opened it")
+        .bytes()
+        .await
+        .expect("a pooled connection must outlive the download that opened it");
+    assert_eq!(&body[..], b"ok");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "the second GET must reuse the pooled connection"
+    );
+}
+
 #[tokio::test]
 async fn demand_queue_errors_preserve_prior_remote_failures() {
     let dir = tempfile::tempdir().unwrap();

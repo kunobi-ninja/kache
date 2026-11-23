@@ -7996,20 +7996,14 @@ where
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    // The download is polled on the worker thread, but tasks it spawns (the
+    // HTTP connections it puts in the shared pool) go to the daemon runtime.
+    // A runtime owned by this thread would drop those connections when the
+    // download returns, failing whichever request reuses them next.
+    let runtime = tokio::runtime::Handle::current();
     if let Err(error) = std::thread::Builder::new()
         .name("kache-compile-remote".into())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("compile remote runtime")
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = tx.send(Err(error));
-                    return;
-                }
-            };
             let outcome = runtime.block_on(async move {
                 let mut download = std::pin::pin!(download);
                 let mut cancel = cancel_rx;
@@ -8018,10 +8012,7 @@ where
                 })
                 .await
             });
-            // Deliver the result before runtime shutdown. Shutdown only reaps
-            // this thread; the handler must already be free to answer.
             let _ = tx.send(outcome);
-            runtime.shutdown_timeout(Duration::from_millis(50));
         })
     {
         tracing::warn!("compile remote thread did not start: {error}");

@@ -230,9 +230,11 @@ fn reader_names_checkout(
         }
         // Keep the bytes a match near the end still needs, and the bytes
         // before it that say whether Kache wrote the path it sits in.
-        let keep_from = window.len().saturating_sub(tail + LOOKBEHIND);
+        let keep_from = window.len().saturating_sub(tail.saturating_add(LOOKBEHIND));
         window.drain(..keep_from);
-        from = LOOKBEHIND + 1;
+        // A match at `LOOKBEHIND` itself was decided too, and is decided again
+        // with the same answer: it still has the LOOKBEHIND bytes before it.
+        from = LOOKBEHIND;
     }
 }
 
@@ -381,6 +383,18 @@ mod tests {
         bytes.extend_from_slice(b"/build/pkg/0123/out/gen.rs\0");
         bytes.extend(std::iter::repeat_n(b'y', CHUNK));
         assert!(!file_found(&bytes, b"/build"));
+    }
+
+    /// A match that starts within `tail` bytes of the chunk edge is left for
+    /// the next window, which must still hold all of it.
+    #[test]
+    fn a_match_left_for_the_next_window_is_found_there() {
+        let needle = b"/build";
+        let left_over = needle.len() + PATH_TAIL - 10;
+        let mut bytes = vec![b'x'; CHUNK - left_over];
+        bytes.extend_from_slice(b"\0/build/assets\0");
+        bytes.extend(std::iter::repeat_n(b'y', CHUNK));
+        assert!(file_found(&bytes, needle));
     }
 
     #[test]

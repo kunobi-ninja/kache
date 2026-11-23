@@ -952,35 +952,31 @@ mod tests {
         );
     }
 
-    /// A process number is reused once its process exits, and on Linux a
-    /// thread's ID answers for a process, so a record's number can name a
-    /// live stranger.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Linux reuses process numbers, and answers for a thread's ID as for a
+    /// process, so a record's number can name a live stranger.
+    #[cfg(target_os = "linux")]
     #[test]
     fn reused_numbers_are_pruned_without_discarding_live_legacy_holders() {
         let current = crate::process_identity::ProcessIdentity::current();
         let start = current.start().expect("this process reports its start");
+        let (sent_tid, thread_id) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments and returns this thread's ID.
+            sent_tid.send(unsafe { libc::gettid() } as u32).unwrap();
+            let _ = stopped.recv();
+        });
+        let tid = thread_id.recv().unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let lease = shared(dir.path(), "cargo build", &mut io::sink()).unwrap();
         let records = holders_dir(dir.path());
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut reused = vec![
+        let reused = [
+            // A thread of this very process.
+            format!("{tid}-1-{start}"),
             // A process that started after the one that wrote the record.
             format!("{}-1-{}", current.pid(), start ^ 1),
         ];
-        #[cfg(target_os = "linux")]
-        let thread = {
-            let (sent_tid, thread_id) = std::sync::mpsc::channel();
-            let (stop, stopped) = std::sync::mpsc::channel::<()>();
-            let thread = std::thread::spawn(move || {
-                // SAFETY: gettid has no arguments and returns this thread's ID.
-                sent_tid.send(unsafe { libc::gettid() } as u32).unwrap();
-                let _ = stopped.recv();
-            });
-            // A thread of this very process.
-            reused.push(format!("{}-1-{start}", thread_id.recv().unwrap()));
-            (stop, thread)
-        };
         for name in &reused {
             std::fs::write(records.join(name), "5\tcargo nextest").unwrap();
         }
@@ -995,11 +991,8 @@ mod tests {
         }
 
         drop(lease);
-        #[cfg(target_os = "linux")]
-        {
-            drop(thread.0);
-            thread.1.join().unwrap();
-        }
+        drop(stop);
+        thread.join().unwrap();
         assert!(try_exclusive(dir.path(), dir.path()).unwrap().is_some());
     }
 

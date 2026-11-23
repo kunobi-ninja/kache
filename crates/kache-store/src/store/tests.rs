@@ -2729,7 +2729,7 @@ fn entry_blob_cleanup_does_not_scan_the_blob_table() {
 #[test]
 fn an_input_prediction_waits_out_a_writer_like_a_compile_store() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(test_config(dir.path())).unwrap();
+    let mut store = Store::open(test_config(dir.path())).unwrap();
     store
         .record_input_prediction(None, "old", 1, Some("build_script_run"), "{}")
         .unwrap();

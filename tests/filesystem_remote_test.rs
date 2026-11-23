@@ -974,7 +974,10 @@ fn two_job_runtimes_share_one_store_across_daemon_restart() {
     );
     assert!(node_cache.path().join("store").is_dir());
     assert!(node_cache.path().join("index.db").is_file());
-    assert!(!node_cache.path().join("daemon.sock").exists());
+    assert!(
+        !kache_config::config::default_daemon_socket(node_cache.path(), node_cache.path(), None)
+            .exists()
+    );
     assert!(!node_cache.path().join("events.jsonl").exists());
 }
 
@@ -1570,7 +1573,12 @@ fn dropping_a_client_stops_its_daemon() {
     let run_lock = {
         let client = Client::new(shared.path());
         client.start_daemon();
-        let run_lock_path = client.runtime_dir.join("daemon.run.lock");
+        let run_lock_path = kache_config::config::default_daemon_socket(
+            &client.cache_dir,
+            &client.runtime_dir,
+            None,
+        )
+        .with_extension("run.lock");
         let run_lock = std::fs::OpenOptions::new()
             .write(true)
             .open(&run_lock_path)

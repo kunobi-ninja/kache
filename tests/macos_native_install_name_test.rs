@@ -3,6 +3,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -24,6 +25,8 @@ impl Fixture {
             cache: TempDir::new().unwrap(),
             config: PathBuf::new(),
         };
+        // This fixture explicitly binds a short socket directly in the cache.
+        fs::set_permissions(fixture.cache.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let config = fixture.cache.path().join("config.toml");
         fs::write(&config, "[cache]\nlocal_only = true\n").unwrap();
         fs::write(fixture.root.path().join("Cargo.toml"), "[workspace]\n").unwrap();

@@ -3326,7 +3326,8 @@ exit 0
                 .env("KACHE_RUNTIME_DIR", &requested);
         }
         let output = start.output().unwrap();
-        let state = std::fs::read(requested.join("daemon.state.json"));
+        let socket = kache_config::config::default_daemon_socket(&requested, &requested, None);
+        let state = std::fs::read(socket.with_extension("state.json"));
         // Both possible instances are task-owned; clean them even on failure.
         for store in [&requested, &manager_store] {
             e.cmd()
@@ -5369,7 +5370,9 @@ fn daemon_start_refuses_a_socket_path_too_long_for_a_unix_socket() {
     assert!(stderr.contains("KACHE_SOCKET_PATH"), "{stderr}");
     assert!(!stderr.contains("exited before readiness"), "{stderr}");
     assert!(
-        !deep.join("daemon.state.json").exists(),
+        !kache_config::config::default_daemon_socket(&deep, &deep, None)
+            .with_extension("state.json")
+            .exists(),
         "no daemon may have started"
     );
 }
@@ -5403,17 +5406,18 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
     let home = TempDir::new().unwrap();
     let root = TempDir::new().unwrap();
     let limit = longest_bindable_socket_path(root.path());
-    let name = limit - root.path().as_os_str().len() - 1 - "/daemon.sock".len();
+    let name = limit - root.path().as_os_str().len() - 1 - "/ipc/daemon.sock".len();
     let runtime = root.path().join("d".repeat(name));
     std::fs::create_dir_all(&runtime).unwrap();
-    assert_eq!(runtime.join("daemon.sock").as_os_str().len(), limit);
+    let socket = kache_config::config::default_daemon_socket(&runtime, &runtime, None);
+    assert_eq!(socket.as_os_str().len(), limit);
 
     let start = kache(home.path(), &runtime)
         .args(["daemon", "start"])
         .output()
         .unwrap();
     // Read before stopping: the daemon removes its record on a clean exit.
-    let bound = runtime.join("daemon.sock").exists();
+    let bound = socket.exists();
     // Stop before asserting, so a failure leaves no daemon behind.
     kache(home.path(), &runtime)
         .args(["daemon", "stop"])

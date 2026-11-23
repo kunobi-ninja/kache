@@ -93,12 +93,22 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
     let lease = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(cache.join("target-use.lock"))
+        .open(common::target_use_lock(&cache, &project))
         .unwrap();
     assert!(
         matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "the cargo shim released the target while its test was running"
     );
+    // Only its own workspace: the store-wide lock stays free for cleanup.
+    let everything = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache.join("target-use.lock"))
+        .unwrap();
+    everything.try_lock().unwrap();
+    everything.unlock().unwrap();
     assert!(target.join("debug/output").exists());
 
     std::fs::write(&go, "").unwrap();
@@ -126,13 +136,16 @@ fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
         std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
         kache_fs::testutil::write_executable(&real.join("cargo"), "#!/bin/sh\n: > \"$STARTED\"\n");
-        // Held the way `kache clean` and the daemon hold it while they delete.
+        // Held the way `kache clean` and the daemon hold it while they delete
+        // the project's target.
+        let lock = common::target_use_lock(&cache, &project);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         let cleanup = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(cache.join("target-use.lock"))
+            .open(lock)
             .unwrap();
         cleanup.lock().unwrap();
 
@@ -704,13 +717,15 @@ fn assert_cargo_lease_gone(holders: &Path) {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "records left behind: {left:?}");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(holders.parent().unwrap().join("target-use.lock"))
-        .unwrap();
-    lock.try_lock().unwrap();
-    lock.unlock().unwrap();
+    for lock in std::fs::read_dir(holders.parent().unwrap().join("target-use.d")).unwrap() {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock.unwrap().path())
+            .unwrap();
+        lock.try_lock().unwrap();
+        lock.unlock().unwrap();
+    }
 }
 
 #[test]

@@ -623,11 +623,17 @@ impl KeyLockSweepStats {
     }
 }
 
-/// The cache key a name in `store/` locks, or `None` for anything that is
-/// not `<valid key>.lock`: `gc.lock`, `durability.lock`, entry directories.
+/// Recover an index key from its on-disk directory name. Only checkout-bound
+/// entries have a leading dot in the store.
+fn key_of_entry_dir(name: &str) -> Option<&str> {
+    if let Some(key) = name.strip_prefix('.') {
+        return kache_format::is_checkout_key(key).then_some(key);
+    }
+    kache_format::is_valid_cache_key(name).then_some(name)
+}
+
 fn key_of_lock_name(name: &str) -> Option<&str> {
-    name.strip_suffix(".lock")
-        .filter(|key| kache_format::is_valid_store_key(key))
+    key_of_entry_dir(name.strip_suffix(".lock")?)
 }
 
 /// Old enough to unlink? A modification time ahead of `now` reads as young.
@@ -880,6 +886,17 @@ fn restore_source_writable_if_unshared(source: &Path, blob: &Path) {
             perms.set_readonly(false);
             let _ = fs::set_permissions(source, perms);
         }
+    }
+}
+
+/// Locate a local entry without opening the store index.
+pub fn entry_path_in_store_dir(store_dir: &Path, cache_key: &str) -> PathBuf {
+    // Older sync clients look for store/<key> directly. Keep checkout-only
+    // entries outside that layout even when binaries share the index.
+    if kache_format::is_checkout_key(cache_key) {
+        store_dir.join(format!(".{cache_key}"))
+    } else {
+        store_dir.join(cache_key)
     }
 }
 
@@ -4187,14 +4204,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // Entry dirs are named by cache key. Anything else under store/ is
             // not ours to interpret, and an unvalidated name would be a path
             // component we then join.
-            let key = if let Some(key) = name
-                .strip_prefix('.')
-                .filter(|key| kache_format::is_checkout_key(key))
-            {
-                key
-            } else if kache_format::is_valid_cache_key(name) {
-                name
-            } else {
+            let Some(key) = key_of_entry_dir(name) else {
                 continue;
             };
 
@@ -5114,13 +5124,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
-        // Older sync clients look for store/<key> directly. Keep checkout-only
-        // entries outside that layout even when binaries share the index.
-        if kache_format::is_checkout_key(cache_key) {
-            self.config.store_dir().join(format!(".{cache_key}"))
-        } else {
-            self.config.store_dir().join(cache_key)
-        }
+        entry_path_in_store_dir(&self.config.store_dir(), cache_key)
     }
 
     /// Calculate the total size of the store.

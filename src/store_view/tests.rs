@@ -393,6 +393,39 @@ fn volume_inventory_deduplicates_symlinked_stores() {
 }
 
 #[test]
+fn inventory_reads_metadata_for_shared_and_checkout_bound_entries_in_a_shard() {
+    let (dir, config, shard_config) = fixture();
+    let shard = Store::open(&shard_config).unwrap();
+    let digest = blake3::hash(b"unit").to_hex().to_string();
+    let bound = format!("checkout-{digest}");
+    let artifact = dir.path().join("libunit.rlib");
+    std::fs::write(&artifact, b"rlib").unwrap();
+    for key in [&digest, &bound] {
+        shard
+            .put(
+                key,
+                "unit",
+                &[],
+                &[],
+                "target",
+                "debug",
+                &[(artifact.clone(), "libunit.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+    let view = read(&config, true, "name").unwrap();
+    assert_eq!(view.entries.len(), 2);
+    for entry in &view.entries {
+        let path = entry_meta_path(entry).unwrap();
+        let meta: crate::store::EntryMeta =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(meta.cache_key, entry.cache_key);
+    }
+}
+
+#[test]
 fn legacy_stats_without_store_locations_have_no_metadata_path() {
     let entry: StatsEntry = serde_json::from_value(serde_json::json!({
         "cache_key": "old-key", "crate_name": "old-crate", "crate_type": "lib",

@@ -191,14 +191,8 @@ fn add_store(
 pub(crate) fn entry_meta_path(entry: &StatsEntry) -> Option<PathBuf> {
     // Older daemon responses omit store_dirs. Without a location, the client
     // cannot safely infer which store owns this entry.
-    Some(
-        entry
-            .store_dirs
-            .first()?
-            .join("store")
-            .join(&entry.cache_key)
-            .join("meta.json"),
-    )
+    let store_dir = entry.store_dirs.first()?.join("store");
+    Some(kache_store::entry_path_in_store_dir(&store_dir, &entry.cache_key).join("meta.json"))
 }
 
 pub(crate) fn entry_store_locations(entry: &StatsEntry) -> String {

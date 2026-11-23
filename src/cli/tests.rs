@@ -4430,6 +4430,11 @@ fn explain_crate_entry_rows_name_what_sets_each_entry_apart() {
     let empty = diff_meta("", "", &[], &[]);
     assert_eq!(stored_entry_row(&bare, Some(&empty), Some("other"))[5], "");
     assert_eq!(stored_entry_row(&bare, None, None)[5], "");
+    let bound = stats_entry(&format!("checkout-{}", "a".repeat(64)), "", "");
+    assert_eq!(
+        stored_entry_row(&bound, None, None)[5],
+        "local only (artifact contains a checkout path)"
+    );
 
     let entries: Vec<_> = (0..11)
         .map(|i| stats_entry(&format!("key{i:02}"), "", ""))

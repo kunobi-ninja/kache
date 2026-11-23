@@ -312,6 +312,17 @@ impl Client {
     /// Compile the crate `kt` rooted at `source`, from `cwd`, into `target`,
     /// as the package at `manifest_dir`.
     fn compile_unit(&self, cwd: &Path, source: &str, target: &Path, manifest_dir: &Path) {
+        self.compile_unit_with_log(cwd, source, target, manifest_dir, "off");
+    }
+
+    fn compile_unit_with_log(
+        &self,
+        cwd: &Path,
+        source: &str,
+        target: &Path,
+        manifest_dir: &Path,
+        log_filter: &str,
+    ) -> Output {
         let deps = target.join("debug/deps");
         std::fs::create_dir_all(&deps).unwrap();
         let out_dir = deps.display().to_string();
@@ -337,7 +348,10 @@ impl Client {
                 "-L",
                 &search,
             ],
-            &[("CARGO_MANIFEST_DIR", manifest_dir)],
+            &[
+                ("CARGO_MANIFEST_DIR", manifest_dir),
+                ("KACHE_LOG", Path::new(log_filter)),
+            ],
             Duration::from_secs(90),
         );
         assert!(
@@ -345,6 +359,7 @@ impl Client {
             "kache rustc failed.\nstderr: {}",
             String::from_utf8_lossy(&output.stderr),
         );
+        output
     }
 
     /// Start this client's daemon and wait until it is ready. The remote
@@ -725,6 +740,108 @@ fn daemon_upload_reaches_an_independent_client_through_one_folder() {
         "the remotely restored artifact must match the producer byte-for-byte"
     );
     beta.stop_daemon_and_wait();
+}
+
+/// The wrapper discovers checkout paths in the compiled output even when
+/// rustc records no environment dependency for them.
+#[test]
+fn checkout_bound_rust_output_hits_locally_and_never_enqueues_an_upload() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let client = Client::new(shared.path());
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    // Both compiles read identical bytes and embed both directories. Each
+    // result must be bound by the wrapper to the checkout doing the compile.
+    let source = format!(
+        "pub static ROOTS: [&str; 2] = [{:?}, {:?}];\n",
+        a.path().to_str().unwrap(),
+        b.path().to_str().unwrap(),
+    );
+    for checkout in [a.path(), b.path()] {
+        std::fs::write(checkout.join("lib.rs"), &source).unwrap();
+    }
+    client.start_daemon();
+    let compile = |checkout: &Path| {
+        let target = checkout.join("target");
+        if target.exists() {
+            std::fs::remove_dir_all(&target).unwrap();
+        }
+        let output = client.compile_unit_with_log(checkout, "lib.rs", &target, checkout, "debug");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.is_empty(),
+            "the wrapper diagnostic capture must be active"
+        );
+        // Even a rejected upload is a wrapper bug. The daemon client rejects
+        // a bound key before it creates a spool file or sends anything.
+        assert!(
+            !stderr.contains("failed to send upload job to daemon"),
+            "{stderr}"
+        );
+        let report = client.report();
+        crate_event(&report, "kt").clone()
+    };
+    let first = compile(a.path());
+    assert_eq!(first["result"], "miss", "{first}");
+    assert_eq!(first["compiler_runs"], 1, "{first}");
+    assert!(
+        first["cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("checkout-"),
+        "{first}"
+    );
+    let rlib = a
+        .path()
+        .join("target/debug/deps/libkt-fedcba9876543210.rlib");
+    let built = std::fs::read(&rlib).unwrap();
+
+    let warm = compile(a.path());
+    assert_eq!(warm["result"], "local_hit", "{warm}");
+    assert_eq!(warm["compiler_runs"], 0, "{warm}");
+    assert_eq!(warm["cache_key"], first["cache_key"]);
+    assert_eq!(std::fs::read(&rlib).unwrap(), built);
+
+    let other = compile(b.path());
+    assert!(
+        other["result"] == "miss" || other["result"] == "dup",
+        "{other}"
+    );
+    assert_eq!(other["compiler_runs"], 1, "{other}");
+    assert!(
+        other["cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("checkout-"),
+        "{other}"
+    );
+    assert_ne!(other["cache_key"], first["cache_key"]);
+
+    // Use the same client and daemon to publish a portable crate. Once the
+    // daemon drains, it must be the only crate with a manifest and pack.
+    std::fs::write(a.path().join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let output = TempDir::new().unwrap();
+    client.compile_checkout(a.path(), output.path());
+    let report = client.report();
+    let control = crate_event(&report, "fsremote");
+    wait_for_remote_entry(
+        shared.path(),
+        "fsremote",
+        control["cache_key"].as_str().unwrap(),
+    );
+    client.stop_daemon_and_wait();
+    let mut bound_files = Vec::new();
+    for layout in ["manifests", "packs"] {
+        collect_files(
+            &shared.path().join("artifacts/v3").join(layout).join("kt"),
+            &mut bound_files,
+        );
+    }
+    assert!(
+        bound_files.is_empty(),
+        "published checkout-bound files: {bound_files:?}"
+    );
 }
 
 /// C object compiles use the same v3 pack layout and daemon upload/check

@@ -2225,13 +2225,7 @@ fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusq
          )",
         params![cache_key],
     )?;
-    conn.execute(
-        "DELETE FROM blobs
-         WHERE refcount <= 0 AND hash IN (
-             SELECT hash FROM entry_blobs WHERE cache_key = ?1
-         )",
-        params![cache_key],
-    )?;
+    conn.execute(DELETE_ENTRY_UNREFERENCED_BLOBS, params![cache_key])?;
     conn.execute(
         "DELETE FROM entry_blobs WHERE cache_key = ?1",
         params![cache_key],
@@ -3722,34 +3716,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let total_size: u64 = meta.files.iter().map(|file| file.size).sum();
             let crate_type = meta.crate_types.join(",");
             let content_hash = compute_content_hash(&meta.files);
-            // A crash or legacy importer may have left an uncommitted row.
-            // It is not a cache hit and must not permanently block a verified
-            // replacement through INSERT OR IGNORE. Undo any partial mapping
-            // bookkeeping in this same transaction before replacing it.
-            tx.execute(
-                "UPDATE blobs
-                 SET refcount = MAX(0, refcount - COALESCE((
-                     SELECT refs FROM entry_blobs
-                     WHERE cache_key = ?1 AND hash = blobs.hash
-                 ), 0))
-                 WHERE hash IN (
-                     SELECT hash FROM entry_blobs WHERE cache_key = ?1
-                 ) AND EXISTS (
-                     SELECT 1 FROM entries
-                     WHERE cache_key = ?1 AND committed = 0
-                 )",
-                params![entry.cache_key],
-            )?;
-            // Only this entry's blobs can have dropped to zero above.
-            tx.execute(DELETE_ENTRY_UNREFERENCED_BLOBS, params![entry.cache_key])?;
-            tx.execute(
-                "DELETE FROM entry_blobs
-                 WHERE cache_key = ?1 AND EXISTS (
-                     SELECT 1 FROM entries
-                     WHERE cache_key = ?1 AND committed = 0
-                 )",
-                params![entry.cache_key],
-            )?;
+            // An unfinished generation cannot win INSERT OR IGNORE. Keep its
+            // mappings until we release its references below.
             tx.execute(
                 "DELETE FROM entries WHERE cache_key = ?1 AND committed = 0",
                 params![entry.cache_key],
@@ -3779,8 +3747,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if inserted == 0 {
                 continue;
             }
-            // No row owned this key, so a mapping still recorded for it is
-            // a leftover whose references nothing else will release.
+            // This key had an unfinished row or none at all. Release its old
+            // mappings before counting the new files, preserving shared blobs
+            // even when an older importer failed to count every mapping.
             release_entry_blob_refs(&tx, &entry.cache_key)?;
 
             for file in &meta.files {

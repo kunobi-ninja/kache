@@ -2725,31 +2725,69 @@ fn entry_blob_cleanup_does_not_scan_the_blob_table() {
 }
 
 /// A build-script prediction is written after its run is stored. A writer
-/// that keeps the index busy for longer than one busy timeout must delay
-/// it, as it delays a compile store, rather than fail it.
+/// that outlasts the first lock attempt must still allow the write to retry.
 #[test]
 fn an_input_prediction_waits_out_a_writer_like_a_compile_store() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
-    store.db.busy_timeout(Duration::from_millis(200)).unwrap();
     store
         .record_input_prediction(None, "old", 1, Some("build_script_run"), "{}")
         .unwrap();
 
-    let side = Connection::open(dir.path().join("index.db")).unwrap();
-    side.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let holder = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        side.execute_batch("COMMIT").unwrap();
-    });
-    let recorded =
-        store.record_input_prediction(Some("old"), "new", 1, Some("build_script_run"), "{}");
-    holder.join().unwrap();
-    recorded.unwrap();
+    // When SQLite reports a busy writer, release the other connection and
+    // refuse the attempt. Only a fresh BEGIN IMMEDIATE can then succeed.
+    thread_local! {
+        static WRITER: std::cell::RefCell<Option<Connection>> = const { std::cell::RefCell::new(None) };
+    }
+    let writer = Connection::open(dir.path().join("index.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    WRITER.set(Some(writer));
+    store
+        .db
+        .busy_handler(Some(|_| {
+            drop(WRITER.take());
+            false
+        }))
+        .unwrap();
+    store
+        .record_input_prediction(Some("old"), "new", 1, Some("build_script_run"), "{}")
+        .unwrap();
+    assert!(
+        WRITER.take().is_none(),
+        "the prediction must contend for the lock"
+    );
 
     let cache = store.file_hash_cache();
     assert!(cache.get_input_prediction("old").unwrap().is_none());
     assert!(cache.get_input_prediction("new").unwrap().is_some());
+}
+
+#[test]
+fn replacing_a_prediction_rolls_back_its_delete_when_the_insert_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    store
+        .record_input_prediction(None, "old", 1, None, "old payload")
+        .unwrap();
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER reject_new_prediction BEFORE INSERT ON input_predictions
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .record_input_prediction(Some("old"), "new", 2, None, "new payload")
+            .is_err()
+    );
+    let cache = store.file_hash_cache();
+    assert_eq!(
+        cache.get_input_prediction("old").unwrap(),
+        Some((1, "old payload".into()))
+    );
+    assert_eq!(cache.get_input_prediction("new").unwrap(), None);
 }
 
 struct DurabilitySyncObserver {
@@ -13853,6 +13891,60 @@ fn verified_batch_import_is_atomic_and_registers_every_entry() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(refcounts, vec![1, 1]);
+}
+
+#[test]
+fn verified_batch_import_preserves_other_owners_of_a_partial_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let key = "a".repeat(64);
+    let shared = content_hash(b"shared");
+    let private = content_hash(b"old");
+    put_outputs(
+        &store,
+        dir.path(),
+        "owner",
+        "one",
+        &[("shared.rlib", b"shared")],
+    );
+    put_outputs(
+        &store,
+        dir.path(),
+        &key,
+        "one",
+        &[("shared.rlib", b"shared"), ("old.rmeta", b"old")],
+    );
+    // A partial import counted its private blob but left the shared one's
+    // count at the other owner's single reference.
+    store
+        .db
+        .execute(
+            "UPDATE entries SET committed = 0 WHERE cache_key = ?1",
+            [&key],
+        )
+        .unwrap();
+    store
+        .db
+        .execute("UPDATE blobs SET refcount = 1 WHERE hash = ?1", [&shared])
+        .unwrap();
+    let restored = write_verified_fixture(&store, &key, &key, "replacement.rlib", None);
+    let imported_hash = restored.meta.files[0].hash.clone();
+
+    assert_eq!(
+        store.import_verified_restored_entries(&[restored]).unwrap(),
+        1
+    );
+    assert_eq!(blob_refcount(&store, &shared), Some(1));
+    assert_eq!(blob_refcount(&store, &private), None);
+    assert_eq!(blob_refcount(&store, &imported_hash), Some(1));
+    assert_blob_refs_match_mappings(&store);
+    assert_eq!(store.sweep_orphan_blobs(Duration::ZERO).unwrap().removed, 1);
+    assert!(!store.blob_path(&private).exists());
+    assert_eq!(
+        fs::read(store.blob_path(&shared)).unwrap().as_slice(),
+        b"shared"
+    );
+    assert!(store.get(&key).unwrap().is_some());
 }
 
 fn write_verified_fixture(

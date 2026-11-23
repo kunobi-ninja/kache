@@ -13503,7 +13503,7 @@ fn cc_successful_compile_and_handoff_preserve_actual_rebuilt_outputs() {
     let mut config = test_config(dir.path().join("cache"));
     config.deferred_discovery = false;
     config.daemon_publish = true;
-    std::fs::create_dir_all(&config.cache_dir).unwrap();
+    crate::daemon::prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
     let run_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

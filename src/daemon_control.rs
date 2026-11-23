@@ -977,6 +977,7 @@ mod tests {
     fn an_unavailable_advertised_binary_endpoint_never_downgrades_to_legacy() {
         let root = tempfile::tempdir().unwrap();
         let config = super::super::tests::test_config(root.path());
+        super::super::prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
         let legacy = std::os::unix::net::UnixListener::bind(config.socket_path()).unwrap();
         legacy.set_nonblocking(true).unwrap();
         let mut coord = DaemonCoordFile::for_socket(&config.socket_path());

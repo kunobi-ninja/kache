@@ -245,11 +245,11 @@ mod tests {
         let cache = home.join("manager-cache");
         let text = manager(home, &format!("XDG_CACHE_HOME={}\n", cache.display()));
         let socket = configured_socket(&text).unwrap();
-        assert_eq!(socket, cache.join("kache/daemon.sock"));
-        assert_ne!(socket, home.join(".cache/kache/daemon.sock"));
+        assert_eq!(socket, cache.join("kache/ipc/d.sock"));
+        assert_ne!(socket, home.join(".cache/kache/ipc/d.sock"));
         assert_eq!(
             configured_socket(&manager(home, "")).unwrap(),
-            home.join(".cache/kache/daemon.sock")
+            home.join(".cache/kache/ipc/d.sock")
         );
     }
 

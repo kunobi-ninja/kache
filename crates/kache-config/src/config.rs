@@ -182,7 +182,7 @@ pub struct Config {
     /// follows that isolated path; an explicit runtime dir does not.
     pub runtime_dir: PathBuf,
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
-    /// `None` keeps the default `<runtime_dir>/daemon.sock` placement.
+    /// `None` selects the default daemon endpoint.
     pub socket_path_override: Option<PathBuf>,
     /// Volume-local store shards from `[cache.volumes]` (empty when
     /// unconfigured). The wrapper opens the matching shard as `cache_dir`
@@ -4213,15 +4213,15 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        let socket = self
+        let scope = self.pull_request_scope();
+        if let Some(socket) = self
             .socket_path_override
             .as_ref()
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
-            .unwrap_or_else(|| self.runtime_dir.join("daemon.sock"));
-        match self.pull_request_scope() {
-            Some(scope) => scoped_socket_path(&socket, &scope),
-            None => socket,
+        {
+            return scoped_socket_path(socket, scope.as_deref());
         }
+        default_daemon_socket(&self.cache_dir, &self.runtime_dir, scope.as_deref())
     }
 
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
@@ -5197,10 +5197,34 @@ pub fn config_file_path() -> PathBuf {
     config_base.join("kache").join("config.toml")
 }
 
+/// The default endpoint used both by callers and by login-service discovery.
+pub fn default_daemon_socket(cache: &Path, runtime: &Path, scope: Option<&str>) -> PathBuf {
+    let socket = scoped_socket_path(runtime.join("daemon.sock"), scope);
+    #[cfg(unix)]
+    if runtime == cache {
+        use std::os::unix::fs::PermissionsExt;
+        // Keep both the data and control endpoints within the legacy path budget.
+        let ipc = scoped_socket_path(runtime.join("ipc/d.sock"), scope);
+        // Older daemons leave the run lock behind when they stop. A fresh
+        // store always chooses ipc, even before the store directory exists.
+        let legacy = std::fs::symlink_metadata(runtime)
+            .is_ok_and(|meta| meta.is_dir() && meta.permissions().mode() & 0o7777 == 0o700)
+            && socket.with_extension("run.lock").is_file()
+            && !ipc.with_extension("run.lock").is_file();
+        if !legacy {
+            return ipc;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cache;
+    socket
+}
+
 /// Resolve the daemon endpoint once. Invalid values fall back to the default
 /// instead of reaching daemon startup's `socket_path.parent().unwrap()` calls.
 /// `daemon.sock` becomes `daemon-<scope>.sock` in the same directory.
-fn scoped_socket_path(socket: &Path, scope: &str) -> PathBuf {
+fn scoped_socket_path(socket: PathBuf, scope: Option<&str>) -> PathBuf {
+    let Some(scope) = scope else { return socket };
     let mut name = socket.file_stem().unwrap_or_default().to_os_string();
     name.push("-");
     name.push(scope);
@@ -5215,7 +5239,7 @@ fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathB
     let raw = raw?;
     if raw.is_empty() {
         tracing::warn!(
-            "ignoring empty KACHE_SOCKET_PATH; falling back to <runtime_dir>/daemon.sock"
+            "ignoring empty KACHE_SOCKET_PATH; falling back to the default daemon socket"
         );
         return None;
     }

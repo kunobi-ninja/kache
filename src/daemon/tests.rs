@@ -814,6 +814,7 @@ async fn each_bind_gets_an_endpoint_name_of_its_own() {
 /// Bind a daemon-style listener at `path`, taking the cross-platform
 /// transport. Used by every roundtrip test to remove boilerplate.
 fn bind_listener(path: &Path) -> TokioListener {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let name = socket_name(path).expect("socket name");
     ListenerOptions::new()
         .name(name)
@@ -1697,6 +1698,102 @@ async fn test_send_request_with_timeout_bounds_unresponsive_daemon() {
     assert!(result.is_err());
     assert!(started.elapsed() < Duration::from_millis(750));
     server.abort();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("store");
+    std::fs::create_dir(&store).unwrap();
+    let chmod = |p: &Path, mode| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let mut config = test_config(&store);
+    chmod(&store, 0o2750);
+    let socket = config.socket_path();
+    prepare_daemon_socket_dir(&config, &socket).unwrap();
+    assert_eq!(mode(&store), 0o2750);
+    assert_eq!(mode(socket.parent().unwrap()) & 0o777, 0o700);
+    config.socket_path_override = Some(store.join("custom.sock"));
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&store), 0o2750);
+
+    let dedicated = temp.path().join("runtime");
+    std::fs::create_dir(&dedicated).unwrap();
+    chmod(&dedicated, 0o755);
+    config.runtime_dir = dedicated.clone();
+    config.socket_path_override = None;
+    prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
+    assert_eq!(mode(&dedicated), 0o700);
+    assert_eq!(mode(&store), 0o2750);
+
+    chmod(&dedicated, 0o770);
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&dedicated), 0o770);
+    let custom = temp.path().join("custom");
+    std::fs::create_dir(&custom).unwrap();
+    config.socket_path_override = Some(custom.join("kache.sock"));
+    chmod(&custom, 0o755);
+    prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
+    assert_eq!(mode(&custom), 0o700);
+    chmod(&custom, 0o707);
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&custom), 0o707);
+    config.socket_path_override = None;
+
+    let alias = temp.path().join("alias");
+    symlink(&store, &alias).unwrap();
+    config.runtime_dir = alias;
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert_eq!(mode(&store), 0o2750);
+}
+
+#[cfg(unix)]
+#[test]
+fn ipc_path_owners_and_sticky_permissions() {
+    let me = 1001;
+    for owner in [0, me] {
+        assert!(ipc_ancestor_is_safe(owner, 0o755, me, true));
+        assert!(ipc_ancestor_is_safe(owner, 0o1777, me, false));
+        assert!(!ipc_ancestor_is_safe(owner, 0o1777, me, true));
+        assert!(!ipc_ancestor_is_safe(owner, 0o775, me, false));
+        assert!(!ipc_ancestor_is_safe(owner, 0o707, me, true));
+    }
+    assert!(!ipc_ancestor_is_safe(1002, 0o700, me, true));
+    assert!(!ipc_ancestor_is_safe(1002, 0o1777, me, false));
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_writers_cannot_replace_the_ipc_directory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let container = temp.path().join("container");
+    let root = container.join("store");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = test_config(&root);
+    for writable in [&root, &container] {
+        std::fs::set_permissions(writable, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap_err();
+        assert!(error.to_string().contains("KACHE_RUNTIME_DIR"));
+        std::fs::set_permissions(writable, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    let bridge = temp.path().join("bridge");
+    let hidden = container.join("nested");
+    std::fs::create_dir_all(hidden.join("another")).unwrap();
+    symlink(&hidden, &bridge).unwrap();
+    std::fs::set_permissions(&container, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let bridged = test_config(&bridge.join("another"));
+    assert!(prepare_daemon_socket_dir(&bridged, &bridged.socket_path()).is_err());
+    std::fs::set_permissions(&container, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let alias = temp.path().join("aliased-store");
+    symlink(&root, &alias).unwrap();
+    let config = test_config(&alias);
+    assert!(prepare_daemon_socket_dir(&config, &config.socket_path()).is_err());
+    assert!(!root.join("ipc").exists());
 }
 
 pub(super) fn test_config(dir: &Path) -> Config {
@@ -5197,7 +5294,7 @@ fn test_handle_stats_empty_store() {
     assert_eq!(eff.cache_dir, dir.path().display().to_string());
     assert_eq!(
         eff.socket_path,
-        dir.path().join("daemon.sock").display().to_string()
+        daemon.config.socket_path().display().to_string()
     );
     assert!(eff.started_at_ms > 0, "startup capture stamps a time");
     assert!(eff.config_fingerprint.is_some());

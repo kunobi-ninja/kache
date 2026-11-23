@@ -60,7 +60,7 @@ pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
         ));
     }
     let socket = config.socket_path();
-    std::fs::create_dir_all(socket.parent().context("socket has no parent")?)?;
+    super::prepare_daemon_socket_dir(config, &socket)?;
     let Some(lock) = kunobi_daemon::readiness::wait_until(deadline, |_| {
         ProcessLock::try_acquire(socket.with_extension("lock"))
     })?
@@ -429,6 +429,12 @@ fn written_since(path: &Path, start: u64) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn fixture_config(root: &Path) -> Config {
+        let config = super::super::tests::test_config(root);
+        prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
+        config
+    }
+
     /// A daemon another process started while this one waited for the
     /// coordinator lock was already running; this call started nothing.
     #[test]
@@ -586,7 +592,7 @@ mod tests {
     #[test]
     fn abandoned_startup_reaps_the_child_without_terminating_it() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let release = root.path().join("release");
         let mut command = kunobi_daemon::launch::DaemonCommand::new("sh");
         command.args(["-c", "while [ ! -e \"$1\" ]; do sleep 0.05; done", "sh"]);
@@ -617,7 +623,7 @@ mod tests {
     #[test]
     fn failed_ownership_probe_remains_an_error() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         std::fs::create_dir(daemon_run_lock_path(&config.socket_path())).unwrap();
         assert!(
             ensure(&config, true).is_err(),
@@ -628,7 +634,7 @@ mod tests {
     #[test]
     fn legacy_initializer_is_waited_for_without_claiming_readiness() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
             .unwrap()
             .unwrap();
@@ -643,7 +649,7 @@ mod tests {
     #[test]
     fn drain_waits_for_both_exclusive_lock_and_retiring_process() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let mut replacement = driver(&config);
         replacement.stopping = true;
         replacement.retiring_pid = Some(std::process::id());
@@ -670,7 +676,7 @@ mod tests {
     #[test]
     fn drain_keeps_waiting_when_the_held_owner_has_not_bound_control_yet() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
             .unwrap()
             .unwrap();
@@ -688,7 +694,7 @@ mod tests {
     #[test]
     fn drain_does_not_hide_an_unsupported_control_protocol() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
             .unwrap()
             .unwrap();
@@ -708,7 +714,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_requests_drain_before_waiting_for_cache_ownership() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
             .unwrap()
             .unwrap();
@@ -811,7 +817,7 @@ mod tests {
     #[test]
     fn candidate_verification_rejects_malformed_readiness() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let error = verify_signaled_candidate(&config, "not-a-readiness-message").unwrap_err();
         assert!(
             error
@@ -825,7 +831,7 @@ mod tests {
     #[test]
     fn candidate_verification_preserves_health_protocol_errors() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
         coord.control_version = Some(u32::MAX);
         coord.write_phase(DaemonPhase::Ready).unwrap();
@@ -842,7 +848,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn candidate_verification_returns_done_only_with_fresh_health_proof() {
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let lifecycle = Arc::new(Lifecycle::default());
         let mut server = lifecycle_control::serve(&config, lifecycle).await.unwrap();
         server.service.mark_ready();

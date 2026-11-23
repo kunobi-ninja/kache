@@ -138,7 +138,7 @@ local_max_size = "200GiB"
 | `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
 | `KACHE_READONLY_STORE` | `cache.readonly_store` | unset | Another store on this machine to read after the local one, never written. See [Read-only store](#read-only-store). |
 | none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. GC sweeps each shard with its own budget; see [Volume shards](#volume-shards). |
-| `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
+| `KACHE_SOCKET_PATH` | none | inferred from the runtime directory | Absolute daemon endpoint in a private directory |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, rounded to the nearest GiB, floored at 5GiB and capped at 100GiB; 50GiB when the disk size cannot be read | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
@@ -321,6 +321,10 @@ GC skips a shard whose store dir has no `index.db`: a missing directory, an unmo
 `kache gc --json`, `kache gc --stale-schema` and emptying the cache with `kache clean --cache` still cover only the main store. Automatic prefetch still imports into the main store.
 
 ### Read-only store
+
+On Unix, a daemon sharing its cache with other local readers puts its socket in a private `ipc/` directory. The cache root keeps its group permissions and ACLs. Readers need read and search access to the store. If other users can write to the store or one of its parent directories, set `cache.runtime_dir` to a separate private directory owned by the daemon user.
+
+A private cache that already hosted an older daemon keeps its existing socket after upgrade. Stop an older daemon before upgrading a shared cache. If that version already changed the store's permissions, restore your group mode and ACL once after stopping it.
 
 Set `readonly_store` to read another store on the same machine after your own. Mount that store read-only, for example by giving a CI container the build host's store through a `:ro` volume:
 

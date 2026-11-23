@@ -5406,26 +5406,27 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
     let home = TempDir::new().unwrap();
     let root = TempDir::new().unwrap();
     let limit = longest_bindable_socket_path(root.path());
-    let name = limit - root.path().as_os_str().len() - 1 - "/ipc/daemon.sock".len();
-    let runtime = root.path().join("d".repeat(name));
-    std::fs::create_dir_all(&runtime).unwrap();
-    let socket = kache_config::config::default_daemon_socket(&runtime, &runtime, None);
-    assert_eq!(socket.as_os_str().len(), limit);
+    for suffix in ["daemon.sock", "ipc/d.sock"] {
+        let name = limit - root.path().as_os_str().len() - 2 - suffix.len();
+        let runtime = root.path().join("d".repeat(name));
+        std::fs::create_dir_all(&runtime).unwrap();
+        assert_eq!(runtime.join(suffix).as_os_str().len(), limit);
+        let socket = runtime.join("ipc/d.sock");
 
-    let start = kache(home.path(), &runtime)
-        .args(["daemon", "start"])
-        .output()
-        .unwrap();
-    // Read before stopping: the daemon removes its record on a clean exit.
-    let bound = socket.exists();
-    // Stop before asserting, so a failure leaves no daemon behind.
-    kache(home.path(), &runtime)
-        .args(["daemon", "stop"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&start.stderr);
-    assert!(start.status.success(), "{stderr}");
-    assert!(bound, "the daemon must have bound its socket: {stderr}");
+        let start = kache(home.path(), &runtime)
+            .args(["daemon", "start"])
+            .output()
+            .unwrap();
+        // Read before stopping: the daemon removes both sockets on a clean exit.
+        let bound = socket.exists() && socket.with_extension("ctl").exists();
+        kache(home.path(), &runtime)
+            .args(["daemon", "stop"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&start.stderr);
+        assert!(start.status.success(), "{stderr}");
+        assert!(bound, "the daemon must have bound both endpoints: {stderr}");
+    }
 }
 
 /// Cargo's first call for a target directory it has not built is its

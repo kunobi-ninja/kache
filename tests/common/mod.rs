@@ -366,7 +366,7 @@ pub fn settle_writes(dirs: &[&Path]) {
 /// It is released only after the daemon's shutdown drain, so it is the one
 /// signal that works for Unix sockets and Windows named pipes alike.
 fn daemon_run_lock_path(runtime_dir: &Path) -> PathBuf {
-    let nested = runtime_dir.join("ipc/daemon.run.lock");
+    let nested = runtime_dir.join("ipc/d.run.lock");
     if nested.exists() {
         nested
     } else {

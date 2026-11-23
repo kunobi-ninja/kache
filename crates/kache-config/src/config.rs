@@ -4219,10 +4219,7 @@ impl Config {
             .as_ref()
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
         {
-            return match scope {
-                Some(scope) => scoped_socket_path(&socket, &scope),
-                None => socket,
-            };
+            return scoped_socket_path(socket, scope.as_deref());
         }
         default_daemon_socket(&self.cache_dir, &self.runtime_dir, scope.as_deref())
     }
@@ -5202,17 +5199,12 @@ pub fn config_file_path() -> PathBuf {
 
 /// The default endpoint used both by callers and by login-service discovery.
 pub fn default_daemon_socket(cache: &Path, runtime: &Path, scope: Option<&str>) -> PathBuf {
-    let socket = runtime.join("daemon.sock");
-    let socket = match scope {
-        Some(scope) => scoped_socket_path(&socket, scope),
-        None => socket,
-    };
+    let socket = scoped_socket_path(runtime.join("daemon.sock"), scope);
     #[cfg(unix)]
     if runtime == cache {
         use std::os::unix::fs::PermissionsExt;
-        let ipc = runtime
-            .join("ipc")
-            .join(socket.file_name().expect("daemon socket has a name"));
+        // Keep both the data and control endpoints within the legacy path budget.
+        let ipc = scoped_socket_path(runtime.join("ipc/d.sock"), scope);
         // Older daemons leave the run lock behind when they stop. A fresh
         // store always chooses ipc, even before the store directory exists.
         let legacy = std::fs::symlink_metadata(runtime)
@@ -5231,7 +5223,8 @@ pub fn default_daemon_socket(cache: &Path, runtime: &Path, scope: Option<&str>) 
 /// Resolve the daemon endpoint once. Invalid values fall back to the default
 /// instead of reaching daemon startup's `socket_path.parent().unwrap()` calls.
 /// `daemon.sock` becomes `daemon-<scope>.sock` in the same directory.
-fn scoped_socket_path(socket: &Path, scope: &str) -> PathBuf {
+fn scoped_socket_path(socket: PathBuf, scope: Option<&str>) -> PathBuf {
+    let Some(scope) = scope else { return socket };
     let mut name = socket.file_stem().unwrap_or_default().to_os_string();
     name.push("-");
     name.push(scope);

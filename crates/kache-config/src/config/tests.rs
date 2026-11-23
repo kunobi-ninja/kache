@@ -4345,7 +4345,7 @@ fn fresh_and_existing_daemon_endpoints_are_stable_per_scope() {
     let root = temp.path().join("store");
     let socket = |scope| default_daemon_socket(&root, &root, scope);
     let flat = root.join("daemon.sock");
-    let nested = root.join("ipc/daemon.sock");
+    let nested = root.join("ipc/d.sock");
     assert_eq!(socket(None), nested);
     std::fs::create_dir(&root).unwrap();
     for mode in [0o700, 0o750, 0o755] {
@@ -4361,7 +4361,7 @@ fn fresh_and_existing_daemon_endpoints_are_stable_per_scope() {
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::create_dir(root.join("ipc")).unwrap();
     let scoped = socket(Some("pr-test"));
-    assert_eq!(scoped, root.join("ipc/daemon-pr-test.sock"));
+    assert_eq!(scoped, root.join("ipc/d-pr-test.sock"));
     std::fs::write(scoped.with_extension("run.lock"), "").unwrap();
     assert_eq!(socket(None), flat);
     std::fs::write(nested.with_extension("run.lock"), "").unwrap();
@@ -6822,7 +6822,13 @@ fn a_pull_request_job_with_its_own_prefix_may_write_there() {
 fn a_pull_request_job_never_shares_a_daemon_or_upload_queue_with_a_trusted_job() {
     let with_prefix = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n\
                        pull_request_prefix = \"artifacts-pr/7\"\n";
-    let pull_request = load_in_ci("pull_request", "false", with_prefix);
+    let store = tempfile::tempdir().unwrap();
+    let pull_request = Config {
+        cache_dir: store.path().into(),
+        runtime_dir: store.path().into(),
+        socket_path_override: None,
+        ..load_in_ci("pull_request", "false", with_prefix)
+    };
     let push = Config {
         pull_request_prefix: None,
         ..pull_request.clone()
@@ -6835,19 +6841,16 @@ fn a_pull_request_job_never_shares_a_daemon_or_upload_queue_with_a_trusted_job()
 
     let socket = pull_request.socket_path();
     assert_eq!(socket.parent(), push.socket_path().parent());
-    let name = socket.file_name().unwrap().to_str().unwrap();
-    assert!(
-        name.starts_with("daemon-pr-") && name.ends_with(".sock") && name.len() == 23,
-        "{name}"
-    );
+    assert_eq!(socket.extension().unwrap(), "sock");
+    let stem = socket.file_stem().unwrap().to_str().unwrap();
+    let prefix = if cfg!(unix) { "d-" } else { "daemon-" };
+    let scope = stem.strip_prefix(prefix).unwrap();
+    assert!(scope.starts_with("pr-") && scope.len() == 11, "{scope}");
     let queue = pull_request.upload_spool_dir();
     assert_eq!(queue.parent(), Some(pull_request.cache_dir.as_path()));
     assert_eq!(
         queue.file_name().unwrap().to_str().unwrap(),
-        format!(
-            "upload-queue-{}",
-            &name["daemon-".len()..name.len() - ".sock".len()]
-        )
+        format!("upload-queue-{scope}")
     );
 
     let other = Config {
@@ -6865,11 +6868,11 @@ fn a_pull_request_job_never_shares_a_daemon_or_upload_queue_with_a_trusted_job()
 #[test]
 fn a_scoped_socket_keeps_its_directory_and_extension() {
     assert_eq!(
-        scoped_socket_path(Path::new("/run/kache/daemon.sock"), "pr-0123abcd"),
+        scoped_socket_path(PathBuf::from("/run/kache/daemon.sock"), Some("pr-0123abcd")),
         PathBuf::from("/run/kache/daemon-pr-0123abcd.sock")
     );
     assert_eq!(
-        scoped_socket_path(Path::new("/run/kache/pipe"), "pr-0123abcd"),
+        scoped_socket_path(PathBuf::from("/run/kache/pipe"), Some("pr-0123abcd")),
         PathBuf::from("/run/kache/pipe-pr-0123abcd")
     );
 }

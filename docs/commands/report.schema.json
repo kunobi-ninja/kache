@@ -102,7 +102,7 @@
         "prefetch_hits": { "type": "integer", "minimum": 0 },
         "remote_hits": { "type": "integer", "minimum": 0 },
         "dups": { "type": "integer", "minimum": 0 },
-        "misses": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0, "description": "Includes keyed compiles whose output was declined for storage." },
         "errors": { "type": "integer", "minimum": 0 },
         "passthroughs": { "type": "integer", "minimum": 0 },
         "probes": { "type": "integer", "minimum": 0 },
@@ -310,7 +310,7 @@
       "type": "object",
       "required": ["prefetch_hits", "total_hits", "contribution_pct"],
       "properties": {
-        "prefetch_hits": { "type": "integer", "minimum": 0 },
+        "prefetch_hits": { "type": "integer", "minimum": 0, "description": "Recorded prefetch hits plus local hits attributed to a completed prefetch import." },
         "total_hits": { "type": "integer", "minimum": 0 },
         "contribution_pct": { "type": "number", "minimum": 0.0, "maximum": 100.0 }
       }
@@ -351,6 +351,8 @@
         "probes": { "type": "integer", "minimum": 0 },
         "skipped": { "type": "integer", "minimum": 0 },
         "fallbacks": { "type": "integer", "minimum": 0 },
+        "declined_stores": { "type": "integer", "minimum": 0, "description": "Uncached compiles also counted as misses." },
+        "declined_store_elapsed_ms": { "type": "integer", "minimum": 0, "description": "Wrapper time shared by uncached compiles and misses." },
         "direct_passthroughs": { "type": "integer", "minimum": 0 },
         "reasons": {
           "type": "array",

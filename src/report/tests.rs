@@ -88,7 +88,10 @@ fn a_blaze_command_is_separate_from_uncached_compiler_invocations() {
     workspace.elapsed_ms = 20;
     assert!(!ran_compiler_uncached(&command));
     assert!(ran_compiler_uncached(&workspace));
-    assert_eq!(uncached_compile_totals(&[command, workspace]), (1, 0, 20));
+    let bypass = uncached_compile_totals(&[command, workspace]);
+    assert_eq!(bypass.uncached_compiles, 1);
+    assert_eq!(bypass.edit_rebuilds, 0);
+    assert_eq!(bypass.uncached_compile_time_ms, 20);
 }
 
 /// A run at exactly the cutoff is inside the window: the comparison is
@@ -895,7 +898,47 @@ fn a_declined_store_counts_against_both_hit_rates() {
     let expected = (hits / a.total_crates as f64 * 1000.0).round() / 10.0;
     assert_eq!(a.hit_rate_pct, expected);
     let saved = a.time_saved_ms as f64;
-    let compiled = (after.timing.miss_compile_time_ms + 50_000) as f64;
+    assert_eq!(a.misses, b.misses + 1);
+    assert_eq!(
+        after.timing.miss_compile_time_ms,
+        before.timing.miss_compile_time_ms + 50_000
+    );
+    assert_eq!(after.bypass.declined_stores, 1);
+    assert_eq!(after.bypass.declined_store_elapsed_ms, 51_000);
+    assert_eq!(compiled_note(a, &after.bypass), "4 compiled, 2 not cached");
+    assert_eq!(
+        compiles_timing_row(a, &after.timing, &after.bypass),
+        timing_row("Compiles", 73_000, 18_250.0, "per crate")
+    );
+    assert!(format_text(&after).contains("3 of 6 crates from cache, 4 compiled, 2 not cached"));
+    assert_eq!(
+        after
+            .all_events
+            .iter()
+            .filter(|row| row.crate_name == "gen")
+            .count(),
+        1
+    );
+    assert!(after.all_events.iter().all(|row| row.crate_name != "probe"));
+    assert_eq!(
+        after.timeline.compiled_count,
+        before.timeline.compiled_count + 1
+    );
+    assert!(after.top_misses.iter().any(|row| row.crate_name == "gen"));
+    let es =
+        crate::cli::snapshot_from_direct_reads(&config, false, "size", SinceWindow::DEFAULT, false)
+            .event_stats;
+    assert_eq!(es.misses, a.misses);
+    assert_eq!(es.miss_compile_time_ms, after.timing.miss_compile_time_ms);
+    assert_eq!(
+        (crate::cli::count_hit_rate(&es) * 10.0).round() / 10.0,
+        a.hit_rate_pct
+    );
+    assert_eq!(
+        crate::cli::compile_weighted_hit_rate(&es).map(|rate| (rate * 10.0).round() / 10.0),
+        a.weighted_hit_rate_pct
+    );
+    let compiled = after.timing.miss_compile_time_ms as f64;
     let expected = (saved / (saved + compiled) * 1000.0).round() / 10.0;
     assert_eq!(a.weighted_hit_rate_pct, Some(expected));
     assert_eq!(a.cache_efficiency_pct, expected);
@@ -1050,12 +1093,129 @@ fn local_hit_on_an_entry_prefetch_imported_counts_as_a_prefetch_hit() {
 
     let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
     assert_eq!(
-        report.summary.prefetch_hits, 2,
-        "label plus one imported key"
+        report.summary.prefetch_hits, 1,
+        "summary preserves the recorded hit sources"
     );
-    assert_eq!(report.summary.local_hits, 2);
+    assert_eq!(report.summary.local_hits, 3);
     assert_eq!(report.prefetch.prefetch_hits, 2);
     assert_eq!(report.prefetch.total_hits, 5);
+    assert_eq!(report.prefetch.contribution_pct, 40.0);
+}
+
+#[test]
+fn prefetch_credit_requires_a_matching_import_by_first_demand() {
+    use kache_core::timeline::{
+        KeyDemand, PackedEntryTransfer, PrefetchAccounting, PrefetchOperation, PrefetchOrigin,
+    };
+
+    let mut hit = test_event("lib", EventResult::LocalHit, 200, 100, 0, "key");
+    hit.ts = jiff::Timestamp::from_millisecond(1000).unwrap();
+    hit.session_id = "build".into();
+    let origin = PrefetchOrigin {
+        session_id: "build".into(),
+        ..Default::default()
+    };
+    let mut get = test_transfer("lib", TransferDirection::Download, "v3", 10, 5, true);
+    get.cache_key = "key".into();
+    get.prefetch = Some(origin.clone());
+    get.finished_at_unix_ms = 801;
+    let credit = |hit: &BuildEvent, get: &TransferEvent| {
+        prefetch_served_local_hits(std::slice::from_ref(hit), std::slice::from_ref(get))
+    };
+    // Without a recorded demand, use the start of this invocation.
+    assert_eq!(credit(&hit, &get), 0);
+    get.finished_at_unix_ms = 800;
+    assert_eq!(credit(&hit, &get), 1);
+    hit.demands = vec![
+        KeyDemand {
+            cache_key: "other".into(),
+            first_demand_at_ms: 100,
+            ..Default::default()
+        },
+        KeyDemand {
+            cache_key: "key".into(),
+            first_demand_at_ms: 950,
+            ..Default::default()
+        },
+        KeyDemand {
+            cache_key: "key".into(),
+            first_demand_at_ms: 900,
+            ..Default::default()
+        },
+    ];
+    get.finished_at_unix_ms = 901;
+    assert_eq!(credit(&hit, &get), 0);
+    get.finished_at_unix_ms = 900;
+    assert_eq!(credit(&hit, &get), 1);
+    hit.readonly_store = true;
+    assert_eq!(credit(&hit, &get), 0);
+    hit.readonly_store = false;
+    hit.session_id = "another".into();
+    assert_eq!(credit(&hit, &get), 0);
+    hit.session_id = "build".into();
+    let mut explicit = hit.clone();
+    explicit.result = EventResult::PrefetchHit;
+    assert_eq!(
+        prefetch_served_local_hits(&[hit.clone(), hit.clone()], std::slice::from_ref(&get)),
+        1
+    );
+    assert_eq!(
+        prefetch_served_local_hits(&[hit.clone(), explicit], std::slice::from_ref(&get)),
+        0
+    );
+    let mut foreign_explicit = hit.clone();
+    foreign_explicit.result = EventResult::PrefetchHit;
+    foreign_explicit.session_id = "foreign".into();
+    assert_eq!(
+        prefetch_served_local_hits(&[hit.clone(), foreign_explicit], std::slice::from_ref(&get)),
+        1
+    );
+    let mut later = get.clone();
+    later.finished_at_unix_ms = 999;
+    assert_eq!(
+        prefetch_served_local_hits(std::slice::from_ref(&hit), &[later, get.clone()]),
+        1
+    );
+    let mut empty_hit = hit.clone();
+    empty_hit.cache_key.clear();
+    let mut empty_get = get.clone();
+    empty_get.cache_key.clear();
+    empty_get.finished_at_unix_ms = 10;
+    assert_eq!(credit(&empty_hit, &empty_get), 0);
+    get.ok = false;
+    assert_eq!(credit(&hit, &get), 0);
+    get.ok = true;
+    get.outcome = "not_found".into();
+    assert_eq!(credit(&hit, &get), 0);
+    get.outcome = "completed".into();
+    get.direction = TransferDirection::Upload;
+    assert_eq!(credit(&hit, &get), 0);
+    get.direction = TransferDirection::Download;
+    get.prefetch = None;
+    assert_eq!(credit(&hit, &get), 0);
+
+    // Each packed entry carries its own outcome, key, session and import time.
+    let entry = PackedEntryTransfer {
+        cache_key: "key".into(),
+        outcome: "completed".into(),
+        finished_at_ms: 900,
+        prefetch: origin,
+        ..Default::default()
+    };
+    get.accounting = Some(PrefetchAccounting {
+        entries: vec![entry],
+        ..Default::default()
+    });
+    get.cache_key = "pack".into();
+    assert_eq!(credit(&hit, &get), 1);
+    get.accounting.as_mut().unwrap().operation = PrefetchOperation::List;
+    assert_eq!(credit(&hit, &get), 0);
+    get.accounting.as_mut().unwrap().operation = PrefetchOperation::Get;
+    get.accounting.as_mut().unwrap().entries[0].outcome = "error".into();
+    assert_eq!(credit(&hit, &get), 0);
+    get.accounting.as_mut().unwrap().entries[0].outcome = "completed".into();
+    get.accounting.as_mut().unwrap().entries[0].finished_at_ms = 0;
+    assert_eq!(credit(&hit, &get), 0);
 }
 
 #[test]

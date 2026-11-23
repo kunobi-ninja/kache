@@ -2390,6 +2390,115 @@ fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Con
     Err(last_error.expect("try_open_index_db must record an error before returning"))
 }
 
+/// Ask the operating system why the index cannot be opened. SQLite reports
+/// `SQLITE_CANTOPEN` for "Permission denied", "Too many open files" and
+/// others alike, and its error carries no errno (#1698).
+///
+/// Checks the index and its `-wal` and `-shm` sidecars, in that order, and
+/// describes the first one that is unusable. A missing file is fine: SQLite
+/// can create it. This runs after the failed open, so a condition that has
+/// cleared by then reports nothing.
+///
+/// It never opens any of the three files. On Unix, closing any descriptor for
+/// a file drops every `fcntl` lock the process holds on that file. The daemon
+/// keeps the index open while it opens more connections to it, so an open and
+/// close here would release the locks of those connections and let another
+/// process write in the middle of their transactions. `stat` and `access`
+/// answer the same questions without a descriptor. When the files look fine,
+/// [`index_dir_open_os_error`] checks whether the process can open anything.
+#[cfg(unix)]
+fn index_open_os_error(db_path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Some(format!("opening {} read/write: {error}", path.display())),
+        };
+        if !metadata.is_file() {
+            return Some(format!(
+                "opening {} read/write: not a regular file",
+                path.display()
+            ));
+        }
+        // `metadata` has already refused a path with a NUL byte, and such a
+        // file cannot exist.
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            continue;
+        };
+        // One call per mode. The first refusal ends the search, so the errno
+        // read below belongs to it.
+        let refused = [libc::R_OK, libc::W_OK]
+            .into_iter()
+            // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+            .any(|mode| unsafe { libc::access(c_path.as_ptr(), mode) } != 0);
+        if refused {
+            let error = std::io::Error::last_os_error();
+            return Some(format!("opening {} read/write: {error}", path.display()));
+        }
+    }
+    index_dir_open_os_error(db_path.parent().filter(|dir| !dir.as_os_str().is_empty())?)
+}
+
+/// Whether the process can open the directory that holds the index. This is
+/// how the Unix probe notices "Too many open files" without opening the index:
+/// SQLite takes no lock on the directory, so closing it again is harmless.
+/// SQLite does not need to read the directory: it opens it only to sync it,
+/// and ignores a failure there. So a directory that can be searched and not
+/// read is named here even when it is not the cause.
+#[cfg(unix)]
+fn index_dir_open_os_error(dir: &Path) -> Option<String> {
+    match fs::File::open(dir) {
+        Ok(_) => None,
+        Err(error) => Some(format!("opening {}: {error}", dir.display())),
+    }
+}
+
+/// Ask the operating system why the index cannot be opened. SQLite reports
+/// `SQLITE_CANTOPEN` for many different causes and its error carries no
+/// errno (#1698).
+///
+/// Opens the index and its `-wal` and `-shm` sidecars read/write, in that
+/// order, and describes the first failure. Never creates, truncates or writes
+/// a file. A missing file is fine: SQLite can create it. This runs after the
+/// failed open, so a condition that has cleared by then reports nothing.
+///
+/// Opening is safe here, unlike on Unix: a Windows lock belongs to the handle
+/// that took it, and closing another handle to the same file leaves it alone.
+/// Tests build it on every platform, so the Linux mutation run covers it.
+#[cfg(any(test, not(unix)))]
+fn index_open_os_error_by_opening(db_path: &Path) -> Option<String> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Some(format!("opening {} read/write: {error}", path.display())),
+        }
+    }
+    None
+}
+
+/// Context for a failed index open: the path, plus what this platform's
+/// probe finds, if anything.
+fn index_open_failure_context(db_path: &Path) -> String {
+    let context = format!("opening index database {}", db_path.display());
+    #[cfg(unix)]
+    let found = index_open_os_error(db_path);
+    #[cfg(not(unix))]
+    let found = index_open_os_error_by_opening(db_path);
+    match found {
+        Some(os_error) => format!("{context} (a direct check reports: {os_error})"),
+        None => context,
+    }
+}
+
 /// Whether a SQLite error means the database file itself is unusable
 /// (`SQLITE_CORRUPT` / `SQLITE_NOTADB`) — the rebuildable-index case
 /// [`open_index_db`] self-heals, as opposed to a transient open failure.
@@ -2564,7 +2673,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
         let db_path = config.index_db_path();
         let (db, recovered) = open_index_db_reporting_recovery(&db_path, config.index_mode)
-            .with_context(|| format!("opening index database {}", db_path.display()))?;
+            .with_context(|| index_open_failure_context(&db_path))?;
 
         let store = Self {
             policy: std::marker::PhantomData,

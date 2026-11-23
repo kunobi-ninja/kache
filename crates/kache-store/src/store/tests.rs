@@ -16405,3 +16405,323 @@ fn parallel_retainer_probes_answer_in_the_order_asked() {
     assert_eq!(super::probe_external_retainers(&paths[..8]), expected[..8]);
     assert!(super::probe_external_retainers(&[]).is_empty());
 }
+
+/// The index and its two sidecars inside `dir`.
+fn index_open_probe_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        dir.join("index.db"),
+        dir.join("index.db-wal"),
+        dir.join("index.db-shm"),
+    )
+}
+
+/// A probe and whether it works by opening the files.
+type IndexOpenProbe = (fn(&Path) -> Option<String>, bool);
+
+/// Every probe, on every platform that can build it. The opening probe is
+/// what non-Unix platforms use, and it is tested everywhere.
+fn index_open_probes() -> Vec<IndexOpenProbe> {
+    vec![
+        #[cfg(unix)]
+        (super::index_open_os_error, false),
+        (super::index_open_os_error_by_opening, true),
+    ]
+}
+
+/// What a probe must say about `path` when it is a directory. A directory
+/// in place of a file is the portable way to break the index: no platform
+/// accepts it, root included, and it is never reported as missing. The Unix
+/// probe names the kind of file. The opening probe passes on the error of
+/// the failed open.
+fn assert_index_open_probe_reports_directory(found: &str, path: &Path, opens: bool) {
+    let prefix = format!("opening {} read/write: ", path.display());
+    assert!(found.starts_with(&prefix), "found = {found}");
+    if opens {
+        assert!(found.contains("os error"), "found = {found}");
+    } else {
+        assert_eq!(found, format!("{prefix}not a regular file"));
+    }
+}
+
+#[test]
+fn index_open_os_error_names_an_unopenable_index() {
+    for (probe, opens) in index_open_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, _, _) = index_open_probe_paths(dir.path());
+        std::fs::create_dir(&index).unwrap();
+
+        let found = probe(&index).expect("a directory is not an index");
+        assert_index_open_probe_reports_directory(&found, &index, opens);
+    }
+}
+
+#[test]
+fn index_open_os_error_names_the_failing_sidecar() {
+    for (probe, opens) in index_open_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, wal, shm) = index_open_probe_paths(dir.path());
+        std::fs::write(&index, b"").unwrap();
+        std::fs::create_dir(&wal).unwrap();
+
+        let found = probe(&index).expect("the wal is a directory");
+        assert_index_open_probe_reports_directory(&found, &wal, opens);
+
+        std::fs::remove_dir(&wal).unwrap();
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::create_dir(&shm).unwrap();
+
+        let found = probe(&index).expect("the shm is a directory");
+        assert_index_open_probe_reports_directory(&found, &shm, opens);
+    }
+}
+
+#[test]
+fn index_open_os_error_is_silent_for_missing_and_healthy_files() {
+    for (probe, opens) in index_open_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, wal, shm) = index_open_probe_paths(dir.path());
+        assert_eq!(probe(&index), None, "all missing, opens = {opens}");
+
+        for path in [&index, &wal, &shm] {
+            std::fs::write(path, b"kept").unwrap();
+        }
+        assert_eq!(probe(&index), None, "all usable, opens = {opens}");
+        for path in [&index, &wal, &shm] {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"kept",
+                "the probe never writes"
+            );
+        }
+    }
+}
+
+/// A path the Unix probe cannot even examine is reported with that error:
+/// here the index's parent is a regular file.
+#[cfg(unix)]
+#[test]
+fn index_open_os_error_names_a_path_it_cannot_examine() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    let index = blocker.join("index.db");
+
+    let found = super::index_open_os_error(&index).expect("the parent is a file");
+    let prefix = format!("opening {} read/write: ", index.display());
+    assert!(found.starts_with(&prefix), "found = {found}");
+    assert!(found.contains("os error"), "found = {found}");
+}
+
+#[test]
+fn index_open_failure_context_adds_the_os_error_only_when_there_is_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, _, _) = index_open_probe_paths(dir.path());
+    let plain = format!("opening index database {}", index.display());
+    assert_eq!(super::index_open_failure_context(&index), plain);
+
+    std::fs::create_dir(&index).unwrap();
+    #[cfg(unix)]
+    let os_error = super::index_open_os_error(&index).unwrap();
+    #[cfg(not(unix))]
+    let os_error = super::index_open_os_error_by_opening(&index).unwrap();
+    assert_eq!(
+        super::index_open_failure_context(&index),
+        format!("{plain} (a direct check reports: {os_error})")
+    );
+}
+
+#[test]
+fn store_open_failure_names_the_os_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let index = config.index_db_path();
+    std::fs::create_dir(&index).unwrap();
+
+    let err = match Store::open_with_options(&config, StoreOptions::from_env(|_| None)) {
+        Ok(_) => panic!("a directory is not an index"),
+        Err(err) => err,
+    };
+    let text = format!("{err:#}");
+    // Spelled out here, so the text does not depend on the probe under test.
+    let expected = format!(
+        "opening index database {index} (a direct check reports: opening {index} read/write: ",
+        index = index.display()
+    );
+    assert!(text.starts_with(&expected), "text = {text}");
+}
+
+/// Whether a mode of 000 keeps this process out of a file. It does not for
+/// root, so the tests that depend on it return early there.
+#[cfg(unix)]
+fn mode_000_denies_access(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = dir.join("mode-000-scratch");
+    std::fs::write(&scratch, b"").unwrap();
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&scratch)
+        .is_err()
+}
+
+#[cfg(unix)]
+#[test]
+fn index_open_os_error_names_an_index_the_process_may_not_use() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    if !mode_000_denies_access(dir.path()) {
+        return;
+    }
+    let (index, _, _) = index_open_probe_paths(dir.path());
+    std::fs::write(&index, b"").unwrap();
+    let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+    // Unreadable and unwritable, read-only, then write-only.
+    for mode in [0o000, 0o400, 0o200] {
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            super::index_open_os_error(&index),
+            Some(format!("opening {} read/write: {denied}", index.display())),
+            "mode {mode:o}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn index_open_os_error_names_a_sidecar_the_process_may_not_use() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    if !mode_000_denies_access(dir.path()) {
+        return;
+    }
+    let (index, wal, _) = index_open_probe_paths(dir.path());
+    std::fs::write(&index, b"").unwrap();
+    std::fs::write(&wal, b"").unwrap();
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+    assert_eq!(
+        super::index_open_os_error(&index),
+        Some(format!("opening {} read/write: {denied}", wal.display()))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_dir_open_os_error_names_a_directory_that_cannot_be_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(super::index_dir_open_os_error(dir.path()), None);
+
+    let missing = dir.path().join("missing");
+    let found = super::index_dir_open_os_error(&missing).expect("no such directory");
+    let prefix = format!("opening {}: ", missing.display());
+    assert!(found.starts_with(&prefix), "found = {found}");
+    assert!(found.contains("os error"), "found = {found}");
+}
+
+#[cfg(unix)]
+#[test]
+fn index_open_os_error_checks_the_directory_when_the_files_look_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let (index, _, _) = index_open_probe_paths(&missing);
+
+    let found = super::index_open_os_error(&index).expect("the directory is missing");
+    assert_eq!(
+        Some(found),
+        super::index_dir_open_os_error(&missing),
+        "the directory check supplies the answer"
+    );
+    // A bare file name has no directory to name.
+    assert_eq!(
+        super::index_open_os_error(Path::new("kache-no-such-index.db")),
+        None
+    );
+}
+
+/// Ask for a write lock on the whole file without waiting. `false` means
+/// another process holds a lock that conflicts.
+#[cfg(unix)]
+// The lock type constants are `c_short` on some platforms and `c_int` on others.
+#[allow(clippy::unnecessary_cast)]
+fn try_fcntl_write_lock(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `flock` is plain integers, and zero means "from the start of the
+    // file to its end" for the fields not set below.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    // SAFETY: the descriptor is open and `lock` outlives the call.
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) == 0 }
+}
+
+/// The daemon holds the index open and opens more connections to it. A probe
+/// that opened and closed the index would drop the `fcntl` locks of all of
+/// them, and another process could then write inside their transactions.
+#[cfg(unix)]
+#[test]
+fn index_open_os_error_keeps_the_locks_this_process_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, _, _) = index_open_probe_paths(dir.path());
+    std::fs::write(&index, b"").unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&index)
+        .unwrap();
+    assert!(try_fcntl_write_lock(&holder), "the test takes the lock");
+
+    assert_eq!(super::index_open_os_error(&index), None);
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "store::tests::index_open_probe_lock_child_fixture",
+            "--ignored",
+        ])
+        .env("KACHE_TEST_INDEX_PROBE_LOCK_ROOT", dir.path())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(status) => {
+                assert!(status.success(), "lock fixture failed: {status}");
+                break;
+            }
+            None if std::time::Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("lock fixture did not finish");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("lock-result")).unwrap(),
+        "refused",
+        "the probe must leave this process's lock on the index in place"
+    );
+    drop(holder);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess fixture for index_open_os_error_keeps_the_locks_this_process_holds"]
+fn index_open_probe_lock_child_fixture() {
+    let root =
+        PathBuf::from(std::env::var_os("KACHE_TEST_INDEX_PROBE_LOCK_ROOT").expect("fixture root"));
+    let (index, _, _) = index_open_probe_paths(&root);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&index)
+        .unwrap();
+    let result = if try_fcntl_write_lock(&file) {
+        "acquired"
+    } else {
+        "refused"
+    };
+    std::fs::write(root.join("lock-result"), result).unwrap();
+}

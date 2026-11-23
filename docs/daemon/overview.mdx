@@ -67,7 +67,7 @@ local store. After Commit, a lost daemon connection fails the invocation; see
 
 ## Endpoint placement
 
-The runtime directory defaults to the cache directory. On Unix the default socket is `<runtime_dir>/daemon.sock`; Windows derives a named-pipe name from that path. Move the runtime directory with `[cache] runtime_dir` or `KACHE_RUNTIME_DIR`, or only the endpoint with an absolute `KACHE_SOCKET_PATH`. `KACHE_SOCKET_PATH` has no config-file key, and a relative or unusable value is ignored with a warning.
+The runtime directory defaults to the cache directory. A new Unix store uses `<cache_dir>/ipc/daemon.sock`. A separate runtime directory or an existing private store with a legacy daemon uses `<runtime_dir>/daemon.sock`. Windows derives its named pipe from `<runtime_dir>/daemon.sock`. Move the runtime directory with `[cache] runtime_dir` or `KACHE_RUNTIME_DIR`, or only the endpoint with an absolute `KACHE_SOCKET_PATH`. `KACHE_SOCKET_PATH` has no config-file key, and a relative or unusable value is ignored with a warning.
 
 The daemon also binds a lifecycle control endpoint next to the socket: the socket path with its extension replaced by `.ctl`. With the default `daemon.sock` it is one byte shorter than the socket. A custom `KACHE_SOCKET_PATH` without an extension gets a longer one.
 

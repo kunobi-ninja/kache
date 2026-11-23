@@ -814,6 +814,7 @@ async fn each_bind_gets_an_endpoint_name_of_its_own() {
 /// Bind a daemon-style listener at `path`, taking the cross-platform
 /// transport. Used by every roundtrip test to remove boilerplate.
 fn bind_listener(path: &Path) -> TokioListener {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let name = socket_name(path).expect("socket name");
     ListenerOptions::new()
         .name(name)
@@ -5256,7 +5257,7 @@ fn test_handle_stats_empty_store() {
     assert_eq!(eff.cache_dir, dir.path().display().to_string());
     assert_eq!(
         eff.socket_path,
-        dir.path().join("daemon.sock").display().to_string()
+        daemon.config.socket_path().display().to_string()
     );
     assert!(eff.started_at_ms > 0, "startup capture stamps a time");
     assert!(eff.config_fingerprint.is_some());

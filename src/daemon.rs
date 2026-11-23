@@ -373,7 +373,7 @@ impl Drop for DaemonCoordGuard {
 
 /// Create a missing socket parent privately before opening daemon locks. The
 /// transport also verifies the owner and binds the socket with mode 0600.
-fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
+pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
     let dir = socket.parent().context("daemon socket has no parent")?;
     #[cfg(unix)]
     {
@@ -417,7 +417,7 @@ fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
             .is_ok_and(|store| store.dev() == meta.dev() && store.ino() == meta.ino());
         if is_store {
             anyhow::ensure!(
-                meta.mode() & 0o7077 == 0,
+                meta.mode() & 0o7777 == 0o700,
                 "daemon socket shares a cache directory with non-private permissions; set KACHE_RUNTIME_DIR to a private directory"
             );
         } else if dir == config.runtime_dir && meta.mode() & 0o022 == 0 {

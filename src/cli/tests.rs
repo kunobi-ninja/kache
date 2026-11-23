@@ -7596,6 +7596,7 @@ fn standalone_sync_leaves_pending_work_to_a_reachable_daemon() {
             "",
         )
         .unwrap();
+    crate::daemon::prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
     let listener = crate::transport::ListenerOptions::new()
         .name(crate::transport::socket_name(&config.socket_path()).unwrap())
         .create_sync()

@@ -182,7 +182,7 @@ pub struct Config {
     /// follows that isolated path; an explicit runtime dir does not.
     pub runtime_dir: PathBuf,
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
-    /// `None` keeps the default `<runtime_dir>/daemon.sock` placement.
+    /// `None` selects the default daemon endpoint.
     pub socket_path_override: Option<PathBuf>,
     /// Volume-local store shards from `[cache.volumes]` (empty when
     /// unconfigured). The wrapper opens the matching shard as `cache_dir`
@@ -5216,7 +5216,7 @@ pub fn default_daemon_socket(cache: &Path, runtime: &Path, scope: Option<&str>) 
         // Older daemons leave the run lock behind when they stop. A fresh
         // store always chooses ipc, even before the store directory exists.
         let legacy = std::fs::symlink_metadata(runtime)
-            .is_ok_and(|meta| meta.is_dir() && meta.permissions().mode() & 0o7077 == 0)
+            .is_ok_and(|meta| meta.is_dir() && meta.permissions().mode() & 0o7777 == 0o700)
             && socket.with_extension("run.lock").is_file()
             && !ipc.with_extension("run.lock").is_file();
         if !legacy {
@@ -5246,7 +5246,7 @@ fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathB
     let raw = raw?;
     if raw.is_empty() {
         tracing::warn!(
-            "ignoring empty KACHE_SOCKET_PATH; falling back to <runtime_dir>/daemon.sock"
+            "ignoring empty KACHE_SOCKET_PATH; falling back to the default daemon socket"
         );
         return None;
     }

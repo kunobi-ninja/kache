@@ -151,8 +151,7 @@ performs brokered restores under its own process restrictions:
 - index upkeep, target-directory cleanup and target-file sharing when the machine is quiet
 - monitor statistics that require live transfer state
 
-The client connects through `<runtime_dir>/daemon.sock` on Unix or a named pipe
-on Windows. Before Commit, an unavailable daemon leaves the local engine
+The client connects through a private Unix socket or a Windows named pipe. Before Commit, an unavailable daemon leaves the local engine
 responsible for compilation and local caching. Remote work is skipped or
 deferred on that path.
 

@@ -1182,6 +1182,10 @@ mod tests {
     fn path_locks_conflict_on_ancestors_and_descendants_only() {
         let fx = Fixture::new();
         let held = lease_locks(&fx.cache, &[fx.at("a/b"), fx.at("elsewhere/x")]);
+        let conflicts = |target: &str| {
+            let target = normalize(&fx.at(target)).unwrap();
+            reservation_locks(&fx.cache, &target).any(|lock| held.contains(&lock))
+        };
         for target in [
             "",
             "a",
@@ -1190,16 +1194,10 @@ mod tests {
             "elsewhere",
             "elsewhere/x/release",
         ] {
-            assert!(
-                reservation_locks(&fx.cache, &fx.at(target)).any(|lock| held.contains(&lock)),
-                "{target:?} should be held"
-            );
+            assert!(conflicts(target), "{target:?} should be held");
         }
         for target in ["a/another", "a/bb", "elsewhere/y", "c"] {
-            assert!(
-                !reservation_locks(&fx.cache, &fx.at(target)).any(|lock| held.contains(&lock)),
-                "{target:?} should be free"
-            );
+            assert!(!conflicts(target), "{target:?} should be free");
         }
     }
 

@@ -1506,6 +1506,14 @@ impl EvictionWritePacer {
 /// on a separate connection, so metadata reads do not hold its Store mutex.
 const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 
+/// Deletes the blobs of one entry whose refcount dropped to zero. A batch
+/// import runs it once per entry while it holds the index write lock, so it
+/// must find the entry's blobs through indexes, never by scanning `blobs`.
+const DELETE_ENTRY_UNREFERENCED_BLOBS: &str = "DELETE FROM blobs
+     WHERE refcount <= 0 AND hash IN (
+         SELECT hash FROM entry_blobs WHERE cache_key = ?1
+     )";
+
 /// How long a post-eviction demand record is kept (kunobi-ninja/kache#594).
 ///
 /// A tombstone earns its keep by answering "was this key wanted again soon
@@ -2217,13 +2225,7 @@ fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusq
          )",
         params![cache_key],
     )?;
-    conn.execute(
-        "DELETE FROM blobs
-         WHERE refcount <= 0 AND hash IN (
-             SELECT hash FROM entry_blobs WHERE cache_key = ?1
-         )",
-        params![cache_key],
-    )?;
+    conn.execute(DELETE_ENTRY_UNREFERENCED_BLOBS, params![cache_key])?;
     conn.execute(
         "DELETE FROM entry_blobs WHERE cache_key = ?1",
         params![cache_key],
@@ -2800,6 +2802,30 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Borrow the persistent memo without exposing the index connection.
     pub fn file_hash_cache(&self) -> crate::file_hash::FileHashCache<'_> {
         crate::file_hash::FileHashCache::Borrowed(&self.db)
+    }
+
+    /// Store the input prediction for `identity`, first deleting the one
+    /// stored for `stale`, in one write transaction that waits for a busy
+    /// index as long as a compile store does. The prediction is written after
+    /// its run is stored, and a lookup cannot compute that run's key without
+    /// it.
+    pub fn record_input_prediction(
+        &self,
+        stale: Option<&str>,
+        identity: &str,
+        schema: u32,
+        crate_name: Option<&str>,
+        prediction_json: &str,
+    ) -> Result<()> {
+        self.refuse_write("record an input prediction")?;
+        let tx = self.begin_immediate_writer()?;
+        let cache = crate::file_hash::FileHashCache::Borrowed(&tx);
+        if let Some(stale) = stale {
+            cache.delete_input_prediction(stale)?;
+        }
+        cache.put_input_prediction(identity, schema, crate_name, prediction_json)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Check if a committed entry exists for this cache key.
@@ -3690,37 +3716,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let total_size: u64 = meta.files.iter().map(|file| file.size).sum();
             let crate_type = meta.crate_types.join(",");
             let content_hash = compute_content_hash(&meta.files);
-            // A crash or legacy importer may have left an uncommitted row.
-            // It is not a cache hit and must not permanently block a verified
-            // replacement through INSERT OR IGNORE. Undo any partial mapping
-            // bookkeeping in this same transaction before replacing it.
-            tx.execute(
-                "UPDATE blobs
-                 SET refcount = MAX(0, refcount - COALESCE((
-                     SELECT refs FROM entry_blobs
-                     WHERE cache_key = ?1 AND hash = blobs.hash
-                 ), 0))
-                 WHERE hash IN (
-                     SELECT hash FROM entry_blobs WHERE cache_key = ?1
-                 ) AND EXISTS (
-                     SELECT 1 FROM entries
-                     WHERE cache_key = ?1 AND committed = 0
-                 )",
-                params![entry.cache_key],
-            )?;
-            tx.execute(
-                "DELETE FROM entry_blobs
-                 WHERE cache_key = ?1 AND EXISTS (
-                     SELECT 1 FROM entries
-                     WHERE cache_key = ?1 AND committed = 0
-                 )",
-                params![entry.cache_key],
-            )?;
+            // An unfinished generation cannot win INSERT OR IGNORE. Keep its
+            // mappings until we release its references below.
             tx.execute(
                 "DELETE FROM entries WHERE cache_key = ?1 AND committed = 0",
                 params![entry.cache_key],
             )?;
-            tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, unixepoch(), 1, ?11)",
                 params![
@@ -3746,8 +3747,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if inserted == 0 {
                 continue;
             }
-            // No row owned this key, so a mapping still recorded for it is
-            // a leftover whose references nothing else will release.
+            // This key had an unfinished row or none at all. Release its old
+            // mappings before counting the new files, preserving shared blobs
+            // even when an older importer failed to count every mapping.
             release_entry_blob_refs(&tx, &entry.cache_key)?;
 
             for file in &meta.files {

@@ -4555,6 +4555,41 @@ fn put_entry(store: &Store, dir: &Path, seed: u8, crate_name: &str, content: &[u
 }
 
 #[test]
+fn checkout_entries_survive_index_rebuild_outside_the_legacy_sync_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let bound = format!("checkout-{}", key(1));
+    let artifact = dir.path().join("out.rlib");
+    std::fs::write(&artifact, b"checkout path").unwrap();
+    {
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                &bound,
+                "foo",
+                &[],
+                &[],
+                "target",
+                "debug",
+                &[(artifact, "libfoo.rlib".to_owned())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert!(!config.store_dir().join(&bound).exists());
+        assert!(store.entry_dir(&bound).join("meta.json").is_file());
+    }
+    std::fs::remove_file(config.index_db_path()).unwrap();
+    let store = Store::open(&config).unwrap();
+    store.rebuild_index_from_store().unwrap();
+    assert!(store.get(&bound).unwrap().is_some());
+    assert_eq!(
+        key_of_lock_name(&format!("{bound}.lock")),
+        Some(bound.as_str())
+    );
+}
+
+#[test]
 fn rebuild_index_from_store_recovers_entries_after_the_index_is_lost() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());

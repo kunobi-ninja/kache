@@ -51,7 +51,11 @@ fn checkout_key(key: &str, checkout: &[u8]) -> String {
     hasher.update(key.as_bytes());
     hasher.update(b"\0");
     hasher.update(checkout);
-    hasher.finalize().to_hex().to_string()
+    format!(
+        "{}{}",
+        kache_format::CHECKOUT_KEY_PREFIX,
+        hasher.finalize().to_hex()
+    )
 }
 
 /// The key for rendered diagnostics at `columns`. Derived from the shared key
@@ -219,7 +223,8 @@ mod tests {
             ]
         );
         let bound = &keys[2].key;
-        assert!(kache_format::is_valid_cache_key(bound), "{bound}");
+        assert!(kache_format::is_checkout_key(bound), "{bound}");
+        assert!(!kache_format::is_valid_cache_key(bound));
         let elsewhere = args_in(&[], &[("CARGO_MANIFEST_DIR", "/w/two/a")]);
         assert!(!local_lookup_keys(&elsewhere, &shared).any(|key| key == keys[2]));
         assert_eq!(lookup_keys(&cargo, &shared), [shared_key, width]);

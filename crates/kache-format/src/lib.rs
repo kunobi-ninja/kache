@@ -116,6 +116,19 @@ pub fn is_valid_cache_key(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
+/// Checkout entries share the local store and have no corresponding remote key.
+pub const CHECKOUT_KEY_PREFIX: &str = "checkout-";
+
+pub fn is_checkout_key(key: &str) -> bool {
+    key.strip_prefix(CHECKOUT_KEY_PREFIX)
+        .is_some_and(is_valid_cache_key)
+}
+
+/// Entry keys accepted by local store maintenance.
+pub fn is_valid_store_key(key: &str) -> bool {
+    is_valid_cache_key(key) || is_checkout_key(key)
+}
+
 /// Is `s` a crate name safe to use as an S3 object-key path component?
 ///
 /// Permissive enough for real crate names and cc source basenames
@@ -202,6 +215,19 @@ mod tests {
             "warning: processing debug info with `dsymutil` failed: exit status: 1\n"
         ));
     }
+    #[test]
+    fn checkout_keys_are_local_entry_names() {
+        let digest = "a".repeat(64);
+        let checkout = format!("checkout-{digest}");
+        assert!(is_checkout_key(&checkout));
+        assert!(is_valid_store_key(&checkout));
+        assert!(is_valid_store_key(&digest));
+        assert!(!is_valid_cache_key(&checkout));
+        for invalid in ["checkout-", "checkout-../abc", "checkout-digest"] {
+            assert!(!is_valid_store_key(invalid));
+        }
+    }
+
     #[test]
     fn debug_info_tool_failure_ignores_clean_and_unrelated_output() {
         assert!(!reports_debug_info_tool_failure(""));

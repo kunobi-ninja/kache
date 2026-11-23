@@ -5994,6 +5994,11 @@ fn remove_targets(
     let mut held = Vec::new();
     for target in to_remove {
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
+        let reservation =
+            crate::target_use::try_exclusive(cache_dir, &target.path).unwrap_or_else(|error| {
+                tracing::warn!("cannot check running Cargo commands before clean: {error}");
+                None
+            });
         let current_identity = directory_identity(&target.path);
         if target.scanned_identity.is_none() || current_identity != target.scanned_identity {
             const CHANGED: &str = "directory changed since scan; refusing to remove";
@@ -6003,11 +6008,6 @@ fn remove_targets(
             failed.push(CleanFailed::new(&target.path, CHANGED));
             continue;
         }
-        let reservation =
-            crate::target_use::try_exclusive(cache_dir, &target.path).unwrap_or_else(|error| {
-                tracing::warn!("cannot check running Cargo commands before clean: {error}");
-                None
-            });
         let Some(_reservation) = reservation else {
             let holders = crate::target_use::holders_covering(cache_dir, &target.path);
             let reason = held_reason(&holders, kache_store::markers::now_epoch_secs());

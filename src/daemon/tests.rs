@@ -3304,6 +3304,132 @@ fn test_handle_gc_reports_lock_skip() {
     assert_eq!(report.total.entries_evicted, 0);
 }
 
+/// A periodic sweep that finds a store's `gc.lock` held (an automatic size
+/// sweep ranking for minutes) asks again for that store alone after a pause,
+/// instead of leaving its age pass and housekeeping to the next interval, six
+/// hours on. A store still held after the retries is left to the timer.
+#[tokio::test]
+async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    let shard_dir = dir.path().join("shard");
+    config.volume_stores = vec![crate::config::VolumeStore {
+        volume: shard_dir.to_string_lossy().into_owned(),
+        store: shard_dir,
+        max_size: None,
+    }];
+    let shard = config.for_volume_store(&config.volume_stores[0], |_| None);
+    let main = Store::open(&config).unwrap();
+    Store::open(&shard).unwrap();
+    // A stale key lock with no entry: what a sweep's housekeeping removes.
+    let stale_lock = |store: &Config| {
+        let path = store
+            .store_dir()
+            .join(format!("{}.lock", blake3::hash(b"stale").to_hex()));
+        std::fs::write(&path, b"1").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        path
+    };
+    let main_lock = stale_lock(&config);
+    let shard_lock = stale_lock(&shard);
+    let daemon = Daemon::new(config);
+    let sweep = |stores| std::future::ready(daemon.periodic_gc(stores));
+
+    // The main store held through every try: the first sweep sweeps the
+    // shard, the retries ask for the main store alone, then stop. Each pause
+    // notes whether the shard's lock went and puts it back.
+    let held = main.try_gc_lock().unwrap().expect("gc lock");
+    let mut shard_swept = Vec::new();
+    let started = run_periodic_gc(
+        sweep,
+        |pause| {
+            assert_eq!(pause, PERIODIC_GC_RETRY);
+            assert!(shard_swept.len() < 2, "at most two retries, so two pauses");
+            shard_swept.push(!shard_lock.exists());
+            stale_lock(&shard);
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        2,
+    )
+    .await;
+    assert_eq!(started, 3, "one sweep and two retries");
+    assert_eq!(
+        shard_swept,
+        [true, false],
+        "only the first sweep swept the shard"
+    );
+    assert!(shard_lock.exists(), "the last retry left the shard alone");
+    assert!(
+        main_lock.exists(),
+        "no sweep of the main store ran while it was held"
+    );
+
+    // Let go during the first pause: the retry sweeps the main store.
+    let held = std::cell::Cell::new(Some(held));
+    let mut pauses = 0;
+    let started = run_periodic_gc(
+        sweep,
+        |_| {
+            pauses += 1;
+            held.take();
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        PERIODIC_GC_RETRIES,
+    )
+    .await;
+    assert_eq!((started, pauses), (2, 1));
+    assert!(
+        !main_lock.exists(),
+        "the retry ran the main store's housekeeping"
+    );
+
+    // A held shard is asked again too, and swept once let go.
+    let shard_store = Store::open(&shard).unwrap();
+    let shard_lock = stale_lock(&shard);
+    let held = std::cell::Cell::new(Some(shard_store.try_gc_lock().unwrap().expect("gc lock")));
+    let started = run_periodic_gc(
+        sweep,
+        |_| {
+            held.take();
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        PERIODIC_GC_RETRIES,
+    )
+    .await;
+    assert_eq!(started, 2);
+    assert!(!shard_lock.exists(), "the retry swept the shard");
+
+    // A held shard whose volume went away during the pause (its index gone)
+    // is not opened again, which would create the store on the mount point.
+    stale_lock(&shard);
+    let held = std::cell::Cell::new(Some(shard_store.try_gc_lock().unwrap().expect("gc lock")));
+    drop(shard_store);
+    let started = run_periodic_gc(
+        sweep,
+        |_| {
+            held.take();
+            std::fs::remove_dir_all(&shard.cache_dir).unwrap();
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        PERIODIC_GC_RETRIES,
+    )
+    .await;
+    assert_eq!(started, 2);
+    assert!(
+        !shard.cache_dir.exists(),
+        "the retry left the gone shard alone"
+    );
+}
+
 #[test]
 fn test_handle_gc_with_max_age() {
     let dir = tempfile::tempdir().unwrap();

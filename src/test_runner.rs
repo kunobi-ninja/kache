@@ -101,11 +101,24 @@ fn binary_label(binary: &OsStr) -> String {
 /// The directory the binary runs from: removing any target that holds it
 /// would take the binary and the files it reads beside it.
 fn binary_scope(binary: &OsStr) -> crate::target_use::Scope {
+    use crate::target_use::Scope;
     let path = Path::new(binary);
-    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(dir) => crate::target_use::Scope::within([dir.to_path_buf()]),
-        None => crate::target_use::Scope::Everything,
+    // CreateProcess can append .exe when the supplied name lacks an extension.
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        return Scope::Everything;
     }
+    let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Scope::Everything;
+    };
+    let Ok(real) = path.canonicalize() else {
+        return Scope::Everything;
+    };
+    let Some(real_dir) = real.parent() else {
+        return Scope::Everything;
+    };
+    // The launcher can be a symlink into another target. Keep both directories.
+    Scope::within([dir.to_owned(), real_dir.to_owned()])
 }
 
 /// Run `args` (the test binary, then its arguments) and return the exit code
@@ -133,12 +146,12 @@ pub fn run(args: &[OsString]) -> i32 {
     let test_args = args[1..].iter().map(OsString::as_os_str);
     let target_use = match cache_dir
         .map(|dir| {
-            crate::target_use::shared_for(
-                dir,
-                &binary_scope(&args[0]),
-                &binary_label(&args[0]),
-                test_args,
-            )
+            let scope = if crate::target_use::SCOPED_LOCKS {
+                binary_scope(&args[0])
+            } else {
+                crate::target_use::Scope::Everything
+            };
+            crate::target_use::shared_for(dir, &scope, &binary_label(&args[0]), test_args)
         })
         .transpose()
     {
@@ -505,6 +518,31 @@ mod tests {
         ] {
             assert!(!is_help_flag(OsStr::new(binary)), "{binary}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runner_symlink_keeps_both_binary_directories() {
+        use crate::target_use::Scope;
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&launch).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let program = target.join("test");
+        std::fs::write(&program, "").unwrap();
+        let link = launch.join("test");
+        std::os::unix::fs::symlink(&program, &link).unwrap();
+        assert_eq!(
+            binary_scope(link.as_os_str()),
+            Scope::within([launch, target])
+        );
+        std::fs::remove_file(program).unwrap();
+        assert_eq!(binary_scope(link.as_os_str()), Scope::Everything);
+        assert_eq!(binary_scope(OsStr::new("test")), Scope::Everything);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert_eq!(binary_scope(link.as_os_str()), Scope::Everything);
     }
 
     #[test]

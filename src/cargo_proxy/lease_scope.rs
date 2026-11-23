@@ -1,13 +1,5 @@
-//! Which directories a Cargo command may build in, for its target lease.
-//!
-//! Cargo puts a workspace's output in `<workspace root>/target` unless a
-//! `--target-dir`, a `CARGO_*_DIR` variable or a config `build.target-dir`
-//! or `build.build-dir` moves it. The workspace root is the manifest's own
-//! directory or an ancestor, so the topmost ancestor with a `Cargo.toml`
-//! contains it. Leasing that ancestor and every directory the command moves
-//! output to keeps every target the command can touch. Anything this cannot
-//! read for certain (`-C`, a `--config` that may move output, a config
-//! `include`, a template it does not know) leases everything.
+//! Limit leases to known Cargo build layouts. An unknown command, option,
+//! workspace or placement policy keeps the cache-wide lease.
 
 use super::*;
 use crate::target_use::Scope;
@@ -18,15 +10,44 @@ const DIR_VARIABLES: [&str; 3] = [
     "CARGO_BUILD_BUILD_DIR",
 ];
 
-/// The lease scope of Cargo run with `args` in `cwd`.
-pub(super) fn of(cwd: &Path, args: &[OsString], env: &crate::invocation::InvocationEnv) -> Scope {
-    let cargo_home = match env.var_os("CARGO_HOME").filter(|home| !home.is_empty()) {
-        Some(home) => Some(cwd.join(home)),
+pub(super) fn of(
+    cwd: &Path,
+    args: &[OsString],
+    env: &crate::invocation::InvocationEnv,
+    separate_checks: bool,
+) -> Scope {
+    if !crate::target_use::SCOPED_LOCKS {
+        return Scope::Everything;
+    }
+    configured_scope(cwd, args, env, separate_checks)
+}
+
+fn configured_scope(
+    cwd: &Path,
+    args: &[OsString],
+    env: &crate::invocation::InvocationEnv,
+    separate_checks: bool,
+) -> Scope {
+    if env.vars_os().any(|(name, _)| {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let key = name.to_ascii_uppercase();
+        key.starts_with("CARGO_UNSTABLE_")
+            || key.starts_with("CARGO_CONFIG_")
+            || key == "CARGO_INCLUDE"
+            || (key.starts_with("CARGO_")
+                && key.ends_with("_DIR")
+                && !DIR_VARIABLES.contains(&key.as_str()))
+    }) {
+        return Scope::Everything;
+    }
+    let home = match env.var_os("CARGO_HOME") {
+        Some(home) => literal(cwd, Path::new(&home)),
         None => cargo_home(cwd).ok(),
     };
     let variables = DIR_VARIABLES.map(|name| env.var_os(name));
-    cargo_home
-        .and_then(|home| paths(cwd, args, &variables, &home))
+    home.and_then(|home| paths(cwd, args, &variables, &home, separate_checks))
         .map_or(Scope::Everything, Scope::within)
 }
 
@@ -35,287 +56,410 @@ fn paths(
     args: &[OsString],
     variables: &[Option<OsString>],
     cargo_home: &Path,
+    separate_checks: bool,
 ) -> Option<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    let mut base = cwd.to_path_buf();
+    cwd.to_str()?;
+    cargo_home.to_str()?;
+    if args.iter().any(|arg| arg.to_str().is_none()) {
+        return None;
+    }
     let (_, args) = split_toolchain_selector(args);
-    let mut args = args.iter();
+    let (command, options) = args.split_first()?;
+    match command.to_str()? {
+        "build" | "run" | "test" => {}
+        "check" if !separate_checks => {}
+        _ => return None,
+    }
+    let mut roots = Vec::new();
+    // A logical working directory and its physical path can have different
+    // ancestor manifests and Cargo configs.
+    for dir in cwd.ancestors() {
+        if std::fs::symlink_metadata(dir).ok()?.is_symlink() {
+            return None;
+        }
+    }
+    let mut manifest_dir = cwd.to_path_buf();
+    let mut args = options.iter();
     while let Some(arg) = args.next() {
-        let text = arg.to_string_lossy();
+        let text = arg.to_str()?;
         if text == "--" {
             break;
         }
-        if let Some(dir) = value_of(&text, "--target-dir", &mut args) {
-            paths.push(cwd.join(dir));
-        } else if let Some(manifest) = value_of(&text, "--manifest-path", &mut args) {
-            base = cwd.join(manifest).parent()?.to_path_buf();
-        } else if let Some(config) = value_of(&text, "--config", &mut args) {
-            // A file, or a value that may move output, is more than this reads.
-            let config = config.to_string_lossy();
-            if !config.contains('=') || config.contains("-dir") {
+        let (option, inline) = text
+            .split_once('=')
+            .map_or((text, None), |(k, v)| (k, Some(v)));
+        match option {
+            "--manifest-path" | "--target-dir" => {
+                let raw = match inline {
+                    Some(value) => value,
+                    None => args.next()?.to_str()?,
+                };
+                if raw.starts_with('-') {
+                    return None;
+                }
+                if option == "--manifest-path" {
+                    let path = cwd.join(raw);
+                    if path.file_name()? != "Cargo.toml"
+                        || !std::fs::symlink_metadata(&path).ok()?.is_file()
+                        || literal(cwd, Path::new(raw))? != path.canonicalize().ok()?
+                    {
+                        return None;
+                    }
+                    manifest_dir = path.parent()?.to_owned();
+                } else {
+                    roots.push(literal(cwd, Path::new(raw))?);
+                }
+            }
+            "--package" | "-p" | "--bin" | "--test" | "--bench" | "--example" | "--features"
+            | "-F" | "--jobs" | "-j" | "--color" | "--profile" | "--target" => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => args.next()?.to_str()?,
+                };
+                if value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+            }
+            "--lib"
+            | "--bins"
+            | "--tests"
+            | "--benches"
+            | "--examples"
+            | "--all-targets"
+            | "--workspace"
+            | "--release"
+            | "--all-features"
+            | "--no-default-features"
+            | "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--quiet"
+            | "-q"
+            | "--verbose"
+            | "-v"
+            | "-vv"
+            | "--no-run"
+            | "--no-fail-fast"
+                if inline.is_none() => {}
+            _ if command == "test" && !text.starts_with('-') => {}
+            _ => return None,
+        }
+    }
+    for path in variables.iter().flatten() {
+        roots.push(literal(cwd, Path::new(path))?);
+    }
+    config_dirs(cwd, cargo_home, &mut roots)?;
+    // A member can inherit an ancestor workspace. Check each possible default
+    // target as well as the workspace itself: target/ can point outside it.
+    let mut workspace = None;
+    let base = manifest_dir.canonicalize().ok()?;
+    for dir in base.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        let Some(text) = optional_text(&manifest)? else {
+            continue;
+        };
+        let table: toml::Table = toml::from_str(&text).ok()?;
+        if ["package", "project"]
+            .iter()
+            .any(|key| table.get(*key).and_then(|p| p.get("workspace")).is_some())
+        {
+            return None;
+        }
+        roots.push(literal(dir, Path::new("target"))?);
+        workspace = Some(dir);
+    }
+    roots.push(workspace?.to_owned());
+    Some(roots)
+}
+
+/// Cargo may expand templates or resolve `..` across a symlink. Leave either
+/// case to Cargo. Scope::within resolves the existing prefixes of literal paths.
+fn literal(base: &Path, value: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let text = value.to_str()?;
+    if text.is_empty()
+        || text.contains(['{', '}'])
+        || value.components().any(|c| c == Component::ParentDir)
+    {
+        return None;
+    }
+    let path = base.join(value);
+    path.is_absolute().then_some(path)
+}
+
+/// Absence is ordinary. An unreadable file, symlink, or malformed file leaves
+/// the scope unknown, since Cargo could resolve a different workspace or config.
+fn optional_text(path: &Path) -> Option<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Some(Some(std::fs::read_to_string(path).ok()?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        _ => None,
+    }
+}
+
+fn config_dirs(cwd: &Path, home: &Path, roots: &mut Vec<PathBuf>) -> Option<()> {
+    let locals = cwd.ancestors().map(|dir| dir.join(".cargo"));
+    for config_dir in std::iter::once(home.to_owned()).chain(locals) {
+        let mut config = None;
+        for name in ["config", "config.toml"] {
+            if let Some(text) = optional_text(&config_dir.join(name))? {
+                config = Some(text);
+                break;
+            }
+        }
+        let Some(text) = config else { continue };
+        let table: toml::Table = toml::from_str(&text).ok()?;
+        if table.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "build"
+                    | "env"
+                    | "alias"
+                    | "http"
+                    | "net"
+                    | "term"
+                    | "registry"
+                    | "registries"
+                    | "source"
+                    | "target"
+                    | "profile"
+                    | "credential-alias"
+            )
+        }) {
+            return None;
+        }
+        if let Some(env) = table.get("env")
+            && env
+                .as_table()?
+                .keys()
+                .any(|key| key.to_ascii_uppercase().starts_with("CARGO_"))
+        {
+            return None;
+        }
+        if let Some(build) = table.get("build") {
+            let build = build.as_table()?;
+            if build.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "target-dir"
+                        | "build-dir"
+                        | "jobs"
+                        | "rustflags"
+                        | "rustdocflags"
+                        | "rustc"
+                        | "rustdoc"
+                        | "rustc-wrapper"
+                        | "rustc-workspace-wrapper"
+                        | "incremental"
+                        | "target"
+                        | "dep-info-basedir"
+                        | "pipelining"
+                )
+            }) {
                 return None;
             }
-        } else if text.starts_with("-C") {
-            return None;
-        }
-    }
-    for value in variables.iter().flatten().filter(|value| !value.is_empty()) {
-        paths.extend(templated(cwd, Path::new(value), cargo_home)?);
-    }
-    for (config, dir) in config_dirs(cwd, cargo_home)? {
-        // Cargo reads a config path relative to the directory holding `.cargo`.
-        let relative_to = config.parent().and_then(Path::parent).unwrap_or(cwd);
-        paths.extend(templated(relative_to, Path::new(&dir), cargo_home)?);
-    }
-    paths.extend(workspace_roots(&base));
-    Some(paths)
-}
-
-/// The value of `--name value` or `--name=value`, taking the next argument
-/// for the first form.
-fn value_of<'a>(
-    arg: &str,
-    name: &str,
-    rest: &mut impl Iterator<Item = &'a OsString>,
-) -> Option<OsString> {
-    if arg == name {
-        return rest.next().cloned();
-    }
-    arg.strip_prefix(name)?
-        .strip_prefix('=')
-        .map(OsString::from)
-}
-
-/// `path` relative to `base`, cut before the first `{...}` template Cargo
-/// fills in: no path for `{workspace-root}`, which lies inside the leased
-/// workspace; Cargo's home for `{cargo-cache-home}`; `None` for a template
-/// this does not know.
-fn templated(base: &Path, path: &Path, cargo_home: &Path) -> Option<Vec<PathBuf>> {
-    let mut resolved = PathBuf::new();
-    for (index, component) in path.components().enumerate() {
-        let text = component.as_os_str().to_string_lossy();
-        if !text.contains('{') {
-            resolved.push(component);
-            continue;
-        }
-        return match (index, text.as_ref()) {
-            (0, "{workspace-root}") => Some(Vec::new()),
-            (0, "{cargo-cache-home}") => Some(vec![cargo_home.to_path_buf()]),
-            (0, _) => None,
-            _ => Some(vec![base.join(resolved)]),
-        };
-    }
-    Some(vec![base.join(resolved)])
-}
-
-/// Each config file that sets `build.target-dir` or `build.build-dir`, with
-/// the value; `None` when a config cannot be read for certain.
-fn config_dirs(cwd: &Path, cargo_home: &Path) -> Option<Vec<(PathBuf, String)>> {
-    let mut dirs = Vec::new();
-    for (path, _) in cargo_config_candidates(cwd, cargo_home) {
-        let text = std::fs::read_to_string(&path).ok()?;
-        let table: toml::Table = toml::from_str(&text).ok()?;
-        if table.contains_key("include") {
-            return None;
-        }
-        let Some(build) = table.get("build") else {
-            continue;
-        };
-        let build = build.as_table()?;
-        for key in ["target-dir", "build-dir"] {
-            if let Some(value) = build.get(key) {
-                dirs.push((path.clone(), value.as_str()?.to_owned()));
+            for key in ["target-dir", "build-dir"] {
+                if let Some(value) = build.get(key) {
+                    if std::fs::symlink_metadata(&config_dir).ok()?.is_symlink() {
+                        return None;
+                    }
+                    roots.push(literal(config_dir.parent()?, Path::new(value.as_str()?))?);
+                }
             }
         }
     }
-    Some(dirs)
-}
-
-/// The topmost ancestor of `base` with a `Cargo.toml`, which contains the
-/// workspace root, and the nearest manifest's `package.workspace` when it
-/// names one elsewhere. `base` itself when no ancestor has a manifest.
-fn workspace_roots(base: &Path) -> Vec<PathBuf> {
-    let manifests: Vec<&Path> = base
-        .ancestors()
-        .filter(|dir| dir.join("Cargo.toml").is_file())
-        .collect();
-    let mut roots = vec![manifests.last().copied().unwrap_or(base).to_path_buf()];
-    if let Some(nearest) = manifests.first() {
-        let named = std::fs::read_to_string(nearest.join("Cargo.toml"))
-            .ok()
-            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-            .and_then(|manifest| {
-                manifest
-                    .get("package")?
-                    .get("workspace")?
-                    .as_str()
-                    .map(|workspace| nearest.join(workspace))
-            });
-        roots.extend(named);
-    }
-    roots
+    Some(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     struct Tree {
         _dir: tempfile::TempDir,
         root: PathBuf,
+        cwd: PathBuf,
+        home: PathBuf,
     }
 
     impl Tree {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            Self { _dir: dir, root }
-        }
-
-        fn write(&self, path: &str, text: &str) {
-            let path = self.root.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
-
-        fn at(&self, path: &str) -> PathBuf {
-            self.root.join(path)
-        }
-
-        fn paths(
-            &self,
-            cwd: &str,
-            args: &[&str],
-            variables: &[(usize, &str)],
-        ) -> Option<Vec<PathBuf>> {
-            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            let mut values = vec![None, None, None];
-            for (index, value) in variables {
-                values[*index] = Some(OsString::from(value));
+            let cwd = root.join("repo/member");
+            let home = root.join("home/.cargo");
+            fs::create_dir_all(&cwd).unwrap();
+            fs::create_dir_all(&home).unwrap();
+            fs::write(root.join("repo/Cargo.toml"), "[workspace]\n").unwrap();
+            fs::write(cwd.join("Cargo.toml"), "[package]\nname='member'\n").unwrap();
+            Self {
+                _dir: dir,
+                root,
+                cwd,
+                home,
             }
-            paths(&self.at(cwd), &args, &values, &self.at("home/.cargo"))
+        }
+
+        fn scope(&self, args: &[&str], env: &[Option<OsString>], check: bool) -> Scope {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            paths(&self.cwd, &args, env, &self.home, check).map_or(Scope::Everything, Scope::within)
         }
     }
 
     #[test]
-    fn a_workspace_leases_its_topmost_manifest_directory() {
+    fn the_invocation_environment_can_require_a_cache_wide_lease() {
         let tree = Tree::new();
-        tree.write("repo/Cargo.toml", "[workspace]\n");
-        tree.write("repo/crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
-        assert_eq!(
-            tree.paths("repo/crates/a", &["build"], &[]),
-            Some(vec![tree.at("repo")])
-        );
-        assert_eq!(
-            tree.paths("repo/crates", &["test"], &[]),
-            Some(vec![tree.at("repo")])
-        );
-        // No manifest anywhere: the directory Cargo runs in.
-        assert_eq!(
-            tree.paths("elsewhere", &["new", "x"], &[]),
-            Some(vec![tree.at("elsewhere")])
-        );
-    }
-
-    #[test]
-    fn a_manifest_path_and_a_named_workspace_move_the_root() {
-        let tree = Tree::new();
-        tree.write(
-            "one/Cargo.toml",
-            "[package]\nname = \"one\"\nworkspace = \"../ws\"\n",
-        );
-        tree.write("two/Cargo.toml", "[package]\nname = \"two\"\n");
-        assert_eq!(
-            tree.paths("", &["build", "--manifest-path", "two/Cargo.toml"], &[]),
-            Some(vec![tree.at("two")])
-        );
-        assert_eq!(
-            tree.paths("", &["build", "--manifest-path=one/Cargo.toml"], &[]),
-            Some(vec![tree.at("one"), tree.at("one/../ws")])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn target_and_build_directories_join_the_lease() {
-        let tree = Tree::new();
-        tree.write("repo/Cargo.toml", "[package]\nname = \"r\"\n");
-        tree.write("repo/.cargo/config.toml", "[build]\ntarget-dir = \"out\"\n");
-        tree.write(
-            "home/.cargo/config.toml",
-            "[build]\nbuild-dir = \"{cargo-cache-home}/build/{workspace-path-hash}\"\n",
-        );
-        assert_eq!(
-            tree.paths(
-                "repo",
-                &[
-                    "+nightly",
-                    "build",
-                    "--target-dir",
-                    "/abs/t",
-                    "--target-dir=rel",
-                    "--",
-                    "--target-dir",
-                    "x"
+        let args = [OsString::from("build")];
+        let check = |name: &str, value: &OsStr| {
+            let env = crate::invocation::InvocationEnv::from_parts(
+                [
+                    (OsStr::new("CARGO_HOME"), tree.home.as_os_str()),
+                    (OsStr::new(name), value),
                 ],
-                &[(0, "env-target"), (2, "{workspace-root}/b")]
-            ),
-            Some(vec![
-                PathBuf::from("/abs/t"),
-                tree.at("repo/rel"),
-                tree.at("repo/env-target"),
-                tree.at("home/.cargo"),
-                tree.at("repo/out"),
-                tree.at("repo"),
-            ])
-        );
+                Some(tree.cwd.clone()),
+                Some(tree.root.join("home")),
+                tree.root.clone(),
+            );
+            configured_scope(&tree.cwd, &args, &env, false)
+        };
+        let out = tree.root.join("placed");
+        for name in DIR_VARIABLES {
+            let scope = check(name, out.as_os_str());
+            assert!(scope.covers(&out));
+            assert!(!scope.covers(&tree.root.join("unrelated")));
+        }
+        assert!(!check("OTHER_DIR", out.as_os_str()).covers(&out));
+        for name in [
+            "CARGO_UNSTABLE_FOO",
+            "CARGO_CONFIG_INCLUDE",
+            "CARGO_INCLUDE",
+            "CARGO_BUILD_ARTIFACT_DIR",
+        ] {
+            assert_eq!(check(name, OsStr::new("x")), Scope::Everything);
+        }
+        assert_eq!(check("CARGO_TARGET_DIR", OsStr::new("")), Scope::Everything);
     }
 
     #[test]
-    fn what_cannot_be_read_for_certain_leases_everything() {
+    fn common_commands_lease_the_workspace_and_known_output_directories() {
         let tree = Tree::new();
-        tree.write("repo/Cargo.toml", "[package]\nname = \"r\"\n");
+        let outside = tree.root.join("external");
+        let home_output = tree.root.join("home/output");
+        let config = tree.home.join("config.toml");
+        fs::write(config, "[build]\nbuild-dir='output'\n").unwrap();
+        let env = [Some(outside.clone().into_os_string())];
         for args in [
-            &["-C", "elsewhere", "build"][..],
-            &["-Celsewhere", "build"],
-            &["build", "--config", "extra.toml"],
-            &["build", "--config=build.target-dir=\"x\""],
+            &["+stable", "build", "--locked", "-p", "member", "--release"][..],
+            &["test", "name", "--", "a-filter"],
+            &["run", "--features=feature", "--bin", "member"],
+            &["check", "--manifest-path", "Cargo.toml"],
         ] {
-            assert_eq!(tree.paths("repo", args, &[]), None, "{args:?}");
+            let scope = tree.scope(args, &env, false);
+            assert!(scope.covers(&tree.root.join("repo/target")));
+            assert!(scope.covers(&home_output));
+            assert!(scope.covers(&outside));
+            assert!(!scope.covers(&tree.root.join("unrelated")));
         }
-        assert!(
-            tree.paths("repo", &["build", "--config", "profile.dev.debug=0"], &[])
-                .is_some()
+        let scope = tree.scope(
+            &["build", "--target-dir", outside.to_str().unwrap()],
+            &[],
+            false,
         );
-        assert_eq!(tree.paths("repo", &["build"], &[(1, "{unknown}/x")]), None);
-        tree.write("repo/.cargo/config.toml", "include = [\"other.toml\"]\n");
-        assert_eq!(tree.paths("repo", &["build"], &[]), None);
-        tree.write("repo/.cargo/config.toml", "[build]\ntarget-dir = 5\n");
-        assert_eq!(tree.paths("repo", &["build"], &[]), None);
-        tree.write("repo/.cargo/config.toml", "not toml [");
-        assert_eq!(tree.paths("repo", &["build"], &[]), None);
+        assert!(scope.covers(&outside));
+        assert!(!scope.covers(&tree.root.join("other")));
+        let arg = format!("--target-dir={}", outside.display());
+        assert!(tree.scope(&["build", &arg], &[], false).covers(&outside));
+    }
+
+    #[test]
+    fn unknown_commands_and_placement_keep_the_cache_wide_lease() {
+        let tree = Tree::new();
+        for args in [
+            &["custom-alias"][..],
+            &["b"],
+            &["clippy"],
+            &["install"],
+            &["--config", "another", "build"],
+            &["build", "--config=include=['extra']"],
+            &["build", "-Zunstable-options"],
+            &["run", "-C", "elsewhere"],
+            &["build", "--artifact-dir=elsewhere"],
+            &["build", "--manifest-path=missing/Cargo.toml"],
+            &["build", "--manifest-path=elsewhere.toml"],
+            &["build", "--target-dir"],
+            &["build", "--target-dir=../out"],
+            &["build", "--target-dir=out/{workspace-root}/../elsewhere"],
+            &["build", "-p", "--target-dir"],
+        ] {
+            assert_eq!(tree.scope(args, &[], false), Scope::Everything, "{args:?}");
+        }
+        assert_eq!(tree.scope(&["check"], &[], true), Scope::Everything);
+        let config = tree.home.join("config.toml");
+        for text in [
+            "include=['nested']",
+            "[unstable]\nbuild-dir=true",
+            "[build]\nartifact-dir='out'",
+            "[env]\nCARGO_TARGET_DIR={value='x',force=true}",
+            "[env]\ncargo_build_build_dir='elsewhere'",
+            "[build]\nbuild-dir='{workspace-root}/build'",
+            "[build]\ntarget-dir=2",
+            "not a table[",
+            "[unrecognized]\nplacement='other'",
+        ] {
+            fs::write(&config, text).unwrap();
+            assert_eq!(
+                tree.scope(&["run"], &[], false),
+                Scope::Everything,
+                "{text}"
+            );
+        }
+        fs::remove_file(config).unwrap();
+        for manifest in ["[package]\nworkspace='../../different'", "[missing"] {
+            fs::write(tree.cwd.join("Cargo.toml"), manifest).unwrap();
+            assert_eq!(tree.scope(&["build"], &[], false), Scope::Everything);
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn templates_cut_the_path_where_cargo_fills_it_in() {
-        let base = Path::new("/base");
-        let home = Path::new("/home/.cargo");
-        let one = |path: &str| Some(vec![PathBuf::from(path)]);
-        assert_eq!(templated(base, Path::new("t"), home), one("/base/t"));
-        assert_eq!(templated(base, Path::new("/abs/t"), home), one("/abs/t"));
+    fn redirected_targets_are_leased_and_broken_links_are_unknown() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let tree = Tree::new();
+        let alias = tree.root.join("member-link");
+        symlink(&tree.cwd, &alias).unwrap();
+        assert!(paths(&alias, &["build".into()], &[], &tree.home, false).is_none());
+        let outside = tree.root.join("other");
+        fs::create_dir(&outside).unwrap();
+        let link = tree.root.join("repo/target");
+        symlink(&outside, &link).unwrap();
+        let scope = tree.scope(&["test"], &[], false);
+        assert!(scope.covers(&outside));
+        assert!(!scope.covers(&tree.root.join("elsewhere")));
+        fs::remove_dir(&outside).unwrap();
+        assert_eq!(tree.scope(&["test"], &[], false), Scope::Everything);
+        fs::remove_file(&link).unwrap();
+        let bad = OsStr::from_bytes(b"non-utf8-\xff").to_owned();
         assert_eq!(
-            templated(base, Path::new("out/{workspace-path-hash}/x"), home),
-            one("/base/out")
+            tree.scope(&["build"], &[Some(bad.clone())], false),
+            Scope::Everything
         );
-        assert_eq!(
-            templated(base, Path::new("{cargo-cache-home}/build"), home),
-            one("/home/.cargo")
-        );
-        assert_eq!(
-            templated(base, Path::new("{workspace-root}/t"), home),
-            Some(Vec::new())
-        );
-        assert_eq!(templated(base, Path::new("{other}/t"), home), None);
+        let args = [OsString::from("run"), OsString::from("--"), bad];
+        assert!(paths(&tree.cwd, &args, &[], &tree.home, false).is_none());
+        let config_dir = tree.cwd.join(".cargo");
+        symlink(&tree.home, &config_dir).unwrap();
+        fs::write(
+            tree.home.join("config.toml"),
+            "[build]\ntarget-dir='relative'",
+        )
+        .unwrap();
+        assert_eq!(tree.scope(&["build"], &[], false), Scope::Everything);
+        fs::remove_file(config_dir).unwrap();
+        let manifest = tree.root.join("outside/Cargo.toml");
+        fs::create_dir(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, "[workspace]").unwrap();
+        fs::remove_file(tree.cwd.join("Cargo.toml")).unwrap();
+        symlink(manifest, tree.cwd.join("Cargo.toml")).unwrap();
+        assert_eq!(tree.scope(&["build"], &[], false), Scope::Everything);
     }
 }

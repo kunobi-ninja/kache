@@ -107,7 +107,7 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
     // Blaze builds through an engine of its own, wherever that keeps output.
     let scope = match env.cwd().filter(|_| !config.blaze) {
-        Some(cwd) => lease_scope::of(cwd, &cargo_args, &env),
+        Some(cwd) => lease_scope::of(cwd, &cargo_args, &env, config.separate_check_targets),
         None => crate::target_use::Scope::Everything,
     };
     let lease = crate::target_use::shared_for(
@@ -343,6 +343,12 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
         command.env("CARGO_ENCODED_RUSTFLAGS", flags);
     }
 
+    // Applying a separate check target can create and tag the directory.
+    // Take the lease before that first write as well as before Cargo starts.
+    let scope = lease_scope::of(&cwd, &cargo_args, &env, check_target.is_some());
+    let what = cargo_command_label(command.get_args());
+    let lease = crate::target_use::shared_for(&config.cache_dir, &scope, &what, command.get_args())
+        .context("protecting target directories while Cargo runs")?;
     if let Some(plan) = check_target {
         check_targets::apply(&mut command, plan);
     }
@@ -355,21 +361,7 @@ fn run_with_source(cargo_args: Vec<OsString>) -> Result<()> {
             .any(|value| value == WORKTREE_BUILD_DIR_CONFIG),
     );
 
-    let scope = lease_scope::of(&cwd, &cargo_args, &env);
-    run_cargo_with_target_protection(command, &cargo, &scope)
-}
-
-fn run_cargo_with_target_protection(
-    command: Command,
-    cargo: &Path,
-    scope: &crate::target_use::Scope,
-) -> Result<()> {
-    let config = crate::config::Config::load().context("loading the cache configuration")?;
-    let what = cargo_command_label(command.get_args());
-    let target_use =
-        crate::target_use::shared_for(&config.cache_dir, scope, &what, command.get_args())
-            .context("protecting target directories while Cargo runs")?;
-    run_cargo_and_exit(command, cargo, target_use, &config)
+    run_cargo_and_exit(command, &cargo, lease, &config)
 }
 
 /// Run Cargo under `lease`, then exit as Cargo did. Exiting runs no

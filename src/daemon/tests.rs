@@ -13508,6 +13508,126 @@ async fn abandoned_compile_download_does_not_take_a_later_permit() {
     );
 }
 
+/// Hold a second request open on the demand download's connection while
+/// the download finishes. The response must survive its worker's exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compile_download_connection_survives_the_download_thread() {
+    use axum::{Router, extract::ConnectInfo, routing::get};
+    use std::net::SocketAddr;
+    use tokio::sync::{Notify, Semaphore, oneshot, watch};
+
+    // Hyper races a fresh dial against a connection returning to the pool.
+    // Admit just the first dial so scheduling cannot choose a second socket.
+    struct SingleDial(SocketAddr, Arc<Semaphore>);
+    impl reqwest::dns::Resolve for SingleDial {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let address = self.0;
+            let permits = Arc::clone(&self.1);
+            Box::pin(async move {
+                permits.acquire().await?.forget();
+                Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let second_started = Arc::new(Notify::new());
+    let second_seen = Arc::clone(&second_started);
+    let (release, released) = watch::channel(false);
+    let app = Router::new()
+        .route(
+            "/first",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        )
+        .route(
+            "/second",
+            get(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                let second_seen = Arc::clone(&second_seen);
+                let mut released = released.clone();
+                async move {
+                    second_seen.notify_one();
+                    released
+                        .wait_for(|done| *done)
+                        .await
+                        .expect("release the response");
+                    peer.to_string()
+                }
+            }),
+        );
+    let (shutdown, stop) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stop.await;
+        })
+        .await
+        .expect("serve test requests");
+    });
+
+    let timeout = Duration::from_secs(10);
+    let dials = Arc::new(Semaphore::new(1));
+    let client = reqwest::Client::builder()
+        .dns_resolver(SingleDial(address, Arc::clone(&dials)))
+        .http1_only()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .unwrap();
+    let base = format!("http://fixture.invalid:{}", address.port());
+    let first_request = client.get(format!("{base}/first"));
+    let (first_read, idle) = oneshot::channel();
+    let download = tokio::spawn(finish_compile_remote_download(
+        RemoteDeadline::from_millis(10_000),
+        async move {
+            let first = first_request
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            first_read.send(()).expect("announce the idle connection");
+            second_started.notified().await;
+            Ok(first)
+        },
+    ));
+    tokio::time::timeout(timeout, idle)
+        .await
+        .expect("first GET deadline")
+        .expect("first GET finished");
+    let second = tokio::spawn(client.get(format!("{base}/second")).send());
+    let first_peer = download
+        .await
+        .expect("download task")
+        .expect("demand download");
+    release.send(true).expect("release the second response");
+    let second_peer = second
+        .await
+        .expect("second GET task")
+        .expect("pooled connection after worker exit")
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    dials.close();
+    drop(client);
+    shutdown.send(()).expect("request server shutdown");
+    tokio::time::timeout(timeout, server)
+        .await
+        .expect("server shutdown deadline")
+        .expect("server task");
+    assert_eq!(
+        first_peer, second_peer,
+        "both requests must use the same TCP connection"
+    );
+}
+
 #[tokio::test]
 async fn demand_queue_errors_preserve_prior_remote_failures() {
     let dir = tempfile::tempdir().unwrap();

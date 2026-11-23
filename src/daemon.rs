@@ -371,6 +371,62 @@ impl Drop for DaemonCoordGuard {
     }
 }
 
+/// Create a missing socket parent privately before opening daemon locks. The
+/// transport also verifies the owner and binds the socket with mode 0600.
+fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
+    let dir = socket.parent().context("daemon socket has no parent")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if dir.parent() == Some(config.cache_dir.as_path()) {
+            // Readers may traverse the store, but may not replace an IPC
+            // directory or an ancestor. A sticky temp parent protects its
+            // children when they belong to root or this user.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&config.cache_dir)?;
+            anyhow::ensure!(
+                std::fs::symlink_metadata(&config.cache_dir)?.is_dir(),
+                "daemon IPC needs a real cache directory; set KACHE_RUNTIME_DIR to a private directory"
+            );
+            for ancestor in config.cache_dir.ancestors() {
+                let meta = std::fs::metadata(ancestor)?;
+                let sticky_parent = ancestor != config.cache_dir && meta.mode() & 0o1000 != 0;
+                anyhow::ensure!(
+                    (meta.uid() == uid || meta.uid() == 0)
+                        && (meta.mode() & 0o022 == 0 || sticky_parent),
+                    "daemon IPC path {} can be changed by another user; set KACHE_RUNTIME_DIR to a private directory",
+                    ancestor.display()
+                );
+            }
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let meta = std::fs::symlink_metadata(dir)?;
+        anyhow::ensure!(
+            meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0,
+            "daemon socket directory {} must be owned by this user and private; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
+            dir.display()
+        );
+        // Avoid resetting any special bits on an explicitly selected store root.
+        anyhow::ensure!(
+            dir != config.cache_dir || meta.mode() & 0o7000 == 0,
+            "daemon socket shares a cache directory with special permissions; set KACHE_RUNTIME_DIR to a private directory"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
+}
+
 fn daemon_state_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("state.json")
 }
@@ -6932,7 +6988,7 @@ pub fn run_server(
     // released when this function returns or the process exits/crashes.
     let socket_path = config.socket_path();
     let lock_path = socket_path.with_extension("run.lock");
-    std::fs::create_dir_all(socket_path.parent().unwrap())?;
+    prepare_daemon_socket_dir(config, &socket_path)?;
 
     let Some(_lock) =
         kunobi_daemon::ProcessLock::try_acquire(&lock_path).context("acquiring daemon run lock")?
@@ -7214,8 +7270,6 @@ async fn server_main(
     capacity: DaemonCapacity,
 ) -> Result<()> {
     let socket_path = config.socket_path();
-    std::fs::create_dir_all(socket_path.parent().unwrap())?;
-
     let Some(listener) = crate::transport::bind_daemon_listener(&socket_path).await? else {
         tracing::info!("another daemon owns the endpoint");
         return Ok(());

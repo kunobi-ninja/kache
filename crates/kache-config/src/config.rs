@@ -4213,15 +4213,18 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        let socket = self
+        let scope = self.pull_request_scope();
+        if let Some(socket) = self
             .socket_path_override
             .as_ref()
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
-            .unwrap_or_else(|| self.runtime_dir.join("daemon.sock"));
-        match self.pull_request_scope() {
-            Some(scope) => scoped_socket_path(&socket, &scope),
-            None => socket,
+        {
+            return match scope {
+                Some(scope) => scoped_socket_path(&socket, &scope),
+                None => socket,
+            };
         }
+        default_daemon_socket(&self.cache_dir, &self.runtime_dir, scope.as_deref())
     }
 
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
@@ -5195,6 +5198,32 @@ pub fn config_file_path() -> PathBuf {
                 .join(".config")
         });
     config_base.join("kache").join("config.toml")
+}
+
+/// The default endpoint used both by callers and by login-service discovery.
+pub fn default_daemon_socket(cache: &Path, runtime: &Path, scope: Option<&str>) -> PathBuf {
+    let socket = runtime.join("daemon.sock");
+    let socket = match scope {
+        Some(scope) => scoped_socket_path(&socket, scope),
+        None => socket,
+    };
+    #[cfg(unix)]
+    if runtime == cache {
+        use std::os::unix::fs::PermissionsExt;
+        let ipc = runtime.join("ipc");
+        // Older daemons leave the run lock behind when they stop. A fresh
+        // store always chooses ipc, even before the store directory exists.
+        let legacy = std::fs::symlink_metadata(runtime)
+            .is_ok_and(|meta| meta.is_dir() && meta.permissions().mode() & 0o7077 == 0)
+            && socket.with_extension("run.lock").is_file()
+            && !ipc.is_dir();
+        if !legacy {
+            return ipc.join(socket.file_name().expect("daemon socket has a name"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cache;
+    socket
 }
 
 /// Resolve the daemon endpoint once. Invalid values fall back to the default

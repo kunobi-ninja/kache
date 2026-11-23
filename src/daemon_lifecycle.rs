@@ -60,7 +60,7 @@ pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
         ));
     }
     let socket = config.socket_path();
-    std::fs::create_dir_all(socket.parent().context("socket has no parent")?)?;
+    super::prepare_daemon_socket_dir(config, &socket)?;
     let Some(lock) = kunobi_daemon::readiness::wait_until(deadline, |_| {
         ProcessLock::try_acquire(socket.with_extension("lock"))
     })?

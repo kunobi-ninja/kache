@@ -740,7 +740,8 @@ fn configured_instance_matches(
             }
         }
     }
-    let socket = runtime.unwrap_or(store).join("daemon.sock");
+    let socket =
+        crate::config::default_daemon_socket(&store, runtime.as_deref().unwrap_or(&store), None);
     Ok(canonical_or_original(requested_socket) == canonical_or_original(&socket))
 }
 

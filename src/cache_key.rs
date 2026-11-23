@@ -4022,6 +4022,25 @@ fn macos_debug_bundle_admission(args: &RustcArgs, target: Option<&str>) -> bool 
         && target.is_some_and(|target| target.contains("-apple-"))
 }
 
+fn checkout_archive_admission(
+    crate_types: &[String],
+    target: Option<&str>,
+    custom_target: bool,
+) -> bool {
+    let may_emit_import_lib =
+        custom_target || target.is_none_or(|triple| triple.contains("windows"));
+    // Without --crate-type, a crate-level attribute can request a staticlib.
+    crate_types.is_empty()
+        || crate_types
+            .iter()
+            .flat_map(|arg| arg.split(','))
+            .any(|kind| match kind {
+                "staticlib" => true,
+                "cdylib" | "dylib" | "proc-macro" => may_emit_import_lib,
+                _ => false,
+            })
+}
+
 /// Compute the blake3 cache key for a rustc invocation, with what the
 /// computation learned on the way ([`KeyOutputs`]).
 ///
@@ -4252,6 +4271,15 @@ fn compute_key_into(
     if macos_debug_bundle_admission(args, compiler_target) {
         hasher.set_group("debug_bundle_layout");
         fold_field(&mut hasher, b"debug_bundle_layout.v2:", b"per-file");
+    }
+
+    // Older producers did not scan static archives or Windows import
+    // libraries. Their shared entries can contain another checkout's path.
+    if args.emits_link()
+        && checkout_archive_admission(&args.crate_types, compiler_target, custom_target)
+    {
+        hasher.set_group("checkout_archive");
+        fold_field(&mut hasher, b"checkout_archive.v1:", b"scanned");
     }
 
     // crate identity

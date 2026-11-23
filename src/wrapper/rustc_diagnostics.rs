@@ -32,6 +32,30 @@ impl EntryKey {
             width: Some(columns),
         }
     }
+
+    /// This key bound to one checkout, for outputs that name it
+    /// ([`crate::embedded_checkout`]).
+    pub(super) fn bound_to_checkout(&self, checkout: &[u8]) -> Self {
+        Self {
+            key: checkout_key(&self.key, checkout),
+            width: self.width,
+        }
+    }
+}
+
+/// The key for outputs that name `checkout`. Derived from the unbound key
+/// alone, so no input is hashed twice.
+fn checkout_key(key: &str, checkout: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.rustc.checkout.v1\0");
+    hasher.update(key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(checkout);
+    format!(
+        "{}{}",
+        kache_format::CHECKOUT_KEY_PREFIX,
+        hasher.finalize().to_hex()
+    )
 }
 
 /// The key for rendered diagnostics at `columns`. Derived from the shared key
@@ -45,15 +69,31 @@ fn width_key(shared: &str, columns: u16) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// The keys this invocation may hit, in lookup order: the shared key, then the
-/// key for its terminal width.
+/// Shared keys can be queried from the remote store.
 pub(super) fn lookup_keys(args: &RustcArgs, shared: &str) -> Vec<EntryKey> {
     std::iter::once(EntryKey::shared(shared))
         .chain(
             args.omitted_diagnostic_width()
-                .map(|columns| EntryKey::for_width(shared, columns)),
+                .map(|width| EntryKey::for_width(shared, width)),
         )
         .collect()
+}
+
+/// Probe checkout-bound keys only after exhausting shared local candidates.
+/// A shared hit doesn't need the checkout's canonical paths.
+pub(super) fn local_lookup_keys<'a>(
+    args: &'a RustcArgs,
+    shared: &'a str,
+) -> impl Iterator<Item = EntryKey> + 'a {
+    lookup_keys(args, shared).into_iter().chain(
+        std::iter::once_with(move || crate::embedded_checkout::Checkout::for_args(args))
+            .flatten()
+            .flat_map(move |checkout| {
+                lookup_keys(args, shared)
+                    .into_iter()
+                    .map(move |key| key.bound_to_checkout(&checkout.identity))
+            }),
+    )
 }
 
 /// Where a successful compile is stored. Only rendered output from an
@@ -86,7 +126,7 @@ pub(super) fn usable_entry(
     args: &RustcArgs,
     shared: &str,
 ) -> Result<Option<(EntryKey, EntryMeta)>> {
-    for key in lookup_keys(args, shared) {
+    for key in local_lookup_keys(args, shared) {
         if let Some(meta) = store.get(&key.key)?
             && entry_usable(args, &key, &meta)
         {
@@ -132,13 +172,63 @@ pub(super) fn width_independent(stdout: &str, stderr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKey, lookup_keys, store_key, width_independent, width_key};
+    use super::{
+        EntryKey, local_lookup_keys, lookup_keys, store_key, width_independent, width_key,
+    };
     use crate::args::RustcArgs;
 
+    /// Arguments parsed outside Cargo, with no manifest dir and so no
+    /// checkout-bound keys: `cargo test` sets `CARGO_MANIFEST_DIR`.
     fn args(extra: &[&str]) -> RustcArgs {
+        args_in(extra, &[])
+    }
+
+    fn args_in(extra: &[&str], vars: &[(&str, &str)]) -> RustcArgs {
         let mut argv = vec!["rustc", "lib.rs", "--crate-name", "foo"];
         argv.extend_from_slice(extra);
-        RustcArgs::parse(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()).unwrap()
+        let invocation = kache_config::invocation::InvocationEnv::from_parts(
+            vars.iter()
+                .map(|(name, value)| (*name, std::ffi::OsStr::new(*value))),
+            Some("/w/one".into()),
+            None,
+            "/w/one".into(),
+        );
+        RustcArgs::parse_for(
+            &argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            &invocation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cargo_unit_also_looks_up_its_checkout_bound_keys_last() {
+        let shared = "c".repeat(64);
+        let cargo = args_in(
+            &["--diagnostic-width=80"],
+            &[("CARGO_MANIFEST_DIR", "/w/one/a")],
+        );
+        let keys: Vec<_> = local_lookup_keys(&cargo, &shared).collect();
+        let checkout = crate::embedded_checkout::Checkout::for_args(&cargo)
+            .unwrap()
+            .identity;
+        let shared_key = EntryKey::shared(&shared);
+        let width = EntryKey::for_width(&shared, 80);
+        assert_eq!(
+            keys,
+            [
+                shared_key.clone(),
+                width.clone(),
+                shared_key.bound_to_checkout(&checkout),
+                width.bound_to_checkout(&checkout),
+            ]
+        );
+        let bound = &keys[2].key;
+        assert!(kache_format::is_checkout_key(bound), "{bound}");
+        assert!(!kache_format::is_valid_cache_key(bound));
+        let elsewhere = args_in(&[], &[("CARGO_MANIFEST_DIR", "/w/two/a")]);
+        assert!(!local_lookup_keys(&elsewhere, &shared).any(|key| key == keys[2]));
+        assert_eq!(lookup_keys(&cargo, &shared), [shared_key, width]);
+        assert_eq!(keys[3].width, Some(80));
     }
 
     #[test]

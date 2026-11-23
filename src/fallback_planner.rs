@@ -170,12 +170,12 @@ pub async fn build_prefetch_plan_with_identity(
     Ok(plan)
 }
 
-/// `plan` without build-script runs. They stay in the local store, so the
-/// remote never has them, but manifests and shards published before they
-/// were left out still name them.
+/// Skip local-only entries that a manifest, shard or local history supplied.
 fn without_local_only_runs(mut plan: PrefetchPlan) -> PrefetchPlan {
-    plan.candidates
-        .retain(|candidate| candidate.crate_name != crate::build_script::CRATE_NAME);
+    plan.candidates.retain(|candidate| {
+        candidate.crate_name != crate::build_script::CRATE_NAME
+            && !kache_format::is_checkout_key(&candidate.cache_key)
+    });
     plan
 }
 
@@ -352,6 +352,7 @@ mod tests {
             candidates: vec![
                 candidate("serde", "k-serde"),
                 candidate(crate::build_script::CRATE_NAME, "k-run"),
+                candidate("foo", &format!("checkout-{}", "c".repeat(64))),
                 candidate("tokio", "k-tokio"),
             ],
         };

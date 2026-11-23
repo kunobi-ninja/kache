@@ -147,6 +147,34 @@ fn width_key() -> rustc_diagnostics::EntryKey {
 }
 
 #[test]
+fn shared_store_only_reuses_a_bound_entry_from_the_same_checkout() {
+    let fixture = Fixture::new();
+    let cargo = |checkout: &str| {
+        let invocation = kache_config::InvocationEnv::from_parts(
+            [("CARGO_MANIFEST_DIR", checkout)],
+            Some(fixture.dir.path().into()),
+            None,
+            fixture.dir.path().into(),
+        );
+        RustcArgs::parse_for(&["rustc".into(), "lib.rs".into()], &invocation).unwrap()
+    };
+    let first = cargo("/work/first");
+    let second = cargo("/work/second");
+    let checkout = crate::embedded_checkout::Checkout::for_args(&first).unwrap();
+    let bound = shared_key().bound_to_checkout(&checkout.identity);
+    fixture.publish_under(&bound.key);
+    let (key, _) = rustc_diagnostics::usable_entry(&fixture.store, &first, CACHE_KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(key, bound);
+    assert!(
+        rustc_diagnostics::usable_entry(&fixture.store, &second, CACHE_KEY)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn shared_width_entry_eligibility_requires_files_and_compatible_diagnostics() {
     let mut fixture = shared_width_fixture();
     let usable = |args: &RustcArgs, key: &rustc_diagnostics::EntryKey, meta: &EntryMeta| {

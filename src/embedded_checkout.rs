@@ -6,10 +6,13 @@
 //! `<CARGO_MANIFEST_DIR>/<folder>` at run time (kunobi-ninja/kache#1914).
 //! Neither the source nor the dep-info shows that read, and the key normalizes
 //! the workspace path, so another checkout of the same sources gets the same
-//! key. Such outputs are not stored.
+//! key. Such outputs are stored only under a key bound to their checkout.
 //!
 //! The check looks for the checkout's paths as plain bytes. A path the macro
 //! encodes, compresses or writes relative to something else is not found.
+//! A short checkout path can also match inside an unrelated path, such as
+//! `/src` inside `crates/a/src/lib.rs`; binding the key costs such a unit
+//! only its sharing with other checkouts.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,24 +24,30 @@ use crate::compiler::{ArtifactKind, ArtifactSet};
 const CHUNK: usize = 1 << 20;
 /// Bytes past a match the target-directory check may read.
 const PATH_TAIL: usize = 512;
-
-/// Why this compile's outputs must not be stored, if they name its checkout.
+/// Whether this compile's outputs name its checkout.
+///
+/// `Ok(Some(checkout))` when one does: the entry may only be stored under a
+/// key bound to that checkout, which a build in another checkout
+/// never looks up. `Err` with the reason when an output cannot be read, and
+/// the entry is not stored.
 ///
 /// Any unit can run a proc macro: one its own dependency re-exports loads
 /// through the library search path, not an `--extern` on its command line.
-/// A key bound to this checkout may store: one that holds the manifest dir
-/// by value (the unit's own source reads `CARGO_MANIFEST_DIR`, #167), or one
-/// for a compile without path remapping, which folds the local paths.
-pub(crate) fn embedded_checkout_reason(
+/// A key already bound to this checkout needs no scan: one that holds the
+/// manifest dir by value (the unit's own source reads `CARGO_MANIFEST_DIR`,
+/// #167), or one for a compile without path remapping, which folds the
+/// local paths.
+pub(crate) fn embedded_checkout(
     args: &RustcArgs,
     artifacts: &ArtifactSet,
     key_binds_manifest_dir: bool,
-) -> Option<String> {
-    if key_binds_manifest_dir || args.skip_path_remap() {
-        return None;
+) -> Result<Option<Vec<u8>>, String> {
+    if key_binds_manifest_dir {
+        return Ok(None);
     }
-    let manifest_dir = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
-    let checkout = checkout_spellings(Path::new(&manifest_dir), args.path_normalization_root());
+    let Some(checkout) = Checkout::for_args(args) else {
+        return Ok(None);
+    };
     let target = args
         .target_dir()
         .map(|dir| spellings(&dir))
@@ -57,27 +66,67 @@ pub(crate) fn embedded_checkout_reason(
                 | ArtifactKind::WasmModule
                 // A Unix executable has no extension.
                 | ArtifactKind::Other("extensionless")
-        ) {
+        ) && !is_static_archive(&artifact.path)
+        {
             continue;
         }
-        match file_names_checkout(&artifact.path, &checkout, &target) {
+        match file_names_checkout(&artifact.path, &checkout.spellings, &target) {
             Ok(false) => {}
             Ok(true) => {
-                return Some(format!(
-                    "`{}` names this checkout's directory, which a proc macro can embed \
-                     without the key seeing it",
+                tracing::debug!(
+                    "`{}` names this checkout's directory; storing it for this checkout only",
                     artifact.store_name
-                ));
+                );
+                return Ok(Some(checkout.identity));
             }
             Err(error) => {
-                return Some(format!(
+                return Err(format!(
                     "`{}` could not be read to check for this checkout's directory: {error}",
                     artifact.store_name
                 ));
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// Use the same snapshot of the checkout's paths for scanning and keying.
+pub(crate) struct Checkout {
+    pub(crate) identity: Vec<u8>,
+    spellings: Vec<Vec<u8>>,
+}
+
+impl Checkout {
+    pub(crate) fn for_args(args: &RustcArgs) -> Option<Self> {
+        if args.skip_path_remap() {
+            return None;
+        }
+        let manifest = args.invocation_env().var_os("CARGO_MANIFEST_DIR")?;
+        let root = args.path_normalization_root();
+        let spellings = checkout_spellings(Path::new(&manifest), root);
+        // Keep the manifest and root distinct even when their normalized
+        // spellings overlap. A retargeted symlink changes the canonical form.
+        let mut identity = manifest.as_encoded_bytes().to_vec();
+        identity.push(0);
+        if let Some(root) = root {
+            identity.extend_from_slice(root.as_os_str().as_encoded_bytes());
+        }
+        for spelling in &spellings {
+            identity.push(0);
+            identity.extend_from_slice(spelling);
+        }
+        Some(Self {
+            identity,
+            spellings,
+        })
+    }
+}
+
+/// Whether `path` is a `staticlib` output, which the file-name classifier
+/// leaves without a kind of its own: `.a`, or `.lib` on Windows.
+fn is_static_archive(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "a" || extension == "lib")
 }
 
 /// The spellings of the manifest dir and, when it differs, the workspace
@@ -247,6 +296,12 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_literals_after_a_remap_root_are_checkout_bound() {
+        assert!(found(b"/kache/workspace/build/assets", &[b"/build"], &[]));
+        assert!(found(b"/kache/profile/src/lib.rs", &[b"/src"], &[]));
+    }
+
+    #[test]
     fn a_checkout_path_outside_the_target_dir_is_found() {
         let checkout: &[&[u8]] = &[b"/work/a"];
         let target: &[&[u8]] = &[b"/work/a/target"];
@@ -350,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn outputs_naming_the_checkout_are_not_stored() {
+    fn outputs_naming_the_checkout_are_bound_to_it() {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().canonicalize().unwrap().join("a");
         std::fs::create_dir_all(checkout.join("src")).unwrap();
@@ -388,7 +443,7 @@ mod tests {
             artifact(&pdb, ArtifactKind::DebugBundle),
             artifact(&pdb, ArtifactKind::Other("exp")),
         ]);
-        assert_eq!(embedded_checkout_reason(&args, &clean_set, false), None);
+        assert_eq!(embedded_checkout(&args, &clean_set, false), Ok(None));
 
         let named_set = ArtifactSet::new(vec![
             artifact(&clean, ArtifactKind::Library),
@@ -400,24 +455,109 @@ mod tests {
             &named_exe,
             ArtifactKind::Other("extensionless"),
         )]);
-        let reason = embedded_checkout_reason(&args, &exe_set, false).unwrap();
-        assert!(reason.contains("`named`"), "{reason}");
-        let reason = embedded_checkout_reason(&args, &named_set, false).unwrap();
-        assert!(reason.contains("libnamed.rlib"), "{reason}");
-        assert_eq!(embedded_checkout_reason(&args, &named_set, true), None);
+        let identity = Checkout::for_args(&args).unwrap().identity;
+        assert_eq!(
+            embedded_checkout(&args, &exe_set, false),
+            Ok(Some(identity.clone()))
+        );
+        assert_eq!(
+            embedded_checkout(&args, &named_set, false),
+            Ok(Some(identity))
+        );
+        assert_eq!(embedded_checkout(&args, &named_set, true), Ok(None));
         let mut unremapped = args.clone();
         unremapped.path_normalize_disabled = true;
-        assert_eq!(
-            embedded_checkout_reason(&unremapped, &named_set, false),
-            None
-        );
+        assert_eq!(embedded_checkout(&unremapped, &named_set, false), Ok(None));
+        assert!(Checkout::for_args(&unremapped).is_none());
 
         let missing = ArtifactSet::new(vec![artifact(
             &dir.path().join("gone.rlib"),
             ArtifactKind::Library,
         )]);
-        let reason = embedded_checkout_reason(&args, &missing, false).unwrap();
+        let reason = embedded_checkout(&args, &missing, false).unwrap_err();
         assert!(reason.contains("could not be read"), "{reason}");
+        assert!(reason.contains("gone.rlib"), "{reason}");
+    }
+
+    #[test]
+    fn another_checkout_has_another_identity() {
+        let identity = |manifest_dir: &str, cwd: &str| {
+            let invocation = kache_config::invocation::InvocationEnv::from_parts(
+                [("CARGO_MANIFEST_DIR", std::ffi::OsStr::new(manifest_dir))],
+                Some(PathBuf::from(cwd)),
+                None,
+                PathBuf::from(cwd),
+            );
+            let args = RustcArgs::parse_for(
+                &["rustc".into(), "src/lib.rs".into(), "--crate-name=a".into()],
+                &invocation,
+            )
+            .unwrap();
+            Checkout::for_args(&args).map(|checkout| checkout.identity)
+        };
+        let here = identity("/w/one/a", "/w/one");
+        assert!(here.is_some());
+        assert_eq!(here, identity("/w/one/a", "/w/one"));
+        assert_ne!(here, identity("/w/two/a", "/w/two"));
+        assert_ne!(here, identity("/w/one/a", "/w/two"));
+        // The separator keeps a moved boundary from spelling the same bytes.
+        assert_ne!(identity("/w/a", "/x/y"), identity("/w/a/x", "/y"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeting_a_checkout_symlink_changes_the_bound_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let alias = dir.path().join("current");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let env = kache_config::InvocationEnv::from_parts(
+            [("CARGO_MANIFEST_DIR", alias.as_os_str())],
+            Some(alias.clone()),
+            None,
+            dir.path().into(),
+        );
+        let args = RustcArgs::parse_for(&["rustc".into(), "lib.rs".into()], &env).unwrap();
+        let before = Checkout::for_args(&args).unwrap().identity;
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(second, alias).unwrap();
+        assert_ne!(before, Checkout::for_args(&args).unwrap().identity);
+    }
+
+    #[test]
+    fn a_staticlib_naming_the_checkout_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap().join("a");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        let invocation = kache_config::invocation::InvocationEnv::from_parts(
+            [("CARGO_MANIFEST_DIR", checkout.as_os_str())],
+            Some(checkout.clone()),
+            None,
+            dir.path().to_path_buf(),
+        );
+        let source = checkout.join("src/lib.rs");
+        let args = RustcArgs::parse_for(
+            &[
+                "rustc".into(),
+                source.to_str().unwrap().into(),
+                "--crate-type=staticlib".into(),
+            ],
+            &invocation,
+        )
+        .unwrap();
+        let mut bytes = b"!<arch>\n".to_vec();
+        bytes.extend_from_slice(checkout.join("assets").to_str().unwrap().as_bytes());
+        for name in ["libnamed.a", "named.lib"] {
+            let archive = dir.path().join(name);
+            std::fs::write(&archive, &bytes).unwrap();
+            let kind = crate::compiler::classify_by_filename(name);
+            let set = ArtifactSet::new(vec![artifact(&archive, kind)]);
+            let found = embedded_checkout(&args, &set, false);
+            assert!(matches!(found, Ok(Some(_))), "{name}");
+        }
     }
 
     #[test]

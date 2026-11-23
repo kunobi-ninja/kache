@@ -220,11 +220,15 @@ jobs:
         run: |
           set -euo pipefail
           base="$RUNNER_TEMP/freebsd-base.txz"
-          curl -fsSL --retry 3 -o "$base" \
-            "https://download.freebsd.org/releases/amd64/$FREEBSD_RELEASE/base.txz" ||
-            curl -fsSL --retry 3 -o "$base" \
-              "https://archive.freebsd.org/old-releases/amd64/$FREEBSD_RELEASE/base.txz"
-          echo "$FREEBSD_BASE_SHA256  $base" | sha256sum -c -
+          fetch_base() {
+            echo "Downloading $1"
+            curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 30 \
+              --max-time 210 --write-out 'HTTP %{http_code}, %{size_download} bytes in %{time_total}s\n' \
+              -o "$base" "$1" && echo "$FREEBSD_BASE_SHA256  $base" | sha256sum -c -
+          }
+          # Two bounded attempts leave three minutes to verify and unpack the sysroot.
+          fetch_base "https://download.freebsd.org/releases/amd64/$FREEBSD_RELEASE/base.txz" ||
+            fetch_base "https://archive.freebsd.org/old-releases/amd64/$FREEBSD_RELEASE/base.txz"
           sysroot="$RUNNER_TEMP/freebsd-sysroot"
           mkdir -p "$sysroot"
           tar -xf "$base" -C "$sysroot" ./lib ./usr/include ./usr/lib

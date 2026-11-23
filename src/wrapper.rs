@@ -1261,7 +1261,7 @@ fn claim_rustc_build(store: &Store, args: &RustcArgs, cache_key: &str) -> Result
     let Some(lock) = store.try_lock(cache_key)? else {
         return Ok(RustcClaim::Contended);
     };
-    for entry_key in rustc_diagnostics::lookup_keys(args, cache_key) {
+    for entry_key in rustc_diagnostics::local_lookup_keys(args, cache_key) {
         match store.get(&entry_key.key)? {
             Some(meta) if meta.files.is_empty() => {
                 tracing::warn!(
@@ -4647,7 +4647,7 @@ fn run_parsed_rustc(
         // every hit would be a database write per compile for no new information.
         // A re-derivation is the opposite case: its closure is what the record
         // should have said, so writing it is what repairs a stale row.
-        for entry_key in rustc_diagnostics::lookup_keys(args, &cache_key) {
+        for entry_key in rustc_diagnostics::local_lookup_keys(args, &cache_key) {
             let lookup_start = std::time::Instant::now();
             let lookup_result =
                 lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
@@ -5146,15 +5146,21 @@ fn run_parsed_rustc(
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
     // A proc macro can write the checkout path into generated code where the
-    // key cannot see it (kunobi-ninja/kache#1914).
+    // key cannot see it (kunobi-ninja/kache#1914). Such outputs are stored
+    // under a key bound to this checkout.
     let key_binds_manifest_dir =
         crate::embedded_checkout::key_binds_manifest_dir(key_outputs.env_deps.as_ref());
-    let names_checkout = || {
-        crate::embedded_checkout::embedded_checkout_reason(
-            args,
-            &result.artifacts,
-            key_binds_manifest_dir,
-        )
+    let mut bound_checkout = None;
+    let names_checkout = || match crate::embedded_checkout::embedded_checkout(
+        args,
+        &result.artifacts,
+        key_binds_manifest_dir,
+    ) {
+        Ok(checkout) => {
+            bound_checkout = checkout;
+            None
+        }
+        Err(reason) => Some(reason),
     };
     if let Some(reason) = unaudited.or(degraded).or(unpaired).or_else(names_checkout) {
         tracing::warn!("not caching {crate_name}: {reason}");
@@ -5177,6 +5183,10 @@ fn run_parsed_rustc(
     // Rendered diagnostics from a terminal-width invocation go under that
     // width's key; everything else under the shared key.
     let entry_key = rustc_diagnostics::store_key(args, &cache_key, &result.stdout, &result.stderr);
+    let entry_key = match &bound_checkout {
+        Some(checkout) => entry_key.bound_to_checkout(checkout),
+        None => entry_key,
+    };
     key_record.note_entry_key(&entry_key);
 
     // Put-side admission control: the compile already ran and its outputs are
@@ -5418,7 +5428,13 @@ fn run_parsed_rustc(
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     // 6. Queue remote publication through the shared durable upload path.
-    maybe_enqueue_upload(config, &store, &entry_key.key, crate_name, true);
+    maybe_enqueue_upload(
+        config,
+        &store,
+        &entry_key.key,
+        crate_name,
+        bound_checkout.is_none(),
+    );
 
     record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
 

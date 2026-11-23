@@ -170,6 +170,10 @@ impl<'a> RemoteLayout<'a> {
         deadline: Option<Instant>,
         mut observer: Option<&mut dyn DownloadObserver>,
     ) -> Result<DownloadResult> {
+        anyhow::ensure!(
+            !kache_format::is_checkout_key(cache_key),
+            "checkout-bound entry is local"
+        );
         let object_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
 
         tracing::debug!("downloading v3 pack {}", self.backend.describe(&object_key));
@@ -272,6 +276,10 @@ impl<'a> RemoteLayout<'a> {
         compression_level: i32,
         deadline: Option<Instant>,
     ) -> Result<RemoteUploadResult> {
+        anyhow::ensure!(
+            !kache_format::is_checkout_key(cache_key),
+            "checkout-bound entry is local"
+        );
         deadline_io_check(deadline, "upload preparation")?;
         let meta_path = entry_dir.join("meta.json");
         let meta_content = std::fs::read_to_string(&meta_path).context("reading meta.json")?;
@@ -2352,6 +2360,35 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read(dest.join("libfoo.rlib")).unwrap(),
             b"hello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_entries_never_transfer() {
+        let (_tmp, store, entry_dir) = populated_entry();
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+        let key = format!("checkout-{}", "a".repeat(64));
+        let upload = layout
+            .upload_entry_until(&key, "foo", &entry_dir, &store.blobs_dir(), 3, None)
+            .await;
+        assert!(upload.err().unwrap().to_string().contains("checkout-bound"));
+        assert!(
+            !backend
+                .head(&v3_pack_key(&remote.prefix, &key, "foo"))
+                .await
+                .unwrap()
+        );
+        let download = layout
+            .download_entry_until(&key, "foo", &entry_dir, &store.blobs_dir(), None)
+            .await;
+        assert!(
+            download
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("checkout-bound")
         );
     }
 

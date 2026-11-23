@@ -627,7 +627,7 @@ impl KeyLockSweepStats {
 /// not `<valid key>.lock`: `gc.lock`, `durability.lock`, entry directories.
 fn key_of_lock_name(name: &str) -> Option<&str> {
     name.strip_suffix(".lock")
-        .filter(|key| kache_format::is_valid_cache_key(key))
+        .filter(|key| kache_format::is_valid_store_key(key))
 }
 
 /// Old enough to unlink? A modification time ahead of `now` reads as young.
@@ -4186,12 +4186,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             // Entry dirs are named by cache key. Anything else under store/ is
             // not ours to interpret, and an unvalidated name would be a path
-            // component we then join (see `is_valid_cache_key`).
-            if !kache_format::is_valid_cache_key(name) {
+            // component we then join.
+            let key = if let Some(key) = name
+                .strip_prefix('.')
+                .filter(|key| kache_format::is_checkout_key(key))
+            {
+                key
+            } else if kache_format::is_valid_cache_key(name) {
+                name
+            } else {
                 continue;
-            }
+            };
 
-            match self.rebuild_one_entry(name, &path) {
+            match self.rebuild_one_entry(key, &path) {
                 Ok(Some(blobs)) => {
                     stats.entries_rebuilt += 1;
                     stats.blobs_registered += blobs;
@@ -5107,7 +5114,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
-        self.config.store_dir().join(cache_key)
+        // Older sync clients look for store/<key> directly. Keep checkout-only
+        // entries outside that layout even when binaries share the index.
+        if kache_format::is_checkout_key(cache_key) {
+            self.config.store_dir().join(format!(".{cache_key}"))
+        } else {
+            self.config.store_dir().join(cache_key)
+        }
     }
 
     /// Calculate the total size of the store.

@@ -2409,9 +2409,7 @@ impl GcRunReport {
 }
 
 /// How long a periodic sweep that found a store's `gc.lock` held waits
-/// before it asks again: ten minutes. The holder is mostly an automatic size sweep, which
-/// ranks and removes for minutes and runs none of the periodic sweep's age
-/// pass or housekeeping (tombstones, memos, session markers, key locks).
+/// before it asks again. Size-pressure sweeps take the same lock.
 const PERIODIC_GC_RETRY: Duration = Duration::from_secs(600);
 
 /// How many times a periodic sweep asks again for the stores it found held,
@@ -2422,15 +2420,15 @@ const PERIODIC_GC_RETRIES: u32 = 6;
 /// another GC held; while any are left, `pause(retry)`, then
 /// `sweep(Some(left))` sweeps just those, at most `retries` more times.
 /// Returns how many sweeps it started.
-async fn run_periodic_gc<T, S, SF, P, PF>(
+async fn run_periodic_gc<S, SF, P, PF>(
     mut sweep: S,
     mut pause: P,
     retry: Duration,
     retries: u32,
 ) -> u32
 where
-    S: FnMut(Option<Vec<T>>) -> SF,
-    SF: std::future::Future<Output = Vec<T>>,
+    S: FnMut(Option<Vec<PathBuf>>) -> SF,
+    SF: std::future::Future<Output = Vec<PathBuf>>,
     P: FnMut(Duration) -> PF,
     PF: std::future::Future<Output = ()>,
 {
@@ -6691,78 +6689,48 @@ impl Daemon {
     /// Each store's `gc.lock` is its own: a shard another GC holds is skipped,
     /// and a busy main store does not stop the shards from being swept.
     fn run_gc(&self, policy: GcPolicy, driver: GcDriver) -> Result<GcRunReport> {
-        Ok(self.run_gc_stores(policy, driver)?.0)
-    }
-
-    /// [`Self::run_gc`], with each shard it swept and that shard's report.
-    fn run_gc_stores(
-        &self,
-        policy: GcPolicy,
-        driver: GcDriver,
-    ) -> Result<(GcRunReport, Vec<(Config, GcRunReport)>)> {
         let report = self.run_gc_store(&self.config, policy, driver)?;
-        let shards = crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
+        crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
             self.run_gc_store(shard, policy, driver)
         });
-        Ok((report, shards))
+        Ok(report)
     }
 
-    /// One periodic sweep: of every store (the main store, then each shard)
-    /// when `stores` is `None`, else of just those. Returns the stores whose
-    /// `gc.lock` another GC held, for [`run_periodic_gc`] to ask again. A
-    /// store whose sweep failed is logged and not asked again.
-    fn periodic_gc(&self, stores: Option<Vec<Config>>) -> Vec<Config> {
+    /// Sweep each store independently. Only lock contention schedules a retry.
+    fn periodic_gc(&self, pending: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
+        let stores = pending.unwrap_or_else(|| {
+            let mut seen = HashSet::new();
+            std::iter::once(&self.config.cache_dir)
+                .chain(self.config.volume_stores.iter().map(|shard| &shard.store))
+                .filter(|path| seen.insert(*path))
+                .cloned()
+                .collect()
+        });
         let policy = GcPolicy::Automatic {
             max_age_hours: self.config.gc_max_age_hours,
         };
-        let swept: Vec<(Config, GcRunReport)> = match stores {
-            None => match self.run_gc_stores(policy, GcDriver::Periodic) {
-                Ok((main, shards)) => std::iter::once((self.config.clone(), main))
-                    .chain(shards)
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("periodic GC failed: {e}");
-                    Vec::new()
+        let mut held = Vec::new();
+        for path in stores {
+            // A volume can disappear or change between attempts. Check before
+            // opening its store and compute its budget on the mounted filesystem.
+            let config = if path == self.config.cache_dir {
+                self.config.clone()
+            } else if crate::volume_gc::shard_has_index(&path) {
+                self.config
+                    .for_store_dir(&path, crate::volume_gc::filesystem_bytes)
+            } else {
+                tracing::info!(store = %path.display(), "periodic GC: skipping volume shard with no index");
+                continue;
+            };
+            match self.run_gc_store(&config, policy, GcDriver::Periodic) {
+                Ok(report) if report.total.skipped => held.push(path),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(store = %path.display(), "periodic GC failed: {error:#}")
                 }
-            },
-            Some(stores) => stores
-                .into_iter()
-                .filter(|store| self.can_ask_again(store))
-                .filter_map(
-                    |store| match self.run_gc_store(&store, policy, GcDriver::Periodic) {
-                        Ok(report) => Some((store, report)),
-                        Err(e) => {
-                            tracing::warn!(
-                                store = %store.cache_dir.display(),
-                                "periodic GC failed: {e}"
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect(),
-        };
-        swept
-            .into_iter()
-            .filter(|(_, report)| report.total.skipped)
-            .map(|(store, _)| store)
-            .collect()
-    }
-
-    /// Whether a retry may sweep `store`. A shard is swept again only while
-    /// its index is there: its volume may have been unmounted since the first
-    /// sweep, and opening the store would create it on the bare mount point
-    /// (the guard the first sweep takes in `volume_gc::shard_gc_configs`).
-    fn can_ask_again(&self, store: &Config) -> bool {
-        let gone = store.cache_dir != self.config.cache_dir
-            && !crate::volume_gc::shard_has_index(&store.cache_dir);
-        if gone {
-            tracing::info!(
-                store = %store.cache_dir.display(),
-                "periodic GC: the shard has no index any more; not asking again"
-            );
+            }
         }
-        !gone
+        held
     }
 
     /// Core GC logic for the store of `config` with an explicit policy and
@@ -6820,13 +6788,6 @@ impl Daemon {
                     Ok((memos, inputs)) => tracing::debug!(memos, inputs, "gc: pruned C/C++ memos"),
                     Err(error) => tracing::warn!("gc: C/C++ memo pruning failed: {error}"),
                 }
-                let markers = crate::wrapper::prune_session_markers(
-                    &self.config,
-                    crate::wrapper::SESSION_MARKER_RETENTION,
-                    std::time::SystemTime::now(),
-                );
-                tracing::debug!(markers, "gc: pruned build-session markers");
-
                 // Bound the post-eviction demand log, and report what it says
                 // so far: a high demand rate means eviction is discarding
                 // entries the build still wants (#594).
@@ -6914,7 +6875,6 @@ impl Daemon {
                 } else {
                     0
                 };
-                crate::build_script::sweep_hermetic_out_dirs_for_gc(&self.config.cache_dir);
 
                 // Reclaim orphaned blob files (crash mid-put, or a meta-less
                 // remove_entry that couldn't decrement refcounts). The grace
@@ -6926,19 +6886,6 @@ impl Daemon {
                 // Same grace for put-phase staging snapshots abandoned by a
                 // crash between staging and publish (review finding #3).
                 let staging_stats = store.sweep_stale_staging(crate::store::STAGING_SWEEP_GRACE);
-                // Handoff request directories the staging sweep does not
-                // enter: a daemon that died with publications queued.
-                let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(
-                    &self.config,
-                    crate::store::STAGING_SWEEP_GRACE,
-                );
-                if handoffs.removed > 0 {
-                    tracing::info!(
-                        "swept {} abandoned cc handoffs ({})",
-                        handoffs.removed,
-                        crate::report::format_bytes(handoffs.bytes_reclaimed)
-                    );
-                }
                 let trash_removed = store.sweep_evicted_trash();
                 if trash_removed > 0 {
                     tracing::info!("removed {trash_removed} items left in the eviction trash");
@@ -6968,10 +6915,6 @@ impl Daemon {
                 ))
             })()?;
 
-        // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
-        // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
-        Self::clean_tool_version_caches(&self.config.cache_dir);
-
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
         let mut housekeeping = gc_store.sweep_housekeeping();
@@ -6981,8 +6924,9 @@ impl Daemon {
             housekeeping.flights_removed = flights.removed;
             housekeeping.flights_remaining = flights.remaining;
         }
-        let prestage_pruned =
-            crate::prestage::prune(&self.config.cache_dir, std::time::SystemTime::now());
+        if config.cache_dir == self.config.cache_dir {
+            self.sweep_daemon_housekeeping();
+        }
         tracing::info!(
             key_locks_removed = housekeeping.key_locks_removed,
             key_locks_remaining = housekeeping.key_locks_remaining,
@@ -6990,7 +6934,6 @@ impl Daemon {
             flights_remaining = housekeeping.flights_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
-            prestage_pruned,
             "gc: housekeeping"
         );
 
@@ -7074,6 +7017,31 @@ impl Daemon {
             size: evict_stats,
             total: stats,
         })
+    }
+
+    /// These files belong to the daemon's main cache or runtime. Only the
+    /// sweep holding the main gc.lock may remove them.
+    fn sweep_daemon_housekeeping(&self) {
+        let now = std::time::SystemTime::now();
+        let markers = crate::wrapper::prune_session_markers(
+            &self.config,
+            crate::wrapper::SESSION_MARKER_RETENTION,
+            now,
+        );
+        crate::build_script::sweep_hermetic_out_dirs_for_gc(&self.config.cache_dir);
+        let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(
+            &self.config,
+            crate::store::STAGING_SWEEP_GRACE,
+        );
+        Self::clean_tool_version_caches(&self.config.cache_dir);
+        let prestage_pruned = crate::prestage::prune(&self.config.cache_dir, now);
+        tracing::info!(
+            markers,
+            prestage_pruned,
+            handoffs_removed = handoffs.removed,
+            handoff_bytes_reclaimed = handoffs.bytes_reclaimed,
+            "gc: pruned daemon files"
+        );
     }
 
     /// Remove tool-version cache files older than 7 days.

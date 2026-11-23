@@ -3401,6 +3401,26 @@ fn test_handle_gc_reports_lock_skip() {
     assert_eq!(report.total.entries_evicted, 0);
 }
 
+// Leave a real store lock old enough for GC to remove it.
+fn stale_gc_key_lock(config: &Config) -> PathBuf {
+    let store = Store::open(config).unwrap();
+    let key = blake3::hash(b"stale").to_hex();
+    drop(
+        store
+            .try_lock(key.as_str())
+            .unwrap()
+            .expect("fresh key lock"),
+    );
+    let path = store.entry_dir(key.as_str()).with_extension("lock");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+        .unwrap();
+    path
+}
+
 /// A periodic sweep that finds a store's `gc.lock` held (an automatic size
 /// sweep ranking for minutes) asks again for that store alone after a pause,
 /// instead of leaving its age pass and housekeeping to the next interval, six
@@ -3418,22 +3438,14 @@ async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
     let shard = config.for_volume_store(&config.volume_stores[0], |_| None);
     let main = Store::open(&config).unwrap();
     Store::open(&shard).unwrap();
-    // A stale key lock with no entry: what a sweep's housekeeping removes.
-    let stale_lock = |store: &Config| {
-        let path = store
-            .store_dir()
-            .join(format!("{}.lock", blake3::hash(b"stale").to_hex()));
-        std::fs::write(&path, b"1").unwrap();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
-            .unwrap();
-        path
-    };
-    let main_lock = stale_lock(&config);
-    let shard_lock = stale_lock(&shard);
+    let main_lock = stale_gc_key_lock(&config);
+    let shard_lock = stale_gc_key_lock(&shard);
+    let global_marker = config.runtime_dir.join(".build-sessions/old");
+    std::fs::create_dir_all(global_marker.parent().unwrap()).unwrap();
+    std::fs::File::create(&global_marker)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(172_800))
+        .unwrap();
     let daemon = Daemon::new(config);
     let sweep = |stores| std::future::ready(daemon.periodic_gc(stores));
 
@@ -3445,10 +3457,10 @@ async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
     let started = run_periodic_gc(
         sweep,
         |pause| {
-            assert_eq!(pause, PERIODIC_GC_RETRY);
+            assert_eq!(pause, Duration::from_secs(600));
             assert!(shard_swept.len() < 2, "at most two retries, so two pauses");
             shard_swept.push(!shard_lock.exists());
-            stale_lock(&shard);
+            stale_gc_key_lock(&shard);
             std::future::ready(())
         },
         PERIODIC_GC_RETRY,
@@ -3465,6 +3477,11 @@ async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
     assert!(
         main_lock.exists(),
         "no sweep of the main store ran while it was held"
+    );
+
+    assert!(
+        global_marker.exists(),
+        "shard GC must leave main runtime files alone"
     );
 
     // Let go during the first pause: the retry sweeps the main store.
@@ -3487,9 +3504,14 @@ async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
         "the retry ran the main store's housekeeping"
     );
 
+    assert!(
+        !global_marker.exists(),
+        "the main sweep must prune the runtime marker"
+    );
+
     // A held shard is asked again too, and swept once let go.
     let shard_store = Store::open(&shard).unwrap();
-    let shard_lock = stale_lock(&shard);
+    let shard_lock = stale_gc_key_lock(&shard);
     let held = std::cell::Cell::new(Some(shard_store.try_gc_lock().unwrap().expect("gc lock")));
     let started = run_periodic_gc(
         sweep,
@@ -3506,7 +3528,7 @@ async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
 
     // A held shard whose volume went away during the pause (its index gone)
     // is not opened again, which would create the store on the mount point.
-    stale_lock(&shard);
+    stale_gc_key_lock(&shard);
     let held = std::cell::Cell::new(Some(shard_store.try_gc_lock().unwrap().expect("gc lock")));
     drop(shard_store);
     let started = run_periodic_gc(
@@ -3524,6 +3546,73 @@ async fn a_periodic_sweep_asks_again_for_a_store_whose_gc_lock_was_held() {
     assert!(
         !shard.cache_dir.exists(),
         "the retry left the gone shard alone"
+    );
+}
+
+#[test]
+fn periodic_gc_opens_the_main_store_but_leaves_an_empty_shard_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    let index = config.index_db_path();
+    let missing = dir.path().join("missing");
+    config.volume_stores.push(crate::config::VolumeStore {
+        volume: "volume".into(),
+        store: missing.clone(),
+        max_size: None,
+    });
+    config.volume_stores.push(crate::config::VolumeStore {
+        volume: "main-alias".into(),
+        store: config.cache_dir.clone(),
+        max_size: Some(1),
+    });
+    let daemon = Daemon::new(config);
+    assert!(daemon.periodic_gc(None).is_empty());
+    assert!(index.is_file());
+    assert!(!missing.exists());
+
+    let store = Store::open(&daemon.config).unwrap();
+    let _lock = store.try_gc_lock().unwrap().unwrap();
+    assert_eq!(daemon.periodic_gc(None), [daemon.config.cache_dir.clone()]);
+}
+
+#[test]
+fn periodic_gc_keeps_sweeping_shards_when_the_main_store_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    std::fs::write(&config.cache_dir, b"cannot open this file as a store").unwrap();
+    for name in ["healthy", "busy"] {
+        config.volume_stores.push(crate::config::VolumeStore {
+            volume: name.into(),
+            store: dir.path().join(name),
+            max_size: None,
+        });
+    }
+    let healthy = config.for_volume_store(&config.volume_stores[0], |_| None);
+    let busy = config.for_volume_store(&config.volume_stores[1], |_| None);
+    // A second configured volume can use the same underlying shard directory.
+    let mut also_busy = config.volume_stores[1].clone();
+    also_busy.volume = "another-volume".into();
+    config.volume_stores.push(also_busy);
+    let healthy_lock = stale_gc_key_lock(&healthy);
+    let busy_lock = stale_gc_key_lock(&busy);
+    let store = Store::open(&busy).unwrap();
+    let held = store.try_gc_lock().unwrap().unwrap();
+    let daemon = Daemon::new(config);
+    let pending = daemon.periodic_gc(None);
+    assert_eq!(pending, [busy.cache_dir.clone()]);
+    assert!(!healthy_lock.exists());
+    assert!(busy_lock.exists());
+
+    let healthy_lock = stale_gc_key_lock(&healthy);
+    drop(held);
+    assert!(daemon.periodic_gc(Some(pending)).is_empty());
+    assert!(
+        healthy_lock.exists(),
+        "the successful shard was swept twice"
+    );
+    assert!(
+        !busy_lock.exists(),
+        "the previously locked shard was skipped"
     );
 }
 

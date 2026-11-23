@@ -140,9 +140,36 @@ fn found(pid: u32) -> Found {
     if pid <= 1 {
         return Found::Gone;
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         found_on_this_platform(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const BSD_INFO_SIZE: i32 = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return Found::Gone;
+        };
+        // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is a writable proc_bsdinfo of the requested size.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                BSD_INFO_SIZE,
+            )
+        };
+        process_from_bsdinfo(
+            written,
+            BSD_INFO_SIZE,
+            info.pbi_status,
+            libc::SZOMB,
+            (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            || std::io::Error::last_os_error().raw_os_error(),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -150,48 +177,31 @@ fn found(pid: u32) -> Found {
     }
 }
 
-#[cfg(target_os = "macos")]
-const BSD_INFO_SIZE: libc::c_int = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-
-#[cfg(target_os = "macos")]
-fn found_on_this_platform(pid: u32) -> Found {
-    let Ok(pid) = libc::c_int::try_from(pid) else {
-        return Found::Gone;
-    };
-    // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: the buffer is a writable proc_bsdinfo of the requested size.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&raw mut info).cast(),
-            BSD_INFO_SIZE,
-        )
-    };
-    process_from_bsdinfo(&info, written, || {
-        std::io::Error::last_os_error().raw_os_error()
-    })
-}
-
-/// libproc returns zero on error. A positive short result carries no errno.
-#[cfg(target_os = "macos")]
+/// Only a complete libproc reply supplies a status and start. On error libproc
+/// returns zero and sets errno; a positive short reply carries no errno.
+#[cfg(any(test, target_os = "macos"))]
 fn process_from_bsdinfo(
-    info: &libc::proc_bsdinfo,
-    written: libc::c_int,
+    written: i32,
+    required: i32,
+    status: u32,
+    zombie_status: u32,
+    (seconds, micros): (u64, u64),
     errno: impl FnOnce() -> Option<i32>,
 ) -> Found {
-    match written {
-        0 if errno() == Some(libc::ESRCH) => Found::Gone,
-        BSD_INFO_SIZE if info.pbi_status == libc::SZOMB => Found::Gone,
-        BSD_INFO_SIZE => Found::Started(
-            info.pbi_start_tvsec
-                .saturating_mul(1_000_000)
-                .saturating_add(info.pbi_start_tvusec),
-        ),
-        _ => Found::Unknown,
+    if written == 0 {
+        return if errno() == Some(libc::ESRCH) {
+            Found::Gone
+        } else {
+            Found::Unknown
+        };
     }
+    if written != required {
+        return Found::Unknown;
+    }
+    if status == zombie_status {
+        return Found::Gone;
+    }
+    Found::Started(seconds.saturating_mul(1_000_000).saturating_add(micros))
 }
 
 #[cfg(target_os = "linux")]
@@ -370,34 +380,43 @@ mod tests {
         assert!(!running.is_running());
     }
 
+    #[test]
+    fn bsd_info_requires_a_complete_record_and_only_consults_errno_on_failure() {
+        let required = 128;
+        let alive = 2;
+        let zombie = 5;
+        let start = (2, 3);
+        let no_errno = || panic!("errno only belongs to a failed call");
+
+        assert_eq!(
+            process_from_bsdinfo(required, required, alive, zombie, start, no_errno),
+            Found::Started(2_000_003),
+        );
+        assert_eq!(
+            process_from_bsdinfo(required, required, zombie, zombie, start, no_errno),
+            Found::Gone,
+        );
+        for (error, expected) in [
+            (None, Found::Unknown),
+            (Some(libc::EPERM), Found::Unknown),
+            (Some(libc::ESRCH), Found::Gone),
+        ] {
+            assert_eq!(
+                process_from_bsdinfo(0, required, alive, zombie, start, || error),
+                expected
+            );
+        }
+        for written in [-1, required - 1, required + 1] {
+            assert_eq!(
+                process_from_bsdinfo(written, required, zombie, zombie, start, no_errno),
+                Found::Unknown,
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn bsd_info_gives_the_start_and_only_a_missing_process_is_gone() {
-        // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        info.pbi_start_tvsec = 2;
-        info.pbi_start_tvusec = 3;
-        let no_errno = || panic!("errno only belongs to a failed call");
-        assert_eq!(
-            process_from_bsdinfo(&info, BSD_INFO_SIZE, no_errno),
-            Found::Started(2_000_003)
-        );
-        assert_eq!(
-            process_from_bsdinfo(&info, 0, || Some(libc::ESRCH)),
-            Found::Gone
-        );
-        for error in [Some(libc::EPERM), None] {
-            assert_eq!(process_from_bsdinfo(&info, 0, || error), Found::Unknown);
-        }
-        info.pbi_status = libc::SZOMB;
-        assert_eq!(
-            process_from_bsdinfo(&info, BSD_INFO_SIZE - 1, no_errno),
-            Found::Unknown
-        );
-        assert_eq!(
-            process_from_bsdinfo(&info, BSD_INFO_SIZE, no_errno),
-            Found::Gone
-        );
+    fn libproc_reports_a_stable_start_for_the_current_process() {
         let this = found(std::process::id());
         assert!(matches!(this, Found::Started(_)), "{this:?}");
         assert_eq!(found(std::process::id()), this);

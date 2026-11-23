@@ -96,7 +96,7 @@ pub(crate) struct Tally {
 /// share, or a chronic-miss count may be built from.
 fn is_lookup(event: &BuildEvent) -> bool {
     matches!(
-        event.result,
+        crate::events::cache_outcome(event),
         EventResult::LocalHit
             | EventResult::PrefetchHit
             | EventResult::RemoteHit
@@ -106,23 +106,30 @@ fn is_lookup(event: &BuildEvent) -> bool {
 }
 
 fn is_miss(event: &BuildEvent) -> bool {
-    matches!(event.result, EventResult::Miss | EventResult::Dup)
+    matches!(
+        crate::events::cache_outcome(event),
+        EventResult::Miss | EventResult::Dup
+    )
 }
 
 impl Tally {
     pub(crate) fn add(&mut self, event: &BuildEvent) {
-        match event.result {
+        match crate::events::cache_outcome(event) {
             EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => {
                 self.hits = self.hits.saturating_add(1);
                 self.saved_ms = self.saved_ms.saturating_add(event.compile_time_ms);
             }
             EventResult::Miss => {
                 self.misses = self.misses.saturating_add(1);
-                self.miss_ms = self.miss_ms.saturating_add(event.compile_time_ms);
+                self.miss_ms = self
+                    .miss_ms
+                    .saturating_add(crate::events::miss_compile_ms(event));
             }
             EventResult::Dup => {
                 self.dups = self.dups.saturating_add(1);
-                self.miss_ms = self.miss_ms.saturating_add(event.compile_time_ms);
+                self.miss_ms = self
+                    .miss_ms
+                    .saturating_add(crate::events::miss_compile_ms(event));
             }
             EventResult::Passthrough if is_probe(event) => {
                 self.probes = self.probes.saturating_add(1);
@@ -379,6 +386,8 @@ pub(crate) enum Cause {
     /// `Store::put` failed after the compile (kunobi-ninja/kache#629). The
     /// output was built and not cached.
     StoreFailed(String),
+    /// The compile finished but its output was ineligible for storage.
+    StoreDeclined(String),
     /// An entry for this exact key existed but could not serve the
     /// invocation (kunobi-ninja/kache#655).
     LookupRejected(String),
@@ -414,6 +423,7 @@ impl Cause {
     /// One line a reader can act on.
     pub(crate) fn describe(&self) -> String {
         match self {
+            Cause::StoreDeclined(reason) => format!("store declined: {reason}"),
             Cause::StoreFailed(reason) => format!("compiled but not cached: {reason}"),
             Cause::LookupRejected(reason) => format!("entry rejected at lookup: {reason}"),
             Cause::Evicted => {
@@ -556,8 +566,9 @@ pub(crate) fn analyze_session(
             )
         });
         group.count += 1;
-        group.compile_ms = group.compile_ms.saturating_add(event.compile_time_ms);
-        add_crate_cost(crates, &event.crate_name, event.compile_time_ms);
+        let compile_ms = crate::events::miss_compile_ms(event);
+        group.compile_ms = group.compile_ms.saturating_add(compile_ms);
+        add_crate_cost(crates, &event.crate_name, compile_ms);
     }
     let mut causes: Vec<CauseGroup> = groups
         .into_values()
@@ -648,7 +659,9 @@ pub(crate) fn sort_costliest_first(causes: &mut [CauseGroup]) {
 fn costliest_miss<'a>(misses: impl Iterator<Item = &'a BuildEvent>) -> Option<String> {
     let mut costliest: Option<&BuildEvent> = None;
     for miss in misses {
-        if costliest.is_none_or(|best| miss.compile_time_ms > best.compile_time_ms) {
+        if costliest.is_none_or(|best| {
+            crate::events::miss_compile_ms(miss) > crate::events::miss_compile_ms(best)
+        }) {
             costliest = Some(miss);
         }
     }
@@ -790,6 +803,9 @@ fn stored_or_served(event: &BuildEvent) -> bool {
 
 fn cause_of(events: &[BuildEvent], index: usize, history: &History) -> Cause {
     let event = &events[index];
+    if event.result == EventResult::Skipped {
+        return Cause::StoreDeclined(event.skip_reason.clone());
+    }
     if !event.store_error.is_empty() {
         return Cause::StoreFailed(event.store_error.clone());
     }
@@ -1216,6 +1232,37 @@ mod tests {
         refresh_state(&mut cached, ts(5_000), &live);
         assert_eq!(cached, group_sessions(&events, ts(5_000), &live, gap()));
         assert_eq!(cached[0].key, "id:s1");
+    }
+
+    #[test]
+    fn session_rates_and_causes_include_a_declined_store() {
+        let mut declined = event("a", EventResult::Skipped, 0, "/w", "s");
+        declined.cache_key = "key".into();
+        declined.skip_reason = "admission-threshold".into();
+        declined.elapsed_ms = 700;
+        declined.compile_time_ms = 0;
+        let mut keyless = declined.clone();
+        keyless.cache_key.clear();
+        let events = [
+            declined,
+            keyless,
+            event("b", EventResult::LocalHit, 1, "/w", "s"),
+        ];
+        let sessions = group(&events, gap());
+        let session = &sessions[0];
+        assert_eq!(session.tally.hit_rate(), Some(50.0));
+        assert_eq!(session.tally.miss_ms, 700);
+        assert_eq!(session.tally.lookup_elapsed_ms, 800);
+        assert_eq!(session.tally.skipped, 1);
+        let analysis = analyze_session(&events, session, &sessions);
+        assert_eq!(analysis.misses_total, 1);
+        assert_eq!(analysis.causes[0].compile_ms, 700);
+        assert_eq!(
+            analysis.causes[0].cause.describe(),
+            "store declined: admission-threshold"
+        );
+        assert!(!analysis.causes[0].cause.is_failure());
+        assert!(!stored_or_served(&events[0]));
     }
 
     #[test]

@@ -1419,6 +1419,14 @@ pub(crate) fn cache_outcome(event: &BuildEvent) -> EventResult {
     }
 }
 
+pub(crate) fn miss_compile_ms(event: &BuildEvent) -> u64 {
+    if event.compile_time_ms > 0 {
+        event.compile_time_ms
+    } else {
+        event.elapsed_ms
+    }
+}
+
 /// [`compute_stats`], adding `events` to `stats`.
 pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> EventStats {
     for event in events {
@@ -1444,20 +1452,12 @@ pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> Event
             EventResult::Dup => {
                 stats.dups += 1;
                 stats.miss_elapsed_ms += event.elapsed_ms;
-                stats.miss_compile_time_ms += if event.compile_time_ms > 0 {
-                    event.compile_time_ms
-                } else {
-                    event.elapsed_ms
-                };
+                stats.miss_compile_time_ms += miss_compile_ms(event);
             }
             EventResult::Miss => {
                 stats.misses += 1;
                 stats.miss_elapsed_ms += event.elapsed_ms;
-                stats.miss_compile_time_ms += if event.compile_time_ms > 0 {
-                    event.compile_time_ms
-                } else {
-                    event.elapsed_ms
-                };
+                stats.miss_compile_time_ms += miss_compile_ms(event);
             }
             EventResult::Error => stats.errors += 1,
             EventResult::Passthrough | EventResult::Skipped => continue,

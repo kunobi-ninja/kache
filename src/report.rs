@@ -2253,8 +2253,8 @@ fn event_timeline(e: &BuildEvent) -> (String, String, i64, i64) {
 }
 
 /// Local hits on keys a prefetch download imported before the hit, each key
-/// once per prefetch session. The wrapper finds such an entry in its own store and never asks the
-/// daemon, so the event itself says `local_hit`.
+/// once per prefetch session. The wrapper finds these entries locally and
+/// records a `local_hit`.
 fn prefetch_served_local_hits<'a>(
     build_events: &[BuildEvent],
     transfers: &'a [TransferEvent],
@@ -2301,27 +2301,61 @@ fn prefetch_served_local_hits<'a>(
             );
         }
     }
+    if imported_at.is_empty() {
+        return 0;
+    }
+    // Compiler events arrive in completion order. A later local hit cannot
+    // make a download timely if this build had already asked for the key.
+    let mut first_demands = HashMap::new();
+    for event in build_events {
+        let session = event.session_id.as_str();
+        let key = event.cache_key.as_str();
+        let fallback = if (event.is_hit()
+            || matches!(
+                events::cache_outcome(event),
+                EventResult::Miss | EventResult::Dup
+            ))
+            && !event.demands.iter().any(|demand| demand.cache_key == key)
+        {
+            Some((
+                key,
+                u64::try_from(event_start(event).as_millisecond()).unwrap_or(0),
+            ))
+        } else {
+            None
+        };
+        for (candidate, at) in event
+            .demands
+            .iter()
+            .map(|d| (d.cache_key.as_str(), d.first_demand_at_ms))
+            .chain(fallback)
+        {
+            if imported_at.contains_key(&(candidate, session))
+                || imported_at.contains_key(&(candidate, ""))
+            {
+                let first = first_demands.entry((candidate, session)).or_insert(at);
+                *first = (*first).min(at);
+            }
+        }
+    }
     let mut local = HashSet::new();
     let mut explicit = HashSet::new();
     for event in build_events {
         let served = match event.result {
             EventResult::PrefetchHit => &mut explicit,
-            EventResult::LocalHit if !event.readonly_store => &mut local,
+            // Older local hits did not identify which store served them.
+            EventResult::LocalHit if event.schema >= 28 && !event.readonly_store => &mut local,
             _ => continue,
         };
         let key = event.cache_key.as_str();
-        let demand = event
-            .demands
-            .iter()
-            .filter(|d| d.cache_key == key)
-            .map(|d| d.first_demand_at_ms)
-            .min()
-            .unwrap_or_else(|| u64::try_from(event_start(event).as_millisecond()).unwrap_or(0));
+        let Some(demand) = first_demands.get(&(key, event.session_id.as_str())) else {
+            continue;
+        };
         // Prefer a receipt from this build. Unscoped prefetches also warm the
         // shared writable store, and may be credited once across sessions.
         if let Some(receipt) = [(key, event.session_id.as_str()), (key, "")]
             .into_iter()
-            .find(|receipt| imported_at.get(receipt).is_some_and(|at| *at <= demand))
+            .find(|receipt| imported_at.get(receipt).is_some_and(|at| at <= demand))
         {
             served.insert(receipt);
         }

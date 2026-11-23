@@ -1071,6 +1071,9 @@ fn local_hit_on_an_entry_prefetch_imported_counts_as_a_prefetch_hit() {
         )
         .unwrap();
     }
+    let mut writable_hit = test_event("fresh", EventResult::LocalHit, 5, 300, 10, "fresh-key");
+    writable_hit.schema = 28;
+    events::log_event(&config.event_log_path(), &writable_hit).unwrap();
     let now_ms = jiff::Timestamp::now().as_millisecond() as u64;
     let prefetch = |cache_key: &str, outcome: &str, finished_at_unix_ms: u64| {
         let mut transfer = test_transfer("serde", TransferDirection::Download, "v3", 10, 5, true);
@@ -1083,8 +1086,9 @@ fn local_hit_on_an_entry_prefetch_imported_counts_as_a_prefetch_hit() {
         transfer
     };
     for transfer in [
-        // `write_test_events` logs a local hit on this key.
+        // The fixture's legacy event did not identify its local store.
         prefetch("abc123def456", "completed", now_ms - 60_000),
+        prefetch("fresh-key", "completed", now_ms - 60_000),
         prefetch("late-key", "completed", now_ms + 3_600_000),
         prefetch("not-found-key", "not_found", now_ms - 60_000),
     ] {
@@ -1096,10 +1100,10 @@ fn local_hit_on_an_entry_prefetch_imported_counts_as_a_prefetch_hit() {
         report.summary.prefetch_hits, 1,
         "summary preserves the recorded hit sources"
     );
-    assert_eq!(report.summary.local_hits, 3);
+    assert_eq!(report.summary.local_hits, 4);
     assert_eq!(report.prefetch.prefetch_hits, 2);
-    assert_eq!(report.prefetch.total_hits, 5);
-    assert_eq!(report.prefetch.contribution_pct, 40.0);
+    assert_eq!(report.prefetch.total_hits, 6);
+    assert_eq!(report.prefetch.contribution_pct, 2.0 / 6.0 * 100.0);
 }
 
 #[test]
@@ -1109,6 +1113,7 @@ fn prefetch_credit_requires_a_matching_import_by_first_demand() {
     };
 
     let mut hit = test_event("lib", EventResult::LocalHit, 200, 100, 0, "key");
+    hit.schema = 28;
     hit.ts = jiff::Timestamp::from_millisecond(1000).unwrap();
     hit.session_id = "build".into();
     let origin = PrefetchOrigin {
@@ -1147,6 +1152,30 @@ fn prefetch_credit_requires_a_matching_import_by_first_demand() {
     assert_eq!(credit(&hit, &get), 0);
     get.finished_at_unix_ms = 900;
     assert_eq!(credit(&hit, &get), 1);
+    // A miss can be logged after a later hit. Its earlier demand still
+    // determines whether the import arrived in time.
+    let mut earlier = hit.clone();
+    earlier.result = EventResult::Miss;
+    earlier.ts = jiff::Timestamp::from_millisecond(800).unwrap();
+    earlier.demands.clear();
+    let with_prior_miss = |earlier: &BuildEvent| {
+        prefetch_served_local_hits(&[hit.clone(), earlier.clone()], std::slice::from_ref(&get))
+    };
+    assert_eq!(with_prior_miss(&earlier), 0);
+    earlier.session_id = "other".into();
+    assert_eq!(with_prior_miss(&earlier), 1);
+    earlier.session_id = hit.session_id.clone();
+    // An unsuccessful prediction records the demand under a different final key.
+    earlier.cache_key = "replacement".into();
+    earlier.demands = vec![KeyDemand {
+        cache_key: hit.cache_key.clone(),
+        first_demand_at_ms: 899,
+        ..Default::default()
+    }];
+    assert_eq!(with_prior_miss(&earlier), 0);
+    hit.schema = 27;
+    assert_eq!(credit(&hit, &get), 0);
+    hit.schema = 28;
     hit.readonly_store = true;
     assert_eq!(credit(&hit, &get), 0);
     hit.readonly_store = false;

@@ -571,7 +571,11 @@ fn lookup_series_buckets_by_time_and_keeps_idle_time_flat() {
         event.ts = now - jiff::SignedDuration::from_secs(secs_ago);
         event
     };
+    let mut declined = at(220, EventResult::Skipped);
+    declined.cache_key = "key".into();
+    declined.skip_reason = "admission-threshold".into();
     let events = vec![
+        declined,
         at(10, EventResult::LocalHit),
         at(10, EventResult::RemoteHit),
         at(10, EventResult::Miss),
@@ -589,8 +593,8 @@ fn lookup_series_buckets_by_time_and_keeps_idle_time_flat() {
     );
     assert_eq!(
         misses,
-        vec![0, 1, 1],
-        "dup counts as a compile, passthrough as neither"
+        vec![1, 1, 1],
+        "keyed declined stores and dups count as misses"
     );
     assert_eq!(lookup_series(&events, now, window, 0), (vec![], vec![]));
 }

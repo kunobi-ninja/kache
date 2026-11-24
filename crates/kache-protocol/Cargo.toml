@@ -1,6 +1,6 @@
 [package]
 name = "kache-protocol"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Shared data types for Kache's local client and daemon protocol."
@@ -13,8 +13,8 @@ readme = "README.md"
 test-support = []
 
 [dependencies]
-kache-format = { version = "2.3.0", path = "../kache-format" }
-kache-core = { version = "2.3.0", path = "../kache-core", default-features = false }
+kache-format = { version = "2.3.1", path = "../kache-format" }
+kache-core = { version = "2.3.1", path = "../kache-core", default-features = false }
 jiff = { version = "0.2.46", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 

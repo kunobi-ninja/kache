@@ -95,6 +95,8 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 pub use kache_config::TEST_LEASE_ENV;
 
 pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How long a test waits for slots before it names who holds them.
+const TEST_WAIT_NOTICE: Duration = Duration::from_secs(10);
 /// How long a test lease waits for its marker, never longer than its wait
 /// for slots.
 const MARKER_WAIT: Duration = Duration::from_secs(1);
@@ -925,6 +927,7 @@ impl Scheduler {
     ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
         let mut waited = false;
+        let mut noticed = false;
         loop {
             if crate::invocation::process::check().is_err() {
                 request.evidence.borrow_mut().outcome = SchedulerOutcome::Cancelled;
@@ -932,6 +935,14 @@ impl Scheduler {
             }
             // A need of zero would never be met.
             let asking = need(waited, request.saved_for_tests.get()).max(1);
+            if request.kind == queue::Kind::Test && !noticed && start.elapsed() >= TEST_WAIT_NOTICE
+            {
+                noticed = true;
+                eprintln!(
+                    "kache test-runner: {}",
+                    self.test_wait_notice(start.elapsed(), asking)
+                );
+            }
             match self.collect_permits(request, asking, ticket, start) {
                 WaitStep::Ready(slots) => return Some(slots),
                 WaitStep::Stop => return None,
@@ -962,6 +973,19 @@ impl Scheduler {
         }
     }
 
+    fn test_wait_notice(&self, waited: Duration, need: u32) -> String {
+        let busy = (0..self.pool_size)
+            .filter(|&index| slot_is_held(&self.permit_path(index)) == Some(true))
+            .count() as u32;
+        test_wait_notice(
+            waited,
+            need,
+            &test_holders(&self.root),
+            busy.saturating_sub(tests_held(&self.root)),
+            kache_store::markers::now_epoch_secs(),
+        )
+    }
+
     /// Take slots above the compile reserve for a test binary.
     ///
     /// Blocks up to the wait timeout for the fixed count or the elastic
@@ -986,6 +1010,8 @@ impl Scheduler {
         let lowest = slots.iter().map(|(index, _)| *index).min()?;
         let path = tests_dir(&self.root).join(lowest.to_string());
         Some(TestLease {
+            root: self.root.clone(),
+            holder: None,
             _markers: markers,
             marker_path: std::path::absolute(&path).unwrap_or(path),
             _slots: slots,
@@ -1068,10 +1094,14 @@ pub enum TestWant {
 
 /// Slots held by a running test binary.
 ///
-/// `_markers` holds one marker per slot. Its children find the lowest one
-/// through [`TEST_LEASE_ENV`]. They are declared first so they are released
-/// before the slots: whoever takes a slot next can always lock its marker.
+/// `_markers` holds one marker per slot, in the order of `_slots`. Its
+/// children find the lowest one through [`TEST_LEASE_ENV`]. They are
+/// declared first so they are released before the slots: whoever takes a
+/// slot next can always lock its marker.
 pub struct TestLease {
+    root: PathBuf,
+    /// The record that names this lease to a test that waits for slots.
+    holder: Option<(PathBuf, String)>,
     _markers: Vec<StoreLock>,
     marker_path: PathBuf,
     _slots: Vec<(u32, StoreLock)>,
@@ -1087,6 +1117,167 @@ impl TestLease {
     pub fn held(&self) -> u32 {
         self._slots.len() as u32
     }
+
+    /// Release every slot but the lowest `keep` (at least one: the slot
+    /// whose marker the binary's children were given), and wake the
+    /// requests waiting for them. The number released.
+    pub fn shrink_to(&mut self, keep: u32) -> u32 {
+        let keep = keep.max(1) as usize;
+        if self._slots.len() <= keep {
+            return 0;
+        }
+        let mut held: Vec<(StoreLock, (u32, StoreLock))> =
+            self._markers.drain(..).zip(self._slots.drain(..)).collect();
+        held.sort_by_key(|(_, (index, _))| *index);
+        let released = held.split_off(keep);
+        let count = released.len() as u32;
+        // Each marker goes before its slot, as on drop.
+        for (marker, slot) in released {
+            drop(marker);
+            drop(slot);
+        }
+        (self._markers, self._slots) = held.into_iter().unzip();
+        if let Some((path, what)) = &self.holder {
+            let _ = fs::write(path, holder_text(self._slots.len() as u32, what));
+        }
+        permit_wait::notify(&self.root);
+        count
+    }
+
+    /// Name this lease `what` to a test that waits for slots, until it is
+    /// dropped. The record is named by this process and its start, as
+    /// target leases are (see [`crate::target_use`]).
+    pub fn name_holder(&mut self, what: &str) {
+        let dir = test_holders_dir(&self.root);
+        if fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let process = crate::process_identity::ProcessIdentity::current();
+        let since = kache_store::markers::now_epoch_secs();
+        let name = match process.start() {
+            Some(start) => format!("{}-{start}", process.pid()),
+            None => process.pid().to_string(),
+        };
+        let what = format!("{since}\t{}", what.replace(['\n', '\r', '\t'], " "));
+        let path = dir.join(name);
+        if fs::write(&path, holder_text(self.held(), &what)).is_ok() {
+            self.holder = Some((path, what));
+        }
+    }
+}
+
+impl Drop for TestLease {
+    fn drop(&mut self) {
+        if let Some((path, _)) = self.holder.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn test_holders_dir(root: &Path) -> PathBuf {
+    root.join("test-holders")
+}
+
+/// A holder record: `<slots>\t<since>\t<what>`.
+fn holder_text(slots: u32, since_what: &str) -> String {
+    format!("{slots}\t{since_what}")
+}
+
+/// A running test lease, as its record names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestHolder {
+    pub(crate) pid: u32,
+    pub(crate) slots: u32,
+    pub(crate) since: u64,
+    pub(crate) what: String,
+}
+
+fn parse_test_holder(
+    name: &str,
+    text: &str,
+) -> Option<(crate::process_identity::ProcessIdentity, TestHolder)> {
+    use crate::process_identity::ProcessIdentity;
+    let (pid, start) = match name.split_once('-') {
+        Some((pid, start)) => (pid.parse().ok()?, Some(start.parse().ok()?)),
+        None => (name.parse().ok()?, None),
+    };
+    let process = match start {
+        Some(start) => ProcessIdentity::started_at(pid, start),
+        None => ProcessIdentity::unrecorded(pid),
+    };
+    let mut fields = text.splitn(3, '\t');
+    let slots = fields.next()?.parse().ok()?;
+    let since = fields.next()?.parse().ok()?;
+    let what = fields.next()?.to_owned();
+    Some((
+        process,
+        TestHolder {
+            pid,
+            slots,
+            since,
+            what,
+        },
+    ))
+}
+
+/// The test leases that name themselves, oldest first. A record whose
+/// process is gone is removed.
+pub(crate) fn test_holders(root: &Path) -> Vec<TestHolder> {
+    let Ok(entries) = fs::read_dir(test_holders_dir(root)) else {
+        return Vec::new();
+    };
+    let mut holders = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((process, holder)) = fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| parse_test_holder(&name, &text))
+        else {
+            continue;
+        };
+        if process.is_running() {
+            holders.push(holder);
+        } else {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    holders.sort_by_key(|holder| (holder.since, holder.pid));
+    holders
+}
+
+/// What a test that has waited `waited` for `need` slots prints: who holds
+/// the test slots, for how long, and how many slots compiles hold.
+pub(crate) fn test_wait_notice(
+    waited: Duration,
+    need: u32,
+    holders: &[TestHolder],
+    compiles: u32,
+    now: u64,
+) -> String {
+    let named: Vec<String> = holders
+        .iter()
+        .map(|holder| {
+            let running = now.saturating_sub(holder.since);
+            format!(
+                "{} (pid {}, {} slot{}, running {})",
+                holder.what,
+                holder.pid,
+                holder.slots,
+                if holder.slots == 1 { "" } else { "s" },
+                crate::heartbeat::format_secs(running)
+            )
+        })
+        .collect();
+    let tests = if named.is_empty() {
+        "no test names itself".to_owned()
+    } else {
+        format!("tests hold them: {}", named.join(", "))
+    };
+    format!(
+        "waited {} for {need} test slot{}; {tests}; compiles hold {compiles}",
+        crate::heartbeat::format_secs(waited.as_secs()),
+        if need == 1 { "" } else { "s" },
+    )
 }
 
 /// Take test slots for a test binary from a pool of `pool` slots, waiting at
@@ -4829,6 +5020,134 @@ mod tests {
         assert_eq!(permits_in_use(dir.path()), Some(UNMEASURED_COMPILE_WEIGHT));
         let ceiling = fs::read_to_string(scheduler_root(dir.path()).join("pressure")).unwrap();
         assert!(ceiling.starts_with("1 "), "stored ceiling: {ceiling:?}");
+    }
+
+    #[test]
+    fn a_shrunk_lease_keeps_its_lowest_slots_and_lets_a_waiting_test_in() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 8);
+        let mut lease = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
+        assert_eq!(lease.held(), 6, "slots 2..8");
+        assert_eq!(tests_held(&scheduler.root), 6);
+        let other = budget_scheduler(dir.path(), 8);
+        assert!(
+            other.acquire_test_lease(TestWant::Fixed(1)).is_none(),
+            "every test slot is held"
+        );
+
+        assert_eq!(lease.shrink_to(6), 0, "already that small");
+        assert_eq!(lease.shrink_to(2), 4);
+        assert_eq!(lease.held(), 2);
+        assert_eq!(tests_held(&scheduler.root), 2, "markers go with slots");
+        assert_eq!(slot_is_held(&scheduler.permit_path(2)), Some(true));
+        assert_eq!(slot_is_held(&scheduler.permit_path(3)), Some(true));
+        assert_eq!(slot_is_held(&scheduler.permit_path(4)), Some(false));
+        assert_eq!(slot_is_held(&scheduler.permit_path(7)), Some(false));
+        assert_eq!(
+            lease.marker_path(),
+            tests_dir(&scheduler.root).join("2"),
+            "children keep the marker they were given"
+        );
+        let waiting = other.acquire_test_lease(TestWant::Fixed(4)).unwrap();
+        assert_eq!(waiting.held(), 4, "slots 4..8");
+
+        assert_eq!(lease.shrink_to(0), 1, "one slot stays");
+        assert_eq!(lease.held(), 1);
+        assert_eq!(slot_is_held(&scheduler.permit_path(2)), Some(true));
+        drop(lease);
+        drop(waiting);
+        assert_eq!(tests_held(&scheduler.root), 0);
+    }
+
+    #[test]
+    fn a_named_lease_tells_a_waiting_test_who_holds_the_slots() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 8);
+        let mut lease = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
+        assert!(test_holders(&scheduler.root).is_empty(), "not named yet");
+        lease.name_holder("target/debug/deps/hangs-0123456789abcdef\tx");
+        let holders = test_holders(&scheduler.root);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].pid, std::process::id());
+        assert_eq!(holders[0].slots, 6);
+        assert_eq!(
+            holders[0].what,
+            "target/debug/deps/hangs-0123456789abcdef x"
+        );
+        lease.shrink_to(1);
+        assert_eq!(
+            test_holders(&scheduler.root)[0].slots,
+            1,
+            "the record follows"
+        );
+        drop(lease);
+        assert!(
+            test_holders(&scheduler.root).is_empty(),
+            "gone with the lease"
+        );
+
+        // A record whose process is gone is removed.
+        let records = test_holders_dir(&scheduler.root);
+        fs::write(records.join("2147483646"), "3\t5\tgone").unwrap();
+        fs::write(records.join("garbage"), "x").unwrap();
+        assert!(test_holders(&scheduler.root).is_empty());
+        assert!(!records.join("2147483646").exists());
+    }
+
+    #[test]
+    fn a_test_holder_record_round_trips() {
+        let (_, holder) = parse_test_holder("17-99", "3\t1000\tbin\twith tab").unwrap();
+        assert_eq!(
+            holder,
+            TestHolder {
+                pid: 17,
+                slots: 3,
+                since: 1000,
+                what: "bin\twith tab".into(),
+            }
+        );
+        assert_eq!(parse_test_holder("17", "1\t2\tx").unwrap().1.pid, 17);
+        assert!(parse_test_holder("x", "1\t2\tx").is_none());
+        assert!(parse_test_holder("17-x", "1\t2\tx").is_none());
+        assert!(parse_test_holder("17", "1\t2").is_none());
+        assert!(parse_test_holder("17", "x\t2\ty").is_none());
+        assert!(parse_test_holder("17", "1\tx\ty").is_none());
+    }
+
+    #[test]
+    fn the_wait_notice_names_each_holder_and_its_age() {
+        let holder = |pid, slots, since, what: &str| TestHolder {
+            pid,
+            slots,
+            since,
+            what: what.into(),
+        };
+        assert_eq!(
+            test_wait_notice(
+                Duration::from_secs(10),
+                1,
+                &[holder(6322, 27, 1_000, "tether_host")],
+                3,
+                1_000 + 6 * 3600 + 44 * 60,
+            ),
+            "waited 10s for 1 test slot; tests hold them: tether_host (pid 6322, 27 slots, \
+             running 6h44m); compiles hold 3"
+        );
+        assert_eq!(
+            test_wait_notice(
+                Duration::from_secs(75),
+                2,
+                &[holder(1, 1, 50, "a"), holder(2, 2, 40, "b")],
+                0,
+                100,
+            ),
+            "waited 1m15s for 2 test slots; tests hold them: a (pid 1, 1 slot, running 50s), \
+             b (pid 2, 2 slots, running 1m00s); compiles hold 0"
+        );
+        assert_eq!(
+            test_wait_notice(Duration::from_secs(10), 1, &[], 7, 0),
+            "waited 10s for 1 test slot; no test names itself; compiles hold 7"
+        );
     }
 
     #[test]

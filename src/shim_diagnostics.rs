@@ -128,6 +128,15 @@ fn run_probe(
     temp: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
+    run_probe_with_deadline(command, name, temp, || Instant::now() + timeout)
+}
+
+fn run_probe_with_deadline(
+    command: &mut Command,
+    name: &str,
+    temp: &Path,
+    start_deadline: impl FnOnce() -> Instant,
+) -> Result<(), String> {
     let mut output = tempfile::tempfile_in(temp).map_err(|error| error.to_string())?;
     command
         // A fallback into Kache stops at its first re-entry, before config or leases.
@@ -149,7 +158,7 @@ fn run_probe(
     let mut child = command
         .invocation_spawn_in_group()
         .map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + timeout;
+    let deadline = start_deadline();
     let status = loop {
         if output_exceeds_limit(output.metadata().map_err(|error| error.to_string())?.len()) {
             return Err("version probe exceeded 64 KiB of output".into());
@@ -218,6 +227,17 @@ mod tests {
         command
     }
 
+    fn wait_for_child_lock(ready: &Path, mode: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: descendant never acquired the lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     // First-party subprocess fixture. It never reads or changes the parent's
     // environment; the probe supplies the counters to this child only.
     #[test]
@@ -260,16 +280,12 @@ mod tests {
                     reason = "The fixture leaves its child for the probe's process-tree cleanup after the leader exits."
                 )]
                 let mut child = fixture("lock-child").spawn().unwrap();
-                let ready = std::env::var_os("KACHE_SHIM_TEST_READY").unwrap();
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !Path::new(&ready).exists() {
-                    assert!(Instant::now() < deadline, "descendant did not start");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
                 if mode == "hang-with-child" {
                     let _ = child.wait();
                 } else {
                     // The probe must stop this child even after its leader exits.
+                    let ready = std::env::var_os("KACHE_SHIM_TEST_READY").unwrap();
+                    wait_for_child_lock(Path::new(&ready), &mode);
                     println!("cargo 1.99.0");
                     std::process::exit(0);
                 }
@@ -419,8 +435,11 @@ mod tests {
             command
                 .env("KACHE_SHIM_TEST_LOCK", &lock_path)
                 .env("KACHE_SHIM_TEST_READY", &ready);
-            let result = run_probe(&mut command, "cargo", root.path(), Duration::from_secs(3));
-            assert!(ready.exists(), "descendant never acquired the lock");
+            let result = run_probe_with_deadline(&mut command, "cargo", root.path(), || {
+                // Both fixture processes must start before this test can observe cleanup.
+                wait_for_child_lock(&ready, mode);
+                Instant::now() + Duration::from_secs(3)
+            });
             if mode == "leave-child" {
                 result.unwrap();
             } else {
@@ -435,7 +454,10 @@ mod tests {
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while lock.try_lock().is_err() {
-                assert!(Instant::now() < deadline, "probe left its descendant alive");
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode}: probe left its descendant alive"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
         }

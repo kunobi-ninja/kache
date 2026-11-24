@@ -289,6 +289,13 @@ mod tests {
         symlink(&root, &instance).unwrap();
         assert!(select().is_none());
         fs::remove_file(&instance).unwrap();
+        fs::write(&instance, "occupied").unwrap();
+        chmod(&instance, 0o700);
+        assert!(
+            select().is_none(),
+            "an executable regular file is not an IPC directory"
+        );
+        fs::remove_file(&instance).unwrap();
         fs::create_dir(&instance).unwrap();
         chmod(&instance, 0o700);
         assert_eq!(select().unwrap(), socket);

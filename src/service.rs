@@ -740,8 +740,14 @@ fn configured_instance_matches(
             }
         }
     }
-    let socket =
-        crate::config::default_daemon_socket(&store, runtime.as_deref().unwrap_or(&store), None);
+    let socket = match runtime {
+        #[cfg(unix)]
+        None => kache_config::config::unix_ipc::shared_store_socket(&store)
+            .unwrap_or_else(|| crate::config::default_daemon_socket(&store, &store, None)),
+        other => {
+            crate::config::default_daemon_socket(&store, other.as_deref().unwrap_or(&store), None)
+        }
+    };
     Ok(canonical_or_original(requested_socket) == canonical_or_original(&socket))
 }
 
@@ -1524,6 +1530,27 @@ mod tests {
             error.contains("not loaded") && error.contains("Input/output error"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_service_matches_the_shared_store_endpoint() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let store = fixture.path().join("shared");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let socket = kache_config::config::unix_ipc::shared_store_socket(&store).unwrap();
+        let store_socket = crate::config::default_daemon_socket(&store, &store, None);
+        assert!(configured_instance_matches(&socket, store.clone(), []).unwrap());
+        assert!(!configured_instance_matches(&store_socket, store.clone(), []).unwrap());
+        let file = fixture.path().join("explicit.toml");
+        std::fs::write(
+            &file,
+            format!("[cache]\nruntime_dir = {:?}\n", store.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(configured_instance_matches(&store_socket, store, [file]).unwrap());
     }
 
     #[test]

@@ -324,7 +324,7 @@ GC skips a shard whose store dir has no `index.db`: a missing directory, an unmo
 
 ### Read-only store
 
-On Unix, a daemon sharing its cache with other local readers puts its socket in a private `ipc/` directory. The cache root keeps its group permissions and ACLs. Readers need read and search access to the store. If other users can write to the store or one of its parent directories, set `cache.runtime_dir` to a separate private directory owned by the daemon user.
+On Unix, a daemon sharing its cache with other local readers puts its socket in a private `ipc/` directory. The cache root keeps its group permissions and ACLs. Readers need read and search access to the store. If other users can write to the store or a parent directory, Kache places the socket and its locks in a private directory for that user and store. If Kache cannot find a private location, set `cache.runtime_dir` to a short, user-owned directory.
 
 A private cache that already hosted an older daemon keeps its existing socket after upgrade. Stop an older daemon before upgrading a shared cache. If that version already changed the store's permissions, restore your group mode and ACL once after stopping it.
 

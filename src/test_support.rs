@@ -135,6 +135,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         remote: None,
         remote_error: None,
         socket_path_override: None,
+        shared_store_socket: None,
         disabled: false,
         cache_executables: false,
         cache_cc_links: false,

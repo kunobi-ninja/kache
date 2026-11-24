@@ -4081,6 +4081,7 @@ fn test_config_store_dir() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
+        shared_store_socket: None,
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4182,6 +4183,7 @@ fn test_config_index_db_path() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
+        shared_store_socket: None,
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4279,6 +4281,7 @@ fn test_config_event_log_path() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
+        shared_store_socket: None,
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4443,6 +4446,7 @@ fn test_config_socket_path() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
+        shared_store_socket: None,
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4672,6 +4676,89 @@ fn concurrent_runtime_dirs_isolate_job_state_while_sharing_store() {
         "job-b"
     );
     assert!(!shared.join("events.jsonl").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_store_relocates_only_implicit_ipc() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let shared = fixture.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let store = shared.join("store");
+    let env = |vars: Vec<(&str, String)>| {
+        InvocationEnv::from_parts(
+            vars,
+            Some(fixture.path().to_owned()),
+            None,
+            fixture.path().to_owned(),
+        )
+    };
+    let file = |runtime| {
+        Ok(FileConfig {
+            cache: Some(CacheFileConfig {
+                local_store: Some(store.to_str().unwrap().to_owned()),
+                runtime_dir: runtime,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    let config = Config::load_resolved_for(&env(vec![]), file(None)).unwrap();
+    assert_eq!(config.cache_dir, store);
+    assert_eq!(config.runtime_dir, store);
+    assert_eq!(config.event_log_path(), store.join("events.jsonl"));
+    assert_eq!(config.transfer_log_path(), store.join("transfers.jsonl"));
+    assert_eq!(config.summary_log_path(), store.join("summaries.jsonl"));
+    let socket = config.socket_path();
+    assert!(!socket.starts_with(&store));
+    assert!(!store.exists());
+    let mut pr = config.clone();
+    pr.pull_request_prefix = Some("pr-test".into());
+    assert_ne!(socket, pr.socket_path());
+    assert_eq!(socket.parent(), pr.socket_path().parent());
+    let explicit = fixture.path().join("explicit.sock");
+    let config = Config::load_resolved_for(
+        &env(vec![(
+            "KACHE_SOCKET_PATH",
+            explicit.to_str().unwrap().to_owned(),
+        )]),
+        file(None),
+    )
+    .unwrap();
+    assert_eq!(config.socket_path(), explicit);
+    let direct = store.join("ipc/d.sock");
+    let config =
+        Config::load_resolved_for(&env(vec![]), file(Some(store.to_str().unwrap().to_owned())))
+            .unwrap();
+    assert_eq!(config.socket_path(), direct);
+    let config = Config::load_resolved_for(
+        &env(vec![(
+            "KACHE_RUNTIME_DIR",
+            store.to_str().unwrap().to_owned(),
+        )]),
+        file(None),
+    )
+    .unwrap();
+    assert_eq!(config.socket_path(), direct);
+    let config = Config::load_resolved_for(
+        &env(vec![("KACHE_SOCKET_PATH", "relative".into())]),
+        file(None),
+    )
+    .unwrap();
+    assert_eq!(config.socket_path(), socket);
+    let blocked = fixture.path().join("file");
+    std::fs::write(&blocked, "").unwrap();
+    let config = Config::load_resolved_for(
+        &env(vec![(
+            "KACHE_CACHE_DIR",
+            blocked.join("store").to_str().unwrap().to_owned(),
+        )]),
+        file(None),
+    )
+    .unwrap();
+    assert_eq!(config.socket_path(), Path::new("/dev/null/d.sock"));
 }
 
 #[test]
@@ -6838,6 +6925,7 @@ fn a_pull_request_job_never_shares_a_daemon_or_upload_queue_with_a_trusted_job()
         cache_dir: store.path().into(),
         runtime_dir: store.path().into(),
         socket_path_override: None,
+        shared_store_socket: None,
         ..load_in_ci("pull_request", "false", with_prefix)
     };
     let push = Config {

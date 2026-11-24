@@ -1760,45 +1760,13 @@ fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
 
 #[cfg(unix)]
 #[test]
-fn ipc_path_owners_and_sticky_permissions() {
-    let me = 1001;
-    let store = Path::new("/parent/store");
-    let parent = store.parent().unwrap();
-    for owner in [0, me] {
-        assert!(ipc_ancestor_is_safe(owner, 0o755, me, store, store));
-        assert!(ipc_ancestor_is_safe(owner, 0o1777, me, parent, store));
-        assert!(!ipc_ancestor_is_safe(owner, 0o1777, me, store, store));
-        assert!(!ipc_ancestor_is_safe(owner, 0o775, me, parent, store));
-        assert!(!ipc_ancestor_is_safe(owner, 0o707, me, store, store));
-    }
-    assert!(!ipc_ancestor_is_safe(1002, 0o700, me, store, store));
-    assert!(!ipc_ancestor_is_safe(1002, 0o1777, me, parent, store));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_foreign_namespace_root_needs_a_direct_mount_for_ipc() {
-    use std::os::unix::fs::symlink;
-    let root = Path::new("/");
-    let procfs = Path::new("/proc");
-    let nested = procfs.join("self");
-    assert!(ipc_ancestor_is_safe(65_534, 0o750, 1000, root, &nested));
-    assert!(!ipc_ancestor_is_safe(65_534, 0o770, 1000, root, &nested));
-    assert!(!ipc_ancestor_is_safe(65_534, 0o750, 1000, procfs, &nested));
-    assert!(!ipc_ancestor_is_safe(65_534, 0o750, 1000, root, root));
-    assert!(!ipc_ancestor_is_safe(
-        65_534,
-        0o750,
-        1000,
-        root,
-        Path::new("/no-such-kache-fixture")
-    ));
-
-    let dir = tempfile::tempdir().unwrap();
-    let link = dir.path().join("proc");
-    symlink(procfs, &link).unwrap();
-    assert!(!is_ipc_mount_root(&link));
-    assert!(!is_ipc_mount_root(dir.path()));
+fn unavailable_automatic_endpoint_explains_how_to_start_the_daemon() {
+    let fixture = tempfile::tempdir().unwrap();
+    let mut config = test_config(fixture.path());
+    config.shared_store_socket = Some(PathBuf::from("/dev/null/d.sock"));
+    let error = prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap_err();
+    assert!(error.to_string().contains("set KACHE_RUNTIME_DIR"));
+    assert!(!config.cache_dir.join("ipc").exists());
 }
 
 #[cfg(unix)]
@@ -1886,6 +1854,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         cache_dir: dir.to_path_buf(),
         runtime_dir: dir.to_path_buf(),
         socket_path_override: None,
+        shared_store_socket: None,
         max_size: 50 * 1024 * 1024, // 50 MiB
         remote: None,
         remote_error: None,

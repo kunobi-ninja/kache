@@ -1,3 +1,6 @@
+#[cfg(unix)]
+pub mod unix_ipc;
+
 use crate::invocation::InvocationEnv;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
@@ -184,6 +187,8 @@ pub struct Config {
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
     /// `None` selects the default daemon endpoint.
     pub socket_path_override: Option<PathBuf>,
+    /// Isolated Unix IPC chosen for the primary store before volume routing.
+    pub shared_store_socket: Option<PathBuf>,
     /// Volume-local store shards from `[cache.volumes]` (empty when
     /// unconfigured). The wrapper opens the matching shard as `cache_dir`
     /// so ingest and restore stay on that volume.
@@ -1850,19 +1855,21 @@ impl Config {
         // Keep the historical single-directory layout unless explicitly split.
         // Resolve this once alongside `cache_dir`: wrappers and their daemon must
         // agree on every runtime path even if ambient env changes later.
-        let runtime_dir = env_or_ignored_for(invocation, "KACHE_RUNTIME_DIR", ignore_env)
+        let configured_runtime = env_or_ignored_for(invocation, "KACHE_RUNTIME_DIR", ignore_env)
             .map(|s| shellexpand_for(invocation, &s))
-            .or_else(|_| {
+            .ok()
+            .or_else(|| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.runtime_dir.as_ref())
                     .map(|s| shellexpand_for(invocation, s))
-                    .ok_or(())
-            })
-            .unwrap_or_else(|_| cache_dir.clone());
-        let runtime_dir = resolve_invocation_path(invocation, &runtime_dir)?;
+            });
+        let runtime_dir = resolve_invocation_path(
+            invocation,
+            configured_runtime.as_deref().unwrap_or(&cache_dir),
+        )?;
         let runtime_follows_cache = runtime_dir == cache_dir;
 
         // Trusted node-local L1 (#811): isolate the persistent store under a
@@ -1881,6 +1888,15 @@ impl Config {
         // manually constructed Config or change an existing Config mid-run.
         let socket_path_override =
             resolve_socket_path_override(invocation.var_os("KACHE_SOCKET_PATH"));
+        #[cfg(unix)]
+        let shared_store_socket = if socket_path_override.is_none() && configured_runtime.is_none()
+        {
+            unix_ipc::shared_store_socket(&cache_dir)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let shared_store_socket = None;
 
         let explicit_max_size = env_or_ignored_for(invocation, "KACHE_MAX_SIZE", ignore_env)
             .ok()
@@ -2653,6 +2669,7 @@ impl Config {
             cache_dir,
             runtime_dir,
             socket_path_override,
+            shared_store_socket,
             max_size,
             restore_max_size,
             remote,
@@ -4220,6 +4237,9 @@ impl Config {
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
         {
             return scoped_socket_path(socket, scope.as_deref());
+        }
+        if let Some(socket) = &self.shared_store_socket {
+            return scoped_socket_path(socket.clone(), scope.as_deref());
         }
         default_daemon_socket(&self.cache_dir, &self.runtime_dir, scope.as_deref())
     }

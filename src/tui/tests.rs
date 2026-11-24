@@ -160,6 +160,7 @@ fn test_config() -> Config {
         remote: None,
         remote_error: None,
         socket_path_override: None,
+        shared_store_socket: None,
         disabled: false,
         cache_executables: false,
         cache_cc_links: false,

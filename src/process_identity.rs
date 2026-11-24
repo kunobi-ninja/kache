@@ -17,7 +17,8 @@ pub(crate) struct ProcessIdentity {
 }
 
 /// When a process started, in the OS's own units: clock ticks since boot on
-/// Linux (`/proc/<pid>/stat` field 22).
+/// Linux (`/proc/<pid>/stat` field 22), microseconds since the epoch on
+/// macOS (`proc_bsdinfo`'s start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Start {
     At(u64),
@@ -31,7 +32,7 @@ enum Start {
 /// What the OS reports for a process number now.
 #[derive(Debug, PartialEq, Eq)]
 enum Found {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Started(u64),
     /// A reserved PID or a thread ID rather than a process Kache records.
     Gone,
@@ -134,21 +135,73 @@ fn liveness_from_signal_probe(result: libc::c_int, error: impl FnOnce() -> Optio
     result == 0 || error() != Some(libc::ESRCH)
 }
 
-/// PID 1 names init, which Kache excludes from its records. PID 0 has no
-/// procfs entry; the fallback also rejects it and values that would become
-/// broadcasts to `kill`.
+/// Kache never records the kernel (PID 0) or init (PID 1) as holders.
 fn found(pid: u32) -> Found {
-    if pid == 1 {
+    if pid <= 1 {
         return Found::Gone;
     }
     #[cfg(target_os = "linux")]
     {
         found_on_this_platform(pid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        const BSD_INFO_SIZE: i32 = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return Found::Gone;
+        };
+        // SAFETY: an all-zero proc_bsdinfo is a valid value of plain integers.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is a writable proc_bsdinfo of the requested size.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                BSD_INFO_SIZE,
+            )
+        };
+        process_from_bsdinfo(
+            written,
+            BSD_INFO_SIZE,
+            info.pbi_status,
+            libc::SZOMB,
+            (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            || std::io::Error::last_os_error().raw_os_error(),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Found::Unknown
     }
+}
+
+/// Only a complete libproc reply supplies a status and start. On error libproc
+/// returns zero and sets errno; a positive short reply carries no errno.
+#[cfg(any(test, target_os = "macos"))]
+fn process_from_bsdinfo(
+    written: i32,
+    required: i32,
+    status: u32,
+    zombie_status: u32,
+    (seconds, micros): (u64, u64),
+    errno: impl FnOnce() -> Option<i32>,
+) -> Found {
+    if written == 0 {
+        return if errno() == Some(libc::ESRCH) {
+            Found::Gone
+        } else {
+            Found::Unknown
+        };
+    }
+    if written != required {
+        return Found::Unknown;
+    }
+    if status == zombie_status {
+        return Found::Gone;
+    }
+    Found::Started(seconds.saturating_mul(1_000_000).saturating_add(micros))
 }
 
 #[cfg(target_os = "linux")]
@@ -222,10 +275,10 @@ fn process_from_stat(stat: &str) -> Found {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct RunningChild(std::process::Child);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl Drop for RunningChild {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -279,6 +332,8 @@ mod tests {
 
     #[test]
     fn this_process_is_running_and_numbers_kache_never_records_are_not() {
+        assert_eq!(found(0), Found::Gone);
+        assert_eq!(found(1), Found::Gone);
         assert!(ProcessIdentity::current().is_running());
         for pid in [0, 1, u32::MAX] {
             assert!(!ProcessIdentity::of(pid).is_running(), "pid {pid}");
@@ -286,7 +341,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_process_runs_until_it_exits_and_only_under_its_own_start() {
         let mut child = RunningChild(
@@ -318,10 +373,53 @@ mod tests {
         assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
         // This fallback deliberately cannot distinguish a dead leader from
         // a group with live workers. The stat thread count must decide.
+        #[cfg(target_os = "linux")]
         assert!(process_may_be_running(child.0.id()));
         assert!(!running.is_running());
         child.0.wait().unwrap();
         assert!(!running.is_running());
+    }
+
+    #[test]
+    fn bsd_info_requires_a_complete_record_and_only_consults_errno_on_failure() {
+        let required = 128;
+        let alive = 2;
+        let zombie = 5;
+        let start = (2, 3);
+        let no_errno = || panic!("errno only belongs to a failed call");
+
+        assert_eq!(
+            process_from_bsdinfo(required, required, alive, zombie, start, no_errno),
+            Found::Started(2_000_003),
+        );
+        assert_eq!(
+            process_from_bsdinfo(required, required, zombie, zombie, start, no_errno),
+            Found::Gone,
+        );
+        for (error, expected) in [
+            (None, Found::Unknown),
+            (Some(libc::EPERM), Found::Unknown),
+            (Some(libc::ESRCH), Found::Gone),
+        ] {
+            assert_eq!(
+                process_from_bsdinfo(0, required, alive, zombie, start, || error),
+                expected
+            );
+        }
+        for written in [-1, required - 1, required + 1] {
+            assert_eq!(
+                process_from_bsdinfo(written, required, zombie, zombie, start, no_errno),
+                Found::Unknown,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn libproc_reports_a_stable_start_for_the_current_process() {
+        let this = found(std::process::id());
+        assert!(matches!(this, Found::Started(_)), "{this:?}");
+        assert_eq!(found(std::process::id()), this);
     }
 
     #[cfg(target_os = "linux")]

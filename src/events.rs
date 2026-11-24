@@ -5,6 +5,8 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod build_path;
+#[cfg(target_os = "linux")]
+mod overflow;
 use build_path::LogLock;
 pub(crate) use build_path::{lock_for_build, recent_events_for_build};
 
@@ -146,7 +148,19 @@ fn append_log_line(event_log_path: &Path, line: String, lock_mode: LogLock) -> R
     }
 
     let lock = open_log_lock(event_log_path).context("opening event log lock")?;
-    lock_mode.exclusive(&lock).context("locking event log")?;
+    if let Err(error) = lock_mode.exclusive(&lock) {
+        #[cfg(target_os = "linux")]
+        if let (LogLock::BuildEvent, Some(std::io::ErrorKind::WouldBlock)) = (
+            lock_mode,
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+        ) && overflow::publish(event_log_path, &line)?
+        {
+            return Ok(());
+        }
+        return Err(error.context("locking event log"));
+    }
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -206,7 +220,7 @@ pub(crate) fn log_event_for_build(event_log_path: &Path, event: &BuildEvent) -> 
     append_log_line(
         event_log_path,
         serde_json::to_string(event).context("serializing event")?,
-        LogLock::Build,
+        LogLock::BuildEvent,
     )
 }
 

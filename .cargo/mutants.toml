@@ -582,6 +582,6 @@ exclude_re = [
     # Linux cannot call LockFileEx or UnlockFileEx. The Windows job verifies
     # both offsets against old whole-file locks and unlocks a single byte
     # with both handles still open. Flag selection and error handling run here.
-    "src/target_use/guard.rs:\\d+:\\d+: replace platform::win32_range -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    "^src/target_use/guard\\.rs:\\d+:\\d+: replace platform::win32_range -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
 
 ]

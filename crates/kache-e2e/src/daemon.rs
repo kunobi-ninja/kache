@@ -106,7 +106,7 @@ pub fn start(kache_path: &Path, cache_dir: &Path, kache_config: &Path) -> bool {
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", kache_config)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .status()
     {
         Ok(s) if s.success() => {

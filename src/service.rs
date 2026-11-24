@@ -617,6 +617,9 @@ pub(crate) fn manages_instance_until(
     config: &crate::config::Config,
     deadline: std::time::Instant,
 ) -> Result<bool> {
+    let Ok(requested_socket) = config.available_socket_path() else {
+        return Ok(false);
+    };
     let Some(service) = service_file_path().filter(|path| path.is_file()) else {
         return Ok(false);
     };
@@ -626,7 +629,7 @@ pub(crate) fn manages_instance_until(
         let Some(socket) = systemd_environment::socket(&service, budget) else {
             return Ok(false);
         };
-        Ok(canonical_or_original(&config.socket_path()) == canonical_or_original(&socket))
+        Ok(canonical_or_original(&requested_socket) == canonical_or_original(&socket))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -640,7 +643,7 @@ pub(crate) fn manages_instance_until(
             return Ok(false);
         }
         configured_instance_matches(
-            &config.socket_path(),
+            &requested_socket,
             crate::config::default_cache_dir(),
             std::iter::once(PathBuf::from(crate::config::HOST_CONFIG_PATH))
                 .chain(std::iter::once(crate::config::config_file_path())),
@@ -742,8 +745,11 @@ fn configured_instance_matches(
     }
     let socket = match runtime {
         #[cfg(unix)]
-        None => kache_config::config::unix_ipc::shared_store_socket(&store)
-            .unwrap_or_else(|| crate::config::default_daemon_socket(&store, &store, None)),
+        None => match kache_config::config::unix_ipc::shared_store_socket(&store) {
+            Ok(Some(socket)) => socket,
+            Ok(None) => crate::config::default_daemon_socket(&store, &store, None),
+            Err(_) => return Ok(false),
+        },
         other => {
             crate::config::default_daemon_socket(&store, other.as_deref().unwrap_or(&store), None)
         }
@@ -1540,9 +1546,17 @@ mod tests {
         let store = fixture.path().join("shared");
         std::fs::create_dir(&store).unwrap();
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let socket = kache_config::config::unix_ipc::shared_store_socket(&store).unwrap();
+        let socket = kache_config::config::unix_ipc::shared_store_socket(&store);
         let store_socket = crate::config::default_daemon_socket(&store, &store, None);
-        assert!(configured_instance_matches(&socket, store.clone(), []).unwrap());
+        if let Ok(Some(socket)) = socket {
+            assert!(configured_instance_matches(&socket, store.clone(), []).unwrap());
+        }
+        let blocked = fixture.path().join("file");
+        std::fs::write(&blocked, "").unwrap();
+        assert!(
+            !configured_instance_matches(Path::new("/dev/null/d.sock"), blocked.join("store"), [])
+                .unwrap()
+        );
         assert!(!configured_instance_matches(&store_socket, store.clone(), []).unwrap());
         let file = fixture.path().join("explicit.toml");
         std::fs::write(

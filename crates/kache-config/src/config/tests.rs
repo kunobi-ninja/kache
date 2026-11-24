@@ -4081,7 +4081,7 @@ fn test_config_store_dir() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
-        shared_store_socket: None,
+        shared_store_socket: Ok(None),
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4183,7 +4183,7 @@ fn test_config_index_db_path() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
-        shared_store_socket: None,
+        shared_store_socket: Ok(None),
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4281,7 +4281,7 @@ fn test_config_event_log_path() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
-        shared_store_socket: None,
+        shared_store_socket: Ok(None),
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4446,7 +4446,7 @@ fn test_config_socket_path() {
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
-        shared_store_socket: None,
+        shared_store_socket: Ok(None),
         max_size: 1024,
         remote: None,
         remote_error: None,
@@ -4716,8 +4716,10 @@ fn shared_store_relocates_only_implicit_ipc() {
     assert!(!store.exists());
     let mut pr = config.clone();
     pr.pull_request_prefix = Some("pr-test".into());
-    assert_ne!(socket, pr.socket_path());
-    assert_eq!(socket.parent(), pr.socket_path().parent());
+    if config.available_socket_path().is_ok() {
+        assert_ne!(socket, pr.socket_path());
+        assert_eq!(socket.parent(), pr.socket_path().parent());
+    }
     let explicit = fixture.path().join("explicit.sock");
     let config = Config::load_resolved_for(
         &env(vec![(
@@ -4758,6 +4760,7 @@ fn shared_store_relocates_only_implicit_ipc() {
         file(None),
     )
     .unwrap();
+    assert!(config.available_socket_path().is_err());
     assert_eq!(config.socket_path(), Path::new("/dev/null/d.sock"));
 }
 
@@ -6925,7 +6928,7 @@ fn a_pull_request_job_never_shares_a_daemon_or_upload_queue_with_a_trusted_job()
         cache_dir: store.path().into(),
         runtime_dir: store.path().into(),
         socket_path_override: None,
-        shared_store_socket: None,
+        shared_store_socket: Ok(None),
         ..load_in_ci("pull_request", "false", with_prefix)
     };
     let push = Config {

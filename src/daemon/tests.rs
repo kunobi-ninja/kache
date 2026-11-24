@@ -1763,8 +1763,8 @@ fn prepare_socket_dir_preserves_the_store_and_secures_dedicated_runtimes() {
 fn unavailable_automatic_endpoint_explains_how_to_start_the_daemon() {
     let fixture = tempfile::tempdir().unwrap();
     let mut config = test_config(fixture.path());
-    config.shared_store_socket = Some(PathBuf::from("/dev/null/d.sock"));
-    let error = prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap_err();
+    config.shared_store_socket = Err("no usable account runtime".into());
+    let error = super::lifecycle_client::ensure_outcome(&config, false).unwrap_err();
     assert!(error.to_string().contains("set KACHE_RUNTIME_DIR"));
     assert!(!config.cache_dir.join("ipc").exists());
 }
@@ -1854,7 +1854,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         cache_dir: dir.to_path_buf(),
         runtime_dir: dir.to_path_buf(),
         socket_path_override: None,
-        shared_store_socket: None,
+        shared_store_socket: Ok(None),
         max_size: 50 * 1024 * 1024, // 50 MiB
         remote: None,
         remote_error: None,

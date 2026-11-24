@@ -378,11 +378,6 @@ pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Resul
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        anyhow::ensure!(
-            dir != Path::new("/dev/null"),
-            "no secure private daemon endpoint for {}; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
-            config.cache_dir.display()
-        );
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
         if dir.parent() == Some(config.cache_dir.as_path()) {
@@ -7071,7 +7066,7 @@ pub fn run_server(
     //
     // The lock is held for the daemon's entire lifetime and is automatically
     // released when this function returns or the process exits/crashes.
-    let socket_path = config.socket_path();
+    let socket_path = config.available_socket_path()?;
     let lock_path = socket_path.with_extension("run.lock");
     prepare_daemon_socket_dir(config, &socket_path)?;
 

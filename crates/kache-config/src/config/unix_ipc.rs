@@ -34,17 +34,7 @@ fn is_ipc_mount_root(path: &Path) -> bool {
 }
 
 /// Return an alternate unscoped socket only for stores that cannot protect IPC.
-pub fn shared_store_socket(store: &Path) -> Option<PathBuf> {
-    select_socket(store).unwrap_or_else(|error| {
-        tracing::debug!(%error, "automatic daemon endpoint is unavailable");
-        // All consumers use filesystem paths, including clients that probe the
-        // daemon before falling back to local compilation. A child of the POSIX
-        // null device can neither be created nor connected to.
-        Some(Path::new("/dev/null").join("d.sock"))
-    })
-}
-
-fn select_socket(store: &Path) -> Result<Option<PathBuf>> {
+pub fn shared_store_socket(store: &Path) -> Result<Option<PathBuf>> {
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
     select_socket_with(store, uid, || {
@@ -78,10 +68,7 @@ fn select_socket_with(
     {
         return Ok(Some(socket));
     }
-    bail!(
-        "no secure private daemon endpoint for shared store {}; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
-        store.display()
-    );
+    bail!("no usable private account directory");
 }
 
 /// Recheck the actual path before acquiring coordination locks in the store.
@@ -158,7 +145,7 @@ fn account_home(uid: u32) -> Option<PathBuf> {
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0u8; 16 * 1024];
     // SAFETY: entry and result are writable, and buffer lives until pw_dir is copied.
-    let status = unsafe {
+    unsafe {
         libc::getpwuid_r(
             uid,
             entry.as_mut_ptr(),
@@ -167,15 +154,13 @@ fn account_home(uid: u32) -> Option<PathBuf> {
             &mut result,
         )
     };
-    if status != 0 || result.is_null() {
-        return None;
-    }
-    // SAFETY: a successful lookup initializes entry; pw_dir points into buffer.
-    let raw = unsafe { entry.assume_init().pw_dir };
-    if raw.is_null() {
-        return None;
-    }
-    let home = Path::new(OsStr::from_bytes(unsafe { CStr::from_ptr(raw) }.to_bytes()));
+    // POSIX sets result to null when no record is available, including on errors.
+    let result = std::ptr::NonNull::new(result)?;
+    // SAFETY: the record and backing buffer remain live until the path is copied.
+    let raw = std::ptr::NonNull::new(unsafe { result.as_ref().pw_dir })?;
+    let home = Path::new(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(raw.as_ptr()) }.to_bytes(),
+    ));
     home.is_absolute().then(|| home.to_owned())
 }
 
@@ -201,11 +186,12 @@ fn socket_under(base: &Path, key: &str, uid: u32) -> Option<PathBuf> {
     let parent = std::ffi::CString::new(existing_parent.as_os_str().as_bytes()).ok()?;
     // SAFETY: parent is a live NUL-terminated path. faccessat uses the same
     // effective credentials as the daemon and accounts for read-only mounts.
+    const CREATE_ENTRY: libc::c_int = libc::W_OK | libc::X_OK;
     if unsafe {
         libc::faccessat(
             libc::AT_FDCWD,
             parent.as_ptr(),
-            libc::W_OK | libc::X_OK,
+            CREATE_ENTRY,
             libc::AT_EACCESS,
         )
     } != 0
@@ -301,6 +287,87 @@ mod tests {
         chmod(&root, 0o770);
         assert!(select().is_none());
         assert!(select_socket_with(&root, uid, || [Some(long), None]).is_err());
+    }
+
+    #[test]
+    fn canonical_identity_rejects_obstructions_and_checks_hidden_ancestors() {
+        let fixture = tempfile::Builder::new()
+            .prefix("k")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let shared = root.join("shared");
+        let nested = shared.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        chmod(&shared, 0o770);
+        let link = root.join("link");
+        symlink(&nested, &link).unwrap();
+        assert_eq!(
+            unsafe_store_ancestor(&link.join("store"), uid, true).unwrap(),
+            Some(shared)
+        );
+        assert_eq!(unsafe_store_ancestor(&link, uid, true).unwrap(), Some(link));
+        let missing = root.join("missing/../tail");
+        assert_eq!(canonical_store_path(&missing).unwrap(), root.join("tail"));
+        let file = root.join("file");
+        fs::write(&file, "").unwrap();
+        assert_eq!(check_path(&file, uid, false).unwrap().0, Some(file.clone()));
+        assert!(canonical_store_path(&file.join("child")).is_err());
+        assert!(check_path(&file.join("child"), uid, true).is_err());
+    }
+
+    #[test]
+    fn private_anchor_accepts_last_usable_socket_byte() {
+        let fixture = tempfile::Builder::new()
+            .prefix("k")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let key = "0123456789abcdef0123456789abcdef";
+        let used = root
+            .join("x/.kache-ipc")
+            .join(key)
+            .join("d-pr-ffffffff.sock")
+            .as_os_str()
+            .as_bytes()
+            .len();
+        let base = root.join("x".repeat(104 - used));
+        fs::create_dir(&base).unwrap();
+        let socket = socket_under(&base, key, uid).unwrap();
+        assert_eq!(
+            socket
+                .with_file_name("d-pr-ffffffff.sock")
+                .as_os_str()
+                .as_bytes()
+                .len(),
+            103
+        );
+        let longer =
+            base.with_file_name(format!("{}x", base.file_name().unwrap().to_str().unwrap()));
+        fs::create_dir(&longer).unwrap();
+        assert!(socket_under(&longer, key, uid).is_none());
+        if uid != 0 {
+            chmod(&base, 0o500);
+            assert!(socket_under(&base, key, uid).is_none());
+        }
+    }
+
+    #[test]
+    fn account_lookup_uses_the_uid_record() {
+        // Small build sandboxes can omit a passwd record for the build user.
+        // Check a record the system actually provides.
+        if let Ok(passwd) = fs::read_to_string("/etc/passwd")
+            && let Some(home) = passwd
+                .lines()
+                .map(|line| line.split(':').collect::<Vec<_>>())
+                .find(|fields| fields.get(2) == Some(&"0"))
+                .and_then(|fields| fields.get(5).copied())
+        {
+            assert_eq!(account_home(0).as_deref(), Some(Path::new(home)));
+        }
+        assert!(account_home(u32::MAX).is_none());
     }
 
     #[test]

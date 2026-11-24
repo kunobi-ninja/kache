@@ -45,11 +45,9 @@ fn ensured_after_replacement(
 pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
     // Fail before starting a daemon that could never bind its sockets. The
     // control endpoint's path is derived from the socket's, so check both.
-    for socket in [
-        config.socket_path(),
-        super::lifecycle_control::endpoint(config),
-    ] {
-        if let Some(problem) = crate::transport::socket_path_problem(&socket) {
+    let socket = config.available_socket_path()?;
+    for endpoint in [&socket, &super::lifecycle_control::endpoint(config)] {
+        if let Some(problem) = crate::transport::socket_path_problem(endpoint) {
             anyhow::bail!(problem);
         }
     }
@@ -59,7 +57,6 @@ pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
             (!health.version.is_empty()).then_some(health.version),
         ));
     }
-    let socket = config.socket_path();
     super::prepare_daemon_socket_dir(config, &socket)?;
     let Some(lock) = kunobi_daemon::readiness::wait_until(deadline, |_| {
         ProcessLock::try_acquire(socket.with_extension("lock"))

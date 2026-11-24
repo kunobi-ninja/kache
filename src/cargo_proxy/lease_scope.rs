@@ -43,6 +43,9 @@ fn configured_scope(
             || key == "CARGO_INCLUDE"
             || (key.starts_with("CARGO_")
                 && key.ends_with("_DIR")
+                // Cargo exports the parent package's manifest directory to
+                // tests and build scripts that may start their own Cargo.
+                && key != "CARGO_MANIFEST_DIR"
                 && !DIR_VARIABLES.contains(&key.as_str()))
     }) {
         return Scope::Everything;
@@ -342,10 +345,12 @@ mod tests {
     fn the_invocation_environment_can_require_a_cache_wide_lease() {
         let tree = Tree::new();
         let args = [OsString::from("build")];
+        let parent_package = tree.root.join("parent-package");
         let check = |name: &str, value: &OsStr| {
             let env = crate::invocation::InvocationEnv::from_parts(
                 [
                     (OsStr::new("CARGO_HOME"), tree.home.as_os_str()),
+                    (OsStr::new("CARGO_MANIFEST_DIR"), parent_package.as_os_str()),
                     (OsStr::new(name), value),
                 ],
                 Some(tree.cwd.clone()),
@@ -358,6 +363,8 @@ mod tests {
         for name in DIR_VARIABLES {
             let scope = check(name, out.as_os_str());
             assert!(scope.covers(&out));
+            assert!(scope.covers(&tree.cwd));
+            assert!(!scope.covers(&parent_package));
             assert!(!scope.covers(&tree.root.join("unrelated")));
         }
         assert!(!check("OTHER_DIR", out.as_os_str()).covers(&out));

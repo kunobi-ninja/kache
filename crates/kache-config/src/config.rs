@@ -1,3 +1,6 @@
+#[cfg(unix)]
+pub mod unix_ipc;
+
 use crate::invocation::InvocationEnv;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
@@ -184,6 +187,8 @@ pub struct Config {
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
     /// `None` selects the default daemon endpoint.
     pub socket_path_override: Option<PathBuf>,
+    /// Isolated Unix IPC chosen for the primary store before volume routing.
+    pub shared_store_socket: Result<Option<PathBuf>, String>,
     /// Volume-local store shards from `[cache.volumes]` (empty when
     /// unconfigured). The wrapper opens the matching shard as `cache_dir`
     /// so ingest and restore stay on that volume.
@@ -1850,19 +1855,21 @@ impl Config {
         // Keep the historical single-directory layout unless explicitly split.
         // Resolve this once alongside `cache_dir`: wrappers and their daemon must
         // agree on every runtime path even if ambient env changes later.
-        let runtime_dir = env_or_ignored_for(invocation, "KACHE_RUNTIME_DIR", ignore_env)
+        let configured_runtime = env_or_ignored_for(invocation, "KACHE_RUNTIME_DIR", ignore_env)
             .map(|s| shellexpand_for(invocation, &s))
-            .or_else(|_| {
+            .ok()
+            .or_else(|| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.runtime_dir.as_ref())
                     .map(|s| shellexpand_for(invocation, s))
-                    .ok_or(())
-            })
-            .unwrap_or_else(|_| cache_dir.clone());
-        let runtime_dir = resolve_invocation_path(invocation, &runtime_dir)?;
+            });
+        let runtime_dir = resolve_invocation_path(
+            invocation,
+            configured_runtime.as_deref().unwrap_or(&cache_dir),
+        )?;
         let runtime_follows_cache = runtime_dir == cache_dir;
 
         // Trusted node-local L1 (#811): isolate the persistent store under a
@@ -1881,6 +1888,15 @@ impl Config {
         // manually constructed Config or change an existing Config mid-run.
         let socket_path_override =
             resolve_socket_path_override(invocation.var_os("KACHE_SOCKET_PATH"));
+        #[cfg(unix)]
+        let shared_store_socket = if socket_path_override.is_none() && configured_runtime.is_none()
+        {
+            unix_ipc::shared_store_socket(&cache_dir).map_err(|error| error.to_string())
+        } else {
+            Ok(None)
+        };
+        #[cfg(not(unix))]
+        let shared_store_socket = Ok(None);
 
         let explicit_max_size = env_or_ignored_for(invocation, "KACHE_MAX_SIZE", ignore_env)
             .ok()
@@ -2653,6 +2669,7 @@ impl Config {
             cache_dir,
             runtime_dir,
             socket_path_override,
+            shared_store_socket,
             max_size,
             restore_max_size,
             remote,
@@ -4212,16 +4229,35 @@ impl Config {
         self.runtime_dir.join("summaries.jsonl")
     }
 
+    /// Compatibility path for clients that probe IPC, then build locally if the
+    /// daemon is unavailable. A child of the POSIX null device cannot be bound.
     pub fn socket_path(&self) -> PathBuf {
+        self.available_socket_path()
+            .unwrap_or_else(|_| PathBuf::from("/dev/null/d.sock"))
+    }
+
+    /// Daemon startup and service identification require a usable endpoint.
+    pub fn available_socket_path(&self) -> Result<PathBuf> {
         let scope = self.pull_request_scope();
         if let Some(socket) = self
             .socket_path_override
             .as_ref()
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
         {
-            return scoped_socket_path(socket, scope.as_deref());
+            return Ok(scoped_socket_path(socket, scope.as_deref()));
         }
-        default_daemon_socket(&self.cache_dir, &self.runtime_dir, scope.as_deref())
+        match &self.shared_store_socket {
+            Ok(Some(socket)) => Ok(scoped_socket_path(socket.clone(), scope.as_deref())),
+            Ok(None) => Ok(default_daemon_socket(
+                &self.cache_dir,
+                &self.runtime_dir,
+                scope.as_deref(),
+            )),
+            Err(reason) => anyhow::bail!(
+                "cannot select a private daemon endpoint for {}: {reason}; set KACHE_RUNTIME_DIR or KACHE_SOCKET_PATH to a private location",
+                self.cache_dir.display()
+            ),
+        }
     }
 
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob

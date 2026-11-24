@@ -192,7 +192,7 @@ fn socket_for(variables: BTreeMap<String, String>, home: PathBuf) -> Option<Path
     );
     crate::config::Config::load_for(&environment)
         .ok()
-        .map(|config| config.socket_path())
+        .and_then(|config| config.available_socket_path().ok())
 }
 
 // Decode one shell-quoted assignment without evaluating substitutions. Unknown

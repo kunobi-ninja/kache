@@ -371,32 +371,6 @@ impl Drop for DaemonCoordGuard {
     }
 }
 
-#[cfg(unix)]
-fn ipc_ancestor_is_safe(owner: u32, mode: u32, uid: u32, ancestor: &Path, store: &Path) -> bool {
-    if owner == uid || owner == 0 {
-        return mode & 0o022 == 0 || (ancestor != store && mode & 0o1000 != 0);
-    }
-    // In a Linux user namespace the host's root UID can be unmapped. A
-    // direct mount beneath /, such as Nix's /build, cannot be renamed or
-    // unlinked by its parent owner. Check the mount entry itself, not a link.
-    #[cfg(target_os = "linux")]
-    if ancestor == Path::new("/") && mode & 0o022 == 0 {
-        return store
-            .ancestors()
-            .find(|path| path.parent() == Some(ancestor))
-            .is_some_and(is_ipc_mount_root);
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn is_ipc_mount_root(path: &Path) -> bool {
-    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags, statx};
-    statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE).is_ok_and(|stat| {
-        (stat.stx_attributes & stat.stx_attributes_mask).contains(StatxAttributes::MOUNT_ROOT)
-    })
-}
-
 /// Create a missing socket parent privately before opening daemon locks. The
 /// transport also verifies the owner and binds the socket with mode 0600.
 pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Result<()> {
@@ -418,17 +392,7 @@ pub(crate) fn prepare_daemon_socket_dir(config: &Config, socket: &Path) -> Resul
                 std::fs::symlink_metadata(&config.cache_dir)?.is_dir(),
                 "daemon IPC needs a real cache directory; set KACHE_RUNTIME_DIR to a private directory"
             );
-            let canonical = std::fs::canonicalize(&config.cache_dir)?;
-            for root in [config.cache_dir.as_path(), canonical.as_path()] {
-                for ancestor in root.ancestors() {
-                    let meta = std::fs::metadata(ancestor)?;
-                    anyhow::ensure!(
-                        ipc_ancestor_is_safe(meta.uid(), meta.mode(), uid, ancestor, root),
-                        "daemon IPC path {} can be changed by another user; set KACHE_RUNTIME_DIR to a private directory",
-                        ancestor.display()
-                    );
-                }
-            }
+            kache_config::config::unix_ipc::check_store_ancestry(&config.cache_dir, uid)?;
         }
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -7102,7 +7066,7 @@ pub fn run_server(
     //
     // The lock is held for the daemon's entire lifetime and is automatically
     // released when this function returns or the process exits/crashes.
-    let socket_path = config.socket_path();
+    let socket_path = config.available_socket_path()?;
     let lock_path = socket_path.with_extension("run.lock");
     prepare_daemon_socket_dir(config, &socket_path)?;
 

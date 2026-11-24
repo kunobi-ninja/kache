@@ -27,6 +27,10 @@ toml = "1"
 toml_edit = "0.25"
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 kache-fs = { version = "2.3.0", path = "../kache-fs", features = ["testing"] }
 tempfile = "3"

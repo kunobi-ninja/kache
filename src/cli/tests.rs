@@ -3925,6 +3925,7 @@ fn save_manifest_config(
         separate_check_targets: true,
         remote_error: None,
         socket_path_override: None,
+        shared_store_socket: Ok(None),
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),

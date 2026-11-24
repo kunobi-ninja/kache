@@ -5991,7 +5991,7 @@ fn remove_targets(
     let mut apparent_gap = 0u64;
     let mut removed = 0usize;
     // Each distinct wait, said once for all the targets it holds back.
-    let mut held = Vec::new();
+    let mut held = std::collections::BTreeSet::new();
     for target in to_remove {
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let reservation =
@@ -6016,9 +6016,7 @@ fn remove_targets(
                     waiting.push(holder);
                 }
             }
-            if !held.contains(&reason) {
-                held.push(reason.clone());
-            }
+            held.insert(reason.clone());
             skipped.push(CleanSkipped {
                 path: target.path.display().to_string(),
                 reason,

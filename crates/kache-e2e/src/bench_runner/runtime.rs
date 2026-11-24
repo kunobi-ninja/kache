@@ -1,6 +1,7 @@
 //! A Kache benchmark owns its daemon across all measured phases. The store
 //! can live on a shared build volume while IPC and event logs stay private.
 
+use super::CacheBackend;
 use crate::daemon;
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
@@ -15,7 +16,18 @@ pub(super) struct Runtime<'a> {
 }
 
 impl<'a> Runtime<'a> {
-    pub(super) fn new(kache: &'a Path, store: &'a Path) -> Result<Self> {
+    pub(super) fn for_backend(
+        backend: CacheBackend,
+        kache: &'a Path,
+        store: &'a Path,
+    ) -> Result<Option<Self>> {
+        match backend {
+            CacheBackend::Kache => Self::new(kache, store).map(Some),
+            CacheBackend::Mbx | CacheBackend::Sccache => Ok(None),
+        }
+    }
+
+    fn new(kache: &'a Path, store: &'a Path) -> Result<Self> {
         let mut builder = tempfile::Builder::new();
         builder.prefix("kache-bench-");
         #[cfg(unix)]
@@ -89,14 +101,11 @@ pub(super) fn drain(binary: &Path, store: &Path, runtime: &Path) -> Result<()> {
 
 // The binary under test chooses the name, including a PR-scope suffix if configured.
 fn locks_released(runtime: &Path, timeout: Duration) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
+    let began = Instant::now();
     for entry in std::fs::read_dir(runtime)? {
         let entry = entry?;
         if entry.file_name().as_encoded_bytes().ends_with(b".run.lock")
-            && !daemon::wait_for_lock_path(
-                &entry.path(),
-                deadline.saturating_duration_since(Instant::now()),
-            )
+            && !daemon::wait_for_lock_path(&entry.path(), timeout.saturating_sub(began.elapsed()))
         {
             return Ok(false);
         }
@@ -112,7 +121,16 @@ mod tests {
     fn each_benchmark_owns_a_runtime_and_children_use_its_settings() {
         let store = tempfile::tempdir().unwrap();
         let kache = Path::new("kache");
-        let first = Runtime::new(kache, store.path()).unwrap();
+        for external in [CacheBackend::Mbx, CacheBackend::Sccache] {
+            assert!(
+                Runtime::for_backend(external, kache, store.path())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let first = Runtime::for_backend(CacheBackend::Kache, kache, store.path())
+            .unwrap()
+            .unwrap();
         let second = Runtime::new(kache, store.path()).unwrap();
         assert_ne!(first.path(), second.path());
         assert!(!first.path().starts_with(store.path()));
@@ -156,5 +174,29 @@ mod tests {
         assert!(!locks_released(runtime.path(), Duration::ZERO).unwrap());
         drop(lock);
         assert!(locks_released(runtime.path(), Duration::ZERO).unwrap());
+    }
+    #[test]
+    fn an_unreadable_run_lock_keeps_the_endpoint_reachable_after_a_failed_shutdown() {
+        let store = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(Path::new("no-such-kache"), store.path()).unwrap();
+        let path = runtime.path().to_owned();
+        std::fs::create_dir(path.join("daemon.run.lock")).unwrap();
+        assert!(drain(Path::new("no-such-kache"), store.path(), &path).is_err());
+        drop(runtime);
+        assert!(path.join("kache-config.toml").is_file());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn draining_allows_a_running_daemon_to_finish_within_the_timeout() {
+        let runtime = tempfile::tempdir().unwrap();
+        let lock = std::fs::File::create(runtime.path().join("daemon.run.lock")).unwrap();
+        lock.lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(lock);
+        });
+        assert!(locks_released(runtime.path(), Duration::from_secs(5)).unwrap());
+        release.join().unwrap();
     }
 }

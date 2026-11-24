@@ -238,9 +238,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let clone_a = work_dir.join("clone-a");
     let clone_b = work_dir.join("clone-b");
     let cache_dir = work_dir.join("cache");
-    let runtime = (config.cache_backend == CacheBackend::Kache)
-        .then(|| runtime::Runtime::new(&kache, &cache_dir))
-        .transpose()?;
+    let runtime = runtime::Runtime::for_backend(config.cache_backend, &kache, &cache_dir)?;
     let runtime_dir = runtime.as_ref().map_or(work_dir.as_path(), |r| r.path());
     let event_log = runtime_dir.join("events.jsonl");
 
@@ -720,10 +718,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // assertions still fail the run, while measurements only warn. The
     // same-tree phase's own verdict is held to the same contract, so a PR gate
     // reading these numbers cannot be handed a phase that measured nothing.
-    if run_is_degraded(&result.verdict, result.warm_same_tree_verdict.as_ref()) {
-        bail!("benchmark assertions failed");
-    }
-    Ok(())
+    check_verdict(&result.verdict, result.warm_same_tree_verdict.as_ref())
 }
 
 /// Should this run measure its own disk footprint as the volume's free-space
@@ -864,14 +859,13 @@ fn backfill_ms(record: &mut serde_json::Value, seconds_key: &str, ms_key: &str) 
     }
 }
 
-/// Did any configured assertion say this run is not a valid measurement?
-///
-/// The cross-clone verdict always counts. The same-tree verdict is present only
-/// when `--warm-same-tree` ran, and when it is, it is held to the same
-/// contract: a PR gate reading these numbers must never be handed a phase that
-/// measured nothing.
-fn run_is_degraded(verdict: &Verdict, warm_same_tree_verdict: Option<&Verdict>) -> bool {
-    !verdict.ok || warm_same_tree_verdict.is_some_and(|same_tree| !same_tree.ok)
+/// Fail the run if either measured phase fails its configured assertions.
+fn check_verdict(verdict: &Verdict, warm_same_tree_verdict: Option<&Verdict>) -> Result<()> {
+    anyhow::ensure!(
+        verdict.ok && warm_same_tree_verdict.is_none_or(|same_tree| same_tree.ok),
+        "benchmark assertions failed"
+    );
+    Ok(())
 }
 
 /// Default scratch dir for a scenario when `--work-dir` is not given:
@@ -2028,10 +2022,7 @@ fn run_pull_bench(
     print_pull_summary(&result, run_archive_dir);
     eprintln!("[bench] summary written to {}", out.display());
 
-    if !result.verdict.ok {
-        bail!("benchmark assertions failed");
-    }
-    Ok(())
+    check_verdict(&result.verdict, None)
 }
 
 #[allow(clippy::too_many_arguments)]

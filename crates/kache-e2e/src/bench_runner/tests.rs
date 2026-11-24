@@ -1000,24 +1000,12 @@ fn a_run_is_degraded_when_either_verdict_says_so() {
     let ok = verdict_with(true);
     let bad = verdict_with(false);
 
-    assert!(
-        !run_is_degraded(&ok, None),
-        "a passing run without the same-tree phase is not degraded"
-    );
-    assert!(
-        !run_is_degraded(&ok, Some(&ok)),
-        "both verdicts passing is not degraded"
-    );
-    assert!(
-        run_is_degraded(&ok, Some(&bad)),
-        "the same-tree verdict alone must be able to fail the run"
-    );
-    assert!(
-        run_is_degraded(&bad, Some(&ok)),
-        "the cross-clone verdict alone must be able to fail the run"
-    );
-    assert!(run_is_degraded(&bad, None));
-    assert!(run_is_degraded(&bad, Some(&bad)));
+    assert!(check_verdict(&ok, None).is_ok());
+    assert!(check_verdict(&ok, Some(&ok)).is_ok());
+    assert!(check_verdict(&ok, Some(&bad)).is_err());
+    assert!(check_verdict(&bad, Some(&ok)).is_err());
+    assert!(check_verdict(&bad, None).is_err());
+    assert!(check_verdict(&bad, Some(&bad)).is_err());
 }
 
 /// The free-space delta is only meaningful for a plain full run. Both

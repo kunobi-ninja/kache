@@ -27,6 +27,7 @@ use std::time::Duration;
 use crate::scheduler::{self, TestWant};
 
 mod delegate;
+mod usage;
 #[cfg(unix)]
 pub(crate) use delegate::runner_var;
 
@@ -367,7 +368,9 @@ fn exec(args: &[OsString], marker: Option<String>) -> i32 {
     }
 }
 
-/// Run the binary under a test lease, then record its peak RSS.
+/// Run the binary under a test lease, then record its peak RSS. While it
+/// runs, the lease shrinks to the slots it uses (see [`usage`]), never below
+/// the slots its memory takes.
 fn run_scheduled(
     args: &[OsString],
     marker: Option<String>,
@@ -391,7 +394,16 @@ fn run_scheduled(
         Err(error) => return run_failed(&args[0], &error),
     };
     signals::forward_to(child.id());
+    let lease = lease.map(|mut lease| {
+        lease.name_holder(&Path::new(&args[0]).display().to_string());
+        std::sync::Arc::new(std::sync::Mutex::new(lease))
+    });
+    let watch = lease.as_ref().map(|lease| {
+        let floor = scheduler::test_floor(cache_dir, key);
+        usage::Watch::start(child.id(), floor, std::sync::Arc::clone(lease))
+    });
     let status = child.wait();
+    drop(watch);
     drop(lease);
     scheduler::record_test_rss(cache_dir, key);
     match status {

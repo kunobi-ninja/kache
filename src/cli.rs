@@ -5772,7 +5772,8 @@ fn clean_with_terminal(
     // `--json` without `--yes`, or with `--dry-run`, is a preview. Agents
     // should not enter the TUI.
     if json && preview {
-        let waiting = crate::target_use::blockers(&config.cache_dir).unwrap_or_default();
+        let paths: Vec<&std::path::Path> = targets.iter().map(|t| t.path.as_path()).collect();
+        let waiting = waiting_for(&config.cache_dir, &paths);
         return emit_clean_json(&targets, &skipped, &waiting, &[], Vec::new(), 0);
     }
 
@@ -5989,18 +5990,15 @@ fn remove_targets(
     let programs = crate::target_processes::ActivePrograms::default();
     let mut apparent_gap = 0u64;
     let mut removed = 0usize;
-    let reservation = crate::target_use::try_exclusive(cache_dir).unwrap_or_else(|error| {
-        tracing::warn!("cannot check running Cargo commands before clean: {error}");
-        None
-    });
-    // Without the reservation nothing can go, whatever each target's state:
-    // say once what clean waits for, rather than blame every target.
-    let held = reservation.is_none().then(|| {
-        *waiting = crate::target_use::holders(cache_dir);
-        held_reason(waiting, kache_store::markers::now_epoch_secs())
-    });
+    // Each distinct wait, said once for all the targets it holds back.
+    let mut held = std::collections::BTreeSet::new();
     for target in to_remove {
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
+        let reservation =
+            crate::target_use::try_exclusive(cache_dir, &target.path).unwrap_or_else(|error| {
+                tracing::warn!("cannot check running Cargo commands before clean: {error}");
+                None
+            });
         let current_identity = directory_identity(&target.path);
         if target.scanned_identity.is_none() || current_identity != target.scanned_identity {
             const CHANGED: &str = "directory changed since scan; refusing to remove";
@@ -6010,14 +6008,22 @@ fn remove_targets(
             failed.push(CleanFailed::new(&target.path, CHANGED));
             continue;
         }
-        if let Some(reason) = &held {
+        let Some(_reservation) = reservation else {
+            let holders = crate::target_use::holders_covering(cache_dir, &target.path);
+            let reason = held_reason(&holders, kache_store::markers::now_epoch_secs());
+            for holder in holders {
+                if !waiting.contains(&holder) {
+                    waiting.push(holder);
+                }
+            }
+            held.insert(reason.clone());
             skipped.push(CleanSkipped {
                 path: target.path.display().to_string(),
-                reason: reason.clone(),
+                reason,
                 missing: false,
             });
             continue;
-        }
+        };
         if target_in_use(&target.path) || programs.uses(&target.path) {
             if human_clean_output(quiet) {
                 println!("  skipped {} — {TARGET_IN_USE}", rel.display());
@@ -6052,24 +6058,28 @@ fn remove_targets(
             }
         }
     }
-    if let Some(line) = held_summary(held.as_deref(), skipped).filter(|_| human_clean_output(quiet))
-    {
-        println!("{line}");
+    for reason in &held {
+        if let Some(line) =
+            held_summary(Some(reason), skipped).filter(|_| human_clean_output(quiet))
+        {
+            println!("{line}");
+        }
     }
+    crate::target_use::prune_locks(cache_dir);
     (removed, estimated_reclaimed, apparent_gap)
 }
 
-/// The one line `--yes` prints for the targets it skipped because a running
-/// command held the lock: those in `skipped` with `held` as their reason.
+/// The line `--yes` prints for the targets it skipped because running
+/// commands held their locks: those in `skipped` with `held` as their reason.
 fn held_summary(held: Option<&str>, skipped: &[CleanSkipped]) -> Option<String> {
     let held = held?;
     let count = skipped.iter().filter(|item| item.reason == held).count();
     (count > 0).then(|| format!("  skipped {} — {held}", target_count(count)))
 }
 
-/// Why clean skips every target now: the commands holding Kache's target
-/// lock, by name and how long they have run, or a plain reason when none
-/// left a record.
+/// Why clean skips a target now: the commands whose leases cover it, by
+/// name and how long they have run, or a plain reason when none left a
+/// record.
 fn held_reason(holders: &[crate::target_use::Holder], now: u64) -> String {
     let named: Vec<String> = holders
         .iter()
@@ -6098,24 +6108,59 @@ fn removal_notes(cache_dir: &std::path::Path, paths: &[&std::path::Path]) -> Vec
     if paths.is_empty() {
         return Vec::new();
     }
-    if let Some(holders) = crate::target_use::blockers(cache_dir) {
-        let reason = held_reason(&holders, kache_store::markers::now_epoch_secs());
-        return vec![format!(
-            "Not now: {reason}; until then `kache clean --yes` skips them."
-        )];
+    let now = kache_store::markers::now_epoch_secs();
+    let mut held: Vec<(String, usize)> = Vec::new();
+    let mut free = Vec::new();
+    for path in paths {
+        let Some(holders) = crate::target_use::blockers(cache_dir, path) else {
+            free.push(*path);
+            continue;
+        };
+        let reason = held_reason(&holders, now);
+        match held.iter_mut().find(|(known, _)| *known == reason) {
+            Some((_, count)) => *count += 1,
+            None => held.push((reason, 1)),
+        }
     }
+    let mut notes: Vec<String> = held
+        .into_iter()
+        .map(|(reason, count)| {
+            format!(
+                "Not now: {reason}; until then `kache clean --yes` skips {}.",
+                target_count(count)
+            )
+        })
+        .collect();
     let programs = crate::target_processes::ActivePrograms::default();
-    let in_use = paths
+    let in_use = free
         .iter()
         .filter(|path| target_in_use(path) || programs.uses(path))
         .count();
-    if in_use == 0 {
-        return Vec::new();
+    if in_use > 0 {
+        notes.push(format!(
+            "Not now: {} {TARGET_IN_USE}.",
+            target_count(in_use)
+        ));
     }
-    vec![format!(
-        "Not now: {} {TARGET_IN_USE}.",
-        target_count(in_use)
-    )]
+    notes
+}
+
+/// Every command that keeps clean from removing one of `paths` now.
+fn waiting_for(
+    cache_dir: &std::path::Path,
+    paths: &[&std::path::Path],
+) -> Vec<crate::target_use::Holder> {
+    let mut waiting = Vec::new();
+    for holder in paths
+        .iter()
+        .filter_map(|path| crate::target_use::blockers(cache_dir, path))
+        .flatten()
+    {
+        if !waiting.contains(&holder) {
+            waiting.push(holder);
+        }
+    }
+    waiting
 }
 
 fn human_clean_output(quiet: bool) -> bool {

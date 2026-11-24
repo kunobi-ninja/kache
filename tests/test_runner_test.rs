@@ -341,7 +341,10 @@ fn an_unscheduled_test_holds_target_protection_until_exit() {
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(fixture.cache().join("target-use.lock"))
+        .open(common::target_use_lock(
+            &fixture.cache(),
+            fixture.probe().parent().unwrap(),
+        ))
         .unwrap();
     assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
     kill_group(&child);
@@ -356,13 +359,16 @@ fn a_test_waiting_for_target_cleanup_says_so_unless_cargo_is_quiet() {
     for quiet in [false, true] {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.cache()).unwrap();
-        // Held the way `kache clean` and the daemon hold it while they delete.
+        // Held the way `kache clean` and the daemon hold it while they delete
+        // the target the test binary runs from.
+        let lock = common::target_use_lock(&fixture.cache(), fixture.probe().parent().unwrap());
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
         let cleanup = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(fixture.cache().join("target-use.lock"))
+            .open(lock)
             .unwrap();
         cleanup.lock().unwrap();
         let started = fixture.path().join("started");

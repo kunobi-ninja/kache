@@ -988,7 +988,7 @@ pub(crate) fn prune(
     if crate::target_processes::ActivePrograms::default().uses(target) {
         return Ok(Pruned::default());
     }
-    let Some(_reservation) = crate::target_use::try_exclusive(&config.cache_dir)? else {
+    let Some(_reservation) = crate::target_use::try_exclusive(&config.cache_dir, target)? else {
         return Ok(Pruned::default());
     };
     ensure!(

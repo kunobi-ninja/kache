@@ -579,5 +579,9 @@ exclude_re = [
     # Windows startup releases its inherited cwd; native compiler acceptance
     # checks directory removal while the daemon stays alive.
     "release_daemon_working_directory",
+    # Linux cannot call LockFileEx or UnlockFileEx. The Windows job verifies
+    # both offsets against old whole-file locks and unlocks a single byte
+    # with both handles still open. Flag selection and error handling run here.
+    "^src/target_use/guard\\.rs:\\d+:\\d+: replace platform::win32_range -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
 
 ]

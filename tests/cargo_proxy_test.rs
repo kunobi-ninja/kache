@@ -36,6 +36,22 @@ fn proxied_cargo(home: &Path, cache: &Path, target: &Path) -> Command {
     command
 }
 
+fn lease_test_command(shim: &Path, cache: &Path) -> Command {
+    let mut command = hermetic_command(shim, cache, None);
+    command
+        .env("CARGO_HOME", cache.join("cargo-home"))
+        .env("KACHE_BLAZE", "false")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("CARGO_UNSTABLE_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 #[test]
 fn cargo_shim_holds_target_lease_for_whole_test() {
     let dir = tempfile::tempdir().unwrap();
@@ -69,7 +85,7 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
             .chain(std::env::split_paths(&base_path)),
     )
     .unwrap();
-    let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+    let mut command = lease_test_command(&shims.join("cargo"), &cache);
     let mut child = command
         .arg("test")
         .current_dir(&project)
@@ -93,12 +109,24 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
     let lease = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(cache.join("target-use.lock"))
+        .open(common::target_use_lock(&cache, &project))
         .unwrap();
     assert!(
         matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "the cargo shim released the target while its test was running"
     );
+    // Older cleaners request a whole-file lock, even on a scoped workspace.
+    let everything = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache.join("target-use.lock"))
+        .unwrap();
+    assert!(matches!(
+        everything.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     assert!(target.join("debug/output").exists());
 
     std::fs::write(&go, "").unwrap();
@@ -126,13 +154,16 @@ fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
         std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
         kache_fs::testutil::write_executable(&real.join("cargo"), "#!/bin/sh\n: > \"$STARTED\"\n");
-        // Held the way `kache clean` and the daemon hold it while they delete.
+        // Held the way `kache clean` and the daemon hold it while they delete
+        // the project's target.
+        let lock = common::target_use_lock(&cache, &project);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         let cleanup = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(cache.join("target-use.lock"))
+            .open(lock)
             .unwrap();
         cleanup.lock().unwrap();
 
@@ -143,7 +174,7 @@ fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
                 .chain(std::env::split_paths(&base_path)),
         )
         .unwrap();
-        let mut command = hermetic_command(shims.join("cargo"), &cache, None);
+        let mut command = lease_test_command(&shims.join("cargo"), &cache);
         command
             .arg("build")
             .args(quiet.then_some("-q"))
@@ -704,13 +735,25 @@ fn assert_cargo_lease_gone(holders: &Path) {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "records left behind: {left:?}");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(holders.parent().unwrap().join("target-use.lock"))
-        .unwrap();
-    lock.try_lock().unwrap();
-    lock.unlock().unwrap();
+    let cache = holders.parent().unwrap();
+    let mut paths = vec![cache.join("target-use.lock")];
+    let scoped = cache.join("target-use.d");
+    if scoped.exists() {
+        paths.extend(
+            std::fs::read_dir(scoped)
+                .unwrap()
+                .map(|entry| entry.unwrap().path()),
+        );
+    }
+    for path in paths {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        lock.try_lock().unwrap();
+        lock.unlock().unwrap();
+    }
 }
 
 #[test]

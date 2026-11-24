@@ -213,14 +213,20 @@ pub fn fetch_since_with_root(
     root: Option<&Path>,
 ) -> Result<(KacheReport, serde_json::Value)> {
     let mut cmd = Command::new(kache_path);
-    cmd.args(["report", "--format", "json", "--since", since])
-        .env("KACHE_CACHE_DIR", cache_dir);
+    cmd.env("KACHE_CACHE_DIR", cache_dir);
+    fetch_from_command(cmd, since, root)
+}
+
+pub(crate) fn fetch_from_command(
+    mut cmd: Command,
+    since: &str,
+    root: Option<&Path>,
+) -> Result<(KacheReport, serde_json::Value)> {
+    cmd.args(["report", "--format", "json", "--since", since]);
     if let Some(root) = root {
         cmd.arg("--root").arg(root);
     }
-    let output = cmd
-        .output()
-        .with_context(|| format!("running `{} report`", kache_path.display()))?;
+    let output = cmd.output().context("running kache report")?;
 
     if !output.status.success() {
         anyhow::bail!(

@@ -60,7 +60,7 @@ fn write_cache_otlp_or_warn_is_false_when_kache_is_missing() {
     assert!(!write_cache_otlp_or_warn(
         &dir.path().join("no-such-kache"),
         dir.path(),
-        &dir.path().join("kache.toml"),
+        dir.path(),
         &dir.path().join("cache-otlp-pull"),
         "bench-firefox",
         "pull",
@@ -216,7 +216,7 @@ fn write_otlp_until_spawned(
         reported = write_cache_otlp_or_warn(
             kache,
             dir,
-            &dir.join("kache.toml"),
+            dir,
             &dir.join(format!("cache-otlp-{phase}")),
             scenario,
             phase,
@@ -1110,20 +1110,22 @@ fn phase_speedup_divides_cold_by_the_phase_and_guards_zero() {
 /// phase's events into the next one's counters — and those counters are
 /// what the validity gates read.
 #[test]
-fn reset_event_log_removes_the_log_and_tolerates_its_absence() {
+fn reset_phase_logs_keeps_its_config_and_tolerates_absent_logs() {
     let dir = tempfile::tempdir().unwrap();
-    let event_log = dir.path().join("events.jsonl");
-    std::fs::write(&event_log, b"{\"kind\":\"hit\"}\n").unwrap();
-
-    reset_event_log(&event_log).expect("removing an existing log succeeds");
-    assert!(
-        !event_log.exists(),
-        "the event log must be gone after a reset"
-    );
-
-    // Called again — and before the first phase, when no log exists yet.
-    reset_event_log(&event_log).expect("a missing log is not an error");
-    assert!(!event_log.exists());
+    let names = ["events.jsonl", "transfers.jsonl", "summaries.jsonl"];
+    for name in names {
+        std::fs::write(dir.path().join(name), b"previous phase").unwrap();
+    }
+    let config = dir.path().join("kache-config.toml");
+    std::fs::write(&config, b"keep").unwrap();
+    reset_phase_logs(dir.path()).unwrap();
+    for name in names {
+        assert!(!dir.path().join(name).exists(), "{name}");
+    }
+    assert_eq!(std::fs::read(config).unwrap(), b"keep");
+    reset_phase_logs(dir.path()).unwrap();
+    std::fs::create_dir(dir.path().join("events.jsonl")).unwrap();
+    assert!(reset_phase_logs(dir.path()).is_err());
 }
 
 #[cfg(unix)]
@@ -2073,8 +2075,9 @@ fn retry_load_cold_restores_the_snapshot_and_an_older_results_wall_clock() {
     let work_dir = dir.path().join("work");
     let cache_dir = dir.path().join("cache");
     let kache = dir.path().join("no-such-kache");
+    let runtime = tempfile::tempdir().unwrap();
 
-    let missing = retry_load_cold("pr-cargo", &kache, &cache_dir, &work_dir)
+    let missing = retry_load_cold("pr-cargo", &kache, &cache_dir, runtime.path(), &work_dir)
         .expect_err("nothing to retry from")
         .to_string();
     assert!(
@@ -2105,8 +2108,9 @@ fn retry_load_cold_restores_the_snapshot_and_an_older_results_wall_clock() {
     )
     .unwrap();
 
-    let (cold, cold_raw) = retry_load_cold("pr-cargo", &kache, &cache_dir, &work_dir)
-        .expect("a complete set of artifacts loads");
+    let (cold, cold_raw) =
+        retry_load_cold("pr-cargo", &kache, &cache_dir, runtime.path(), &work_dir)
+            .expect("a complete set of artifacts loads");
 
     assert_eq!(cold.wall_s, 112);
     assert_eq!(
@@ -2155,7 +2159,7 @@ build = "sleep 0.2"
         &clone,
         "cold",
         &dir.path().join("cache"),
-        &dir.path().join("kache.toml"),
+        dir.path(),
         &dir.path().join("kache"),
         &work_dir,
         CacheBackend::Kache,
@@ -2215,7 +2219,7 @@ KACHE_SEED_NEW_TARGETS = "1"
         &clone,
         "cold",
         &dir.path().join("cache"),
-        &dir.path().join("kache.toml"),
+        dir.path(),
         &dir.path().join("kache"),
         &work_dir,
         CacheBackend::Kache,
@@ -3144,7 +3148,7 @@ fn summary_marks_unknown_rates_and_lists_invalid_reasons() {
 fn daemon_start_until_spawned(kache: &Path, dir: &Path, marker: &Path) -> bool {
     let mut started = false;
     for _ in 0..50 {
-        started = daemon::start(kache, dir, &dir.join("kache.toml"));
+        started = runtime::start(kache, dir, dir);
         if marker.is_file() {
             break;
         }
@@ -3169,10 +3173,10 @@ fn daemon_start_reports_whether_the_start_succeeded() {
     assert!(!daemon_start_until_spawned(&kache, down.path(), &marker));
     assert!(marker.is_file(), "the failing stand-in must have run");
 
-    assert!(!daemon::start(
+    assert!(!runtime::start(
         &down.path().join("no-such-kache"),
         down.path(),
-        &down.path().join("kache.toml")
+        down.path()
     ));
 }
 

@@ -13,6 +13,7 @@ import stat
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -1134,7 +1135,7 @@ def write_scenario_files(repo, files):
         path.write_text(entry["content"])
 
 
-def run_batches(args, arms, mirror, work, data):
+def run_batches(args, arms, mirror, work, data, ipc_root):
     workload = getattr(args, "workload", JOBS)
     context_samples = getattr(args, "context_samples", None) or args.samples
     for sample in range(args.samples):
@@ -1168,6 +1169,9 @@ def run_batches(args, arms, mirror, work, data):
                 cell / "runtime",
                 cell / "cold-snapshot",
             )
+            if backend == "kache":
+                runtime = ipc_root / cell.name
+                runtime.mkdir(mode=0o700, exist_ok=True)
             for phase in ("cold", "warm") if cold else ("warm",):
                 if phase == "warm" and args.cold_every > 1:
                     remove_owned_tree(store)
@@ -1384,7 +1388,8 @@ def main():
         os.environ["PATH"] = f"{toolchain_bin}{os.pathsep}{os.environ['PATH']}"
         env["PATH"] = os.environ["PATH"]
         subprocess.run(["cargo", "fetch", "--locked"], cwd=mirror, env=env, check=True)
-        run_batches(args, arms, mirror, work, data)
+        with tempfile.TemporaryDirectory(prefix="kache-bench-", dir="/tmp") as ipc_root:
+            run_batches(args, arms, mirror, work, data, Path(ipc_root))
     except Exception as error:
         data["error"] = str(error)
         write_report(args, data)

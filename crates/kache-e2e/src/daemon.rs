@@ -27,10 +27,11 @@ pub fn stop_and_wait(kache_path: &Path, cache_dir: &Path, timeout: std::time::Du
 }
 
 fn wait_for_run_lock(cache_dir: &Path, timeout: std::time::Duration) -> bool {
-    let lock = match std::fs::OpenOptions::new()
-        .write(true)
-        .open(cache_dir.join("daemon.run.lock"))
-    {
+    wait_for_lock_path(&cache_dir.join("daemon.run.lock"), timeout)
+}
+
+pub(crate) fn wait_for_lock_path(path: &Path, timeout: std::time::Duration) -> bool {
+    let lock = match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(file) => file,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
@@ -52,7 +53,7 @@ fn wait_for_run_lock(cache_dir: &Path, timeout: std::time::Duration) -> bool {
 /// The daemon keeps publishing while it makes progress, and a large build
 /// (Firefox) can end with minutes of queued work, so this only guards
 /// against a daemon that never exits.
-const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+pub(crate) const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// A benchmark must not read or replace a cache with queued publications.
 pub fn drain(kache_path: &Path, cache_dir: &Path) -> anyhow::Result<()> {
@@ -101,14 +102,15 @@ fn fixture_config(cache_dir: &Path) -> std::path::PathBuf {
 /// warn but not fail the scenario. Returns whether `kache daemon start`
 /// succeeded, so a bench can record that its phase ran without one.
 pub fn start(kache_path: &Path, cache_dir: &Path, kache_config: &Path) -> bool {
-    match Command::new(kache_path)
-        .args(["daemon", "start"])
-        .env("KACHE_CACHE_DIR", cache_dir)
+    let mut cmd = Command::new(kache_path);
+    cmd.env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", kache_config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
+        .stderr(Stdio::null());
+    start_command(cmd)
+}
+
+pub(crate) fn start_command(mut cmd: Command) -> bool {
+    match cmd.args(["daemon", "start"]).stdout(Stdio::null()).status() {
         Ok(s) if s.success() => {
             eprintln!("[bench] daemon started");
             true

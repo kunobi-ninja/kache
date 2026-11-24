@@ -753,6 +753,12 @@ else:
                 def phase(
                     args, binary, repos, store, runtime, scheduler, phase, dest, backend
                 ):
+                    if backend == "kache":
+                        self.assertEqual(runtime.parent, Path(ipc_root))
+                        self.assertEqual(runtime.name, store.parent.name)
+                        self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+                    else:
+                        self.assertEqual(runtime, store.parent / "runtime")
                     for repo in repos:
                         (repo / "target").mkdir(exist_ok=True)
                     if phase == "cold":
@@ -780,7 +786,8 @@ else:
                     patch.object(bench, "run_phase", phase),
                     patch.object(bench, "write_report"),
                 ):
-                    bench.run_batches(args, arms, mirror, work, data)
+                    with tempfile.TemporaryDirectory() as ipc_root:
+                        bench.run_batches(args, arms, mirror, work, data, Path(ipc_root))
                 records = data["records"]
                 for arm in ("base", "head"):
                     self.assertEqual(

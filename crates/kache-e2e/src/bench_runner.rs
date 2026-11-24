@@ -95,7 +95,8 @@ use std::time::{Duration, Instant};
 
 use crate::assertions::{AssertionCheck, all_passed};
 use crate::bench_profile::BenchProfile;
-use crate::daemon;
+
+mod runtime;
 use crate::phase::Phase;
 use crate::report;
 use crate::scenario::{MeasureSpec, ScenarioAssertSpec, Selectors};
@@ -237,8 +238,11 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let clone_a = work_dir.join("clone-a");
     let clone_b = work_dir.join("clone-b");
     let cache_dir = work_dir.join("cache");
-    let kache_config = work_dir.join("kache-config.toml");
-    let event_log = cache_dir.join("events.jsonl");
+    let runtime = (config.cache_backend == CacheBackend::Kache)
+        .then(|| runtime::Runtime::new(&kache, &cache_dir))
+        .transpose()?;
+    let runtime_dir = runtime.as_ref().map_or(work_dir.as_path(), |r| r.path());
+    let event_log = runtime_dir.join("events.jsonl");
 
     eprintln!(
         "=== {} benchmark: {} ===",
@@ -264,15 +268,6 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     );
     if let Some(version) = &cache_tool_version {
         eprintln!("version     : {version}");
-    }
-
-    // kache rotates its event log at 10 MiB, keeping only the last 500
-    // lines. A large project build emits tens of thousands of events, so
-    // the default would discard nearly everything before the report is
-    // read. A large cap keeps every event of a phase intact for its report.
-    if config.cache_backend == CacheBackend::Kache {
-        std::fs::write(&kache_config, "[cache]\nevent_log_max_size = \"8GiB\"\n")
-            .context("writing benchmark kache config")?;
     }
 
     if profile.is_pull() {
@@ -305,7 +300,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             &profile,
             &kache,
             &cache_dir,
-            &kache_config,
+            runtime_dir,
             &clone_ref,
             &clone_a,
             &work_dir,
@@ -435,13 +430,13 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // by a prior full run (`--retry`) and reuse cold's metrics. Either
     // way we emerge with `cold_metrics` + `cold_raw`.
     let (mut cold_metrics, cold_raw) = if config.retry {
-        retry_load_cold(&profile.name, &kache, &cache_dir, &work_dir)?
+        retry_load_cold(&profile.name, &kache, &cache_dir, runtime_dir, &work_dir)?
     } else {
         run_cold_phase(
             &profile,
             &kache,
             &cache_dir,
-            &kache_config,
+            runtime_dir,
             &clone_a,
             &work_dir,
             &event_log,
@@ -461,14 +456,14 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // Restore the cold snapshot afterwards so this phase cannot seed the
     // cross-checkout measurement.
     let warm_same_tree_metrics = if config.warm_same_tree {
-        reset_event_log(&event_log)?;
-        let daemon_started = daemon::start(&kache, &cache_dir, &kache_config);
+        reset_phase_logs(runtime_dir)?;
+        let daemon_started = runtime::start(&kache, &cache_dir, runtime_dir);
         let same_tree_run = build(
             &profile,
             &clone_a,
             Phase::WarmSameTree.name(),
             &cache_dir,
-            &kache_config,
+            runtime_dir,
             &kache,
             &work_dir,
             CacheBackend::Kache,
@@ -478,15 +473,16 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         write_cache_otlp_or_warn(
             &kache,
             &cache_dir,
-            &kache_config,
+            runtime_dir,
             &work_dir.join("cache-otlp-warm-same-tree"),
             &profile.name,
             Phase::WarmSameTree.name(),
         );
-        daemon::drain(&kache, &cache_dir)?;
+        runtime::drain(&kache, &cache_dir, runtime_dir)?;
         let (report, raw) = capture_report(
             &kache,
             &cache_dir,
+            runtime_dir,
             &work_dir,
             Phase::WarmSameTree.name(),
             &clone_a,
@@ -509,19 +505,19 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // Reset the event log so warm's report covers only the warm build.
     // Only the observability log is removed — the cache store (`store/`,
     // `index.db`) stays, so warm still hits everything cold populated.
-    reset_event_log(&event_log)?;
+    reset_phase_logs(runtime_dir)?;
 
     // warm: same cache, fresh clone at a different path → served from
     // what cold populated. Bring the daemon up first so the restore uses the
     // async file-hash prefetch path instead of hashing every input inline
     // (cold's daemon was stopped before its report capture).
-    let warm_daemon_started = daemon::start(&kache, &cache_dir, &kache_config);
+    let warm_daemon_started = runtime::start(&kache, &cache_dir, runtime_dir);
     let warm_run = build(
         &profile,
         &clone_b,
         Phase::Warm.name(),
         &cache_dir,
-        &kache_config,
+        runtime_dir,
         &kache,
         &work_dir,
         CacheBackend::Kache,
@@ -531,14 +527,20 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     write_cache_otlp_or_warn(
         &kache,
         &cache_dir,
-        &kache_config,
+        runtime_dir,
         &work_dir.join("cache-otlp-warm"),
         &profile.name,
         "warm",
     );
-    daemon::drain(&kache, &cache_dir)?;
-    let (warm, warm_raw) =
-        capture_report(&kache, &cache_dir, &work_dir, Phase::Warm.name(), &clone_b)?;
+    runtime::drain(&kache, &cache_dir, runtime_dir)?;
+    let (warm, warm_raw) = capture_report(
+        &kache,
+        &cache_dir,
+        runtime_dir,
+        &work_dir,
+        Phase::Warm.name(),
+        &clone_b,
+    )?;
     let warm_events = read_event_log(&event_log);
     let (warm_leaks, warm_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Warm.name())));
@@ -596,7 +598,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         profile.checks.measure.for_phase(Phase::Warm.name()),
     );
 
-    // Allocated size of each pool, each inode once. On APFS the warm clone
+    // Store and output sizes exclude the private daemon runtime. On APFS the warm clone
     // still double-counts the bytes it reflinked from the cache (a reflink is
     // a second inode) — print_summary subtracts those to expose "unique to
     // this clone" disk usage.
@@ -1195,17 +1197,15 @@ fn write_otlp_or_warn(work_dir: &Path, run: crate::bench_otlp::OtlpRun) {
 fn write_cache_otlp_or_warn(
     kache: &Path,
     cache_dir: &Path,
-    kache_config: &Path,
+    runtime_dir: &Path,
     dest: &Path,
     scenario: &str,
     phase: &str,
 ) -> bool {
-    let status = Command::new(kache)
+    let status = runtime::command(kache, cache_dir, runtime_dir)
         .args(["telemetry", "write"])
         .arg(dest)
         .args(["--scenario", scenario, "--phase", phase])
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", kache_config)
         .env("RUSTC_WRAPPER", "")
         .status();
     match status {
@@ -1467,7 +1467,7 @@ fn build(
     clone: &Path,
     phase: &str,
     cache_dir: &Path,
-    kache_config: &Path,
+    runtime_dir: &Path,
     kache: &Path,
     work_dir: &Path,
     cache_backend: CacheBackend,
@@ -1515,9 +1515,8 @@ fn build(
         .env("CARGO_INCREMENTAL", "0");
     match cache_backend {
         CacheBackend::Kache => {
-            cmd.env("KACHE_CACHE_DIR", cache_dir)
-                .env("KACHE_CONFIG", kache_config)
-                .env("KACHE_EVENT_ROOT", clone)
+            runtime::configure(&mut cmd, cache_dir, runtime_dir);
+            cmd.env("KACHE_EVENT_ROOT", clone)
                 // KACHE_LOG still un-mutes stderr (visible if you tail the log),
                 // but the authoritative leak-detector signal goes to the file via
                 // KACHE_LOG_FILE — cargo eats wrapper stderr. With `--trace-keys`
@@ -1687,22 +1686,26 @@ struct BuildRun {
 fn capture_report(
     kache: &Path,
     cache_dir: &Path,
+    runtime_dir: &Path,
     out_dir: &Path,
     phase: &str,
     root: &Path,
 ) -> Result<(report::KacheReport, serde_json::Value)> {
-    let (parsed, raw) = report::fetch_since_with_root(kache, cache_dir, "365d", Some(root))?;
+    let (parsed, raw) = report::fetch_from_command(
+        runtime::command(kache, cache_dir, runtime_dir),
+        "365d",
+        Some(root),
+    )?;
 
     let json_path = out_dir.join(format!("report-{phase}.json"));
     std::fs::write(&json_path, serde_json::to_string_pretty(&raw)? + "\n")
         .with_context(|| format!("writing {}", json_path.display()))?;
 
-    let md = Command::new(kache)
+    let md = runtime::command(kache, cache_dir, runtime_dir)
         .args([
             "report", "--format", "markdown", "--since", "365d", "--root",
         ])
         .arg(root)
-        .env("KACHE_CACHE_DIR", cache_dir)
         .output()
         .with_context(|| format!("running `{} report --format markdown`", kache.display()))?;
     if md.status.success() {
@@ -1711,12 +1714,11 @@ fn capture_report(
             .with_context(|| format!("writing {}", md_path.display()))?;
     }
 
-    let trace = Command::new(kache)
+    let trace = runtime::command(kache, cache_dir, runtime_dir)
         .args([
             "report", "--format", "perfetto", "--since", "365d", "--root",
         ])
         .arg(root)
-        .env("KACHE_CACHE_DIR", cache_dir)
         .output()
         .with_context(|| format!("running `{} report --format perfetto`", kache.display()))?;
     if trace.status.success() {
@@ -1737,25 +1739,25 @@ fn run_cold_phase(
     profile: &BenchProfile,
     kache: &Path,
     cache_dir: &Path,
-    kache_config: &Path,
+    runtime_dir: &Path,
     clone_a: &Path,
     work_dir: &Path,
     event_log: &Path,
     trace_keys: bool,
     sh: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
-    daemon::drain(kache, cache_dir)?;
+    runtime::drain(kache, cache_dir, runtime_dir)?;
     if cache_dir.exists() {
         std::fs::remove_dir_all(cache_dir).context("clearing cache dir")?;
     }
     std::fs::create_dir_all(cache_dir)?;
-    let daemon_started = daemon::start(kache, cache_dir, kache_config);
+    let daemon_started = runtime::start(kache, cache_dir, runtime_dir);
     let cold_run = build(
         profile,
         clone_a,
         Phase::Cold.name(),
         cache_dir,
-        kache_config,
+        runtime_dir,
         kache,
         work_dir,
         CacheBackend::Kache,
@@ -1766,13 +1768,20 @@ fn run_cold_phase(
     write_cache_otlp_or_warn(
         kache,
         cache_dir,
-        kache_config,
+        runtime_dir,
         &work_dir.join("cache-otlp-cold"),
         &profile.name,
         "cold",
     );
-    daemon::drain(kache, cache_dir)?;
-    let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, Phase::Cold.name(), clone_a)?;
+    runtime::drain(kache, cache_dir, runtime_dir)?;
+    let (cold, cold_raw) = capture_report(
+        kache,
+        cache_dir,
+        runtime_dir,
+        work_dir,
+        Phase::Cold.name(),
+        clone_a,
+    )?;
     // Read the raw event log *before* the caller's reset — it carries the
     // passthrough events `kache report` filters out of `all_events`.
     let cold_events = read_event_log(event_log);
@@ -1797,6 +1806,7 @@ fn retry_load_cold(
     profile_name: &str,
     kache: &Path,
     cache_dir: &Path,
+    runtime_dir: &Path,
     work_dir: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
     let snapshot = work_dir.join("cache-after-cold");
@@ -1814,7 +1824,7 @@ fn retry_load_cold(
         "\n[bench] [retry] restoring cold-state cache from {}",
         snapshot.display()
     );
-    daemon::drain(kache, cache_dir)?;
+    runtime::drain(kache, cache_dir, runtime_dir)?;
     source::snapshot_dir(&snapshot, cache_dir)?;
 
     let cold_raw: serde_json::Value = read_json(&report_cold)?;
@@ -1837,7 +1847,7 @@ fn run_pull_bench(
     profile: &BenchProfile,
     kache: &Path,
     cache_dir: &Path,
-    kache_config: &Path,
+    runtime_dir: &Path,
     clone_ref: &Path,
     clone_a: &Path,
     work_dir: &Path,
@@ -1872,7 +1882,7 @@ fn run_pull_bench(
         profile,
         kache,
         cache_dir,
-        kache_config,
+        runtime_dir,
         clone_a,
         work_dir,
         event_log,
@@ -1881,11 +1891,7 @@ fn run_pull_bench(
     )?;
     cold_metrics.prepare = cold_prepare;
 
-    // Reset the event log so the pull report covers only the pull build.
-    if event_log.exists() {
-        std::fs::remove_file(event_log)
-            .with_context(|| format!("resetting {}", event_log.display()))?;
-    }
+    reset_phase_logs(runtime_dir)?;
 
     // Advance the SAME worktree to ref B (the "daily pull") and re-assert the
     // injected files (mozconfig etc.), since checkout may touch tracked files.
@@ -1901,13 +1907,13 @@ fn run_pull_bench(
     // pull: same cache, same path, new source. `build()` wipes the objdir at
     // the start of every phase (unconditionally), so this is a from-scratch
     // rebuild at ref_next and kache is asked about every TU.
-    let daemon_started = daemon::start(kache, cache_dir, kache_config);
+    let daemon_started = runtime::start(kache, cache_dir, runtime_dir);
     let pull_run = build(
         profile,
         clone_a,
         Phase::Pull.name(),
         cache_dir,
-        kache_config,
+        runtime_dir,
         kache,
         work_dir,
         CacheBackend::Kache,
@@ -1917,14 +1923,21 @@ fn run_pull_bench(
     write_cache_otlp_or_warn(
         kache,
         cache_dir,
-        kache_config,
+        runtime_dir,
         &work_dir.join("cache-otlp-pull"),
         &profile.name,
         "pull",
     );
-    daemon::drain(kache, cache_dir)?;
+    runtime::drain(kache, cache_dir, runtime_dir)?;
 
-    let (pull, pull_raw) = capture_report(kache, cache_dir, work_dir, Phase::Pull.name(), clone_a)?;
+    let (pull, pull_raw) = capture_report(
+        kache,
+        cache_dir,
+        runtime_dir,
+        work_dir,
+        Phase::Pull.name(),
+        clone_a,
+    )?;
     let pull_events = read_event_log(event_log);
     let (pull_leaks, _pull_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Pull.name())));
@@ -2467,14 +2480,16 @@ fn capture_sccache_report(
     Ok(SccachePhaseMetrics::from_raw(&raw, wall_ms))
 }
 
-/// Drop the event log so the next phase's report covers only that phase.
-///
-/// Only the observability log goes; the cache store (`store/`, `index.db`)
-/// stays, so the next build still hits everything its predecessor populated.
-fn reset_event_log(event_log: &Path) -> Result<()> {
-    if event_log.exists() {
-        std::fs::remove_file(event_log)
-            .with_context(|| format!("resetting {}", event_log.display()))?;
+/// Each report aggregates the events, transfers and session summaries of its phase.
+fn reset_phase_logs(runtime: &Path) -> Result<()> {
+    for name in ["events.jsonl", "transfers.jsonl", "summaries.jsonl"] {
+        let path = runtime.join(name);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("resetting {}", path.display()));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }

@@ -90,15 +90,25 @@ fn unsafe_store_ancestor(store: &Path, uid: u32, allow_missing: bool) -> Result<
     Ok(check_path(&canonical_store_path(store)?, uid, allow_missing)?.0)
 }
 
+/// Missing components can be created later. An obstruction or permissions
+/// error cannot be treated as evidence that the path is available.
+fn optional<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// An absent store inherits the trust of its existing ancestors. A symlink in
 /// the spelling of the path requires the same check on its resolved ancestors.
 fn check_path(root: &Path, uid: u32, allow_missing: bool) -> io::Result<(Option<PathBuf>, bool)> {
     let mut linked = false;
     for path in root.ancestors() {
-        let meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+        let meta = match optional(fs::symlink_metadata(path))? {
+            Some(meta) => meta,
+            None if allow_missing => continue,
+            None => return Err(io::ErrorKind::NotFound.into()),
         };
         let meta = if meta.is_symlink() {
             if path == root {
@@ -118,21 +128,17 @@ fn check_path(root: &Path, uid: u32, allow_missing: bool) -> io::Result<(Option<
 
 fn canonical_store_path(store: &Path) -> Result<PathBuf> {
     for ancestor in store.ancestors() {
-        match fs::canonicalize(ancestor) {
-            Ok(mut resolved) => {
-                for component in store.strip_prefix(ancestor)?.components() {
-                    match component {
-                        Component::Normal(name) => resolved.push(name),
-                        Component::ParentDir => {
-                            resolved.pop();
-                        }
-                        _ => {}
+        if let Some(mut resolved) = optional(fs::canonicalize(ancestor))? {
+            for component in store.strip_prefix(ancestor)?.components() {
+                match component {
+                    Component::Normal(name) => resolved.push(name),
+                    Component::ParentDir => {
+                        resolved.pop();
                     }
+                    _ => {}
                 }
-                return Ok(resolved);
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            return Ok(resolved);
         }
     }
     bail!("cannot resolve store {}", store.display())
@@ -175,29 +181,22 @@ fn socket_under(base: &Path, key: &str, uid: u32) -> Option<PathBuf> {
     let instance = namespace.join(key);
     let mut existing_parent = base.as_path();
     for path in [&namespace, &instance] {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_dir() && meta.uid() == uid && meta.mode() & 0o7777 == 0o700 => {
-                existing_parent = path;
+        if let Some(meta) = optional(fs::symlink_metadata(path)).ok()? {
+            if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o7777 != 0o700 {
+                return None;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            _ => return None,
+            existing_parent = path;
         }
     }
-    let parent = std::ffi::CString::new(existing_parent.as_os_str().as_bytes()).ok()?;
-    // SAFETY: parent is a live NUL-terminated path. faccessat uses the same
-    // effective credentials as the daemon and accounts for read-only mounts.
-    const CREATE_ENTRY: libc::c_int = libc::W_OK | libc::X_OK;
-    if unsafe {
-        libc::faccessat(
-            libc::AT_FDCWD,
-            parent.as_ptr(),
-            CREATE_ENTRY,
-            libc::AT_EACCESS,
-        )
-    } != 0
-    {
-        return None;
-    }
+    // Check the effective credentials used at startup, including mount restrictions.
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    accessat(
+        CWD,
+        existing_parent,
+        Access::WRITE_OK.union(Access::EXEC_OK),
+        AtFlags::EACCESS,
+    )
+    .ok()?;
     // macOS and BSD allow 103 bytes plus the terminating NUL. Leave room for
     // the longest scoped name before accepting this anchor for any caller.
     if instance

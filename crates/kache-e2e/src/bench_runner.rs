@@ -721,7 +721,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // same-tree phase's own verdict is held to the same contract, so a PR gate
     // reading these numbers cannot be handed a phase that measured nothing.
     if run_is_degraded(&result.verdict, result.warm_same_tree_verdict.as_ref()) {
-        std::process::exit(1);
+        bail!("benchmark assertions failed");
     }
     Ok(())
 }
@@ -2029,7 +2029,7 @@ fn run_pull_bench(
     eprintln!("[bench] summary written to {}", out.display());
 
     if !result.verdict.ok {
-        std::process::exit(1);
+        bail!("benchmark assertions failed");
     }
     Ok(())
 }

@@ -13019,8 +13019,9 @@ impl crate::remote_backend::RemoteBackend for StallingGetBackend {
 /// GET blocks the polling thread. An async `pending()` still lets the
 /// handler's deadline run; this one does not.
 struct BlockingGetBackend {
-    started: AtomicBool,
-    finished: AtomicBool,
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    release: std::sync::Mutex<mpsc::Receiver<()>>,
+    finished: mpsc::Sender<()>,
 }
 
 #[async_trait::async_trait]
@@ -13034,9 +13035,14 @@ impl crate::remote_backend::RemoteBackend for BlockingGetBackend {
         _key: &str,
         _max_bytes: Option<u64>,
     ) -> Result<Option<crate::remote_backend::GetObject>> {
-        self.started.store(true, Ordering::SeqCst);
-        std::thread::sleep(BLOCKING_REMOTE_OP);
-        self.finished.store(true, Ordering::SeqCst);
+        let _ = self.started.send(());
+        let released = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(BLOCKING_GET_WATCHDOG);
+        let _ = self.finished.send(());
+        released.context("blocked test GET was not released")?;
         Ok(None)
     }
 
@@ -14030,6 +14036,7 @@ async fn test_restore_deadline_returns_miss_instead_of_hanging() {
 /// handler's budget. The client gets a miss (local compile), stats is not
 /// stuck behind that handler, and shutdown does not wait the op out.
 const BLOCKING_REMOTE_OP: Duration = Duration::from_secs(3);
+const BLOCKING_GET_WATCHDOG: Duration = Duration::from_secs(15);
 
 #[tokio::test]
 async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
@@ -14069,14 +14076,19 @@ async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
     );
 
     let dir = tempfile::tempdir().unwrap();
+    let (started_get, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let (release, gate) = mpsc::channel();
+    let (finished, completion) = mpsc::channel();
     let backend = Arc::new(BlockingGetBackend {
-        started: AtomicBool::new(false),
-        finished: AtomicBool::new(false),
+        started: started_get,
+        release: std::sync::Mutex::new(gate),
+        finished,
     });
     let mut config = test_config(dir.path());
     config.remote = Some(test_remote_config());
-    config.remote_restore_timeout_secs = 1;
-    config.demand_timeout_secs = 1;
+    // The configured limits must outlast the watchdog to exercise the request budget.
+    config.remote_restore_timeout_secs = 60;
+    config.demand_timeout_secs = 60;
     let daemon = Arc::new(Daemon::new(config));
     daemon.signal_warming_complete();
     assert!(
@@ -14091,6 +14103,19 @@ async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
         .key_cache
         .populate(HashMap::from([(check.key.clone(), "serde".to_string())]))
         .await;
+
+    // A second in the handler queue exhausts this explicit budget, but not the
+    // legacy 3s fallback. The same request with a fresh accept time must reach GET.
+    let queued = daemon
+        .handle_remote_check_started_at(&check, Instant::now() - Duration::from_secs(1))
+        .await;
+    assert!(queued.ok);
+    assert_eq!(queued.found, Some(false));
+    assert_eq!(
+        starts.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+        "the expired wire budget must prevent GET"
+    );
 
     let socket_path = daemon.config.socket_path();
     let listener = bind_listener(&socket_path);
@@ -14121,14 +14146,10 @@ async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
     let remote_client =
         tokio::spawn(async move { client_roundtrip(&remote_socket, &request).await });
 
-    let backend_for_wait = Arc::clone(&backend);
-    tokio::time::timeout(Duration::from_secs(2), async move {
-        while !backend_for_wait.started.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the remote op must start");
+    tokio::time::timeout(BLOCKING_GET_WATCHDOG, starts.recv())
+        .await
+        .expect("the remote op must start")
+        .expect("backend still available");
 
     let stats_socket = socket_path.clone();
     let stats_client = tokio::spawn(async move {
@@ -14147,10 +14168,18 @@ async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
         .await
     });
 
-    let remote_response = remote_client.await.expect("remote client");
-    let stats_response = stats_client.await.expect("stats client");
-    let elapsed = started.elapsed();
-    server.await.expect("server");
+    let (remote_response, stats_response) = tokio::time::timeout(BLOCKING_GET_WATCHDOG, async {
+        let remote_response = remote_client.await.expect("remote client");
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "the remote check returned before its requested deadline"
+        );
+        let stats_response = stats_client.await.expect("stats client");
+        server.await.expect("server");
+        (remote_response, stats_response)
+    })
+    .await
+    .expect("the request deadline must free the only handler for stats");
 
     assert!(remote_response.ok);
     assert_eq!(remote_response.found, Some(false));
@@ -14160,14 +14189,15 @@ async fn blocking_remote_op_is_abandoned_and_stats_stays_inside_the_bound() {
     );
     assert!(stats_response.ok, "stats must answer: {stats_response:?}");
     assert!(stats_response.stats.is_some());
-    assert!(
-        !backend.finished.load(Ordering::SeqCst),
+    assert_eq!(
+        completion.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
         "the handler waited for the remote op to finish"
     );
-    assert!(
-        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
-        "handler and stats must return at the 800ms budget, not after the {BLOCKING_REMOTE_OP:?} op, took {elapsed:?}"
-    );
+    release.send(()).expect("release the remote GET");
+    completion
+        .recv_timeout(BLOCKING_GET_WATCHDOG)
+        .expect("remote GET exited");
     assert_eq!(
         daemon
             .transfer_counters

@@ -105,8 +105,7 @@ pub(crate) fn run_shim(shim: &OsStr, cargo_args: Vec<OsString>) -> Result<()> {
     let config =
         crate::config::Config::load_for(&env).context("loading the cache configuration")?;
     let what = cargo_command_label(cargo_args.iter().map(OsString::as_os_str));
-    // Blaze builds through an engine of its own, wherever that keeps output.
-    let scope = match env.cwd().filter(|_| !config.blaze) {
+    let scope = match lease_scope::cargo_layout_cwd(env.cwd(), config.blaze) {
         Some(cwd) => lease_scope::of(cwd, &cargo_args, &env, config.separate_check_targets),
         None => crate::target_use::Scope::Everything,
     };

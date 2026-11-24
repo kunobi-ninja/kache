@@ -10,6 +10,11 @@ const DIR_VARIABLES: [&str; 3] = [
     "CARGO_BUILD_BUILD_DIR",
 ];
 
+/// The shim may invoke Blaze, whose engine places outputs outside Cargo's layout.
+pub(super) fn cargo_layout_cwd(cwd: Option<&Path>, blaze: bool) -> Option<&Path> {
+    if blaze { None } else { cwd }
+}
+
 pub(super) fn of(
     cwd: &Path,
     args: &[OsString],
@@ -98,11 +103,9 @@ fn paths(
                     return None;
                 }
                 if option == "--manifest-path" {
-                    let path = cwd.join(raw);
-                    if path.file_name()? != "Cargo.toml"
-                        || !std::fs::symlink_metadata(&path).ok()?.is_file()
-                        || literal(cwd, Path::new(raw))? != path.canonicalize().ok()?
-                    {
+                    let path = literal(cwd, Path::new(raw))?;
+                    // The ancestor scan below also checks that the manifest is a regular file.
+                    if path.file_name()? != "Cargo.toml" || path != path.canonicalize().ok()? {
                         return None;
                     }
                     manifest_dir = path.parent()?.to_owned();
@@ -308,6 +311,34 @@ mod tests {
     }
 
     #[test]
+    fn blaze_has_no_cargo_layout_even_with_a_known_working_directory() {
+        let cwd = Some(Path::new("workspace"));
+        assert_eq!(cargo_layout_cwd(cwd, false), cwd);
+        assert_eq!(cargo_layout_cwd(cwd, true), None);
+        assert_eq!(cargo_layout_cwd(None, false), None);
+    }
+
+    #[test]
+    fn cargo_uses_a_workspace_lease_only_where_scoped_locks_are_supported() {
+        let tree = Tree::new();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [(OsStr::new("CARGO_HOME"), tree.home.as_os_str())],
+            Some(tree.cwd.clone()),
+            Some(tree.root.join("home")),
+            tree.root.clone(),
+        );
+        let args = [OsString::from("build")];
+        let inferred = configured_scope(&tree.cwd, &args, &env, false);
+        assert!(matches!(inferred, Scope::Within(_)));
+        let expected = if crate::target_use::SCOPED_LOCKS {
+            inferred
+        } else {
+            Scope::Everything
+        };
+        assert_eq!(of(&tree.cwd, &args, &env, false), expected);
+    }
+
+    #[test]
     fn the_invocation_environment_can_require_a_cache_wide_lease() {
         let tree = Tree::new();
         let args = [OsString::from("build")];
@@ -372,6 +403,29 @@ mod tests {
         assert!(tree.scope(&["build", &arg], &[], false).covers(&outside));
     }
 
+    // Unix returns ENOTDIR for the second lookup; Windows may report the
+    // same ERROR_PATH_NOT_FOUND as it does for a missing directory.
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_cargo_home_is_different_from_an_absent_config() {
+        let tree = Tree::new();
+        let home = tree.root.join("invalid-home");
+        let args = [OsString::from("build")];
+        assert!(paths(&tree.cwd, &args, &[], &home, false).is_some());
+        fs::write(&home, "not a directory").unwrap();
+        assert!(paths(&tree.cwd, &args, &[], &home, false).is_none());
+    }
+
+    #[test]
+    fn an_existing_nonstandard_manifest_requires_the_global_lease() {
+        let tree = Tree::new();
+        fs::write(tree.cwd.join("project.toml"), "[workspace]").unwrap();
+        assert_eq!(
+            tree.scope(&["build", "--manifest-path=project.toml"], &[], false),
+            Scope::Everything
+        );
+    }
+
     #[test]
     fn unknown_commands_and_placement_keep_the_cache_wide_lease() {
         let tree = Tree::new();
@@ -384,7 +438,10 @@ mod tests {
             &["build", "--config=include=['extra']"],
             &["build", "-Zunstable-options"],
             &["run", "-C", "elsewhere"],
+            &["test", "--unsupported-option"],
+            &["build", "unexpected-positional"],
             &["build", "--artifact-dir=elsewhere"],
+            &["build", "--release=false"],
             &["build", "--manifest-path=missing/Cargo.toml"],
             &["build", "--manifest-path=elsewhere.toml"],
             &["build", "--target-dir"],
@@ -429,6 +486,15 @@ mod tests {
         let alias = tree.root.join("member-link");
         symlink(&tree.cwd, &alias).unwrap();
         assert!(paths(&alias, &["build".into()], &[], &tree.home, false).is_none());
+        let alias_manifest = alias.join("Cargo.toml");
+        assert_eq!(
+            tree.scope(
+                &["build", "--manifest-path", alias_manifest.to_str().unwrap()],
+                &[],
+                false
+            ),
+            Scope::Everything
+        );
         let outside = tree.root.join("other");
         fs::create_dir(&outside).unwrap();
         let link = tree.root.join("repo/target");

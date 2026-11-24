@@ -5383,6 +5383,178 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
     );
 }
 
+fn put_partly_held_entry(
+    store: &Store,
+    dir: &Path,
+    held_size: usize,
+    private_size: usize,
+) -> PathBuf {
+    let held_output = dir.join("held.a");
+    let private_output = dir.join("private.rmeta");
+    std::fs::write(&held_output, vec![1u8; held_size]).unwrap();
+    std::fs::write(&private_output, vec![2u8; private_size]).unwrap();
+    store
+        .put(
+            "partly",
+            "big_crate",
+            &["staticlib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[
+                (held_output.clone(), "libbig.a".to_string()),
+                (private_output.clone(), "libbig.rmeta".to_string()),
+            ],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&held_output);
+    if private_size == 0 {
+        fs::remove_file(&private_output).unwrap();
+    } else {
+        store.remove_clone_for_test(&private_output);
+    }
+
+    let meta = store.get("partly").unwrap().unwrap();
+    let held_hash = &meta
+        .files
+        .iter()
+        .find(|f| f.name == "libbig.a")
+        .unwrap()
+        .hash;
+    let retainer = dir.join("target-copy.a");
+    std::fs::hard_link(store.blob_path(held_hash), &retainer).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'partly'",
+            [],
+        )
+        .unwrap();
+    retainer
+}
+
+/// An entry with one output still hardlinked into a target directory and
+/// another that nothing else keeps: refusing it stranded the private bytes,
+/// and a store over its limit made of such entries evicted nothing at all.
+#[test]
+fn evict_frees_an_entry_that_is_only_partly_held_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100;
+    let store = Store::open(&config).unwrap();
+
+    let retainer = put_partly_held_entry(&store, dir.path(), 40, 300);
+    assert!(store.physical_size().unwrap() > config.max_size);
+
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert_eq!(stats.entries_unreclaimable, 0, "{stats:?}");
+    assert_eq!(stats.bytes_freed, 340, "{stats:?}");
+    assert!(stats.disk_bytes_reclaimed > 0, "{stats:?}");
+    assert_eq!(
+        stats.bytes_held, 0,
+        "the held part left with the entry: {stats:?}"
+    );
+    assert!(!store.contains("partly"));
+    assert!(store.physical_size().unwrap() <= config.max_size);
+    assert!(retainer.is_file(), "the target directory keeps its copy");
+}
+
+#[test]
+fn a_size_sweep_credits_a_partial_entry_on_the_same_basis_as_its_budget() {
+    use crate::eviction::HeldBytesBudget;
+    for budget in [HeldBytesBudget::LeftOut, HeldBytesBudget::Counted] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.held_bytes_budget = budget;
+        config.max_size = 15_000;
+        let store = Store::open(&config).unwrap();
+        let retainer = put_partly_held_entry(&store, dir.path(), 30_000, 8_000);
+        put_idle_entry(&store, dir.path(), "next", 14_000);
+        put_idle_entry(&store, dir.path(), "keep", 4_000);
+        assert_eq!(store.physical_size().unwrap(), 56_000);
+
+        // Largest first. After the partial entry goes, both budgets have
+        // 18,000 bytes left. One more eviction reaches the 13,500 target.
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.entries_evicted, 2, "{budget:?}: {stats:?}");
+        assert_eq!(stats.bytes_freed, 52_000);
+        assert_eq!(stats.bytes_held, 0);
+        assert_eq!(store.physical_size().unwrap(), 4_000);
+        assert!(store.contains("keep"));
+        assert_eq!(fs::read(retainer).unwrap(), vec![1; 30_000]);
+    }
+}
+
+#[test]
+fn automatic_gc_leaves_a_partial_entry_if_its_private_bytes_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 15_000;
+    let store = Store::open(&config).unwrap();
+    put_partly_held_entry(&store, dir.path(), 30_000, 8_000);
+
+    let stats = store.evict_for(SweepOrigin::Automatic).unwrap();
+    assert_eq!(stats.bytes_held, 30_000);
+    assert_eq!(stats.entries_unreclaimable, 0);
+    assert_eq!(stats.entries_evicted, 0);
+    assert!(store.contains("partly"));
+}
+
+#[test]
+fn an_empty_private_output_cannot_pay_for_evicting_a_held_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 10_000;
+    config.held_bytes_budget = crate::eviction::HeldBytesBudget::Counted;
+    let store = Store::open(&config).unwrap();
+    let retainer = put_partly_held_entry(&store, dir.path(), 30_000, 0);
+
+    // A staticlib may legitimately have an empty .rmeta beside its archive.
+    // Exercise both the size sweep's probe and a removal without that probe.
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.bytes_held, 30_000);
+    assert_eq!(stats.entries_unreclaimable, 1);
+    assert_eq!(stats.entries_evicted, 0);
+    assert!(matches!(
+        store
+            .remove_entry_guarded("partly", Some(EVICTION_IDLE_GRACE))
+            .unwrap(),
+        GuardedRemoval::Unreclaimable
+    ));
+    assert!(store.contains("partly"));
+    assert_eq!(fs::read(retainer).unwrap(), vec![1; 30_000]);
+}
+
+#[test]
+fn a_missing_empty_blob_cannot_pay_for_evicting_a_held_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let retainer = put_partly_held_entry(&store, dir.path(), 30_000, 0);
+
+    // The index still names the empty .rmeta, but a probe cannot find it.
+    let empty_blob = store.blob_path(blake3::hash(b"").to_hex().as_str());
+    assert_eq!(fs::metadata(&empty_blob).unwrap().len(), 0);
+    unlink_blob(&empty_blob);
+    assert!(!empty_blob.try_exists().unwrap());
+
+    let candidates = store
+        .eviction_candidates_for(SweepOrigin::Requested)
+        .unwrap();
+    let held = store.held_by_live_files(&candidates).unwrap();
+    assert_eq!(held.refused.get("partly"), Some(&30_000));
+    assert!(matches!(
+        store
+            .remove_entry_guarded("partly", Some(EVICTION_IDLE_GRACE))
+            .unwrap(),
+        GuardedRemoval::Unreclaimable
+    ));
+    assert!(store.contains("partly"));
+    assert_eq!(fs::read(retainer).unwrap(), vec![1; 30_000]);
+}
+
 #[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));
@@ -15373,7 +15545,7 @@ fn a_shared_blob_held_outside_is_no_entrys_held_bytes() {
     let candidates = store
         .eviction_candidates_for(SweepOrigin::Requested)
         .unwrap();
-    assert!(store.held_by_live_files(&candidates).unwrap().is_empty());
+    assert_eq!(store.held_by_live_files(&candidates).unwrap().total(), 0);
 }
 
 /// Only a sweep with a byte budget probes: the others remove what their

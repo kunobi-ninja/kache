@@ -261,7 +261,7 @@ A nested build finds its test's slots through `KACHE_TEST_LEASE`. A build that r
 
 By default, GC keeps an entry when removing its last store name would reclaim zero bytes. This preserves a usable cache hit. It also means the registered store size can remain above `local_max_size` until the target output is removed. `kache gc` reports these entries as unreclaimable, with the bytes they hold, and separates store bytes removed from disk bytes reclaimed.
 
-A size-driven sweep leaves those held bytes out of its budget. Before it removes anything, it finds the entries whose last blob a build output still holds, and it evicts until the rest of the store is back under the target. A store whose registered size is mostly held by target directories is therefore not evicted further: removing other entries would lose cache hits without bringing the held bytes down.
+A size-driven sweep leaves bytes held by target directories out of its budget by default. An entry can contain both held and private blobs. For example, a target might still hold its `.rmeta` after Cargo replaced its `.rlib`. GC can evict that entry to reclaim the private blob. The target keeps its existing output, and a later build that needs the evicted entry must restore it from another cache or compile it again.
 
 Automatic eviction has one trigger: a sweep starts when the store is above 110% of `local_max_size` and evicts down to 90%. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. `kache gc` evicts from 100%.
 
@@ -300,7 +300,7 @@ To count bytes retained by build outputs toward the size budget, enable this opt
 count_held_in_max_size = true
 ```
 
-The equivalent environment setting is `KACHE_COUNT_HELD_IN_MAX_SIZE=1`. The automatic trigger then compares the whole store with 110% of `local_max_size`. A size sweep tries to reach 90% by evicting other eligible entries. Keep `gc_evict_shared = false` to retain the entries backed by build outputs.
+The equivalent environment setting is `KACHE_COUNT_HELD_IN_MAX_SIZE=1`. The automatic trigger then compares the whole store with 110% of `local_max_size`. A size sweep tries to reach 90% by evicting other eligible entries. With `gc_evict_shared = false`, GC still keeps an entry when every blob it could release is held by a build output.
 
 This is a budget target. Retained outputs and other protected entries can keep the store above it. If retained bytes alone exceed the target, the sweep can remove every other eligible entry and still remain over budget. Removing those build outputs releases the retained blocks. Counting them can increase future misses because the sweep removes other cache entries to make room for them.
 

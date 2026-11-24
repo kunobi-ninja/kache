@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 /// How a size budget treats the bytes a live build output still holds:
 /// blobs whose last store reference an entry holds while a target directory
-/// hardlinks or clones them too. Evicting such an entry frees no disk, so a
-/// sweep keeps it either way; this decides whether its bytes count toward
-/// `max_size`.
+/// hardlinks or clones them too. This decides whether those bytes count
+/// toward `max_size`. An entry that also owns private blobs can be evicted
+/// under either policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HeldBytesBudget {
     /// Left out (kunobi-ninja/kache#1206): a sweep stops once the rest of

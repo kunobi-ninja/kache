@@ -216,16 +216,28 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    fn short_fixture() -> tempfile::TempDir {
+        // Darwin's TMPDIR leaves little room in a Unix socket address. Nix on
+        // Linux can map /tmp's owner to nobody and supplies a private TMPDIR.
+        let tmp = Path::new("/tmp");
+        let parent = if fs::metadata(tmp).is_ok_and(|meta| meta.uid() == 0) {
+            tmp.to_owned()
+        } else {
+            std::env::temp_dir()
+        };
+        tempfile::Builder::new()
+            .prefix("k")
+            .tempdir_in(parent)
+            .unwrap()
+    }
+
     fn chmod(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
     fn shared_store_identity_survives_creation_and_ancestor_aliases() {
-        let fixture = tempfile::Builder::new()
-            .prefix("k")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let fixture = short_fixture();
         let root = fs::canonicalize(fixture.path()).unwrap();
         let uid = fs::metadata(&root).unwrap().uid();
         let anchor = root.join("user");
@@ -256,10 +268,7 @@ mod tests {
 
     #[test]
     fn private_anchor_requires_safe_existing_directories_and_room_for_scope() {
-        let fixture = tempfile::Builder::new()
-            .prefix("k")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let fixture = short_fixture();
         let root = fs::canonicalize(fixture.path()).unwrap();
         let uid = fs::metadata(&root).unwrap().uid();
         let key = "0123456789abcdef0123456789abcdef";
@@ -290,10 +299,7 @@ mod tests {
 
     #[test]
     fn canonical_identity_rejects_obstructions_and_checks_hidden_ancestors() {
-        let fixture = tempfile::Builder::new()
-            .prefix("k")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let fixture = short_fixture();
         let root = fs::canonicalize(fixture.path()).unwrap();
         let uid = fs::metadata(&root).unwrap().uid();
         let shared = root.join("shared");
@@ -318,10 +324,7 @@ mod tests {
 
     #[test]
     fn private_anchor_accepts_last_usable_socket_byte() {
-        let fixture = tempfile::Builder::new()
-            .prefix("k")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let fixture = short_fixture();
         let root = fs::canonicalize(fixture.path()).unwrap();
         let uid = fs::metadata(&root).unwrap().uid();
         let key = "0123456789abcdef0123456789abcdef";

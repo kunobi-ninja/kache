@@ -22,6 +22,7 @@ from pathlib import Path
 import tomllib
 
 from bench.design import ordered, plan
+from bench.event_capture import detect_event_capture, event_drop_counts, read_overflow_event
 
 JOBS = (
     ("check", ["check", "--locked"]),
@@ -227,6 +228,30 @@ def event_window(path, offset, prefix, identity=None):
         return stream.read().decode("utf-8")
 
 
+def collect_build_events(raw, overflow, dest):
+    """Keep an auditable record of every event used for the counters."""
+    evidence = dest / "overflow"
+    shutil.move(overflow, evidence)
+    event_path = dest / "events.jsonl"
+    event_path.write_text(raw)
+    if raw and not raw.endswith("\n"):
+        raise ValueError("incomplete Kache primary event log")
+    events = [json.loads(line) for line in raw.split("\n") if line.strip()]
+    # Older binaries report an omitted event here. A new binary does the same
+    # if either the primary event log or the overflow capture fails.
+    with (dest / "event-writer.log").open(errors="replace") as diagnostics:
+        for line in diagnostics:
+            if any(event_drop_counts(line)):
+                raise ValueError(f"incomplete Kache event counts; see {diagnostics.name}")
+
+    with event_path.open("a") as output:
+        for path in sorted(evidence.iterdir()):
+            line, event = read_overflow_event(path)
+            events.append(event)
+            output.write(line)
+    return aggregate_events(events)
+
+
 def job_environment(
     args, binary, repo, store, runtime, scheduler, backend="kache", repos=None
 ):
@@ -375,8 +400,8 @@ def stop_kache(binary, env, dest):
             env=env,
             stdout=stream,
             stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
+            timeout=50,
+            check=True,
         )
     wait_for_daemon_lock(Path(env["KACHE_RUNTIME_DIR"]) / "daemon.run.lock", 40)
 
@@ -451,6 +476,15 @@ def run_phase(
     control_env = job_environment(
         args, binary, repos[0], store, runtime, scheduler, backend, repos
     )
+    if backend == "kache":
+        overflow = runtime / "events.jsonl.overflow"
+        overflow.mkdir(mode=0o700)
+        diagnostics = dest / "event-writer.log"
+        diagnostics.touch(exist_ok=False)
+        control_env.update(
+            KACHE_LOG_FILE=getattr(args, "event_log_filter", "kache::wrapper=debug"),
+            KACHE_LOG_FILE_PATH=str(diagnostics.resolve()),
+        )
     if backend == "kache" and getattr(args, "daemon", False):
         with (dest / "daemon-start.log").open("w") as stream:
             subprocess.run(
@@ -490,6 +524,9 @@ def run_phase(
         env = job_environment(
             args, binary, repos[index], store, runtime, scheduler, backend, repos
         )
+        if backend == "kache":
+            env["KACHE_LOG_FILE"] = control_env["KACHE_LOG_FILE"]
+            env["KACHE_LOG_FILE_PATH"] = control_env["KACHE_LOG_FILE_PATH"]
         if backend == "mbx":
             env["MBX_STATS_REPORT"] = str(dest / f"{name}.mbx.json")
         elif backend == "kache" and getattr(args, "trace_phases", False):
@@ -538,10 +575,7 @@ def run_phase(
             stop_kache(binary, control_env, dest)
             kache_stopped = True
             raw = event_window(events_path, offset, prefix, identity)
-            (dest / "events.jsonl").write_text(raw)
-            aggregate = aggregate_events(
-                [json.loads(line) for line in raw.splitlines() if line.strip()]
-            )
+            aggregate = collect_build_events(raw, overflow, dest)
         elif backend == "sccache":
             raw = capture(
                 [str(binary), "--show-stats", "--stats-format", "json"],
@@ -1384,6 +1418,21 @@ def main():
         os.environ["PATH"] = f"{toolchain_bin}{os.pathsep}{os.environ['PATH']}"
         env["PATH"] = os.environ["PATH"]
         subprocess.run(["cargo", "fetch", "--locked"], cwd=mirror, env=env, check=True)
+        capture_modes = {
+            name: detect_event_capture(
+                binary, toolchain_bin / "rustc",
+                job_environment(args, binary, mirror, work, work, scheduler), stop_kache,
+            )
+            for name, binary, scheduler, backend in arms if backend == "kache"
+        }
+        data["event_capture"] = capture_modes
+        # Use the same logging configuration on both sides of a timed pair.
+        target = (
+            "kache::wrapper"
+            if "diagnostic" in capture_modes.values()
+            else "kache::wrapper::event_log"
+        )
+        args.event_log_filter = f"{target}=debug"
         run_batches(args, arms, mirror, work, data)
     except Exception as error:
         data["error"] = str(error)

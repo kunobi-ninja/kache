@@ -443,6 +443,17 @@ class BenchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "incomplete contention"):
                     short.run_contention(args, arms)
 
+    def test_contention_failure_reports_why_the_measurement_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(output=root, project="hk", scenarios=root, samples=1, order_seed=1)
+            contention = root / "contention"
+            contention.mkdir()
+            (contention / "samples.json").write_text(json.dumps({"error": "incomplete Kache event counts"}))
+            with patch.object(short, "run_measurement", side_effect=subprocess.CalledProcessError(1, ["bench"])):
+                with self.assertRaisesRegex(ValueError, "incomplete Kache event counts"):
+                    short.run_contention(args, [])
+
     def test_other_tools_run_only_when_named(self):
         """The per-PR gate measures Kache alone; the nightly names mbx and the
         weekly reference names sccache too."""

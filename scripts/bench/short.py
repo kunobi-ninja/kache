@@ -151,6 +151,13 @@ def run_contention(args, arms, timeout=None):
             raise DeadlineReached(
                 "contention was still running when the time budget ran out"
             ) from None
+        except subprocess.CalledProcessError as error:
+            report = output / "samples.json"
+            if report.is_file():
+                reason = json.loads(report.read_text()).get("error")
+                if reason:
+                    raise ValueError(f"contention measurement failed: {reason}") from error
+            raise
     data = json.loads((output / "samples.json").read_text())
     expected = {
         (sample, arm, phase)

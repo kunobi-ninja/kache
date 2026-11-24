@@ -7,13 +7,14 @@ const RECENT_BYTES: u64 = 262_144;
 pub(super) enum LogLock {
     Wait,
     Build,
+    BuildEvent,
 }
 
 impl LogLock {
-    pub(super) fn exclusive(self, file: &File) -> Result<()> {
+    pub(super) fn exclusive(&self, file: &File) -> Result<()> {
         match self {
             Self::Wait => Ok(file.lock()?),
-            Self::Build => lock_for_build(|| file.try_lock()),
+            Self::Build | Self::BuildEvent => lock_for_build(|| file.try_lock()),
         }
     }
 }

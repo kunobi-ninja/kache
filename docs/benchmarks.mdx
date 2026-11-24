@@ -278,6 +278,12 @@ Contention appears as its own report section and as `bench-hk-contention` or
 results under `contention/` and includes the statistics in `summary.json`.
 Missing backend reports or failed builds invalidate the suite.
 
+Under contention, several wrappers can try to write the event log at once. On
+Linux the benchmark collects any build events that exceed the log’s lock timeout
+in a private directory and includes them in the phase’s `events.jsonl`. If an
+older binary reports a dropped event, the benchmark marks the measurement
+invalid. See `event-writer.log` in the phase artifact for the error.
+
 PRs measure six fresh cold contention seeds and six warm batches per Kache
 arm. Cold duplicate counts use the recorded order randomization and the same
 predeclared family as timings. Warm increases in duplicate compilations,

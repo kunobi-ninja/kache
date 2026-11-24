@@ -9760,7 +9760,11 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
     let _trace = crate::phase_trace::phase("event_log");
     if let Err(error) = events::log_event_for_build(&config.event_log_path(), event) {
-        tracing::debug!(crate_name = %event.crate_name, "could not record compiler event: {error:#}");
+        tracing::debug!(
+            target: "kache::wrapper::event_log",
+            crate_name = %event.crate_name,
+            "could not record compiler event: {error:#}"
+        );
         return;
     }
     crate::opcounts::mark_event_written();

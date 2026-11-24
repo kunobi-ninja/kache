@@ -2,6 +2,7 @@
 """Contention measurements must distinguish elapsed time, work, and waiting."""
 
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -893,6 +894,46 @@ else:
                 bench.counters(path),
                 {"usage_usec": 999, "nr_throttled": 7, "throttled_usec": 312},
             )
+
+    def test_overflow_and_primary_records_are_counted_once_in_the_phase_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory)
+            spool = dest / "events.jsonl.overflow"
+            spool.mkdir(mode=0o700)
+            primary = {"crate_name": "main", "result": "local_hit"}
+            extra = {"crate_name": "build_script_run", "result": "passthrough"}
+            raw = json.dumps(primary) + "\n"
+            (spool / "event-one.jsonl").write_text(json.dumps(extra) + "\n")
+            (dest / "event-writer.log").touch()
+            counts = bench.collect_build_events(raw, spool, dest)
+            self.assertEqual(counts["results"], {"local_hit": 1, "passthrough": 1})
+            records = (dest / "events.jsonl").read_text().splitlines()
+            self.assertEqual([json.loads(line) for line in records], [primary, extra])
+            self.assertFalse(spool.exists(), "the next phase must start with an empty spool")
+
+    def test_incomplete_counts_are_rejected_and_retain_the_evidence(self):
+        for filename, contents, diagnostic in [
+            ("event-temp", "{}", ""),
+            ("event-one.jsonl", "{", ""),
+            ("event-one.jsonl", "{}\n", ""),
+            ("event-one.jsonl", "{}\n{}\n", ""),
+            (None, "", "DEBUG kache::wrapper: could not record compiler event: lock timeout"),
+            (None, "", "DEBUG kache::wrapper::event_log: could not record compiler event: I/O error"),
+        ]:
+            with self.subTest(filename=filename, contents=contents, diagnostic=diagnostic):
+                with tempfile.TemporaryDirectory() as directory:
+                    dest = Path(directory)
+                    spool = dest / "events.jsonl.overflow"
+                    spool.mkdir(mode=0o700)
+                    if filename:
+                        (spool / filename).write_text(contents)
+                    (dest / "event-writer.log").write_text(diagnostic)
+                    raw = '{"crate_name":"cached","result":"local_hit"}\n'
+                    with self.assertRaisesRegex(ValueError, "Kache (event|build|overflow)"):
+                        bench.collect_build_events(raw, spool, dest)
+                    self.assertEqual((dest / "events.jsonl").read_text(), raw)
+                    if filename:
+                        self.assertTrue((dest / "overflow" / filename).is_file())
 
     def test_event_window_rejects_rotation_even_when_the_log_has_regrown(self):
         with tempfile.TemporaryDirectory() as directory:

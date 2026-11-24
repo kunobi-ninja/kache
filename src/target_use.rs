@@ -1256,17 +1256,18 @@ mod tests {
     fn a_waiting_command_uses_the_replacement_after_pruning() {
         let fx = Fixture::new();
         let path = fx.cache.join("replace.lock");
-        let old = open_lock(&path).unwrap();
-        old.lock().unwrap();
         let (said, heard) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
+            // On a failed assertion the guard must unlock before the scope
+            // joins the waiter blocked on this file.
+            let old = try_lock_exclusive(&path, Region::Whole).unwrap().unwrap();
             let waiter = scope.spawn(|| {
                 lock_shared(&path, Region::Whole, &fx.cache, &mut Said(said), &mut false).unwrap()
             });
             heard.recv_timeout(Duration::from_secs(10)).unwrap();
             std::fs::remove_file(&path).unwrap();
             let replacement = open_lock(&path).unwrap();
-            old.unlock().unwrap();
+            drop(old);
             let held = waiter.join().unwrap();
             assert!(matches!(
                 replacement.try_lock(),

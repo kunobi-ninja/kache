@@ -744,6 +744,10 @@ fn configured_instance_matches(
         }
     }
     let socket = match runtime {
+        // This probe does not know the login service's working directory.
+        // Resolving a relative store in the caller's cwd can identify a different daemon.
+        #[cfg(unix)]
+        None if !store.is_absolute() => return Ok(false),
         #[cfg(unix)]
         None => match kache_config::config::unix_ipc::shared_store_socket(&store) {
             Ok(Some(socket)) => socket,
@@ -1536,6 +1540,17 @@ mod tests {
             error.contains("not loaded") && error.contains("Input/output error"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_store_cannot_identify_the_login_service() {
+        let relative = Path::new(".");
+        let guessed = kache_config::config::unix_ipc::shared_store_socket(relative)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| crate::config::default_daemon_socket(relative, relative, None));
+        assert!(!configured_instance_matches(&guessed, relative.to_owned(), []).unwrap());
     }
 
     #[cfg(unix)]

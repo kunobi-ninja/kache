@@ -37,7 +37,9 @@ fn is_ipc_mount_root(path: &Path) -> bool {
 pub fn shared_store_socket(store: &Path) -> Result<Option<PathBuf>> {
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
-    select_socket_with(store, uid, || {
+    let tmp_anchor =
+        || cfg!(target_os = "linux").then(|| Path::new("/tmp").join(format!("kache-ipc-{uid}")));
+    select_socket_with(store, uid, tmp_anchor, || {
         #[cfg(target_os = "linux")]
         let runtime = Some(Path::new("/run/user").join(uid.to_string()));
         #[cfg(not(target_os = "linux"))]
@@ -49,6 +51,7 @@ pub fn shared_store_socket(store: &Path) -> Result<Option<PathBuf>> {
 fn select_socket_with(
     store: &Path,
     uid: u32,
+    tmp_anchor: impl FnOnce() -> Option<PathBuf>,
     anchors: impl FnOnce() -> [Option<PathBuf>; 2],
 ) -> Result<Option<PathBuf>> {
     if unsafe_store_ancestor(store, uid, true)?.is_none() {
@@ -65,6 +68,7 @@ fn select_socket_with(
         .into_iter()
         .flatten()
         .find_map(|base| socket_under(&base, key, uid))
+        .or_else(|| socket_in_system_tmp(&tmp_anchor()?, key, uid))
     {
         return Ok(Some(socket));
     }
@@ -170,6 +174,43 @@ fn account_home(uid: u32) -> Option<PathBuf> {
     home.is_absolute().then(|| home.to_owned())
 }
 
+/// A fixed, root-owned sticky directory protects a child's name once this UID
+/// owns it. Reserve and verify that child before giving its path to any client.
+fn socket_in_system_tmp(anchor: &Path, key: &str, uid: u32) -> Option<PathBuf> {
+    let tmp = anchor.parent()?;
+    let meta = fs::symlink_metadata(tmp).ok()?;
+    if !root_owned_sticky_directory(meta.is_dir(), meta.uid(), meta.mode()) {
+        return None;
+    }
+    let parent = tmp.parent()?;
+    if check_path(parent, 0, false).ok()?.0.is_some() {
+        return None;
+    }
+    reserve_private_directory(anchor, uid)?;
+    socket_under(anchor, key, uid)
+}
+
+fn root_owned_sticky_directory(is_dir: bool, owner: u32, mode: u32) -> bool {
+    is_dir && owner == 0 && mode & 0o1000 != 0
+}
+
+fn reserve_private_directory(anchor: &Path, uid: u32) -> Option<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    // The parent exists and is trusted. create_dir_all semantics let concurrent
+    // clients converge on the same mkdir without changing an existing entry.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(anchor)
+        .ok()?;
+    let meta = fs::symlink_metadata(anchor).ok()?;
+    is_private_directory(&meta, uid).then_some(())
+}
+
+fn is_private_directory(meta: &fs::Metadata, uid: u32) -> bool {
+    meta.is_dir() && meta.uid() == uid && meta.mode() & 0o7777 == 0o700
+}
+
 fn socket_under(base: &Path, key: &str, uid: u32) -> Option<PathBuf> {
     let base = fs::canonicalize(base).ok()?;
     let meta = fs::metadata(&base).ok()?;
@@ -182,7 +223,7 @@ fn socket_under(base: &Path, key: &str, uid: u32) -> Option<PathBuf> {
     let mut existing_parent = base.as_path();
     for path in [&namespace, &instance] {
         if let Some(meta) = optional(fs::symlink_metadata(path)).ok()? {
-            if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o7777 != 0o700 {
+            if !is_private_directory(&meta, uid) {
                 return None;
             }
             existing_parent = path;
@@ -245,8 +286,15 @@ mod tests {
         fs::create_dir(&anchor).unwrap();
         fs::create_dir(&shared).unwrap();
         chmod(&shared, 0o770);
-        let select =
-            |path: &Path| select_socket_with(path, uid, || [Some(anchor.clone()), None]).unwrap();
+        let select = |path: &Path| {
+            select_socket_with(
+                path,
+                uid,
+                || panic!("a usable account anchor precedes system tmp"),
+                || [Some(anchor.clone()), None],
+            )
+            .unwrap()
+        };
         assert_eq!(select(&root.join("private")), None);
         let store = shared.join("one/cache");
         let socket = select(&store).unwrap();
@@ -301,7 +349,76 @@ mod tests {
         assert_eq!(select().unwrap(), socket);
         chmod(&root, 0o770);
         assert!(select().is_none());
-        assert!(select_socket_with(&root, uid, || [Some(long), None]).is_err());
+        assert!(select_socket_with(&root, uid, || None, || [Some(long), None]).is_err());
+    }
+
+    #[test]
+    fn a_shared_system_temp_directory_requires_root_and_the_sticky_bit() {
+        assert!(root_owned_sticky_directory(true, 0, 0o1777));
+        assert!(!root_owned_sticky_directory(false, 0, 0o1777));
+        assert!(!root_owned_sticky_directory(true, 1, 0o1777));
+        assert!(!root_owned_sticky_directory(true, 0, 0o777));
+    }
+
+    #[test]
+    fn concurrent_clients_reserve_the_same_private_directory() {
+        let fixture = short_fixture();
+        let uid = fs::metadata(fixture.path()).unwrap().uid();
+        let anchor = fixture.path().join("private");
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    assert_eq!(reserve_private_directory(&anchor, uid), Some(()));
+                });
+            }
+        });
+        let mode = || fs::symlink_metadata(&anchor).unwrap().mode() & 0o7777;
+        assert_eq!(mode(), 0o700);
+        assert!(reserve_private_directory(&anchor, uid.wrapping_add(1)).is_none());
+        chmod(&anchor, 0o755);
+        assert!(reserve_private_directory(&anchor, uid).is_none());
+        assert_eq!(mode(), 0o755);
+        let file = fixture.path().join("occupied");
+        fs::write(&file, "unchanged").unwrap();
+        chmod(&file, 0o700);
+        assert!(reserve_private_directory(&file, uid).is_none());
+        assert_eq!(fs::read(&file).unwrap(), b"unchanged");
+        let link = fixture.path().join("link");
+        symlink(fixture.path(), &link).unwrap();
+        assert!(reserve_private_directory(&link, uid).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_system_temp_socket_uses_only_a_protected_directory() {
+        let fixture = short_fixture();
+        let anchor = fs::canonicalize(fixture.path()).unwrap();
+        chmod(&anchor, 0o700);
+        let uid = fs::metadata(&anchor).unwrap().uid();
+        // This fixture can live in /build when Nix maps /tmp's owner to nobody.
+        let tmp = anchor.parent().unwrap();
+        let meta = fs::symlink_metadata(tmp).unwrap();
+        let socket = socket_in_system_tmp(&anchor, "unit", uid);
+        if tmp == Path::new("/tmp") && meta.uid() == 0 && meta.mode() & 0o1000 != 0 {
+            assert_eq!(socket, Some(anchor.join(".kache-ipc/unit/d.sock")));
+            let shared = anchor.join("store");
+            fs::create_dir(&shared).unwrap();
+            chmod(&shared, 0o777);
+            let selected =
+                select_socket_with(&shared, uid, || Some(anchor.clone()), || [None, None])
+                    .unwrap()
+                    .unwrap();
+            assert!(selected.starts_with(anchor.join(".kache-ipc")));
+            assert!(!selected.starts_with(&shared));
+        } else {
+            assert!(socket.is_none());
+        }
+        let untrusted = anchor.join("not-sticky");
+        fs::create_dir(&untrusted).unwrap();
+        assert!(socket_in_system_tmp(&untrusted.join("anchor"), "unit", uid).is_none());
+        assert!(!untrusted.join("anchor").exists());
     }
 
     #[test]

@@ -107,26 +107,29 @@ fn normalize(path: &Path) -> Option<PathBuf> {
                 return ((!SCOPED_LOCKS || name.is_ascii()) && !name.contains(&b'\n'))
                     .then_some(path);
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return None,
+            Err(error) => require_not_found(error)?,
         }
         // A dangling symlink already names another path. Wait for a known
         // target under the global guard rather than guessing where it will lead.
-        match std::fs::symlink_metadata(existing) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            _ => return None,
-        }
+        require_not_found(std::fs::symlink_metadata(existing).err()?)?;
         let name = existing.file_name()?;
         #[cfg(windows)]
-        if name.as_encoded_bytes().ends_with(b".")
-            || name.as_encoded_bytes().ends_with(b" ")
-            || name.as_encoded_bytes().contains(&b'~')
-        {
+        if windows_name_may_alias(name) {
             return None;
         }
         missing.push(name.to_owned());
         existing = existing.parent()?;
     }
+}
+
+fn require_not_found(error: io::Error) -> Option<()> {
+    (error.kind() == io::ErrorKind::NotFound).then_some(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_name_may_alias(name: &OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.ends_with(b".") || name.ends_with(b" ") || name.contains(&b'~')
 }
 
 fn comparison_path(path: &Path) -> PathBuf {
@@ -235,20 +238,25 @@ fn reservation_locks(cache_dir: &Path, target: &Path) -> impl Iterator<Item = Pa
 
 /// Whether `file` is still the file at `path`. A pruned lock file is gone,
 /// and a lock taken on it guards nothing.
-#[cfg(unix)]
 fn still_named(file: &File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), std::fs::metadata(path)) {
-        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
-        _ => false,
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), std::fs::metadata(path)) {
+            (Ok(held), Ok(named)) => (held.dev(), held.ino()) == (named.dev(), named.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // These hosts never unlink lock files.
+        let _ = (file, path);
+        true
     }
 }
 
-/// Lock files are never pruned here, so the open file is the named one.
-#[cfg(not(unix))]
-fn still_named(_: &File, _: &Path) -> bool {
-    true
-}
+// Stop if concurrent pruning repeatedly removes the file we just opened.
+const MAX_LOCK_OPENS: usize = 8;
 
 /// Share the lock at `path`, waiting for a cleanup that holds it. `said`
 /// keeps the notice to one line per lease.
@@ -259,7 +267,7 @@ fn lock_shared(
     notice: &mut dyn Write,
     said: &mut bool,
 ) -> io::Result<Held> {
-    loop {
+    for _ in 0..MAX_LOCK_OPENS {
         let file = open_lock(path)?;
         match region.try_shared(&file) {
             Ok(()) => {}
@@ -277,11 +285,12 @@ fn lock_shared(
             return Ok(held);
         }
     }
+    Err(io::Error::other("target-use lock file repeatedly replaced"))
 }
 
 /// Take the lock at `path` without waiting: `None` when someone holds it.
 fn try_lock_exclusive(path: &Path, region: Region) -> io::Result<Option<Held>> {
-    loop {
+    for _ in 0..MAX_LOCK_OPENS {
         let file = open_lock(path)?;
         match region.try_exclusive(&file) {
             Ok(()) => {}
@@ -293,6 +302,7 @@ fn try_lock_exclusive(path: &Path, region: Region) -> io::Result<Option<Held>> {
             return Ok(Some(held));
         }
     }
+    Err(io::Error::other("target-use lock file repeatedly replaced"))
 }
 
 fn holder_record(cache_dir: &Path) -> PathBuf {
@@ -540,32 +550,28 @@ pub(crate) fn try_exclusive(cache_dir: &Path, target: &Path) -> io::Result<Optio
 /// opened one before it went sees the file gone once it locks, and opens the
 /// path again.
 #[cfg(unix)]
-pub(crate) fn prune_locks(cache_dir: &Path) -> usize {
+pub(crate) fn prune_locks(cache_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(locks_dir(cache_dir)) else {
-        return 0;
+        return;
     };
-    let mut pruned = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
             continue;
         };
         if file.try_lock().is_ok() {
-            if still_named(&file, &path) && std::fs::remove_file(&path).is_ok() {
-                pruned += 1;
+            if still_named(&file, &path) {
+                let _ = std::fs::remove_file(&path);
             }
             let _ = file.unlock();
         }
     }
-    pruned
 }
 
 /// Windows refuses to reopen a file whose deletion is pending, so a lease
 /// there could fail rather than retry; its lock files stay.
 #[cfg(not(unix))]
-pub(crate) fn prune_locks(_: &Path) -> usize {
-    0
-}
+pub(crate) fn prune_locks(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -875,6 +881,33 @@ mod tests {
         assert!(!scope.covers(&fx.at("ws2")));
     }
 
+    #[test]
+    fn an_unreadable_prefix_is_not_a_missing_directory() {
+        assert_eq!(
+            require_not_found(io::ErrorKind::PermissionDenied.into()),
+            None
+        );
+        assert_eq!(require_not_found(io::ErrorKind::NotFound.into()), Some(()));
+    }
+
+    #[test]
+    fn normalized_names_fit_holder_records_and_case_comparison() {
+        let fx = Fixture::new();
+        assert_eq!(normalize(&fx.at("future\nname")), None);
+        assert_eq!(normalize(&fx.at("future")), Some(fx.at("future")));
+        assert_eq!(normalize(&fx.at("résultat")).is_some(), !SCOPED_LOCKS);
+    }
+
+    #[test]
+    fn future_windows_aliases_require_the_global_guard() {
+        for name in ["target.", "target ", "TARGE~1"] {
+            assert!(windows_name_may_alias(OsStr::new(name)), "{name}");
+        }
+        for name in ["target", "control.target", "control target"] {
+            assert!(!windows_name_may_alias(OsStr::new(name)), "{name}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn paths_are_compared_as_the_filesystem_names_them() {
@@ -1155,20 +1188,20 @@ mod tests {
             );
         }
         // Obtain this file before pruning, as a cleanup in another workspace does.
-        drop(
-            try_lock_exclusive(&path_lock(&fx.cache, 'u', &fx.at("other")), Region::Whole)
-                .unwrap()
-                .unwrap(),
-        );
-        assert_eq!(prune_locks(&fx.cache), 1);
+        let unused = path_lock(&fx.cache, 'u', &fx.at("other"));
+        drop(try_lock_exclusive(&unused, Region::Whole).unwrap().unwrap());
+        prune_locks(&fx.cache);
+        assert!(!unused.exists());
         for lock in &held {
             assert!(lock.exists(), "{} pruned while held", lock.display());
         }
         drop(guards);
-        assert_eq!(prune_locks(&fx.cache), held.len());
+        prune_locks(&fx.cache);
         assert_eq!(std::fs::read_dir(locks_dir(&fx.cache)).unwrap().count(), 0);
-        assert_eq!(prune_locks(&fx.cache), 0);
-        assert_eq!(prune_locks(&fx.at("no-cache")), 0);
+        prune_locks(&fx.cache);
+        let absent = fx.at("no-cache");
+        prune_locks(&absent);
+        assert!(!absent.exists());
     }
 
     #[test]
@@ -1216,5 +1249,31 @@ mod tests {
         let taken = try_lock_exclusive(&lock, Region::Whole).unwrap().unwrap();
         assert!(still_named(&taken.file, &lock));
         assert!(try_lock_exclusive(&lock, Region::Whole).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_command_uses_the_replacement_after_pruning() {
+        let fx = Fixture::new();
+        let path = fx.cache.join("replace.lock");
+        let old = open_lock(&path).unwrap();
+        old.lock().unwrap();
+        let (said, heard) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                lock_shared(&path, Region::Whole, &fx.cache, &mut Said(said), &mut false).unwrap()
+            });
+            heard.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let replacement = open_lock(&path).unwrap();
+            old.unlock().unwrap();
+            let held = waiter.join().unwrap();
+            assert!(matches!(
+                replacement.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(held);
+            replacement.try_lock().unwrap();
+        });
     }
 }

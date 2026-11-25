@@ -6855,6 +6855,29 @@ fn oci_remote_rejects_mixed_backend_fields_and_round_trips_toml() {
 }
 
 #[test]
+fn separate_buckets_must_have_distinct_plain_names() {
+    for name in ["abc", "a.b", "artifacts-2", &"a".repeat(63)] {
+        assert!(valid_isolated_bucket(name), "{name}");
+    }
+    for name in [
+        "",
+        "ab",
+        ".abc",
+        "abc.",
+        "-abc",
+        "abc-",
+        "a..b",
+        "a_b",
+        "a@b",
+        "aBc",
+        "a/b",
+        &"a".repeat(64),
+    ] {
+        assert!(!valid_isolated_bucket(name), "{name}");
+    }
+}
+
+#[test]
 fn a_pull_request_prefix_must_stay_clear_of_the_base_prefix() {
     assert_eq!(pull_request_prefix_for("artifacts", "  ").unwrap(), None);
     assert_eq!(

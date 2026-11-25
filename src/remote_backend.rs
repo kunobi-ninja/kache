@@ -1390,7 +1390,6 @@ pub async fn create_backend_for(
     {
         let pr = S3RemoteConfig {
             bucket: bucket.clone(),
-            pull_request_bucket: None,
             ..base.clone()
         };
         let keys = pull_request_s3_keys(

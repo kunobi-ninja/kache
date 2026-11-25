@@ -174,6 +174,7 @@ pub async fn build_prefetch_plan_with_identity(
 fn without_local_only_runs(mut plan: PrefetchPlan) -> PrefetchPlan {
     plan.candidates.retain(|candidate| {
         candidate.crate_name != crate::build_script::CRATE_NAME
+            && !crate::build_script::image::reserved(&candidate.crate_name)
             && !kache_format::is_checkout_key(&candidate.cache_key)
     });
     plan
@@ -352,6 +353,7 @@ mod tests {
             candidates: vec![
                 candidate("serde", "k-serde"),
                 candidate(crate::build_script::CRATE_NAME, "k-run"),
+                candidate("kache.build-script.v1.image.native_sys", "k-image"),
                 candidate("foo", &format!("checkout-{}", "c".repeat(64))),
                 candidate("tokio", "k-tokio"),
             ],
@@ -547,6 +549,7 @@ mod tests {
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
+            build_script_image: None,
             build_script_omit_cargo_source_dir_mtime: false,
             build_script_out_dir_max_size:
                 kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,

@@ -2639,6 +2639,42 @@ fn a_pending_entry_evicted_between_a_lookups_two_reads_is_verified() {
     );
 }
 
+#[test]
+fn failed_imported_declarations_roll_back_the_entry_and_its_blob_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let key = "b".repeat(64);
+    write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+    store.db.execute_batch("CREATE TRIGGER fail_prediction BEFORE INSERT ON input_predictions BEGIN SELECT RAISE(ABORT, 'controlled rollback'); END;").unwrap();
+    let prediction = ImportedPrediction {
+        identity: "image-fixture",
+        schema: 1,
+        crate_name: "test",
+        json: "{}",
+    };
+    assert!(
+        store
+            .import_restored_entry_with_prediction(&key, Some(&prediction))
+            .is_err()
+    );
+    assert!(!store.contains(&key));
+    assert!(!store.entry_dir(&key).exists());
+    assert!(
+        store
+            .file_hash_cache()
+            .get_input_prediction("image-fixture")
+            .unwrap()
+            .is_none()
+    );
+    let refs: i64 = store
+        .db
+        .query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(refs, 0);
+}
+
 /// Deferred durability covers downloaded entries too: both import paths
 /// leave the entry pending, so a hit verifies its bytes until the flush.
 /// With the feature off, an import is durable at once.

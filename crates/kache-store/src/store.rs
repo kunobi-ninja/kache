@@ -13,6 +13,32 @@ use std::time::Duration;
 
 use crate::config::{Config, IndexMode};
 
+/// Declarations bundled with a remote entry. Conflicting observations leave
+/// this remote identity unusable without overwriting local declarations.
+pub struct ImportedPrediction<'a> {
+    pub identity: &'a str,
+    pub schema: u32,
+    pub crate_name: &'a str,
+    pub json: &'a str,
+}
+
+impl ImportedPrediction<'_> {
+    fn record(&self, tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        let cache = crate::file_hash::FileHashCache::Borrowed(tx);
+        let value = match cache.get_input_prediction(self.identity)? {
+            Some((schema, old)) if schema == self.schema => {
+                if old == self.json || old == "null" {
+                    return Ok(());
+                }
+                "null"
+            }
+            _ => self.json,
+        };
+        cache.put_input_prediction(self.identity, self.schema, Some(self.crate_name), value)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StorePutResult {
     pub output_blobs: u32,
@@ -2972,6 +2998,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
+    pub fn record_imported_prediction(&self, prediction: &ImportedPrediction<'_>) -> Result<()> {
+        self.refuse_write("import an input prediction")?;
+        let tx = self.begin_immediate_writer()?;
+        prediction.record(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Check if a committed entry exists for this cache key.
     pub fn contains(&self, cache_key: &str) -> bool {
         let entry_dir = self.entry_dir(cache_key);
@@ -3566,6 +3600,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Strict stores verify and flush before success. A failed flush leaves
     /// committed entries pending for retry rather than certifying their bytes.
     pub fn import_downloaded_entry(&self, cache_key: &str) -> Result<()> {
+        self.import_downloaded_entry_with_prediction(cache_key, None)
+    }
+
+    fn import_downloaded_entry_with_prediction(
+        &self,
+        cache_key: &str,
+        prediction: Option<&ImportedPrediction<'_>>,
+    ) -> Result<()> {
         self.refuse_write("import an entry")?;
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -3671,6 +3713,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, unixepoch(), 1, ?11)",
             params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema, false, meta.rustc_version],
         )?;
+        if let Some(prediction) = prediction {
+            prediction.record(&tx)?;
+        }
         tx.commit()?;
 
         // Remove downloaded duplicates whose content-addressed inode already
@@ -3695,8 +3740,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// serialized with Store publishers and preserves any committed generation
     /// that won the race.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
+        self.import_restored_entry_with_prediction(cache_key, None)
+    }
+
+    /// Commit the imported entry and its declared inputs in one transaction.
+    pub fn import_restored_entry_with_prediction(
+        &self,
+        cache_key: &str,
+        prediction: Option<&ImportedPrediction<'_>>,
+    ) -> Result<()> {
         self.refuse_write("import an entry")?;
-        match self.import_downloaded_entry(cache_key) {
+        match self.import_downloaded_entry_with_prediction(cache_key, prediction) {
             Ok(()) => Ok(()),
             Err(import_error) => match self.discard_uncommitted_restored_entry(cache_key) {
                 Ok(()) => Err(import_error),

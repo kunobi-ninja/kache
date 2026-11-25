@@ -1838,6 +1838,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,

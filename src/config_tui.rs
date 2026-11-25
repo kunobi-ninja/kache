@@ -2199,6 +2199,7 @@ mod tests {
                 target_liveness: None,
                 seed_new_targets: None,
                 build_script_hermetic: None,
+                build_script_image: None,
                 build_script_omit_cargo_source_dir_mtime: None,
                 build_script_out_dir_max_size: None,
                 gc_evict_shared: Some(true),

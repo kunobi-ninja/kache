@@ -18,6 +18,8 @@ struct Metadata {
 
 #[derive(Deserialize)]
 struct Package {
+    #[serde(default)]
+    name: String,
     id: String,
     targets: Vec<Target>,
 }
@@ -68,27 +70,42 @@ fn metadata(manifest: &Path, dependencies: bool) -> Result<Metadata> {
     serde_json::from_slice(&output.stdout).context("parsing cargo metadata")
 }
 
-pub(super) fn resolve(manifest_path: Option<&str>, filtered_pull: bool) -> Result<Scope> {
+pub(super) fn resolve(
+    manifest_path: Option<&str>,
+    filtered_pull: bool,
+    image: Option<&str>,
+) -> Result<Scope> {
     let cwd = std::env::current_dir().context("finding current directory for sync")?;
-    resolve_at(manifest_path, &cwd, filtered_pull, metadata)
+    resolve_at(manifest_path, &cwd, filtered_pull, image, metadata)
 }
 
 fn resolve_at(
     manifest_path: Option<&str>,
     cwd: &Path,
     filtered_pull: bool,
+    image: Option<&str>,
     read_metadata: impl Fn(&Path, bool) -> Result<Metadata>,
 ) -> Result<Scope> {
+    let add_image_names = |names: &mut HashSet<String>| {
+        if let Some(image) = image {
+            let qualified = names
+                .iter()
+                .map(|name| crate::build_script::image::package_namespace(image, name))
+                .collect::<Vec<_>>();
+            names.extend(qualified);
+        }
+    };
     let manifest = manifest_path
         .map(PathBuf::from)
         .or_else(|| manifest_in_ancestors(cwd));
     let Some(manifest) = manifest else {
-        let pull = if filtered_pull {
+        let mut pull = if filtered_pull || image.is_some() {
             super::parse_cargo_lock_crate_names_from(&cwd.join("Cargo.lock"))
         } else {
             None
         };
-        if pull.is_some() {
+        if let Some(names) = &mut pull {
+            add_image_names(names);
             eprintln!(
                 "warning: Cargo.lock without Cargo.toml cannot resolve renamed library targets; \
                  using normalized package names. Use `kache sync --pull --all` for every remote crate."
@@ -104,14 +121,26 @@ fn resolve_at(
     // must not turn a workspace-scoped push into an upload of the whole store.
     let workspace = read_metadata(&manifest, false)
         .with_context(|| format!("resolving sync workspace from {}", manifest.display()))?;
-    let workspace_names = workspace.crate_names(true);
-    let mut pull = if filtered_pull {
+    let mut workspace_names = workspace.crate_names(true);
+    if let Some(image) = image {
+        workspace_names.extend(
+            workspace
+                .packages
+                .iter()
+                .filter(|p| workspace.workspace_members.contains(&p.id))
+                .map(|p| crate::build_script::image::package_namespace(image, &p.name)),
+        );
+    }
+    let mut pull = if filtered_pull || image.is_some() {
         super::parse_cargo_lock_crate_names_from(&workspace.workspace_root.join("Cargo.lock"))
     } else {
         None
     };
     if let Some(names) = &mut pull {
+        add_image_names(names);
         names.extend(workspace_names.iter().cloned());
+    }
+    if filtered_pull && let Some(names) = &mut pull {
         match read_metadata(&manifest, true) {
             Ok(resolved) => names.extend(resolved.crate_names(false)),
             Err(error) => eprintln!(
@@ -137,6 +166,7 @@ mod tests {
             workspace_root: root.to_owned(),
             workspace_members: HashSet::from(["member".into()]),
             packages: vec![Package {
+                name: "member".into(),
                 id: "member".into(),
                 targets: vec![Target {
                     name: "custom_member".into(),
@@ -152,12 +182,18 @@ mod tests {
         let lock = root.path().join("Cargo.lock");
         let contents = "version = 3\n[[package]]\nname = \"dash-package\"\nversion = \"1.0.0\"\n";
         std::fs::write(&lock, contents).unwrap();
-        let scope = resolve_at(Some("Cargo.toml"), root.path(), true, |_, dependencies| {
-            if dependencies {
-                anyhow::bail!("offline source unavailable");
-            }
-            Ok(workspace(root.path()))
-        })
+        let scope = resolve_at(
+            Some("Cargo.toml"),
+            root.path(),
+            true,
+            None,
+            |_, dependencies| {
+                if dependencies {
+                    anyhow::bail!("offline source unavailable");
+                }
+                Ok(workspace(root.path()))
+            },
+        )
         .unwrap();
         assert_eq!(
             scope.workspace.unwrap(),
@@ -178,6 +214,7 @@ mod tests {
                 Some("Cargo.toml"),
                 root.path(),
                 filtered,
+                None,
                 |_, dependencies| {
                     assert!(
                         !dependencies,
@@ -198,16 +235,26 @@ mod tests {
             "version = 3\npackage = []\n",
         )
         .unwrap();
-        let scope = resolve_at(Some("Cargo.toml"), root.path(), false, |_, dependencies| {
-            assert!(!dependencies);
-            Ok(workspace(root.path()))
-        })
+        let scope = resolve_at(
+            Some("Cargo.toml"),
+            root.path(),
+            false,
+            None,
+            |_, dependencies| {
+                assert!(!dependencies);
+                Ok(workspace(root.path()))
+            },
+        )
         .unwrap();
         assert!(scope.pull.is_none());
         assert!(
-            resolve_at(Some("Cargo.toml"), root.path(), true, |_, _| anyhow::bail!(
-                "bad manifest"
-            ))
+            resolve_at(
+                Some("Cargo.toml"),
+                root.path(),
+                true,
+                None,
+                |_, _| anyhow::bail!("bad manifest")
+            )
             .is_err()
         );
     }
@@ -220,19 +267,26 @@ mod tests {
             "version = 3\n[[package]]\nname = \"optional-package\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
-        let scope = resolve_at(Some("Cargo.toml"), root.path(), true, |_, dependencies| {
-            let mut result = workspace(root.path());
-            if dependencies {
-                result.packages.push(Package {
-                    id: "external".into(),
-                    targets: vec![Target {
-                        name: "renamed_dependency".into(),
-                        kind: vec!["lib".into()],
-                    }],
-                });
-            }
-            Ok(result)
-        })
+        let scope = resolve_at(
+            Some("Cargo.toml"),
+            root.path(),
+            true,
+            None,
+            |_, dependencies| {
+                let mut result = workspace(root.path());
+                if dependencies {
+                    result.packages.push(Package {
+                        name: "dependency".into(),
+                        id: "external".into(),
+                        targets: vec![Target {
+                            name: "renamed_dependency".into(),
+                            kind: vec!["lib".into()],
+                        }],
+                    });
+                }
+                Ok(result)
+            },
+        )
         .unwrap();
         assert_eq!(
             scope.workspace.unwrap(),
@@ -249,6 +303,42 @@ mod tests {
     }
 
     #[test]
+    fn image_scopes_keep_unrelated_projects_out_of_push_and_pull() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.lock"),
+            "version=3\n[[package]]\nname='native-sys'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        let image = format!("sha256:{}", "a".repeat(64));
+        let package = |name: &str| crate::build_script::image::package_namespace(&image, name);
+        let scope = resolve_at(
+            Some("Cargo.toml"),
+            root.path(),
+            false,
+            Some(&image),
+            |_, deps| {
+                assert!(!deps, "a push must not fetch dependencies");
+                Ok(workspace(root.path()))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            scope.workspace.unwrap(),
+            HashSet::from(["custom_member".into(), package("member")])
+        );
+        assert_eq!(
+            scope.pull.unwrap(),
+            HashSet::from([
+                "custom_member".into(),
+                "native_sys".into(),
+                package("native-sys"),
+                package("member")
+            ])
+        );
+    }
+
+    #[test]
     fn standalone_lockfile_filters_only_default_pulls_without_running_cargo() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -257,7 +347,7 @@ mod tests {
         )
         .unwrap();
         for filtered in [false, true] {
-            let scope = resolve_at(None, root.path(), filtered, |_, _| {
+            let scope = resolve_at(None, root.path(), filtered, None, |_, _| {
                 panic!("a lockfile without a manifest must not invoke Cargo")
             })
             .unwrap();
@@ -268,7 +358,10 @@ mod tests {
             );
         }
         std::fs::remove_file(root.path().join("Cargo.lock")).unwrap();
-        let scope = resolve_at(None, root.path(), true, |_, _| panic!("no Cargo project")).unwrap();
+        let scope = resolve_at(None, root.path(), true, None, |_, _| {
+            panic!("no Cargo project")
+        })
+        .unwrap();
         assert!(scope.workspace.is_none());
         assert!(scope.pull.is_none());
     }

@@ -9040,7 +9040,11 @@ pub fn sync(
             pull: None,
         }
     } else {
-        sync_scope::resolve(manifest_path, !pull_all && !pull_workspace && !push_only)?
+        sync_scope::resolve(
+            manifest_path,
+            !pull_all && !pull_workspace && !push_only,
+            config.build_script_image.as_deref(),
+        )?
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -9185,6 +9189,17 @@ async fn sync_with_client(
     // LIST per crate). `--workspace` narrows that to workspace members only;
     // otherwise it's the Cargo.lock dep set; `--all` (or no filter) lists the
     // whole bucket.
+    let image_namespace = config
+        .build_script_image
+        .as_deref()
+        .map(crate::build_script::image::namespace);
+    let allowed = |name: &str| {
+        name != crate::build_script::CRATE_NAME
+            && (!crate::build_script::image::reserved(name)
+                || image_namespace
+                    .as_deref()
+                    .is_some_and(|prefix| name.starts_with(prefix)))
+    };
     let s3_keys = if !push_only {
         if pull_workspace {
             // `--workspace` must resolve to a non-empty workspace set. If cargo
@@ -9246,7 +9261,7 @@ async fn sync_with_client(
     let to_pull: Vec<(String, String)> = if !push_only {
         s3_keys
             .iter()
-            .filter(|(k, _)| !store.contains(k))
+            .filter(|(key, name)| allowed(name) && !store.contains(key))
             .map(|(k, cn)| (k.clone(), cn.clone()))
             .collect()
     } else {
@@ -9259,13 +9274,13 @@ async fn sync_with_client(
         local_entries
             .iter()
             // Host probes and outputs that name this checkout stay local.
-            .filter(|e| {
-                e.crate_name != crate::build_script::CRATE_NAME
-                    && !kache_format::is_checkout_key(&e.cache_key)
-            })
+            .filter(|e| allowed(&e.crate_name) && !kache_format::is_checkout_key(&e.cache_key))
             .filter(|e| {
                 if let Some(ws) = workspace_crates {
                     ws.contains(&e.crate_name)
+                        || (crate::build_script::image::reserved(&e.crate_name)
+                            && !pull_workspace
+                            && lock_crates.is_some_and(|packages| packages.contains(&e.crate_name)))
                 } else {
                     true
                 }
@@ -9351,7 +9366,16 @@ async fn sync_with_client(
                         // INSERT OR REPLACE is idempotent if daemon also imported.
                         let mut imported = false;
                         match Store::open(&cfg) {
-                            Ok(s) => match s.import_restored_entry(&key) {
+                            Ok(s) => match if crate::build_script::image::reserved(&crate_name) {
+                                cfg.build_script_image
+                                    .as_deref()
+                                    .context("missing build-script image")
+                                    .and_then(|image| {
+                                        crate::build_script::image::import(&s, &key, image)
+                                    })
+                            } else {
+                                s.import_restored_entry(&key)
+                            } {
                                 Ok(_) => {
                                     imported = true;
                                 }

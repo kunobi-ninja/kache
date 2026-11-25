@@ -387,6 +387,7 @@ fn fold_declared_env(
 pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     fold(&mut hasher, "kind", b"kache-build-script-hermetic-v4");
+    super::image::fold_image(&mut hasher, run.config.build_script_image.as_deref());
     fold(
         &mut hasher,
         "key_version",

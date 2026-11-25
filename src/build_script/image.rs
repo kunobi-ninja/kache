@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const PREFIX: &str = "kache.build-script.v1.";
 const DESCRIPTOR: &str = "image-run-v1.json";
 const MAX_DESCRIPTOR: u64 = 4 << 20;
+const MAX_ENTRY_META: u64 = 16 << 20;
 
 pub(crate) fn namespace(image: &str) -> String {
     format!("{PREFIX}{}.", image.trim_start_matches("sha256:"))
@@ -253,10 +254,10 @@ pub(super) fn encode(
         prediction: prediction.clone(),
         outputs,
     };
-    let bytes = serde_json::to_vec(&d)?;
-    if bytes.len() as u64 > MAX_DESCRIPTOR
-        || serde_json::to_vec(manifest)?.len() as u64 > MAX_DESCRIPTOR
-    {
+    let Some(bytes) = transport_json(&d)? else {
+        return Ok(None);
+    };
+    if transport_json(manifest)?.is_none() {
         return Ok(None);
     }
     let path = staging.join(DESCRIPTOR);
@@ -268,12 +269,27 @@ pub(super) fn encode(
     Ok(Some(package_namespace(image, &package)))
 }
 
+fn transport_json(value: &impl serde::Serialize) -> Result<Option<Vec<u8>>> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok((bytes.len() as u64 <= MAX_DESCRIPTOR).then_some(bytes))
+}
+
+fn read_bounded(reader: impl std::io::Read, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "image run metadata is too large"
+    );
+    Ok(bytes)
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(
     store: &Store,
     meta: &EntryMeta,
     name: &str,
 ) -> Result<T> {
-    use std::io::Read as _;
     let file = meta
         .files
         .iter()
@@ -285,7 +301,6 @@ fn read_json<T: serde::de::DeserializeOwned>(
             && kache_format::is_valid_cache_key(&meta.cache_key),
         "invalid image run metadata"
     );
-    let mut bytes = Vec::new();
     // A downloaded artifact stays beside meta.json until Store commits it.
     let source = match std::fs::File::open(store.blob_path(&file.hash)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -293,7 +308,7 @@ fn read_json<T: serde::de::DeserializeOwned>(
         }
         other => other?,
     };
-    source.take(MAX_DESCRIPTOR + 1).read_to_end(&mut bytes)?;
+    let bytes = read_bounded(source, file.size)?;
     ensure!(
         bytes.len() as u64 == file.size && blake3::hash(&bytes).to_hex().as_str() == file.hash,
         "invalid image run metadata size or checksum"
@@ -348,16 +363,11 @@ fn decode(
 /// A fresh runner must know the script's declared inputs before its first
 /// lookup. Sync installs these rows only inside this image's prediction slot.
 pub(crate) fn import(store: &Store, key: &str, image: &str) -> Result<()> {
-    use std::io::Read as _;
     let decoded = (|| -> Result<Descriptor> {
-        let mut bytes = Vec::new();
-        std::fs::File::open(store.entry_dir(key).join("meta.json"))?
-            .take(MAX_DESCRIPTOR * 4 + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_DESCRIPTOR * 4,
-            "image run entry metadata is too large"
-        );
+        let bytes = read_bounded(
+            std::fs::File::open(store.entry_dir(key).join("meta.json"))?,
+            MAX_ENTRY_META,
+        )?;
         let meta: EntryMeta = serde_json::from_slice(&bytes)?;
         ensure!(meta.cache_key == key, "image run entry key mismatch");
         let (d, _, _) = decode(store, &meta, image)?;
@@ -440,6 +450,244 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_metadata_accepts_the_exact_limit_and_stops_after_the_first_extra_byte() {
+        assert_eq!((MAX_DESCRIPTOR, MAX_ENTRY_META), (4_194_304, 16_777_216));
+        assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
+        let mut source = std::io::Cursor::new(b"abcdefgh");
+        assert!(read_bounded(&mut source, 4).is_err());
+        assert_eq!(source.position(), 5);
+    }
+
+    #[test]
+    fn the_json_limit_includes_its_serialization_overhead() {
+        let mut value = "x".repeat(4_194_304 - 2);
+        assert_eq!(transport_json(&value).unwrap().unwrap().len(), 4_194_304);
+        value.push('x');
+        assert!(transport_json(&value).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_blob_open_error_does_not_fall_back_to_a_staged_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().into());
+        let store = Store::open(&config).unwrap();
+        let bytes = b"{}";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let key = "a".repeat(64);
+        let meta: EntryMeta = serde_json::from_value(serde_json::json!({
+            "cache_key": key, "crate_name":"test", "crate_types":[], "stdout":"", "stderr":"",
+            "files":[{"name": DESCRIPTOR, "size":2, "hash":hash, "executable":false}]
+        }))
+        .unwrap();
+        let staged = store.entry_dir(&key);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join(DESCRIPTOR), bytes).unwrap();
+        let blob = store.blob_path(&hash);
+        let prefix = blob.parent().unwrap();
+        std::fs::create_dir_all(prefix.parent().unwrap()).unwrap();
+        std::fs::write(prefix, b"not a directory").unwrap();
+        let err = read_json::<serde_json::Value>(&store, &meta, DESCRIPTOR).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+    }
+
+    #[test]
+    fn declaration_validation_accepts_package_roots_and_relative_paths() {
+        for spelling in ["${KACHE_MANIFEST_DIR}", "${KACHE_MANIFEST_DIR}/src", "src"] {
+            let input = if spelling == "src" {
+                "${KACHE_MANIFEST_DIR}/src"
+            } else {
+                spelling
+            };
+            let prediction = recorded_prediction(
+                vec![input.into()],
+                vec!["FLAG".into()],
+                false,
+                vec![],
+                false,
+            );
+            let mut manifest: Manifest = serde_json::from_value(serde_json::json!({
+                "version":1, "directories":[], "empty_files":[], "stderr":"",
+                "stdout":format!("cargo:rerun-if-changed={spelling}\ncargo:rerun-if-env-changed=FLAG\n")
+            })).unwrap();
+            assert!(matches_declarations(&prediction, &manifest), "{spelling}");
+            manifest
+                .stdout
+                .push_str("cargo:rerun-if-env-changed=EXTRA\n");
+            assert!(!matches_declarations(&prediction, &manifest));
+        }
+    }
+
+    #[test]
+    fn portable_names_fit_the_transport_limits() {
+        assert!(valid_package("crate-name_2"));
+        assert!(valid_package(&"a".repeat(255)));
+        for name in ["", "a.name", "a/child", &"a".repeat(256)] {
+            assert!(!valid_package(name), "{name:?}");
+        }
+        for path in ["COM", "LPT10.dll", "COMx.txt", "a b+2@x"] {
+            assert!(portable_path(path), "{path:?}");
+        }
+        assert!(portable_path(&vec!["a"; 32].join("/")));
+        assert!(!portable_path(&vec!["a"; 33].join("/")));
+        let segment = "s".repeat(255);
+        assert!(portable_path(&segment));
+        assert!(!portable_path(&"s".repeat(256)));
+        let prefix = vec![segment.as_str(); 16].join("/");
+        assert_eq!(prefix.len(), 4095);
+        assert!(portable_path(&prefix));
+        assert!(!portable_path(&format!("{prefix}/x")));
+    }
+
+    #[test]
+    fn predictions_accept_only_declared_portable_inputs_and_environment_names() {
+        let base = recorded_prediction(
+            vec![
+                "${KACHE_MANIFEST_DIR}".into(),
+                "${KACHE_MANIFEST_DIR}/src".into(),
+            ],
+            vec!["MY_FLAG-2".into()],
+            false,
+            vec![],
+            false,
+        );
+        assert!(valid_prediction(&base));
+        for bad in [
+            Prediction {
+                version: 0,
+                ..base.clone()
+            },
+            Prediction {
+                embedded_roots: None,
+                ..base.clone()
+            },
+            Prediction {
+                embedded_roots: Some(vec!["${KACHE_OUT_DIR}".into()]),
+                ..base.clone()
+            },
+            Prediction {
+                rewrites_text: true,
+                ..base.clone()
+            },
+            Prediction {
+                portable_out_dir: false,
+                ..base.clone()
+            },
+            Prediction {
+                external_link_inputs: vec!["/host/lib".into()],
+                ..base.clone()
+            },
+            Prediction {
+                inputs: vec!["/host/src".into()],
+                ..base.clone()
+            },
+            Prediction {
+                inputs: vec!["${KACHE_MANIFEST_DIR}/../src".into()],
+                ..base.clone()
+            },
+            Prediction {
+                env: vec![String::new()],
+                ..base.clone()
+            },
+            Prediction {
+                env: vec!["FLAG=VALUE".into()],
+                ..base.clone()
+            },
+            Prediction {
+                env: vec!["A".repeat(257)],
+                ..base.clone()
+            },
+        ] {
+            assert!(!valid_prediction(&bad), "{bad:?}");
+        }
+        assert!(valid_prediction(&Prediction {
+            env: vec!["A".repeat(256)],
+            ..base
+        }));
+    }
+
+    #[test]
+    fn portable_link_searches_stay_inside_the_output_tree() {
+        for allowed in [
+            "cargo:rustc-link-lib=static=zstd",
+            "cargo:rustc-link-search=${KACHE_OUT_DIR}",
+            "cargo::rustc-link-search=native=${KACHE_OUT_DIR}/lib",
+        ] {
+            assert!(portable_link_directives(allowed), "{allowed}");
+        }
+        for refused in [
+            "cargo:rustc-flags=-L../lib",
+            "cargo::rustc-cdylib-link-arg=other.o",
+            "cargo:rustc-link-arg-bin=a=other.o",
+            "cargo::rustc-link-search=/lib",
+            "cargo:rustc-link-search=native=${KACHE_OUT_DIR}/../lib",
+        ] {
+            assert!(!portable_link_directives(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_transport_manifest_describes_only_unique_regular_files_and_directories() {
+        use serde_json::json;
+        let base = json!({"version": 5, "stdout":"", "stderr":"", "directories":["dir"], "rewritten":["out/dir/data"], "empty_files":[{"name":"empty", "executable":false}]});
+        let outputs = [String::from("dir/data")];
+        let accepts = |value| regular_outputs(&serde_json::from_value(value).unwrap(), &outputs);
+        assert!(accepts(base.clone()));
+        for (field, value) in [
+            ("version", json!(0)),
+            ("version", json!(6)),
+            ("directories", json!(["../outside"])),
+            ("directories", json!(["empty"])),
+            ("directories", json!(["dir", "dir"])),
+            (
+                "empty_files",
+                json!([{"name":"dir/data", "executable":false}]),
+            ),
+            (
+                "empty_files",
+                json!([{"name":"../outside", "executable":false}]),
+            ),
+            ("rewritten", json!(["out/not-stored"])),
+            ("rewritten", json!(["dir/data"])),
+            ("rewritten", json!(["out/dir/data", "out/dir/data"])),
+            ("symlinks", json!([{"name":"link", "target":"target"}])),
+            (
+                "rooted_symlinks",
+                json!([{"name":"link", "root":"package", "suffix":"target"}]),
+            ),
+            ("outside_directories", json!(["dep"])),
+            (
+                "outside_empty_files",
+                json!([{"name":"file", "executable":false}]),
+            ),
+            (
+                "outside_symlinks",
+                json!([{"name":"link", "target":"target"}]),
+            ),
+        ] {
+            let mut manifest = base.clone();
+            manifest[field] = value;
+            assert!(!accepts(manifest), "{field}");
+        }
+    }
+
+    #[test]
+    fn the_output_limit_counts_files_empty_files_and_directories_together() {
+        let m: Manifest = serde_json::from_value(serde_json::json!({
+            "version": 1, "stdout":"", "stderr":"", "directories":["dir"],
+            "empty_files":[{"name":"empty", "executable":false}]
+        }))
+        .unwrap();
+        let mut files: Vec<_> = (0..49_998).map(|n| format!("file-{n}")).collect();
+        assert!(regular_outputs(&m, &files));
+        files.push("one-too-many".into());
+        assert!(!regular_outputs(&m, &files));
+    }
+
+    #[test]
     fn image_output_paths_have_one_portable_spelling() {
         for path in [
             "../other", "x/../y", "/tmp/a", "x\\y", "x:y", "a\nlog", "a./b", "a /b", "prn.txt",
@@ -493,6 +741,7 @@ mod tests {
             "link",
             "ordinal",
             "checksum",
+            "oversized-entry-meta",
             "valid",
         ] {
             let staged = store.entry_dir(&key);
@@ -526,7 +775,7 @@ mod tests {
                     manifest["symlinks"] = json!([{"name":"dir/link", "target":"../elsewhere"}])
                 }
                 "ordinal" => artifact = "output-01",
-                "checksum" | "valid" => (),
+                "checksum" | "oversized-entry-meta" | "valid" => (),
                 _ => unreachable!(),
             }
             let mut files = Vec::new();
@@ -544,7 +793,13 @@ mod tests {
                 files.push(json!({"name":file,"size":bytes.len(),"hash":hash,"executable":false}));
             }
             let meta = json!({"cache_key":key, "crate_name":name, "crate_types":["build-script"], "files":files,"stdout":"","stderr":""});
-            std::fs::write(staged.join("meta.json"), meta.to_string()).unwrap();
+            let mut bytes = serde_json::to_vec(&meta).unwrap();
+            match change {
+                "oversized-entry-meta" => bytes.resize(16_777_217, b' '),
+                "valid" => bytes.resize(16_777_216, b' '),
+                _ => (),
+            }
+            std::fs::write(staged.join("meta.json"), bytes).unwrap();
             let result = import(&store, &key, &image);
             if change == "valid" {
                 result.unwrap();

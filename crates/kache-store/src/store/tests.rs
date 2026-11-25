@@ -2640,6 +2640,45 @@ fn a_pending_entry_evicted_between_a_lookups_two_reads_is_verified() {
 }
 
 #[test]
+fn conflicting_imported_declarations_stay_disabled_until_the_schema_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let a = r#"["a.h"]"#;
+    let b = r#"["b.h"]"#;
+    for (digit, schema, json, expected) in [
+        (Some("1"), 1, a, a),
+        (Some("2"), 1, a, a),
+        (Some("3"), 1, b, "null"),
+        (Some("4"), 1, a, "null"),
+        (None, 2, b, b),
+    ] {
+        let prediction = ImportedPrediction {
+            identity: "image-fixture",
+            schema,
+            crate_name: "fixture",
+            json,
+        };
+        if let Some(digit) = digit {
+            let key = digit.repeat(64);
+            write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+            store
+                .import_restored_entry_with_prediction(&key, Some(&prediction))
+                .unwrap();
+        } else {
+            store.record_imported_prediction(&prediction).unwrap();
+        }
+        assert_eq!(
+            store
+                .file_hash_cache()
+                .get_input_prediction(prediction.identity)
+                .unwrap(),
+            Some((schema, expected.to_owned())),
+            "after importing entry {digit:?} with declarations {json}"
+        );
+    }
+}
+
+#[test]
 fn failed_imported_declarations_roll_back_the_entry_and_its_blob_references() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();

@@ -6062,6 +6062,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_local_image_prediction_is_available_without_sync() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (mut run, _) = two_targets(dir.as_path());
+        run.config.build_script_image = Some(format!("sha256:{}", "a".repeat(64)));
+        let p = recorded_prediction(
+            vec!["${KACHE_MANIFEST_DIR}/build.rs".into()],
+            vec![],
+            false,
+            vec![],
+            false,
+        );
+        assert!(run.prediction().unwrap().is_none());
+        run.record_prediction(&p).unwrap();
+        assert_eq!(run.prediction().unwrap(), Some(p));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_ineligible_for_image_sync_keep_their_local_artifact_names() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (mut run, _) = two_targets(dir.as_path());
+        let mut vars = EnvRestore::new();
+        run.config.build_script_image = Some(format!("sha256:{}", "a".repeat(64)));
+        for case in [
+            "package",
+            "prediction",
+            "output",
+            "declarations",
+            "large-descriptor",
+            "large-manifest",
+            "eligible",
+        ] {
+            let package = if case == "package" {
+                "bad/name"
+            } else {
+                "producer"
+            };
+            vars.set("CARGO_PKG_NAME", package.as_ref());
+            let mut p = recorded_prediction(
+                vec!["${KACHE_MANIFEST_DIR}".into()],
+                vec![],
+                true,
+                vec![],
+                false,
+            );
+            if case == "prediction" {
+                p.embedded_roots = None;
+            }
+            let mut m: Manifest = serde_json::from_value(serde_json::json!({
+                "version": if case == "output" { 0 } else { 1 },
+                "directories":[], "empty_files":[], "stderr":"",
+                "stdout": if case == "declarations" { "cargo:rerun-if-changed=input\n" } else { "" }
+            }))
+            .unwrap();
+            if case == "large-manifest" {
+                m.stderr = "x".repeat(4_194_304);
+            }
+            let staging = tempfile::tempdir().unwrap();
+            let local = (dir.as_path().join("payload"), "out/file".to_string());
+            let original = if case == "large-descriptor" {
+                let suffix = "x".repeat(220);
+                (0..20_000)
+                    .map(|i| (local.0.clone(), format!("out/file-{i}-{suffix}")))
+                    .collect()
+            } else {
+                vec![local]
+            };
+            let mut files = original.clone();
+            let namespace =
+                image::encode(&run, &"b".repeat(64), &p, &m, &mut files, staging.path()).unwrap();
+            if case == "eligible" {
+                assert_eq!(
+                    namespace,
+                    Some(image::package_namespace(
+                        run.config.build_script_image.as_deref().unwrap(),
+                        package
+                    ))
+                );
+                assert_eq!(files[0].1, "output-0");
+            } else {
+                assert!(namespace.is_none(), "{case}");
+                assert!(files == original, "{case}");
+                assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
     /// A library the script names under the target directory, beside `OUT_DIR`,
     /// is restored in the next checkout at that checkout's path. Cargo's `deps`
     /// directory and a system directory named in the same stdout are not.

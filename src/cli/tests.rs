@@ -6785,6 +6785,73 @@ async fn sync_with_client_push_uploads_local_only_entry() {
 }
 
 #[tokio::test]
+async fn sync_push_scopes_image_runs_to_the_selected_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = test_remote_cfg();
+    let mut config = save_manifest_config(dir.path().into(), Some(remote.clone()));
+    let image = format!("sha256:{}", "a".repeat(64));
+    let dependency = crate::build_script::image::package_namespace(&image, "dependency");
+    let unrelated = crate::build_script::image::package_namespace(&image, "unrelated");
+    config.build_script_image = Some(image);
+    let store = Store::open(&config).unwrap();
+    let artifact = dir.path().join("output");
+    std::fs::write(&artifact, b"content").unwrap();
+    for name in ["member", "dependency", &dependency, &unrelated] {
+        store
+            .put(
+                &sync_test_cache_key(name),
+                name,
+                &[],
+                &[],
+                "target",
+                "debug",
+                &[(artifact.clone(), "output".into())],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+    let members = std::collections::HashSet::from(["member".to_owned()]);
+    let packages = std::collections::HashSet::from(["dependency".to_owned(), dependency.clone()]);
+    for workspace_only in [false, true] {
+        let backend = TestBackend::memory();
+        sync_with_client(
+            &as_cache_remote(as_remote_backend(&backend), &remote),
+            &config,
+            &store,
+            Some(&members),
+            false,
+            false,
+            false,
+            false,
+            Some(&packages),
+            workspace_only,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut expected = vec!["member"];
+        if !workspace_only {
+            expected.push(&dependency);
+        }
+        let mut expected = expected
+            .into_iter()
+            .map(|name| {
+                format!(
+                    "prefix/v3/manifests/{name}/{}.json",
+                    sync_test_cache_key(name)
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut manifests = backend.put_calls();
+        manifests.retain(|path| path.starts_with("prefix/v3/manifests/"));
+        manifests.sort();
+        expected.sort();
+        assert_eq!(manifests, expected, "workspace_only={workspace_only}");
+    }
+}
+
+#[tokio::test]
 async fn sync_with_client_push_throttles_with_low_concurrency() {
     // Two local entries still upload when the daemon pool is 1. Sync no longer
     // uses that pool as its in-flight cap.

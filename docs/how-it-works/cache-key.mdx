@@ -322,4 +322,24 @@ KACHE_LOG=trace cargo build -p my_crate 2>&1 | grep '\[key:my_crate\]'
 
 To compare a crate's trace between two checkouts, build both with `KACHE_SEED_NEW_TARGETS=0`. [Seeding](/docs/getting-started/configuration#new-checkouts) copies registry and git units into a new or cleaned target directory, Cargo then runs no compile for them, and no key is traced.
 
+If `kache explain` identifies the `link` group, capture one compilation of the
+crate in each checkout using the same Kache version. From the first checkout:
+
+```bash
+trace_dir=$(mktemp -d)
+CARGO_TARGET_DIR="$trace_dir/target-a" KACHE_SEED_NEW_TARGETS=0 \
+  KACHE_LOG_FILE=kache::cache_key=trace KACHE_LOG_FILE_PATH="$trace_dir/first.log" \
+  cargo build -p my_crate
+```
+
+In the same shell, repeat the build in the other checkout with `target-b` and
+`second.log`. Run
+`kache key diff --link-trace my_crate "$trace_dir/first.log" "$trace_dir/second.log"`
+to see the old and new linker, SDK, library and other recorded link values.
+Repeated inputs are numbered from zero. An empty result means the recorded
+link values agree. Older wrappers recorded paths for some linker arguments
+without their content hashes. The comparison skips these paths.
+Raw traces may contain environment values and source paths.
+Keep them local and review individual differences before sharing.
+
 With `KACHE_LOG=warn`, the wrapper also logs `residual absolute path detected in ...` when a keyed value still names a home or temporary directory after normalization.

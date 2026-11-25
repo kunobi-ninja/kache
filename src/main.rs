@@ -176,11 +176,14 @@ enum KeyCommands {
         args: Vec<String>,
     },
 
-    /// Name the fields that differ between two key-input JSON documents
+    /// Compare two key-input documents or the recorded link inputs in two build traces
     Diff {
-        /// First document, from `kache key explain`
+        /// Compare one crate’s recorded link inputs in two trace files
+        #[arg(long, value_name = "CRATE")]
+        link_trace: Option<String>,
+        /// First key-input document or trace file
         file_a: PathBuf,
-        /// Second document, from `kache key explain`
+        /// Second key-input document or trace file
         file_b: PathBuf,
     },
 }
@@ -1170,7 +1173,28 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                     &mut stdout,
                 )
             }
-            KeyCommands::Diff { file_a, file_b } => {
+            KeyCommands::Diff {
+                file_a,
+                file_b,
+                link_trace: Some(crate_name),
+            } => {
+                let changed = key_inputs::link_trace::compare(
+                    &crate_name,
+                    &file_a,
+                    &file_b,
+                    json,
+                    std::io::stdout().lock(),
+                )?;
+                if changed {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            KeyCommands::Diff {
+                file_a,
+                file_b,
+                link_trace: None,
+            } => {
                 let fields = key_inputs::diff_files(&file_a, &file_b)?;
                 if json {
                     serde_json::to_writer(std::io::stdout(), &fields)?;

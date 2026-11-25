@@ -5304,6 +5304,42 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
     assert_eq!(value["dependency_chain"]["roots"][0]["crate_name"], "leaf");
 }
 
+#[test]
+fn why_miss_points_to_the_crate_whose_link_inputs_changed() {
+    let e = env();
+    write_checkout_builds(
+        &e,
+        &[
+            ("/checkouts/a", "old", "one"),
+            ("/checkouts/b", "new", "two"),
+        ],
+    );
+    let events = e.cache.join("events.jsonl");
+    let mut input = String::new();
+    for line in std::fs::read_to_string(&events).unwrap().lines() {
+        let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+        let digest = event["key_fields"]["env_deps"].clone();
+        event["key_fields"] = serde_json::json!({"link":digest});
+        input.push_str(&event.to_string());
+        input.push('\n');
+    }
+    std::fs::write(events, input).unwrap();
+    for name in ["leaf", "app"] {
+        let output = e.cmd().args(["--json", "explain", name]).output().unwrap();
+        assert!(output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let links: Vec<_> = value["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hint| hint.as_str())
+            .filter(|hint| hint.contains("--link-trace"))
+            .collect();
+        assert_eq!(links.len(), 1);
+        assert!(links[0].contains("key diff --link-trace leaf first.log second.log"));
+    }
+}
+
 /// `leaf` computes the same key in both checkouts but produces a different
 /// artifact: the cascade ends there as `path_only`, and `leaf`'s own
 /// comparison says the key is not why it missed.

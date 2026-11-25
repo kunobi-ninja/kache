@@ -11,7 +11,12 @@ pub(super) fn try_bootstrap(
     disabled: bool,
     trusted_pipeline: bool,
 ) -> Result<Option<i32>> {
-    let bootstrap = ["kache".into(), "daemon".into(), "start".into()];
+    let bootstrap = [
+        "kache".into(),
+        "daemon".into(),
+        "start".into(),
+        "--if-idle".into(),
+    ];
     if !disabled
         && let Ok(mut command) = super::engine_command(
             execution.executable,

@@ -1082,29 +1082,29 @@ fn clippy_units_hit_with_their_diagnostics() {
     )
     .unwrap();
 
+    // The assertions below use leaf's event. Other workspace members can
+    // contend for the same event log while the wrapper is reporting its hit.
+    let clippy_leaf = |phase: &str| {
+        let mut cmd = cargo(
+            "clippy",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target(&fx, phase),
+            &[],
+        );
+        cmd.args(["-p", "leaf"]);
+        cmd
+    };
     let mark = event_count(&fx.cache);
-    let cold = run(&mut cargo(
-        "clippy",
-        &fx.workspace,
-        &fx.home,
-        &fx.cache,
-        &target(&fx, "cold"),
-        &[],
-    ));
+    let cold = run(&mut clippy_leaf("cold"));
     let cold_err = String::from_utf8_lossy(&cold.stderr).into_owned();
     assert!(cold_err.contains("needless_return"), "{cold_err}");
     let events = events_since(&fx.cache, mark);
     assert_eq!(results_for(&events, "leaf"), vec!["miss"]);
 
     let mark = event_count(&fx.cache);
-    let warm = run(&mut cargo(
-        "clippy",
-        &fx.workspace,
-        &fx.home,
-        &fx.cache,
-        &target(&fx, "warm"),
-        &[],
-    ));
+    let warm = run(&mut clippy_leaf("warm"));
     let warm_err = String::from_utf8_lossy(&warm.stderr).into_owned();
     assert_eq!(
         results_for(&events_since(&fx.cache, mark), "leaf"),
@@ -1124,14 +1124,7 @@ fn clippy_units_hit_with_their_diagnostics() {
 
     // Different lint arguments are a different unit.
     let mark = event_count(&fx.cache);
-    let mut allowed = cargo(
-        "clippy",
-        &fx.workspace,
-        &fx.home,
-        &fx.cache,
-        &target(&fx, "allowed"),
-        &[],
-    );
+    let mut allowed = clippy_leaf("allowed");
     allowed.args(["--", "-A", "clippy::needless_return"]);
     let allowed = run(&mut allowed);
     assert!(!String::from_utf8_lossy(&allowed.stderr).contains("needless_return"));

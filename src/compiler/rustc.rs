@@ -147,6 +147,10 @@ impl RustcCompiler {
                     .to_string(),
             );
         }
+        outputs.loose_coff_key = outputs
+            .loose_coff_key
+            .take()
+            .map(|key| finish_key(parsed, ctx, key));
         (key.map(|key| finish_key(parsed, ctx, key)), outputs)
     }
 

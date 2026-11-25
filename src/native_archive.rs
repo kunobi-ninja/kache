@@ -468,6 +468,41 @@ const SHORT_IMPORT_SIGNATURE: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 /// unchecked nested member header. Other archive users retain their existing
 /// readers and policy. BSD and GNU64 containers stay outside this subset.
 pub(crate) fn validate_closed_windows_runtime_archive(bytes: &[u8]) -> Option<()> {
+    visit_coff_archive(bytes, validate_closed_coff_member, |_| Some(())).map(|_| ())
+}
+
+/// Digest of an MSVC archive with both linker indexes. The only bytes omitted
+/// are the twelve date bytes of each ar header. In particular, timestamps
+/// inside a COFF object, symbol tables, filenames and padding remain keyed.
+/// Only an rlib that demonstrably copied loose members may use this digest.
+pub(crate) fn loose_coff_digest(bytes: &[u8]) -> Option<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    let mut from = 0;
+    let indexes = visit_coff_archive(
+        bytes,
+        |object| {
+            let header = object.get(..20)?;
+            supported_runtime_coff_machine(u16::from_le_bytes([header[0], header[1]])).then_some(())
+        },
+        |start| {
+            parse_ar_timestamp(&bytes[start + 16..start + 28])?;
+            hasher.update(&bytes[from..start + 16]);
+            from = start + 28;
+            Some(())
+        },
+    )?;
+    if indexes != 2 {
+        return None;
+    }
+    hasher.update(&bytes[from..]);
+    Some(hasher.finalize())
+}
+
+fn visit_coff_archive(
+    bytes: &[u8],
+    validate_member: impl Fn(&[u8]) -> Option<()>,
+    mut visit_header: impl FnMut(usize) -> Option<()>,
+) -> Option<usize> {
     bytes.strip_prefix(AR_MAGIC)?;
     let mut pos = AR_MAGIC.len();
     let mut objects = Vec::new();
@@ -483,6 +518,7 @@ pub(crate) fn validate_closed_windows_runtime_archive(bytes: &[u8]) -> Option<()
         let start = pos.checked_add(AR_HEADER_LEN)?;
         let end = start.checked_add(size)?;
         let data = bytes.get(start..end)?;
+        visit_header(pos)?;
         if field == "//" {
             if longnames.is_some() || !objects.is_empty() {
                 return None;
@@ -511,7 +547,7 @@ pub(crate) fn validate_closed_windows_runtime_archive(bytes: &[u8]) -> Option<()
             if name.is_empty() || is_bsd_symdef(name) {
                 return None;
             }
-            validate_closed_coff_member(data)?;
+            validate_member(data)?;
             objects.push(pos);
         }
         pos = if size & 1 == 0 {
@@ -527,10 +563,11 @@ pub(crate) fn validate_closed_windows_runtime_archive(bytes: &[u8]) -> Option<()
     if objects.is_empty() {
         return None;
     }
+    let index_count = indexes.len();
     for (kind, data) in indexes {
         validate_runtime_archive_index(kind, data, &objects)?;
     }
-    Some(())
+    Some(index_count)
 }
 
 const MAX_RUNTIME_NAME_BYTES: usize = 256;
@@ -1642,6 +1679,11 @@ pub(crate) fn coff_archive_with_section_for_tests(name: &[u8], payload: &[u8]) -
     tests::raw_archive(&[("runtime.obj/", &tests::runtime_coff_object(name, payload))])
 }
 
+#[cfg(test)]
+pub(crate) fn indexed_coff_archive_for_tests(payload: &[u8]) -> Vec<u8> {
+    tests::indexed_runtime_archive(&tests::runtime_coff_object(b".debug$S", payload))
+}
+
 /// A BSD archive with one DWARF-bearing Mach-O member, for `cache_key` tests.
 #[cfg(test)]
 pub(crate) fn dwarf_bsd_archive_for_tests(payload: &[u8]) -> Vec<u8> {
@@ -1728,7 +1770,7 @@ mod tests {
 
     /// Real COFF linker-index layouts, including both `/` members and a
     /// NUL-terminated long-name table. No compiler or linker is needed.
-    fn indexed_runtime_archive(object: &[u8]) -> Vec<u8> {
+    pub(super) fn indexed_runtime_archive(object: &[u8]) -> Vec<u8> {
         let symbol = b"runtime_symbol\0";
         let mut first = 1_u32.to_be_bytes().to_vec();
         first.extend_from_slice(&0_u32.to_be_bytes());
@@ -1746,6 +1788,40 @@ mod tests {
         first[4..8].copy_from_slice(&u32::try_from(offset).unwrap().to_be_bytes());
         second[4..8].copy_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
         raw_archive(&[("/", &first), ("/", &second), ("//", names), ("/0", object)])
+    }
+
+    #[test]
+    fn loose_coff_ignores_only_member_dates_in_a_recognized_microsoft_library() {
+        let object = runtime_coff_object(b".debug$S", b"CodeView-data");
+        let original = indexed_runtime_archive(&object);
+        let digest = loose_coff_digest(&original).unwrap();
+        let mut next = original.clone();
+        let mut pos = AR_MAGIC.len();
+        while pos < next.len() {
+            let len = parse_ar_decimal(&next[pos + 48..pos + 58]).unwrap();
+            next[pos + 16..pos + 28].copy_from_slice(b"1732133600  ");
+            pos += AR_HEADER_LEN + len + (len & 1);
+        }
+        assert_ne!(original, next);
+        assert_eq!(loose_coff_digest(&next), Some(digest));
+        for needle in [
+            b"CodeView-data".as_slice(),
+            b"runtime_symbol",
+            b"long_runtime_member_name",
+        ] {
+            let mut changed = next.clone();
+            let pos = changed
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap();
+            changed[pos] ^= 32;
+            assert_ne!(loose_coff_digest(&changed), Some(digest));
+        }
+        next[AR_MAGIC.len() + 16] = b'x';
+        assert!(loose_coff_digest(&next).is_none());
+        assert!(loose_coff_digest(&raw_archive(&[("x.obj/", &object)])).is_none());
+        assert!(loose_coff_digest(&indexed_runtime_archive(&[0; 32])).is_none());
+        assert!(loose_coff_digest(&indexed_runtime_archive(&object[..2])).is_none());
     }
 
     #[test]

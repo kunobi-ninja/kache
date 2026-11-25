@@ -256,9 +256,11 @@ Crates that trybuild builds under `target/tests/trybuild/` get the same treatmen
 An explicit `-L native=` directory inside a unit's own `OUT_DIR` can share an
 `rlib` key across target directory and profile names. Kache retains its path
 below the profile directory and hashes the native archives, including their member names,
-timestamps and contents. When rustc bundles a regular archive whose members
-Kache cannot interpret (such as an MSVC library or LLVM bitcode), the rlib
-key includes the archive name and exact bytes. Direct links retain the
+timestamps and contents. When rustc unpacks a Microsoft COFF library into an
+rlib, Kache can reuse it after only the archive member dates change. It checks
+that the rlib contains the individual objects and keys their exact bytes,
+including debug paths. Libraries packed whole and unrecognized archive
+formats retain their names and exact bytes in the rlib key. Direct links retain the
 archive path in this case. This applies only when Rust path normalization is on,
 the search path and `OUT_DIR` are absolute, and the resolved search directory
 stays inside that `OUT_DIR`. Native links, test binaries, `staticlib` outputs,

@@ -1725,6 +1725,203 @@ fn main() {
     }
 }
 
+#[cfg(unix)]
+fn macro_consumer_fixture() -> Fixture {
+    fixture_from(|root| {
+        let write = |file: &str, contents: &str| {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nfacade={path='facade'}\n",
+        );
+        write(
+            "facade/Cargo.toml",
+            "[package]\nname='facade'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nasset={path='../asset'}\n",
+        );
+        write("facade/src/lib.rs", "pub use asset::asset;");
+        write(
+            "asset/Cargo.toml",
+            "[package]\nname='asset'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+        );
+        write(
+            "asset/src/lib.rs",
+            r#"use proc_macro::TokenStream;
+#[proc_macro]
+pub fn asset(input: TokenStream) -> TokenStream {
+    if input.to_string() == "idle" {
+        return format!("{:?}", "idle").parse().unwrap();
+    }
+    let dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let value = std::fs::read_to_string(dir.join("seed")).unwrap();
+    let file = dir.join("nested/expanded");
+    if let Err(error) = std::fs::write(&file, value) {
+        if input.to_string() == "catch" && error.kind() == std::io::ErrorKind::PermissionDenied {
+            return format!("{:?}", "silently stale").parse().unwrap();
+        }
+        panic!("{error}");
+    }
+    format!("include_str!({:?})", file).parse().unwrap()
+}
+"#,
+        );
+        write(
+            "build.rs",
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("seed"), "generated").unwrap();
+}
+"#,
+        );
+        write(
+            "src/main.rs",
+            r#"fn main() { print!("{}", facade::asset!()); }"#,
+        );
+    })
+}
+
+/// Expansion runs after the build script; both phases need the same writable OUT_DIR.
+#[cfg(unix)]
+#[test]
+fn a_macro_can_update_its_consumers_out_dir_after_build_script_reuse() {
+    let fx = macro_consumer_fixture();
+    let hermetic_config = write_hermetic_config(&fx.cache);
+    let hermetic = [("KACHE_CONFIG", hermetic_config.as_str())];
+    let first = target(&fx, "one");
+    let second = target(&fx, "two");
+    for (round, dir) in [&first, &first, &second].into_iter().enumerate() {
+        if round == 1 {
+            run(&mut cargo(
+                "clean",
+                &fx.workspace,
+                &fx.home,
+                &fx.cache,
+                dir,
+                &hermetic,
+            ));
+        }
+        let output = run(&mut cargo(
+            "run",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            dir,
+            &hermetic,
+        ));
+        assert_eq!(output.stdout, b"generated");
+        let expanded = walkdir(&dir.join("debug/build"))
+            .into_iter()
+            .find(|path| path.ends_with("out/nested/expanded"))
+            .expect("the macro's side effect exists in this target");
+        assert_eq!(std::fs::read(expanded).unwrap(), b"generated");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reexported_macro_can_start_writing_after_its_implementation_changes() {
+    let fx = macro_consumer_fixture();
+    let config = write_hermetic_config(&fx.cache);
+    let path = target(&fx, "same-target");
+    let run_target = || {
+        run(&mut cargo(
+            "run",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &path,
+            &[("KACHE_CONFIG", &config)],
+        ))
+    };
+    std::fs::write(
+        fx.workspace.join("src/main.rs"),
+        r#"fn main() { print!("{}", facade::asset!(idle)); }"#,
+    )
+    .unwrap();
+    assert_eq!(run_target().stdout, b"idle");
+    let source = fx.workspace.join("asset/src/lib.rs");
+    let script = std::fs::read_to_string(&source).unwrap();
+    std::fs::write(&source, script.replace(r#"== "idle""#, r#"== "unused""#)).unwrap();
+    assert_eq!(run_target().stdout, b"generated");
+    assert!(
+        walkdir(&path.join("debug/build"))
+            .iter()
+            .any(|p| p.ends_with("out/nested/expanded"))
+    );
+}
+
+/// Older stores have sealed runs but no evidence that the consumer tolerates them.
+#[cfg(unix)]
+#[test]
+fn upgrading_a_sealed_run_preserves_a_consumers_writable_outputs() {
+    let fx = macro_consumer_fixture();
+    let config = write_hermetic_config(&fx.cache);
+    let hermetic = [("KACHE_CONFIG", config.as_str())];
+    let command =
+        |verb: &str, path: &Path| cargo(verb, &fx.workspace, &fx.home, &fx.cache, path, &hermetic);
+    let main = fx.workspace.join("src/main.rs");
+    let change_macro = |mode: &str| {
+        std::fs::write(
+            &main,
+            format!("fn main() {{ print!(\"{{}}\", facade::asset!({mode})); }}"),
+        )
+        .unwrap();
+    };
+    let existing = target(&fx, "existing");
+    change_macro("idle");
+    assert_eq!(
+        run(&mut command("run", &target(&fx, "first"))).stdout,
+        b"idle"
+    );
+    // Reproduce an older learner that considered the idle macro read-only.
+    // The build script will create a genuine sealed run in the next target.
+    let markers = fx.cache.join("out-dirs/writable-consumers");
+    let marker = std::fs::read_dir(&markers)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("consumer-")
+        })
+        .unwrap();
+    std::fs::rename(&marker, marker.with_extension("observed")).unwrap();
+    let old_observation = command("run", &existing).output().unwrap();
+    assert!(
+        !old_observation.status.success(),
+        "a previous read-only observation cannot authorize a macro"
+    );
+    assert!(String::from_utf8_lossy(&old_observation.stderr).contains("cargo clean -p consumer"));
+    let out = walkdir(&existing.join("debug/build"))
+        .into_iter()
+        .find(|dir| dir.is_symlink() && dir.join("seed").is_file())
+        .expect("a genuine sealed run in the target");
+    let sealed = out.canonicalize().unwrap();
+    std::fs::remove_dir_all(&markers).unwrap();
+    change_macro("catch");
+    let stopped = command("run", &existing).output().unwrap();
+    assert!(!stopped.status.success());
+    assert!(String::from_utf8_lossy(&stopped.stderr).contains("cargo clean -p consumer"));
+    assert!(!sealed.join("nested/expanded").exists());
+    run(command("clean", &existing).args(["-p", "consumer"]));
+    assert_eq!(run(&mut command("run", &existing)).stdout, b"generated");
+    assert!(!out.is_symlink());
+    // A fresh target and an old store recover in the same Cargo invocation.
+    std::fs::remove_dir_all(&markers).unwrap();
+    assert_eq!(
+        run(&mut command("run", &target(&fx, "fresh"))).stdout,
+        b"generated"
+    );
+    assert_eq!(std::fs::read(sealed.join("seed")).unwrap(), b"generated");
+    assert!(!sealed.join("nested/expanded").exists());
+}
+
 /// A build script that derives values from its `OUT_DIR` path (its length, a
 /// sum of its bytes) leaves no path in its outputs, so only a hermetic run can
 /// share it: the script sees the same `OUT_DIR` in every target directory,
@@ -1740,8 +1937,13 @@ fn hermetic_runs_keep_values_derived_from_out_dir_consistent() {
         };
         write(
             "Cargo.toml",
-            "[package]\nname = \"derives\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"derives\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nleaf={path='leaf'}\n",
         );
+        write(
+            "leaf/Cargo.toml",
+            "[package]\nname='leaf'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write("leaf/src/lib.rs", "pub fn answer() -> u8 { 42 }");
         write(
             "build.rs",
             r#"fn main() {
@@ -1765,6 +1967,7 @@ fn main() {
     let sum: u64 = DIR.bytes().map(u64::from).sum();
     assert_eq!(seen, cargo, "the script's OUT_DIR is where Cargo's resolves");
     assert_eq!((LEN, SUM), (DIR.len(), sum), "values derived from the OUT_DIR the script saw");
+    assert_eq!(leaf::answer(), 42);
     println!("consistent");
 }
 "#,

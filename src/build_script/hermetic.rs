@@ -223,6 +223,76 @@ fn not_to_attempt(sandbox: &Sandbox) -> bool {
     sandbox.refused_path().exists() || sandbox.root.join(SEALED).exists()
 }
 
+/// A compiler can write extra outputs after its package's build script exits.
+/// Remember that property by Cargo unit across cleans and target directories.
+/// Keep the marker outside the sealed tree so it never changes cached outputs.
+pub(crate) struct ConsumerOutDir {
+    out: PathBuf,
+    marker: PathBuf,
+}
+
+impl ConsumerOutDir {
+    fn new(cache: &Path, out: &Path, package: &str) -> Option<Self> {
+        let unit = crate::cargo_layout::out_dir_unit_name(out, package)?;
+        Some(Self {
+            out: out.to_owned(),
+            marker: cache.join("out-dirs/writable-consumers").join(unit),
+        })
+    }
+
+    pub(crate) fn for_compile(
+        config: &crate::config::Config,
+        env: &crate::invocation::InvocationEnv,
+    ) -> Option<Self> {
+        Self::new(
+            &env.resolve(&config.cache_dir)?,
+            &env.resolve(Path::new(&env.var_os("OUT_DIR")?))?,
+            &env.var("CARGO_PKG_NAME").ok()?,
+        )
+    }
+
+    pub(crate) fn needs_writable(&self) -> bool {
+        self.marker.is_file()
+    }
+
+    pub(crate) fn observed_readonly(&self) -> bool {
+        self.marker.with_extension("observed").is_file()
+    }
+
+    pub(crate) fn sealed(&self) -> bool {
+        std::fs::read_link(&self.out).is_ok_and(|target| in_sealed_out_dir(&target))
+    }
+
+    fn record(&self, writable: bool) -> std::io::Result<()> {
+        let parent = self.marker.parent().expect("consumer marker has a parent");
+        crate::out_dir_alias::create_private_dir_all(parent)?;
+        let marker = if writable {
+            self.marker.clone()
+        } else {
+            self.marker.with_extension("observed")
+        };
+        match std::fs::File::create_new(&marker) {
+            Ok(_) => Ok(()),
+            Err(_) if marker.is_file() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn require_writable(&self) {
+        let _ = self.record(true);
+    }
+
+    pub(crate) fn record_plain(&self) {
+        if !self.observed_readonly() {
+            let _ = self.record(false);
+        }
+    }
+
+    pub(crate) fn note_sealed_write_failure(&self) -> bool {
+        self.sealed() && self.record(true).is_ok()
+    }
+}
+
 /// Run or restore hermetically. `None` when this run cannot be hermetic
 /// (a root user, an `OUT_DIR` outside Cargo's layout) or the attempt could
 /// not be sealed: the caller then runs the script as usual.
@@ -241,6 +311,13 @@ pub(super) fn run(
         return Ok(None);
     }
     let cargo_out_dir = &run.environment.out_dir;
+    if let Some(consumer) = std::env::var("CARGO_PKG_NAME")
+        .ok()
+        .and_then(|package| ConsumerOutDir::new(&run.config.cache_dir, cargo_out_dir, &package))
+        && (consumer.needs_writable() || !consumer.observed_readonly())
+    {
+        return Ok(None);
+    }
     let Some(target) = target_dir_for(cargo_out_dir, run.environment.target.as_deref()) else {
         return Ok(None);
     };
@@ -910,6 +987,35 @@ pub(crate) mod test_support {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_sealed_out_dir_can_be_refused_without_modifying_its_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let below = Path::new("debug/build/app-0123456789abcdef/out");
+        let out = temp.path().join("target").join(below);
+        let other = temp.path().join("other-target").join(below);
+        let consumer = ConsumerOutDir::new(&cache, &out, "app").unwrap();
+        let other_consumer = ConsumerOutDir::new(&cache, &other, "app").unwrap();
+        assert!(ConsumerOutDir::new(&cache, &out, "unrelated").is_none());
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(!consumer.note_sealed_write_failure());
+        assert!(!other_consumer.needs_writable());
+        std::fs::remove_dir(&out).unwrap();
+        let shared = test_support::sealed_run(&cache, &"ab".repeat(32), below);
+        std::os::unix::fs::symlink(&shared, &out).unwrap();
+        let original = output_digest(&shared).unwrap();
+        assert!(consumer.note_sealed_write_failure());
+        assert!(consumer.note_sealed_write_failure());
+        assert!(other_consumer.needs_writable());
+        std::fs::remove_file(&consumer.marker).unwrap();
+        std::fs::create_dir(&consumer.marker).unwrap();
+        assert!(!consumer.note_sealed_write_failure());
+        assert!(!other_consumer.needs_writable());
+        assert_eq!(output_digest(&shared).unwrap(), original);
+        assert_eq!(std::fs::read_link(out).unwrap(), shared);
+    }
 
     #[test]
     fn hermetic_records_refuse_sibling_units_before_linking_output() {

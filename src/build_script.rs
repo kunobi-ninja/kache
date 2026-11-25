@@ -56,12 +56,14 @@ mod external;
 mod git;
 mod hermetic;
 pub(crate) mod inputs;
+pub(crate) mod macro_deps;
 mod outside;
 #[cfg(unix)]
 pub(crate) mod repair;
 mod restore;
 mod rooted_links;
 
+pub(crate) use hermetic::ConsumerOutDir;
 use rooted_links::RootedSymlink;
 
 use declarations::parse_declarations;

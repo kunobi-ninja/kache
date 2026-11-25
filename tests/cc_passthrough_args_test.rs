@@ -92,6 +92,7 @@ fn refused_double_dash_invocation_is_exact_passthrough() {
         .env("KACHE_CACHE_DIR", &cache_dir)
         .env("KACHE_CONFIG", &config)
         .env("KACHE_BASE_DIR", dir.path())
+        .env("KACHE_PHASE_TRACE_DIR", dir.path().join("trace"))
         .env("KACHE_LOG", "kache=debug")
         .output()
         .expect("failed to run kache as a cc wrapper");
@@ -111,6 +112,23 @@ fn refused_double_dash_invocation_is_exact_passthrough() {
         ["-c", "-o", "windows.o", "--", source.to_str().unwrap()],
         "refused passthrough must preserve the original argv without cache-only flags"
     );
+
+    let spans: Vec<serde_json::Value> = fs::read_dir(dir.path().join("trace"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .flat_map(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["traceEvents"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let span = |name: &str| spans.iter().find(|s| s["name"] == name).unwrap();
+    let preflight = span("cc_preflight");
+    let compiler = span("cc_passthrough_compiler");
+    let preflight_end = preflight["ts"].as_u64().unwrap() + preflight["dur"].as_u64().unwrap();
+    assert!(compiler["ts"].as_u64().unwrap() >= preflight_end);
+    assert!(compiler["dur"].as_u64().unwrap() > 0);
 }
 
 /// Compile-first misses retain their initial store and parsed policy through

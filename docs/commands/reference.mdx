@@ -444,7 +444,7 @@ kache key diff a.json b.json
 
 `kache key explain` prints the strings one rustc invocation contributes to its cache key. It does not run rustc. Put the rustc path and its arguments after `--`. `--rustc-version` or `--rustc-version-file` supplies `rustc -vV` text when the host line belongs in the document. Without either, that line is left out. The two version flags cannot be combined.
 
-`kache key diff` reads two of those documents and prints the fields that differ. Matching inputs print nothing.
+`kache key diff` reads two of those documents and prints the fields that differ. Matching inputs print nothing. To compare the concrete link inputs recorded by two builds, use `kache key diff --link-trace <crate> first.log second.log`. See [capturing key traces](/docs/how-it-works/cache-key).
 
 ## `kache explain`
 

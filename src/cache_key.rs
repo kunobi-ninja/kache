@@ -4697,7 +4697,13 @@ fn compute_key_into(
         }
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
-        tracing::trace!("[key:{}] link_search:{}", crate_name, normalized);
+        tracing::trace!(
+            "[key:{}] link_search:{}{}{}",
+            crate_name,
+            kind.unwrap_or(""),
+            if kind.is_some() { "=" } else { "" },
+            normalized
+        );
     }
 
     // Native libraries to link (`-l`). The name alone (machine-independent;
@@ -6276,7 +6282,7 @@ fn fold_native_link_inputs<H: KeyFold>(
             "[key:{}] native_archive:{}={} ({usage:?})",
             crate_name,
             path.display(),
-            &digest[..digest.len().min(24)]
+            digest
         );
         Ok::<_, anyhow::Error>(digest)
     };
@@ -6437,7 +6443,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 "[key:{}] link_lib_content:{}={} ({})",
                 crate_name,
                 lib,
-                &content_hash[..content_hash.len().min(16)],
+                content_hash,
                 path.display()
             );
             archives.push(path);
@@ -6460,7 +6466,7 @@ fn fold_native_link_inputs<H: KeyFold>(
             b"link_arg_input.v1:",
             format!("{index}={digest}").as_bytes(),
         );
-        tracing::trace!("[key:{}] link_arg_input:{}", crate_name, file.display());
+        tracing::trace!("[key:{}] link_arg_input:{index}={digest}", crate_name);
     }
 
     // A `-Bstatic` in the link arguments can make the linker skip a shared
@@ -6480,7 +6486,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 b"link_arg_library.v1:",
                 format!("{index}={digest}").as_bytes(),
             );
-            tracing::trace!("[key:{}] link_arg_library:{}", crate_name, path.display());
+            tracing::trace!("[key:{}] link_arg_library:{index}={digest}", crate_name);
             archives.push(path);
         }
     }

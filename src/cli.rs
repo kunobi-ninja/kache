@@ -2230,6 +2230,27 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         diagnosis.hints =
             miss_diagnosis::env_hints(&crate::miss_chain::changed_env_inputs(&all_events, index));
     }
+    let mut link_crates = std::collections::BTreeSet::new();
+    if miss
+        .key_diff
+        .iter()
+        .chain(diagnosis.checkout.iter().flat_map(|c| &c.groups))
+        .any(|group| group == "link")
+    {
+        link_crates.insert(crate_name);
+    }
+    if let Some(chain) = &diagnosis.dependency_chain {
+        for root in &chain.roots {
+            if let crate::miss_chain::RootKind::Groups(groups) = &root.kind
+                && groups.iter().any(|group| group == "link")
+            {
+                link_crates.insert(&root.crate_name);
+            }
+        }
+    }
+    for name in link_crates {
+        diagnosis.hints.push(format!("Compare recorded link inputs with `kache key diff --link-trace {name} first.log second.log`. For each build, set KACHE_SEED_NEW_TARGETS=0, KACHE_LOG_FILE=kache::cache_key=trace and KACHE_LOG_FILE_PATH to a fresh absolute log path."));
+    }
     if json {
         return why_miss_json(
             crate_name,

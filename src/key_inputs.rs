@@ -2,6 +2,8 @@
 //!
 //! The strings are the ones the cache key hashes. This path does not run rustc.
 
+pub(crate) mod link_trace;
+
 use crate::args::RustcArgs;
 use crate::cache_key;
 use crate::invocation::InvocationEnv;

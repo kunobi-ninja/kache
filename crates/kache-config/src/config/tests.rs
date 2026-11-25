@@ -1109,6 +1109,34 @@ fn hermetic_build_scripts_are_off_by_default_and_obey_env_precedence() {
 }
 
 #[test]
+fn image_sharing_requires_an_explicit_digest_and_respects_ignore_env() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _unset = NamedEnvGuard::remove("KACHE_BUILD_SCRIPT_IMAGE");
+    assert_eq!(Config::load().unwrap().build_script_image, None);
+    let first = format!("sha256:{}", "a".repeat(64));
+    let second = format!("sha256:{}", "0".repeat(64));
+    for (ignore, expected) in [(false, &second), (true, &first)] {
+        std::fs::write(
+            &path,
+            format!("[cache]\nignore_env={ignore}\nbuild_script_image='{first}'\n"),
+        )
+        .unwrap();
+        let _env = NamedEnvGuard::set("KACHE_BUILD_SCRIPT_IMAGE", &second);
+        assert_eq!(
+            Config::load().unwrap().build_script_image.as_ref(),
+            Some(expected)
+        );
+    }
+    for bad in ["latest", "sha256:aa", &format!("sha256:{}", "F".repeat(64))] {
+        std::fs::write(&path, format!("[cache]\nbuild_script_image='{bad}'\n")).unwrap();
+        assert!(Config::load().is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn unused_unit_cleanup_defaults_to_thirty_days() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3397,6 +3425,7 @@ fn test_file_config_roundtrip() {
             auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
+            build_script_image: None,
             build_script_omit_cargo_source_dir_mtime: None,
             build_script_out_dir_max_size: None,
             gc_evict_shared: None,
@@ -4071,6 +4100,7 @@ fn test_config_store_dir() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4173,6 +4203,7 @@ fn test_config_index_db_path() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4271,6 +4302,7 @@ fn test_config_event_log_path() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4436,6 +4468,7 @@ fn test_config_socket_path() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -5276,6 +5309,7 @@ fn test_save_and_load_file_config() {
             auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
+            build_script_image: None,
             build_script_omit_cargo_source_dir_mtime: None,
             build_script_out_dir_max_size: None,
             gc_evict_shared: None,

@@ -3476,7 +3476,7 @@ fn test_get_workspace_crate_names_lists_members() {
         std::fs::write(root.join(m).join("src/lib.rs"), "").unwrap();
     }
 
-    let names = sync_scope::resolve(Some(root.join("Cargo.toml").to_str().unwrap()), false)
+    let names = sync_scope::resolve(Some(root.join("Cargo.toml").to_str().unwrap()), false, None)
         .unwrap()
         .workspace
         .unwrap();
@@ -3489,7 +3489,7 @@ fn test_get_workspace_crate_names_errors_on_bad_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("Cargo.toml");
     std::fs::write(&bad, "this is not valid toml [[[").unwrap();
-    assert!(sync_scope::resolve(Some(bad.to_str().unwrap()), false).is_err());
+    assert!(sync_scope::resolve(Some(bad.to_str().unwrap()), false, None).is_err());
 }
 
 // ── backend-neutral remote tests ──────────────────────────────────────────
@@ -3963,6 +3963,7 @@ fn save_manifest_config(
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -6784,6 +6785,73 @@ async fn sync_with_client_push_uploads_local_only_entry() {
 }
 
 #[tokio::test]
+async fn sync_push_scopes_image_runs_to_the_selected_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = test_remote_cfg();
+    let mut config = save_manifest_config(dir.path().into(), Some(remote.clone()));
+    let image = format!("sha256:{}", "a".repeat(64));
+    let dependency = crate::build_script::image::package_namespace(&image, "dependency");
+    let unrelated = crate::build_script::image::package_namespace(&image, "unrelated");
+    config.build_script_image = Some(image);
+    let store = Store::open(&config).unwrap();
+    let artifact = dir.path().join("output");
+    std::fs::write(&artifact, b"content").unwrap();
+    for name in ["member", "dependency", &dependency, &unrelated] {
+        store
+            .put(
+                &sync_test_cache_key(name),
+                name,
+                &[],
+                &[],
+                "target",
+                "debug",
+                &[(artifact.clone(), "output".into())],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+    let members = std::collections::HashSet::from(["member".to_owned()]);
+    let packages = std::collections::HashSet::from(["dependency".to_owned(), dependency.clone()]);
+    for workspace_only in [false, true] {
+        let backend = TestBackend::memory();
+        sync_with_client(
+            &as_cache_remote(as_remote_backend(&backend), &remote),
+            &config,
+            &store,
+            Some(&members),
+            false,
+            false,
+            false,
+            false,
+            Some(&packages),
+            workspace_only,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut expected = vec!["member"];
+        if !workspace_only {
+            expected.push(&dependency);
+        }
+        let mut expected = expected
+            .into_iter()
+            .map(|name| {
+                format!(
+                    "prefix/v3/manifests/{name}/{}.json",
+                    sync_test_cache_key(name)
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut manifests = backend.put_calls();
+        manifests.retain(|path| path.starts_with("prefix/v3/manifests/"));
+        manifests.sort();
+        expected.sort();
+        assert_eq!(manifests, expected, "workspace_only={workspace_only}");
+    }
+}
+
+#[tokio::test]
 async fn sync_with_client_push_throttles_with_low_concurrency() {
     // Two local entries still upload when the daemon pool is 1. Sync no longer
     // uses that pool as its in-flight cap.
@@ -7425,6 +7493,15 @@ async fn sync_with_client_pull_downloads_and_imports_entry() {
         .seed(&format!("prefix/v3/packs/serde/{key}.tar.zst"), pack)
         .await;
 
+    // A legacy listing can contain runs that probed a different host.
+    let run = sync_test_cache_key("host-build-script-run");
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/build_script_run/{run}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+
     sync_with_client(
         &as_cache_remote(as_remote_backend(&backend), &remote),
         &config,
@@ -7441,6 +7518,7 @@ async fn sync_with_client_pull_downloads_and_imports_entry() {
     .await
     .expect("pull sync should succeed");
 
+    assert!(!store.contains(&run));
     // The entry was imported into the local store.
     assert!(
         config.store_dir().join(&key).join("meta.json").exists(),
@@ -7450,6 +7528,42 @@ async fn sync_with_client_pull_downloads_and_imports_entry() {
         backend.get_calls(),
         vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
     );
+}
+
+#[tokio::test]
+async fn an_invalid_image_run_is_never_committed_or_left_for_another_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = test_remote_cfg();
+    let mut config = save_manifest_config(dir.path().into(), Some(remote.clone()));
+    let image = format!("sha256:{}", "a".repeat(64));
+    let namespace = crate::build_script::image::package_namespace(&image, "test");
+    config.build_script_image = Some(image);
+    let store = Store::open(&config).unwrap();
+    let key = sync_test_cache_key("invalid image run");
+    let backend = TestBackend::memory();
+    backend
+        .seed(
+            &format!("prefix/v3/manifests/{namespace}/{key}.json"),
+            b"{}".to_vec(),
+        )
+        .await;
+    // This is a valid remote pack for this name and key, but has no image descriptor.
+    backend
+        .seed(
+            &format!("prefix/v3/packs/{namespace}/{key}.tar.zst"),
+            build_entry_pack(&key, &namespace),
+        )
+        .await;
+    let client = as_cache_remote(as_remote_backend(&backend), &remote);
+    assert!(
+        sync_with_client(
+            &client, &config, &store, None, true, false, false, true, None, false, false
+        )
+        .await
+        .is_err()
+    );
+    assert!(!store.contains(&key));
+    assert!(!store.entry_dir(&key).exists());
 }
 
 #[tokio::test]

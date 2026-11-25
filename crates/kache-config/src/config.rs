@@ -676,6 +676,8 @@ pub struct Config {
     /// Off by default. Set via `KACHE_BUILD_SCRIPT_HERMETIC=1`/`=true` or
     /// `[cache] build_script_hermetic = true`.
     pub build_script_hermetic: bool,
+    /// Immutable toolchain image whose trusted workers may exchange build-script runs.
+    pub build_script_image: Option<String>,
     /// Omit directory mtimes for declared inputs in Cargo's source caches.
     /// Off by default: enable only when scripts do not read those times.
     /// Files and symlink referents retain their timestamp checks.
@@ -1095,6 +1097,7 @@ pub struct CacheFileConfig {
     pub seed_new_targets: Option<bool>,
     /// See [`Config::build_script_hermetic`].
     pub build_script_hermetic: Option<bool>,
+    pub build_script_image: Option<String>,
     /// See [`Config::build_script_omit_cargo_source_dir_mtime`].
     pub build_script_omit_cargo_source_dir_mtime: Option<bool>,
     /// See [`Config::build_script_out_dir_max_size`].
@@ -1557,6 +1560,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
+    "KACHE_BUILD_SCRIPT_IMAGE",
     "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
     "KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE",
     "KACHE_STORAGE_LAYOUT_ADVICE",
@@ -1724,6 +1728,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
+    ("KACHE_BUILD_SCRIPT_IMAGE", "cache.build_script_image"),
     (
         "KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME",
         "cache.build_script_omit_cargo_source_dir_mtime",
@@ -2582,6 +2587,29 @@ impl Config {
         let auto_clean_superseded_executables =
             Self::auto_clean_superseded_executables_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
+        let build_script_image =
+            env_or_ignored_for(invocation, "KACHE_BUILD_SCRIPT_IMAGE", ignore_env)
+                .ok()
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()?
+                        .cache
+                        .as_ref()?
+                        .build_script_image
+                        .clone()
+                });
+        if let Some(image) = &build_script_image {
+            anyhow::ensure!(
+                image.strip_prefix("sha256:").is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }),
+                "cache.build_script_image must be a sha256: digest with 64 lowercase hex digits"
+            );
+        }
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
         let build_script_omit_cargo_source_dir_mtime =
@@ -2736,6 +2764,7 @@ impl Config {
             auto_clean_superseded_executables,
             seed_new_targets,
             build_script_hermetic,
+            build_script_image,
             build_script_omit_cargo_source_dir_mtime,
             build_script_out_dir_max_size,
             gc_evict_shared,

@@ -120,7 +120,13 @@ eligibility checks still apply.
 
 Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, notices a Cargo unit you are editing (a build of it, then a miss in the same target where only its sources or dependencies changed) and gives it isolated incremental state. A `git pull`, a branch switch or a rebase counts as editing too, and so does a change in a local crate the unit depends on. The mode covers every package Cargo builds incrementally, by default the workspace members and path dependencies of a debug build, including a library you edit while running `cargo build -p app`.
 
-Kache neither stores nor uploads what it compiles this way. It skips the cache for up to eight builds of the unit. After the eighth, or after 15 minutes without a build of the unit, it checks the cache first: a hit restores the cached result and drops the state, and a miss keeps compiling incrementally. Until then, switching back to a version the cache already holds compiles it incrementally instead of restoring it.
+Private incremental outputs stay local. Kache can skip the artifact cache
+for up to eight builds of a unit. It checks the cache sooner if an edit returns
+the unit's source files to their last recorded cached contents. A revert or
+branch switch can then restore the artifact if the rest of the key still matches.
+Kache also checks after the eighth build or 15 minutes of inactivity. A hit
+restores the result and drops the private state. On a miss, Kache can keep
+compiling incrementally.
 
 A compile error keeps the state, so the fix still compiles incrementally, as it does with plain Cargo. Kache discards the state when rustc crashes or reports a problem with its incremental files, and after an interrupted build. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn the mode off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics. A CI job that keeps its target directory between runs should turn the mode off; see [CI setup](/docs/remote-cache/ci#ephemeral-and-persistent-runners).
 

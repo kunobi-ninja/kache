@@ -48,40 +48,6 @@ for page in pages:
             errors.append(f"{page}: broken internal route {match.group(1)}")
 
 all_prose = "\n".join([root.joinpath("README.md").read_text(), *(p.read_text() for p in pages)])
-# Advance this pin after publication, independently of the next workspace bump.
-install_version = json.loads(root.joinpath("docs/install-version.json").read_text())["version"]
-install_pins = [
-    re.compile(r"\bcargo (?:install|binstall) kache\b[^\n]*?--version\s+([^\s`]+)"),
-    re.compile(r"github:kunobi-ninja/kache/v([0-9][^\s`]+)"),
-]
-for page in [root / "README.md", *pages]:
-    text = page.read_text()
-    pins = []
-    for pattern in install_pins:
-        pins.extend(pattern.findall(text))
-    action_indent = None
-    inputs_indent = None
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        uses = re.match(r"(-\s+)?uses:\s+['\"]?kunobi-ninja/kache-action@", stripped)
-        if uses:
-            action_indent = indent + len(uses.group(1) or "")
-            inputs_indent = None
-        elif stripped and (stripped.startswith(("```", "~~~")) or (
-            action_indent is not None and indent < action_indent
-        )):
-            action_indent = None
-            inputs_indent = None
-        elif stripped and action_indent is not None and indent == action_indent:
-            inputs_indent = indent if stripped == "with:" else None
-        if inputs_indent is not None and indent > inputs_indent:
-            pin = re.fullmatch(r"version:\s+['\"]?v?([0-9][0-9A-Za-z.+-]*)['\"]?\s*(?:#.*)?", stripped)
-            if pin:
-                pins.append(pin.group(1))
-    for pin in pins:
-        if pin != install_version:
-            errors.append(f"{page.relative_to(root)}: install pin {pin} differs from published install version {install_version}")
 
 for obsolete in ["](/getting-started", "](/daemon", "](/remote-cache", "kache status", "install-shims --dir"]:
     if obsolete in all_prose:

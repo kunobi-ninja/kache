@@ -7,7 +7,7 @@ Kache requires the `kache` client and `kache-engine`. Keep the same
 version of both in the same directory when installing a release manually.
 
 ```bash
-cargo install kache --locked --version 2.1.1
+cargo install kache --locked
 kache init
 ```
 
@@ -15,13 +15,14 @@ kache init
 
 ## Release channels
 
-These docs describe stable v2.1.1. Pin the version as above for reproducible
-installs, or use an unversioned command for the latest stable release.
+Cargo and cargo-binstall select the latest stable release by default. Package
+managers follow their selected channel. To reproduce an install, choose a tag
+from the [release list](https://github.com/kunobi-ninja/kache/releases) and pass
+its version to `--version` without the leading `v`.
 
-Release candidates and betas require an explicit version. Homebrew and Windows
-also have separate unstable packages; APT has an unstable distribution. See the
-[release list](https://github.com/kunobi-ninja/kache/releases) for available
-versions.
+Release candidates and betas require an explicit version with Cargo or
+cargo-binstall. Homebrew and Windows offer separate unstable packages. APT has
+an unstable distribution.
 
 The [upgrade guide](/docs/getting-started/upgrade-v2) covers
 existing installs and what state can start cold.
@@ -32,17 +33,15 @@ existing installs and what state can start cold.
   <Tab value="cargo install">
     ```bash
     cargo install kache --locked
-    # Pin this release:
-    cargo install kache --locked --version 2.1.1
     ```
 
-    Cargo builds Kache with your local Rust toolchain, which must be Rust 1.95 or newer.
+    Cargo builds Kache with your local Rust toolchain, which must be Rust 1.95
+    or newer. `--locked` tells older Cargo versions to use Kache's published
+    dependency lockfile. Cargo 1.100 and later use that lockfile by default.
   </Tab>
   <Tab value="cargo-binstall">
     ```bash
     cargo binstall kache
-    # Pin this release:
-    cargo binstall kache --version 2.1.1
     ```
 
     This downloads a release binary when one exists for your target. Release binaries have no Rust runtime dependency.
@@ -129,11 +128,8 @@ nix run github:kunobi-ninja/kache/stable -- --version
 nix profile install github:kunobi-ninja/kache/stable
 ```
 
-Pin a release tag when updates must be explicit:
-
-```bash
-nix profile install github:kunobi-ninja/kache/v2.1.1
-```
+To pin a release, replace `stable` in the flake URL with the published tag,
+including its leading `v`.
 
 The flake also exports `overlays.default`, `nixosModules.default` and `darwinModules.default`. The module's `services.kache` options are defined in [`packaging/nix/module.nix`](https://github.com/kunobi-ninja/kache/blob/main/packaging/nix/module.nix). `enable` installs Kache, writes `settings` to `/etc/kache/config.toml` and sets `KACHE_CONFIG`. `rustcWrapper`, on by default, sets `RUSTC_WRAPPER`. `daemon.enable` runs the daemon as a systemd or launchd user service. The module does not put the shims on `PATH`; use the example below for that.
 
@@ -162,7 +158,7 @@ Keep the real compilers later in `PATH`. The compiler shims cover C and C++; Rus
 
 Other Rust-supported targets may work through `cargo install`, but they are not release-tested targets.
 
-FreeBSD (x86_64) installs from source with `cargo install kache`. CI checks that it compiles, but there are no prebuilt binaries and the tests do not run on FreeBSD.
+FreeBSD (x86_64) installs from source with `cargo install kache --locked`. CI checks that it compiles, but there are no prebuilt binaries and the tests do not run on FreeBSD.
 
 ## Shell completions
 

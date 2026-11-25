@@ -3,10 +3,11 @@ title: Compatibility
 description: Kache v2 release channels, interfaces, and upgrade behavior
 ---
 
-These docs describe stable Kache v2.1.1. Start with
-[Installation](/docs/getting-started/installation) to choose a release, or
-[Upgrading to v2](/docs/getting-started/upgrade-v2) for an existing installation.
-Release candidates and betas require an explicit version selection.
+Start with [Installation](/docs/getting-started/installation) to choose a
+release. For an existing installation, see
+[Upgrading to v2](/docs/getting-started/upgrade-v2). The
+[release notes](https://github.com/kunobi-ninja/kache/releases) show when
+behavior changed.
 
 ## CLI and configuration
 
@@ -56,7 +57,8 @@ lookups.
 
 ## Building from source
 
-The CLI declares Rust 1.95 or newer in `Cargo.toml`. The repository pins Rust 1.99
-for development and release builds. This requirement concerns building Kache;
-compiler-cache eligibility also depends on the compiler, arguments, platform,
-and artifact type. See [Current support](/docs#current-support).
+The CLI declares Rust 1.95 or newer in `Cargo.toml`. Development and release
+builds use the compiler in
+[`rust-toolchain.toml`](https://github.com/kunobi-ninja/kache/blob/main/rust-toolchain.toml).
+Cache eligibility depends on the compiler, arguments, platform, and artifact
+type. See [Current support](/docs#current-support).

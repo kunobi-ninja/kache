@@ -34,7 +34,26 @@ Narrowing the initial pull does not disable on-demand dependency restores during
 
 ## Share build-script runs within an image
 
-Set `KACHE_BUILD_SCRIPT_IMAGE` to the immutable image digest on both workers, or set `cache.build_script_image` in each configuration file. Use the same setting for `cargo build` and `kache sync`. A fresh worker can then pull the script’s declared inputs and outputs before its first build. Ordinary Rust compiler keys remain the same across images.
+Set `KACHE_BUILD_SCRIPT_IMAGE` to the immutable image digest on both workers,
+or set `cache.build_script_image` in each configuration file. Use the same
+setting for the build and sync commands.
+
+On a trusted producer with remote write access, build and publish the runs.
+
+```bash
+cargo build --release --locked
+kache sync --push
+```
+
+On a fresh worker using the same image, pull the runs before building.
+
+```bash
+kache sync --pull
+cargo build --release --locked
+```
+
+The image setting scopes build-script runs. Ordinary Rust compiler keys
+remain the same across images.
 
 The value is `sha256:` followed by 64 lowercase hexadecimal digits. Use workers with the same native toolchain, system libraries and mounted inputs. A digest identifies the environment you supply. Kache cannot verify a container's identity or detect undeclared host inputs. Give remote write access only to trusted producers.
 

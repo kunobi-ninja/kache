@@ -12,14 +12,14 @@ steps:
   - uses: actions/checkout@v4
   - uses: dtolnay/rust-toolchain@stable
   - uses: kunobi-ninja/kache-action@v1
-    with:
-      version: v2.1.1
   - run: cargo build --locked
 ```
 
 See the [kache-action repository](https://github.com/kunobi-ninja/kache-action) for its current input reference and release notes.
 
-The version input pins v2.1.1; omitting it selects the latest stable release.
+The action selects the latest stable Kache release. To keep a job on a specific
+Kache version, set its `version` input to a published release tag from
+[GitHub Releases](https://github.com/kunobi-ninja/kache/releases).
 The action installs the matching client/engine pair. Its `cache-executables`
 input defaults to `false`, independently of the CLI's Linux/macOS default; set
 that input explicitly if the job should cache eligible Rust executable outputs.
@@ -64,7 +64,7 @@ For a project that uses [PyO3/maturin-action](https://github.com/PyO3/maturin-ac
 
 The action installs Kache and persists its store with GitHub Actions cache for host and manylinux Docker builds. It configures the wrapper for its own build step, so no separate kache-action step is needed.
 
-The example pins the merged Kache integration. The `v1` tag does not yet include these inputs; switch to a release tag once it includes [PyO3/maturin-action#474](https://github.com/PyO3/maturin-action/pull/474).
+The example uses the commit that [added Kache support](https://github.com/PyO3/maturin-action/pull/474). The action ref selects the integration. Its `kache-version` input selects the Kache release.
 
 The `save-cache` input above belongs to kache-action. maturin-action has no equivalent restore-only input; use `cache: none` in release and publishing jobs that must not save caches.
 

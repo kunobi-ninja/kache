@@ -1,6 +1,6 @@
 ---
 title: Windows builds
-description: Install the v2 pair and check Rust, PDB, clang-cl, and CUDA eligibility
+description: Install the v2 pair and check Rust, PDB, MSVC, clang-cl, and CUDA eligibility
 ---
 
 Install Kache through a supported [package manager](/docs/getting-started/installation)
@@ -44,9 +44,11 @@ rules.
 
 Rust links can key supported `rust-lld` toolchains, compiled resource inputs,
 supported application manifests passed with `/MANIFESTINPUT` and `/MANIFEST:EMBED`,
-and modeled runtime/default-library selections. This does not make direct
-`cl.exe` object compilation cacheable. Since v2.1.0, DLL caching also retains import
+and modeled runtime/default-library selections. DLL caching also retains import
 libraries omitted from rustc's artifact notifications.
+
+For C and C++ objects, use the [native compiler launchers](/docs/getting-started/c-cpp#single-executable-cccxx-launchers).
+On Windows, `kache-cl` can cache supported `cl.exe` compilations in the local store.
 
 Long Rust commands can remain cacheable: RC.2 moves Kache-injected arguments into
 a response file when they would overflow the Windows command line. RC.4 also

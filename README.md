@@ -17,20 +17,13 @@ Built by [Kunobi][kunobi-brand].
 
 ## Install
 
-Install Kache v2.1.1 and enable it for your build tools:
+Install the latest stable Kache and enable it for your build tools.
 
 ```bash
-cargo install kache --locked --version 2.1.1
+cargo install kache --locked
 kache init
 kache doctor --probe
 ```
-
-Unversioned install commands select the latest stable release. Blaze routing is
-optional and off by default.
-
-If you use RC.2 with an older cache index, upgrade. RC.3 and later rebuild
-incompatible prediction metadata and keep compiled entries.
-[Choose a version or upgrade an existing installation →](https://ninja.kunobi.com/docs/kache/getting-started/upgrade-v2)
 
 `kache init` shows the changes before applying them. It configures Cargo's compiler
 wrapper and the background service. On Unix it also sets up Cargo and C/C++
@@ -44,10 +37,10 @@ automatically.
 Cargo installation needs Rust 1.95 or newer. Prefer a prebuilt package?
 [Homebrew, APT, AUR, Windows packages, mise, and Nix →](https://ninja.kunobi.com/docs/kache/getting-started/installation)
 
-V2 installs `kache` and its matching `kache-engine` companion. Keep both when
+Kache installs `kache` and its matching `kache-engine` companion. Keep both when
 copying an installation into a container or managing release archives yourself.
 
-## What v2 covers
+## Setup guides
 
 | Workflow | Start here |
 | --- | --- |
@@ -78,7 +71,7 @@ and build settings. Unsupported compiler invocations run normally.
 ## Why use Kache?
 
 - Reuse eligible Rust libraries, executables, and build scripts across worktrees.
-  It also caches GCC, Clang, clang-cl, and single-source CUDA object compilations.
+  It also caches eligible GCC, Clang, clang-cl, MSVC, and CUDA object compilations.
 - Keep identical output bytes once in a cache with a disk budget. On filesystems
   with copy-on-write cloning, restored outputs share disk blocks with the cache.
 - Run builds together. Compiles with the same cache key share one in-flight
@@ -152,13 +145,12 @@ Install your Rust toolchain, then add the official action before your build:
 
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
-  with:
-    version: v2.1.1
 - run: cargo build --locked
 ```
 
-The action can persist the local store through GitHub's cache service.
-For remote storage, credentials, and pull-request policy, follow the [CI guide][nav-ci].
+The action installs the latest stable Kache and can persist the local store
+through GitHub's cache service. The [CI guide][nav-ci] covers version pins,
+remote storage, and pull-request policy.
 
 ## Star History
 

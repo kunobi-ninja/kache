@@ -114,6 +114,9 @@ tag: use the tag's actual contents to decide which version contains a feature.
 Keep historical benchmark versions and measurements attached to their original
 runs.
 
+Use the latest stable release in default installation examples. Document how
+to select a published tag for reproducible runs.
+
 Check the README, the task guide, configuration and command references, and any
 affected crate README. CLI routing and options come from
 `crates/kache-client/src/commands.rs`; `kache --json --help` describes the visible

@@ -9,12 +9,10 @@ Plain `cargo doc` runs through the real rustdoc without caching.
 
 ## Toolchain compatibility
 
-Cargo 1.99 emits `--write-doc-meta-dir` and `--read-doc-meta-dir` for these
-flags, and current nightly toolchains are newer than 1.99. Kache does not
-support those arguments yet, so documentation passes through on Rust 1.99 and
-on any newer toolchain that passes them. Only an older Cargo that still uses
-`--merge=none` and `--merge=finalize` reaches the cached modes below. Check the
-recorded result before assuming a documentation build was cached.
+Kache caches the rustdoc merge modes `--merge=none` and `--merge=finalize`.
+When Cargo sends `--write-doc-meta-dir` or `--read-doc-meta-dir` instead, rustdoc
+generates the HTML normally. `kache stats --full` records those calls under
+`rustdoc flag (not yet supported)`. Use plain `cargo doc` on those toolchains.
 
 ## Enable the rustdoc wrapper
 
@@ -34,7 +32,7 @@ version manager forwards back to Kache, activate Rust for the project or set
 rustup. See [Compiler shims](/docs/commands/reference#compiler-shims) for both
 Cargo and rustdoc overrides.
 
-Then build documentation:
+On a toolchain with the supported merge modes, build documentation.
 
 ```bash
 RUSTC_BOOTSTRAP=1 cargo doc -Z rustdoc-depinfo -Z rustdoc-mergeable-info

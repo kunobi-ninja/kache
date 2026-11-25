@@ -47,18 +47,15 @@ fn read_inputs(path: &Path, crate_name: &str) -> Result<Inputs> {
     let mut fields = Inputs::new();
     let mut records = 0;
     let mut bytes = 0;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.by_ref().take(65_537).read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        ensure!(n <= 65_536, "trace line exceeds 64 KiB");
-        let message = line.trim_end_matches(['\r', '\n']);
-        let message = message
+    // Allow both bytes of CRLF in addition to the 64 KiB text limit. A fresh iterator begins at
+    // the reader's current position and yields None at EOF, including on an
+    // empty or truncated capture.
+    while let Some(line) = reader.by_ref().take(65_538).lines().next() {
+        let line = line?;
+        ensure!(line.len() <= 65_536, "trace line exceeds 64 KiB");
+        let message = line
             .split_once(" TRACE kache::cache_key: ")
-            .map_or(message, |(_, m)| m);
+            .map_or(line.as_str(), |(_, m)| m);
         let Some(message) = message.strip_prefix(&marker) else {
             continue;
         };
@@ -212,6 +209,26 @@ mod tests {
     }
 
     #[test]
+    fn reports_a_changed_resolved_library_digest_without_its_checkout_path() {
+        let left = log(&[
+            "key_version=1",
+            "link_lib_content:z=aaa (/checkout/a/libz.a)",
+            "final=a",
+        ]);
+        let right = log(&[
+            "key_version=1",
+            "link_lib_content:z=bbb (/checkout/b/libz.a)",
+            "final=b",
+        ]);
+        let mut text = Vec::new();
+        assert!(compare("demo", left.path(), right.path(), false, &mut text).unwrap());
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "link_lib_content[0]: \"z=aaa\" -> \"z=bbb\"\n"
+        );
+    }
+
+    #[test]
     fn compares_linker_argument_digests_and_ignores_legacy_checkout_paths() {
         assert_eq!(
             recorded_input("link_arg_input:0=abc"),
@@ -248,6 +265,9 @@ mod tests {
         assert_eq!(read(4096, 256).unwrap()["link_lib"].len(), 4096);
         assert!(read(4097, 1).is_err());
         assert!(read(4096, 257).is_err());
+        let marker_bytes = "[key:demo] link_lib:".len();
+        assert!(read(1, 65_536 - marker_bytes).is_ok());
+        assert!(read(1, 65_537 - marker_bytes).is_err());
         assert!(read(1, 65_536).is_err());
     }
 

@@ -1228,6 +1228,7 @@ fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
         restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: RemoteBackendConfig::S3(S3RemoteConfig {
+            pull_request_bucket: None,
             bucket: "bucket".to_string(),
             endpoint: None,
             region: "us-east-1".to_string(),
@@ -2491,7 +2492,11 @@ fn every_env_var_config_reads_maps_to_a_config_key() {
     let remote: Vec<&str> = ENV_FILE_KEYS
         .iter()
         .filter(|(var, key)| {
-            key.starts_with("cache.remote.") && *var != "KACHE_PULL_REQUEST_PREFIX"
+            key.starts_with("cache.remote.")
+                && !matches!(
+                    *var,
+                    "KACHE_PULL_REQUEST_PREFIX" | "KACHE_PULL_REQUEST_BUCKET"
+                )
         })
         .map(|(var, _)| *var)
         .collect();
@@ -3453,6 +3458,7 @@ fn test_file_config_roundtrip() {
                 path: None,
                 atomic_write_dir: None,
                 pull_request_prefix: None,
+                pull_request_bucket: None,
                 repository: None,
                 insecure: None,
             }),
@@ -6849,6 +6855,29 @@ fn oci_remote_rejects_mixed_backend_fields_and_round_trips_toml() {
 }
 
 #[test]
+fn separate_buckets_must_have_distinct_plain_names() {
+    for name in ["abc", "a.b", "artifacts-2", &"a".repeat(63)] {
+        assert!(valid_isolated_bucket(name), "{name}");
+    }
+    for name in [
+        "",
+        "ab",
+        ".abc",
+        "abc.",
+        "-abc",
+        "abc-",
+        "a..b",
+        "a_b",
+        "a@b",
+        "aBc",
+        "a/b",
+        &"a".repeat(64),
+    ] {
+        assert!(!valid_isolated_bucket(name), "{name}");
+    }
+}
+
+#[test]
 fn a_pull_request_prefix_must_stay_clear_of_the_base_prefix() {
     assert_eq!(pull_request_prefix_for("artifacts", "  ").unwrap(), None);
     assert_eq!(
@@ -6871,6 +6900,15 @@ fn a_pull_request_prefix_must_stay_clear_of_the_base_prefix() {
 }
 
 fn load_in_ci(event: &str, protected: &str, remote_toml: &str) -> Config {
+    load_in_ci_with_pr_bucket(event, protected, remote_toml, None)
+}
+
+fn load_in_ci_with_pr_bucket(
+    event: &str,
+    protected: &str,
+    remote_toml: &str,
+    bucket: Option<&str>,
+) -> Config {
     let _guard = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("kache/config.toml");
@@ -6884,6 +6922,10 @@ fn load_in_ci(event: &str, protected: &str, remote_toml: &str) -> Config {
     let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
     let _explicit = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
     let _prefix_env = NamedEnvGuard::remove("KACHE_PULL_REQUEST_PREFIX");
+    let _pr_bucket = match bucket {
+        Some(name) => NamedEnvGuard::set("KACHE_PULL_REQUEST_BUCKET", name),
+        None => NamedEnvGuard::remove("KACHE_PULL_REQUEST_BUCKET"),
+    };
     let _bucket = NamedEnvGuard::remove("KACHE_S3_BUCKET");
     let _s3_prefix = NamedEnvGuard::remove("KACHE_S3_PREFIX");
     Config::load().unwrap()
@@ -6896,6 +6938,37 @@ fn a_pull_request_job_with_its_own_prefix_may_write_there() {
     let config = load_in_ci("pull_request", "false", with_prefix);
     assert_eq!(config.pull_request_prefix.as_deref(), Some("artifacts-pr"));
     assert!(!config.remote_readonly);
+
+    let separate = "[cache.remote]\ntype='s3'\nbucket='base-store'\nprefix='artifacts'\npull_request_bucket='pr-store'\npull_request_prefix='artifacts'";
+    let overridden =
+        load_in_ci_with_pr_bucket("pull_request", "false", separate, Some("ci-bucket"));
+    assert!(
+        matches!(overridden.require_remote().unwrap().backend, RemoteBackendConfig::S3(ref s3) if s3.pull_request_bucket.as_deref() == Some("ci-bucket"))
+    );
+    let filesystem = "[cache.remote]\npath='/tmp/store'\npull_request_prefix='cache'";
+    let invalid = load_in_ci_with_pr_bucket("pull_request", "false", filesystem, Some("ci-bucket"));
+    assert!(invalid.require_remote().is_err());
+    let pr = load_in_ci("pull_request", "false", separate);
+    assert_eq!(pr.pull_request_prefix.as_deref(), Some("artifacts"));
+    assert!(!pr.remote_readonly);
+    assert_ne!(
+        pr.pull_request_scope(),
+        load_in_ci(
+            "pull_request",
+            "false",
+            &separate.replace("pr-store", "other-pr-store")
+        )
+        .pull_request_scope()
+    );
+    let trusted = load_in_ci("push", "true", separate);
+    assert!(trusted.pull_request_prefix.is_none());
+    assert!(
+        matches!(trusted.remote.unwrap().backend, RemoteBackendConfig::S3(s3) if s3.pull_request_bucket.is_none())
+    );
+    for bad in ["base-store", "BASE-STORE", "foo/../base-store"] {
+        let pr = load_in_ci("pull_request", "false", &separate.replace("pr-store", bad));
+        assert!(pr.require_remote().is_err(), "{bad}");
+    }
 
     let without = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n";
     let config = load_in_ci("pull_request", "false", without);

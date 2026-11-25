@@ -129,12 +129,33 @@ prefix = "artifacts"
 pull_request_prefix = "artifacts-pr"
 ```
 
-`KACHE_PULL_REQUEST_PREFIX` sets the same value. In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), Kache then:
+For an S3-compatible service with bucket-scoped permissions, such as R2, put
+the PR prefix in a second bucket. Both buckets use the configured endpoint and
+region, and can use the same prefix:
+
+```toml
+[cache.remote]
+type = "s3"
+bucket = "build-cache"
+prefix = "artifacts"
+pull_request_bucket = "build-cache-pr"
+pull_request_prefix = "artifacts"
+```
+
+Give the PR job read access to the base bucket. Set
+`KACHE_PULL_REQUEST_S3_ACCESS_KEY` and `KACHE_PULL_REQUEST_S3_SECRET_KEY`
+in its environment to credentials with read and write access to the PR
+bucket. With both variables unset, the PR bucket uses the base credential
+chain. A partial pair disables the remote operation. The bucket name can
+also be set with `KACHE_PULL_REQUEST_BUCKET`. Protected pushes use only
+the base bucket.
+
+`KACHE_PULL_REQUEST_PREFIX` sets `pull_request_prefix`. In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), Kache then:
 
 - reads the base prefix first and the pull request prefix for what the base lacks;
 - writes entries, build manifests, shards and prediction rows only under the pull request prefix.
 
-Every other job ignores the setting: protected-branch pushes, scheduled runs and merge groups never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. The pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
+Every other job ignores the setting: protected-branch pushes, scheduled runs and merge groups never read the pull request prefix, and tags, unprotected branches and `pull_request_target` jobs stay read-only. When both prefixes share a bucket, the pull request prefix must differ from `prefix`, neither may contain the other, and `prefix` must not be empty, because an empty prefix contains every other. Otherwise the job stays read-only and Kache logs why.
 
 A pull request job with a prefix runs its own daemon. Its socket and upload queue carry a name derived from the prefix (`daemon-pr-<hash>.sock`, `upload-queue-pr-<hash>`), so it never hands uploads to a protected-branch job's daemon or reads through one. It still must not share a local store with trusted jobs: an artifact it compiles there would be a local hit for the next trusted build. Keep pull request jobs off the persistent disk described in [Ephemeral and persistent runners](#ephemeral-and-persistent-runners).
 

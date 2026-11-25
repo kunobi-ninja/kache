@@ -2628,6 +2628,7 @@ pub(crate) mod tests {
             restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: String::new(),
             backend: crate::config::RemoteBackendConfig::S3(crate::config::S3RemoteConfig {
+                pull_request_bucket: None,
                 bucket: "bucket".to_string(),
                 endpoint: None,
                 region: "us-east-1".to_string(),

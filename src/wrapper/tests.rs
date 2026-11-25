@@ -14751,3 +14751,52 @@ fn only_a_linking_executable_skips_the_cache_when_executables_are_off() {
         assert!(!skips_uncached_executable(args, false), "{:?}", args.emit);
     }
 }
+
+#[test]
+fn only_complete_loose_bundles_with_all_object_occurrences_get_the_coff_key() {
+    let out = names(&["/", "lib.rmeta", "one.obj", "one.obj", "extra.obj"]);
+    assert!(certifies_loose_coff(
+        &out,
+        &names(&["/", "/", "//", "one.obj", "one.obj"])
+    ));
+    assert!(!certifies_loose_coff(
+        &out,
+        &names(&["one.obj", "one.obj", "one.obj"])
+    ));
+    assert!(!certifies_loose_coff(
+        &out,
+        &names(&["one.obj", "missing.obj"])
+    ));
+    assert!(!certifies_loose_coff(&out, &names(&["/", "//"])));
+}
+
+#[test]
+fn loose_coff_proof_inspects_original_rlib_members_before_import_filtering() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("dep.lib");
+    std::fs::write(&archive, ar_archive(&["one.obj"])).unwrap();
+    let deps = keyed_native(
+        vec![archive.clone()],
+        vec![(archive, false)],
+        vec![temp.path().to_owned()],
+    );
+    let args = rustc_args(&["rustc", "lib.rs", "--crate-type", "rlib"]);
+    let check = |entries: &[(&str, &[u8])]| {
+        let artifacts = rlib_artifacts(temp.path(), entries);
+        let mut loose = false;
+        assert_eq!(
+            audit_native_bundle(&args, &artifacts, &deps, Some(&mut loose)).unwrap(),
+            None
+        );
+        loose
+    };
+    assert!(check(&[("one.obj", b"xx")]));
+    for packed in ["other.lib", "libother.a"] {
+        assert!(!check(&[("one.obj", b"xx"), (packed, b"!<arch>\n")]));
+        assert!(!check(&[
+            ("one.obj", b"xx"),
+            (packed, b"\0\0\xff\xff"),
+            (packed, b"!<arch>\n")
+        ]));
+    }
+}

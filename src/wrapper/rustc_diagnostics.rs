@@ -125,8 +125,12 @@ pub(super) fn usable_entry(
     store: &Store,
     args: &RustcArgs,
     shared: &str,
+    loose_coff: Option<&str>,
 ) -> Result<Option<(EntryKey, EntryMeta)>> {
-    for key in local_lookup_keys(args, shared) {
+    for key in std::iter::once(shared)
+        .chain(loose_coff)
+        .flat_map(|key| local_lookup_keys(args, key))
+    {
         if let Some(meta) = store.get(&key.key)?
             && entry_usable(args, &key, &meta)
         {

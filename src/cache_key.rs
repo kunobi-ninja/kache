@@ -759,6 +759,10 @@ fn fold_apple_deployment_targets<H: KeyFold>(
 /// agnostic to whether per-group tee-hashing is active.
 trait KeyFold {
     fn update(&mut self, bytes: &[u8]);
+
+    fn update_variants(&mut self, raw: &[u8], _loose: &[u8]) {
+        self.update(raw);
+    }
 }
 
 impl KeyFold for blake3::Hasher {
@@ -770,6 +774,15 @@ impl KeyFold for blake3::Hasher {
 impl KeyFold for GroupedHasher {
     fn update(&mut self, bytes: &[u8]) {
         GroupedHasher::update(self, bytes);
+    }
+
+    fn update_variants(&mut self, raw: &[u8], loose: &[u8]) {
+        let alternate = self
+            .loose_coff
+            .get_or_insert_with(|| Box::new(self.main.clone()));
+        alternate.update(loose);
+        self.main.update(raw);
+        self.groups.entry(self.current).or_default().update(raw);
     }
 }
 
@@ -789,6 +802,7 @@ pub(crate) const KEY_FIELD_HEX: usize = 16;
 /// `set_group` may name the same group across non-contiguous segments; the
 /// sub-hasher just keeps accumulating.
 struct GroupedHasher {
+    loose_coff: Option<Box<blake3::Hasher>>,
     main: blake3::Hasher,
     groups: std::collections::BTreeMap<&'static str, blake3::Hasher>,
     current: &'static str,
@@ -797,6 +811,7 @@ struct GroupedHasher {
 impl GroupedHasher {
     fn new(initial_group: &'static str) -> Self {
         GroupedHasher {
+            loose_coff: None,
             main: blake3::Hasher::new(),
             groups: std::collections::BTreeMap::new(),
             current: initial_group,
@@ -809,6 +824,9 @@ impl GroupedHasher {
 
     fn update(&mut self, bytes: &[u8]) {
         self.main.update(bytes);
+        if let Some(alternate) = &mut self.loose_coff {
+            alternate.update(bytes);
+        }
         self.groups.entry(self.current).or_default().update(bytes);
     }
 
@@ -836,6 +854,8 @@ impl GroupedHasher {
 /// `false` and is filled only on the paths that produce it.
 #[derive(Debug, Default)]
 pub struct KeyOutputs {
+    /// Secondary lookup for a previously verified, loose COFF bundle.
+    pub(crate) loose_coff_key: Option<String>,
     /// Per-group digests of the key, for the event log and `explain_miss`
     /// (kunobi-ninja/kache#131). Set only once the whole key was hashed.
     pub fields: Option<BTreeMap<String, String>>,
@@ -4744,6 +4764,18 @@ fn compute_key_into(
     let unit_out_dir = out_dir
         .map(|path| file_hasher.resolve_path(Path::new(&path)))
         .transpose()?;
+    let msvc = args
+        .target
+        .as_deref()
+        .map_or(cfg!(all(windows, target_env = "msvc")), |t| {
+            t.ends_with("-windows-msvc")
+        });
+    let loose_coff = msvc
+        && !native_search_dirs.is_empty()
+        && args.emits_rlib()
+        && !args.links_native_closure()
+        && !args.is_test
+        && !packs_bundled_libs(&args.unstable_flags);
     let native_archives = fold_native_link_inputs(
         &mut hasher,
         args,
@@ -4768,7 +4800,11 @@ fn compute_key_into(
             path_normalizer,
         },
         file_hasher,
+        loose_coff,
     )?;
+    if native_archives.bundled.is_empty() || native_archives.bundled.iter().any(|b| b.packed) {
+        hasher.loose_coff = None;
+    }
     // An rlib that bundles an archive the key did not hash is refused at
     // store time (see the wrapper's bundle audit). Entries stored by clients
     // without that audit must not serve this one.
@@ -5120,6 +5156,10 @@ fn compute_key_into(
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
+    out.loose_coff_key = hasher
+        .loose_coff
+        .as_ref()
+        .map(|alternate| alternate.finalize().to_hex().to_string());
     let (hash, fields) = hasher.finalize_with_fields();
     out.fields = Some(fields);
     let key = hash.to_hex().to_string();
@@ -5519,7 +5559,11 @@ fn resolve_native_static_lib(
     // One candidate keys as before; identical copies add where they are.
     if copies.len() > 1 {
         let places: Vec<&str> = copies.iter().map(|(_, place)| place.as_str()).collect();
-        hash = format!("{hash};copies={}", places.join(","));
+        let suffix = format!(";copies={}", places.join(","));
+        hash = match hash.split_once('\0') {
+            Some((raw, loose)) => format!("{raw}{suffix}\0{loose}{suffix}"),
+            None => format!("{hash}{suffix}"),
+        };
     }
     Ok(Some((path, hash)))
 }
@@ -5532,6 +5576,8 @@ pub enum StaticLibUse {
     /// An rlib-only compile copies the archive's members or packs the archive
     /// itself. Both forms can expose names and bytes, but not its parent path.
     Rlib,
+    /// Probe the member-wise digest of an unpacked MSVC archive.
+    LooseCoff,
     /// The archive's path never reaches the output: rustc bundles it into its
     /// rlib (or staticlib) output, or ld64 strips it through the
     /// `-oso_prefix` kache injects. A later cached debug link names rlib
@@ -5550,6 +5596,7 @@ impl StaticLibUse {
     fn memo_namespace(self) -> &'static str {
         match self {
             Self::Rlib => "static-ar-v1-rlib",
+            Self::LooseCoff => "static-ar-v1-loose-coff",
             Self::Bundled => "static-ar-v8-bundled",
             Self::Linked => "static-ar-v8",
         }
@@ -6017,11 +6064,20 @@ fn fold_native_dir_archives<H: KeyFold>(
                 .strip_prefix(dir)
                 .unwrap_or(&archive)
                 .to_string_lossy();
-            fold_field(
-                hasher,
-                b"native_dir_archive.v1:",
-                format!("{index}/{name}={digest}").as_bytes(),
-            );
+            let label = b"native_dir_archive.v1:";
+            match digest.split_once('\0') {
+                Some((raw, loose)) => {
+                    let raw = format!("{index}/{name}={raw}");
+                    let loose = format!("{index}/{name}={loose}");
+                    hasher.update(label);
+                    hasher.update_variants(
+                        &(raw.len() as u64).to_le_bytes(),
+                        &(loose.len() as u64).to_le_bytes(),
+                    );
+                    hasher.update_variants(raw.as_bytes(), loose.as_bytes());
+                }
+                None => fold_field(hasher, label, format!("{index}/{name}={digest}").as_bytes()),
+            }
             hashed.push(archive);
         }
     }
@@ -6250,6 +6306,7 @@ fn fold_native_link_inputs<H: KeyFold>(
     search: &NativeSearchDirs<'_>,
     context: &NativeLinkContext<'_>,
     file_hasher: &FileHasher<'_>,
+    loose_coff: bool,
 ) -> Result<KeyedNativeArchives> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let links = args.invokes_linker();
@@ -6271,9 +6328,14 @@ fn fold_native_link_inputs<H: KeyFold>(
     let oso_root = spelled_oso_root
         .as_deref()
         .and_then(|path| resolved_path_for(path, args.invocation_env()));
-    let archive_use = |path: &Path| match (spelled_oso_root.as_deref(), oso_root.as_deref()) {
-        (Some(spelled_root), Some(root)) => oso_archive_use(args, path, spelled_root, root),
-        _ => linked_archive_use(args, path, None),
+    let archive_use = |path: &Path| {
+        if loose_coff {
+            return StaticLibUse::LooseCoff;
+        }
+        match (spelled_oso_root.as_deref(), oso_root.as_deref()) {
+            (Some(spelled_root), Some(root)) => oso_archive_use(args, path, spelled_root, root),
+            _ => linked_archive_use(args, path, None),
+        }
     };
     let hash_archive = |path: &Path| {
         let usage = archive_use(path);
@@ -6437,7 +6499,10 @@ fn fold_native_link_inputs<H: KeyFold>(
         }
         if let Some((path, content_hash)) = resolved {
             hasher.update(b"link_lib_content:");
-            hasher.update(content_hash.as_bytes());
+            match content_hash.split_once('\0') {
+                Some((raw, loose)) => hasher.update_variants(raw.as_bytes(), loose.as_bytes()),
+                None => hasher.update(content_hash.as_bytes()),
+            }
             hasher.update(b"\n");
             tracing::trace!(
                 "[key:{}] link_lib_content:{}={} ({})",
@@ -7640,7 +7705,8 @@ fn compute_static_lib_hash_for(
 
     // The ordered search paths are already keyed. Preserve the basename too:
     // a packed rlib can contain an archive named foo.lib or libfoo.a.
-    let (name, identity, prefix) = if usage == StaticLibUse::Rlib && bytes.starts_with(b"!<arch>\n")
+    let (name, identity, prefix) = if matches!(usage, StaticLibUse::Rlib | StaticLibUse::LooseCoff)
+        && bytes.starts_with(b"!<arch>\n")
     {
         (
             path.file_name().context("missing archive filename")?,
@@ -7661,7 +7727,26 @@ fn compute_static_lib_hash_for(
     hasher.update(encoded_path);
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(&bytes);
-    Ok(format!("{prefix}:{}", hasher.finalize().to_hex()))
+    let raw = format!("{prefix}:{}", hasher.finalize().to_hex());
+    if usage == StaticLibUse::LooseCoff
+        && is_native_archive_path(path)
+        && let Some(digest) = crate::native_archive::loose_coff_digest(&bytes)
+    {
+        let mut hasher = blake3::Hasher::new();
+        fold_field(
+            &mut hasher,
+            b"coff-rlib-members.v1",
+            path.file_name()
+                .context("missing archive filename")?
+                .as_encoded_bytes(),
+        );
+        hasher.update(digest.as_bytes());
+        return Ok(format!(
+            "{raw}\0coff-rlib-v1:{}",
+            hasher.finalize().to_hex()
+        ));
+    }
+    Ok(raw)
 }
 
 /// Result of a dep-info pre-pass. Contains all information discovered by

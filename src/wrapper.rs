@@ -1257,11 +1257,19 @@ enum RustcClaim {
 /// [`Store::claim_build`] for Rust. The shared key's lock covers both keys,
 /// and an entry this invocation cannot use leaves the lock to it, so a width
 /// that misses still stores its own entry.
-fn claim_rustc_build(store: &Store, args: &RustcArgs, cache_key: &str) -> Result<RustcClaim> {
+fn claim_rustc_build(
+    store: &Store,
+    args: &RustcArgs,
+    cache_key: &str,
+    loose_coff: Option<&str>,
+) -> Result<RustcClaim> {
     let Some(lock) = store.try_lock(cache_key)? else {
         return Ok(RustcClaim::Contended);
     };
-    for entry_key in rustc_diagnostics::local_lookup_keys(args, cache_key) {
+    for entry_key in std::iter::once(cache_key)
+        .chain(loose_coff)
+        .flat_map(|key| rustc_diagnostics::local_lookup_keys(args, key))
+    {
         match store.get(&entry_key.key)? {
             Some(meta) if meta.files.is_empty() => {
                 tracing::warn!(
@@ -1287,9 +1295,10 @@ fn wait_for_rustc_peer(
     store: &Store,
     args: &RustcArgs,
     cache_key: &str,
+    loose_coff: Option<&str>,
 ) -> Option<(rustc_diagnostics::EntryKey, EntryMeta)> {
     let usable = || {
-        rustc_diagnostics::usable_entry(store, args, cache_key)
+        rustc_diagnostics::usable_entry(store, args, cache_key, loose_coff)
             .ok()
             .flatten()
     };
@@ -1312,14 +1321,15 @@ fn wait_then_claim_rustc(
     store: &Store,
     args: &RustcArgs,
     cache_key: &str,
+    loose_coff: Option<&str>,
 ) -> (
     Option<crate::store::KeyLock>,
     Option<(rustc_diagnostics::EntryKey, EntryMeta)>,
 ) {
-    if let Some(hit) = wait_for_rustc_peer(store, args, cache_key) {
+    if let Some(hit) = wait_for_rustc_peer(store, args, cache_key, loose_coff) {
         return (None, Some(hit));
     }
-    match claim_rustc_build(store, args, cache_key) {
+    match claim_rustc_build(store, args, cache_key, loose_coff) {
         Ok(RustcClaim::Acquired(lock)) => (Some(lock), None),
         Ok(RustcClaim::Committed(key, meta)) => (None, Some((key, *meta))),
         Ok(RustcClaim::Contended) | Err(_) => (None, None),
@@ -4701,7 +4711,10 @@ fn run_parsed_rustc(
         // every hit would be a database write per compile for no new information.
         // A re-derivation is the opposite case: its closure is what the record
         // should have said, so writing it is what repairs a stale row.
-        for entry_key in rustc_diagnostics::local_lookup_keys(args, &cache_key) {
+        for entry_key in std::iter::once(cache_key.as_str())
+            .chain(key_outputs.loose_coff_key.as_deref())
+            .flat_map(|key| rustc_diagnostics::local_lookup_keys(args, key))
+        {
             let lookup_start = std::time::Instant::now();
             let lookup_result =
                 lookup_or_miss(crate_name, LOOKUP_BUSY_BUDGET, std::thread::sleep, || {
@@ -4924,9 +4937,14 @@ fn run_parsed_rustc(
             crate_name,
             args.invokes_linker(),
             || {
-                rustc_diagnostics::usable_entry(&store, args, &cache_key)
-                    .ok()
-                    .flatten()
+                rustc_diagnostics::usable_entry(
+                    &store,
+                    args,
+                    &cache_key,
+                    key_outputs.loose_coff_key.as_deref(),
+                )
+                .ok()
+                .flatten()
             },
         )
     } else {
@@ -4935,7 +4953,12 @@ fn run_parsed_rustc(
     let (lock, committed) = if let Some(hit) = scheduled_hit {
         (None, Some(hit))
     } else {
-        match claim_rustc_build(&store, args, &cache_key) {
+        match claim_rustc_build(
+            &store,
+            args,
+            &cache_key,
+            key_outputs.loose_coff_key.as_deref(),
+        ) {
             Ok(RustcClaim::Acquired(lock)) => (Some(lock), None),
             Ok(RustcClaim::Committed(key, meta)) => (None, Some((key, *meta))),
             Err(e) => {
@@ -4949,7 +4972,12 @@ fn run_parsed_rustc(
             Ok(RustcClaim::Contended) => {
                 // Another process is building this key — wait for it
                 tracing::debug!("waiting for {} to be built by another process", crate_name);
-                wait_then_claim_rustc(&store, args, &cache_key)
+                wait_then_claim_rustc(
+                    &store,
+                    args,
+                    &cache_key,
+                    key_outputs.loose_coff_key.as_deref(),
+                )
             }
         }
     };
@@ -5184,7 +5212,13 @@ fn run_parsed_rustc(
     // its `-L` dirs that the key did not hash (a `#[link(kind = "static")]`
     // attribute, say). The compile already ran; we only decline to cache it.
     let native_archives = key_outputs.native_archives.take().unwrap_or_default();
-    let unaudited = match unaudited_native_bundle(args, &result.artifacts, &native_archives) {
+    let mut loose_coff = false;
+    let unaudited = match audit_native_bundle(
+        args,
+        &result.artifacts,
+        &native_archives,
+        key_outputs.loose_coff_key.as_ref().map(|_| &mut loose_coff),
+    ) {
         Ok(None) => None,
         Ok(Some(member)) => Some(format!(
             "its rlib bundles `{member}` from an archive the key does not hash"
@@ -5236,7 +5270,12 @@ fn run_parsed_rustc(
 
     // Rendered diagnostics from a terminal-width invocation go under that
     // width's key; everything else under the shared key.
-    let entry_key = rustc_diagnostics::store_key(args, &cache_key, &result.stdout, &result.stderr);
+    let storage_key = key_outputs
+        .loose_coff_key
+        .as_deref()
+        .filter(|_| loose_coff)
+        .unwrap_or(&cache_key);
+    let entry_key = rustc_diagnostics::store_key(args, storage_key, &result.stdout, &result.stderr);
     let entry_key = match &bound_checkout {
         Some(checkout) => entry_key.bound_to_checkout(checkout),
         None => entry_key,
@@ -6525,10 +6564,20 @@ fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<S
 /// carries the `native_bundle_audit` marker; a system library dir outside the
 /// build tree is never read. A file in those dirs that is no `ar` archive (a
 /// linker script) cannot be bundled, so it is no candidate.
+#[cfg(test)]
 fn unaudited_native_bundle(
     args: &RustcArgs,
     artifacts: &ArtifactSet,
     native: &crate::cache_key::KeyedNativeArchives,
+) -> Result<Option<String>> {
+    audit_native_bundle(args, artifacts, native, None)
+}
+
+fn audit_native_bundle(
+    args: &RustcArgs,
+    artifacts: &ArtifactSet,
+    native: &crate::cache_key::KeyedNativeArchives,
+    loose_coff: Option<&mut bool>,
 ) -> Result<Option<String>> {
     if !crate::cache_key::needs_native_bundle_audit(args, &native.dirs) {
         return Ok(None);
@@ -6540,8 +6589,15 @@ fn unaudited_native_bundle(
     else {
         return Ok(None);
     };
-    let members = without_import_members(&crate::native_archive::members(&rlib.path)?);
+    let rlib_members = crate::native_archive::members(&rlib.path)?;
+    let members = without_import_members(&rlib_members);
     let keyed = bundle_credits(&native.bundled)?;
+    if let Some(proof) = loose_coff {
+        *proof = !rlib_members
+            .iter()
+            .any(|member| crate::cache_key::is_native_archive_path(Path::new(&member.name)))
+            && certifies_loose_coff(&members, &keyed);
+    }
     if unkeyed_rlib_members(&members, &keyed).is_empty() {
         return Ok(None);
     }
@@ -6556,6 +6612,33 @@ fn unaudited_native_bundle(
         }
     }
     Ok(unaudited_bundled_member(&members, &keyed, &candidates))
+}
+
+/// Rustc also packs cfg-dependent source-level #[link] libraries, which need
+/// not appear as packed in argv. A packed library is a member named after
+/// the archive itself. Certify only outputs carrying the declared inputs as
+/// individual members, with no embedded archive. Others retain the raw key.
+fn certifies_loose_coff(members: &[String], credits: &[String]) -> bool {
+    let mut available = std::collections::HashMap::<&str, usize>::new();
+    for name in members {
+        *available.entry(name).or_default() += 1;
+    }
+    let mut objects = credits
+        .iter()
+        .filter(|name| {
+            !matches!(name.as_str(), "/" | "//" | "/SYM64/") && !name.starts_with("__.SYMDEF")
+        })
+        .peekable();
+    objects.peek().is_some()
+        && objects.all(|name| {
+            available.get_mut(name.as_str()).is_some_and(|count| {
+                if *count == 0 {
+                    return false;
+                }
+                *count -= 1;
+                true
+            })
+        })
 }
 
 /// The names of the rlib members an archive the key hashed accounts for:
@@ -6825,7 +6908,12 @@ fn adaptive_compile_before_key(
             return true;
         };
         let lookup_start = std::time::Instant::now();
-        let stored = rustc_diagnostics::usable_entry(ctx.store, ctx.args, &keyed.cache_key);
+        let stored = rustc_diagnostics::usable_entry(
+            ctx.store,
+            ctx.args,
+            &keyed.cache_key,
+            keyed.outputs.loose_coff_key.as_deref(),
+        );
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
         (key_ms, key_hash_stats, _) = combine_key_measurements(
             key_ms,
@@ -7023,8 +7111,13 @@ fn compile_before_key(
             };
             let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
             let stored = keyed.ok().is_some_and(|keyed| {
-                rustc_diagnostics::usable_entry(ctx.store, args, &keyed.cache_key)
-                    .is_ok_and(|entry| entry.is_some())
+                rustc_diagnostics::usable_entry(
+                    ctx.store,
+                    args,
+                    &keyed.cache_key,
+                    keyed.outputs.loose_coff_key.as_deref(),
+                )
+                .is_ok_and(|entry| entry.is_some())
             });
             if stored {
                 hit_closure = Some((dep_info, tree.clone()));
@@ -7800,7 +7893,10 @@ fn try_rustc_remote_hit(
     key: &crate::cache_key::KeyOutputs,
     key_record: &KeyEventRecord,
 ) -> Option<Result<()>> {
-    for entry_key in rustc_diagnostics::lookup_keys(hit.args, cache_key) {
+    for entry_key in std::iter::once(cache_key)
+        .chain(key.loose_coff_key.as_deref())
+        .flat_map(|candidate| rustc_diagnostics::lookup_keys(hit.args, candidate))
+    {
         let Some((meta, result)) = acquire_entry(
             hit.config,
             store,

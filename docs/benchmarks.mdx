@@ -310,6 +310,11 @@ validation, dependency discovery, file hashing, scheduler waits, compiler
 execution, local lookups, and Rust artifact restoration. Nested spans include
 their children; summing them double-counts that work.
 
+To time a compiler probe that passes through, set `KACHE_PHASE_TRACE_DIR` to an
+empty directory and run the probe. In its trace, `cc_preflight` times Kache's
+cacheability check. `cc_passthrough_compiler` covers launching and waiting for
+the selected C/C++ compiler when Kache runs it directly.
+
 Outside the benchmark, set `KACHE_PHASE_TRACE_DIR=/tmp/kache-phases` when
 running Cargo through Kache. Each wrapper writes its own trace on return.
 The trace covers the wrapper's calling thread only: it leaves out CLI startup

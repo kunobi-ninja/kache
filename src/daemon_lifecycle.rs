@@ -16,13 +16,15 @@ pub enum Ensured {
     AlreadyRunning(Option<String>),
     /// This call started or replaced the daemon, and it is ready.
     Started,
+    /// Another process owns startup. The compiler client can proceed locally.
+    StartingElsewhere,
     /// No daemon became ready in time.
     TimedOut,
 }
 
 impl Ensured {
     pub fn is_ready(&self) -> bool {
-        !matches!(self, Ensured::TimedOut)
+        matches!(self, Ensured::Started | Ensured::AlreadyRunning(_))
     }
 }
 
@@ -43,6 +45,14 @@ fn ensured_after_replacement(
 }
 
 pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
+    ensure_with_lock(config, force, true)
+}
+
+pub(super) fn start_for_compiler(config: &Config) -> Result<Ensured> {
+    ensure_with_lock(config, false, false)
+}
+
+fn ensure_with_lock(config: &Config, force: bool, wait_for_starter: bool) -> Result<Ensured> {
     // Fail before starting a daemon that could never bind its sockets. The
     // control endpoint's path is derived from the socket's, so check both.
     let socket = config.available_socket_path()?;
@@ -58,11 +68,20 @@ pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
         ));
     }
     super::prepare_daemon_socket_dir(config, &socket)?;
-    let Some(lock) = kunobi_daemon::readiness::wait_until(deadline, |_| {
-        ProcessLock::try_acquire(socket.with_extension("lock"))
-    })?
-    else {
-        return Ok(Ensured::TimedOut);
+    let start_lock = socket.with_extension("lock");
+    let lock = if wait_for_starter {
+        let Some(lock) = kunobi_daemon::readiness::wait_until(deadline, |_| {
+            ProcessLock::try_acquire(&start_lock)
+        })?
+        else {
+            return Ok(Ensured::TimedOut);
+        };
+        lock
+    } else {
+        let Some(lock) = ProcessLock::try_acquire(&start_lock)? else {
+            return Ok(Ensured::StartingElsewhere);
+        };
+        lock
     };
     let mut driver = KacheReplacement {
         config,

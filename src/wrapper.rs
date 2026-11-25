@@ -2194,8 +2194,10 @@ fn run_cc_inner(
     // Refuse-to-cache check: non-empty = this invocation isn't a
     // cacheable single-source `-c` compile (link mode, multi-arch,
     // PCH, modules, etc. — see CcArgs::refuse_reasons). Passthrough.
-    let trace_preflight = crate::phase_trace::phase("cc_preflight");
-    let refuse = compiler.refuse_reasons(&parsed);
+    let refuse = {
+        let _trace = crate::phase_trace::phase("cc_preflight");
+        compiler.refuse_reasons(&parsed)
+    };
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
@@ -2249,7 +2251,6 @@ fn run_cc_inner(
             format!("source excluded: {}", source.display()),
         );
     }
-    drop(trace_preflight);
 
     let trace_store_open = crate::phase_trace::phase("store_open");
     let (store, fallback_stores) =
@@ -2964,6 +2965,7 @@ fn cc_passthrough_impl(
     // existing output path (#645).
     refuse_legacy_cc_blob_outputs(config, parsed)?;
     crate::opcounts::record_compiler_run();
+    let _trace = crate::phase_trace::phase("cc_passthrough_compiler");
     let status = crate::invocation::io::status(
         parsed
             .invocation_env

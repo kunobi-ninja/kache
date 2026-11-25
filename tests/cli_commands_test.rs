@@ -4318,6 +4318,51 @@ fn daemon_status_subcommand_succeeds() {
     );
 }
 
+#[test]
+fn compiler_bootstrap_yields_to_another_starter_and_recovers() {
+    let e = env();
+    let runtime = e.cache.join("private-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let lock = || {
+        kunobi_daemon::ProcessLock::try_acquire(runtime.join("daemon.lock"))
+            .unwrap()
+            .unwrap()
+    };
+    let start = || {
+        e.cmd()
+            .env("KACHE_RUNTIME_DIR", &runtime)
+            .args(["daemon", "start", "--if-idle"])
+            .output()
+            .unwrap()
+    };
+    let held = lock();
+    let busy = start();
+    assert!(!busy.status.success());
+    assert!(
+        String::from_utf8_lossy(&busy.stderr).contains("another process is starting the daemon")
+    );
+    drop(held);
+
+    let ready = start();
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let held = lock();
+    let existing = start();
+    drop(held);
+    let stopped = e
+        .cmd()
+        .env("KACHE_RUNTIME_DIR", &runtime)
+        .args(["daemon", "stop"])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(existing.status.success());
+    assert!(String::from_utf8_lossy(&existing.stderr).contains("daemon already running"));
+}
+
 /// kache-action looks for `<KACHE_RUNTIME_DIR>/daemon.sock`, spelled out in
 /// full, in `kache daemon status` to tell whether a release honors the
 /// runtime directory. On GitHub runners that directory is under $HOME, so the

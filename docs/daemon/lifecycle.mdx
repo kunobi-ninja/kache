@@ -14,6 +14,10 @@ kache daemon run         # foreground process
 kache daemon log         # follow logs
 ```
 
+On Windows, if another process already owns daemon startup, a compiler wrapper
+can run that invocation locally. The next invocation tries the daemon again.
+An explicit `kache daemon start` still waits for readiness.
+
 Use `KACHE_LOG=kache=debug kache daemon run` for foreground debugging. Stop the background daemon first with `kache daemon stop`: while another daemon serves this cache, `kache daemon run` exits at once.
 
 When an installed service manages this cache, `start`, `restart` and automatic starts start the service instead of spawning a process. On macOS, Kache loads the job with `launchctl bootstrap` if launchd no longer has it.

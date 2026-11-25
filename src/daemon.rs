@@ -9777,6 +9777,11 @@ pub fn start(config: &Config) -> Result<Ensured> {
     lifecycle_client::ensure_outcome(config, false)
 }
 
+/// The thin compiler client can run locally while a different process starts the daemon.
+pub fn start_for_compiler(config: &Config) -> Result<Ensured> {
+    lifecycle_client::start_for_compiler(config)
+}
+
 /// Drain and replace this cache's daemon through the shared exclusive coordinator.
 /// Returns true only after the replacement answers a compatible readiness probe.
 pub fn restart(config: &Config) -> Result<bool> {

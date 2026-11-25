@@ -1382,14 +1382,60 @@ pub async fn create_backend_for(
 ) -> Result<Arc<dyn RemoteBackend>> {
     let backend =
         create_backend_with_upload_timeout(remote, pool_idle_secs, upload_timeout_secs).await?;
-    Ok(match pull_request_prefix {
-        Some(pull_request) => Arc::new(PullRequestBackend {
-            inner: backend,
-            base: remote.prefix.clone(),
-            pull_request: pull_request.to_string(),
-        }),
-        None => backend,
-    })
+    let Some(prefix) = pull_request_prefix else {
+        return Ok(backend);
+    };
+    let writer: Arc<dyn RemoteBackend> = if let RemoteBackendConfig::S3(base) = &remote.backend
+        && let Some(bucket) = &base.pull_request_bucket
+    {
+        let pr = S3RemoteConfig {
+            bucket: bucket.clone(),
+            pull_request_bucket: None,
+            ..base.clone()
+        };
+        let keys = pull_request_s3_keys(
+            std::env::var("KACHE_PULL_REQUEST_S3_ACCESS_KEY").ok(),
+            std::env::var("KACHE_PULL_REQUEST_S3_SECRET_KEY").ok(),
+        )?
+        .or_else(kache_s3_keys);
+        Arc::new(s3_backend_with_upload_timeout(
+            &pr,
+            pool_idle_secs,
+            keys,
+            upload_timeout_secs,
+        )?)
+    } else {
+        Arc::clone(&backend)
+    };
+    Ok(Arc::new(PullRequestBackend {
+        reader: backend,
+        writer,
+        base: remote.prefix.clone(),
+        pull_request: prefix.to_owned(),
+    }))
+}
+
+// A partial pair must never silently fall back to a different authority.
+fn pull_request_s3_keys(
+    access: Option<String>,
+    secret: Option<String>,
+) -> Result<Option<Credential>> {
+    match (access, secret) {
+        (None, None) => Ok(None),
+        (Some(access_key_id), Some(secret_access_key))
+            if !access_key_id.is_empty() && !secret_access_key.is_empty() =>
+        {
+            Ok(Some(Credential {
+                access_key_id,
+                secret_access_key,
+                session_token: None,
+                expires_in: None,
+            }))
+        }
+        _ => anyhow::bail!(
+            "set both KACHE_PULL_REQUEST_S3_ACCESS_KEY and KACHE_PULL_REQUEST_S3_SECRET_KEY"
+        ),
+    }
 }
 
 /// The remote as a pull request job sees it. Every key names an object under
@@ -1399,7 +1445,8 @@ pub async fn create_backend_for(
 /// Merged objects (manifests, shards) are read and written under the pull
 /// request prefix only, so their conditional updates stay consistent.
 pub struct PullRequestBackend {
-    inner: Arc<dyn RemoteBackend>,
+    reader: Arc<dyn RemoteBackend>,
+    writer: Arc<dyn RemoteBackend>,
     base: String,
     pull_request: String,
 }
@@ -1427,13 +1474,17 @@ impl PullRequestBackend {
 #[async_trait]
 impl RemoteBackend for PullRequestBackend {
     async fn head(&self, key: &str) -> Result<bool> {
-        Ok(self.inner.head(key).await? || self.inner.head(&self.pull_request_key(key)).await?)
+        Ok(self.reader.head(key).await? || self.writer.head(&self.pull_request_key(key)).await?)
     }
 
     async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>> {
-        match self.inner.get(key, max_bytes).await? {
+        match self.reader.get(key, max_bytes).await? {
             Some(object) => Ok(Some(object)),
-            None => self.inner.get(&self.pull_request_key(key), max_bytes).await,
+            None => {
+                self.writer
+                    .get(&self.pull_request_key(key), max_bytes)
+                    .await
+            }
         }
     }
 
@@ -1445,10 +1496,10 @@ impl RemoteBackend for PullRequestBackend {
     ) -> Result<Option<GetTransfer>> {
         // A missing object is reported before any bytes are written, so the
         // second read starts from an untouched `destination`.
-        match self.inner.get_into(key, max_bytes, destination).await? {
+        match self.reader.get_into(key, max_bytes, destination).await? {
             Some(transfer) => Ok(Some(transfer)),
             None => {
-                self.inner
+                self.writer
                     .get_into(&self.pull_request_key(key), max_bytes, destination)
                     .await
             }
@@ -1460,7 +1511,7 @@ impl RemoteBackend for PullRequestBackend {
         key: &str,
         max_bytes: Option<u64>,
     ) -> Result<Option<(GetObject, Option<String>)>> {
-        self.inner
+        self.writer
             .get_versioned(&self.pull_request_key(key), max_bytes)
             .await
     }
@@ -1472,13 +1523,13 @@ impl RemoteBackend for PullRequestBackend {
         content_type: Option<&str>,
         expected: Option<&str>,
     ) -> Result<ConditionalPut> {
-        self.inner
+        self.writer
             .put_if_match(&self.pull_request_key(key), body, content_type, expected)
             .await
     }
 
     async fn put(&self, key: &str, body: bytes::Bytes, content_type: Option<&str>) -> Result<()> {
-        self.inner
+        self.writer
             .put(&self.pull_request_key(key), body, content_type)
             .await
     }
@@ -1489,14 +1540,14 @@ impl RemoteBackend for PullRequestBackend {
         body: bytes::Bytes,
         content_type: Option<&str>,
     ) -> Result<PutIfAbsentResult> {
-        self.inner
+        self.writer
             .put_if_absent(&self.pull_request_key(key), body, content_type)
             .await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = self.inner.list(prefix).await?;
-        let pull_request = self.inner.list(&self.pull_request_key(prefix)).await?;
+        let mut keys = self.reader.list(prefix).await?;
+        let pull_request = self.writer.list(&self.pull_request_key(prefix)).await?;
         keys.extend(pull_request.iter().map(|key| self.base_key(key)));
         keys.sort();
         keys.dedup();
@@ -1504,7 +1555,7 @@ impl RemoteBackend for PullRequestBackend {
     }
 
     fn describe(&self, key: &str) -> String {
-        self.inner.describe(key)
+        self.reader.describe(key)
     }
 }
 
@@ -1821,10 +1872,127 @@ mod tests {
 
     fn pull_request_view(inner: Arc<dyn RemoteBackend>) -> PullRequestBackend {
         PullRequestBackend {
-            inner,
+            reader: Arc::clone(&inner),
+            writer: inner,
             base: "artifacts".to_string(),
             pull_request: "artifacts-pr".to_string(),
         }
+    }
+
+    #[test]
+    fn pull_request_credentials_require_a_complete_nonempty_pair() {
+        assert!(pull_request_s3_keys(None, None).unwrap().is_none());
+        for (access, secret) in [
+            (Some("key"), None),
+            (None, Some("secret")),
+            (Some(""), Some("secret")),
+            (Some("key"), Some("")),
+        ] {
+            assert!(
+                pull_request_s3_keys(access.map(str::to_owned), secret.map(str::to_owned)).is_err()
+            );
+        }
+        let keys = pull_request_s3_keys(Some("pr-key".into()), Some("pr-secret".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys.access_key_id, "pr-key");
+        assert_eq!(keys.secret_access_key, "pr-secret");
+    }
+
+    #[tokio::test]
+    async fn separate_pr_bucket_signs_reads_and_writes_with_their_own_keys() {
+        let (endpoint, requests) = mock_http_server(vec![
+            http_response("404 Not Found", ""),
+            http_response("200 OK", "pr"),
+            http_response("200 OK", ""),
+        ])
+        .await;
+        let remote = RemoteConfig {
+            prefix: "cache".into(),
+            restore_max_size: 1024,
+            backend: RemoteBackendConfig::S3(S3RemoteConfig {
+                bucket: "base-store".into(),
+                pull_request_bucket: Some("pr-store".into()),
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                profile: None,
+                user_agent: None,
+            }),
+        };
+        let backend = {
+            let _lock = crate::test_support::process_state_test_lock();
+            let _base = ScopedEnvVar::set("KACHE_S3_ACCESS_KEY", "mock-base-key");
+            let _base_secret = ScopedEnvVar::set("KACHE_S3_SECRET_KEY", "mock-base-secret");
+            let _pr = ScopedEnvVar::set("KACHE_PULL_REQUEST_S3_ACCESS_KEY", "mock-pr-key");
+            let _pr_secret =
+                ScopedEnvVar::set("KACHE_PULL_REQUEST_S3_SECRET_KEY", "mock-pr-secret");
+            futures::executor::block_on(create_backend_for(&remote, Some("cache"), 30, 30)).unwrap()
+        };
+        assert_eq!(
+            backend
+                .get("cache/a", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .as_ref(),
+            b"pr"
+        );
+        backend.put("cache/b", "new".into(), None).await.unwrap();
+        let requests = requests.await.unwrap();
+        for (request, (method_path, key)) in requests.iter().zip([
+            ("GET /base-store/cache/a ", "mock-base-key"),
+            ("GET /pr-store/cache/a ", "mock-pr-key"),
+            ("PUT /pr-store/cache/b ", "mock-pr-key"),
+        ]) {
+            assert!(request.starts_with(method_path), "{request}");
+            assert!(request.contains(&format!("Credential={key}/")), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn separate_pull_request_bucket_isolates_writes_even_at_the_same_prefix() {
+        let reader: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+        let writer: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
+        let view = PullRequestBackend {
+            reader: reader.clone(),
+            writer: writer.clone(),
+            base: "cache".into(),
+            pull_request: "cache".into(),
+        };
+        reader.put("cache/a", "base".into(), None).await.unwrap();
+        view.put("cache/a", "pr".into(), None).await.unwrap();
+        assert_eq!(
+            view.get("cache/a", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .as_ref(),
+            b"base"
+        );
+        assert_eq!(
+            view.get_versioned("cache/a", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .body
+                .as_ref(),
+            b"pr"
+        );
+        view.put_if_absent("cache/b", "pr-only".into(), None)
+            .await
+            .unwrap();
+        assert!(!reader.head("cache/b").await.unwrap());
+        let mut output = Vec::new();
+        view.get_into("cache/b", None, &mut output)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, b"pr-only");
+        assert!(view.head("cache/b").await.unwrap());
+        assert_eq!(view.list("cache/").await.unwrap(), ["cache/a", "cache/b"]);
     }
 
     #[tokio::test]
@@ -2262,6 +2430,7 @@ mod tests {
     #[tokio::test]
     async fn s3_operator_builds_with_profile_and_custom_endpoint() {
         let config = S3RemoteConfig {
+            pull_request_bucket: None,
             bucket: "bucket".to_string(),
             endpoint: Some("http://127.0.0.1:9000".to_string()),
             region: "us-east-1".to_string(),
@@ -3239,6 +3408,7 @@ mod tests {
     /// `KACHE_S3_*` keys read the way `create_backend` reads them.
     fn backend_with_kache_keys(endpoint: String, user_agent: Option<&str>) -> OpenDalBackend {
         let config = S3RemoteConfig {
+            pull_request_bucket: None,
             bucket: "bucket".to_string(),
             endpoint: Some(endpoint),
             region: "us-east-1".to_string(),
@@ -3332,6 +3502,7 @@ mod tests {
         let (endpoint, _requests) =
             mock_http_server(vec![http_response("404 Not Found", "")]).await;
         let config = S3RemoteConfig {
+            pull_request_bucket: None,
             bucket: "bucket".to_string(),
             endpoint: Some(endpoint),
             region: "us-east-1".to_string(),
@@ -3434,6 +3605,7 @@ mod tests {
     async fn s3_upload_response_timeout_is_configurable_and_does_not_change_reads() {
         let (endpoint, server) = delayed_upload_response_server(Duration::from_millis(200)).await;
         let config = S3RemoteConfig {
+            pull_request_bucket: None,
             bucket: "test".into(),
             endpoint: Some(endpoint),
             region: "us-east-1".into(),

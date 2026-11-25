@@ -25,6 +25,10 @@ pub const DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS: u64 = 60;
 /// blank. It must differ from `base` and neither may contain the other, so
 /// that nothing a pull request writes is ever under the base prefix.
 pub fn pull_request_prefix_for(base: &str, configured: &str) -> Result<Option<String>> {
+    scoped_prefix(base, configured, false)
+}
+
+fn scoped_prefix(base: &str, configured: &str, separate_bucket: bool) -> Result<Option<String>> {
     let configured = configured.trim();
     if configured.is_empty() {
         return Ok(None);
@@ -34,7 +38,8 @@ pub fn pull_request_prefix_for(base: &str, configured: &str) -> Result<Option<St
         outer.is_empty() || inner == outer || inner.starts_with(&format!("{outer}/"))
     };
     anyhow::ensure!(
-        !prefix.is_empty() && !nested(base, &prefix) && !nested(&prefix, base),
+        !prefix.is_empty()
+            && (separate_bucket || (!nested(base, &prefix) && !nested(&prefix, base))),
         "pull_request_prefix {prefix:?} must differ from the remote prefix {base:?} and \
          neither may contain the other"
     );
@@ -789,6 +794,8 @@ pub struct GcsRemoteConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3RemoteConfig {
+    /// Separate destination for a pull request job; shares the base endpoint and region.
+    pub pull_request_bucket: Option<String>,
     pub bucket: String,
     pub endpoint: Option<String>,
     pub region: String,
@@ -832,6 +839,17 @@ impl Config {
     }
 }
 
+// Bucket isolation relies on distinct storage namespaces. Reject aliases, URLs,
+// access-point ARNs and path components in either name in this mode.
+fn valid_isolated_bucket(name: &str) -> bool {
+    let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    (3..=63).contains(&name.len())
+        && name.bytes().next().is_some_and(alnum)
+        && name.bytes().last().is_some_and(alnum)
+        && name.bytes().all(|b| alnum(b) || b == b'-' || b == b'.')
+        && !name.contains("..")
+}
+
 impl RemoteConfig {
     /// Stable machine-readable backend name for the JSON report.
     pub fn backend_kind(&self) -> &'static str {
@@ -864,6 +882,7 @@ impl RemoteConfig {
             restore_max_size: DEFAULT_RESTORE_MAX_SIZE,
             prefix: prefix.to_string(),
             backend: RemoteBackendConfig::S3(S3RemoteConfig {
+                pull_request_bucket: None,
                 bucket: bucket.to_string(),
                 endpoint: None,
                 region: "us-east-1".to_string(),
@@ -1197,6 +1216,8 @@ pub struct RemoteFileConfig {
     pub atomic_write_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request_bucket: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1484,6 +1505,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PREFETCH_ENABLED",
     "KACHE_REMOTE_KEY_LISTING",
     "KACHE_PULL_REQUEST_PREFIX",
+    "KACHE_PULL_REQUEST_BUCKET",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
     "KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS",
@@ -1583,6 +1605,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_PULL_REQUEST_PREFIX",
         "cache.remote.pull_request_prefix",
+    ),
+    (
+        "KACHE_PULL_REQUEST_BUCKET",
+        "cache.remote.pull_request_bucket",
     ),
     ("KACHE_PREFETCH_MAX_KEYS", "cache.prefetch_max_keys"),
     ("KACHE_PREFETCH_MAX_BYTES", "cache.prefetch_max_bytes"),
@@ -2614,9 +2640,10 @@ impl Config {
         }
         let remote_key_listing = explicit_remote_key_listing
             .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
-        let pull_request_prefix =
-            if crate::policy::pull_request_job_with(|name| invocation.var(name).ok()) {
-                remote.as_ref().and_then(|remote| {
+        let pull_request_prefix = if crate::policy::pull_request_job_with(|name| {
+            invocation.var(name).ok()
+        }) {
+            remote.as_ref().and_then(|remote| {
                     if matches!(remote.backend, RemoteBackendConfig::Oci(_)) {
                         tracing::warn!(
                             "OCI pull request jobs stay read-only: tags in one repository share \
@@ -2635,7 +2662,8 @@ impl Config {
                                     .and_then(|cache| cache.remote.as_ref())
                                     .and_then(|remote| remote.pull_request_prefix.clone())
                             })?;
-                    match pull_request_prefix_for(&remote.prefix, &configured) {
+                    let separate_bucket = matches!(&remote.backend, RemoteBackendConfig::S3(s3) if s3.pull_request_bucket.is_some());
+                    match scoped_prefix(&remote.prefix, &configured, separate_bucket) {
                         Ok(prefix) => prefix,
                         Err(error) => {
                             tracing::warn!("{error:#}; this pull request job stays read-only");
@@ -2643,9 +2671,9 @@ impl Config {
                         }
                     }
                 })
-            } else {
-                None
-            };
+        } else {
+            None
+        };
         if pull_request_prefix.is_some()
             && !Self::remote_readonly_enabled_for(invocation, &file_config)
         {
@@ -3051,11 +3079,27 @@ impl Config {
             .filter(|v| !v.is_empty())
             .map(str::to_ascii_lowercase);
 
-        let file_has_s3_fields = file_remote.is_some_and(|r| {
-            [&r.bucket, &r.endpoint, &r.region, &r.profile, &r.user_agent]
-                .into_iter()
-                .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
-        });
+        let pull_request_bucket =
+            crate::policy::pull_request_job_with(|name| invocation.var(name).ok())
+                .then(|| {
+                    env_or_ignored_for(invocation, "KACHE_PULL_REQUEST_BUCKET", ignore_env)
+                        .ok()
+                        .or_else(|| {
+                            file_remote.and_then(|remote| remote.pull_request_bucket.clone())
+                        })
+                })
+                .flatten();
+        if pull_request_bucket.is_some()
+            && configured_type.as_deref().is_some_and(|kind| kind != "s3")
+        {
+            anyhow::bail!("pull_request_bucket requires an S3 remote");
+        }
+        let file_has_s3_fields = pull_request_bucket.is_some()
+            || file_remote.is_some_and(|r| {
+                [&r.bucket, &r.endpoint, &r.region, &r.profile, &r.user_agent]
+                    .into_iter()
+                    .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
+            });
         let file_has_filesystem_fields = file_remote.is_some_and(|r| {
             [&r.path, &r.atomic_write_dir]
                 .into_iter()
@@ -3228,10 +3272,17 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        if let Some(pr) = &pull_request_bucket {
+            anyhow::ensure!(
+                pr != &bucket && valid_isolated_bucket(pr) && valid_isolated_bucket(&bucket),
+                "pull_request_bucket requires two distinct, plain S3 bucket names"
+            );
+        }
         Ok(Some(RemoteConfig {
             restore_max_size: DEFAULT_RESTORE_MAX_SIZE,
             prefix,
             backend: RemoteBackendConfig::S3(S3RemoteConfig {
+                pull_request_bucket,
                 bucket,
                 endpoint,
                 region,
@@ -4206,7 +4257,26 @@ impl Config {
     /// directory and a store.
     fn pull_request_scope(&self) -> Option<String> {
         self.pull_request_prefix.as_ref().map(|prefix| {
-            let hash = blake3::hash(prefix.as_bytes()).to_hex();
+            let mut scope = blake3::Hasher::new();
+            if let Some(RemoteConfig {
+                backend: RemoteBackendConfig::S3(s3),
+                ..
+            }) = &self.remote
+                && let Some(bucket) = &s3.pull_request_bucket
+            {
+                for segment in [
+                    "s3-pr-bucket",
+                    s3.endpoint.as_deref().unwrap_or(""),
+                    &s3.region,
+                    &s3.bucket,
+                    bucket,
+                ] {
+                    scope.update(segment.as_bytes());
+                    scope.update(&[0]);
+                }
+            }
+            scope.update(prefix.as_bytes());
+            let hash = scope.finalize().to_hex();
             format!("pr-{}", &hash[..8])
         })
     }

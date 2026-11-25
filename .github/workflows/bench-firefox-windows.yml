@@ -1,40 +1,42 @@
-name: Windows native qualification
+name: Windows ARM64 configure probe comparison
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
   conftest:
-    name: Native Windows ARM64 configure probes
+    name: Released and corrected bootstrap on Windows ARM64
     runs-on: windows-11-arm
-    timeout-minutes: 25
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      RUSTUP_TOOLCHAIN: 1.100.0-aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
-      - run: python .github/validation/arm-conftest.py
+          path: verification
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: 4926bda69cde7aed3f55cd1fd435118f54762c07
+          persist-credentials: false
+          path: source
+      - name: Build native client and engine from the candidate
+        working-directory: source
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc -vV
+          cargo build --locked --bin kache --bin kache-engine
+      - name: Compare the released client and candidate on the same machine
+        shell: pwsh
+        run: |
+          $env:CANDIDATE_KACHE = (Resolve-Path source/target/debug/kache.exe).Path
+          python verification/.github/validation/arm-conftest.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: windows-arm-conftest
-          path: arm-conftest.json
+          name: windows-arm-conftest-comparison
+          path: arm-conftest-*.json
           retention-days: 7
-  refs:
-    name: Native ReFS fingerprint
-    runs-on: windows-2025
-    timeout-minutes: 40
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          path: verification
-          persist-credentials: false
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          ref: d2e2b93a8fe91432856b304dfbe8d88cbe84ba3c
-          path: source
-          persist-credentials: false
-      - name: Exercise real ReFS file identity
-        working-directory: source
-        shell: pwsh
-        run: '& ../verification/.github/validation/refs.ps1'

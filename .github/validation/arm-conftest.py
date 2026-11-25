@@ -42,9 +42,9 @@ def native_clang():
     return next(p for p in candidates if p.is_file() and image_machine(p) == ARM64)
 
 
-def main():
+def measure(name, candidate=None):
     root = Path(tempfile.mkdtemp(prefix="kache-arm-", dir=os.environ["RUNNER_TEMP"]))
-    out = Path(os.environ["GITHUB_WORKSPACE"]) / "arm-conftest.json"
+    out = Path(os.environ["GITHUB_WORKSPACE"]) / f"arm-conftest-{name}.json"
     observations = []
     env = {k: v for k, v in os.environ.items() if not k.startswith("KACHE_")}
     env.update(KACHE_CONFIG=str(root / "config.toml"), KACHE_CACHE_DIR=str(root / "cache"),
@@ -53,13 +53,18 @@ def main():
     (root / "runtime").mkdir()
     (root / "sdk").mkdir()
     assert os.environ["RUNNER_ARCH"] == "ARM64", platform.machine()
-    archive = root / ARCHIVE
-    urllib.request.urlretrieve(f"https://github.com/kunobi-ninja/kache/releases/download/{VERSION}/{ARCHIVE}", archive)
-    assert hashlib.sha256(archive.read_bytes()).hexdigest() == SHA256
-    with ZipFile(archive) as release:
-        release.extractall(root / "tool")
-    binary = next((root / "tool").rglob("kache.exe"))
-    engine = next((root / "tool").rglob("kache-engine.exe"))
+    if candidate is None:
+        archive = root / ARCHIVE
+        urllib.request.urlretrieve(f"https://github.com/kunobi-ninja/kache/releases/download/{VERSION}/{ARCHIVE}", archive)
+        assert hashlib.sha256(archive.read_bytes()).hexdigest() == SHA256
+        with ZipFile(archive) as release:
+            release.extractall(root / "tool")
+        binary = next((root / "tool").rglob("kache.exe"))
+    else:
+        binary = Path(candidate).resolve(strict=True)
+    engine = binary.with_name("kache-engine.exe")
+    print("arm", name, "kache_sha256", hashlib.sha256(binary.read_bytes()).hexdigest(),
+          "engine_sha256", hashlib.sha256(engine.read_bytes()).hexdigest(), flush=True)
     assert image_machine(binary) == image_machine(engine) == ARM64
     compiler = native_clang()
     (root / "conftest.c").write_text("int probe(void) {return 17;}\n")
@@ -69,7 +74,7 @@ def main():
         result = subprocess.run(argv, cwd=root, env=env, capture_output=True, timeout=42)
         elapsed = round((time.monotonic() - start) * 1000, 1)
         item = {"phase": label, "wall_ms": elapsed, "exit_code": result.returncode}
-        if "compile" not in label:
+        if not label.endswith("_compile"):
             item["detail"] = (result.stdout + result.stderr).decode(errors="replace").strip()[:400]
         observations.append(item)
         print(json.dumps(item), flush=True)
@@ -117,8 +122,21 @@ def main():
             finally:
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-        run("recovered_start", [binary, "daemon", "start"])
         compile_probe("recovered")
+        recovered = run("recovered_start", [binary, "daemon", "start"])
+        assert "already running" in recovered.get("detail", "")
+        assert run("version_after_recovery", [binary, "--version"])["detail"] == "kache 2.3.1"
+        if candidate is not None:
+            rustc = subprocess.check_output(["rustup", "which", "rustc"], text=True).strip()
+            (root / "sanity.rs").write_text("pub fn sanity() -> u32 { 17 }\n")
+            run("rustc_smoke", [binary, rustc, "--crate-type=lib", "sanity.rs", "-o", "libsanity.rlib"])
+            assert (root / "libsanity.rlib").is_file()
+        blocked = [o for o in observations if o["phase"] == "contended_compile"]
+        assert all(o["event"]["result"] == "passthrough" for o in blocked)
+        if candidate is None:
+            assert all(o["wall_ms"] >= 7000 for o in blocked)
+        else:
+            assert all(o["wall_ms"] < 2500 and o["event"]["startup_ms"] < 2000 for o in blocked)
     finally:
         with contextlib.suppress(Exception):
             run("cleanup", [binary, "daemon", "stop"], expected=None)
@@ -126,4 +144,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    measure("release")
+    measure("candidate", os.environ["CANDIDATE_KACHE"])

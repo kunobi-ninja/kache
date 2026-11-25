@@ -363,8 +363,15 @@ The regular cache cannot check for such values.
   run without a digest, sends the build through the regular build-script cache.
   `rustc-link-search` lines are replayed with Cargo's own `OUT_DIR`, so
   `cargo run` and `cargo test` still find libraries there.
-- The first run of a script records what it declares, so hermetic runs start
-  with the second.
+- A compiler can execute a proc macro re-exported by a Rust library. Kache
+  records which local libraries were built without macro dependencies and
+  checks their file identities before allowing a consumer to use sealed
+  outputs. A unit that can run a macro, or whose dependencies lack this
+  evidence, keeps a writable target directory. Kache runs its compiler to
+  recreate any files the macro produces.
+- When upgrading an existing store, a fresh target can build immediately. If
+  a macro consumer's target already links to a sealed run, Kache asks you to
+  run `cargo clean -p <package>` and rebuild before executing that macro.
 
 Registry and Git dependencies live under the Cargo home, so their keys match
 across worktrees. A workspace member's manifest directory is part of its key,

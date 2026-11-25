@@ -55,7 +55,9 @@ pub(crate) mod declarations;
 mod external;
 mod git;
 mod hermetic;
+pub(crate) use hermetic::ConsumerOutDir;
 pub(crate) mod inputs;
+pub(crate) mod macro_deps;
 mod outside;
 #[cfg(unix)]
 pub(crate) mod repair;

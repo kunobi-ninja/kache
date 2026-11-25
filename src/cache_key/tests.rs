@@ -11723,6 +11723,7 @@ fn fold_inputs(
         &NativeSearchDirs { native, framework },
         context,
         &FileHasher::new(),
+        false,
     )?;
     Ok((hasher.finalize().to_hex().to_string(), keyed))
 }
@@ -22676,6 +22677,67 @@ mod build_script_target_paths {
         }
     }
 
+    #[test]
+    fn only_msvc_rlibs_with_loose_native_objects_gain_an_alternate_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        let target = unit.workspace.join("target");
+        let out = Unit::out_dir(&target);
+        let path = out.join("libfoo.a");
+        let make_key = |extra: &[&str]| {
+            unit.key(
+                Some(&target),
+                Some(&out),
+                &[native(&out)],
+                "rlib",
+                extra,
+                None,
+            )
+        };
+        let ordinary = ["--target=x86_64-pc-windows-msvc", "-lstatic=foo"];
+        let mut original = crate::native_archive::indexed_coff_archive_for_tests(b"original");
+        std::fs::write(&path, &original).unwrap();
+        // cc-rs creates two names for identical bytes. Both the declared
+        // library and the archive scan contribute to both keys.
+        let alias = out.join("foo.lib");
+        std::fs::write(&alias, &original).unwrap();
+        let first = make_key(&ordinary);
+        let loose = first.1.loose_coff_key.unwrap();
+        original[8 + 16..8 + 28].copy_from_slice(b"1750000000  ");
+        for p in [&path, &alias] {
+            std::fs::write(p, &original).unwrap();
+        }
+        let rebuilt = make_key(&ordinary);
+        assert_ne!(first.0, rebuilt.0);
+        assert_eq!(rebuilt.1.loose_coff_key.as_deref(), Some(loose.as_str()));
+        for flags in [
+            vec![
+                "--target=x86_64-pc-windows-msvc",
+                "-lstatic:+whole-archive=foo",
+            ],
+            vec![
+                "--target=x86_64-pc-windows-msvc",
+                "-Zpacked-bundled-libs",
+                "-lstatic=foo",
+            ],
+            vec!["--target=x86_64-pc-windows-msvc"],
+            vec!["--target=x86_64-unknown-linux-gnu", "-lstatic=foo"],
+        ] {
+            assert!(make_key(&flags).1.loose_coff_key.is_none(), "{flags:?}");
+        }
+        let changed = crate::native_archive::indexed_coff_archive_for_tests(b"modified");
+        for p in [&path, &alias] {
+            std::fs::write(p, &changed).unwrap();
+        }
+        let changed = make_key(&ordinary);
+        assert_ne!(rebuilt.0, changed.0);
+        assert_ne!(changed.1.loose_coff_key.unwrap(), loose);
+        for p in [&path, &alias] {
+            std::fs::write(p, gnu_ar_named_object("other.obj", b"opaque")).unwrap();
+        }
+        assert!(make_key(&ordinary).1.loose_coff_key.is_none());
+    }
+
     fn native(path: &Path) -> String {
         format!("native={}", path.to_str().unwrap())
     }
@@ -24865,4 +24927,31 @@ fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
         "no file index where one is required"
     );
     assert!(may_carry_over(&anonymous, &anonymous_other, false));
+}
+
+#[test]
+fn separate_native_archive_transcripts_preserve_the_full_raw_key() {
+    fn transcript(key: &mut impl KeyFold) {
+        key.update(b"first");
+        key.update_variants(b"raw-1", b"loose-1");
+        key.update(b"both");
+        key.update_variants(b"raw-2", b"loose-2");
+        key.update(b"trailer");
+    }
+    let expected = blake3::hash(b"firstraw-1bothraw-2trailer");
+    let mut plain = blake3::Hasher::new();
+    transcript(&mut plain);
+    assert_eq!(
+        plain.finalize(),
+        expected,
+        "plain hasher must retain both raw inputs"
+    );
+
+    let mut key = GroupedHasher::new("archives");
+    transcript(&mut key);
+    assert_eq!(key.main.finalize(), expected);
+    assert_eq!(
+        key.loose_coff.unwrap().finalize(),
+        blake3::hash(b"firstloose-1bothloose-2trailer")
+    );
 }

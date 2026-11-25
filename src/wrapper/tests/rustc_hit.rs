@@ -163,12 +163,12 @@ fn shared_store_only_reuses_a_bound_entry_from_the_same_checkout() {
     let checkout = crate::embedded_checkout::Checkout::for_args(&first).unwrap();
     let bound = shared_key().bound_to_checkout(&checkout.identity);
     fixture.publish_under(&bound.key);
-    let (key, _) = rustc_diagnostics::usable_entry(&fixture.store, &first, CACHE_KEY)
+    let (key, _) = rustc_diagnostics::usable_entry(&fixture.store, &first, CACHE_KEY, None)
         .unwrap()
         .unwrap();
     assert_eq!(key, bound);
     assert!(
-        rustc_diagnostics::usable_entry(&fixture.store, &second, CACHE_KEY)
+        rustc_diagnostics::usable_entry(&fixture.store, &second, CACHE_KEY, None)
             .unwrap()
             .is_none()
     );
@@ -349,14 +349,14 @@ fn width_claim_keeps_the_lock_past_a_rendered_shared_entry() {
     // A piped compile's rendered entry cannot serve this width, so this
     // invocation compiles and must own the lock to store its own entry.
     let RustcClaim::Acquired(lock) =
-        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY, None).unwrap()
     else {
         panic!("a width must claim past a rendered shared entry");
     };
     drop(lock);
     let piped = Fixture::new();
     let RustcClaim::Committed(key, _) =
-        claim_rustc_build(&fixture.store, &piped.args, CACHE_KEY).unwrap()
+        claim_rustc_build(&fixture.store, &piped.args, CACHE_KEY, None).unwrap()
     else {
         panic!("a piped compile must use the piped entry");
     };
@@ -364,12 +364,12 @@ fn width_claim_keeps_the_lock_past_a_rendered_shared_entry() {
 
     fixture.publish_under(&width_key().key);
     let RustcClaim::Committed(key, _) =
-        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY, None).unwrap()
     else {
         panic!("a peer's entry for this width must be found");
     };
     assert_eq!(key, width_key());
-    let (key, _) = rustc_diagnostics::usable_entry(&fixture.store, &fixture.args, CACHE_KEY)
+    let (key, _) = rustc_diagnostics::usable_entry(&fixture.store, &fixture.args, CACHE_KEY, None)
         .unwrap()
         .unwrap();
     assert_eq!(key, width_key());
@@ -400,7 +400,7 @@ fn width_waiter_waits_past_a_rendered_shared_entry_for_its_own() {
         store.insert_entry_row_for_test(&width);
         drop(held);
     });
-    let (key, _) = wait_for_rustc_peer(&fixture.store, &fixture.args, CACHE_KEY)
+    let (key, _) = wait_for_rustc_peer(&fixture.store, &fixture.args, CACHE_KEY, None)
         .expect("the peer's entry for this width");
     assert_eq!(key, width_key());
     peer.join().unwrap();
@@ -413,7 +413,7 @@ fn a_claim_evicts_an_entry_without_files_and_builds() {
     fixture.meta.files.clear();
     fixture.publish();
     let RustcClaim::Acquired(_lock) =
-        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY).unwrap()
+        claim_rustc_build(&fixture.store, &fixture.args, CACHE_KEY, None).unwrap()
     else {
         panic!("an entry without files cannot be restored");
     };
@@ -443,7 +443,7 @@ fn a_waiter_whose_peer_stored_another_width_claims_the_build() {
     });
     // Nothing this width can use: it compiles, and must hold the lock to
     // store its own entry instead of compiling uncached.
-    let (lock, hit) = wait_then_claim_rustc(&fixture.store, &fixture.args, CACHE_KEY);
+    let (lock, hit) = wait_then_claim_rustc(&fixture.store, &fixture.args, CACHE_KEY, None);
     assert!(hit.is_none());
     assert!(lock.is_some(), "the waiter must claim the build");
     peer.join().unwrap();
@@ -1085,4 +1085,16 @@ fn unidentifiable_executable_entries_evict_only_the_writable_source() {
             }
         }
     }
+}
+
+#[test]
+fn a_peer_can_publish_its_loose_coff_key_while_holding_the_raw_key_lock() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let fixture = Fixture::new();
+    fixture.publish();
+    let raw = "1234567890123456789012345678901234567890123456789012345678901234";
+    let claim = claim_rustc_build(&fixture.store, &fixture.args, raw, Some(CACHE_KEY)).unwrap();
+    assert!(matches!(claim, RustcClaim::Committed(key,_) if key.key == CACHE_KEY));
+    let (_, hit) = wait_then_claim_rustc(&fixture.store, &fixture.args, raw, Some(CACHE_KEY));
+    assert_eq!(hit.unwrap().0.key, CACHE_KEY);
 }

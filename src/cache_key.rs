@@ -6770,10 +6770,7 @@ fn normalize_env_dep_value_with_hasher(
     // CARGO_MANIFEST_DIR is never forceable: rustc can embed it in crate
     // metadata and generated code, so erasing it from the key can restore an
     // rlib containing another checkout's path (#167).
-    let forced = !is_manifest_dir_var(var)
-        && path_normalizer.path_only_env_vars().iter().any(|entry| {
-            matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
-        });
+    let forced = forced_path_only_env(path_normalizer.path_only_env_vars(), crate_name, var);
     // The checks below read the resolved form. It is the raw value, and so
     // shares its canonical path, unless resolution changed the string.
     let resolved_value = (resolved != val).then(|| EnvDepValue::new(&resolved));
@@ -6931,6 +6928,14 @@ fn env_dep_path_only_decision(
         return EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof;
     }
     env_dep_source_decision(var, paths.source_files, file_hasher)
+}
+
+/// A scoped entry asserts that this crate only uses the variable as a locator.
+pub(crate) fn forced_path_only_env(entries: &[String], crate_name: &str, var: &str) -> bool {
+    !is_manifest_dir_var(var)
+        && entries
+            .iter()
+            .any(|entry| entry.split_once(':') == Some((crate_name, var)))
 }
 
 /// Whether `var` names Cargo's manifest dir. Windows matches environment

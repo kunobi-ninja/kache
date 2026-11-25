@@ -43,6 +43,16 @@ impl Fixture {
         }
     }
 
+    fn normalizer(&self) -> crate::path_normalizer::PathNormalizer {
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [] as [(&str, &str); 0],
+            Some(self.package.clone()),
+            None,
+            self.root.join("tmp"),
+        );
+        crate::path_normalizer::PathNormalizer::from_invocation(Some(&self.package), &env)
+    }
+
     fn stdout(&self) -> PathBuf {
         self.out_dir.with_file_name("output")
     }
@@ -68,6 +78,15 @@ impl Fixture {
     }
 
     fn resolve(&self, vars: &[(&str, &str)], max_entries: usize) -> Result<Resolved> {
+        self.resolve_with(vars, max_entries, &|_, _| None)
+    }
+
+    fn resolve_with(
+        &self,
+        vars: &[(&str, &str)],
+        max_entries: usize,
+        scoped: &ScopedValue<'_>,
+    ) -> Result<Resolved> {
         let mut env: HashMap<String, OsString> = vars
             .iter()
             .map(|(name, value)| (name.to_string(), OsString::from(value)))
@@ -90,6 +109,7 @@ impl Fixture {
                 cache_dir: &self.cache,
                 excluded: &excluded,
                 outside: &outside,
+                scoped_value: scoped,
                 max_entries,
             },
         )
@@ -471,10 +491,74 @@ fn the_cargo_home_is_found_as_cargo_finds_it() {
 }
 
 #[test]
+fn a_scoped_declared_directory_keys_its_location_and_declared_contents() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    for f in [&a, &b] {
+        f.write("data/asset", "one");
+        f.declare("cargo:rerun-if-env-changed=DATA_DIR\ncargo:rerun-if-changed=data/asset\n");
+    }
+    let digest_for = |f: &Fixture, entry: &str, value: &str| {
+        let entries = [entry.to_owned()];
+        let normalizer = f.normalizer();
+        let scoped = |var: &str, v: &OsStr| {
+            crate::cache_key::forced_path_only_env(&entries, "lib_target", var)
+                .then(|| declared_path_value(v, &normalizer))
+                .flatten()
+        };
+        match f
+            .resolve_with(&[("DATA_DIR", value)], 100, &scoped)
+            .unwrap()
+        {
+            Resolved::Folded(s) => s.digest,
+            other => panic!("{other:?}"),
+        }
+    };
+    let left = a.package.join("data");
+    let right = b.package.join("data");
+    let left = left.to_str().unwrap();
+    let right = right.to_str().unwrap();
+    let entry = "lib_target:DATA_DIR";
+    for raw in ["DATA_DIR", "another:DATA_DIR", "lib_target:OTHER"] {
+        assert_ne!(digest_for(&a, raw, left), digest_for(&b, raw, right));
+    }
+    let key = digest_for(&a, entry, left);
+    assert_eq!(key, digest_for(&b, entry, right));
+    assert_ne!(key, digest_for(&b, entry, "<WORKSPACE>/data"));
+    assert_ne!(
+        key,
+        digest_for(&b, entry, b.package.join("other").to_str().unwrap())
+    );
+    b.write("data/asset", "two");
+    assert_ne!(key, digest_for(&b, entry, right));
+}
+
+#[test]
+fn pathmap_preserves_destinations_other_flags_and_spacing() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let flags = |f: &Fixture, dest: &str, after: &str| {
+        let path = f.package.display();
+        let normalizer = f.normalizer();
+        declared_path_value(
+            OsStr::new(&format!("/O2 /pathmap:{path}={dest}{after}")),
+            &normalizer,
+        )
+    };
+    let shared = flags(&a, "Z:/source", " /Zi");
+    assert!(shared.is_some());
+    assert_eq!(shared, flags(&b, "Z:/source", " /Zi"));
+    assert_ne!(shared, flags(&b, "other", " /Zi"));
+    assert_ne!(shared, flags(&b, "Z:/source", " /Z7"));
+    assert_ne!(shared, flags(&b, "Z:/source", "  /Zi"));
+    assert_eq!(flags(&b, "Z:/source", " /DNAME=\"quoted\""), None);
+}
+
+#[test]
 fn names_no_process_can_hold_read_as_unset() {
     let var = vars(&[("", "empty"), ("A=B", "eq"), ("A", "1")]);
     let located = Fixture::new().located();
-    let state = |name| env_state(name, &var, &located);
+    let state = |name| env_state(name, &var, &located, &|_, _| None);
     assert_eq!(state(""), EnvState::Unset);
     assert_eq!(state("A=B"), EnvState::Unset);
     assert_eq!(state("A\0B"), EnvState::Unset);

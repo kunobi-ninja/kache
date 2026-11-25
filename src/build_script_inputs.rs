@@ -170,11 +170,14 @@ pub(crate) fn cargo_home_writes(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+type ScopedValue<'a> = dyn Fn(&str, &OsStr) -> Option<Vec<u8>> + 'a;
+
 /// What resolving a unit's declared inputs reads besides the unit.
 pub(crate) struct Resolver<'a, 'db> {
     /// Hashes declared files. The fingerprints it guards go into the snapshot.
     pub(crate) file_hasher: &'a FileHasher<'db>,
     pub(crate) var: &'a dyn Fn(&str) -> Option<OsString>,
+    pub(crate) scoped_value: &'a ScopedValue<'a>,
     /// Holds the tree memo and the marker of a package too large to digest.
     pub(crate) cache_dir: &'a Path,
     /// Left out of every tree, in each spelling: the target directory,
@@ -255,6 +258,7 @@ impl Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EnvState {
     Set(Vec<u8>),
+    ScopedPath(Vec<u8>),
     Unset,
     /// Cargo sets it on the rustc command, so the value rustc sees is not
     /// the one Cargo compared before it reran the script.
@@ -345,7 +349,7 @@ pub(crate) fn resolve(located: &Located, resolver: &Resolver<'_, '_>) -> Result<
         .map(|name| {
             (
                 crate::cache_key::env_name_key_bytes(OsStr::new(name)),
-                env_state(name, resolver.var, located),
+                env_state(name, resolver.var, located, resolver.scoped_value),
             )
         })
         .collect();
@@ -509,7 +513,12 @@ impl Roots {
     }
 }
 
-fn env_state(name: &str, var: &dyn Fn(&str) -> Option<OsString>, located: &Located) -> EnvState {
+fn env_state(
+    name: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    located: &Located,
+    scoped_value: &ScopedValue<'_>,
+) -> EnvState {
     if set_by_cargo(name) {
         return EnvState::SetByCargo;
     }
@@ -519,9 +528,45 @@ fn env_state(name: &str, var: &dyn Fn(&str) -> Option<OsString>, located: &Locat
     }
     match var(name) {
         Some(value) if is_script_out_dir(name, &value, located) => EnvState::SetByCargo,
-        Some(value) => EnvState::Set(crate::cache_key::env_os_key_bytes(&value)),
+        Some(value) => scoped_value(name, &value).map_or_else(
+            || EnvState::Set(crate::cache_key::env_os_key_bytes(&value)),
+            EnvState::ScopedPath,
+        ),
         None => EnvState::Unset,
     }
+}
+
+/// Identity for a user-asserted locator. Preserve unrecognized values literally.
+/// In unquoted MSVC flags, remap only the source of a standalone /pathmap
+/// option. The destination and all other bytes can change the object.
+pub(crate) fn declared_path_value(
+    value: &OsStr,
+    normalizer: &crate::path_normalizer::PathNormalizer,
+) -> Option<Vec<u8>> {
+    let path = Path::new(value);
+    if let Some(id) = normalizer.source_path_identity(path) {
+        return Some(id);
+    }
+    let text = value.to_str()?;
+    if text.contains(['\'', '"']) {
+        return None;
+    }
+    let mut digest = blake3::Hasher::new();
+    let mut mapped = false;
+    for token in text.split_inclusive(|ch: char| ch.is_ascii_whitespace()) {
+        if let Some((source, rest)) = token
+            .strip_prefix("/pathmap:")
+            .and_then(|arg| arg.split_once('='))
+            && let Some(id) = normalizer.source_path_identity(Path::new(source))
+        {
+            crate::build_script::fold(&mut digest, "source", &id);
+            crate::build_script::fold(&mut digest, "rest", rest.as_bytes());
+            mapped = true;
+        } else {
+            crate::build_script::fold(&mut digest, "literal", token.as_bytes());
+        }
+    }
+    mapped.then(|| digest.finalize().as_bytes().to_vec())
 }
 
 /// Whether Cargo sets `name` on the rustc command of every unit of the
@@ -566,6 +611,7 @@ fn digest(paths: &BTreeMap<Vec<u8>, String>, vars: &BTreeMap<Vec<u8>, EnvState>)
         fold(&mut hasher, "env_name", name);
         match state {
             EnvState::Set(value) => fold(&mut hasher, "env_value", value),
+            EnvState::ScopedPath(value) => fold(&mut hasher, "env_scoped_path", value),
             EnvState::Unset => fold(&mut hasher, "env_unset", b""),
             EnvState::SetByCargo => fold(&mut hasher, "env_set_by_cargo", b""),
         }

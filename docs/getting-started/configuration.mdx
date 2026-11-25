@@ -621,6 +621,15 @@ embeds it in crate metadata, and every crate's sources live under it, so the
 checks above would pass for a value that does change the artifact. Kache warns
 when a list names it and ignores the entry.
 
+For workspace and path packages, a scoped entry also applies to the package
+unit's key when its build script declares the variable with
+`cargo:rerun-if-env-changed`. For example, `app:DATA_DIR` lets identical
+checkouts share `app` when the script declares the files read from `DATA_DIR`
+with `cargo:rerun-if-changed`. Check that neither the crate nor its macros bake
+the literal path into the artifact. Kache normalizes a known path or the source
+of an unquoted MSVC `/pathmap:source=destination` option. Changing the
+destination or other flags still changes the key.
+
 Build scripts can also share runs when a linker wrapper lives in each
 checkout. Set `KACHE_BASE_DIR` to the checkout root and opt the tool variable
 into normalization:

@@ -35,6 +35,16 @@ case "$PROBE_MODE" in
   echo) exec cat ;;
   env) printf 'lease=%s threads=%s\n' "${KACHE_TEST_LEASE-unset}" "${RUST_TEST_THREADS-unset}" ;;
   started) : > "$PROBE_DIR/started" ;;
+  resume)
+    printf '%s\n' "$RUST_TEST_THREADS" > "$PROBE_DIR/ready"
+    i=0
+    while [ ! -e "$PROBE_DIR/go" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+    [ -e "$PROBE_DIR/go" ] || exit 3
+    # Resume a CPU phase under the original grant's libtest thread setting.
+    i=0
+    while [ "$i" -lt 10000 ]; do i=$((i + 1)); done
+    printf '%s\n' "$RUST_TEST_THREADS" > "$PROBE_DIR/finished"
+    ;;
   term)
     trap 'exit 0' TERM
     : > "$PROBE_DIR/ready"
@@ -673,6 +683,59 @@ fn termination_reaches_the_test_and_interrupts_do_not_kill_the_runner() {
         Some(0),
         "the test trapped the forwarded SIGTERM and exited 0: {output:?}"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_paused_elastic_test_admits_a_peer_then_resumes_with_its_original_threads() {
+    if pool() < 3 {
+        return; // The test needs two test slots and the compile reserve.
+    }
+    let fixture = Fixture::new();
+    let mut first = fixture.runner(&fixture.probe(), "resume").spawn().unwrap();
+    let ready = fixture.path().join("ready");
+    wait_for_file(&ready, &mut first);
+    let peer = fixture
+        .runner(&fixture.probe(), "started")
+        .env("RUST_TEST_THREADS", "1")
+        .spawn()
+        .unwrap();
+    assert!(finish(peer, Duration::from_secs(20)).status.success());
+    assert!(fixture.path().join("started").exists());
+    assert!(first.try_wait().unwrap().is_none());
+    let threads = fs::read_to_string(ready).unwrap();
+    assert!(threads.trim().parse::<u32>().unwrap() > 1);
+    fs::write(fixture.path().join("go"), b"").unwrap();
+    assert!(finish(first, Duration::from_secs(10)).status.success());
+    assert_eq!(
+        fs::read_to_string(fixture.path().join("finished")).unwrap(),
+        threads
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_paused_fixed_test_keeps_every_promised_slot() {
+    let pool = pool();
+    let slots = pool - (pool / 4).max(1);
+    if slots < 2 {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut first = fixture
+        .runner(&fixture.probe(), "resume")
+        .env("RUST_TEST_THREADS", slots.to_string())
+        .spawn()
+        .unwrap();
+    wait_for_file(&fixture.path().join("ready"), &mut first);
+    let initially_free = lock_slots(&fixture.cache(), 0..pool);
+    assert_eq!(initially_free.len() as u32, pool - slots);
+    // Cover a full five-sample window while the child is idle.
+    std::thread::sleep(Duration::from_secs(7));
+    assert!(lock_slots(&fixture.cache(), 0..pool).is_empty());
+    fs::write(fixture.path().join("go"), b"").unwrap();
+    assert!(finish(first, Duration::from_secs(10)).status.success());
+    assert_eq!(lock_slots(&fixture.cache(), 0..pool).len() as u32, slots);
 }
 
 /// The regression the runner exists for: with every slot busy, a test

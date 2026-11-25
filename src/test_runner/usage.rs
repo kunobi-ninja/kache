@@ -9,10 +9,11 @@
 //! never below the slots the binary's memory takes. A lease only shrinks:
 //! the binary keeps the thread count it was started with.
 
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ExitStatus};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::scheduler::TestLease;
+use crate::scheduler::{TestLease, TestWant};
 
 /// How often the runner reads the binary's CPU time.
 pub(crate) const WINDOW: Duration = Duration::from_secs(1);
@@ -38,70 +39,77 @@ pub(crate) fn slots_in_use(readings: &[f64], floor: u32) -> u32 {
 /// Cores used between two readings of CPU time `wall` apart. CPU time can go
 /// down when a descendant exits before its parent reaps it; that reads as
 /// none.
-pub(crate) fn cores(before: Duration, after: Duration, wall: Duration) -> f64 {
+fn cores(before: Duration, after: Duration, wall: Duration) -> Option<f64> {
     if wall.is_zero() {
-        return 0.0;
+        return None;
     }
-    after.saturating_sub(before).as_secs_f64() / wall.as_secs_f64()
+    Some(after.checked_sub(before)?.as_secs_f64() / wall.as_secs_f64())
 }
 
-/// Shrinks a running binary's lease to what it uses, on its own thread.
-/// Dropping it stops the thread.
-pub(crate) struct Watch {
-    stop: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+/// Only spare slots from an elastic grant can be returned. Fixed grants
+/// include explicit libtest thread counts and nextest's per-test reservations.
+fn shrink_floor(want: TestWant, held: u32) -> Option<u32> {
+    match want {
+        TestWant::Elastic(floor) if floor < held => Some(floor),
+        _ => None,
+    }
 }
 
-impl Watch {
-    pub(crate) fn start(pid: u32, floor: u32, lease: Arc<Mutex<TestLease>>) -> Self {
-        let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            let mut readings = Vec::with_capacity(WINDOWS);
-            let Some(mut last) = tree_cpu_time(pid) else {
-                return;
-            };
-            let mut at = Instant::now();
-            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(WINDOW)
-            {
-                let Some(now) = tree_cpu_time(pid) else {
-                    return;
-                };
-                let wall = at.elapsed();
-                at = Instant::now();
-                if readings.len() == WINDOWS {
-                    readings.remove(0);
-                }
-                readings.push(cores(last, now, wall));
-                last = now;
-                if readings.len() < WINDOWS {
-                    continue;
-                }
-                let keep = slots_in_use(&readings, floor);
-                let Ok(mut lease) = lease.lock() else {
-                    return;
-                };
-                let released = lease.shrink_to(keep);
-                if released > 0 {
-                    tracing::debug!(
-                        released,
-                        kept = lease.held(),
-                        "test binary uses fewer slots than it holds"
-                    );
-                }
-            }
-        });
-        Self {
-            stop: Some(stop),
-            thread: Some(thread),
+/// Keep the grant alive until the child exits, even if a sampler cannot start.
+pub(super) fn wait(
+    child: &mut Child,
+    mut lease: TestLease,
+    want: TestWant,
+) -> std::io::Result<ExitStatus> {
+    let Some(floor) = shrink_floor(want, lease.held()) else {
+        return child.wait();
+    };
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return child.wait();
+    }
+    let pid = child.id();
+    std::thread::scope(|scope| {
+        let (stop, stopped) = mpsc::channel();
+        let watcher = std::thread::Builder::new()
+            .spawn_scoped(scope, || sample(pid, floor, &mut lease, stopped));
+        let result = child.wait();
+        drop(stop);
+        if let Ok(watcher) = watcher {
+            let _ = watcher.join();
         }
-    }
+        result
+    })
 }
 
-impl Drop for Watch {
-    fn drop(&mut self) {
-        drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+fn sample(pid: u32, floor: u32, lease: &mut TestLease, stopped: mpsc::Receiver<()>) {
+    let Some(mut last) = tree_cpu_time(pid) else {
+        return;
+    };
+    let mut at = Instant::now();
+    let mut readings = std::collections::VecDeque::with_capacity(WINDOWS);
+    while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(WINDOW) {
+        let Some(now) = tree_cpu_time(pid) else {
+            return;
+        };
+        let instant = Instant::now();
+        let reading = cores(last, now, instant.duration_since(at));
+        at = instant;
+        last = now;
+        let Some(reading) = reading else {
+            // An incomplete interval is no evidence that the binary was idle.
+            readings.clear();
+            continue;
+        };
+        if readings.len() == WINDOWS {
+            readings.pop_front();
+        }
+        readings.push_back(reading);
+        if readings.len() == WINDOWS {
+            let keep = slots_in_use(readings.make_contiguous(), floor);
+            lease.shrink_to(keep);
+            if lease.held() == floor {
+                break;
+            }
         }
     }
 }
@@ -114,7 +122,7 @@ pub(crate) fn tree_cpu_time(pid: u32) -> Option<Duration> {
     let mut visited = 1;
     while let Some(child) = pending.pop() {
         if visited >= TREE_LIMIT {
-            break;
+            return None;
         }
         visited += 1;
         if let Some(time) = process_cpu_time(child) {
@@ -242,6 +250,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_elastic_grants_above_their_floor_can_shrink() {
+        assert_eq!(shrink_floor(TestWant::Fixed(8), 8), None);
+        assert_eq!(shrink_floor(TestWant::Fixed(8), 6), None);
+        assert_eq!(shrink_floor(TestWant::Elastic(3), 8), Some(3));
+        assert_eq!(shrink_floor(TestWant::Elastic(3), 3), None);
+        assert_eq!(shrink_floor(TestWant::Elastic(8), 3), None);
+    }
+
+    #[test]
     fn a_lease_keeps_the_busiest_readings_cores() {
         assert_eq!(slots_in_use(&[0.0, 0.0, 0.0], 1), 1, "idle keeps the floor");
         assert_eq!(slots_in_use(&[0.0, 0.0], 0), 1, "never none");
@@ -256,11 +273,11 @@ mod tests {
     #[test]
     fn cores_are_cpu_time_over_wall_time() {
         let s = Duration::from_secs;
-        assert_eq!(cores(s(10), s(14), s(2)), 2.0);
-        assert_eq!(cores(s(10), s(10), s(2)), 0.0);
-        assert_eq!(cores(s(10), s(4), s(2)), 0.0, "an exited child");
-        assert_eq!(cores(s(0), s(5), Duration::ZERO), 0.0);
-        assert_eq!(cores(s(1), s(2), s(4)), 0.25);
+        assert_eq!(cores(s(10), s(14), s(2)), Some(2.0));
+        assert_eq!(cores(s(10), s(10), s(2)), Some(0.0));
+        assert_eq!(cores(s(10), s(4), s(2)), None, "an exited child");
+        assert_eq!(cores(s(0), s(5), Duration::ZERO), None);
+        assert_eq!(cores(s(1), s(2), s(4)), Some(0.25));
     }
 
     #[test]
@@ -283,7 +300,7 @@ mod tests {
     fn a_busy_child_counts_toward_its_parents_tree() {
         // A shell whose child spins: the shell itself does nothing.
         let mut shell = std::process::Command::new("/bin/sh")
-            .args(["-c", "while :; do :; done & wait"])
+            .args(["-c", "ulimit -t 12 || exit 1; while :; do :; done & wait"])
             .spawn()
             .unwrap();
         let pid = shell.id();
@@ -296,7 +313,7 @@ mod tests {
         let started = Instant::now();
         std::thread::sleep(Duration::from_millis(500));
         let after = tree_cpu_time(pid).unwrap();
-        let used = cores(before, after, started.elapsed());
+        let used = cores(before, after, started.elapsed()).unwrap();
         for child in &spinner {
             unsafe { libc::kill(*child as libc::pid_t, libc::SIGKILL) };
         }

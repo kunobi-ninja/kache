@@ -394,17 +394,13 @@ fn run_scheduled(
         Err(error) => return run_failed(&args[0], &error),
     };
     signals::forward_to(child.id());
-    let lease = lease.map(|mut lease| {
-        lease.name_holder(&Path::new(&args[0]).display().to_string());
-        std::sync::Arc::new(std::sync::Mutex::new(lease))
-    });
-    let watch = lease.as_ref().map(|lease| {
-        let floor = scheduler::test_floor(cache_dir, key);
-        usage::Watch::start(child.id(), floor, std::sync::Arc::clone(lease))
-    });
-    let status = child.wait();
-    drop(watch);
-    drop(lease);
+    let status = match lease {
+        Some(mut lease) => {
+            lease.name_holder(&Path::new(&args[0]).to_string_lossy());
+            usage::wait(&mut child, lease, want)
+        }
+        None => child.wait(),
+    };
     scheduler::record_test_rss(cache_dir, key);
     match status {
         Ok(status) => finish(exit_disposition(status.code(), signals::of(&status))),

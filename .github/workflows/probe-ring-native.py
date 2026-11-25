@@ -62,8 +62,8 @@ def project(parent, name):
 
 def fixture(name, payload):
     p=project(ROOT,name); pre=p/'pregenerated';pre.mkdir(); obj=pre/'a-long-absolute-native-member-name.obj'
-    src=pre/'input.c'; text=json.dumps(str(p)) if payload else '"test"';src.write_text(f'const char fixture_data[] = {text};\n')
-    run(['cl','/nologo','/c','/Od','/Fo'+obj.name,src.name],pre,BASE)
+    outside=ROOT/('compile-'+name);outside.mkdir(); src=outside/'input.c'; text=json.dumps(str(p)) if payload else '"test"';src.write_text(f'const char fixture_data[] = {text};\n')
+    run(['cl','/nologo','/c','/Od','/Fo'+obj.name,src.name],outside,BASE); shutil.copyfile(outside/obj.name,obj)
     data=obj.read_bytes(); assert (str(p).encode() in data)==payload
     def entry(n,b):
         h=f'{n:<16}{0:<12}{0:<6}{0:<6}{644:<8}{len(b):<10}`\n'.encode(); assert len(h)==60
@@ -78,19 +78,36 @@ def measure(label,binary,work,crate,manifest):
     base=ROOT/(label+'-'+crate);base.mkdir();cache=base/'cache';config=base/'config.toml';config.write_text('[cache]\nlocal_only=true\n');
     env={**BASE,'RUSTC_WRAPPER':str(binary),'KACHE_CACHE_DIR':str(cache),'KACHE_RUNTIME_DIR':str(base/'ipc'),
          'KACHE_CONFIG':str(config),'KACHE_HOST_CONFIG':str(config),'KACHE_BASE_DIR':str(work)}
-    if crate == "ring": env.pop("CARGO_PROFILE_DEV_DEBUG", None)
+    if crate == 'ring': env.pop('CARGO_PROFILE_DEV_DEBUG', None)
+    if label == 'main' and crate=='ring': env['KACHE_LOG']='kache::cache_key=trace,kache::wrapper=debug'
     run([binary,'daemon','start'],work,env,label+'-'+crate+'-start.log');rows=[]
     try:
         for phase,targetname in [('cold','a'),('same','a'),('new','b')]:
             target=base/targetname
             if target.exists():shutil.rmtree(target)
             before={f:f.stat().st_size for f in base.rglob('events.jsonl')}
+            tracepos={f:f.stat().st_size for f in base.rglob('kache.log')}
             messages=run(['cargo','build','--message-format=json-render-diagnostics','--locked','--offline','--lib','--target-dir',target],work,env,f'{label}-{crate}-{phase}.log')
             products=[json.loads(line) for line in messages.splitlines() if line.startswith('{')]
             files=[Path(path) for m in products if m.get('reason')=='compiler-artifact' and m['target']['name']==crate for path in m['filenames'] if path.endswith('.rlib')]
             if len(files)!=1:
                 raise RuntimeError(f'cargo artifact {crate} {files} under {target}: {[str(p) for p in target.rglob("*.rlib")]}')
             artifacts=files
+            if label=='main' and crate=='ring':
+                native=[]
+                for m in products:
+                    if m.get('reason')!='build-script-executed' or 'ring@' not in m.get('package_id',''):continue
+                    directory=Path(m['out_dir'])
+                    for archive in directory.rglob('*'):
+                        if archive.is_file() and archive.suffix.lower() in ('.a','.lib'):
+                            blob=archive.read_bytes();h=sha(blob);(OUT/'archives').mkdir(exist_ok=True);dest=OUT/'archives'/(h+archive.suffix)
+                            if not dest.exists():dest.write_bytes(blob)
+                            native.append({'path':str(archive),'sha256':h,'len':len(blob)})
+                traces=[line for line in messages.splitlines() if '[key:ring]' in line]
+                for f in base.rglob('kache.log'):
+                    with f.open('rb') as stream:
+                        stream.seek(tracepos.get(f,0)); traces.extend(l for l in stream.read().decode(errors='replace').splitlines() if '[key:ring]' in l)
+                (OUT/f'native-{phase}.json').write_text(json.dumps(native,indent=2));(OUT/f'key-{phase}.log').write_text('\n'.join(traces),encoding='utf-8')
             analysis=inspect(artifacts[0],manifest); events=[]
             for f in base.rglob('events.jsonl'):
                 with f.open('rb') as stream:
@@ -110,7 +127,7 @@ for version in [*OIDS,'main']:
     else:
         arm=ROOT/version;arm.mkdir();a=arm/'bin.zip';urllib.request.urlretrieve(f'https://github.com/kunobi-ninja/kache/releases/download/v{version}/kache-x86_64-pc-windows-msvc.zip',a);assert sha(a.read_bytes())==OIDS[version];zipfile.ZipFile(a).extractall(arm);binary=next(arm.rglob('kache.exe'))
     print('BINARY',version,run([binary,'--version'],ring,BASE).strip(),sha(binary.read_bytes()),flush=True)
-    measure(version,binary,ring,'ring',package)
+    if version=='main':measure(version,binary,ring,'ring',package)
     binaries[version]=binary
 work={}; inputs={}
 for name,content in [('names_only',False),('payload_only',True)]:

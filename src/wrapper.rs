@@ -7345,6 +7345,7 @@ fn sources_written_since(
                 mtime_ns: invocation_start_ns,
                 ctime_ns: invocation_start_ns,
                 inode: 0,
+                refs_id: None,
             }),
     );
     written

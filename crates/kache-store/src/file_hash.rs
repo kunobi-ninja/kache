@@ -28,6 +28,15 @@ pub fn file_hash_memo_eligible(inode: i64, requires_identity: bool) -> bool {
     !requires_identity || inode != 0
 }
 
+/// ReFS supplies a volume and 128-bit file ID in place of the legacy inode.
+pub fn file_stamp_memo_eligible(
+    inode: i64,
+    refs_id: Option<[u8; 24]>,
+    requires_identity: bool,
+) -> bool {
+    file_hash_memo_eligible(inode, requires_identity) || refs_id.is_some()
+}
+
 /// How long a file must have been left alone, when it was read, before its
 /// hash may be memoised.
 ///
@@ -202,6 +211,10 @@ pub struct FileFingerprint {
     /// so an in-place swap that preserves path+size+mtime+ctime but changes the
     /// inode (and content) can't return a stale memoized hash (kunobi-ninja/kache#324).
     pub inode: i64,
+    /// ReFS volume serial followed by the full 128-bit file ID. Leave inode zero
+    /// so older readers cannot mistake a partial identity for a strong stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_id: Option<[u8; 24]>,
 }
 
 /// Result of a content-hash cache lookup that does NOT compute a blake3 — the
@@ -241,14 +254,14 @@ impl<'db> FileHashCache<'db> {
     /// recorded under [`FILE_HASH_RULE`] or a later rule, in this boot
     /// ([`memo_rows_valid_since`]).
     pub fn get(&self, fingerprint: &FileFingerprint) -> rusqlite::Result<Option<String>> {
-        if !file_hash_memo_eligible(fingerprint.inode, cfg!(windows)) {
+        if !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows)) {
             return Ok(None);
         }
         self.db()
             .query_row(
                 "SELECT hash FROM file_hashes
                  WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4 AND inode = ?5
-                   AND rule >= ?6 AND updated_at >= datetime(?7, 'unixepoch')",
+                   AND refs_id IS ?8 AND rule >= ?6 AND updated_at >= datetime(?7, 'unixepoch')",
                 params![
                     fingerprint.path,
                     fingerprint.size,
@@ -256,7 +269,8 @@ impl<'db> FileHashCache<'db> {
                     fingerprint.ctime_ns,
                     fingerprint.inode,
                     FILE_HASH_RULE,
-                    memo_rows_valid_since()
+                    memo_rows_valid_since(),
+                    fingerprint.refs_id.as_ref().map(|id| id.as_slice())
                 ],
                 |row| row.get(0),
             )
@@ -279,7 +293,7 @@ impl<'db> FileHashCache<'db> {
                 chunk.iter().copied().collect();
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
-                "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
+                "SELECT path, size, mtime_ns, ctime_ns, inode, hash, refs_id FROM file_hashes
                  WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}
                    AND updated_at >= datetime({since}, 'unixepoch')"
             ))?;
@@ -293,6 +307,7 @@ impl<'db> FileHashCache<'db> {
                             mtime_ns: row.get(2)?,
                             ctime_ns: row.get(3)?,
                             inode: row.get(4)?,
+                            refs_id: row.get(6)?,
                         },
                         row.get::<_, String>(5)?,
                     ))
@@ -300,7 +315,9 @@ impl<'db> FileHashCache<'db> {
             )?;
             for row in rows {
                 let (stamp, hash) = row?;
-                if wanted.contains(&stamp) && file_hash_memo_eligible(stamp.inode, cfg!(windows)) {
+                if wanted.contains(&stamp)
+                    && file_stamp_memo_eligible(stamp.inode, stamp.refs_id, cfg!(windows))
+                {
                     found.insert(stamp.path, hash);
                 }
             }
@@ -309,13 +326,13 @@ impl<'db> FileHashCache<'db> {
     }
 
     pub fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
-        if !file_hash_memo_eligible(fingerprint.inode, cfg!(windows)) {
+        if !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows)) {
             return Ok(());
         }
         self.db().execute(
             "INSERT OR REPLACE INTO file_hashes
-             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7)",
+             (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule, refs_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7, ?8)",
             params![
                 fingerprint.path,
                 fingerprint.size,
@@ -323,7 +340,8 @@ impl<'db> FileHashCache<'db> {
                 fingerprint.ctime_ns,
                 fingerprint.inode,
                 hash,
-                FILE_HASH_RULE
+                FILE_HASH_RULE,
+                fingerprint.refs_id.as_ref().map(|id| id.as_slice())
             ],
         )?;
         Ok(())
@@ -484,6 +502,11 @@ impl<'db> FileHashCache<'db> {
         if !file_hashes_has_rowid(&tx)? {
             return Ok(false);
         }
+        let refs_id = if crate::cc_memo::has_column(&tx, "file_hashes", "refs_id")? {
+            "refs_id"
+        } else {
+            "NULL"
+        };
         let rule = if file_hashes_have_rule(&tx)? {
             "rule"
         } else {
@@ -492,8 +515,8 @@ impl<'db> FileHashCache<'db> {
         tx.execute_batch(&format!(
             "CREATE TABLE file_hashes_rebuilt ({FILE_HASHES_COLUMNS}) WITHOUT ROWID;
              INSERT INTO file_hashes_rebuilt
-                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
-                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at, {rule}
+                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule, refs_id)
+                 SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at, {rule}, {refs_id}
                  FROM file_hashes;
              DROP TABLE file_hashes;
              ALTER TABLE file_hashes_rebuilt RENAME TO file_hashes;
@@ -637,6 +660,7 @@ const FILE_HASHES_COLUMNS: &str = "
     mtime_ns   INTEGER NOT NULL,
     ctime_ns   INTEGER NOT NULL DEFAULT 0,
     inode      INTEGER NOT NULL DEFAULT 0,
+    refs_id    BLOB,
     hash       TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     rule       INTEGER NOT NULL DEFAULT 0";
@@ -705,6 +729,8 @@ fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
 /// its column fails every read and write.
 pub(crate) fn has_rule_columns(db: &Connection) -> rusqlite::Result<bool> {
     Ok(file_hashes_have_rule(db)?
+        && crate::cc_memo::has_column(db, "file_hashes", "refs_id")?
+        && crate::cc_memo::has_column(db, "cc_memo_inputs", "refs_id")?
         && crate::cc_memo::has_rule_columns(db)?
         && input_predictions_have_current_payload(db)?
         && input_predictions_have_last_used(db)?)
@@ -735,6 +761,8 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
     for column in [
         "ALTER TABLE file_hashes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE file_hashes ADD COLUMN inode INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE file_hashes ADD COLUMN refs_id BLOB",
+        "ALTER TABLE cc_memo_inputs ADD COLUMN refs_id BLOB",
     ] {
         if let Err(e) = db.execute_batch(column)
             && !e.to_string().contains("duplicate column name")
@@ -748,7 +776,7 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Why no file under `path` can be served from the hash memo, or `None` when
-/// files there can be. Only Windows needs handle evidence (NTFS) for that.
+/// files there can be. On Windows this requires handle-derived NTFS or ReFS identity.
 pub fn memo_identity_problem(path: &Path) -> Option<String> {
     #[cfg(windows)]
     return windows_fingerprint(path)
@@ -764,10 +792,9 @@ pub fn memo_identity_problem(path: &Path) -> Option<String> {
 impl FileFingerprint {
     /// Identity of a file as the memo sees it. Also the cheapest available
     /// proof that an external tool did NOT rewrite a file across some
-    /// operation when `inode != 0`: an in-place write bumps a change stamp
-    /// and replacement changes the file ID. Windows uses NTFS handle evidence;
-    /// unsupported filesystems or failed queries return weak metadata with
-    /// `inode == 0`, which must not authorize a hash-memo hit or publication.
+    /// operation: an in-place write bumps a change stamp and replacement changes
+    /// the file ID. Failed queries or unsupported Windows volumes return only
+    /// weak metadata, which cannot authorize a memo hit or publication.
     pub fn from_path(path: &Path) -> Result<Self> {
         #[cfg(windows)]
         match windows_fingerprint(path) {
@@ -793,14 +820,14 @@ impl FileFingerprint {
             mtime_ns: metadata_mtime_ns(metadata),
             ctime_ns: metadata_ctime_ns(metadata),
             inode: metadata_inode(metadata),
+            refs_id: None,
         }
     }
 }
 
 /// NTFS's change time detects writes whose modification time is restored;
-/// its file index detects replacement. Both come from one open handle. Other
-/// filesystems stay fresh reads: ReFS needs a 128-bit ID which our memo schema
-/// cannot represent, and FAT does not provide this change-time contract.
+/// its file index detects replacement. ReFS needs the full FileIdInfo from
+/// the same handle. FAT cannot provide this change-time contract.
 #[cfg(windows)]
 fn windows_fingerprint(path: &Path) -> Result<FileFingerprint> {
     #[cfg(any(test, feature = "test-support"))]
@@ -856,6 +883,28 @@ fn windows_fingerprint(path: &Path) -> Result<FileFingerprint> {
     {
         return Err(std::io::Error::last_os_error().into());
     }
+    let refs_id = if filesystem.starts_with(&REFS_NAME) {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo};
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: FileIdInfo writes FILE_ID_INFO to the matching buffer on this live handle.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut id = [0; 24];
+        id[..8].copy_from_slice(&info.VolumeSerialNumber.to_le_bytes());
+        id[8..].copy_from_slice(&info.FileId.Identifier);
+        Some(id)
+    } else {
+        None
+    };
     windows_fingerprint_from_parts(
         path,
         &filesystem,
@@ -863,12 +912,17 @@ fn windows_fingerprint(path: &Path) -> Result<FileFingerprint> {
         (identity.nFileSizeHigh, identity.nFileSizeLow),
         basic.LastWriteTime,
         basic.ChangeTime,
+        refs_id,
     )
 }
 
 /// Decode handle evidence without querying the OS. Index and size tuples are
-/// (high, low) DWORDs. ReFS's wider IDs and filesystems without NTFS change
-/// times cannot authorize the current hash memo's identity proof.
+/// (high, low) DWORDs. Only ReFS uses the extended identity.
+#[cfg(any(windows, test))]
+const REFS_NAME: [u16; 5] = [b'R' as u16, b'e' as u16, b'F' as u16, b'S' as u16, 0];
+#[cfg(any(windows, test))]
+const NTFS_NAME: [u16; 5] = [b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0];
+
 #[cfg(any(windows, test))]
 fn windows_fingerprint_from_parts(
     path: &Path,
@@ -877,8 +931,11 @@ fn windows_fingerprint_from_parts(
     file_size: (u32, u32),
     last_write_time: i64,
     change_time: i64,
+    refs_id: Option<[u8; 24]>,
 ) -> Result<FileFingerprint> {
-    if !filesystem.starts_with(&[b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0]) {
+    let ntfs = filesystem.starts_with(&NTFS_NAME);
+    let refs = filesystem.starts_with(&REFS_NAME) && refs_id.is_some_and(|id| id[8..] != [0; 16]);
+    if !ntfs && !refs {
         let end = filesystem.iter().position(|&unit| unit == 0);
         let name = String::from_utf16_lossy(&filesystem[..end.unwrap_or(filesystem.len())]);
         anyhow::bail!(
@@ -891,8 +948,8 @@ fn windows_fingerprint_from_parts(
         );
     }
     let index = (u64::from(file_index.0) << 32) + u64::from(file_index.1);
-    let changed = u64::try_from(change_time).context("invalid NTFS change time")?;
-    if index == 0 || windows_filetime_ns(changed) == 0 {
+    let changed = u64::try_from(change_time).context("invalid filesystem change time")?;
+    if (!refs && index == 0) || windows_filetime_ns(changed) == 0 {
         anyhow::bail!("filesystem returned an unavailable file index or change time");
     }
     Ok(FileFingerprint {
@@ -901,7 +958,8 @@ fn windows_fingerprint_from_parts(
         mtime_ns: windows_filetime_ns(u64::try_from(last_write_time)?),
         ctime_ns: windows_filetime_ns(changed),
         // Preserve every file-ID bit; inode is an opaque equality token.
-        inode: index as i64,
+        inode: if refs { 0 } else { index as i64 },
+        refs_id: if refs { refs_id } else { None },
     })
 }
 
@@ -1222,7 +1280,10 @@ mod tests {
             (17, true, true),
             (i64::MIN, true, true),
         ] {
-            assert_eq!(file_hash_memo_eligible(inode, requires_identity), eligible);
+            assert_eq!(
+                file_stamp_memo_eligible(inode, None, requires_identity),
+                eligible
+            );
         }
     }
 
@@ -1240,6 +1301,7 @@ mod tests {
             (1, 7),
             116_444_736_012_345_678,
             116_444_736_023_456_789,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1247,6 +1309,7 @@ mod tests {
             FileFingerprint {
                 path: path.to_string_lossy().into_owned(),
                 inode: -9_223_372_032_559_808_510,
+                refs_id: None,
                 size: 4_294_967_303,
                 mtime_ns: 1_234_567_800,
                 ctime_ns: 2_345_678_900,
@@ -1264,6 +1327,7 @@ mod tests {
                 (0x7fff_ffff, u32::MAX),
                 116_444_736_000_000_000,
                 116_444_736_000_000_001,
+                None,
             )
             .unwrap();
             assert_eq!(fingerprint.inode, expected);
@@ -1278,11 +1342,54 @@ mod tests {
             (0, 0),
             i64::MAX,
             i64::MAX,
+            None,
         )
         .unwrap();
         assert_eq!(empty.size, 0);
         assert_eq!(empty.mtime_ns, i64::MAX);
         assert_eq!(empty.ctime_ns, i64::MAX);
+    }
+
+    #[test]
+    fn refs_memo_checks_the_volume_and_every_file_id_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let source = dir.path().join("source");
+        let id = [1; 24];
+        let stamp = |identity| {
+            windows_fingerprint_from_parts(
+                &source,
+                &[82, 101, 70, 83, 0],
+                (0, 0),
+                (0, 80),
+                116_444_736_000_000_001,
+                116_444_736_000_000_001,
+                Some(identity),
+            )
+        };
+        let original = stamp(id).unwrap();
+        assert_eq!(original.inode, 0); // Old Windows readers decline this stamp.
+        assert!(stamp([0; 24]).is_err());
+        FileHashCache::open(&db)
+            .unwrap()
+            .put(&original, "first")
+            .unwrap();
+        let cache = FileHashCache::open(&db).unwrap();
+        assert_eq!(cache.get(&original).unwrap().as_deref(), Some("first"));
+        assert_eq!(
+            cache.get_many(&[&original]).unwrap()[&original.path],
+            "first"
+        );
+        for offset in [0, 8, 23] {
+            let mut different = id;
+            different[offset] ^= 1;
+            let replacement = stamp(different).unwrap();
+            assert!(cache.get(&replacement).unwrap().is_none());
+            assert!(cache.get_many(&[&replacement]).unwrap().is_empty());
+        }
+        let mut weak = original;
+        weak.refs_id = None;
+        assert!(cache.get(&weak).unwrap().is_none());
     }
 
     #[test]
@@ -1302,6 +1409,7 @@ mod tests {
             (0, 1),
             116_444_736_000_000_001,
             116_444_736_000_000_001,
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().starts_with("ReFS "), "{error}");
@@ -1329,6 +1437,7 @@ mod tests {
                     (0, 1),
                     116_444_736_000_000_001,
                     116_444_736_000_000_001,
+                    None,
                 )
                 .is_err(),
                 "filesystem: {filesystem:?}"
@@ -1371,6 +1480,7 @@ mod tests {
                     size,
                     written,
                     changed,
+                    None,
                 )
                 .is_err(),
                 "index={index:?}, size={size:?}, written={written}, changed={changed}"
@@ -1511,6 +1621,7 @@ mod tests {
             mtime_ns,
             ctime_ns,
             inode: 7,
+            refs_id: None,
         }
     }
 
@@ -1873,7 +1984,7 @@ mod tests {
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
-            assert_ne!(fingerprint.inode, 0);
+            assert!(fingerprint.inode != 0 || fingerprint.refs_id.is_some());
             assert_eq!(
                 fingerprint.mtime_ns,
                 ((metadata.last_write_time() - 116_444_736_000_000_000) * 100) as i64
@@ -1892,13 +2003,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_fingerprint_detects_restored_mtime_edits_and_replacement() {
-        let dir = tempfile::tempdir().unwrap();
+        let refs_dir = std::env::var_os("KACHE_TEST_REFS_DIR");
+        let dir = match &refs_dir {
+            Some(root) => tempfile::tempdir_in(root),
+            None => tempfile::tempdir(),
+        }
+        .unwrap();
         let path = dir.path().join("runtime.lib");
         std::fs::write(&path, vec![b'a'; 70_000]).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let mtime = filetime::FileTime::from_last_modification_time(&metadata);
         let first = FileFingerprint::from_path(&path).unwrap();
-        assert_ne!(first.inode, 0, "native CI must provide NTFS evidence");
+        assert!(first.inode != 0 || first.refs_id.is_some());
+        if refs_dir.is_some() {
+            assert!(
+                first.refs_id.is_some(),
+                "KACHE_TEST_REFS_DIR must be on ReFS"
+            );
+        }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while stamp_clock_ns() <= first.ctime_ns.saturating_add(20_000_000) {
@@ -1910,7 +2032,7 @@ mod tests {
         let edited = FileFingerprint::from_path(&path).unwrap();
         assert_eq!(edited.size, first.size);
         assert_eq!(edited.mtime_ns, first.mtime_ns);
-        assert_eq!(edited.inode, first.inode);
+        assert_eq!((edited.inode, edited.refs_id), (first.inode, first.refs_id));
         assert_ne!(edited.ctime_ns, first.ctime_ns);
         assert_eq!(
             FileFingerprint::from_metadata(&path, &std::fs::metadata(&path).unwrap()),
@@ -1926,7 +2048,10 @@ mod tests {
         let replaced = FileFingerprint::from_path(&path).unwrap();
         assert_eq!(replaced.size, first.size);
         assert_eq!(replaced.mtime_ns, first.mtime_ns);
-        assert_ne!(replaced.inode, edited.inode);
+        assert_ne!(
+            (replaced.inode, replaced.refs_id),
+            (edited.inode, edited.refs_id)
+        );
     }
 
     #[cfg(windows)]
@@ -2447,6 +2572,7 @@ mod tests {
             mtime_ns: 1,
             ctime_ns: 2,
             inode,
+            refs_id: None,
         };
 
         cache.put(&fp(10), "hash_for_inode_10").unwrap();

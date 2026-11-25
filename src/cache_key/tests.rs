@@ -2282,9 +2282,10 @@ async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() 
     let root = directory.path().canonicalize().unwrap();
     let large = root.join("large.rlib");
     let small = root.join("small.rs");
-    let bytes = vec![b'l'; 65_537];
+    // The daemon starts prefetching at exactly 64 KiB.
+    let bytes = vec![b'l'; 65_536];
     std::fs::write(&large, &bytes).unwrap();
-    std::fs::write(&small, b"small").unwrap();
+    std::fs::write(&small, vec![b's'; 65_535]).unwrap();
     let fingerprint = FileFingerprint::from_path(&large).unwrap();
     let expected_request = HashFileRequest {
         path: fingerprint.path.clone(),
@@ -2292,6 +2293,7 @@ async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() 
         mtime_ns: fingerprint.mtime_ns,
         ctime_ns: fingerprint.ctime_ns,
         inode: fingerprint.inode,
+        refs_id: fingerprint.refs_id,
     };
     let expected = blake3::hash(&bytes).to_hex().to_string();
     let reply = Response::ok_hash_results(vec![HashFileResult {
@@ -2300,6 +2302,7 @@ async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() 
         mtime_ns: fingerprint.mtime_ns,
         ctime_ns: fingerprint.ctime_ns,
         inode: fingerprint.inode,
+        refs_id: fingerprint.refs_id,
         hash: Some(expected.clone()),
         cache_hit: true,
         bytes_hashed: 0,
@@ -2443,6 +2446,7 @@ fn runtime_warmup_reply(
         mtime_ns: request.mtime_ns,
         ctime_ns: request.ctime_ns,
         inode: request.inode,
+        refs_id: request.refs_id,
         cache_hit: hash.is_some(),
         hash,
         bytes_hashed: 0,
@@ -2727,6 +2731,7 @@ fn native_runtime_warmup_admission_requires_strong_settled_fingerprints() {
         mtime_ns: 1_234_567_007,
         ctime_ns: 1_234_567_007,
         inode: 5,
+        refs_id: None,
     };
     assert!(native_runtime_fingerprints_can_warm(
         std::slice::from_ref(&file),
@@ -17327,6 +17332,7 @@ fn the_too_new_guard_allows_for_coarse_file_clocks_and_keeps_its_margin() {
             mtime_ns: stamp_ns,
             ctime_ns: stamp_ns,
             inode: 1,
+            refs_id: None,
         });
         hasher.too_new()
     };
@@ -19334,6 +19340,7 @@ fn a_row_observed_inside_the_settle_window_is_never_memoised_however_late_the_fl
         mtime_ns: 1,
         ctime_ns: 1,
         inode: 7,
+        refs_id: None,
     };
     let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
     for (path, observed_ns) in [
@@ -24813,6 +24820,7 @@ fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
         mtime_ns: 1,
         ctime_ns: 1,
         inode,
+        refs_id: None,
     };
     let first = |inode, observed_ns| ObservedFingerprint {
         fingerprint: stamp(r"C:\a\b.rs", inode),
@@ -24844,6 +24852,7 @@ fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
         },
         FileFingerprint {
             inode: 8,
+            refs_id: None,
             ..other.clone()
         },
     ] {

@@ -357,6 +357,7 @@ fn the_cc_memo_rule_columns_arrive_once_and_older_rows_are_never_served() {
         mtime_ns,
         ctime_ns: mtime_ns,
         inode: 1,
+        refs_id: None,
     };
     // The statements 1.0.0 records a memo, a mapped hash and a verdict with.
     let record_as_older_release = |db: &Connection, memo_key: &str, mtime_ns: i64| {
@@ -571,6 +572,7 @@ fn an_older_release_reopening_the_index_does_not_empty_the_file_hash_memo() {
         mtime_ns: 1,
         ctime_ns: 1,
         inode: 1,
+        refs_id: None,
     };
     // The statement 1.0.0 records a row with.
     let record_as_older_release = |db: &Connection, file: &str| {
@@ -645,6 +647,7 @@ fn file_hashes_rebuilt_by_an_older_gc_after_the_upgrade_get_their_rule_back() {
         mtime_ns: 1,
         ctime_ns: 1,
         inode: 1,
+        refs_id: None,
     };
 
     // A store from before 0.27, just opened by the older GC.
@@ -16474,6 +16477,7 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
                     mtime_ns: 1,
                     ctime_ns: 1,
                     inode: 1,
+                    refs_id: None,
                 },
                 content: "header-content".into(),
                 mapped: String::new(),

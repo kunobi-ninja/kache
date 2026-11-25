@@ -64,7 +64,7 @@ fn key_time_result(events: &[&BuildEvent]) -> Option<Check> {
 }
 
 /// Whether unchanged key inputs under each root can be served from the
-/// file-hash memo. On Windows that needs NTFS file identity; elsewhere every
+/// file-hash memo. On Windows that needs NTFS or ReFS file identity; elsewhere every
 /// root passes, so the check is only shown on Windows.
 pub(super) fn memo_volume_check(roots: &[(&str, PathBuf)]) -> Check {
     let problems: Vec<_> = roots
@@ -83,7 +83,7 @@ fn memo_volume_result(problems: &[(&str, &std::path::Path, String)]) -> Check {
         return Check {
             label: FILE_HASH_MEMO,
             pass: true,
-            detail: "key inputs are on NTFS; an unchanged file is hashed once".into(),
+            detail: "key input directories support file identity on NTFS or ReFS".into(),
             fix: None,
         };
     }
@@ -98,7 +98,7 @@ fn memo_volume_result(problems: &[(&str, &std::path::Path, String)]) -> Check {
         detail,
         fix: Some(
             "every cache key reads these files again, which antivirus scanning makes slow; \
-             keep them on NTFS (ReFS, including Dev Drive, FAT and exFAT are not memoised)"
+             use NTFS or a ReFS Dev Drive that supplies stable file IDs and change times"
                 .into(),
         ),
     }
@@ -188,7 +188,7 @@ mod tests {
             (
                 "workspace",
                 Path::new("D:/src/app"),
-                "ReFS gives no file identity".into(),
+                "FAT gives no file identity".into(),
             ),
             (
                 "target directory",
@@ -198,7 +198,7 @@ mod tests {
         ]);
         assert!(!check.pass);
         assert!(
-            check.detail.contains("workspace D:/src/app: ReFS"),
+            check.detail.contains("workspace D:/src/app: FAT"),
             "{}",
             check.detail
         );

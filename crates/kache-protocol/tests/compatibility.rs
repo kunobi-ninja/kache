@@ -201,3 +201,19 @@ fn publication_memos_keep_flattened_fingerprints_and_old_defaults() {
         })
     );
 }
+
+#[test]
+fn file_hash_requests_preserve_the_complete_refs_identity() {
+    let legacy = json!({"path":"file","size":2,"mtime_ns":3,"ctime_ns":4,"inode":0});
+    let mut request: kache_protocol::HashFileRequest = from_value(legacy.clone()).unwrap();
+    assert_eq!(request.refs_id, None);
+    assert_eq!(to_value(&request).unwrap(), legacy);
+    let id = std::array::from_fn(|i| i as u8);
+    request.refs_id = Some(id);
+    let wire = to_value(&request).unwrap();
+    assert_eq!(wire["refs_id"], json!(id));
+    assert_eq!(
+        from_value::<kache_protocol::HashFileRequest>(wire).unwrap(),
+        request
+    );
+}

@@ -1,6 +1,8 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
-use crate::file_hash::{FileFingerprint, FileHashCache, file_hash_memo_eligible, stamp_is_settled};
+use crate::file_hash::{
+    FileFingerprint, FileHashCache, file_stamp_memo_eligible, stamp_is_settled,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,8 +30,11 @@ impl CcPreprocessMemoInput {
     /// write moves it (see [`stamp_is_settled`]). Only such a stamp may stand
     /// in for the content on a later lookup.
     pub fn stamp_settled(&self) -> bool {
-        file_hash_memo_eligible(self.fingerprint.inode, cfg!(windows))
-            && stamp_is_settled(&self.fingerprint, self.observed_ns)
+        file_stamp_memo_eligible(
+            self.fingerprint.inode,
+            self.fingerprint.refs_id,
+            cfg!(windows),
+        ) && stamp_is_settled(&self.fingerprint, self.observed_ns)
     }
 }
 
@@ -75,6 +80,9 @@ fn stamp_proof(stamp: &FileFingerprint) -> i64 {
     for value in [stamp.size, stamp.mtime_ns, stamp.ctime_ns, stamp.inode] {
         hasher.update(&value.to_le_bytes());
     }
+    if let Some(id) = stamp.refs_id {
+        hasher.update(&id);
+    }
     let mut proof = [0; 8];
     proof.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
     i64::from_le_bytes(proof)
@@ -89,6 +97,7 @@ fn unproven(path: String) -> FileFingerprint {
         mtime_ns: 0,
         ctime_ns: 0,
         inode: 0,
+        refs_id: None,
     }
 }
 
@@ -230,7 +239,7 @@ const RULE_COLUMNS: [(&str, &str, &str); 3] = [
     ("cc_asm_scans", "rule", "rule INTEGER NOT NULL DEFAULT 0"),
 ];
 
-fn has_column(db: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+pub(crate) fn has_column(db: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     db.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
         params![table, column],
@@ -540,7 +549,7 @@ impl FileHashCache<'_> {
         let mut stmt = self.db().prepare_cached(
             "SELECT m.preprocessed_hash, m.input_count, m.last_used <= unixepoch() - 86400,
                     i.id, i.name, i.content, i.mapped, i.local_path,
-                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof
+                    i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof, i.refs_id
              FROM cc_preprocess_memos m
              LEFT JOIN cc_memo_input_refs r ON r.memo_id = m.id
              LEFT JOIN cc_memo_inputs i ON i.id = r.input_id
@@ -568,6 +577,7 @@ impl FileHashCache<'_> {
                 mtime_ns: row.get(9)?,
                 ctime_ns: row.get(10)?,
                 inode: row.get(11)?,
+                refs_id: row.get(13)?,
             };
             let proven = row.get::<_, Option<i64>>(12)? == Some(stamp_proof(&stamp));
             result.as_mut().unwrap().inputs.push(CcPreprocessMemoInput {
@@ -622,12 +632,12 @@ impl FileHashCache<'_> {
         tx.execute("DELETE FROM cc_memo_input_refs WHERE memo_id = ?1", [id])?;
         {
             let mut put = tx.prepare_cached(
-                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode, proof)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO cc_memo_inputs(name, content, mapped, local_path, size, mtime_ns, ctime_ns, inode, proof, refs_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(name, content, mapped) DO UPDATE SET
                  local_path = excluded.local_path, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, ctime_ns = excluded.ctime_ns, inode = excluded.inode,
-                 proof = excluded.proof
+                 proof = excluded.proof, refs_id = excluded.refs_id
                  RETURNING id",
             )?;
             let mut put_unproven = tx.prepare_cached(
@@ -652,7 +662,8 @@ impl FileHashCache<'_> {
                             stamp.mtime_ns,
                             stamp.ctime_ns,
                             stamp.inode,
-                            stamp_proof(stamp)
+                            stamp_proof(stamp),
+                            stamp.refs_id.as_ref().map(|id| id.as_slice())
                         ],
                         |row| row.get(0),
                     )?
@@ -759,6 +770,22 @@ mod tests {
     /// settled.
     const SETTLED: i64 = 10 * HASH_SETTLE_NS;
 
+    #[test]
+    fn refs_stamp_proof_covers_volume_and_file_id() {
+        let mut stamp = input("source", "hash").fingerprint;
+        let legacy_proof = stamp_proof(&stamp);
+        let id = [1; 24];
+        stamp.refs_id = Some(id);
+        let proof = stamp_proof(&stamp);
+        assert_ne!(proof, legacy_proof);
+        for index in [0, 8, 23] {
+            let mut changed = id;
+            changed[index] += 1;
+            stamp.refs_id = Some(changed);
+            assert_ne!(stamp_proof(&stamp), proof);
+        }
+    }
+
     fn input(name: &str, content: &str) -> CcPreprocessMemoInput {
         CcPreprocessMemoInput {
             name: name.into(),
@@ -770,6 +797,7 @@ mod tests {
                 mtime_ns: 20,
                 ctime_ns: 30,
                 inode: 40,
+                refs_id: None,
             },
             observed_ns: SETTLED,
         }
@@ -1076,6 +1104,7 @@ mod tests {
             mtime_ns: 21,
             ctime_ns: 31,
             inode: 41,
+            refs_id: None,
         };
         cache
             .put_cc_preprocess_memo_inputs("b", "hash-b", std::slice::from_ref(&moved))
@@ -1140,6 +1169,7 @@ mod tests {
             mtime_ns: 50,
             ctime_ns: 60,
             inode: 41,
+            refs_id: None,
         };
         elsewhere.observed_ns = just_before_settling(&elsewhere);
         cache
@@ -1192,6 +1222,7 @@ mod tests {
                         mtime_ns: row.get(2)?,
                         ctime_ns: row.get(3)?,
                         inode: row.get(4)?,
+                        refs_id: None,
                     })
                 },
             )

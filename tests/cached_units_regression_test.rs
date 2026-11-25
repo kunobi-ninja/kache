@@ -1966,7 +1966,12 @@ fn image_sync_supplies_a_build_scripts_first_run_only_for_matching_inputs_and_im
     };
     let sync = |cache: &Path, config: &Path, options: &[&str]| {
         let mut cmd = hermetic_command(kache_binary(), cache, Some(config));
-        cmd.current_dir(&fx.workspace).arg("sync").args(options);
+        // The producer writes only to the fixture's temporary filesystem remote.
+        cmd.env_remove("GITHUB_ACTIONS")
+            .env_remove("GITLAB_CI")
+            .current_dir(&fx.workspace)
+            .arg("sync")
+            .args(options);
         run(&mut cmd);
     };
     let build =

@@ -64,4 +64,6 @@ pub struct FileFingerprint {
     pub mtime_ns: i64,
     pub ctime_ns: i64,
     pub inode: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_id: Option<[u8; 24]>,
 }

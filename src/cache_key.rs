@@ -1116,6 +1116,7 @@ fn walk_one_root(root: &WalkedRoot, max_entries: usize) -> StampOutcome {
                 mtime_ns: metadata_mtime_ns(metadata),
                 ctime_ns: metadata_ctime_ns(metadata),
                 inode,
+                refs_id: None,
             });
         }
     };
@@ -8676,9 +8677,9 @@ impl std::fmt::Display for NativeRuntimeHashesWarming {
 impl std::error::Error for NativeRuntimeHashesWarming {}
 
 fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: i64) -> bool {
-    files
-        .iter()
-        .all(|file| file.inode != 0 && stamp_is_settled(file, observed_at))
+    files.iter().all(|file| {
+        (file.inode != 0 || file.refs_id.is_some()) && stamp_is_settled(file, observed_at)
+    })
 }
 
 #[derive(Clone)]
@@ -8704,9 +8705,9 @@ fn may_carry_over(
     let was = &first.fingerprint;
     was.path != now.path
         && first.settled()
-        && file_hash_memo_eligible(now.inode, requires_identity)
-        && (now.size, now.mtime_ns, now.ctime_ns, now.inode)
-            == (was.size, was.mtime_ns, was.ctime_ns, was.inode)
+        && file_stamp_memo_eligible(now.inode, now.refs_id, requires_identity)
+        && (now.size, now.mtime_ns, now.ctime_ns, now.inode, now.refs_id)
+            == (was.size, was.mtime_ns, was.ctime_ns, was.inode, was.refs_id)
 }
 
 /// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
@@ -9107,7 +9108,7 @@ impl<'db> FileHasher<'db> {
         }
         inputs.iter().all(|input| {
             let expected = &input.fingerprint;
-            expected.inode != 0
+            (expected.inode != 0 || expected.refs_id.is_some())
                 && FileFingerprint::from_path(Path::new(&expected.path))
                     .is_ok_and(|current| current == *expected)
         })
@@ -9131,7 +9132,7 @@ impl<'db> FileHasher<'db> {
                 FileFingerprint::from_path(Path::new(&expected.path)).map_or(true, |current| {
                     current.size != expected.size
                         || current.mtime_ns != expected.mtime_ns
-                        || current.inode != expected.inode
+                        || (current.inode, current.refs_id) != (expected.inode, expected.refs_id)
                 })
             })
     }
@@ -9523,7 +9524,11 @@ impl<'db> FileHasher<'db> {
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
             if current.fingerprint == expected.fingerprint
-                && file_hash_memo_eligible(current.fingerprint.inode, cfg!(windows))
+                && file_stamp_memo_eligible(
+                    current.fingerprint.inode,
+                    current.fingerprint.refs_id,
+                    cfg!(windows),
+                )
             {
                 // Unhashed, so registered here with the bytes its stamp
                 // proves: the recheck after a compile has to cover it like
@@ -9915,7 +9920,7 @@ impl<'db> FileHasher<'db> {
                 continue;
             };
             if fingerprint.size < MIN_PERSISTED_HASH_BYTES
-                || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+                || !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows))
                 || self.prefetched.borrow().contains_key(&fingerprint)
             {
                 continue;
@@ -9926,6 +9931,7 @@ impl<'db> FileHasher<'db> {
                 mtime_ns: fingerprint.mtime_ns,
                 ctime_ns: fingerprint.ctime_ns,
                 inode: fingerprint.inode,
+                refs_id: fingerprint.refs_id,
             });
         }
 
@@ -9947,6 +9953,7 @@ impl<'db> FileHasher<'db> {
                             mtime_ns: result.mtime_ns,
                             ctime_ns: result.ctime_ns,
                             inode: result.inode,
+                            refs_id: result.refs_id,
                         },
                         PrefetchedHash {
                             hash,
@@ -10036,6 +10043,7 @@ impl<'db> FileHasher<'db> {
                     mtime_ns: file.mtime_ns,
                     ctime_ns: file.ctime_ns,
                     inode: file.inode,
+                    refs_id: file.refs_id,
                 });
                 missing.insert(file);
             }
@@ -10056,6 +10064,7 @@ impl<'db> FileHasher<'db> {
                     mtime_ns: result.mtime_ns,
                     ctime_ns: result.ctime_ns,
                     inode: result.inode,
+                    refs_id: result.refs_id,
                 };
                 if !missing.contains(&file) {
                     continue;
@@ -10350,6 +10359,7 @@ impl<'db> FileHasher<'db> {
                     mtime_ns: metadata_mtime_ns(metadata),
                     ctime_ns: metadata_ctime_ns(metadata),
                     inode: metadata_inode(metadata),
+                    refs_id: None,
                 },
                 observed_ns,
             };
@@ -10466,7 +10476,7 @@ impl<'db> FileHasher<'db> {
             MIN_PERSISTED_HASH_BYTES
         };
         if fingerprint.size < memo_floor
-            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+            || !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows))
         {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
@@ -10702,7 +10712,7 @@ impl<'db> FileHasher<'db> {
         // Windows); the archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES
-            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+            || !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows))
         {
             let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
             self.record_miss(size);
@@ -10729,6 +10739,7 @@ impl<'db> FileHasher<'db> {
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,
             inode: fingerprint.inode,
+            refs_id: fingerprint.refs_id,
         };
         match cache.get(&key) {
             Ok(Some(hash)) => {
@@ -10784,7 +10795,11 @@ impl<'db> FileHasher<'db> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
         if self.cache.is_none()
-            || !file_hash_memo_eligible(observed.fingerprint.inode, cfg!(windows))
+            || !file_stamp_memo_eligible(
+                observed.fingerprint.inode,
+                observed.fingerprint.refs_id,
+                cfg!(windows),
+            )
         {
             return self.hash(path);
         }

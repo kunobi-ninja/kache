@@ -246,6 +246,7 @@ mod tests {
                 mtime_ns: 1,
                 ctime_ns: 1,
                 inode: 7,
+                refs_id: None,
             },
             "ab".repeat(32),
         )

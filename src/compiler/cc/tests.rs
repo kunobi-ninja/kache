@@ -9542,6 +9542,7 @@ fn direct_inputs_digest_follows_names_and_content_only() {
             mtime_ns: 2,
             ctime_ns: 3,
             inode: 4,
+            refs_id: None,
         },
         observed_ns: 0,
     };
@@ -10216,6 +10217,7 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
             mtime_ns: 2,
             ctime_ns: 3,
             inode: 4,
+            refs_id: None,
         },
         observed_ns: 3 + crate::cache_key::HASH_SETTLE_NS,
     };

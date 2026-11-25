@@ -2021,6 +2021,7 @@ struct FileHashCacheKey {
     mtime_ns: i64,
     ctime_ns: i64,
     inode: i64,
+    refs_id: Option<[u8; 24]>,
 }
 
 const HASH_WARMUP_REQUEST_LIMIT: usize = 64;
@@ -2035,6 +2036,7 @@ impl From<&HashFileRequest> for FileHashCacheKey {
             mtime_ns: file.mtime_ns,
             ctime_ns: file.ctime_ns,
             inode: file.inode,
+            refs_id: file.refs_id,
         }
     }
 }
@@ -2047,6 +2049,7 @@ impl FileHashCacheKey {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             inode: self.inode,
+            refs_id: self.refs_id,
         }
     }
 
@@ -2057,6 +2060,7 @@ impl FileHashCacheKey {
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
             inode: self.inode,
+            refs_id: self.refs_id,
             cache_hit: hash.is_some(),
             hash,
             bytes_hashed: 0,
@@ -2076,7 +2080,7 @@ fn hash_warmup_keys(files: &[HashFileRequest]) -> Result<Vec<FileHashCacheKey>> 
             anyhow::ensure!(
                 Path::new(&file.path).is_absolute()
                     && file.size > 0
-                    && file.inode != 0
+                    && (file.inode != 0 || file.refs_id.is_some())
                     && file.mtime_ns >= 0
                     && file.ctime_ns > 0,
                 "file hash warmup requires a strong absolute fingerprint"
@@ -2283,7 +2287,9 @@ fn prepare_hash_warmup_with(
 ) -> Result<Option<String>> {
     let path = Path::new(&key.path);
     let before = observe(path)?;
-    if before.fingerprint != key.fingerprint() || before.fingerprint.inode == 0 || !before.settled()
+    if before.fingerprint != key.fingerprint()
+        || (before.fingerprint.inode == 0 && before.fingerprint.refs_id.is_none())
+        || !before.settled()
     {
         return Ok(None);
     }
@@ -3517,10 +3523,15 @@ impl Daemon {
                 mtime_ns: file.mtime_ns,
                 ctime_ns: file.ctime_ns,
                 inode: file.inode,
+                refs_id: file.refs_id,
             };
 
             if let Ok(cache) = self.file_hash_cache.lock()
-                && crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
+                && crate::cache_key::file_stamp_memo_eligible(
+                    file.inode,
+                    file.refs_id,
+                    cfg!(windows),
+                )
                 && let Some(hash) = cache.get(&key).cloned()
             {
                 results.push(HashFileResult {
@@ -3529,6 +3540,7 @@ impl Daemon {
                     mtime_ns: file.mtime_ns,
                     ctime_ns: file.ctime_ns,
                     inode: file.inode,
+                    refs_id: file.refs_id,
                     hash: Some(hash),
                     cache_hit: true,
                     bytes_hashed: 0,
@@ -3545,7 +3557,8 @@ impl Daemon {
                     if fingerprint.size == file.size
                         && fingerprint.mtime_ns == file.mtime_ns
                         && fingerprint.ctime_ns == file.ctime_ns
-                        && fingerprint.inode == file.inode => {}
+                        && fingerprint.inode == file.inode
+                        && fingerprint.refs_id == file.refs_id => {}
                 Ok(_) => {
                     results.push(HashFileResult {
                         path: file.path.clone(),
@@ -3553,6 +3566,7 @@ impl Daemon {
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
                         inode: file.inode,
+                        refs_id: file.refs_id,
                         hash: None,
                         cache_hit: false,
                         bytes_hashed: 0,
@@ -3567,6 +3581,7 @@ impl Daemon {
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
                         inode: file.inode,
+                        refs_id: file.refs_id,
                         hash: None,
                         cache_hit: false,
                         bytes_hashed: 0,
@@ -3579,17 +3594,19 @@ impl Daemon {
             // A stamp that had changed within the settle window when it was
             // observed can be kept by a second write in the same tick, so
             // its hash goes back to this caller and is remembered nowhere.
-            let settled = crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
-                && crate::cache_key::stamp_is_settled(
-                    &crate::cache_key::FileFingerprint {
-                        path: file.path.clone(),
-                        size: file.size,
-                        mtime_ns: file.mtime_ns,
-                        ctime_ns: file.ctime_ns,
-                        inode: file.inode,
-                    },
-                    observed_ns,
-                );
+            let settled =
+                crate::cache_key::file_stamp_memo_eligible(file.inode, file.refs_id, cfg!(windows))
+                    && crate::cache_key::stamp_is_settled(
+                        &crate::cache_key::FileFingerprint {
+                            path: file.path.clone(),
+                            size: file.size,
+                            mtime_ns: file.mtime_ns,
+                            ctime_ns: file.ctime_ns,
+                            inode: file.inode,
+                            refs_id: file.refs_id,
+                        },
+                        observed_ns,
+                    );
 
             // #281: hold the store mutex only for the cheap cache lookup and
             // record; run the blake3 read of the whole file OUTSIDE the lock so
@@ -3634,6 +3651,7 @@ impl Daemon {
                         mtime_ns: file.mtime_ns,
                         ctime_ns: file.ctime_ns,
                         inode: file.inode,
+                        refs_id: file.refs_id,
                         hash: Some(hash),
                         cache_hit,
                         bytes_hashed,
@@ -3646,6 +3664,7 @@ impl Daemon {
                     mtime_ns: file.mtime_ns,
                     ctime_ns: file.ctime_ns,
                     inode: file.inode,
+                    refs_id: file.refs_id,
                     hash: None,
                     cache_hit: false,
                     bytes_hashed: 0,
@@ -9345,7 +9364,8 @@ fn hash_warmup_results_from_response(
             && result.size == key.size
             && result.mtime_ns == key.mtime_ns
             && result.ctime_ns == key.ctime_ns
-            && result.inode == key.inode;
+            && result.inode == key.inode
+            && result.refs_id == key.refs_id;
         anyhow::ensure!(
             matched && result.error.is_none() && result.bytes_hashed == 0,
             "file hash warmup response does not match its fingerprint"

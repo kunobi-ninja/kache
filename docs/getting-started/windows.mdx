@@ -100,20 +100,19 @@ To wait for the hashes and cache from the first native compile:
 kache config set cache.native_runtime_warmup false
 ```
 
-Ordinary runtime-library hashes reuse file-hash memos when NTFS supplies a file
-index and change time. Since v2.1.0, Kache also uses these memos
+Ordinary runtime-library hashes reuse file-hash memos when NTFS or ReFS supplies a file
+identity and change time. Since v2.1.0, Kache also uses these memos
 for Microsoft `link.exe` and `cl.exe` banner digests. A replaced file or an edit
 that restores its old modification time invalidates the memo. Other filesystems,
 or failed identity queries, keep caching artifacts but read bytes on each key. Explicit
 `/DEFAULTLIB` requests still validate and hash the selected archive together.
 An unavailable or older daemon uses the synchronous path too.
 
-Keep the workspace, its `target` directory and Cargo home on NTFS. Rust sources,
-dependency crates and registry files reuse the same memos, so an unchanged file
-is hashed once. On ReFS (including Dev Drive), FAT or exFAT every cache key
-reads its inputs again, and on-access antivirus scanning makes those reads slow.
-ReFS still gives copy-on-write restores. `kache doctor` names any of these
-directories that is not on NTFS.
+On ReFS Dev Drives, Kache compares the volume serial and the full 128-bit
+file ID when reusing a hash. NTFS, ReFS, and Dev Drives can therefore reuse
+hashes for unchanged files in the workspace, target directory, and Cargo home.
+On FAT and exFAT, each key reads its inputs again. `kache doctor` lists
+directories where it cannot obtain a usable identity.
 
 `kache doctor` also reports the median key time of the latest build. If it
 fails, record the slow build with phase tracing:

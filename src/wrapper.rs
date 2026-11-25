@@ -3960,11 +3960,13 @@ fn resolve_located_build_script_inputs(
     };
     let outside = |path: &Path| crate::cache_key::source_path_identity(path, normalizer());
     let scoped_value = |var: &str, value: &std::ffi::OsStr| {
-        let krate = args.crate_name.as_deref()?;
-        if !crate::cache_key::forced_path_only_env(&config.path_only_env_vars, krate, var) {
-            return None;
-        }
-        crate::build_script_inputs::declared_path_value(value, normalizer())
+        crate::build_script_inputs::declared_path_value(
+            &config.path_only_env_vars,
+            args.crate_name.as_deref(),
+            var,
+            value,
+            normalizer,
+        )
     };
     crate::build_script_inputs::resolve(
         located,

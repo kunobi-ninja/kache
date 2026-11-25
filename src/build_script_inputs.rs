@@ -539,10 +539,17 @@ fn env_state(
 /// Identity for a user-asserted locator. Preserve unrecognized values literally.
 /// In unquoted MSVC flags, remap only the source of a standalone /pathmap
 /// option. The destination and all other bytes can change the object.
-pub(crate) fn declared_path_value(
+pub(crate) fn declared_path_value<'a>(
+    entries: &[String],
+    crate_name: Option<&str>,
+    var: &str,
     value: &OsStr,
-    normalizer: &crate::path_normalizer::PathNormalizer,
+    normalizer: impl FnOnce() -> &'a crate::path_normalizer::PathNormalizer,
 ) -> Option<Vec<u8>> {
+    if !crate::cache_key::forced_path_only_env(entries, crate_name?, var) {
+        return None;
+    }
+    let normalizer = normalizer();
     let path = Path::new(value);
     if let Some(id) = normalizer.source_path_identity(path) {
         return Some(id);

@@ -502,9 +502,7 @@ fn a_scoped_declared_directory_keys_its_location_and_declared_contents() {
         let entries = [entry.to_owned()];
         let normalizer = f.normalizer();
         let scoped = |var: &str, v: &OsStr| {
-            crate::cache_key::forced_path_only_env(&entries, "lib_target", var)
-                .then(|| declared_path_value(v, &normalizer))
-                .flatten()
+            declared_path_value(&entries, Some("lib_target"), var, v, || &normalizer)
         };
         match f
             .resolve_with(&[("DATA_DIR", value)], 100, &scoped)
@@ -524,7 +522,13 @@ fn a_scoped_declared_directory_keys_its_location_and_declared_contents() {
     }
     let key = digest_for(&a, entry, left);
     assert_eq!(key, digest_for(&b, entry, right));
-    assert_ne!(key, digest_for(&b, entry, "<WORKSPACE>/data"));
+    let literal = String::from_utf8(
+        b.normalizer()
+            .source_path_identity(Path::new(right))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(key, digest_for(&b, entry, &literal));
     assert_ne!(
         key,
         digest_for(&b, entry, b.package.join("other").to_str().unwrap())
@@ -541,8 +545,11 @@ fn pathmap_preserves_destinations_other_flags_and_spacing() {
         let path = f.package.display();
         let normalizer = f.normalizer();
         declared_path_value(
+            &["lib_target:CFLAGS".into()],
+            Some("lib_target"),
+            "CFLAGS",
             OsStr::new(&format!("/O2 /pathmap:{path}={dest}{after}")),
-            &normalizer,
+            || &normalizer,
         )
     };
     let shared = flags(&a, "Z:/source", " /Zi");

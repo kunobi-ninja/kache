@@ -78,14 +78,19 @@ def measure(label,binary,work,crate,manifest):
     base=ROOT/(label+'-'+crate);base.mkdir();cache=base/'cache';config=base/'config.toml';config.write_text('[cache]\nlocal_only=true\n');
     env={**BASE,'RUSTC_WRAPPER':str(binary),'KACHE_CACHE_DIR':str(cache),'KACHE_RUNTIME_DIR':str(base/'ipc'),
          'KACHE_CONFIG':str(config),'KACHE_HOST_CONFIG':str(config),'KACHE_BASE_DIR':str(work)}
+    if crate == "ring": env.pop("CARGO_PROFILE_DEV_DEBUG", None)
     run([binary,'daemon','start'],work,env,label+'-'+crate+'-start.log');rows=[]
     try:
         for phase,targetname in [('cold','a'),('same','a'),('new','b')]:
             target=base/targetname
             if target.exists():shutil.rmtree(target)
             before={f:f.stat().st_size for f in base.rglob('events.jsonl')}
-            run(['cargo','build','--locked','--offline','--lib','--target-dir',target],work,env,f'{label}-{crate}-{phase}.log')
-            artifacts=list((target/'debug/deps').glob('lib'+crate+'-*.rlib'));assert len(artifacts)==1,artifacts
+            messages=run(['cargo','build','--message-format=json-render-diagnostics','--locked','--offline','--lib','--target-dir',target],work,env,f'{label}-{crate}-{phase}.log')
+            products=[json.loads(line) for line in messages.splitlines() if line.startswith('{')]
+            files=[Path(path) for m in products if m.get('reason')=='compiler-artifact' and m['target']['name']==crate for path in m['filenames'] if path.endswith('.rlib')]
+            if len(files)!=1:
+                raise RuntimeError(f'cargo artifact {crate} {files} under {target}: {[str(p) for p in target.rglob("*.rlib")]}')
+            artifacts=files
             analysis=inspect(artifacts[0],manifest); events=[]
             for f in base.rglob('events.jsonl'):
                 with f.open('rb') as stream:

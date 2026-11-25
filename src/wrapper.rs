@@ -3947,8 +3947,8 @@ fn resolve_located_build_script_inputs(
         args.invocation_env(),
     ));
     let normalizer = std::cell::OnceCell::new();
-    let outside = |path: &Path| {
-        let normalizer = normalizer.get_or_init(|| {
+    let normalizer = || {
+        normalizer.get_or_init(|| {
             crate::path_normalizer::PathNormalizer::from_invocation(
                 workspace_root,
                 args.invocation_env(),
@@ -3956,8 +3956,17 @@ fn resolve_located_build_script_inputs(
             .with_target_dir(args.target_dir().as_deref())
             .with_profile_dir(args.profile_dir().as_deref())
             .with_base_dirs(&config.base_dirs)
-        });
-        crate::cache_key::source_path_identity(path, normalizer)
+        })
+    };
+    let outside = |path: &Path| crate::cache_key::source_path_identity(path, normalizer());
+    let scoped_value = |var: &str, value: &std::ffi::OsStr| {
+        crate::build_script_inputs::declared_path_value(
+            &config.path_only_env_vars,
+            args.crate_name.as_deref(),
+            var,
+            value,
+            normalizer,
+        )
     };
     crate::build_script_inputs::resolve(
         located,
@@ -3967,6 +3976,7 @@ fn resolve_located_build_script_inputs(
             cache_dir: &config.cache_dir,
             excluded: &excluded,
             outside: &outside,
+            scoped_value: &scoped_value,
             max_entries: crate::build_script_inputs::MAX_ENTRIES,
         },
     )

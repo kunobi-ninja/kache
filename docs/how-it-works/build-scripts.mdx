@@ -265,6 +265,7 @@ and keys:
   key. A path under the Cargo home's `registry` or `git` directory counts by
   name only, since Cargo treats those as immutable;
 - each `cargo:rerun-if-env-changed` variable, by its exact value or as unset.
+  A [crate-scoped path-only variable](/docs/getting-started/configuration#cache-key-controls) can share a declared path across checkouts.
   A variable Cargo itself sets on the rustc command, such as `OUT_DIR`,
   `CARGO_MANIFEST_DIR` or `CARGO_PKG_VERSION`, counts by name only. A variable
   whose name ends in `_OUT_DIR` counts by name only when it holds another

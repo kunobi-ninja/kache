@@ -2215,6 +2215,7 @@ source = "git+https://example.com/gitdep#abc"
                             cache_dir: cache.path(),
                             excluded: &[],
                             outside: &outside,
+                            scoped_value: &|_, _| None,
                             max_entries: 100,
                         },
                     )

@@ -18,8 +18,8 @@
 //! files, map files, diagnostics, and target-specific relocation handling, and
 //! rustc preserves those names when bundling a native archive into an rlib.
 //! Ignoring path-derived `cc` member prefixes would therefore permit a false
-//! hit. Anything not proven safe returns `None`; the caller uses a path-bound
-//! fallback digest (or makes thin archives uncacheable).
+//! hit. Anything not proven safe returns `None`; the caller hashes a regular archive
+//! as raw bytes or refuses a thin archive.
 //!
 //! ## What is hashed (GNU archives)
 //! - every object's exact header name token and DATA bytes, length-framed,
@@ -48,7 +48,7 @@
 //! Object payloads must be structurally valid ELF relocatable objects without
 //! recognized embedded LTO/offload section names or types, or pass the same
 //! fail-closed Mach-O gate as BSD members. Raw/wrapped LLVM bitcode and unknown
-//! payloads use path fallback.
+//! payloads use the raw-byte fallback.
 //!
 //! ## What is hashed (BSD / Darwin archives, #691)
 //! macOS `ar` stores long member names INLINE: a `#1/N` header name puts the
@@ -77,7 +77,7 @@
 //!   absolute path, which that `--out-dir` prefix does not strip, so
 //!   [`ArchiveIdentity::macho_dwarf_members`] lets the caller keep the
 //!   path-bound fallback there. Unsupported, malformed, STABS, bitcode, and
-//!   ARM64_32 objects always use the path-bound fallback;
+//!   ARM64_32 objects use the raw-byte fallback;
 //! - the ranlib member (`__.SYMDEF[ SORTED]` / `__.SYMDEF_64[ SORTED]`) DATA
 //!   **as-is**, tagged with its trimmed name: `_64` reads the same bytes with
 //!   a different word width and ` SORTED` changes the lookup contract, so the
@@ -92,12 +92,13 @@
 //! and rustc normalizes them when rebuilding an rlib. Member names, timestamps,
 //! sizes, contents, order, and symbol tables remain identity-bearing.
 //!
-//! ## Out of scope -> path-bound fallback (`None`)
+//! ## Formats without a structural digest (`None`)
 //! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts,
 //! STABS-bearing Mach-O, compiler bitcode/LTO, ARM64_32, unknown object formats,
 //! and anything malformed. Thin archives are made uncacheable because their
-//! external member bytes are absent from the container. Other fallbacks bind
-//! both the archive bytes and lexical absolute archive path.
+//! external member bytes are absent from the container. For a regular archive
+//! an rlib-only compile keys the file name and exact bytes. Linking units
+//! also key the lexical absolute path.
 //!
 //! Explicit Windows DEFAULTLIB inputs use a separate closed-container check,
 //! [`validate_closed_windows_runtime_archive`], while retaining their raw file

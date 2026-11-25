@@ -312,7 +312,7 @@ impl Client {
     /// Compile the crate `kt` rooted at `source`, from `cwd`, into `target`,
     /// as the package at `manifest_dir`.
     fn compile_unit(&self, cwd: &Path, source: &str, target: &Path, manifest_dir: &Path) {
-        self.compile_unit_with_log(cwd, source, target, manifest_dir, "off");
+        self.compile_unit_with_log(cwd, source, target, manifest_dir, "off", &[]);
     }
 
     fn compile_unit_with_log(
@@ -322,32 +322,35 @@ impl Client {
         target: &Path,
         manifest_dir: &Path,
         log_filter: &str,
+        extra: &[&str],
     ) -> Output {
         let deps = target.join("debug/deps");
         std::fs::create_dir_all(&deps).unwrap();
         let out_dir = deps.display().to_string();
         let search = format!("dependency={out_dir}");
         let rustc = rustc_path();
+        let mut argv = vec![
+            rustc.as_str(),
+            "--crate-name",
+            "kt",
+            "--edition=2021",
+            source,
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata,link",
+            "-C",
+            "metadata=fedcba9876543210",
+            "-C",
+            "extra-filename=-fedcba9876543210",
+            "--out-dir",
+            &out_dir,
+            "-L",
+            &search,
+        ];
+        argv.extend_from_slice(extra);
         let output = self.run_within_at_env(
             Some(cwd),
-            &[
-                &rustc,
-                "--crate-name",
-                "kt",
-                "--edition=2021",
-                source,
-                "--crate-type",
-                "lib",
-                "--emit=dep-info,metadata,link",
-                "-C",
-                "metadata=fedcba9876543210",
-                "-C",
-                "extra-filename=-fedcba9876543210",
-                "--out-dir",
-                &out_dir,
-                "-L",
-                &search,
-            ],
+            &argv,
             &[
                 ("CARGO_MANIFEST_DIR", manifest_dir),
                 ("KACHE_LOG", Path::new(log_filter)),
@@ -744,6 +747,92 @@ fn daemon_upload_reaches_an_independent_client_through_one_folder() {
 
 /// The wrapper discovers checkout paths in the compiled output even when
 /// rustc records no environment dependency for them.
+// A prebuilt member can carry the registry crate's path in its archive name
+// even when the crate's Rust and object code do not read CARGO_MANIFEST_DIR.
+#[test]
+fn a_registry_archive_with_an_absolute_member_name_hits_locally() {
+    let scratch = TempDir::new().unwrap();
+    let package = scratch.path().join("registry/src/example/probe-0.1.0");
+    let objects = package.join("pregenerated");
+    std::fs::create_dir_all(&objects).unwrap();
+    let member = objects.join("probe.o");
+    let native = objects.join("native.rs");
+    std::fs::write(
+        &native,
+        "#![no_std]\n#[no_mangle] pub extern \"C\" fn native_value() -> u32 { 7 }",
+    )
+    .unwrap();
+    let output = std::process::Command::new(rustc_path())
+        .args(["--crate-type=lib", "--emit=obj", "-Cdebuginfo=0", "-o"])
+        .arg(&member)
+        .arg(&native)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let name = member.to_str().unwrap().as_bytes();
+    // BSD extended ar names are inline, including their full path. rustc
+    // accepts this input on MSVC as well as Unix and supplies the rlib index.
+    let object = std::fs::read(&member).unwrap();
+    // ar starts with an 8-byte magic and a 60-byte member header. Pad the
+    // inline name so LLVM can read the object at its required alignment.
+    let object_offset = (68 + name.len()).next_multiple_of(16);
+    let name_len = object_offset - 68;
+    let extended = format!("#1/{name_len}");
+    let header = format!(
+        "{extended:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        0,
+        0,
+        0,
+        644,
+        name_len + object.len()
+    );
+    let mut archive = b"!<arch>\n".to_vec();
+    archive.extend_from_slice(header.as_bytes());
+    archive.extend_from_slice(name);
+    archive.resize(object_offset, 0);
+    archive.extend_from_slice(&object);
+    if !archive.len().is_multiple_of(2) {
+        archive.push(b'\n');
+    }
+    std::fs::write(objects.join("libprobe.a"), archive).unwrap();
+    std::fs::write(package.join("lib.rs"), "pub fn answer() -> u32 { 7 }").unwrap();
+
+    let client = Client::new(scratch.path());
+    client.start_daemon();
+    let target = scratch.path().join("target");
+    let search = format!("native={}", objects.display());
+    let compile = || {
+        client.compile_unit_with_log(
+            &package,
+            "lib.rs",
+            &target,
+            &package,
+            "off",
+            &["-L", &search, "-lstatic=probe"],
+        );
+        let event = crate_event(&client.report(), "kt").clone();
+        let rlib = std::fs::read(target.join("debug/deps/libkt-fedcba9876543210.rlib")).unwrap();
+        (event, rlib)
+    };
+    let (cold, built) = compile();
+    assert_eq!(cold["result"], "miss", "{cold}");
+    assert!(
+        cold["cache_key"].as_str().unwrap().starts_with("checkout-"),
+        "{cold}"
+    );
+    assert!(built.windows(name.len()).any(|bytes| bytes == name));
+    std::fs::remove_dir_all(&target).unwrap();
+    let (warm, restored) = compile();
+    assert_eq!(warm["result"], "local_hit", "{warm}");
+    assert_eq!(warm["compiler_runs"], 0);
+    assert_eq!(cold["cache_key"], warm["cache_key"]);
+    assert_eq!(built, restored);
+}
+
 #[test]
 fn checkout_bound_rust_output_hits_locally_and_never_enqueues_an_upload() {
     build_kache();
@@ -767,7 +856,8 @@ fn checkout_bound_rust_output_hits_locally_and_never_enqueues_an_upload() {
         if target.exists() {
             std::fs::remove_dir_all(&target).unwrap();
         }
-        let output = client.compile_unit_with_log(checkout, "lib.rs", &target, checkout, "debug");
+        let output =
+            client.compile_unit_with_log(checkout, "lib.rs", &target, checkout, "debug", &[]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stderr.is_empty(),

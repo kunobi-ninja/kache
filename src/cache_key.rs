@@ -5522,6 +5522,9 @@ fn resolve_native_static_lib(
 /// checkouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticLibUse {
+    /// An rlib-only compile copies the archive's members or packs the archive
+    /// itself. Both forms can expose names and bytes, but not its parent path.
+    Rlib,
     /// The archive's path never reaches the output: rustc bundles it into its
     /// rlib (or staticlib) output, or ld64 strips it through the
     /// `-oso_prefix` kache injects. A later cached debug link names rlib
@@ -5539,6 +5542,7 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
+            Self::Rlib => "static-ar-v1-rlib",
             Self::Bundled => "static-ar-v8-bundled",
             Self::Linked => "static-ar-v8",
         }
@@ -5591,7 +5595,10 @@ fn oso_archive_use(
 /// kache injects (`oso_root`, from
 /// [`crate::compiler::rustc::oso_prefix_root_for_key`]) strips it.
 fn linked_archive_use(args: &RustcArgs, archive: &Path, oso_root: Option<&Path>) -> StaticLibUse {
-    if !args.is_executable_output() || oso_root.is_some_and(|root| archive.starts_with(root)) {
+    if !args.is_test && args.emits_rlib() && !args.links_native_closure() {
+        StaticLibUse::Rlib
+    } else if !args.is_executable_output() || oso_root.is_some_and(|root| archive.starts_with(root))
+    {
         StaticLibUse::Bundled
     } else {
         StaticLibUse::Linked
@@ -7591,11 +7598,11 @@ fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
 
 /// Compute a linked `static=` archive's cache-key digest. A proven GNU/BSD
 /// archive gets the structural member-identity hash, unless the invocation
-/// links an archive with DWARF-bearing Mach-O members itself. Every other
-/// non-thin archive gets a digest of both its bytes and lexical absolute path
-/// because linkers can expose `archive-path(member)`. Thin archives are
-/// uncacheable: rustc reads external members whose bytes are absent from the
-/// container.
+/// links an archive with DWARF-bearing Mach-O members itself. The fallback
+/// hashes the raw bytes and filename for a regular archive bundled by an
+/// rlib-only compile. Other uses retain the lexical absolute path because
+/// linkers can expose `archive-path(member)`. Thin archives have external
+/// members and are uncacheable.
 fn compute_static_lib_hash_for(
     path: &Path,
     usage: StaticLibUse,
@@ -7619,14 +7626,30 @@ fn compute_static_lib_hash_for(
         return Ok(identity.digest);
     }
 
-    let encoded_path = absolute.as_os_str().as_encoded_bytes();
+    // The ordered search paths are already keyed. Preserve the basename too:
+    // a packed rlib can contain an archive named foo.lib or libfoo.a.
+    let (name, identity, prefix) = if usage == StaticLibUse::Rlib && bytes.starts_with(b"!<arch>\n")
+    {
+        (
+            path.file_name().context("missing archive filename")?,
+            b"kache.native-ar.rlib.v1\0".as_slice(),
+            "rlib-ar-v1",
+        )
+    } else {
+        (
+            absolute.as_os_str(),
+            b"kache.native-ar.path-bound-fallback.v1\0".as_slice(),
+            "path-ar-v1",
+        )
+    };
+    let encoded_path = name.as_encoded_bytes();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache.native-ar.path-bound-fallback.v1\0");
+    hasher.update(identity);
     hasher.update(&(encoded_path.len() as u64).to_le_bytes());
     hasher.update(encoded_path);
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(&bytes);
-    Ok(format!("path-ar-v1:{}", hasher.finalize().to_hex()))
+    Ok(format!("{prefix}:{}", hasher.finalize().to_hex()))
 }
 
 /// Result of a dep-info pre-pass. Contains all information discovered by

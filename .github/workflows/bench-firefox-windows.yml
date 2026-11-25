@@ -1,4 +1,4 @@
-name: Native Windows archive admission
+name: Native MSVC archive rebuild comparison
 on: workflow_dispatch
 permissions:
   contents: read
@@ -14,12 +14,28 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
-      - name: Build current Kache for the native MSVC host
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: 21737f35e57050d12f0ecfd6f062b0ac9da2320b
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: 2361c44dac64a87527d6858597507ddce67aa2f4
+          path: candidate
+          persist-credentials: false
+      - name: Build baseline and candidate for the native MSVC host
         run: |
           rustup toolchain install 1.100.0-x86_64-pc-windows-msvc --profile minimal
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustc -Vv
-          cargo build --locked --bin kache --bin kache-engine
+          foreach ($arm in @("baseline", "candidate")) {
+            Push-Location $arm
+            git rev-parse HEAD
+            cargo build --locked --bin kache --bin kache-engine
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Pop-Location
+          }
       - name: Compare ring and inspect COFF archive fields
         shell: cmd
         run: |

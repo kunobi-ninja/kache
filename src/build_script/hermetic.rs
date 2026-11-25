@@ -271,9 +271,9 @@ impl ConsumerOutDir {
         } else {
             self.marker.with_extension("observed")
         };
-        match std::fs::File::create_new(marker) {
+        match std::fs::File::create_new(&marker) {
             Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) if marker.is_file() => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -1009,6 +1009,10 @@ mod tests {
         assert!(consumer.note_sealed_write_failure());
         assert!(consumer.note_sealed_write_failure());
         assert!(other_consumer.needs_writable());
+        std::fs::remove_file(&consumer.marker).unwrap();
+        std::fs::create_dir(&consumer.marker).unwrap();
+        assert!(!consumer.note_sealed_write_failure());
+        assert!(!other_consumer.needs_writable());
         assert_eq!(output_digest(&shared).unwrap(), original);
         assert_eq!(std::fs::read_link(out).unwrap(), shared);
     }

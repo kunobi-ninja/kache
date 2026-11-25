@@ -135,6 +135,23 @@ mod tests {
         }
     }
     #[test]
+    fn an_invocation_that_did_not_emit_the_default_library_cannot_certify_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut unit = args(dir.path());
+        let previous = dir.path().join("libleaf.rlib");
+        std::fs::write(&previous, "previous library").unwrap();
+
+        unit.output = Some(dir.path().join("explicit.rlib"));
+        record(&unit);
+        assert!(!proven_library(&previous));
+
+        unit.output = None;
+        unit.crate_types.clear(); // rustc's default crate type is a binary.
+        record(&unit);
+        assert!(!proven_library(&previous));
+    }
+
+    #[test]
     fn hidden_crate_inputs_cannot_establish_a_macro_free_graph() {
         let dir = tempfile::tempdir().unwrap();
         let mut unit = args(dir.path());

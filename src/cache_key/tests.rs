@@ -11160,6 +11160,40 @@ fn static_lib_fallback_binds_lexical_archive_path() {
     assert_ne!(first_hash, second_hash);
 }
 
+#[test]
+fn only_an_rlib_shares_identical_opaque_archive_bytes_across_checkouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let fh = FileHasher::new();
+    let left = dir.path().join("checkout-a/lib/probe.lib");
+    let right = dir.path().join("checkout-b/lib/probe.lib");
+    let bytes = crate::native_archive::closed_coff_archive_for_tests(b"original");
+    for file in [&left, &right] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, &bytes).unwrap();
+    }
+    let hash = |p: &Path, usage| fh.hash_static_lib_for(p, usage).unwrap();
+    let portable = hash(&left, StaticLibUse::Rlib);
+    assert!(portable.starts_with("rlib-ar-v1:"));
+    assert_eq!(portable, hash(&right, StaticLibUse::Rlib));
+    // Even an ld64 link under -oso_prefix has no proof for an opaque member.
+    for usage in [StaticLibUse::Linked, StaticLibUse::Bundled] {
+        assert_ne!(hash(&left, usage), hash(&right, usage));
+    }
+    let renamed = right.with_file_name("libprobe.a");
+    std::fs::copy(&right, &renamed).unwrap();
+    assert_ne!(portable, hash(&renamed, StaticLibUse::Rlib));
+    std::fs::write(
+        &right,
+        crate::native_archive::closed_coff_archive_for_tests(b"changed"),
+    )
+    .unwrap();
+    assert_ne!(portable, hash(&right, StaticLibUse::Rlib));
+    std::fs::write(&right, b"!<thin>\n").unwrap();
+    assert!(fh.hash_static_lib_for(&right, StaticLibUse::Rlib).is_err());
+    std::fs::write(&right, b"not a regular archive").unwrap();
+    assert!(hash(&right, StaticLibUse::Rlib).starts_with("path-ar-v1:"));
+}
+
 /// A link through Cargo's `OUT_DIR` symlink into a sealed hermetic
 /// directory keys the archive by content; anything else stays resolved.
 #[cfg(unix)]
@@ -11241,10 +11275,14 @@ fn linked_archive_use_follows_output_and_oso_root() {
         }
         linked_archive_use(&RustcArgs::parse(&argv).unwrap(), archive, oso_root)
     };
-    for crate_type in ["lib", "rlib", "staticlib"] {
+    assert_eq!(
+        use_of("staticlib", false, outside, None),
+        StaticLibUse::Bundled
+    );
+    for crate_type in ["lib", "rlib"] {
         assert_eq!(
             use_of(crate_type, false, outside, None),
-            StaticLibUse::Bundled,
+            StaticLibUse::Rlib,
             "{crate_type}"
         );
     }

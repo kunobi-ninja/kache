@@ -256,8 +256,10 @@ Crates that trybuild builds under `target/tests/trybuild/` get the same treatmen
 An explicit `-L native=` directory inside a unit's own `OUT_DIR` can share an
 `rlib` key across target directory and profile names. Kache retains its path
 below the profile directory and hashes the native archives, including their member names,
-timestamps and contents. Archives whose digest retains their path can still
-miss after relocation. This applies only when Rust path normalization is on,
+timestamps and contents. When rustc bundles a regular archive whose members
+Kache cannot interpret (such as an MSVC library or LLVM bitcode), the rlib
+key includes the archive name and exact bytes. Direct links retain the
+archive path in this case. This applies only when Rust path normalization is on,
 the search path and `OUT_DIR` are absolute, and the resolved search directory
 stays inside that `OUT_DIR`. Native links, test binaries, `staticlib` outputs,
 metadata-only outputs, and bare, `all=` or `framework=` search paths keep their existing path

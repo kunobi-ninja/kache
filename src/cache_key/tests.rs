@@ -24931,16 +24931,25 @@ fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
 
 #[test]
 fn separate_native_archive_transcripts_preserve_the_full_raw_key() {
-    let mut key = GroupedHasher::new("archives");
-    key.update(b"first");
-    key.update_variants(b"raw-1", b"loose-1");
-    key.update(b"both");
-    key.update_variants(b"raw-2", b"loose-2");
-    key.update(b"trailer");
+    fn transcript(key: &mut impl KeyFold) {
+        key.update(b"first");
+        key.update_variants(b"raw-1", b"loose-1");
+        key.update(b"both");
+        key.update_variants(b"raw-2", b"loose-2");
+        key.update(b"trailer");
+    }
+    let expected = blake3::hash(b"firstraw-1bothraw-2trailer");
+    let mut plain = blake3::Hasher::new();
+    transcript(&mut plain);
     assert_eq!(
-        key.main.finalize(),
-        blake3::hash(b"firstraw-1bothraw-2trailer")
+        plain.finalize(),
+        expected,
+        "plain hasher must retain both raw inputs"
     );
+
+    let mut key = GroupedHasher::new("archives");
+    transcript(&mut key);
+    assert_eq!(key.main.finalize(), expected);
     assert_eq!(
         key.loose_coff.unwrap().finalize(),
         blake3::hash(b"firstloose-1bothloose-2trailer")

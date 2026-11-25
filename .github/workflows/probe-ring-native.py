@@ -61,7 +61,7 @@ def project(parent, name):
 
 def fixture(name, payload):
     p=project(ROOT,name); pre=p/'pregenerated';pre.mkdir(); obj=pre/'a-long-absolute-native-member-name.obj'
-    outside=ROOT/('compile-'+name);outside.mkdir(); src=outside/'input.c'; text=json.dumps(str(p)) if payload else '"test"';src.write_text(f'const char fixture_data[] = {text};\n')
+    outside=ROOT/('compile-'+name);outside.mkdir(); src=outside/'input.c'; text=json.dumps(str(p)) if payload else '"test"';src.write_text(f'const char fixture_data[] = {text};\nconst char content_marker[] = "KACHE_TEST_VALUE_A";\n')
     run(['cl','/nologo','/c','/Od','/Fo'+obj.name,src.name],outside,BASE); shutil.copyfile(outside/obj.name,obj)
     data=obj.read_bytes(); assert (str(p).encode() in data)==payload
     def entry(n,b):
@@ -85,9 +85,9 @@ def rewrite_archive(path, original, phase):
     if phase == 'payload':
         assert data.count(b'fixture_data') >= 1
         # The symbol name stays unchanged. Replace its constant data.
-        marker = b'test\x00' if b'test\x00' in data else str(path.parent.parent).encode() + b'\x00'
+        marker = b'KACHE_TEST_VALUE_A\x00'
         assert data.count(marker) == 1, marker
-        place = data.index(marker)
+        place = data.index(marker) + len(marker) - 2
         data[place] = (data[place] + 1) % 256
     path.write_bytes(data)
 
@@ -102,9 +102,10 @@ def archived_objects(products, manifest):
     return archives
 
 
-def measure(arm, binary, project_dir, crate, manifest, mode):
-    base = ROOT / ('cache-' + arm + '-' + crate)
-    base.mkdir()
+def measure(arm, binary, project_dir, crate, manifest, mode, *, phases=None, group=None, keep_daemon=False, sample=None, reference=False):
+    log_name = sample or arm
+    base = ROOT / ('cache-' + (group or arm) + '-' + crate)
+    base.mkdir(exist_ok=True)
     config = base / 'config.toml'
     config.write_text('[cache]\nlocal_only=true\n')
     env = {**BASE, 'RUSTC_WRAPPER':str(binary) if binary else '', 'KACHE_CACHE_DIR':str(base/'cache'),
@@ -114,11 +115,14 @@ def measure(arm, binary, project_dir, crate, manifest, mode):
         env['RUSTC_BOOTSTRAP'] = crate
     if crate == 'ring':
         env.pop('CARGO_PROFILE_DEV_DEBUG', None)
+    if reference:
+        env.update({'RUSTC':str(REFERENCE_RUSTC), 'KACHE_PROBE_REAL_RUSTC': REAL_RUSTC, 'KACHE_PROBE_CRATE':crate,
+                    'KACHE_PROBE_RECEIPT':str(OUT / f'{arm}-{crate}-direct.txt')})
     if binary:
-        run([binary,'daemon','start'], project_dir, env, f'{arm}-{crate}-start.log')
+        run([binary,'daemon','start'], project_dir, env, f'{log_name}-{crate}-start.log')
     native = project_dir / 'pregenerated' / 'opaque.lib'
     initial = native.read_bytes() if native.exists() else None
-    phases = ('cold','same','new') if mode == 'ring' else ('cold','same','date','payload')
+    phases = phases or (('cold','same','new') if mode == 'ring' else ('cold','same','date','payload'))
     reports = {}
     try:
         for phase in phases:
@@ -133,12 +137,17 @@ def measure(arm, binary, project_dir, crate, manifest, mode):
             event_file = base / 'ipc' / 'events.jsonl'
             before = event_file.stat().st_size if event_file.exists() else 0
             messages = run(['cargo','build','--message-format=json-render-diagnostics','--locked','--offline',
-                            '--lib','--target-dir',target], project_dir, env, f'{arm}-{crate}-{phase}.log')
+                            '--lib','--target-dir',target], project_dir, env, f'{log_name}-{crate}-{phase}.log')
             products = [json.loads(line) for line in messages.splitlines() if line.startswith('{')]
             files = [Path(path) for m in products if m.get('reason') == 'compiler-artifact'
                      and m['target']['name'] == crate for path in m['filenames'] if path.endswith('.rlib')]
             assert len(files) == 1, files
             reports[phase] = row = {'phase':phase,'rlib_sha256':sha(files[0].read_bytes())}
+            if reference:
+                receipt = Path(env['KACHE_PROBE_RECEIPT']).read_text()
+                assert receipt.startswith('direct-replay-equal '+crate+' '), receipt
+                assert '--remap-path-prefix=' in receipt, receipt
+                row['same_argv_direct_replay'] = True
             if mode == 'ring':
                 row['native_inputs'] = archived_objects(products,manifest)
                 assert row['native_inputs']
@@ -154,12 +163,12 @@ def measure(arm, binary, project_dir, crate, manifest, mode):
                 row['lookup'] = {k:lookups[0].get(k) for k in ('result','compiler_runs','cache_key','store_error','key_ms',
                                                                               'key_hash_hits','key_hash_misses','key_hash_bytes','lookup_ms')}
             print(arm,crate,phase,row['rlib_sha256'],row.get('lookup'),row.get('packed_input'),flush=True)
-            (OUT / f'{arm}-{crate}.json').write_text(json.dumps(reports,indent=2))
+            (OUT / f'{sample or arm}-{crate}.json').write_text(json.dumps(reports,indent=2))
     finally:
         if initial is not None:
             native.write_bytes(initial)
-        if binary:
-            run([binary,'daemon','stop'],project_dir,env,f'{arm}-{crate}-stop.log')
+        if binary and not keep_daemon:
+            run([binary,'daemon','stop'],project_dir,env,f'{log_name}-{crate}-stop.log')
     return reports
 
 
@@ -170,10 +179,12 @@ def verify(results, modes):
             failures.append(message)
     for crate,mode in modes.items():
         plain, baseline, candidate = (results[key,crate] for key in ('rustc','baseline','candidate'))
+        reference = results['reference',crate]
         for phase,control in plain.items():
             row = candidate[phase]
             for name,example in [('baseline',baseline[phase]),('candidate',row)]:
-                check(example['rlib_sha256'] == control['rlib_sha256'], f'{name}/{crate}/{phase}: different .rlib than rustc')
+                check(example['rlib_sha256'] == reference[phase]['rlib_sha256'], f'{name}/{crate}/{phase}: different .rlib than direct rustc with identical compiler flags')
+            check(reference[phase]['same_argv_direct_replay'], f'{crate}/{phase}: no direct compiler receipt')
             event = row['lookup']
             check(not event['store_error'], f'{crate}/{phase}: store error')
             check(event['cache_key'].startswith('checkout-') if mode in ('names','payload','ring') else True,
@@ -191,12 +202,20 @@ def verify(results, modes):
                 check(members(old)==members(same), f'{arm_name}/ring: inconsistent same-target input objects')
                 check(any(old[k]['sha256'] != same[k]['sha256'] for k in old), f'{arm_name}/ring: no changing lib.exe headers')
                 check(members(old)!=members(new), f'{arm_name}/ring: renamed target did not change an object payload')
+            for phase in plain:
+                for archive in plain[phase]['native_inputs']:
+                    raw_members = [v[1] for v in plain[phase]['native_inputs'][archive]['objects']]
+                    for arm in (baseline, candidate, reference):
+                        compared = [v[1] for v in arm[phase]['native_inputs'][archive]['objects']]
+                        check(raw_members == compared, f'{crate}/{phase}: plain cargo produced different COFF object bytes')
             check(baseline['same']['lookup']['compiler_runs'] == 1, 'baseline/ring: expected a recompile')
             check(candidate['new']['lookup']['compiler_runs'] == 1, 'candidate/ring: different COFF payload restored')
         else:
             check(candidate['payload']['lookup']['compiler_runs'] == 1,f'{crate}: changed object restored')
             check(plain['payload']['rlib_sha256'] != plain['date']['rlib_sha256'], f'{crate}: plain rustc insensitive to changed object')
             for phase in plain:
+                for arm in (baseline, candidate, reference):
+                    check(arm[phase]['input']['sha256'] == plain[phase]['input']['sha256'], f'{crate}/{phase}: mismatched native input')
                 check(plain[phase]['packed_input'] == (mode in ('cfg','explicit')), f'{crate}/{phase}: packing assumption wrong')
             if mode in ('cfg','explicit'):
                 check(plain['same']['rlib_sha256'] != plain['date']['rlib_sha256'], f'{crate}: plain rustc insensitive to new date inside packed input')
@@ -240,7 +259,11 @@ for crate,mode in [('names_only','names'),('payload_only','payload'),('cfg_packe
     run(['cargo','generate-lockfile','--offline'],work,BASE)
     subjects[crate] = (work,work,mode)
 workspace = Path(os.environ['GITHUB_WORKSPACE'])
-binaries = {'rustc':None, **{arm:workspace/arm/'target/debug/kache.exe' for arm in ('baseline','candidate')}}
+REAL_RUSTC = run(['rustup','which','rustc'],ROOT,BASE).strip()
+REFERENCE_RUSTC = ROOT/'direct-shim'/'rustc.exe'
+REFERENCE_RUSTC.parent.mkdir()
+run([REAL_RUSTC,'--edition=2021','-O',Path(__file__).with_name('native-rustc-reference.rs'),'-o',REFERENCE_RUSTC], ROOT, BASE)
+binaries = {'rustc':None, **{arm:workspace/arm/'target/release/kache.exe' for arm in ('baseline','candidate')}}
 provenance = {arm:{'commit':run(['git','rev-parse','HEAD'],workspace/arm,BASE).strip(),
                    'launcher':sha(binary.read_bytes()),'engine':sha(binary.with_name('kache-engine.exe').read_bytes())}
               for arm,binary in binaries.items() if binary}
@@ -257,6 +280,35 @@ for crate,(work,manifest,mode) in subjects.items():
         except Exception as error:
             execution_errors.append(f'{arm}/{crate}: {error!r}')
             print(execution_errors[-1], flush=True)
+    reference_result = {}
+    for phase in (('cold','same','new') if mode=='ring' else ('cold','same','date','payload')):
+        try:
+            reference_result.update(measure(f'reference-{phase}',binaries['candidate'],work,crate,manifest,mode,
+                                            phases=(phase,),reference=True))
+        except Exception as error:
+            execution_errors.append(f'reference/{phase}/{crate}: {error!r}')
+            print(execution_errors[-1], flush=True)
+    outputs['reference',crate] = reference_result
+
+# Prime both independent stores. Interleave matched measurements on the exact
+# same target and wait for timestamp granularity in every build.
+pairs = []
+for arm in ('baseline','candidate'):
+    measure(arm,binaries[arm],ring,'ring',ring_dir,'ring',phases=('cold',),group='perf-'+arm,
+            keep_daemon=True,sample='perf-prime-'+arm)
+for block in range(8):
+    order = ('baseline','candidate') if block % 2 == 0 else ('candidate','baseline')
+    pair = {}
+    for arm in order:
+        row = measure(arm,binaries[arm],ring,'ring',ring_dir,'ring',phases=('same',),
+                      group='perf-'+arm,keep_daemon=block<7,sample=f'perf-{block}-{arm}')['same']
+        pair[arm] = row['lookup']
+        expected = 1 if arm == 'baseline' else 0
+        if pair[arm]['compiler_runs'] != expected:
+            execution_errors.append(f'perf/{block}/{arm}: expected compiler_runs={expected}')
+    pairs.append(pair)
+    (OUT/'matched-cost.json').write_text(json.dumps(pairs,indent=2))
+print('Matched release key_ms', [(p['baseline']['key_ms'],p['candidate']['key_ms']) for p in pairs],flush=True)
 if execution_errors:
     raise RuntimeError('\n'.join(execution_errors))
 

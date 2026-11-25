@@ -5,7 +5,7 @@ permissions:
 jobs:
   ring:
     runs-on: windows-2025
-    timeout-minutes: 40
+    timeout-minutes: 50
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_INCREMENTAL: 0
@@ -32,7 +32,7 @@ jobs:
           foreach ($arm in @("baseline", "candidate")) {
             Push-Location $arm
             git rev-parse HEAD
-            cargo build --locked --bin kache --bin kache-engine
+            cargo build --release --locked --bin kache --bin kache-engine
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             Pop-Location
           }

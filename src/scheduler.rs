@@ -1130,6 +1130,7 @@ impl TestLease {
     /// Release every slot but the lowest `keep` (at least one: the slot
     /// whose marker the binary's children were given), and wake the
     /// requests waiting for them. The number released.
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     pub fn shrink_to(&mut self, keep: u32) -> u32 {
         let keep = keep.max(1) as usize;
         if self._slots.len() <= keep {

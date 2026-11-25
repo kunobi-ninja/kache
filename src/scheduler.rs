@@ -935,13 +935,10 @@ impl Scheduler {
             }
             // A need of zero would never be met.
             let asking = need(waited, request.saved_for_tests.get()).max(1);
-            if request.kind == queue::Kind::Test && !noticed && start.elapsed() >= TEST_WAIT_NOTICE
+            if let Some(notice) =
+                self.test_wait_notice(request.kind, start.elapsed(), asking, &mut noticed)
             {
-                noticed = true;
-                eprintln!(
-                    "kache test-runner: {}",
-                    self.test_wait_notice(start.elapsed(), asking)
-                );
+                eprintln!("kache test-runner: {notice}");
             }
             match self.collect_permits(request, asking, ticket, start) {
                 WaitStep::Ready(slots) => return Some(slots),
@@ -973,17 +970,27 @@ impl Scheduler {
         }
     }
 
-    fn test_wait_notice(&self, waited: Duration, need: u32) -> String {
+    fn test_wait_notice(
+        &self,
+        kind: queue::Kind,
+        waited: Duration,
+        need: u32,
+        noticed: &mut bool,
+    ) -> Option<String> {
+        if kind != queue::Kind::Test || *noticed || waited < TEST_WAIT_NOTICE {
+            return None;
+        }
+        *noticed = true;
         let busy = (0..self.pool_size)
             .filter(|&index| slot_is_held(&self.permit_path(index)) == Some(true))
             .count() as u32;
-        test_wait_notice(
+        Some(test_wait_notice(
             waited,
             need,
             &test_holders(&self.root),
             busy.saturating_sub(tests_held(&self.root)),
             kache_store::markers::now_epoch_secs(),
-        )
+        ))
     }
 
     /// Take slots above the compile reserve for a test binary.
@@ -5108,6 +5115,46 @@ mod tests {
         assert!(parse_test_holder("17", "1\t2").is_none());
         assert!(parse_test_holder("17", "x\t2\ty").is_none());
         assert!(parse_test_holder("17", "1\tx\ty").is_none());
+    }
+
+    #[test]
+    fn only_a_waiting_test_reports_current_holders_once_at_ten_seconds() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 8);
+        let mut lease = scheduler.acquire_test_lease(TestWant::Fixed(2)).unwrap();
+        lease.name_holder("heavy");
+        let _compile = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+
+        let mut noticed = false;
+        let threshold = Duration::from_secs(10);
+        assert_eq!(
+            scheduler.test_wait_notice(queue::Kind::Compile, threshold, 3, &mut noticed),
+            None
+        );
+        assert_eq!(
+            scheduler.test_wait_notice(
+                queue::Kind::Test,
+                Duration::from_millis(9999),
+                3,
+                &mut noticed
+            ),
+            None
+        );
+        let notice = scheduler
+            .test_wait_notice(queue::Kind::Test, threshold, 3, &mut noticed)
+            .unwrap();
+        assert!(
+            notice.starts_with("waited 10s for 3 test slots; tests hold them: heavy (pid "),
+            "{notice}"
+        );
+        assert!(notice.contains(", 2 slots, running "), "{notice}");
+        assert!(notice.ends_with("; compiles hold 1"), "{notice}");
+        assert_eq!(
+            scheduler.test_wait_notice(queue::Kind::Test, Duration::from_secs(11), 3, &mut noticed),
+            None
+        );
     }
 
     #[test]

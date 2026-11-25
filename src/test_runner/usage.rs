@@ -64,9 +64,6 @@ pub(super) fn wait(
     let Some(floor) = shrink_floor(want, lease.held()) else {
         return child.wait();
     };
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return child.wait();
-    }
     let pid = child.id();
     std::thread::scope(|scope| {
         let (stop, stopped) = mpsc::channel();
@@ -86,38 +83,69 @@ fn sample(pid: u32, floor: u32, lease: &mut TestLease, stopped: mpsc::Receiver<(
         return;
     };
     let mut at = Instant::now();
-    let mut readings = std::collections::VecDeque::with_capacity(WINDOWS);
-    while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(WINDOW) {
-        let Some(now) = tree_cpu_time(pid) else {
-            return;
-        };
+    let samples = std::iter::from_fn(|| {
+        match stopped.recv_timeout(WINDOW) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            _ => return None,
+        }
+        let now = tree_cpu_time(pid)?;
         let instant = Instant::now();
         let reading = cores(last, now, instant.duration_since(at));
         at = instant;
         last = now;
-        let Some(reading) = reading else {
-            // An incomplete interval is no evidence that the binary was idle.
-            readings.clear();
-            continue;
-        };
-        if readings.len() == WINDOWS {
-            readings.pop_front();
-        }
-        readings.push_back(reading);
-        if readings.len() == WINDOWS {
-            let keep = slots_in_use(readings.make_contiguous(), floor);
-            lease.shrink_to(keep);
-            if lease.held() == floor {
-                break;
-            }
+        Some(reading)
+    });
+    follow_usage(samples, floor, |keep| {
+        lease.shrink_to(keep);
+        lease.held()
+    });
+}
+
+fn follow_usage(
+    samples: impl Iterator<Item = Option<f64>>,
+    floor: u32,
+    mut shrink: impl FnMut(u32) -> u32,
+) {
+    let mut readings = std::collections::VecDeque::with_capacity(WINDOWS);
+    for sample in samples {
+        if let Some(keep) = observe(&mut readings, sample, floor)
+            && shrink(keep) == floor
+        {
+            break;
         }
     }
+}
+
+/// Wait for a full window of consecutive samples. A discontinuity starts
+/// the window over because it gives no evidence that the binary was idle.
+fn observe(
+    readings: &mut std::collections::VecDeque<f64>,
+    reading: Option<f64>,
+    floor: u32,
+) -> Option<u32> {
+    let Some(reading) = reading else {
+        readings.clear();
+        return None;
+    };
+    if readings.len() == WINDOWS {
+        readings.pop_front();
+    }
+    readings.push_back(reading);
+    (readings.len() == WINDOWS).then(|| slots_in_use(readings.make_contiguous(), floor))
 }
 
 /// CPU time of `pid` and its live descendants, each with the time of the
 /// children it has reaped. `None` when `pid` cannot be read.
 pub(crate) fn tree_cpu_time(pid: u32) -> Option<Duration> {
-    let mut total = process_cpu_time(pid)?;
+    sum_tree_cpu_time(pid, process_cpu_time, children)
+}
+
+fn sum_tree_cpu_time(
+    pid: u32,
+    cpu_time: impl Fn(u32) -> Option<Duration>,
+    children: impl Fn(u32) -> Vec<u32>,
+) -> Option<Duration> {
+    let mut total = cpu_time(pid)?;
     let mut pending = children(pid);
     let mut visited = 1;
     while let Some(child) = pending.pop() {
@@ -125,7 +153,7 @@ pub(crate) fn tree_cpu_time(pid: u32) -> Option<Duration> {
             return None;
         }
         visited += 1;
-        if let Some(time) = process_cpu_time(child) {
+        if let Some(time) = cpu_time(child) {
             total += time;
         }
         pending.extend(children(child));
@@ -201,8 +229,15 @@ fn process_cpu_time(pid: u32) -> Option<Duration> {
     let ticks = linux_stat_ticks(&stat)?;
     // SAFETY: sysconf only reads a constant of the system.
     let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let per_second = u64::try_from(per_second).ok().filter(|&tick| tick > 0)?;
-    Some(Duration::from_secs_f64(ticks as f64 / per_second as f64))
+    linux_cpu_duration(ticks, per_second)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_cpu_duration(ticks: u64, per_second: libc::c_long) -> Option<Duration> {
+    let frequency = std::num::NonZeroU64::new(u64::try_from(per_second).ok()?)?;
+    Some(Duration::from_secs_f64(
+        ticks as f64 / frequency.get() as f64,
+    ))
 }
 
 /// Clock ticks of a `/proc/<pid>/stat` line: its own user and system time
@@ -234,17 +269,6 @@ fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_cpu_time(_pid: u32) -> Option<Duration> {
-    // No reading: the lease keeps the size it started with.
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn children(_pid: u32) -> Vec<u32> {
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +280,54 @@ mod tests {
         assert_eq!(shrink_floor(TestWant::Elastic(3), 8), Some(3));
         assert_eq!(shrink_floor(TestWant::Elastic(3), 3), None);
         assert_eq!(shrink_floor(TestWant::Elastic(8), 3), None);
+    }
+
+    #[test]
+    fn a_partial_tree_cannot_report_a_lower_cpu_total() {
+        let tick = |_| Some(Duration::from_millis(1));
+        let chain = |end| move |pid| if pid < end { vec![pid + 1] } else { vec![] };
+        assert_eq!(
+            sum_tree_cpu_time(1, tick, chain(512)),
+            Some(Duration::from_millis(512))
+        );
+        assert_eq!(sum_tree_cpu_time(1, tick, chain(513)), None);
+        assert_eq!(sum_tree_cpu_time(1, |_| None, chain(2)), None);
+    }
+
+    #[test]
+    fn an_intermediate_grant_keeps_sampling_until_it_reaches_the_floor() {
+        let mut grants = Vec::new();
+        let samples = [
+            Some(3.5),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+        ];
+        let past_floor =
+            std::iter::once_with(|| panic!("sampled after releasing every spare slot"));
+        follow_usage(samples.into_iter().chain(past_floor), 2, |keep| {
+            grants.push(keep);
+            keep
+        });
+        assert_eq!(grants, [4, 2]);
+    }
+
+    #[test]
+    fn only_five_consecutive_samples_can_release_slots() {
+        let mut readings = std::collections::VecDeque::new();
+        assert_eq!(observe(&mut readings, Some(4.5), 2), None);
+        for _ in 0..3 {
+            assert_eq!(observe(&mut readings, Some(0.0), 2), None);
+        }
+        assert_eq!(observe(&mut readings, Some(0.0), 2), Some(5));
+        assert_eq!(observe(&mut readings, Some(0.0), 2), Some(2));
+        assert_eq!(observe(&mut readings, None, 2), None);
+        for _ in 0..4 {
+            assert_eq!(observe(&mut readings, Some(0.0), 2), None);
+        }
+        assert_eq!(observe(&mut readings, Some(2.5), 2), Some(3));
     }
 
     #[test]
@@ -278,6 +350,17 @@ mod tests {
         assert_eq!(cores(s(10), s(4), s(2)), None, "an exited child");
         assert_eq!(cores(s(0), s(5), Duration::ZERO), None);
         assert_eq!(cores(s(1), s(2), s(4)), Some(0.25));
+    }
+
+    #[test]
+    fn linux_cpu_time_requires_a_positive_tick_frequency() {
+        assert_eq!(
+            linux_cpu_duration(125, 100),
+            Some(Duration::from_millis(1250))
+        );
+        assert_eq!(linux_cpu_duration(0, 100), Some(Duration::ZERO));
+        assert_eq!(linux_cpu_duration(1, 0), None);
+        assert_eq!(linux_cpu_duration(1, -1), None);
     }
 
     #[test]

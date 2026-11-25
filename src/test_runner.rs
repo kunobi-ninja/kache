@@ -27,6 +27,7 @@ use std::time::Duration;
 use crate::scheduler::{self, TestWant};
 
 mod delegate;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod usage;
 #[cfg(unix)]
 pub(crate) use delegate::runner_var;
@@ -397,7 +398,14 @@ fn run_scheduled(
     let status = match lease {
         Some(mut lease) => {
             lease.name_holder(&Path::new(&args[0]).to_string_lossy());
-            usage::wait(&mut child, lease, want)
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                usage::wait(&mut child, lease, want)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                child.wait()
+            }
         }
         None => child.wait(),
     };

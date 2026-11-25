@@ -25,6 +25,8 @@ The monitor opens on Now.
 | Time saved | Compile time restored from the cache over the last 24 hours |
 | Builds | How many builds are in the list below |
 
+The Build tab counts cache lookups in the selected time window. If every compiler invocation passed through, Live Build still shows activity and the Lookups panel shows how many passed through.
+
 The Now size counts logical output bytes. The Store tab shows deduplicated blob bytes, and `kache stats` uses those registered blob bytes for its Cache and Store rows. The cap applies to registered blob bytes.
 
 Under the figures: the share of compile time that came back from the cache, and the share of lookup time that was a miss. Remote is one line. When the daemon reports `not configured` or `local-only`, that line reads `remote is off`.

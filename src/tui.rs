@@ -2149,11 +2149,12 @@ fn lookup_series(
     now: jiff::Timestamp,
     window: Duration,
     columns: usize,
-) -> (Vec<u64>, Vec<u64>) {
+) -> (Vec<u64>, Vec<u64>, u64) {
+    let mut passthroughs = 0;
     let mut hits = vec![0u64; columns];
     let mut misses = vec![0u64; columns];
     if columns == 0 {
-        return (hits, misses);
+        return (hits, misses, passthroughs);
     }
     let window_ms = window.as_millis().max(1);
     for event in events {
@@ -2171,10 +2172,11 @@ fn lookup_series(
                 hits[index] += 1;
             }
             EventResult::Miss | EventResult::Dup => misses[index] += 1,
-            EventResult::Passthrough | EventResult::Skipped | EventResult::Error => {}
+            EventResult::Passthrough => passthroughs += 1,
+            EventResult::Skipped | EventResult::Error => {}
         }
     }
-    (hits, misses)
+    (hits, misses, passthroughs)
 }
 
 /// A compact window label: `5m`, `2h`, `7d`.
@@ -2202,7 +2204,7 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let label_width = 8u16;
     let columns = inner.width.saturating_sub(label_width) as usize;
-    let (hits, misses) = lookup_series(
+    let (hits, misses, passthroughs) = lookup_series(
         &state.events,
         jiff::Timestamp::now(),
         state.spark_window,
@@ -2256,7 +2258,11 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
     ])
     .split(rows[2]);
     let idle = if total_hits + total_misses == 0 {
-        format!("  ·  no lookups in the last {window}")
+        if passthroughs > 0 {
+            format!("  ·  no lookups · passthroughs: {passthroughs}")
+        } else {
+            format!("  ·  no lookups in the last {window}")
+        }
     } else {
         String::new()
     };

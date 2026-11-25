@@ -2282,9 +2282,10 @@ async fn file_hash_prefetch_requests_only_eligible_files_and_reuses_the_reply() 
     let root = directory.path().canonicalize().unwrap();
     let large = root.join("large.rlib");
     let small = root.join("small.rs");
-    let bytes = vec![b'l'; 65_537];
+    // The daemon starts prefetching at exactly 64 KiB.
+    let bytes = vec![b'l'; 65_536];
     std::fs::write(&large, &bytes).unwrap();
-    std::fs::write(&small, b"small").unwrap();
+    std::fs::write(&small, vec![b's'; 65_535]).unwrap();
     let fingerprint = FileFingerprint::from_path(&large).unwrap();
     let expected_request = HashFileRequest {
         path: fingerprint.path.clone(),

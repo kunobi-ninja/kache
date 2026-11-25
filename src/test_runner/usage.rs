@@ -298,30 +298,44 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_busy_child_counts_toward_its_parents_tree() {
-        // A shell whose child spins: the shell itself does nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("stop");
         let mut shell = std::process::Command::new("/bin/sh")
-            .args(["-c", "ulimit -t 12 || exit 1; while :; do :; done & wait"])
+            .args([
+                "-c",
+                r#"ulimit -t 12 || exit 1; while [ ! -e "$1" ]; do :; done & wait"#,
+                "test-runner-probe",
+            ])
+            .arg(&stop)
             .spawn()
             .unwrap();
         let pid = shell.id();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while children(pid).is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut counted = false;
+        while Instant::now() < deadline && shell.try_wait().unwrap().is_none() {
+            if let [child] = children(pid).as_slice()
+                && let Some(before) = process_cpu_time(*child)
+                && before >= Duration::from_millis(50)
+            {
+                // The shell waits while its child spins. Compare with CPU
+                // actually granted by the runner during this sample.
+                if let (Some(tree), Some(after), Some(parent)) = (
+                    tree_cpu_time(pid),
+                    process_cpu_time(*child),
+                    process_cpu_time(pid),
+                ) {
+                    counted = tree >= before && tree <= after + parent;
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let spinner = children(pid);
-        let before = tree_cpu_time(pid).unwrap();
-        let started = Instant::now();
-        std::thread::sleep(Duration::from_millis(500));
-        let after = tree_cpu_time(pid).unwrap();
-        let used = cores(before, after, started.elapsed()).unwrap();
-        for child in &spinner {
-            unsafe { libc::kill(*child as libc::pid_t, libc::SIGKILL) };
-        }
-        let _ = shell.kill();
-        let _ = shell.wait();
-        assert_eq!(spinner.len(), 1, "one spinning child");
-        assert!(used > 0.5, "the spinner's core counts: {used}");
-        assert!(used < 1.5, "one core, not more: {used}");
+        std::fs::write(stop, []).unwrap();
+        assert!(shell.wait().unwrap().success());
+        assert!(
+            counted,
+            "the process tree must include the child's CPU time once"
+        );
         assert!(tree_cpu_time(u32::MAX).is_none());
     }
 }

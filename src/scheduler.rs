@@ -1001,13 +1001,15 @@ impl Scheduler {
             tracing::debug!("no test slots above the compile reserve; running without a lease");
             return None;
         }
-        let slots = self.wait_for_permit(queue::Kind::Test, |_, _| need, elastic)?;
+        let mut slots = self.wait_for_permit(queue::Kind::Test, |_, _| need, elastic)?;
+        // A slot can become free between the floor scan and the spare scan.
+        slots.sort_unstable_by_key(|(index, _)| *index);
         // One marker per slot, so a compile can count the slots tests hold.
         let markers = slots
             .iter()
             .map(|(index, _)| self.lock_marker(*index))
             .collect::<Option<Vec<_>>>()?;
-        let lowest = slots.iter().map(|(index, _)| *index).min()?;
+        let (lowest, _) = slots.first()?;
         let path = tests_dir(&self.root).join(lowest.to_string());
         Some(TestLease {
             root: self.root.clone(),
@@ -1126,17 +1128,11 @@ impl TestLease {
         if self._slots.len() <= keep {
             return 0;
         }
-        let mut held: Vec<(StoreLock, (u32, StoreLock))> =
-            self._markers.drain(..).zip(self._slots.drain(..)).collect();
-        held.sort_by_key(|(_, (index, _))| *index);
-        let released = held.split_off(keep);
-        let count = released.len() as u32;
-        // Each marker goes before its slot, as on drop.
-        for (marker, slot) in released {
-            drop(marker);
-            drop(slot);
-        }
-        (self._markers, self._slots) = held.into_iter().unzip();
+        let count = (self._slots.len() - keep) as u32;
+        // Every released marker must be unlocked before the next slot owner
+        // tries to acquire it. The child's inherited marker is first.
+        self._markers.truncate(keep);
+        self._slots.truncate(keep);
         if let Some((path, what)) = &self.holder {
             let _ = fs::write(path, holder_text(self._slots.len() as u32, what));
         }

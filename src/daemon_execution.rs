@@ -246,6 +246,7 @@ impl Prepared {
                     .into(),
                 env.clone(),
                 jobserver.clone(),
+                cancellation.clone(),
             )?;
             io.with_unix_broker(broker)?
         };

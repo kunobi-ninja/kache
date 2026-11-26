@@ -156,13 +156,18 @@ impl Client {
         self.output_started
     }
 
+    /// Requests and their descriptors arrive in separate messages. A daemon
+    /// stalled between them delays the request and never fails it, and a
+    /// contents descriptor the client cannot take ends the channel instead of
+    /// staying queued for the next request.
     pub(super) fn service(&mut self) -> anyhow::Result<bool> {
         use std::io::Read;
+        let control = self.control.get_ref().as_raw_fd();
+        // SAFETY: self.control owns the descriptor for this whole call.
+        let alive = || crate::peer_wait::connected(unsafe { BorrowedFd::borrow_raw(control) });
         let mut frame = Vec::new();
-        self.control
-            .by_ref()
-            .take(MAX_FRAME_BYTES)
-            .read_until(b'\n', &mut frame)?;
+        let mut request = self.control.by_ref().take(MAX_FRAME_BYTES);
+        crate::peer_wait::while_alive(alive, || request.read_until(b'\n', &mut frame))?;
         if frame.is_empty() {
             return Ok(false);
         }
@@ -171,7 +176,16 @@ impl Client {
             "incomplete native process request"
         );
         let command = serde_json::from_slice(&frame)?;
-        let (reply, files) = match self.execute(command) {
+        let contents = match &command {
+            Command::Workspace(operation) if super::workspace::carries_contents(operation) => {
+                let mut files = crate::peer_wait::while_alive(alive, || {
+                    crate::descriptors::receive(self.pipes.as_fd(), &[0; 16], 1)
+                })?;
+                Some(File::from(files.remove(0)))
+            }
+            _ => None,
+        };
+        let (reply, files) = match self.execute_with(command, contents) {
             Ok(result) => result,
             Err(error) => (
                 Reply::Failed {
@@ -181,7 +195,9 @@ impl Client {
                 Vec::new(),
             ),
         };
-        super::write_message(self.control.get_mut(), &reply)?;
+        let mut frame = serde_json::to_vec(&reply)?;
+        frame.push(b'\n');
+        crate::peer_wait::write_all_while_alive(&mut self.control.get_ref(), &frame, alive)?;
         if !files.is_empty() {
             let files = files.iter().map(AsFd::as_fd).collect::<Vec<_>>();
             crate::descriptors::send(self.pipes.as_fd(), &[0; 16], &files)?;
@@ -189,12 +205,21 @@ impl Client {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn execute(&mut self, command: Command) -> io::Result<(Reply, Vec<OwnedFd>)> {
+        self.execute_with(command, None)
+    }
+
+    fn execute_with(
+        &mut self,
+        command: Command,
+        contents: Option<File>,
+    ) -> io::Result<(Reply, Vec<OwnedFd>)> {
         let reply = match command {
             Command::Workspace(operation) => {
                 return self
                     .workspace
-                    .execute(operation, &self.pipes)
+                    .execute(operation, contents)
                     .map(|reply| (reply, Vec::new()));
             }
             Command::Spawn { command, jobserver } => return self.spawn(*command, jobserver),
@@ -490,6 +515,115 @@ mod tests {
             assert_eq!(client.output_started(), shown, "{plan:?}");
             client.execute(Command::Release { id }).unwrap();
         }
+    }
+
+    /// Shrink the client deadlines so a test can outlast them.
+    fn stalled_daemon_fixture(
+        root: &std::path::Path,
+    ) -> (Client, BufReader<UnixStream>, UnixDatagram) {
+        let (client, [control, pipes]) = fixture_with_manifest(root, false, 0);
+        let deadline = Some(std::time::Duration::from_millis(20));
+        client.control.get_ref().set_read_timeout(deadline).unwrap();
+        client.pipes.set_read_timeout(deadline).unwrap();
+        let control = UnixStream::from(control);
+        control
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        (client, BufReader::new(control), UnixDatagram::from(pipes))
+    }
+
+    fn write_request(target: &std::path::Path) -> Vec<u8> {
+        let mut frame = serde_json::to_vec(&Command::Workspace(
+            kache_protocol::execution::unix::Workspace::Write {
+                path: NativeString::capture(target.as_os_str()),
+                mode: 0o644,
+            },
+        ))
+        .unwrap();
+        frame.push(b'\n');
+        frame
+    }
+
+    /// A daemon stalled by memory reclaim, a CPU quota or SIGSTOP in the
+    /// middle of a request or before its descriptor delays the restore. It
+    /// must neither fail it nor leave the late descriptor queued for the
+    /// next request, which would write the previous file's bytes.
+    #[test]
+    fn a_stalled_daemon_delays_requests_and_their_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut control, pipes) = stalled_daemon_fixture(root.path());
+        let stall = || std::thread::sleep(std::time::Duration::from_millis(100));
+        for (name, bytes) in [
+            ("first", &b"first file"[..]),
+            ("second", &b"second file"[..]),
+        ] {
+            let target = root.path().join(name);
+            let frame = write_request(&target);
+            let mut contents = tempfile::tempfile().unwrap();
+            contents.write_all(bytes).unwrap();
+            contents.rewind().unwrap();
+            let reply = std::thread::scope(|threads| {
+                let daemon = threads.spawn(|| {
+                    let (head, tail) = frame.split_at(frame.len() / 2);
+                    control.get_mut().write_all(head).unwrap();
+                    stall();
+                    control.get_mut().write_all(tail).unwrap();
+                    stall();
+                    crate::descriptors::send(pipes.as_fd(), &[0; 16], &[contents.as_fd()]).unwrap();
+                    let mut reply = String::new();
+                    control.read_line(&mut reply).map(|_| reply)
+                });
+                let serviced = client.service();
+                let reply = daemon.join().unwrap();
+                assert!(serviced.unwrap(), "{name}");
+                serde_json::from_str::<Reply>(&reply.unwrap()).unwrap()
+            });
+            assert!(matches!(reply, Reply::Done), "{name}: {reply:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), bytes, "{name}");
+        }
+    }
+
+    /// Waiting for a stalled daemon ends when the daemon closes the channel.
+    #[test]
+    fn a_daemon_that_closes_the_channel_ends_a_descriptor_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut control, _pipes) = stalled_daemon_fixture(root.path());
+        control
+            .get_mut()
+            .write_all(&write_request(&root.path().join("target")))
+            .unwrap();
+        drop(control);
+        assert!(client.service().is_err());
+        assert!(!root.path().join("target").exists());
+    }
+
+    /// The client takes a request's descriptor before validating it, so a
+    /// rejected write never leaves its payload for the next operation.
+    #[test]
+    fn rejected_writes_consume_their_payload_before_the_next_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut control, pipes) = stalled_daemon_fixture(root.path());
+        let target = root.path().join("output");
+        for (path, bytes, accepted) in [
+            (
+                std::path::Path::new("invalid-relative"),
+                &b"rejected"[..],
+                false,
+            ),
+            (target.as_path(), &b"current"[..], true),
+        ] {
+            let mut payload = tempfile::tempfile().unwrap();
+            payload.write_all(bytes).unwrap();
+            payload.rewind().unwrap();
+            control.get_mut().write_all(&write_request(path)).unwrap();
+            crate::descriptors::send(pipes.as_fd(), &[0; 16], &[payload.as_fd()]).unwrap();
+            assert!(client.service().unwrap());
+            let mut reply = String::new();
+            control.read_line(&mut reply).unwrap();
+            let reply = serde_json::from_str::<Reply>(&reply).unwrap();
+            assert_eq!(matches!(reply, Reply::Done), accepted, "{reply:?}");
+        }
+        assert_eq!(std::fs::read(target).unwrap(), b"current");
     }
 
     #[test]

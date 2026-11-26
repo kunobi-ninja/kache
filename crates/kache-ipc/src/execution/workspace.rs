@@ -22,6 +22,14 @@ mod windows;
 #[cfg(windows)]
 use windows::touch;
 
+/// Operations whose bytes travel as a descriptor next to the request.
+pub(super) fn carries_contents(operation: &Workspace) -> bool {
+    matches!(
+        operation,
+        Workspace::Write { .. } | Workspace::PrepareBytes { .. }
+    )
+}
+
 #[derive(Default)]
 pub(super) struct Files {
     next_id: u64,
@@ -39,11 +47,7 @@ impl Files {
         operation: Workspace,
         mut input: Option<File>,
     ) -> io::Result<Reply> {
-        let needs_contents = matches!(
-            &operation,
-            Workspace::Write { .. } | Workspace::PrepareBytes { .. }
-        );
-        if needs_contents != input.is_some() {
+        if carries_contents(&operation) != input.is_some() {
             return Err(invalid("workspace contents do not match the operation"));
         }
         match operation {

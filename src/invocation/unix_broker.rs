@@ -6,7 +6,7 @@ use kache_protocol::execution::{
     process::{Spawn, Stdio, Stream},
     unix::{Command, MAX_FRAME_BYTES, Reply},
 };
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::os::unix::process::ExitStatusExt;
@@ -67,6 +67,9 @@ fn capture_owned_identity<I>(
 
 pub(crate) struct Broker {
     channel: Mutex<Channel>,
+    /// The request this broker serves. Its waits end when the request is
+    /// cancelled, whichever thread waits, with or without a request scope.
+    cancellation: super::process::Cancellation,
     env: InvocationEnv,
     jobserver: kache_ipc::jobserver::Descriptors,
     /// A child was started on the client's own output streams.
@@ -84,6 +87,7 @@ impl Broker {
         pipes: OwnedFd,
         env: InvocationEnv,
         jobserver: kache_ipc::jobserver::Descriptors,
+        cancellation: super::process::Cancellation,
     ) -> io::Result<Arc<Self>> {
         let control = UnixStream::from(control);
         let timeout = Some(std::time::Duration::from_secs(5));
@@ -96,6 +100,7 @@ impl Broker {
                 reader: BufReader::new(control),
                 pipes,
             }),
+            cancellation,
             env,
             jobserver,
             written: std::sync::atomic::AtomicBool::new(false),
@@ -137,33 +142,19 @@ impl Broker {
                 "native process request exceeds frame limit",
             ));
         }
-        let workspace = matches!(command, Command::Workspace(_));
         let exchanged = (|| -> io::Result<(Reply, Vec<OwnedFd>)> {
-            channel.reader.get_mut().write_all(&frame)?;
+            let alive = || self.while_active();
+            kache_ipc::peer_wait::write_all_while_alive(
+                &mut channel.reader.get_ref(),
+                &frame,
+                alive,
+            )?;
             if let Some(contents) = contents {
                 kache_ipc::descriptors::send(channel.pipes.as_fd(), &[0; 16], &[contents.as_fd()])?;
             }
             frame.clear();
             let mut reply = channel.reader.by_ref().take(MAX_FRAME_BYTES);
-            loop {
-                match reply.read_until(b'\n', &mut frame) {
-                    Err(error)
-                        if workspace
-                            && matches!(
-                                error.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                            ) =>
-                    {
-                        // File restores can exceed a socket deadline under I/O
-                        // pressure. Keep waiting while the request is active.
-                        super::process::check()?;
-                    }
-                    result => {
-                        result?;
-                        break;
-                    }
-                }
-            }
+            kache_ipc::peer_wait::while_alive(alive, || reply.read_until(b'\n', &mut frame))?;
             if frame.last() != Some(&b'\n') {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -174,7 +165,9 @@ impl Broker {
             let files = if pipes == 0 || matches!(reply, Reply::Failed { .. }) {
                 Vec::new()
             } else {
-                kache_ipc::descriptors::receive(channel.pipes.as_fd(), &[0; 16], pipes)?
+                kache_ipc::peer_wait::while_alive(alive, || {
+                    kache_ipc::descriptors::receive(channel.pipes.as_fd(), &[0; 16], pipes)
+                })?
             };
             Ok((reply, files))
         })();
@@ -280,6 +273,18 @@ impl Broker {
             stdout: next(stdio.stdout).map(ChildStdout::from),
             stderr: next(stdio.stderr).map(ChildStderr::from),
         })
+    }
+
+    /// The client owns every native operation, so a socket deadline only
+    /// paces cancellation checks. A client stalled by memory reclaim, a CPU
+    /// quota or SIGSTOP keeps a committed compile waiting instead of failing
+    /// it. A client that exits closes the channel, and a cancelled request
+    /// stops at the next deadline, including the Kill its cancellation sends.
+    fn while_active(&self) -> io::Result<()> {
+        tracing::debug!(
+            "native process client has not answered within the socket deadline; waiting while the request is active"
+        );
+        self.cancellation.check()
     }
 
     fn done(&self, command: Command) -> io::Result<()> {
@@ -419,6 +424,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::super::workspace::content_file;
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn owned_exit_reply_distinguishes_running_and_retained_status() {
@@ -810,19 +816,112 @@ mod tests {
     }
 
     fn pair() -> (Arc<Broker>, UnixStream) {
+        cancellable_pair(super::super::process::Cancellation::default())
+    }
+
+    fn cancellable_pair(
+        cancellation: super::super::process::Cancellation,
+    ) -> (Arc<Broker>, UnixStream) {
+        let (broker, client, _) = pair_with_pipes(cancellation);
+        (broker, client)
+    }
+
+    fn pair_with_pipes(
+        cancellation: super::super::process::Cancellation,
+    ) -> (Arc<Broker>, UnixStream, UnixDatagram) {
         let (control, client) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .unwrap();
-        let (pipes, _client_pipes) = UnixDatagram::pair().unwrap();
+        let (pipes, client_pipes) = UnixDatagram::pair().unwrap();
         let broker = Broker::new(
             control.into(),
             pipes.into(),
             InvocationEnv::default(),
             kache_ipc::jobserver::Descriptors::default(),
+            cancellation,
         )
         .unwrap();
-        (broker, client)
+        (broker, client, client_pipes)
+    }
+
+    /// Shrink the broker read deadlines so a test can outlast them.
+    fn short_deadlines(broker: &Broker) {
+        let deadline = Some(std::time::Duration::from_millis(20));
+        let channel = broker.channel.lock().unwrap();
+        channel.reader.get_ref().set_read_timeout(deadline).unwrap();
+        channel
+            .reader
+            .get_ref()
+            .set_write_timeout(deadline)
+            .unwrap();
+        channel.pipes.set_read_timeout(deadline).unwrap();
+    }
+
+    fn reply(stream: &mut UnixStream, reply: &Reply) {
+        let mut bytes = serde_json::to_vec(reply).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+    }
+
+    /// A stalled client (memory reclaim, CPU quota, SIGSTOP) must not fail a
+    /// committed compile: the client still owns the compiler children.
+    #[test]
+    fn slow_native_control_replies_outlive_the_socket_deadline() {
+        for (command, answer) in [
+            (
+                Command::TryWait { id: 3 },
+                Reply::Waited {
+                    status: None,
+                    max_rss: 0,
+                },
+            ),
+            (Command::Kill { id: 3 }, Reply::Done),
+            (Command::Release { id: 3 }, Reply::Done),
+        ] {
+            let (broker, client) = pair();
+            short_deadlines(&broker);
+            let result = std::thread::scope(|threads| {
+                let expected = command.clone();
+                let peer = threads.spawn(move || {
+                    let mut reader = BufReader::new(client);
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    assert_eq!(serde_json::from_str::<Command>(&frame).unwrap(), expected);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    reply(reader.get_mut(), &answer);
+                });
+                let result = broker.call(command.clone(), 0);
+                peer.join().unwrap();
+                result
+            });
+            let (received, files) = result.unwrap_or_else(|error| panic!("{command:?}: {error}"));
+            assert!(files.is_empty());
+            assert!(!matches!(received, Reply::Failed { .. }));
+        }
+    }
+
+    #[test]
+    fn slow_descriptor_delivery_outlives_the_socket_deadline() {
+        let (broker, client, client_pipes) =
+            pair_with_pipes(super::super::process::Cancellation::default());
+        short_deadlines(&broker);
+        let result = std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                reply(reader.get_mut(), &Reply::Spawned { id: 1, pid: 2 });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let file = tempfile::tempfile().unwrap();
+                kache_ipc::descriptors::send(client_pipes.as_fd(), &[0; 16], &[file.as_fd()])
+                    .unwrap();
+            });
+            let result = broker.call(Command::TryWait { id: 1 }, 1);
+            peer.join().unwrap();
+            result
+        });
+        assert_eq!(result.unwrap().1.len(), 1);
     }
 
     #[test]
@@ -885,69 +984,145 @@ mod tests {
     }
 
     #[test]
-    fn native_control_replies_still_fail_at_their_deadline() {
+    fn cancellation_ends_a_slow_reply() {
+        for command in [
+            Command::Workspace(kache_protocol::execution::unix::Workspace::Permissions {
+                path: NativeString::capture(std::ffi::OsStr::new("/tmp/cancelled-restore")),
+                mode: 0o644,
+            }),
+            Command::Kill { id: 1 },
+        ] {
+            let cancellation = super::super::process::Cancellation::default();
+            let (broker, client) = cancellable_pair(cancellation.clone());
+            short_deadlines(&broker);
+            std::thread::scope(|threads| {
+                let peer = threads.spawn(move || {
+                    let mut reader = BufReader::new(client);
+                    let mut frame = String::new();
+                    reader.read_line(&mut frame).unwrap();
+                    cancellation.cancel();
+                    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                });
+                let error = broker.done(command.clone()).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{command:?}");
+                peer.join().unwrap();
+            });
+        }
+    }
+
+    /// A Spawn frame with cargo's environment and check-cfg lists can exceed
+    /// the socket buffer. A client stalled while it arrives delays the
+    /// compile; the write resumes where the deadline interrupted it.
+    #[test]
+    fn a_frame_larger_than_the_socket_buffer_outlives_a_stalled_client() {
         let (broker, client) = pair();
-        broker
-            .channel
-            .lock()
-            .unwrap()
-            .reader
-            .get_mut()
-            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
-            .unwrap();
+        short_deadlines(&broker);
+        // Host defaults vary; pin a send buffer far below the frame.
+        let buffer: libc::c_int = 64 << 10;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    broker.channel.lock().unwrap().reader.get_ref().as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&buffer as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let request = sized_frame(4 << 20);
         std::thread::scope(|threads| {
+            let expected = request.clone();
             let peer = threads.spawn(move || {
+                // Stall only once the frame has started to arrive; encoding
+                // it takes longer than the stall.
+                let mut ready = libc::pollfd {
+                    fd: client.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(unsafe { libc::poll(&mut ready, 1, 30_000) }, 1);
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 let mut reader = BufReader::new(client);
                 let mut frame = String::new();
                 reader.read_line(&mut frame).unwrap();
-                assert_eq!(
-                    serde_json::from_str::<Command>(&frame).unwrap(),
-                    Command::Kill { id: 1 }
-                );
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                let received = serde_json::from_str::<Command>(&frame);
+                reply(reader.get_mut(), &Reply::Done);
+                received.map(|received| received == expected)
             });
-            let error = broker.done(Command::Kill { id: 1 }).unwrap_err();
-            assert!(matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ));
-            peer.join().unwrap();
+            let result = broker.call(request, 0);
+            let received = peer.join().unwrap();
+            assert_eq!(result.unwrap().0, Reply::Done);
+            assert!(received.unwrap());
         });
     }
 
+    /// Cancellation kills remote children from whichever thread ends the
+    /// request: a drained connection task or a finished scope, neither of
+    /// which has the request in scope. A stalled client must not hold that
+    /// thread past one deadline.
     #[test]
-    fn cancellation_ends_a_slow_workspace_reply() {
-        let (broker, client) = pair();
-        broker
-            .channel
-            .lock()
-            .unwrap()
-            .reader
-            .get_mut()
-            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
-            .unwrap();
-        let cancellation = super::super::process::Cancellation::default();
-        let _scope = super::super::process::CancellationScope::borrow(Some(cancellation.clone()));
-        std::thread::scope(|threads| {
-            let peer = threads.spawn(move || {
-                let mut reader = BufReader::new(client);
-                let mut frame = String::new();
-                reader.read_line(&mut frame).unwrap();
-                cancellation.cancel();
-                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-            });
-            let error = broker
-                .done(Command::Workspace(
-                    kache_protocol::execution::unix::Workspace::Permissions {
-                        path: NativeString::capture(std::ffi::OsStr::new("/tmp/cancelled-restore")),
-                        mode: 0o644,
-                    },
-                ))
-                .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-            peer.join().unwrap();
+    #[cfg(target_os = "linux")]
+    fn cancelling_from_an_unscoped_thread_ends_at_the_first_deadline() {
+        use super::super::io::{InvocationIo, InvocationIoScope};
+        use super::super::process::{Cancellation, CancellationScope, CommandExt};
+        let cancellation = Cancellation::default();
+        let (broker, client) = cancellable_pair(cancellation.clone());
+        short_deadlines(&broker);
+        let io = InvocationIo::from_files(
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            None,
+        )
+        .with_unix_broker(broker)
+        .unwrap();
+        let _io = InvocationIoScope::enter(io);
+        let peer = std::thread::spawn(move || {
+            let mut reader = BufReader::new(client);
+            let mut frame = String::new();
+            reader.read_line(&mut frame).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Command>(&frame).unwrap(),
+                Command::Spawn { .. }
+            ));
+            reply(reader.get_mut(), &Reply::Spawned { id: 1, pid: 1 });
+            frame.clear();
+            reader.read_line(&mut frame).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Command>(&frame).unwrap(),
+                Command::Kill { id: 1 }
+            );
+            // Stalled: never answer. The daemon closes the channel instead.
+            reader.read(&mut [0]).unwrap()
         });
+        let child = {
+            let _scope = CancellationScope::borrow(Some(cancellation.clone()));
+            std::process::Command::new("/bin/true")
+                .current_dir("/")
+                .invocation_spawn_with_io(kache_protocol::execution::process::Stdio {
+                    stdin: Stream::Null,
+                    stdout: Stream::Null,
+                    stderr: Stream::Null,
+                })
+                .unwrap()
+        };
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            cancellation.cancel();
+            let _ = done.send(());
+        });
+        if finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_err()
+        {
+            // Dropping the child would wait on the same stalled client.
+            std::mem::forget(child);
+            panic!("cancellation waited for a stalled client");
+        }
+        drop(child);
+        assert_eq!(peer.join().unwrap(), 0);
     }
 
     /// Only a child on the client's own stdout or stderr may show Cargo

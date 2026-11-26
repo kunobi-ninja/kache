@@ -786,6 +786,7 @@ See [Remote cache](/docs/remote-cache/overview) for setup guides and credential 
 | --- | --- | --- | --- |
 | `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest and planner prefetch |
 | `KACHE_REMOTE_KEY_LISTING` | `cache.remote_key_listing` | `false` for S3, GCS, and OCI; `true` for a filesystem remote | List the remote's keys, for the fallback planner's key index and packed-prefetch catalogs; on S3 this needs `s3:ListBucket` |
+| none | `cache.prefetch_catalog_head` | `false` | Fetch a publisher's pack catalog pointer by exact key. See [Read published prefetch packs with GET access](/docs/remote-cache/s3-setup#read-published-prefetch-packs-with-get-access). |
 | `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Refresh the remote key index while listing is on; `0` means initial load only |
 | `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Entries allowed per plan; `0` is unlimited |
 | `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Compressed bytes allowed per plan; `0` is unlimited. In-flight downloads may finish. In TOML the value is a quoted size, such as `"4GiB"` or `"0"` |

@@ -4825,39 +4825,49 @@ impl Daemon {
         }
     }
 
-    /// Try the manifest-level immutable pack catalog, returning candidate keys
-    /// successfully imported. Every other candidate remains eligible for the
-    /// existing v3 coordinator below.
-    async fn try_packed_prefetch(
-        self: &Arc<Self>,
+    async fn discover_packed_catalog(
+        &self,
         context: &PackPrefetchContext,
         v3: &Arc<crate::cache_remote::V3Remote>,
-        remote: &crate::config::RemoteConfig,
-        candidates: &[(String, String, PathBuf)],
-        bytes_at_plan_start: u64,
-        attribution: &PackedAttribution<'_>,
-    ) -> HashSet<String> {
-        let wanted = candidates
-            .iter()
-            .map(|(key, _, _)| key.clone())
-            .collect::<HashSet<_>>();
-        let mut imported = HashSet::new();
-        // Finding the latest catalog is a LIST, which needs s3:ListBucket.
-        // Without it the entries come one by one, as they would with no catalog.
-        if !self.config.remote_key_listing || self.listing_refused.load(Ordering::Relaxed) {
-            return imported;
-        }
-        let catalog_prefix =
-            match crate::remote_pack::catalog_prefix(&remote.prefix, &context.selector) {
-                Ok(prefix) => prefix,
-                Err(error) => {
-                    tracing::warn!("packed-prefetch selector rejected: {error:#}");
-                    return imported;
-                }
+        prefix: &str,
+        origin: &PrefetchOrigin,
+    ) -> Result<Option<crate::remote_pack::CatalogObjectRef>> {
+        if self.config.prefetch_catalog_head {
+            let key = crate::remote_pack::catalog_head_key(prefix, &context.selector)?;
+            let mut receipt = PrefetchReceipt::new(
+                self.prefetch_receipts.clone(),
+                origin.clone(),
+                &key,
+                "pack_catalog_head",
+                PrefetchOperation::Get,
+            );
+            let Some(object) = self
+                .packed_prefetch_get(
+                    v3,
+                    &key,
+                    crate::remote_pack::MAX_CATALOG_HEAD_BYTES,
+                    "packed-prefetch catalog pointer GET",
+                    &mut receipt,
+                )
+                .await
+                .ok()
+                .flatten()
+            else {
+                return Ok(None);
             };
+            let reference =
+                crate::remote_pack::decode_catalog_head(prefix, &context.selector, &object.body);
+            receipt.finish(if reference.is_ok() {
+                "completed"
+            } else {
+                "validation_error"
+            });
+            return reference.map(Some);
+        }
+        let catalog_prefix = crate::remote_pack::catalog_prefix(prefix, &context.selector)?;
         let mut list_receipt = PrefetchReceipt::new(
             self.prefetch_receipts.clone(),
-            attribution.origin.clone(),
+            origin.clone(),
             &catalog_prefix,
             "pack_catalog",
             PrefetchOperation::List,
@@ -4870,18 +4880,38 @@ impl Daemon {
             Err(error) => {
                 list_receipt.finish("error");
                 tracing::debug!("packed-prefetch catalog discovery failed: {error:#}");
-                self.prefetch_stats
-                    .pack_fallback_entries
-                    .fetch_add(wanted.len() as u64, Ordering::Relaxed);
-                return imported;
+                return Ok(None);
             }
         };
         drop(list_receipt);
-        let catalog_ref = match crate::remote_pack::latest_catalog_object(
-            &remote.prefix,
-            &context.selector,
-            &objects,
-        ) {
+        crate::remote_pack::latest_catalog_object(prefix, &context.selector, &objects)
+    }
+
+    /// Try the manifest-level immutable pack catalog, returning candidate keys
+    /// successfully imported. Other candidates can still be fetched individually.
+    async fn try_packed_prefetch(
+        self: &Arc<Self>,
+        context: &PackPrefetchContext,
+        v3: &Arc<crate::cache_remote::V3Remote>,
+        remote: &crate::config::RemoteConfig,
+        candidates: &[(String, String, PathBuf)],
+        bytes_at_plan_start: u64,
+        attribution: &PackedAttribution<'_>,
+    ) -> HashSet<String> {
+        let mut imported = HashSet::new();
+        if !self.config.prefetch_catalog_head
+            && (!self.config.remote_key_listing || self.listing_refused.load(Ordering::Relaxed))
+        {
+            return imported;
+        }
+        let wanted = candidates
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let catalog_ref = match self
+            .discover_packed_catalog(context, v3, &remote.prefix, attribution.origin)
+            .await
+        {
             Ok(Some(catalog)) => catalog,
             Ok(None) => {
                 self.prefetch_stats

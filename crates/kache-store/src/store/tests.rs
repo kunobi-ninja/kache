@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod blob_seal_tests;
 mod compiler_gc_tests;
 mod cost_backfill_tests;
 

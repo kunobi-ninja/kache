@@ -16114,6 +16114,32 @@ fn read_only_store_sees_entries_committed_after_it_opened() {
     );
 }
 
+/// The last writer to close keeps the WAL side files, so a reader opened
+/// after every writer has gone still finds the entries.
+#[test]
+fn read_only_store_hits_after_the_last_writer_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    {
+        let owner = Store::open(&config).unwrap();
+        ro_put(&owner, src.path(), "kept", b"bytes");
+        let limit: i64 = owner
+            .db
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(limit, 16 << 20, "a kept WAL is bounded");
+    }
+    for side in ["index.db-wal", "index.db-shm"] {
+        assert!(
+            dir.path().join(side).is_file(),
+            "{side} outlived its writer"
+        );
+    }
+    let ro = Store::open_read_only(&config).unwrap();
+    assert!(ro.get("kept").unwrap().is_some());
+}
+
 #[test]
 fn read_only_store_refuses_without_a_live_index_and_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -16127,7 +16153,7 @@ fn read_only_store_refuses_without_a_live_index_and_creates_nothing() {
         let owner = Store::open(&config).unwrap();
         ro_put(&owner, src.path(), "k", b"bytes");
     }
-    // The owner has gone: its index has no live -wal and -shm.
+    // Its -wal and -shm are gone.
     for side in ["index.db-wal", "index.db-shm"] {
         let _ = fs::remove_file(dir.path().join(side));
     }

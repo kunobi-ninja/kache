@@ -374,6 +374,12 @@ fn daemon_run_lock_path(runtime_dir: &Path) -> PathBuf {
     }
 }
 
+/// Whether a daemon still runs for `runtime_dir`.
+#[allow(dead_code)]
+pub fn daemon_is_running(runtime_dir: &Path) -> bool {
+    daemon_run_lock_is_held(&daemon_run_lock_path(runtime_dir))
+}
+
 /// Whether a daemon currently holds `lock_path`. The probe
 /// does not create the file, so a test that never started a daemon stays
 /// untouched. An error other than "missing" counts as held: the caller then

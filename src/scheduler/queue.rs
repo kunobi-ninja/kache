@@ -13,10 +13,9 @@
 //! plan with the same free slots.
 //!
 //! - Rank: the arrival time in milliseconds, less [`FOREGROUND_HEAD_START`]
-//!   for a foreground build. Lower ranks go first. A ticket keeps its rank
-//!   while later ones arrive, so its priority rises the longer it waits: a
-//!   background request that has waited the head start outranks every
-//!   foreground request that arrives after.
+//!   for a foreground build. Lower ranks go first. A foreground compile that
+//!   has queued for two seconds gets a second head start while the pressure
+//!   ceiling recovers. Background requests over twenty seconds older still go first.
 //! - Free slots go to tickets in rank order, each taking the lowest slots it
 //!   can use. A ticket that does not fit is passed by later ones that do.
 //! - The first ticket can be passed [`pass_budget`] times. After that it
@@ -148,12 +147,18 @@ pub(super) struct Entry {
 }
 
 impl Entry {
-    pub(super) fn new(rank: u64, kind: Kind, need: u32) -> Self {
+    pub(super) fn new(rank: u64, kind: Kind, need: u32, priority: Priority) -> Self {
+        let mut id = new_id();
+        if priority == Priority::Background {
+            // Older wrappers accept this alphanumeric prefix. Their own IDs
+            // are lowercase hex or start with a lowercase 'p'.
+            id.insert(0, 'B');
+        }
         Self {
             rank,
             kind,
             need,
-            id: new_id(),
+            id,
         }
     }
 
@@ -521,11 +526,33 @@ impl Ticket {
         &self.entry
     }
 
-    /// Note that the owner looked at `now`, asking for `need` slots. Call only
-    /// under `queue.lock`.
-    pub(super) fn refresh(&mut self, need: u32, now: SystemTime) -> Result<()> {
-        if need != self.entry.need {
+    /// Advance only across identified background compiles inside the extra
+    /// head start. Test tickets, older wrappers and earned reservations keep
+    /// their place. Call under `queue.lock`.
+    pub(super) fn recovery_rank(&self, base: u64, queue: &[Entry], budget: u32) -> u64 {
+        let ahead = base.saturating_sub(FOREGROUND_HEAD_START.as_millis() as u64);
+        let mut rank = base;
+        for entry in queue {
+            if entry.id == self.entry.id || !(ahead..=base).contains(&entry.rank) {
+                continue;
+            }
+            if entry.kind != Kind::Compile
+                || !entry.id.starts_with('B')
+                || passes(&self.root, entry) >= budget
+            {
+                return base;
+            }
+            rank = ahead;
+        }
+        rank
+    }
+
+    /// Update the owner's rank, slot request and last-seen time under `queue.lock`.
+    pub(super) fn refresh(&mut self, rank: u64, need: u32, now: SystemTime) -> Result<bool> {
+        let renamed = rank != self.entry.rank || need != self.entry.need;
+        if renamed {
             let renamed = Entry {
+                rank,
                 need,
                 ..self.entry.clone()
             };
@@ -537,7 +564,8 @@ impl Ticket {
         }
         let mut state = read_state(&mut self.state).unwrap_or_default();
         state.seen = millis(now);
-        write_state(&mut self.state, state)
+        write_state(&mut self.state, state)?;
+        Ok(renamed)
     }
 
     /// Leave the queue after taking slots. Nothing changed for the other
@@ -614,11 +642,15 @@ mod tests {
 
     #[test]
     fn new_ids_are_distinct_ticket_ids() {
-        let first = Entry::new(1, Kind::Compile, 1);
-        let second = Entry::new(1, Kind::Compile, 1);
+        let first = Entry::new(1, Kind::Compile, 1, Priority::Foreground);
+        let second = Entry::new(1, Kind::Compile, 1, Priority::Foreground);
         assert_ne!(first.id, second.id);
         assert_eq!(first.id.len(), 16);
         assert_eq!(Entry::parse(&first.name()), Some(first));
+
+        let background = Entry::new(1, Kind::Compile, 1, Priority::Background);
+        assert!(background.id.starts_with('B'));
+        assert_eq!(Entry::parse(&background.name()), Some(background));
     }
 
     #[test]
@@ -1036,6 +1068,42 @@ mod tests {
     }
 
     #[test]
+    fn a_recovery_move_crosses_only_background_compiles_without_reservations() {
+        let dir = root();
+        let base = 100_000;
+        let me = entry(base, Kind::Compile, 1, "me");
+        let ticket = Ticket::create(dir.path(), me.clone(), at(base)).unwrap();
+        let background = entry(90_000, Kind::Compile, 1, "B1");
+        let _other = Ticket::create(dir.path(), background.clone(), at(base)).unwrap();
+        let rank = |queue: &[Entry]| ticket.recovery_rank(base, queue, 2);
+        assert_eq!(rank(std::slice::from_ref(&me)), base);
+        for protected in [
+            entry(92_000, Kind::Test, 1, "B2"),
+            entry(92_000, Kind::Compile, 1, "legacy"),
+        ] {
+            assert_eq!(rank(&[background.clone(), protected]), base);
+        }
+        record_pass(dir.path(), &background).unwrap();
+        assert_eq!(
+            rank(&[
+                entry(89_999, Kind::Test, 1, "old"),
+                background.clone(),
+                me,
+                entry(100_001, Kind::Test, 1, "later"),
+            ]),
+            90_000
+        );
+        for _ in 2..=3 {
+            record_pass(dir.path(), &background).unwrap();
+            assert_eq!(
+                rank(std::slice::from_ref(&background)),
+                base,
+                "the reservation has priority at or above budget"
+            );
+        }
+    }
+
+    #[test]
     fn refreshing_a_ticket_renames_it_and_keeps_its_passes() {
         let dir = root();
         let queued = entry(7, Kind::Compile, 4, "grow");
@@ -1044,7 +1112,7 @@ mod tests {
         record_pass(dir.path(), &queued).unwrap();
         assert_eq!(passes(dir.path(), &queued), 2);
 
-        ticket.refresh(4, at(3_000)).unwrap();
+        assert!(!ticket.refresh(7, 4, at(3_000)).unwrap());
         assert_eq!(
             list(dir.path()).unwrap(),
             std::slice::from_ref(&queued),
@@ -1052,7 +1120,7 @@ mod tests {
         );
         assert!(ready(dir.path(), &queued, at(4_000)), "seen again at 3 s");
 
-        ticket.refresh(2, at(5_000)).unwrap();
+        assert!(ticket.refresh(7, 2, at(5_000)).unwrap());
         let shrunk = entry(7, Kind::Compile, 2, "grow");
         assert_eq!(ticket.entry(), &shrunk);
         assert_eq!(list(dir.path()).unwrap(), std::slice::from_ref(&shrunk));

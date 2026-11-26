@@ -363,8 +363,10 @@ fn concurrent_checkout_builds(changed_source: bool) {
     let workspaces = [fx.workspace.as_path(), second.path()];
     for (index, workspace) in workspaces.into_iter().enumerate() {
         let extra = usize::from(changed_source) * index;
+        let bin = workspace.join("app/src/bin");
+        std::fs::create_dir(&bin).unwrap();
         std::fs::write(
-            workspace.join("app/src/main.rs"),
+            bin.join("checkout_answer.rs"),
             format!("fn main() {{ println!(\"{{}}\", app::answer() + {extra}); }}\n"),
         )
         .unwrap();
@@ -387,6 +389,7 @@ fn concurrent_checkout_builds(changed_source: bool) {
         .map(|(workspace, target)| {
             cargo("build", workspace, &fx.home, &fx.cache, target, &[])
                 .args(["--offline", "--locked"])
+                .env("KACHE_EVENT_ROOT", workspace)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -402,24 +405,89 @@ fn concurrent_checkout_builds(changed_source: bool) {
         );
     }
     let events = events_since(&fx.cache, mark);
-    let mut runs = std::collections::BTreeMap::new();
+    let mut compiles = std::collections::BTreeMap::new();
+    let mut binary_keys = std::collections::BTreeSet::new();
     for event in &events {
         let key = field(event, "cache_key");
-        if !key.is_empty() {
-            *runs.entry(key).or_insert(0) += number(event, "compiler_runs");
+        if key.is_empty() {
+            continue;
+        }
+        if field(event, "crate_name") == "checkout_answer" {
+            binary_keys.insert(key);
+        }
+        if number(event, "compiler_runs") != 0 {
+            assert_eq!(number(event, "compiler_runs"), 1, "{event}");
+            compiles.entry(key).or_insert_with(Vec::new).push(event);
         }
     }
-    assert!(runs.values().any(|runs| *runs == 1), "{events:?}");
-    assert!(
-        runs.values().all(|runs| *runs <= 1),
-        "checkouts repeated a compile for the same key: {runs:?}\n{events:?}"
+    assert_eq!(
+        binary_keys.len(),
+        1 + usize::from(changed_source),
+        "{events:?}"
     );
+    assert!(!compiles.is_empty());
+    for (key, runs) in compiles {
+        match runs.as_slice() {
+            [_] => {}
+            [first, second] if changed_source && raced_other_checkout(first, second) => {}
+            _ => panic!("checkouts repeated a compile for {key}: {runs:?}"),
+        }
+    }
     for (index, target) in targets.iter().enumerate() {
-        let output = Command::new(target.join("debug/app")).output().unwrap();
+        let output = Command::new(target.join("debug/checkout_answer"))
+            .output()
+            .unwrap();
         assert!(output.status.success());
         let expected = (47 + usize::from(changed_source) * index).to_string();
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
+}
+
+/// Discovery can time out on a different tree before the owner knows its
+/// final key. Both checkouts can then compile; only one may publish.
+fn raced_other_checkout(first: &Value, second: &Value) -> bool {
+    let root = field(first, "root");
+    let other = field(second, "root");
+    !root.is_empty()
+        && !other.is_empty()
+        && root != other
+        && [first, second].iter().any(|event| {
+            event["scheduler_decisions"]
+                .as_array()
+                .is_some_and(|decisions| {
+                    decisions.iter().any(|d| {
+                        field(d, "phase") == "discovery"
+                            && field(d, "outcome") == "timeout_fallback"
+                    })
+                })
+        })
+        && [first, second]
+            .iter()
+            .any(|e| matches!(field(e, "result"), "miss" | "dup"))
+        && [first, second].iter().any(|e| {
+            field(e, "result") == "skipped" && field(e, "skip_reason") == "peer-already-committed"
+        })
+}
+
+#[test]
+fn a_duplicate_compile_needs_another_checkout_a_discovery_timeout_and_one_publisher() {
+    let stored = serde_json::json!({
+        "root": "first", "result": "miss",
+        "scheduler_decisions": [{"phase": "discovery", "outcome": "timeout_fallback"}]
+    });
+    let mut skipped = serde_json::json!({
+        "root": "second", "result": "skipped", "skip_reason": "peer-already-committed"
+    });
+    assert!(raced_other_checkout(&stored, &skipped));
+    assert!(!raced_other_checkout(&stored, &stored));
+    let mut no_timeout = stored.clone();
+    no_timeout["scheduler_decisions"][0]["phase"] = "capacity".into();
+    assert!(!raced_other_checkout(&no_timeout, &skipped));
+    skipped["root"] = "first".into();
+    assert!(!raced_other_checkout(&stored, &skipped));
+    skipped["root"] = "second".into();
+    skipped["result"] = "miss".into();
+    assert!(!raced_other_checkout(&stored, &skipped));
 }
 
 /// A miss with no closure record and no remote keys from the compile's own

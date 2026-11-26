@@ -331,6 +331,31 @@ environment.
 phase offsets are reconstructed from millisecond totals. The opt-in files
 above record actual interval placement and retain sub-millisecond work.
 
+## Build memory on macOS
+
+Use a locked Rust workspace and a patch that changes one function. Fetch the
+workspace's dependencies into your Cargo cache before running the benchmark.
+The measured builds use `--locked --offline`.
+
+```bash
+python3 scripts/bench-macos-memory.py \
+  --project /path/to/workspace \
+  --patch /path/to/edit.diff \
+  --kache /path/to/kache > memory.json
+```
+
+Each run starts from the workspace's committed HEAD, with a fresh target
+directory and Kache store. The script builds once, applies the patch in the
+temporary checkout, and builds again. It alternates Cargo and Kache across
+three repetitions and starts a dedicated local-only Kache daemon for each
+Kache run. Pass `--cargo` for a Cargo binary outside rustup.
+
+The JSON includes timing, raw samples, peak bytes during each build, and the
+physical footprint still held after one second. The peak is sampled every
+20 ms across the build, the daemon, and observed descendants. Brief peaks can
+fall between samples. This benchmark follows the cold, edit, and retained
+memory measurements proposed in [Blaze #2605](https://github.com/indexable-inc/blaze/pull/2605).
+
 ## Memory-pressure admission qualification
 
 `scripts/bench-pressure.py` compares real Rust builds under measured Linux

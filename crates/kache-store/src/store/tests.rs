@@ -5832,6 +5832,72 @@ fn durable_upload_key_enumeration_is_bounded_and_fails_closed_on_read_error() {
     );
 }
 
+/// A writer with a scoped prefix queues in `upload-queue-<scope>`; an
+/// eviction of the shared store keeps those entries like the unscoped
+/// spool's, and a scoped writer's queue never hides another scope's.
+#[test]
+fn every_upload_spool_of_the_store_pins_its_entries_against_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "d".repeat(64);
+    let (store, config) = store_with_one_evictable_entry(dir.path(), &key);
+    let scoped = dir.path().join("upload-queue-pr-0123abcd");
+    fs::create_dir_all(&scoped).unwrap();
+    let intent = scoped.join(format!("{key}.json"));
+    fs::write(&intent, b"{}").unwrap();
+
+    let unscoped_key = "e".repeat(64);
+    let other_key = "f".repeat(64);
+    let other = dir.path().join("upload-queue-pr-89abcdef");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join(format!("{other_key}.json")), b"{}").unwrap();
+    fs::create_dir_all(config.upload_spool_dir()).unwrap();
+    fs::write(
+        config
+            .upload_spool_dir()
+            .join(format!("{unscoped_key}.json")),
+        b"{}",
+    )
+    .unwrap();
+    // Neither is a spool: a directory without the scope separator, and a
+    // stray file that must not abort the sweep.
+    let not_a_spool = dir.path().join("upload-queue.old");
+    fs::create_dir_all(&not_a_spool).unwrap();
+    fs::write(not_a_spool.join(format!("{}.json", "a".repeat(64))), b"{}").unwrap();
+    fs::write(dir.path().join("upload-queue-stray"), b"not a spool").unwrap();
+
+    assert_eq!(
+        store.durable_upload_keys().unwrap(),
+        std::collections::HashSet::from([key.clone(), unscoped_key, other_key])
+    );
+    let size = store.evict().unwrap();
+    assert!(size.entries_pinned >= 1);
+    assert!(store.contains(&key));
+    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    assert!(pressure.entries_pinned >= 1);
+    assert!(store.contains(&key));
+
+    fs::remove_file(intent).unwrap();
+    store.evict().unwrap();
+    assert!(!store.contains(&key), "a retired intent no longer pins");
+}
+
+#[test]
+fn listing_upload_spools_tolerates_only_a_missing_cache_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(test_config(dir.path())).unwrap();
+    store.config.cache_dir = dir.path().join("missing");
+    assert!(store.durable_upload_keys().unwrap().is_empty());
+
+    let file = dir.path().join("a-file");
+    fs::write(&file, b"not a directory").unwrap();
+    store.config.cache_dir = file;
+    let blocked = store.durable_upload_keys().unwrap_err();
+    assert!(
+        format!("{blocked:#}").contains("a-file"),
+        "an unreadable cache directory fails closed: {blocked:#}"
+    );
+}
+
 /// #594 step 2, end to end: evicting an entry records a tombstone with the
 /// features the decision used, and a later lookup for that key marks it as
 /// demanded. That demand is the observation a live-store snapshot can never

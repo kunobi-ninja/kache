@@ -46,6 +46,27 @@ fn scoped_prefix(base: &str, configured: &str, separate_bucket: bool) -> Result<
     Ok(Some(prefix))
 }
 
+/// The prefix a configured proposal prefix lets this process write, or `None`
+/// when it cannot isolate writes: an OCI remote (tags in one repository share
+/// permissions) or a value equal to or nested with the base prefix.
+fn proposal_write_prefix(remote: Option<&RemoteConfig>, configured: &str) -> Option<String> {
+    let remote = remote?;
+    if matches!(remote.backend, RemoteBackendConfig::Oci(_)) {
+        tracing::warn!(
+            "OCI remotes cannot isolate writes by prefix; with proposal_prefix set the remote \
+             stays read-only"
+        );
+        return None;
+    }
+    match pull_request_prefix_for(&remote.prefix, configured) {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            tracing::warn!("proposal_prefix: {error:#}; the remote stays read-only");
+            None
+        }
+    }
+}
+
 /// `remote_key_listing` when neither the environment nor the file sets it:
 /// on for a filesystem remote, where listing is a directory walk that needs
 /// no extra permission; off for S3, where it needs `s3:ListBucket` and costs a
@@ -488,6 +509,13 @@ pub struct Config {
     /// read it. `None` elsewhere, and in a pull request job without it, which
     /// stays read-only. OCI pull request jobs always stay read-only because
     /// registry permissions apply to repositories rather than tag prefixes.
+    ///
+    /// A proposal prefix (`[cache.remote] proposal_prefix` or
+    /// `KACHE_PROPOSAL_PREFIX`) fills this field in every job, CI or not, and
+    /// wins over a pull request prefix: for a writer whose credentials may
+    /// write only below its own prefix. It fails closed: a value equal to or
+    /// nested with the base prefix, or an OCI remote, leaves this `None` and
+    /// the remote read-only, never writing the base prefix.
     pub pull_request_prefix: Option<String>,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
     /// invocation whose keyed inputs were modified at/after the build started
@@ -1221,6 +1249,9 @@ pub struct RemoteFileConfig {
     pub pull_request_prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request_bucket: Option<String>,
+    /// Write only below this prefix in every job (see `Config::pull_request_prefix`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1509,6 +1540,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_REMOTE_KEY_LISTING",
     "KACHE_PULL_REQUEST_PREFIX",
     "KACHE_PULL_REQUEST_BUCKET",
+    "KACHE_PROPOSAL_PREFIX",
     "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
     "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
     "KACHE_REMOTE_UPLOAD_MAX_ATTEMPTS",
@@ -1614,6 +1646,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_PULL_REQUEST_BUCKET",
         "cache.remote.pull_request_bucket",
     ),
+    ("KACHE_PROPOSAL_PREFIX", "cache.remote.proposal_prefix"),
     ("KACHE_PREFETCH_MAX_KEYS", "cache.prefetch_max_keys"),
     ("KACHE_PREFETCH_MAX_BYTES", "cache.prefetch_max_bytes"),
     (
@@ -2668,9 +2701,14 @@ impl Config {
         }
         let remote_key_listing = explicit_remote_key_listing
             .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
-        let pull_request_prefix = if crate::policy::pull_request_job_with(|name| {
-            invocation.var(name).ok()
-        }) {
+        let pull_request_prefix = if let Some(configured) =
+            Self::proposal_prefix_for(invocation, &file_config)
+        {
+            let prefix = proposal_write_prefix(remote.as_ref(), &configured);
+            // Fail closed: once a proposal prefix is set, the base prefix is never written.
+            remote_readonly |= prefix.is_none();
+            prefix
+        } else if crate::policy::pull_request_job_with(|name| invocation.var(name).ok()) {
             remote.as_ref().and_then(|remote| {
                     if matches!(remote.backend, RemoteBackendConfig::Oci(_)) {
                         tracing::warn!(
@@ -3118,6 +3156,9 @@ impl Config {
                         })
                 })
                 .flatten();
+        // A proposal prefix writes into the one bucket it reads.
+        let pull_request_bucket = pull_request_bucket
+            .filter(|_| Self::proposal_prefix_for(invocation, file_config).is_none());
         if pull_request_bucket.is_some()
             && configured_type.as_deref().is_some_and(|kind| kind != "s3")
         {
@@ -3319,6 +3360,29 @@ impl Config {
                 user_agent,
             }),
         }))
+    }
+
+    /// The configured proposal prefix: `KACHE_PROPOSAL_PREFIX`, else
+    /// `[cache.remote] proposal_prefix`. A blank value turns it off.
+    fn proposal_prefix_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> Option<String> {
+        env_or_ignored_for(
+            invocation,
+            "KACHE_PROPOSAL_PREFIX",
+            Self::ignore_env_enabled(file_config),
+        )
+        .ok()
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|config| config.cache.as_ref())
+                .and_then(|cache| cache.remote.as_ref())
+                .and_then(|remote| remote.proposal_prefix.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
     }
 
     /// Whether strict local-only mode is active (#221). Env wins over the

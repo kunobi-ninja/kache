@@ -816,6 +816,11 @@ fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileCon
                 .as_ref()
                 .and_then(|cache| cache.remote.as_ref())
                 .and_then(|remote| remote.pull_request_prefix.clone()),
+            proposal_prefix: original
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.remote.as_ref())
+                .and_then(|remote| remote.proposal_prefix.clone()),
             _type: remote_type,
             bucket,
             endpoint,
@@ -2132,6 +2137,7 @@ mod tests {
                     bucket: Some("b".to_string()),
                     pull_request_prefix: Some("artifacts-pr".to_string()),
                     pull_request_bucket: Some("build-cache-pr".to_string()),
+                    proposal_prefix: Some("proposals/a".to_string()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2146,6 +2152,7 @@ mod tests {
             remote.pull_request_bucket.as_deref(),
             Some("build-cache-pr")
         );
+        assert_eq!(remote.proposal_prefix.as_deref(), Some("proposals/a"));
     }
 
     #[test]
@@ -2269,6 +2276,7 @@ mod tests {
                     atomic_write_dir: None,
                     pull_request_prefix: None,
                     pull_request_bucket: None,
+                    proposal_prefix: None,
                     repository: None,
                     insecure: None,
                 }),

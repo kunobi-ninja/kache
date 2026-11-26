@@ -163,6 +163,37 @@ fn rejected_readonly_hits_are_recompiled_and_cached_locally() {
     }
 }
 
+/// The host's writer has exited and no process holds its index open: a job
+/// reading that store must still hit it rather than compile again.
+#[test]
+fn readonly_store_hits_after_every_host_writer_exited() {
+    build_kache();
+    let root = tempfile::tempdir().unwrap();
+    let host = root.path().join("host-cache");
+    let job = root.path().join("job-cache");
+    let source = root.path().join("lib.rs");
+    std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let key = {
+        let _host_daemon = common::DaemonGuard::new(kache_binary(), &host);
+        let host_config = write_config(&host, None);
+        compile(&host, &host_config, &source, &root.path().join("host-out"));
+        let seed = last_event(&host);
+        assert_eq!(seed["result"], "miss", "{seed}");
+        seed["cache_key"].as_str().unwrap().to_owned()
+    };
+    assert!(
+        !common::daemon_is_running(&host),
+        "the host daemon is stopped"
+    );
+    let _job_daemon = common::DaemonGuard::new(kache_binary(), &job);
+    let job_config = write_config(&job, Some(&host));
+    compile(&job, &job_config, &source, &root.path().join("job-out"));
+    let hit = last_event(&job);
+    assert_eq!(hit["cache_key"], key.as_str(), "{hit}");
+    assert_eq!(hit["result"], "local_hit", "{hit}");
+    assert_eq!(hit["readonly_store"], true, "{hit}");
+}
+
 #[cfg(unix)]
 #[test]
 fn empty_job_store_uses_the_readonly_cc_hit_before_compiling() {

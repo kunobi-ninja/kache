@@ -2012,8 +2012,45 @@ fn is_retryable_sqlite_open_error(err: &SqlError) -> bool {
     }
 }
 
+/// Keep `index.db-wal` and `index.db-shm` when this connection is the last
+/// one to close. SQLite otherwise checkpoints and deletes them, and a reader
+/// on a read-only mount cannot open a WAL index without them (see
+/// [`ArtifactStore::open_read_only`]): every lookup of such a reader would
+/// miss until some writer opened the store again. Every writer sets it, so
+/// whichever closes last keeps them.
+fn persist_wal_side_files(db: &Connection) -> rusqlite::Result<()> {
+    let mut persist: std::ffi::c_int = 1;
+    // SAFETY: the handle belongs to this open connection, the schema name is
+    // NUL-terminated, and SQLITE_FCNTL_PERSIST_WAL reads and writes one int.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            db.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&raw mut persist).cast(),
+        )
+    };
+    if rc == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rc),
+            Some("keeping the index WAL files on close".into()),
+        ))
+    }
+}
+
+/// The size SQLite truncates `index.db-wal` back to when a writer restarts
+/// it. A busy store's WAL cycles near the 1000-page autocheckpoint (about
+/// 4 MiB), so this never truncates in steady state. It bounds a WAL that grew
+/// while readers held snapshots, which a kept WAL ([`persist_wal_side_files`])
+/// would otherwise hold at its largest size.
+const INDEX_WAL_SIZE_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
+
 fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
+    persist_wal_side_files(db)?;
     db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "journal_size_limit", INDEX_WAL_SIZE_LIMIT_BYTES)?;
     db.pragma_update(None, "synchronous", mode.resolve().pragma_value())?;
     // Let concurrent writers retry for up to 5 s instead of failing immediately
     // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
@@ -2781,9 +2818,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// WAL side files on a writable mount even with a read-only connection.
     ///
     /// A WAL-mode index needs existing `index.db-wal` and `index.db-shm` files.
-    /// Missing files are refused before opening, but this check cannot prevent
-    /// their owner from removing them concurrently. Do not use SQLite's
-    /// immutable mode here: it would hide later commits in the live WAL.
+    /// Writers keep them when they close (`persist_wal_side_files`), so they
+    /// exist whether or not a writer runs. Missing files are refused before
+    /// opening, but this check cannot prevent their removal concurrently. Do
+    /// not use SQLite's immutable mode here: it would hide later commits in
+    /// the live WAL.
     ///
     /// [`Self::get`] stamps no hit and evicts or migrates nothing. A damaged
     /// or legacy entry is a miss. Mutators return an error, or do nothing for
@@ -2821,8 +2860,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 let side = PathBuf::from(side);
                 if !side.is_file() {
                     anyhow::bail!(
-                        "read-only store: {} is in WAL mode and {} is missing, so its owner is not \
-                         running; a read-only open would create it",
+                        "read-only store: {} is in WAL mode and {} is missing (removed, or last \
+                         closed by a Kache that did not keep it); a read-only open would create \
+                         it",
                         db_path.display(),
                         side.display()
                     );

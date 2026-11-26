@@ -2,7 +2,8 @@
 //! before Commit, and never starts compiler work.
 
 use super::execution_policy::{
-    EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver, stop_worker, unfinished_reply,
+    CACHE_STAGE_BUDGET, CacheStageWatch, EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver,
+    execution_ticker, stop_worker, unfinished_reply,
 };
 use super::*;
 use crate::invocation::{
@@ -465,9 +466,23 @@ pub(super) async fn handle(
     });
     let mut unexpected = [0; 1];
     let mut drain_seen = false;
+    let mut ticker = execution_ticker();
+    let mut watch = CacheStageWatch::new(CACHE_STAGE_BUDGET, Instant::now());
     let result = loop {
         tokio::select! {
             result = &mut worker => break result,
+            _ = ticker.tick() => {
+                if watch.expired(Instant::now(), cancellation.child_activity()) {
+                    let stopped = stop_worker(&cancellation, &mut worker, WORKER_STOP_GRACE).await;
+                    let reply = unfinished_reply(
+                        streams.output_written(),
+                        stopped,
+                        false,
+                        format!("cache stages made no progress for {CACHE_STAGE_BUDGET:?}"),
+                    );
+                    return deliver(frames, &reply).await;
+                }
+            }
             disconnected = reader.read(&mut unexpected) => {
                 let _ = disconnected;
                 cancellation.cancel();

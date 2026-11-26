@@ -66,20 +66,17 @@ mod tests {
     fn shared_budget_preserves_store_defaults_and_explicit_wait_limits() {
         assert_eq!(store_wait_budget(None).1, None);
         let _scope = crate::scheduler::InvocationWaitScope::enter();
-        assert_eq!(store_wait_budget(None).1, Some(Duration::from_secs(600)));
+        // A scoped invocation waits for a peer's key at most its two-minute
+        // coordination allowance, never the store's 10 min default.
+        let scoped = store_wait_budget(None).1.unwrap();
+        assert!(
+            scoped <= Duration::from_secs(120) && scoped > Duration::from_secs(119),
+            "{scoped:?}"
+        );
         assert_eq!(
             store_wait_budget(Some(Duration::from_secs(7))).1,
             Some(Duration::from_secs(7))
         );
-        assert_eq!(
-            store_wait_budget(Some(Duration::from_secs(900))).1,
-            Some(Duration::from_secs(900))
-        );
-        assert!(
-            store_wait_budget(Some(Duration::from_secs(3600)))
-                .1
-                .unwrap()
-                <= Duration::from_secs(1800)
-        );
+        assert!(store_wait_budget(Some(Duration::from_secs(900))).1.unwrap() <= scoped);
     }
 }

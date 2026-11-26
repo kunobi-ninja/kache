@@ -22,6 +22,9 @@ pub(crate) struct Cancellation(Arc<Request>);
 struct Request {
     cancelled: AtomicBool,
     children: Mutex<Vec<Weak<Mutex<Running>>>>,
+    /// Children started so far, so a watcher sampling every few seconds
+    /// still sees a compiler that started and finished between samples.
+    spawns: std::sync::atomic::AtomicU64,
 }
 
 impl Cancellation {
@@ -44,6 +47,21 @@ impl Cancellation {
                 .kill();
             true
         });
+    }
+
+    /// Whether a child of this request is alive, and how many it started.
+    /// Never waits: a spawn holds the registry while its child starts, and
+    /// that counts as a child alive.
+    pub(crate) fn child_activity(&self) -> (bool, u64) {
+        let live = |children: &[Weak<Mutex<Running>>]| {
+            children.iter().any(|child| child.strong_count() != 0)
+        };
+        let running = match self.0.children.try_lock() {
+            Ok(children) => live(&children),
+            Err(std::sync::TryLockError::Poisoned(poison)) => live(&poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        };
+        (running, self.0.spawns.load(Ordering::Acquire))
     }
 
     pub(crate) fn check(&self) -> io::Result<()> {
@@ -549,6 +567,9 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
         children.retain(|child| child.strong_count() != 0);
         children.push(Arc::downgrade(&running));
     }
+    if let Some(token) = &cancellation {
+        token.0.spawns.fetch_add(1, Ordering::AcqRel);
+    }
     Ok(Child {
         running,
         stdin,
@@ -561,6 +582,48 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn child_activity_reports_live_and_started_compiler_children() {
+        let token = Cancellation::default();
+        let _scope = CancellationScope::borrow(Some(token.clone()));
+        assert_eq!(token.child_activity(), (false, 0));
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.2"])
+            .invocation_spawn()
+            .unwrap();
+        assert_eq!(token.child_activity(), (true, 1));
+        assert!(child.wait().unwrap().success());
+        drop(child);
+        assert_eq!(token.child_activity(), (false, 1));
+        // An unscoped spawn belongs to no request.
+        let mut other = {
+            let _unscoped = CancellationScope::borrow(None);
+            Command::new("/bin/true").invocation_spawn().unwrap()
+        };
+        assert!(other.wait().unwrap().success());
+        assert_eq!(token.child_activity(), (false, 1));
+    }
+
+    #[test]
+    fn child_activity_never_waits_for_the_child_registry() {
+        let token = Cancellation::default();
+        {
+            // A spawn in progress holds the registry: count it as activity.
+            let _spawning = token.0.children.lock().unwrap();
+            assert_eq!(token.child_activity(), (true, 0));
+        }
+        assert_eq!(token.child_activity(), (false, 0));
+        let poisoner = token.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.0.children.lock().unwrap();
+            panic!("poison the child registry");
+        })
+        .join();
+        assert!(token.0.children.is_poisoned());
+        assert_eq!(token.child_activity(), (false, 0));
+    }
 
     #[test]
     fn checking_cancellation_does_not_wait_for_child_shutdown() {

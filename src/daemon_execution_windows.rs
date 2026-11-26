@@ -1,7 +1,8 @@
 //! The daemon owns the pipeline; its frontend owns native Windows launches.
 
 use super::execution_policy::{
-    EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver, stop_worker, unfinished_reply,
+    CACHE_STAGE_BUDGET, CacheStageWatch, EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver,
+    execution_ticker, stop_worker, unfinished_reply,
 };
 use super::*;
 use crate::invocation::{
@@ -306,6 +307,8 @@ pub(super) async fn handle(
     });
     let mut unexpected = [0u8; 1];
     let mut drain_seen = false;
+    let mut ticker = execution_ticker();
+    let mut watch = CacheStageWatch::new(CACHE_STAGE_BUDGET, Instant::now());
     let result = loop {
         let call = tokio::select! {
             biased;
@@ -334,6 +337,21 @@ pub(super) async fn handle(
                     "daemon is shutting down".into(),
                 );
                 return deliver(frames, &reply).await;
+            }
+            _ = ticker.tick() => {
+                if watch.expired(Instant::now(), cancellation.child_activity()) {
+                    drop(calls);
+                    drop(finished);
+                    let stopped = stop_worker(&cancellation, &mut worker, WORKER_STOP_GRACE).await;
+                    let reply = unfinished_reply(
+                        streams.output_written(),
+                        stopped,
+                        client_owns_effects,
+                        format!("cache stages made no progress for {CACHE_STAGE_BUDGET:?}"),
+                    );
+                    return deliver(frames, &reply).await;
+                }
+                continue;
             }
             // Reap completed owners before admitting another native spawn.
             Some(id) = finished.recv() => Call {

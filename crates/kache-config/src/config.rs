@@ -183,6 +183,10 @@ pub fn default_recovery_floor(in_ci: bool) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
+    /// The cache directory before trust-domain isolation: probe memos are facts about this
+    /// machine's toolchains, shared by every trust domain, so they stay beside the domains' stores
+    /// ([`Config::probe_memo_dir`]). Equal to `cache_dir` without a trust domain.
+    pub probe_root: PathBuf,
     /// Job/process-lifetime state root. Defaults to [`Self::cache_dir`] for
     /// compatibility, but can be separated from a persistent node-local store
     /// with `KACHE_RUNTIME_DIR` / `[cache] runtime_dir`. When
@@ -1907,6 +1911,7 @@ impl Config {
         // single path-safe label. Invalid or unusable labels fail open to the
         // unscoped cache dir. Do not export this on public/fork jobs.
         let trust_domain = invocation.var("KACHE_TRUST_DOMAIN").ok();
+        let probe_root = cache_dir.clone();
         let cache_dir = isolate_cache_dir_for_trust_domain(cache_dir, trust_domain.as_deref());
         let runtime_dir = if runtime_follows_cache {
             cache_dir.clone()
@@ -2723,6 +2728,7 @@ impl Config {
 
         Ok(Config {
             cache_dir,
+            probe_root,
             runtime_dir,
             socket_path_override,
             shared_store_socket,
@@ -4320,7 +4326,7 @@ impl Config {
     /// store's ([`seed_probe_memo_dir`]); each memo still checks its own
     /// stamps before it is used.
     pub fn probe_memo_dir(&self) -> PathBuf {
-        let memo_dir = self.cache_dir.join(PROBE_MEMO_DIR_NAME);
+        let memo_dir = self.probe_root.join(PROBE_MEMO_DIR_NAME);
         if let Some(readonly_store) = &self.readonly_store {
             seed_probe_memo_dir(&memo_dir, &readonly_store.join(PROBE_MEMO_DIR_NAME));
         }

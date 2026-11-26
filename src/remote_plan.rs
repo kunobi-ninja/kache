@@ -120,6 +120,7 @@ mod tests {
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
+            probe_root: PathBuf::from("/tmp/kache-test").clone(),
             cache_dir: PathBuf::from("/tmp/kache-test"),
             runtime_dir: PathBuf::from("/tmp/kache-test"),
             max_size: 1024,

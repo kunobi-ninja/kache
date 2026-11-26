@@ -3978,6 +3978,7 @@ fn save_manifest_config(
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         runtime_dir: cache_dir.clone(),
+        probe_root: cache_dir.clone(),
         cache_dir,
         max_size: 1024 * 1024,
         remote,

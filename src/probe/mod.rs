@@ -409,28 +409,21 @@ pub enum ProbedFamily {
 /// `"cc-family"`. No changes to `ResolvedConfig` — the family string
 /// is stored in the `version_line` field of the existing record format.
 ///
-/// Cache directory for the family probe, straight from the environment.
-///
-/// Avoids parsing the full TOML config just to get the cache directory on
-/// the fast path — but expands a tilde exactly like `Config::load` would.
-/// Taking the env value verbatim wrote probe records under a literal
-/// `./~/probes/` for values the shell never expanded (systemd Environment=
-/// files, and the tilde-expansion tests' env windows in CI) (#673).
+/// Cache directory for the family probe: the store that holds every other
+/// probe memo ([`crate::config::probe_memo_dir_for`]), which [`cache`] extends
+/// by that same `probes` directory. `KACHE_CACHE_DIR` and `[cache]
+/// local_store` are resolved, tilde included, as `Config::load` does (#673).
+/// No memo when the configuration does not load: the probe then simply runs.
 #[cfg(test)]
 fn family_probe_cache_dir() -> std::path::PathBuf {
     family_probe_cache_dir_for(&InvocationEnv::capture()).expect("client cache directory resolves")
 }
 
 fn family_probe_cache_dir_for(env: &InvocationEnv) -> Option<std::path::PathBuf> {
-    let path = env
-        .var_os("KACHE_CACHE_DIR")
-        .map(|path| crate::config::shellexpand_for(env, &path.to_string_lossy()))
-        .unwrap_or_else(|| {
-            env.cache_dir()
-                .unwrap_or_else(|| Path::new("/tmp"))
-                .join("kache")
-        });
-    env.resolve(&path)
+    crate::config::probe_memo_dir_for(env)
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 /// Returns `None` if the binary isn't a recognized C compiler.
@@ -1040,7 +1033,10 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
         let cwd = root.path().join("project");
         let home = root.path().join("home");
         let mut env = InvocationEnv::from_parts(
-            [("KACHE_CACHE_DIR", "~/compiler-cache")],
+            [
+                ("KACHE_CACHE_DIR", "~/compiler-cache"),
+                ("KACHE_HOST_CONFIG", ""),
+            ],
             Some(cwd.clone()),
             Some(home.clone()),
             root.path().join("temp"),
@@ -1054,8 +1050,32 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
             family_probe_cache_dir_for(&env),
             Some(cwd.join("relative-cache"))
         );
+        let local = root.path().join("local");
+        let config = root.path().join("kache.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[cache]\nlocal_store = {}\n",
+                toml::Value::String(local.display().to_string())
+            ),
+        )
+        .unwrap();
+        let configured = InvocationEnv::from_parts(
+            [
+                ("KACHE_CONFIG", config.to_str().unwrap()),
+                ("KACHE_HOST_CONFIG", ""),
+            ],
+            Some(cwd.clone()),
+            Some(home.clone()),
+            root.path().join("temp"),
+        );
+        assert_eq!(
+            family_probe_cache_dir_for(&configured),
+            Some(local),
+            "the configured local store holds the family memos"
+        );
         let default_env = InvocationEnv::from_parts(
-            std::iter::empty::<(&str, &str)>(),
+            [("KACHE_HOST_CONFIG", "")],
             Some(cwd),
             Some(home),
             root.path().join("temp"),

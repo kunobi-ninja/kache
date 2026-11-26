@@ -3371,6 +3371,12 @@ fn shared_hardlink_restores_are_off_unless_switched_on() {
 fn probe_memos_live_under_the_configured_cache_dir() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
+    // The memos follow the loaded configuration, so no user or host config
+    // may select another store.
+    let config = dir.path().join("kache.toml");
+    std::fs::write(&config, "").unwrap();
+    let _config = set_kache_config_for_test(&config);
+    let _host_config = set_env_for_test("KACHE_HOST_CONFIG", Some("".as_ref()));
     // SAFETY: the process-state lock serialises environment edits.
     unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path()) };
     let probes = probe_memo_dir();

@@ -177,10 +177,28 @@ fn crt_memo_material(driver: &Path, env: &InvocationEnv) -> Option<(PathBuf, Str
                 .unwrap_or_default(),
         );
     }
-    // Relative search paths are interpreted in the requesting client's cwd.
-    material.push(env.cwd()?.as_os_str().as_encoded_bytes());
-    material.push(env.var_os("PATH").unwrap_or_default().as_encoded_bytes());
+    let path = env.var_os("PATH").unwrap_or_default();
+    // Relative search paths are interpreted in the requesting client's cwd, so
+    // only they make it part of the key: with absolute ones, clients in other
+    // working directories share the memo.
+    if crt_search_is_cwd_relative(env, &path) {
+        material.push(env.cwd()?.as_os_str().as_encoded_bytes());
+    }
+    material.push(path.as_encoded_bytes());
     Some((canonical, material.digest()))
+}
+
+/// Whether `PATH` or a CRT search variable names a directory relative to the
+/// working directory (an empty list entry is the working directory itself).
+fn crt_search_is_cwd_relative(env: &InvocationEnv, path: &std::ffi::OsStr) -> bool {
+    let relative = |value: &std::ffi::OsStr| {
+        !value.is_empty() && std::env::split_paths(value).any(|entry| !entry.is_absolute())
+    };
+    relative(path)
+        || CRT_SEARCH_ENV
+            .iter()
+            .filter_map(|name| env.var_os(name))
+            .any(|value| relative(&value))
 }
 
 fn directory_stamp(directory: &Path) -> Option<String> {
@@ -461,6 +479,20 @@ impl LinkerSelection {
         self
     }
 
+    /// Whether a `-B` directory, `--ld-path` or path-like `-fuse-ld` is
+    /// relative to the working directory. A bare linker name is searched in
+    /// `PATH`, which the CRT digest already covers.
+    fn names_cwd_relative_path(&self) -> bool {
+        let relative_path = |value: &str| {
+            let path = Path::new(value);
+            path.components().count() > 1 && !path.is_absolute()
+        };
+        self.driver_search_dirs()
+            .any(|dir| !Path::new(dir).is_absolute())
+            || self.ld_path.as_deref().is_some_and(relative_path)
+            || self.fuse_ld.as_deref().is_some_and(relative_path)
+    }
+
     /// `-B` directories in the order the driver searches them.
     fn driver_search_dirs(&self) -> impl Iterator<Item = &str> {
         self.bundled_lld
@@ -629,6 +661,10 @@ fn linker_memo_digest(
     for dir in selection.driver_search_dirs() {
         material.push(b"-B");
         material.push(dir.as_bytes());
+    }
+    // The CRT digest keeps the cwd only for relative search variables.
+    if selection.names_cwd_relative_path() {
+        material.push(env.cwd()?.as_os_str().as_encoded_bytes());
     }
     material.push(selection.fuse_ld.as_deref().unwrap_or("").as_bytes());
     material.push(selection.ld_path.as_deref().unwrap_or("").as_bytes());
@@ -3533,6 +3569,99 @@ esac
         assert_eq!(right, resolve(&second));
         assert!(crt_placement_memo_for(&memo, &driver, &first).is_some());
         assert!(crt_placement_memo_for(&memo, &driver, &second).is_some());
+    }
+
+    /// With absolute search paths the working directory decides no placement,
+    /// so clients in other directories share one memo. A relative entry in
+    /// `PATH` or any CRT search variable keeps them apart.
+    #[test]
+    fn crt_memos_key_the_cwd_only_for_relative_search_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let driver = root.join("driver-cc");
+        std::fs::write(&driver, "driver").unwrap();
+        let absolute = root.join("lib").into_os_string();
+        let with_relative = std::env::join_paths([absolute.clone(), "lib".into()]).unwrap();
+        let shared = |vars: &[(&str, &std::ffi::OsStr)]| {
+            let digest = |cwd: &str| {
+                let cwd = root.join(cwd);
+                let env = InvocationEnv::from_parts(vars.to_vec(), Some(cwd.clone()), None, cwd);
+                crt_memo_material(&driver, &env).unwrap().1
+            };
+            digest("one") == digest("two")
+        };
+        assert!(shared(&[]));
+        assert!(shared(&[("PATH", &absolute)]));
+        assert!(
+            shared(&[("PATH", &absolute), ("LIBRARY_PATH", "".as_ref())]),
+            "an empty variable names no directory"
+        );
+        assert!(!shared(&[("PATH", &with_relative)]));
+        for &name in CRT_SEARCH_ENV {
+            assert!(
+                !shared(&[("PATH", &absolute), (name, &with_relative)]),
+                "{name}"
+            );
+            assert!(shared(&[("PATH", &absolute), (name, &absolute)]), "{name}");
+        }
+        if cfg!(unix) {
+            let empty_entry = std::env::join_paths([absolute.clone(), "".into()]).unwrap();
+            assert!(
+                !shared(&[("PATH", &empty_entry)]),
+                "an empty entry is the working directory"
+            );
+        }
+    }
+
+    /// A relative `-B` directory or linker path is found from the working
+    /// directory, so it keys the linker memo by the cwd; bare linker names
+    /// and absolute paths do not.
+    #[test]
+    fn linker_memos_key_the_cwd_only_for_relative_selections() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let driver = root.join("driver-cc");
+        std::fs::write(&driver, "driver").unwrap();
+        let absolute = root.join("tools").display().to_string();
+        let selection = |args: &[String]| LinkerSelection::from_words(args).unwrap();
+        let relative = |args: &[&str]| selection(&words(args)).names_cwd_relative_path();
+        let absolute_args = [
+            vec![format!("-fuse-ld={absolute}/ld.mold")],
+            vec![format!("--ld-path={absolute}/ld")],
+            vec!["-B".to_string(), absolute.clone()],
+        ];
+        for args in &absolute_args {
+            assert!(!selection(args).names_cwd_relative_path(), "{args:?}");
+        }
+        assert!(
+            !selection(&[])
+                .with_bundled_lld(root.join("gcc-ld"))
+                .names_cwd_relative_path()
+        );
+        assert!(!relative(&[]));
+        assert!(!relative(&["-fuse-ld=lld"]), "a bare name is searched");
+        assert!(!relative(&["--ld-path=ld.lld"]), "a bare name is searched");
+        assert!(relative(&["-fuse-ld=tools/ld.mold"]));
+        assert!(relative(&["--ld-path=tools/ld"]));
+        assert!(relative(&["-Btools"]));
+
+        let shared = |args: &[String]| {
+            let digest = |cwd: &str| {
+                let cwd = root.join(cwd);
+                let env = InvocationEnv::from_parts(
+                    std::iter::empty::<(&str, &str)>(),
+                    Some(cwd.clone()),
+                    None,
+                    cwd,
+                );
+                linker_memo_digest(&driver, &selection(args), &env)
+                    .unwrap()
+                    .1
+            };
+            digest("one") == digest("two")
+        };
+        assert!(shared(&absolute_args[2]));
+        assert!(!shared(&words(&["-Btools"])));
     }
 
     #[cfg(unix)]

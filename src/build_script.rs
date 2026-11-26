@@ -642,7 +642,7 @@ struct Run {
 fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     let start = std::time::Instant::now();
     let config = Config::load()?;
-    let _ = TREE_MEMO_DIR.set(config.cache_dir.clone());
+    let _ = TREE_MEMO_DIR.set(config.probe_memo_dir());
     if config.disabled {
         anyhow::bail!("kache is disabled");
     }

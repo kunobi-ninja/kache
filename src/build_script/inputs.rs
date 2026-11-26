@@ -647,9 +647,8 @@ fn tree_stamp_in(path: &Path, walk: &Walk<'_>, budget: usize) -> Result<TreeStam
     }
 }
 
-/// Where tree digests are memoised: under the configured cache directory
-/// once a run has loaded its configuration, else the environment's or the
-/// default one.
+/// Where tree digests are memoised: the configuration's probe memo directory
+/// once a run has loaded it, else the environment's or the default one.
 pub(super) static TREE_MEMO_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// A file's bytes when it may be text: `None` once its first block holds a
@@ -698,7 +697,7 @@ fn tree_memo_path(path: &Path, walk: &Walk<'_>, text: Option<&Environment>) -> P
         Some((cache_dir, _)) => cache_dir.join("probes"),
         None => TREE_MEMO_DIR
             .get()
-            .map(|cache_dir| cache_dir.join("probes"))
+            .cloned()
             .unwrap_or_else(crate::config::probe_memo_dir),
     }
     .join(format!("tree-{}.txt", &name[..24]))

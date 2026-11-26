@@ -7585,31 +7585,24 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
 
 /// What Kache and Cargo write as a project builds, which the tree guard and
 /// the walks of declared build-script inputs leave out wherever it lies
-/// inside a tree, each as spelled and as resolved: Kache's cache, runtime and
-/// probe directories, the store the unit's outputs route to, and what Cargo
-/// itself writes in its home ([`crate::build_script_inputs::cargo_home_writes`]).
+/// inside a tree, each as spelled and as resolved: Kache's cache (probe memos
+/// included) and runtime directories, the store the unit's outputs route to,
+/// and what Cargo itself writes in its home
+/// ([`crate::build_script_inputs::cargo_home_writes`]).
 /// GitLab CI caches only paths inside the project, so a job keeps Kache's
 /// cache and Cargo's home there, and Cargo records in its home when builds
 /// use downloaded crates. The rest of Cargo's home still counts: with the
-/// home in the project's `.cargo`, its `config.toml` is the project's. Under
-/// a trust domain the probe directory, which holds the tree memos, stays in
-/// the base cache directory, outside the domain's own cache.
+/// home in the project's `.cargo`, its `config.toml` is the project's.
 fn written_while_building(
     config: &Config,
     store: Option<&Store>,
     env: &crate::invocation::InvocationEnv,
 ) -> Vec<PathBuf> {
-    let probe_dir =
-        crate::config::probe_memo_dir_for(env).unwrap_or_else(|_| config.cache_dir.join("probes"));
     let mut written = crate::build_script_inputs::excluded_roots(
         None,
-        [
-            config.cache_dir.as_path(),
-            config.runtime_dir.as_path(),
-            probe_dir.as_path(),
-        ]
-        .into_iter()
-        .chain(store.map(Store::cache_dir)),
+        [config.cache_dir.as_path(), config.runtime_dir.as_path()]
+            .into_iter()
+            .chain(store.map(Store::cache_dir)),
     );
     if let Some(home) = crate::build_script_inputs::cargo_home(&|name| env.var_os(name)) {
         written.extend(crate::build_script_inputs::cargo_home_writes(&home));

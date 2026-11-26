@@ -27,6 +27,8 @@ use std::time::Duration;
 use crate::scheduler::{self, TestWant};
 
 mod delegate;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod usage;
 #[cfg(unix)]
 pub(crate) use delegate::runner_var;
 
@@ -367,7 +369,9 @@ fn exec(args: &[OsString], marker: Option<String>) -> i32 {
     }
 }
 
-/// Run the binary under a test lease, then record its peak RSS.
+/// Run the binary under a test lease, then record its peak RSS. While it
+/// runs, the lease shrinks to the slots it uses (see [`usage`]), never below
+/// the slots its memory takes.
 fn run_scheduled(
     args: &[OsString],
     marker: Option<String>,
@@ -391,8 +395,20 @@ fn run_scheduled(
         Err(error) => return run_failed(&args[0], &error),
     };
     signals::forward_to(child.id());
-    let status = child.wait();
-    drop(lease);
+    let status = match lease {
+        Some(mut lease) => {
+            lease.name_holder(&Path::new(&args[0]).to_string_lossy());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                usage::wait(&mut child, lease, want)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                child.wait()
+            }
+        }
+        None => child.wait(),
+    };
     scheduler::record_test_rss(cache_dir, key);
     match status {
         Ok(status) => finish(exit_disposition(status.code(), signals::of(&status))),

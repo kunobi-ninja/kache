@@ -1737,7 +1737,11 @@ fn report_run(config: &Config, out: &std::path::Path, record: bool) {
     .unwrap();
 }
 
-/// Every file under `dir` with its contents.
+/// Every file under `dir` with its contents. The index's wal-index
+/// (`index.db-shm`) counts only as present: it is SQLite's shared memory,
+/// which every connection rewrites when it opens the index, and it holds no
+/// data. Writers keep it (and the WAL) after they close, so a read-only open
+/// finds them.
 fn tree_contents(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -1747,7 +1751,12 @@ fn tree_contents(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
             if path.is_dir() {
                 pending.push(path);
             } else {
-                let body = std::fs::read(&path).unwrap();
+                let wal_index = path.extension().is_some_and(|ext| ext == "db-shm");
+                let body = if wal_index {
+                    Vec::new()
+                } else {
+                    std::fs::read(&path).unwrap()
+                };
                 files.push((path, body));
             }
         }

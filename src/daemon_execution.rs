@@ -1,6 +1,7 @@
 //! Compiler tasks reuse the daemon process. Preparation owns every resource
 //! before Commit, and never starts compiler work.
 
+use super::execution_policy::{WORKER_STOP_GRACE, stop_worker, unfinished_reply};
 use super::*;
 use crate::invocation::{
     InvocationContext, InvocationEnv, io::InvocationIo, process::Cancellation,
@@ -324,6 +325,17 @@ async fn write_reply(stream: &TokioStream, reply: &ExecutionReply) -> Result<()>
     Ok(())
 }
 
+/// Return a committed invocation that has not started to the client.
+async fn hand_back(stream: &TokioStream, reason: &str) -> Result<()> {
+    write_reply(
+        stream,
+        &ExecutionReply::Fallback {
+            reason: reason.into(),
+        },
+    )
+    .await
+}
+
 pub(super) async fn handle(
     stream: &TokioStream,
     reader: &mut BufReader<&TokioStream>,
@@ -409,7 +421,9 @@ pub(super) async fn handle(
     write_reply(stream, &ExecutionReply::Prepared).await?;
     let mut frame = Vec::new();
     let commit = tokio::select! {
-        _ = lifecycle.draining() => return Ok(()),
+        // The client may already have written Commit: closing silently would
+        // turn this shutdown into its build failure. Nothing has run.
+        _ = lifecycle.draining() => return hand_back(stream, "daemon is shutting down").await,
         result = tokio::time::timeout(PREPARE_TIMEOUT, read_bounded_line(reader, &mut frame)) => result??,
     }.context("compiler client disconnected before Commit")?;
     let _: ExecutionCommand = serde_json::from_str(&commit)?;
@@ -421,6 +435,7 @@ pub(super) async fn handle(
     // cannot stand in for it. Its compiler children inherit the same.
     context.priority = Some(crate::scheduler::Priority::of_process(client_pid));
     write_reply(stream, &ExecutionReply::Accepted).await?;
+    let streams = context.io.clone();
     let activity = daemon.request_clock.begin_activity();
 
     let mut worker = tokio::task::spawn_blocking(move || {
@@ -434,23 +449,48 @@ pub(super) async fn handle(
         }
     });
     let mut unexpected = [0; 1];
-    let result = tokio::select! {
-        result = &mut worker => result,
-        disconnected = reader.read(&mut unexpected) => {
-            let _ = disconnected;
-            cancellation.cancel();
-            let _ = worker.await;
-            return Ok(());
+    let mut drain_seen = false;
+    let result = loop {
+        tokio::select! {
+            result = &mut worker => break result,
+            disconnected = reader.read(&mut unexpected) => {
+                let _ = disconnected;
+                cancellation.cancel();
+                let _ = worker.await;
+                return Ok(());
+            }
+            _ = lifecycle.draining(), if !drain_seen => {
+                drain_seen = true;
+                if streams.output_written() {
+                    // Cargo is already reading this compile: let it finish
+                    // under the drain deadline.
+                    continue;
+                }
+                let stopped = stop_worker(&cancellation, &mut worker, WORKER_STOP_GRACE).await;
+                let reply = unfinished_reply(
+                    streams.output_written(),
+                    stopped,
+                    false,
+                    "daemon is shutting down".into(),
+                );
+                return write_reply(stream, &reply).await;
+            }
         }
     };
+    // A pipeline error or panic before any output is a cache failure, not a
+    // build failure: the client compiles locally. The worker has finished, so
+    // its children are reaped.
     let reply = match result {
         Ok(Ok(exit_code)) => ExecutionReply::Complete { exit_code },
-        Ok(Err(error)) => ExecutionReply::Failed {
-            message: format!("{error:#}"),
-        },
-        Err(error) => ExecutionReply::Failed {
-            message: format!("compiler worker failed: {error}"),
-        },
+        Ok(Err(error)) => {
+            unfinished_reply(streams.output_written(), true, false, format!("{error:#}"))
+        }
+        Err(error) => unfinished_reply(
+            streams.output_written(),
+            true,
+            false,
+            format!("compiler worker failed: {error}"),
+        ),
     };
     write_reply(stream, &reply).await
 }
@@ -1120,10 +1160,27 @@ mod tests {
                     .iter()
                     .map(|(original, received)| (*original, received.as_raw_fd()))
                     .collect::<std::collections::BTreeMap<_, _>>();
-                let (_client, control) = UnixStream::pair().unwrap();
+                let (client_end, control) = UnixStream::pair().unwrap();
                 let (_pipes_client, pipes) = UnixDatagram::pair().unwrap();
                 descriptors.extend([OwnedFd::from(control), OwnedFd::from(pipes)]);
                 descriptors.extend(jobs.into_iter().map(|(_, file)| file));
+                // The client side of the broker: the worker announces each
+                // output stream before its first byte and waits for the answer.
+                let announcements = std::thread::spawn(move || {
+                    use kache_protocol::execution::unix::{Command, Reply};
+                    use std::io::BufRead;
+                    let mut answers = client_end.try_clone().unwrap();
+                    let mut seen = 0;
+                    for line in std::io::BufReader::new(client_end).lines() {
+                        let command: Command = serde_json::from_str(&line.unwrap()).unwrap();
+                        assert_eq!(command, Command::OutputStarted);
+                        seen += 1;
+                        let mut reply = serde_json::to_vec(&Reply::Done).unwrap();
+                        reply.push(b'\n');
+                        answers.write_all(&reply).unwrap();
+                    }
+                    seen
+                });
                 let (_, _, _, received) = prepared
                     .receive(descriptors, Cancellation::default(), daemon.clone())
                     .unwrap();
@@ -1180,6 +1237,9 @@ mod tests {
                         assert!(writer.is_none());
                     }
                 }
+                assert!(received.io.output_written());
+                drop(received);
+                assert_eq!(announcements.join().unwrap(), count - 1);
                 assert_eq!(std::fs::read(&paths[0]).unwrap(), b"");
                 assert_eq!(std::fs::read(&paths[1]).unwrap(), b"stdout");
                 assert_eq!(std::fs::read(&paths[2]).unwrap(), b"stderr");
@@ -1554,8 +1614,50 @@ mod tests {
         let (stream, _) = prepare_client(&socket, request(&args, &context), &context).await;
         lifecycle.start_drain();
         assert!(server.await.unwrap()[0].is_ok());
+        // The client may already have written Commit: it is told to compile
+        // locally instead of finding the connection closed.
+        let line = read_bounded_line(&mut BufReader::new(&stream), &mut Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str(&line).unwrap(),
+                ExecutionReply::Fallback { .. }
+            ),
+            "{line}"
+        );
         drop(stream);
         assert!(!path.join("record").exists());
+        assert_eq!(daemon.execution_workers.available_permits(), 1);
+    }
+
+    #[test]
+    fn draining_after_output_lets_the_compiler_finish() {
+        isolated_test("draining_after_output_lets_the_compiler_finish");
+    }
+
+    #[tokio::test]
+    #[ignore = "bounded subprocess fixture"]
+    async fn fixture_draining_after_output_lets_the_compiler_finish() {
+        if !native_execution_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (socket, daemon, lifecycle, server) = server(root.path(), 1, 1).await;
+        let (args, context) = fixture(root.path(), "drained");
+        let path = context.env.cwd().unwrap().to_owned();
+        let client = tokio::task::spawn_blocking(move || {
+            crate::invocation::execution::try_execute(&socket, &args, &context)
+        });
+        ready(&path.join("ready")).await;
+        // Cargo has read this compile's output: the drain must not cut it.
+        lifecycle.start_drain();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!client.is_finished());
+        std::fs::write(path.join("release"), b"go").unwrap();
+        assert_eq!(client.await.unwrap().unwrap(), Some(7));
+        assert!(server.await.unwrap()[0].is_ok());
         assert_eq!(daemon.execution_workers.available_permits(), 1);
     }
 

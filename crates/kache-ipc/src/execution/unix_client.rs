@@ -197,6 +197,7 @@ impl Client {
                 drop(self.children.remove(&id).ok_or_else(unknown)?);
                 Reply::Done
             }
+            Command::OutputStarted => Reply::Done,
         };
         Ok((reply, Vec::new()))
     }

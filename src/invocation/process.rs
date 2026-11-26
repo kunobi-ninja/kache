@@ -46,7 +46,7 @@ impl Cancellation {
         });
     }
 
-    fn check(&self) -> io::Result<()> {
+    pub(crate) fn check(&self) -> io::Result<()> {
         if self.0.cancelled.load(Ordering::Acquire) {
             Err(cancelled())
         } else {

@@ -659,8 +659,13 @@ fn run_main() -> Result<()> {
     let entry = kache_client::engine_entry(std::env::args_os().collect(), VERSION)?;
     // Windows frontends already try the daemon, bootstrap it, then retry before
     // forwarding here. A local fallback must not repeat that startup budget.
+    // A daemon that took the invocation and gave it back is not asked again.
+    let handed_back = std::env::var_os(kache_ipc::execution::HANDED_BACK_ENV).is_some();
+    // SAFETY: no thread has been spawned yet. The marker belongs to this
+    // invocation only, never to the compiler and build scripts it runs.
+    unsafe { std::env::remove_var(kache_ipc::execution::HANDED_BACK_ENV) };
     let daemon_attempted =
-        frontend_completed_daemon_attempt(cfg!(windows), entry.frontend.is_some());
+        frontend_completed_daemon_attempt(cfg!(windows), entry.frontend.is_some(), handed_back);
     opcounts::mark_process_start_at(entry.started_at);
     if let Some(frontend) = entry.frontend {
         platform::set_frontend_image(frontend)?;
@@ -1648,8 +1653,8 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
     std::process::exit(exit);
 }
 
-fn frontend_completed_daemon_attempt(windows: bool, forwarded: bool) -> bool {
-    windows && forwarded
+fn frontend_completed_daemon_attempt(windows: bool, forwarded: bool, handed_back: bool) -> bool {
+    (windows && forwarded) || handed_back
 }
 
 /// A frontend's unsuccessful handoff permits local execution, not another
@@ -1666,7 +1671,9 @@ fn try_wrapper_daemon(
     }
     match execute()? {
         kache_ipc::execution::Attempt::Complete(exit) => return Ok(Some(exit)),
-        kache_ipc::execution::Attempt::LocalOnly => return Ok(None),
+        kache_ipc::execution::Attempt::LocalOnly | kache_ipc::execution::Attempt::HandedBack => {
+            return Ok(None);
+        }
         kache_ipc::execution::Attempt::Recoverable => {}
     }
     match start() {
@@ -2025,16 +2032,19 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn frontend_provenance_keeps_each_platforms_startup_policy() {
-        for (windows, forwarded, expected_attempts, expected_starts) in [
-            (true, true, 0, 0),
-            (true, false, 2, 1),
-            (false, true, 2, 1),
-            (false, false, 2, 1),
+        for (windows, forwarded, handed_back, expected_attempts, expected_starts) in [
+            (true, true, false, 0, 0),
+            (true, false, false, 2, 1),
+            (false, true, false, 2, 1),
+            (false, false, false, 2, 1),
+            // A frontend whose daemon gave the invocation back.
+            (false, true, true, 0, 0),
+            (true, false, true, 0, 0),
         ] {
             let mut attempts = 0;
             let mut starts = 0;
             let result = try_wrapper_daemon(
-                frontend_completed_daemon_attempt(windows, forwarded),
+                frontend_completed_daemon_attempt(windows, forwarded, handed_back),
                 || {
                     attempts += 1;
                     Ok(kache_ipc::execution::Attempt::Recoverable)
@@ -2116,18 +2126,23 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn local_only_handoff_does_not_start_or_retry_the_daemon() {
-        let mut attempts = 0;
-        let result = try_wrapper_daemon(
-            false,
-            || {
-                attempts += 1;
-                Ok(kache_ipc::execution::Attempt::LocalOnly)
-            },
-            || panic!("startup cannot change this invocation's security context"),
-        )
-        .unwrap();
-        assert_eq!(result, None);
-        assert_eq!(attempts, 1);
+        for attempt in [
+            kache_ipc::execution::Attempt::LocalOnly,
+            kache_ipc::execution::Attempt::HandedBack,
+        ] {
+            let mut attempts = 0;
+            let result = try_wrapper_daemon(
+                false,
+                || {
+                    attempts += 1;
+                    Ok(attempt)
+                },
+                || panic!("startup cannot change {attempt:?}"),
+            )
+            .unwrap();
+            assert_eq!(result, None);
+            assert_eq!(attempts, 1);
+        }
     }
 
     #[cfg(any(unix, windows))]

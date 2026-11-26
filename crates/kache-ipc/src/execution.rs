@@ -34,6 +34,10 @@ use unix::Connection;
 #[cfg(unix)]
 mod unix_client;
 
+/// Set on the engine a frontend starts after [`Attempt::HandedBack`], so the
+/// engine compiles at once instead of asking the daemon again.
+pub const HANDED_BACK_ENV: &str = "KACHE_EXECUTION_HANDED_BACK";
+
 /// A failed handoff can require local execution without a daemon restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
@@ -42,13 +46,17 @@ pub enum Attempt {
     Recoverable,
     /// This invocation cannot delegate under its current process context.
     LocalOnly,
+    /// The daemon took the invocation and gave it back before anything was
+    /// shown. Compile locally now: starting or asking that daemon again would
+    /// only repeat what made it give up.
+    HandedBack,
 }
 
 impl Attempt {
     pub fn exit_code(self) -> Option<i32> {
         match self {
             Self::Complete(exit) => Some(exit),
-            Self::Recoverable | Self::LocalOnly => None,
+            Self::Recoverable | Self::LocalOnly | Self::HandedBack => None,
         }
     }
 
@@ -99,9 +107,21 @@ pub fn try_execute_with_recovery(
     finish_attempt(result, committed)
 }
 
-fn finish_attempt(result: Result<i32>, committed: bool) -> Result<Attempt> {
+/// What a completed exchange reports.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Exit(i32),
+    /// The daemon handed the invocation back ([`ExecutionReply::Fallback`]).
+    Fallback(String),
+}
+
+fn finish_attempt(result: Result<Outcome>, committed: bool) -> Result<Attempt> {
     match result {
-        Ok(exit) => Ok(Attempt::Complete(exit)),
+        Ok(Outcome::Exit(exit)) => Ok(Attempt::Complete(exit)),
+        Ok(Outcome::Fallback(reason)) => {
+            tracing::debug!(%reason, "daemon handed the compiler invocation back");
+            Ok(Attempt::HandedBack)
+        }
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
             let denied = error.chain().any(|cause| {
@@ -126,7 +146,7 @@ fn exchange(
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
     committed: &mut bool,
-) -> Result<i32> {
+) -> Result<Outcome> {
     #[cfg(unix)]
     let (mut unix_client, broker_files) = if matches!(
         request.channels,
@@ -206,20 +226,26 @@ fn exchange(
     drop(broker_files);
 
     stream.prepare_commit()?;
-    send_commit(&mut &stream, committed).context("sending compiler Commit")?;
+    if let Err(error) = send_commit(&mut &stream, committed) {
+        // A draining daemon hands the invocation back and closes without
+        // reading Commit. Its reply is still readable after the write failed.
+        if let Ok(ExecutionReply::Fallback { reason }) = read_reply(&mut reader) {
+            return Ok(Outcome::Fallback(reason));
+        }
+        return Err(error.context("sending compiler Commit"));
+    }
     #[cfg(windows)]
     stream.commit_written()?;
-    ensure!(
-        matches!(
-            read_reply(&mut reader).context("waiting for compiler acceptance")?,
-            ExecutionReply::Accepted
-        ),
-        "daemon did not acknowledge compiler execution"
-    );
+    match read_reply(&mut reader).context("waiting for compiler acceptance")? {
+        ExecutionReply::Accepted => {}
+        ExecutionReply::Fallback { reason } => return Ok(Outcome::Fallback(reason)),
+        reply => bail!("daemon did not acknowledge compiler execution: {reply:?}"),
+    }
     #[cfg(windows)]
     loop {
         match read_reply(&mut reader)? {
-            ExecutionReply::Complete { exit_code } => return Ok(exit_code),
+            ExecutionReply::Complete { exit_code } => return Ok(Outcome::Exit(exit_code)),
+            ExecutionReply::Fallback { reason } => return Ok(Outcome::Fallback(reason)),
             ExecutionReply::Failed { message } => bail!("{message}"),
             ExecutionReply::WindowsControl { command } => {
                 write_message(&mut &stream, &client.execute_from(command, &stream))?;
@@ -245,7 +271,8 @@ fn exchange(
             continue;
         }
         return match read_reply(&mut reader).context("waiting for compiler completion")? {
-            ExecutionReply::Complete { exit_code } => Ok(exit_code),
+            ExecutionReply::Complete { exit_code } => Ok(Outcome::Exit(exit_code)),
+            ExecutionReply::Fallback { reason } => Ok(Outcome::Fallback(reason)),
             ExecutionReply::Failed { message } => bail!("{message}"),
             reply => bail!("invalid compiler completion: {reply:?}"),
         };
@@ -374,10 +401,34 @@ mod recovery_tests {
             let error = finish_attempt(Err(std::io::Error::from(kind).into()), true).unwrap_err();
             assert!(error.to_string().contains("will not be run again locally"));
         }
-        assert_eq!(finish_attempt(Ok(17), true).unwrap(), Attempt::Complete(17));
+        assert_eq!(
+            finish_attempt(Ok(Outcome::Exit(17)), true).unwrap(),
+            Attempt::Complete(17)
+        );
         assert_eq!(Attempt::Complete(17).exit_code(), Some(17));
         assert_eq!(Attempt::Recoverable.exit_code(), None);
         assert_eq!(Attempt::LocalOnly.exit_code(), None);
+        assert_eq!(Attempt::HandedBack.exit_code(), None);
+    }
+
+    #[test]
+    fn a_handed_back_invocation_compiles_locally_without_recovery() {
+        assert_eq!(
+            finish_attempt(
+                Ok(Outcome::Fallback("daemon is shutting down".into())),
+                true
+            )
+            .unwrap(),
+            Attempt::HandedBack
+        );
+        assert_eq!(
+            Attempt::HandedBack
+                .recover_with(|| panic!(
+                    "the daemon that gave the invocation back is not asked again"
+                ))
+                .unwrap(),
+            None
+        );
     }
 }
 
@@ -536,6 +587,13 @@ mod tests {
         AfterPrepared,
         AfterCommit,
         AfterAccepted,
+        /// The daemon hands the invocation back right after Prepared and
+        /// closes without reading Commit (a drain).
+        FallbackBeforeCommit,
+        /// The daemon answers Commit with Fallback instead of Accepted.
+        FallbackForCommit,
+        /// The daemon accepts, then hands the invocation back.
+        FallbackAfterAccepted,
     }
 
     struct Fixture {
@@ -579,6 +637,10 @@ mod tests {
     }
 
     fn disconnected_exchange(stage: Disconnect) -> Result<Option<i32>> {
+        staged_exchange(stage).map(Attempt::exit_code)
+    }
+
+    fn staged_exchange(stage: Disconnect) -> Result<Attempt> {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("control");
         let listener = UnixListener::bind(&path).unwrap();
@@ -653,6 +715,13 @@ mod tests {
                 if matches!(stage, Disconnect::AfterPrepared) {
                     return;
                 }
+                let fallback = ExecutionReply::Fallback {
+                    reason: "daemon is shutting down".into(),
+                };
+                if matches!(stage, Disconnect::FallbackBeforeCommit) {
+                    write_message(&mut stream, &fallback).unwrap();
+                    return;
+                }
                 line.clear();
                 reader.read_line(&mut line).unwrap();
                 assert_eq!(
@@ -662,9 +731,16 @@ mod tests {
                 if matches!(stage, Disconnect::AfterCommit) {
                     return;
                 }
+                if matches!(stage, Disconnect::FallbackForCommit) {
+                    write_message(&mut stream, &fallback).unwrap();
+                    return;
+                }
                 write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
+                if matches!(stage, Disconnect::FallbackAfterAccepted) {
+                    write_message(&mut stream, &fallback).unwrap();
+                }
             });
-            let result = try_execute(
+            let result = try_execute_with_recovery(
                 &path,
                 &context.request,
                 &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
@@ -692,6 +768,21 @@ mod tests {
             assert!(
                 error.to_string().contains("will not be run again locally"),
                 "{stage:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_daemon_fallback_after_commit_runs_the_compiler_locally() {
+        for stage in [
+            Disconnect::FallbackBeforeCommit,
+            Disconnect::FallbackForCommit,
+            Disconnect::FallbackAfterAccepted,
+        ] {
+            assert_eq!(
+                staged_exchange(stage).unwrap(),
+                Attempt::HandedBack,
+                "{stage:?}"
             );
         }
     }
@@ -941,7 +1032,10 @@ mod windows_tests {
         // A complete peer must expose preparation errors, rather than letting
         // the availability fallback hide them behind the server's timeout.
         let result = if matches!(peer, Peer::Complete | Peer::Workspace) {
-            exchange(&path, &request, &mut false).map(Some)
+            exchange(&path, &request, &mut false).map(|outcome| match outcome {
+                Outcome::Exit(exit) => Some(exit),
+                Outcome::Fallback(_) => None,
+            })
         } else {
             try_execute(&path, &request)
         };

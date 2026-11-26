@@ -20,6 +20,10 @@ pub enum Command {
         id: u64,
     },
     Workspace(Workspace),
+    /// The worker is about to write to the client's own output streams.
+    /// Answered before the first byte is written, so the client knows whether
+    /// Cargo may have read anything if the daemon later goes away.
+    OutputStarted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

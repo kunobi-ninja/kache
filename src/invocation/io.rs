@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone)]
@@ -33,6 +34,14 @@ struct Streams {
 struct Output {
     file: File,
     serial: Mutex<()>,
+    /// Set before the first write: Cargo may have read from this stream.
+    written: AtomicBool,
+    /// The client broker of a delegated request, told before the first
+    /// write so the client knows Cargo may have read something.
+    #[cfg(unix)]
+    announce: std::sync::OnceLock<Weak<super::unix_broker::Broker>>,
+    #[cfg(unix)]
+    announced: std::sync::Once,
 }
 
 impl Output {
@@ -40,7 +49,29 @@ impl Output {
         Arc::new(Self {
             file,
             serial: Mutex::new(()),
+            written: AtomicBool::new(false),
+            #[cfg(unix)]
+            announce: std::sync::OnceLock::new(),
+            #[cfg(unix)]
+            announced: std::sync::Once::new(),
         })
+    }
+
+    fn note_written(&self) {
+        self.written.store(true, Ordering::Release);
+        // Concurrent first writers wait here until the client has heard.
+        #[cfg(unix)]
+        self.announced.call_once(|| {
+            if let Some(broker) = self.announce.get().and_then(Weak::upgrade)
+                && let Err(error) = broker.announce_output()
+            {
+                tracing::debug!("output announcement failed: {error}");
+            }
+        });
+    }
+
+    fn was_written(&self) -> bool {
+        self.written.load(Ordering::Acquire)
     }
 
     fn with_writer<T>(&self, write: impl FnOnce(&mut &File) -> io::Result<T>) -> io::Result<T> {
@@ -52,7 +83,43 @@ impl Output {
     }
 }
 
+impl Streams {
+    fn written(&self) -> bool {
+        self.output.was_written()
+            || self.error.was_written()
+            || self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.was_written())
+    }
+
+    /// A child or another process received the client's own streams.
+    fn hand_out(&self) {
+        self.output.note_written();
+        self.error.note_written();
+        if let Some(terminal) = &self.terminal {
+            terminal.note_written();
+        }
+    }
+}
+
 impl InvocationIo {
+    /// Whether anything may have reached the client's output streams through
+    /// this request: a write, or a child started on those streams. While this
+    /// is false a delegated invocation can still be handed back to the client
+    /// to compile locally without Cargo seeing anything twice.
+    pub(crate) fn output_written(&self) -> bool {
+        match &self.0 {
+            Source::Process => false,
+            Source::Owned(streams) => streams.written(),
+            Source::Borrowed(streams) => streams.upgrade().is_some_and(|streams| streams.written()),
+            #[cfg(unix)]
+            Source::Unix { streams, broker } => streams.written() || broker.output_written(),
+            #[cfg(windows)]
+            Source::Windows(broker) => broker.output_written(),
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn with_unix_broker(
         self,
@@ -61,6 +128,14 @@ impl InvocationIo {
         let streams = self
             .streams()?
             .ok_or_else(|| io::Error::other("native broker requires captured streams"))?;
+        let outputs = [
+            Some(&streams.output),
+            Some(&streams.error),
+            streams.terminal.as_ref(),
+        ];
+        for output in outputs.into_iter().flatten() {
+            let _ = output.announce.set(Arc::downgrade(&broker));
+        }
         Ok(Self(Source::Unix { streams, broker }))
     }
 
@@ -169,6 +244,7 @@ impl InvocationIo {
 
     fn configure(&self, command: &mut Command) -> io::Result<()> {
         if let Some(streams) = self.streams()? {
+            streams.hand_out();
             command.stdin(Stdio::from(streams.input.try_clone()?));
             command.stdout(Stdio::from(streams.output.file.try_clone()?));
             command.stderr(Stdio::from(streams.error.file.try_clone()?));
@@ -244,7 +320,10 @@ impl Write for InvocationWriter {
         match &self.0 {
             Sink::Output => io::stdout().write(bytes),
             Sink::Error => io::stderr().write(bytes),
-            Sink::File(output) => output.with_writer(|file| file.write(bytes)),
+            Sink::File(output) => {
+                output.note_written();
+                output.with_writer(|file| file.write(bytes))
+            }
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
             #[cfg(windows)]
             Sink::Windows(broker, output) => {
@@ -258,7 +337,10 @@ impl Write for InvocationWriter {
         match &self.0 {
             Sink::Output => io::stdout().write_all(bytes),
             Sink::Error => io::stderr().write_all(bytes),
-            Sink::File(output) => output.with_writer(|file| file.write_all(bytes)),
+            Sink::File(output) => {
+                output.note_written();
+                output.with_writer(|file| file.write_all(bytes))
+            }
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
             #[cfg(windows)]
             Sink::Windows(broker, output) => broker.write(*output, bytes),
@@ -269,7 +351,10 @@ impl Write for InvocationWriter {
         match &self.0 {
             Sink::Output => io::stdout().write_fmt(args),
             Sink::Error => io::stderr().write_fmt(args),
-            Sink::File(output) => output.with_writer(|file| file.write_fmt(args)),
+            Sink::File(output) => {
+                output.note_written();
+                output.with_writer(|file| file.write_fmt(args))
+            }
             Sink::Closed => Err(io::ErrorKind::BrokenPipe.into()),
             #[cfg(windows)]
             Sink::Windows(broker, output) => broker.write(*output, args.to_string().as_bytes()),
@@ -375,6 +460,49 @@ mod tests {
             File::create(root.join(format!("{name}.err"))).unwrap(),
             tty.then(|| File::create(root.join(format!("{name}.tty"))).unwrap()),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_latch_records_writes_and_handed_out_streams_but_not_flushes() {
+        let root = tempfile::tempdir().unwrap();
+        let quiet = files(root.path(), "quiet", false);
+        assert!(!quiet.output_written());
+        {
+            let _scope = InvocationIoScope::enter(quiet.clone());
+            stdout().flush().unwrap();
+            stderr().flush().unwrap();
+        }
+        assert!(!quiet.output_written(), "a flush shows Cargo nothing");
+
+        let writes: [fn(); 4] = [
+            || stdout().write_all(b"out").unwrap(),
+            || assert_eq!(stderr().write(b"err").unwrap(), 3),
+            || write!(stderr(), "warning").unwrap(),
+            || terminal().unwrap().write_all(b"tty").unwrap(),
+        ];
+        for (index, write) in writes.into_iter().enumerate() {
+            let written = files(root.path(), &format!("written-{index}"), true);
+            {
+                let _scope = InvocationIoScope::enter(written.clone());
+                write();
+            }
+            assert!(written.output_written(), "write {index}");
+            assert!(
+                written.borrow_for_monitor().output_written(),
+                "write {index}"
+            );
+        }
+
+        let handed = files(root.path(), "handed", false);
+        handed
+            .configure(&mut std::process::Command::new("/bin/true"))
+            .unwrap();
+        assert!(
+            handed.output_written(),
+            "a child on the client streams may write"
+        );
+        assert!(!InvocationIo::process().output_written());
     }
 
     #[cfg(unix)]

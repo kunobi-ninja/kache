@@ -69,6 +69,8 @@ pub(crate) struct Broker {
     channel: Mutex<Channel>,
     env: InvocationEnv,
     jobserver: kache_ipc::jobserver::Descriptors,
+    /// A child was started on the client's own output streams.
+    written: std::sync::atomic::AtomicBool,
 }
 
 struct Channel {
@@ -96,7 +98,22 @@ impl Broker {
             }),
             env,
             jobserver,
+            written: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// See [`crate::invocation::io::InvocationIo::output_written`].
+    pub(crate) fn output_written(&self) -> bool {
+        self.written.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tell the client, before the first byte, that the worker writes to its
+    /// output streams (see [`Command::OutputStarted`]).
+    pub(crate) fn announce_output(&self) -> io::Result<()> {
+        match self.call(Command::OutputStarted, 0)?.0 {
+            Reply::Done => Ok(()),
+            _ => Err(io::Error::other("invalid output announcement response")),
+        }
     }
 
     fn call(&self, command: Command, pipes: usize) -> io::Result<(Reply, Vec<OwnedFd>)> {
@@ -210,6 +227,10 @@ impl Broker {
             cwd: NativeString::capture(cwd.as_os_str()),
             stdio,
         };
+        if stdio.stdout == Stream::Inherit || stdio.stderr == Stream::Inherit {
+            self.written
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let count = [stdio.stdin, stdio.stdout, stdio.stderr]
             .into_iter()
             .filter(|mode| *mode == Stream::Pipe)
@@ -927,6 +948,48 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             peer.join().unwrap();
         });
+    }
+
+    /// Only a child on the client's own stdout or stderr may show Cargo
+    /// output; captured and silenced children do not.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn children_on_the_client_streams_mark_output_written() {
+        for (stdout, stderr, written) in [
+            (Stream::Inherit, Stream::Null, true),
+            (Stream::Null, Stream::Inherit, true),
+            (Stream::Null, Stream::Null, false),
+        ] {
+            let (broker, client) = pair();
+            assert!(!broker.output_written());
+            std::thread::scope(|threads| {
+                let peer = threads.spawn(move || {
+                    let mut reader = BufReader::new(client);
+                    for reply in [Reply::Spawned { id: 1, pid: 2 }, Reply::Done] {
+                        let mut frame = String::new();
+                        reader.read_line(&mut frame).unwrap();
+                        let mut bytes = serde_json::to_vec(&reply).unwrap();
+                        bytes.push(b'\n');
+                        reader.get_mut().write_all(&bytes).unwrap();
+                    }
+                });
+                let mut command = std::process::Command::new("/bin/true");
+                command.current_dir("/");
+                let child = broker
+                    .spawn(
+                        &command,
+                        Stdio {
+                            stdin: Stream::Null,
+                            stdout,
+                            stderr,
+                        },
+                    )
+                    .unwrap();
+                drop(child);
+                peer.join().unwrap();
+            });
+            assert_eq!(broker.output_written(), written, "{stdout:?} {stderr:?}");
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! The daemon owns the pipeline; its frontend owns native Windows launches.
 
+use super::execution_policy::{WORKER_STOP_GRACE, stop_worker, unfinished_reply};
 use super::*;
 use crate::invocation::{
     InvocationContext, InvocationEnv,
@@ -166,6 +167,20 @@ async fn write_reply(stream: &TokioStream, reply: &ExecutionReply) -> Result<()>
     Ok(())
 }
 
+/// Return a committed invocation that has not started to the frontend.
+async fn hand_back(stream: &TokioStream, reason: &str) -> Result<()> {
+    tokio::time::timeout(
+        PREPARE_TIMEOUT,
+        write_reply(
+            stream,
+            &ExecutionReply::Fallback {
+                reason: reason.into(),
+            },
+        ),
+    )
+    .await?
+}
+
 async fn decline(stream: &TokioStream, reason: impl ToString) -> Result<()> {
     tokio::time::timeout(
         PREPARE_TIMEOUT,
@@ -215,7 +230,9 @@ pub(super) async fn handle(
     .await??;
     let mut frame = Vec::new();
     let commit = tokio::select! {
-        _ = lifecycle.draining() => return Ok(()),
+        // The frontend may already have written Commit: closing silently
+        // would turn this shutdown into its build failure. Nothing has run.
+        _ = lifecycle.draining() => return hand_back(stream, "daemon is shutting down").await,
         line = tokio::time::timeout(PREPARE_TIMEOUT, read_bounded_line(reader, &mut frame)) => line??,
     }.context("compiler frontend disconnected before Commit")?;
     anyhow::ensure!(
@@ -255,6 +272,10 @@ pub(super) async fn handle(
         cancellation: Some(cancellation.clone()),
         priority: Some(priority),
     };
+    // Children and target-directory writes of an untrusted pipeline belong
+    // to the frontend, which stops them when it takes the invocation back.
+    let client_owns_effects = !trusted_pipeline;
+    let streams = context.io.clone();
     let activity = daemon.request_clock.begin_activity();
     let mut worker = tokio::task::spawn_blocking(move || {
         let _activity = activity;
@@ -269,6 +290,7 @@ pub(super) async fn handle(
         }
     });
     let mut unexpected = [0u8; 1];
+    let mut drain_seen = false;
     let result = loop {
         let call = tokio::select! {
             biased;
@@ -279,6 +301,24 @@ pub(super) async fn handle(
                 cancellation.cancel();
                 let _ = worker.await;
                 return Ok(());
+            }
+            _ = lifecycle.draining(), if !drain_seen => {
+                drain_seen = true;
+                if streams.output_written() {
+                    // Cargo is already reading this compile: let it finish
+                    // under the drain deadline.
+                    continue;
+                }
+                drop(calls);
+                drop(finished);
+                let stopped = stop_worker(&cancellation, &mut worker, WORKER_STOP_GRACE).await;
+                let reply = unfinished_reply(
+                    streams.output_written(),
+                    stopped,
+                    client_owns_effects,
+                    "daemon is shutting down".into(),
+                );
+                return write_reply(stream, &reply).await;
             }
             // Reap completed owners before admitting another native spawn.
             Some(id) = finished.recv() => Call {
@@ -296,14 +336,22 @@ pub(super) async fn handle(
             return Err(error);
         }
     };
+    // A pipeline error or panic before any output is a cache failure, not a
+    // build failure: the frontend compiles locally.
     let reply = match result {
         Ok(Ok(exit_code)) => ExecutionReply::Complete { exit_code },
-        Ok(Err(error)) => ExecutionReply::Failed {
-            message: format!("{error:#}"),
-        },
-        Err(error) => ExecutionReply::Failed {
-            message: format!("compiler worker failed: {error}"),
-        },
+        Ok(Err(error)) => unfinished_reply(
+            streams.output_written(),
+            true,
+            client_owns_effects,
+            format!("{error:#}"),
+        ),
+        Err(error) => unfinished_reply(
+            streams.output_written(),
+            true,
+            client_owns_effects,
+            format!("compiler worker failed: {error}"),
+        ),
     };
     write_reply(stream, &reply).await
 }

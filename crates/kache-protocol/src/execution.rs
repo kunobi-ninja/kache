@@ -8,7 +8,9 @@ pub mod windows;
 pub mod workspace;
 
 /// Version 2 requires client-owned restores on every supported platform.
-pub const EXECUTION_VERSION: u32 = 2;
+/// Version 3 adds [`ExecutionReply::Fallback`]: after Commit, the daemon can
+/// hand an invocation back to the client while nothing has been shown.
+pub const EXECUTION_VERSION: u32 = 3;
 
 /// Native strings retain Unix bytes or Windows UTF-16, including values that
 /// cannot be represented by a Rust String. A receiver rejects a foreign encoding.
@@ -178,6 +180,13 @@ pub enum ExecutionReply {
     Failed {
         message: String,
     },
+    /// The daemon gave the invocation up after Commit before anything reached
+    /// the client's output streams, and nothing it started can still act on
+    /// the client's behalf. The client runs the compiler locally, as after
+    /// `Declined`: a drain or a pipeline error must not fail the build.
+    Fallback {
+        reason: String,
+    },
     /// Windows launches native children in the client's security/console context.
     WindowsControl {
         command: windows::Command,
@@ -261,7 +270,7 @@ mod tests {
     fn execution_diagnostics_reject_legacy_and_foreign_protocols() {
         let mut status: super::ExecutionStatus = serde_json::from_str(r#"{"eligible":true,"client_trust_enabled":false,"daemon_trust_enabled":false,"detail":"old daemon"}"#).unwrap();
         assert!(!status.compatible());
-        for (version, compatible) in [(0, false), (1, false), (2, true), (3, false)] {
+        for (version, compatible) in [(0, false), (2, false), (3, true), (4, false)] {
             status.protocol_version = version;
             assert_eq!(status.compatible(), compatible);
         }

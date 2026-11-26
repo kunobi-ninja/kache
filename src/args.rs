@@ -200,6 +200,21 @@ fn expand_rustc_argfiles(
     Ok(Some(expander.expanded))
 }
 
+/// How the key of a unit whose lints are all capped at `allow` stands in for
+/// the diagnostic and lint flags it leaves out
+/// ([`RustcArgs::capped_presentation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CappedPresentation<'a> {
+    /// What rustc emits apart from rendered text; keyed in place of the
+    /// diagnostic flags.
+    pub emission: String,
+    /// `--check-cfg` tokens in argv order; still keyed.
+    pub kept_outcome_flags: Vec<&'a str>,
+    /// Lint level tokens the cap makes irrelevant, in argv order. With
+    /// [`RustcArgs::diagnostic_flags`] they decide how emitted text renders.
+    pub dropped_lint_flags: Vec<&'a str>,
+}
+
 /// Parsed rustc invocation arguments relevant to caching.
 #[derive(Debug, Clone, Default)]
 pub struct RustcArgs {
@@ -765,6 +780,138 @@ impl RustcArgs {
         self.diagnostic_flags
             .iter()
             .filter(move |flag| !omit_width || !flag.starts_with("--diagnostic-width="))
+    }
+
+    /// The key shape of a unit whose lints are all capped at `allow`, or `None`
+    /// when the unit keeps every diagnostic and lint flag in its key.
+    ///
+    /// Under exactly one `--cap-lints allow` and no `--force-warn`, rustc caps
+    /// every lint at `allow` (`--force-warn` alone escapes the cap) and emits
+    /// no warning. The lint levels then decide nothing: no lint can fail the
+    /// compile or print a warning, and rustc keeps lint levels out of the
+    /// crate hash (`TRACKED_NO_CRATE_HASH`), so the artifacts are the same.
+    /// How diagnostics are rendered (`--error-format` human, short or json,
+    /// `--color`, `--diagnostic-width`, `--json=diagnostic-short` and
+    /// `diagnostic-rendered-ansi`) is `UNTRACKED` in rustc and changes no
+    /// artifact either. What rustc emits besides rendered text stays keyed as
+    /// the emission class: JSON or not, and the `artifacts` and
+    /// `future-incompat` requests, which rustc tracks and which decide what
+    /// lines a hit must replay.
+    ///
+    /// Text that is still emitted (a future-incompat report) does depend on
+    /// the dropped flags, so the wrapper stores it under a key derived from
+    /// them (`wrapper::rustc_diagnostics`).
+    ///
+    /// Anything rustc might reject, or any option whose output Kache does not
+    /// model, makes this `None`: a cached success must never stand in for a
+    /// command line rustc refuses. `-W help` prints the lint list instead of
+    /// compiling, so a `help` level is excluded too.
+    pub(crate) fn capped_presentation(&self) -> Option<CappedPresentation<'_>> {
+        let (kept_outcome_flags, dropped_lint_flags) = self.capped_lint_flags()?;
+        Some(CappedPresentation {
+            emission: self.diagnostic_emission_class()?,
+            kept_outcome_flags,
+            dropped_lint_flags,
+        })
+    }
+
+    /// Split the outcome flags of a unit with exactly one `--cap-lints allow`
+    /// and no `--force-warn` into those that stay keyed (`--check-cfg`, whose
+    /// malformed values are hard errors) and the lint levels the cap makes
+    /// irrelevant, both in argv order. `None` for any other unit.
+    fn capped_lint_flags(&self) -> Option<(Vec<&str>, Vec<&str>)> {
+        let mut caps = 0usize;
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        let mut flags = self.outcome_lint_flags.iter().map(String::as_str);
+        while let Some(flag) = flags.next() {
+            let (name, value, tokens) = if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&flag) {
+                // A missing value is a rustc argument error.
+                let value = flags.next()?;
+                (flag, value, vec![flag, value])
+            } else {
+                let prefix = OUTCOME_LINT_ATTACHED_PREFIXES
+                    .iter()
+                    .find(|prefix| flag.starts_with(**prefix))?;
+                (
+                    prefix.trim_end_matches('='),
+                    &flag[prefix.len()..],
+                    vec![flag],
+                )
+            };
+            match name {
+                "--force-warn" => return None,
+                "--check-cfg" => kept.extend(tokens),
+                "--cap-lints" if value == "allow" => {
+                    caps += 1;
+                    dropped.extend(tokens);
+                }
+                "--cap-lints" => return None,
+                _ if value.is_empty() || value == "help" => return None,
+                _ => dropped.extend(tokens),
+            }
+        }
+        (caps == 1).then_some((kept, dropped))
+    }
+
+    /// What rustc emits apart from rendered diagnostic text, for a command line
+    /// rustc accepts and whose every presentation option Kache models; `None`
+    /// otherwise. A repeated single-valued option, `--json` without
+    /// `--error-format=json` or with `--color`, and unknown or unstable values
+    /// (`pretty-json`, `human-unicode`, `diagnostic-unicode`, `timings`,
+    /// `unused-externs`) all stay `None`.
+    fn diagnostic_emission_class(&self) -> Option<String> {
+        let mut error_format = None;
+        let mut color = None;
+        let mut width = None;
+        let mut json = false;
+        let mut artifacts = false;
+        let mut future_incompat = false;
+        for flag in &self.diagnostic_flags {
+            let (name, value) = flag.split_once('=')?;
+            match name {
+                "--error-format" => {
+                    if error_format.replace(value).is_some()
+                        || !matches!(value, "human" | "short" | "json")
+                    {
+                        return None;
+                    }
+                }
+                "--color" => {
+                    if color.replace(value).is_some()
+                        || !matches!(value, "auto" | "always" | "never")
+                    {
+                        return None;
+                    }
+                }
+                "--diagnostic-width" => {
+                    if width.replace(value).is_some()
+                        || !value.parse::<u16>().is_ok_and(|columns| columns > 0)
+                    {
+                        return None;
+                    }
+                }
+                _ => {
+                    // `--json`, the only other diagnostic flag.
+                    json = true;
+                    for option in value.split(',') {
+                        match option {
+                            "diagnostic-short" | "diagnostic-rendered-ansi" => {}
+                            "artifacts" => artifacts = true,
+                            "future-incompat" => future_incompat = true,
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+        }
+        let json_format = error_format == Some("json");
+        if json && (!json_format || color.is_some()) {
+            return None;
+        }
+        Some(format!(
+            "json={json_format};artifacts={artifacts};future-incompat={future_incompat}"
+        ))
     }
 
     /// Original compact argv. This differs from [`Self::all_args`] only after
@@ -3224,5 +3371,190 @@ mod tests {
         assert!(!parse(&["--json=artifacts"]).reports_artifacts());
         assert!(!parse(&["--error-format=human", "--json=artifacts"]).reports_artifacts());
         assert!(!parse(&[]).reports_artifacts());
+    }
+
+    /// The emission class, kept and dropped outcome flags of a capped unit.
+    type Capped = (String, Vec<String>, Vec<String>);
+
+    fn capped_presentation(extra: &[&str]) -> Option<Capped> {
+        let mut argv = vec!["rustc", "--crate-name", "x", "src/lib.rs"];
+        argv.extend_from_slice(extra);
+        let parsed =
+            RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap();
+        let owned = |flags: &[&str]| flags.iter().map(|flag| flag.to_string()).collect();
+        parsed.capped_presentation().map(|capped| {
+            (
+                capped.emission,
+                owned(&capped.kept_outcome_flags),
+                owned(&capped.dropped_lint_flags),
+            )
+        })
+    }
+
+    #[test]
+    fn capped_presentation_models_cargo_dependency_units() {
+        const CARGO: &str = "--json=diagnostic-rendered-ansi,artifacts,future-incompat";
+        for cap in [&["--cap-lints", "allow"][..], &["--cap-lints=allow"][..]] {
+            let with = |extra: &[&str]| {
+                let mut flags = cap.to_vec();
+                flags.extend_from_slice(extra);
+                capped_presentation(&flags)
+            };
+            let (emission, kept, dropped) = with(&["--error-format=json", CARGO]).unwrap();
+            assert_eq!(emission, "json=true;artifacts=true;future-incompat=true");
+            assert!(kept.is_empty());
+            assert_eq!(dropped, cap);
+            let (emission, _, _) = with(&[]).unwrap();
+            assert_eq!(emission, "json=false;artifacts=false;future-incompat=false");
+            for text in [
+                &["--error-format=human"][..],
+                &["--error-format", "short"][..],
+                &["--color=always", "--diagnostic-width=80"][..],
+                &["--color", "never", "--diagnostic-width", "65535"][..],
+                &["--color=auto", "--diagnostic-width=1"][..],
+            ] {
+                assert_eq!(with(text).unwrap().0, emission, "{text:?}");
+            }
+            let (emission, _, _) = with(&["--error-format=json"]).unwrap();
+            assert_eq!(emission, "json=true;artifacts=false;future-incompat=false");
+            let (emission, _, _) = with(&["--error-format=json", "--json=artifacts"]).unwrap();
+            assert_eq!(emission, "json=true;artifacts=true;future-incompat=false");
+            let (emission, _, _) = with(&[
+                "--error-format=json",
+                "--json=diagnostic-short",
+                "--json",
+                "future-incompat",
+            ])
+            .unwrap();
+            assert_eq!(emission, "json=true;artifacts=false;future-incompat=true");
+            let (emission, _, _) = with(&[
+                "--error-format=json",
+                "--color=always",
+                "--diagnostic-width=80",
+            ])
+            .unwrap();
+            assert_eq!(emission, "json=true;artifacts=false;future-incompat=false");
+        }
+    }
+
+    #[test]
+    fn capped_presentation_keeps_check_cfg_and_drops_every_lint_level() {
+        let (_, kept, dropped) = capped_presentation(&[
+            "--check-cfg",
+            "cfg(feature)",
+            "--cap-lints=allow",
+            "-Awarnings",
+        ])
+        .unwrap();
+        assert_eq!(kept, ["--check-cfg", "cfg(feature)"]);
+        assert_eq!(dropped, ["--cap-lints=allow", "-Awarnings"]);
+        let (_, kept, dropped) = capped_presentation(&[
+            "-D",
+            "warnings",
+            "--check-cfg=cfg(a)",
+            "--cap-lints",
+            "allow",
+            "--warn=unused",
+            "-Fmissing_docs",
+            "--allow",
+            "dead_code",
+        ])
+        .unwrap();
+        assert_eq!(kept, ["--check-cfg=cfg(a)"]);
+        assert_eq!(
+            dropped,
+            [
+                "-D",
+                "warnings",
+                "--cap-lints",
+                "allow",
+                "--warn=unused",
+                "-Fmissing_docs",
+                "--allow",
+                "dead_code",
+            ]
+        );
+    }
+
+    #[test]
+    fn capped_presentation_is_none_unless_every_flag_is_modeled() {
+        for flags in [
+            // No cap, another cap, a repeated cap, a cap without a value.
+            &[][..],
+            &["-Awarnings"][..],
+            &["--cap-lints=warn"][..],
+            &["--cap-lints", "Allow"][..],
+            &["--cap-lints=allow", "--cap-lints=allow"][..],
+            &["--cap-lints=allow", "--cap-lints", "warn"][..],
+            &["--cap-lints=warn", "--cap-lints=allow"][..],
+            &["--cap-lints=allow", "--cap-lints"][..],
+            &["--check-cfg", "--cap-lints=allow"][..],
+            // `--force-warn` escapes the cap.
+            &["--cap-lints=allow", "--force-warn=unused"][..],
+            &["--force-warn", "unused", "--cap-lints=allow"][..],
+            &[
+                "--cap-lints=allow",
+                "--force-warn=unused_crate_dependencies",
+                "--error-format=json",
+                "--json=unused-externs-silent",
+            ][..],
+            // `-W help` lists lints instead of compiling; a level without a value.
+            &["--cap-lints=allow", "-W", "help"][..],
+            &["--cap-lints=allow", "-Whelp"][..],
+            &["--cap-lints=allow", "--warn=help"][..],
+            &["--cap-lints=allow", "-A", ""][..],
+            &["--cap-lints=allow", "-D"][..],
+            // Presentation rustc rejects or Kache does not model.
+            &["--cap-lints=allow", "--error-format=pretty-json"][..],
+            &["--cap-lints=allow", "--error-format=human-unicode"][..],
+            &[
+                "--cap-lints=allow",
+                "--error-format=json",
+                "--error-format=json",
+            ][..],
+            &["--cap-lints=allow", "--error-format"][..],
+            &["--cap-lints=allow", "--json=artifacts"][..],
+            &[
+                "--cap-lints=allow",
+                "--error-format=human",
+                "--json=artifacts",
+            ][..],
+            &[
+                "--cap-lints=allow",
+                "--error-format=json",
+                "--json=artifacts",
+                "--color=never",
+            ][..],
+            &["--cap-lints=allow", "--error-format=json", "--json=timings"][..],
+            &[
+                "--cap-lints=allow",
+                "--error-format=json",
+                "--json=unused-externs",
+            ][..],
+            &[
+                "--cap-lints=allow",
+                "--error-format=json",
+                "--json=unused-externs-silent",
+            ][..],
+            &[
+                "--cap-lints=allow",
+                "--error-format=json",
+                "--json=diagnostic-unicode",
+            ][..],
+            &["--cap-lints=allow", "--error-format=json", "--json="][..],
+            &["--cap-lints=allow", "--error-format=json", "--json"][..],
+            &["--cap-lints=allow", "--color=sometimes"][..],
+            &["--cap-lints=allow", "--color=never", "--color=never"][..],
+            &["--cap-lints=allow", "--diagnostic-width=0"][..],
+            &["--cap-lints=allow", "--diagnostic-width=65536"][..],
+            &["--cap-lints=allow", "--diagnostic-width=wide"][..],
+            &[
+                "--cap-lints=allow",
+                "--diagnostic-width=80",
+                "--diagnostic-width=80",
+            ][..],
+        ] {
+            assert_eq!(capped_presentation(flags), None, "{flags:?}");
+        }
     }
 }

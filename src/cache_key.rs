@@ -4931,10 +4931,31 @@ fn compute_key_into(
 
     // Always fold the version tag, including when no format was explicit:
     // older clients stored arbitrary diagnostic formats under that default key.
+    //
+    // A unit whose lints are all capped at `allow` (Cargo's dependencies) keys
+    // only what rustc emits besides rendered text, and none of its lint levels:
+    // see `RustcArgs::capped_presentation` for why neither changes its
+    // artifacts or its outcome. Its own tag keeps these entries apart from
+    // every key an older client computes. Rendered text is stored under a key
+    // derived from the dropped flags (`wrapper::rustc_diagnostics`).
+    let capped = args.capped_presentation();
     hasher.set_group("diagnostics");
-    fold_field(&mut hasher, b"diagnostics.v1:", b"");
-    for flag in args.cache_key_diagnostic_flags() {
-        fold_field(&mut hasher, b"diagnostic_arg:", flag.as_bytes());
+    if let Some(capped) = &capped {
+        fold_field(
+            &mut hasher,
+            b"diagnostics.capped.v1:",
+            capped.emission.as_bytes(),
+        );
+        tracing::trace!(
+            "[key:{}] diagnostics_capped:{}",
+            crate_name,
+            capped.emission
+        );
+    } else {
+        fold_field(&mut hasher, b"diagnostics.v1:", b"");
+        for flag in args.cache_key_diagnostic_flags() {
+            fold_field(&mut hasher, b"diagnostic_arg:", flag.as_bytes());
+        }
     }
 
     // Outcome-affecting lint configuration (-A/-W/-D/-F, their long forms,
@@ -4955,7 +4976,18 @@ fn compute_key_into(
     // not an outcome — and erase order, which rustc itself treats as
     // meaningful (the last level named for a lint wins). A stable argv order
     // for a given build config means keeping it costs no hits.
-    if !args.outcome_lint_flags.is_empty() {
+    if let Some(capped) = &capped {
+        // Every lint is `allow` under the single cap, so the levels named
+        // around it decide nothing; `--check-cfg` stays, as rustc rejects a
+        // malformed one.
+        hasher.set_group("outcome_lints");
+        fold_field(&mut hasher, b"outcome_lint.capped.v1:", b"allow");
+        for tok in &capped.kept_outcome_flags {
+            check_for_path_leak(tok, "outcome_lint");
+            fold_field(&mut hasher, b"outcome_lint.v1:", tok.as_bytes());
+            tracing::trace!("[key:{}] outcome_lint:{}", crate_name, tok);
+        }
+    } else if !args.outcome_lint_flags.is_empty() {
         hasher.set_group("outcome_lints");
         for tok in &args.outcome_lint_flags {
             // Fold raw: check-cfg accepts arbitrary string values, including

@@ -13358,11 +13358,111 @@ fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
                 "{width}"
             );
         }
-        for flag in ["--color=always", "--error-format=json", "--json=artifacts"] {
+        for flag in ["--error-format=json", "--json=artifacts"] {
             let other = key(&[flag]);
             assert_ne!(base, other, "{flag}");
             assert_eq!(other, key(&[flag, "--diagnostic-width=80"]), "{flag}");
         }
+    }
+}
+
+#[test]
+fn capped_units_key_only_their_emission_class_and_check_cfg() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
+    const CARGO: [&str; 2] = [
+        "--error-format=json",
+        "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+    ];
+    let key = |flags: &[&str]| key_of_flags(&diagnostic_flag_base(&source, flags));
+    let with = |base: &[&str], extra: &[&str]| {
+        let mut flags = base.to_vec();
+        flags.extend_from_slice(extra);
+        key(&flags)
+    };
+    let capped = with(&CARGO, &["--cap-lints", "allow"]);
+    // `cargo build`, `--message-format short`, an IDE asking for JSON and a
+    // profile with `-D warnings` in its rustflags.
+    for same in [
+        &["--cap-lints=allow"][..],
+        &["--json=diagnostic-short", "--cap-lints=allow"][..],
+        &["--cap-lints=allow", "-D", "warnings"][..],
+        &[
+            "-Awarnings",
+            "--cap-lints=allow",
+            "--warn=unused",
+            "-Fmissing_docs",
+        ][..],
+        &["--cap-lints=allow", "--diagnostic-width=80"][..],
+    ] {
+        assert_eq!(capped, with(&CARGO, same), "{same:?}");
+    }
+    let text = key(&["--cap-lints=allow"]);
+    for same in [
+        &["--cap-lints=allow", "--error-format=human"][..],
+        &[
+            "--error-format=short",
+            "--color=always",
+            "--cap-lints=allow",
+        ][..],
+        &["--cap-lints=allow", "--color", "never", "-Dwarnings"][..],
+    ] {
+        assert_eq!(text, key(same), "{same:?}");
+    }
+    let checked = with(&CARGO, &["--cap-lints=allow", "--check-cfg=cfg(a)"]);
+    assert_ne!(capped, checked);
+    assert_eq!(
+        checked,
+        with(
+            &CARGO,
+            &["--check-cfg=cfg(a)", "-Dwarnings", "--cap-lints=allow"]
+        )
+    );
+    assert_ne!(
+        checked,
+        with(&CARGO, &["--cap-lints=allow", "--check-cfg=cfg(b)"])
+    );
+    // Every emission class keys apart, and apart from uncapped units.
+    let mut classes = vec![
+        capped.clone(),
+        text.clone(),
+        key(&["--error-format=json", "--cap-lints=allow"]),
+        key(&[
+            "--error-format=json",
+            "--json=artifacts",
+            "--cap-lints=allow",
+        ]),
+        key(&[
+            "--error-format=json",
+            "--json=future-incompat",
+            "--cap-lints=allow",
+        ]),
+        with(&CARGO, &[]),
+        key(&[]),
+    ];
+    classes.sort();
+    classes.dedup();
+    assert_eq!(classes.len(), 7, "{classes:?}");
+    // A unit the cap does not fully model keeps every flag keyed.
+    for keyed in [
+        &["--cap-lints=allow", "--force-warn=unused"][..],
+        &["--cap-lints=allow", "--cap-lints=allow"][..],
+        &["--cap-lints=warn"][..],
+        &["--cap-lints=allow", "-W", "help"][..],
+        &["--cap-lints=allow", "--json=timings"][..],
+    ] {
+        assert_ne!(
+            with(&CARGO, keyed),
+            with(&CARGO, &[keyed, &["-Dwarnings"][..]].concat()),
+            "{keyed:?}"
+        );
+        assert_ne!(
+            with(&CARGO, keyed),
+            with(&CARGO, &[keyed, &["--json=diagnostic-short"][..]].concat()),
+            "{keyed:?}"
+        );
     }
 }
 

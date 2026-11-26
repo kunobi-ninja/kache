@@ -272,6 +272,8 @@ pub struct Config {
     /// It needs `s3:ListBucket`. Off, readers need only `s3:GetObject`. Set
     /// via `KACHE_REMOTE_KEY_LISTING` or `[cache] remote_key_listing`.
     pub remote_key_listing: bool,
+    /// Read a publisher's packed-prefetch catalog pointer by exact key.
+    pub prefetch_catalog_head: bool,
     /// Periodic remote key-cache refresh interval in seconds (default 60).
     /// `0` performs one initial population and disables periodic refreshes.
     /// Ignored when `prefetch_enabled` is false. Set via
@@ -1144,6 +1146,7 @@ pub struct CacheFileConfig {
     pub s3_concurrency: Option<u32>,
     pub prefetch_enabled: Option<bool>,
     pub remote_key_listing: Option<bool>,
+    pub prefetch_catalog_head: Option<bool>,
     pub remote_key_cache_refresh_secs: Option<u64>,
     pub prefetch_max_keys: Option<u64>,
     #[serde(default, deserialize_with = "crate::size::optional_text")]
@@ -2105,6 +2108,12 @@ impl Config {
                     .and_then(|cache| cache.prefetch_enabled)
                     .unwrap_or(DEFAULT_PREFETCH_ENABLED)
             });
+        let prefetch_catalog_head = file_config
+            .as_ref()
+            .ok()
+            .and_then(|config| config.cache.as_ref())
+            .and_then(|cache| cache.prefetch_catalog_head)
+            .unwrap_or(false);
         // Resolved against the remote below when neither sets it.
         let explicit_remote_key_listing =
             env_or_ignored_for(invocation, "KACHE_REMOTE_KEY_LISTING", ignore_env)
@@ -2810,6 +2819,7 @@ impl Config {
             s3_concurrency,
             prefetch_enabled,
             remote_key_listing,
+            prefetch_catalog_head,
             remote_key_cache_refresh_secs,
             prefetch_max_keys,
             prefetch_max_bytes,

@@ -1279,7 +1279,9 @@ fn remote_key_listing_is_off_unless_the_file_or_env_turns_it_on() {
     std::fs::write(&config_path, "[cache]\n").unwrap();
     {
         let _listing = NamedEnvGuard::remove("KACHE_REMOTE_KEY_LISTING");
-        assert!(!Config::load().unwrap().remote_key_listing);
+        let config = Config::load().unwrap();
+        assert!(!config.remote_key_listing);
+        assert!(!config.prefetch_catalog_head);
     }
 
     std::fs::write(&config_path, "[cache]\nremote_key_listing = true\n").unwrap();
@@ -1292,7 +1294,12 @@ fn remote_key_listing_is_off_unless_the_file_or_env_turns_it_on() {
         assert!(!Config::load().unwrap().remote_key_listing);
     }
 
-    std::fs::write(&config_path, "[cache]\nremote_key_listing = false\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "[cache]\nremote_key_listing = false\nprefetch_catalog_head = true\n",
+    )
+    .unwrap();
+    assert!(Config::load().unwrap().prefetch_catalog_head);
     {
         let _listing = NamedEnvGuard::set("KACHE_REMOTE_KEY_LISTING", "1");
         assert!(Config::load().unwrap().remote_key_listing);
@@ -3462,6 +3469,7 @@ fn test_file_config_roundtrip() {
             s3_concurrency: Some(8),
             prefetch_enabled: None,
             remote_key_listing: None,
+            prefetch_catalog_head: None,
             remote_key_cache_refresh_secs: None,
             prefetch_max_keys: None,
             prefetch_max_bytes: None,
@@ -4140,6 +4148,7 @@ fn test_config_store_dir() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -4243,6 +4252,7 @@ fn test_config_index_db_path() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -4342,6 +4352,7 @@ fn test_config_event_log_path() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -4508,6 +4519,7 @@ fn test_config_socket_path() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -5346,6 +5358,7 @@ fn test_save_and_load_file_config() {
             s3_concurrency: None,
             prefetch_enabled: None,
             remote_key_listing: None,
+            prefetch_catalog_head: None,
             remote_key_cache_refresh_secs: None,
             prefetch_max_keys: None,
             prefetch_max_bytes: None,

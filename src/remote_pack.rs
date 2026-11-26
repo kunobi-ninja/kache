@@ -26,6 +26,7 @@ const PACK_MAGIC: &[u8; 8] = b"KACHPK01";
 const PACK_HEADER_BYTES: usize = PACK_MAGIC.len() + size_of::<u64>();
 const MAX_PACK_INDEX_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CATALOG_HEAD_BYTES: u64 = 256;
 const MAX_PACK_ENTRIES: usize = 65_536;
 const MAX_CATALOG_PACKS: usize = 16_384;
 const MAX_SELECTOR_TEXT_BYTES: usize = 4096;
@@ -136,6 +137,14 @@ pub(crate) struct CatalogObjectRef {
     pub digest: String,
 }
 
+/// A publisher writes this pointer last, after both the packs and catalog.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogHead {
+    created_at_ms: u64,
+    digest: String,
+}
+
 /// Stable selector for one manifest/build namespace and Cargo.lock shard set.
 /// Raw user-controlled text is length-prefixed into BLAKE3 and never used as an
 /// object-key path component.
@@ -190,6 +199,25 @@ pub(crate) fn catalog_prefix(prefix: &str, selector: &str) -> Result<String> {
         prefix,
         &format!("v4/prefetch/catalogs/{selector}/"),
     ))
+}
+
+pub(crate) fn catalog_head_key(prefix: &str, selector: &str) -> Result<String> {
+    Ok(format!("{}head.json", catalog_prefix(prefix, selector)?))
+}
+
+pub(crate) fn decode_catalog_head(
+    prefix: &str,
+    selector: &str,
+    bytes: &[u8],
+) -> Result<CatalogObjectRef> {
+    let head: CatalogHead =
+        serde_json::from_slice(bytes).context("parsing packed-prefetch catalog pointer")?;
+    let object_key = catalog_object_key(prefix, selector, head.created_at_ms, &head.digest)?;
+    Ok(CatalogObjectRef {
+        object_key,
+        created_at_ms: head.created_at_ms,
+        digest: head.digest,
+    })
 }
 
 pub(crate) fn catalog_object_key(

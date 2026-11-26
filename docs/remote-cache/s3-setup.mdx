@@ -132,6 +132,34 @@ Buffered downloads also share a 512 MiB memory budget per Kache process, includi
 
 Kache never deletes remote objects. Bound the bucket with a lifecycle rule; [Bound a remote](/docs/remote-cache/bounding) lists the prefixes and ages.
 
+## Read published prefetch packs with GET access
+
+If your publisher already writes v4 prefetch packs, set the reader's config:
+
+```toml
+[cache]
+prefetch_catalog_head = true
+remote_key_listing = false
+```
+
+Grant `s3:GetObject` on the configured prefix's `v4/prefetch/` objects as well
+as the existing manifest and entry prefixes. The publisher uploads the packs
+and immutable catalog first. It then writes `head.json` beside that catalog
+at `{prefix}/v4/prefetch/catalogs/{selector}/head.json`:
+
+```json
+{"created_at_ms": 1760000000000, "digest": "<64 lowercase BLAKE3 hex digits>"}
+```
+
+Use the millisecond timestamp and digest from the immutable catalog's filename.
+Serialize updates to each selector's pointer so a late publisher cannot replace
+it with an older one. Kache derives the catalog key under the same selector
+and verifies its digest and build context before downloading the packs.
+When discovery fails, Kache fetches entries individually.
+
+This lookup follows the direct index discovery in
+[Blaze #2520](https://github.com/indexable-inc/blaze/pull/2520).
+
 ## macOS LAN access
 
 macOS may request Local Network permission when an installed LaunchAgent reaches a LAN endpoint. If only the service gets `No route to host`, reinstall it with the current binary and check System Settings > Privacy & Security > Local Network.

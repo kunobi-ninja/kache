@@ -1879,6 +1879,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
@@ -8709,12 +8710,21 @@ async fn packed_receipt_survives_cancellation_after_body_before_import() {
     );
 }
 
-/// Entries imported from a seeded pack catalog. The catalog is found by
-/// a LIST, so none are imported when listing is off or was refused.
-async fn packed_imports_with_listing(listing: bool, refused: bool) -> usize {
+enum TestCatalogHead {
+    Missing,
+    Valid,
+    Invalid,
+}
+
+async fn packed_imports_with_discovery(
+    listing: bool,
+    refused: bool,
+    head: Option<TestCatalogHead>,
+) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
     config.remote_key_listing = listing;
+    config.prefetch_catalog_head = head.is_some();
     config.remote = Some(test_remote_config());
     let remote = config.remote.clone().unwrap();
     let backend = test_remote_backend();
@@ -8742,6 +8752,28 @@ async fn packed_imports_with_listing(listing: bool, refused: bool) -> usize {
         None,
     )
     .await;
+    if let Some(head) = head {
+        use TestCatalogHead::{Invalid, Missing, Valid};
+        let prefix = crate::remote_pack::catalog_prefix("prefix", &context.selector).unwrap();
+        let key = format!("prefix/v4/prefetch/catalogs/{}/head.json", context.selector);
+        let objects = backend.list(&prefix).await.unwrap();
+        let reference =
+            crate::remote_pack::latest_catalog_object("prefix", &context.selector, &objects)
+                .unwrap()
+                .unwrap();
+        let digest = match head {
+            Missing => None,
+            Valid => Some(reference.digest.as_str()),
+            Invalid => Some("../../other-prefix"),
+        };
+        if let Some(digest) = digest {
+            let pointer = serde_json::json!({
+                "created_at_ms": reference.created_at_ms,
+                "digest": digest,
+            });
+            put_test_object(&backend, &key, &serde_json::to_vec(&pointer).unwrap()).await;
+        }
+    }
     let candidates = vec![(key.clone(), "serde".to_string(), daemon.entry_dir_for(&key))];
     let v3 = daemon.v3_remote().await.unwrap();
     daemon
@@ -8762,10 +8794,27 @@ async fn packed_imports_with_listing(listing: bool, refused: bool) -> usize {
 }
 
 #[tokio::test]
-async fn packed_prefetch_skips_the_catalog_when_listing_is_off_or_refused() {
-    assert_eq!(packed_imports_with_listing(true, false).await, 1);
-    assert_eq!(packed_imports_with_listing(false, false).await, 0);
-    assert_eq!(packed_imports_with_listing(true, true).await, 0);
+async fn packed_prefetch_discovers_catalogs_by_list_or_exact_key() {
+    assert_eq!(packed_imports_with_discovery(true, false, None).await, 1);
+    assert_eq!(packed_imports_with_discovery(false, false, None).await, 0);
+    assert_eq!(packed_imports_with_discovery(true, true, None).await, 0);
+    use TestCatalogHead::{Invalid, Missing, Valid};
+    assert_eq!(
+        packed_imports_with_discovery(false, false, Some(Valid)).await,
+        1
+    );
+    assert_eq!(
+        packed_imports_with_discovery(true, true, Some(Valid)).await,
+        1
+    );
+    assert_eq!(
+        packed_imports_with_discovery(false, false, Some(Missing)).await,
+        0
+    );
+    assert_eq!(
+        packed_imports_with_discovery(false, false, Some(Invalid)).await,
+        0
+    );
 }
 
 #[test]

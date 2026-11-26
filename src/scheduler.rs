@@ -844,6 +844,9 @@ impl Scheduler {
         saved_for_tests: u32,
     ) -> u32 {
         let (ceiling, level) = pressure::ceiling_observed(&self.root, self.pool_size);
+        request
+            .recovering
+            .set(level == Some(pressure::Level::Calm) && ceiling < self.pool_size);
         let mut evidence = request.evidence.borrow_mut();
         evidence.pool_slots = Some(self.pool_size);
         evidence.pressure_ceiling = Some(
@@ -934,7 +937,9 @@ impl Scheduler {
                 return None;
             }
             // A need of zero would never be met.
-            let asking = need(waited, request.saved_for_tests.get()).max(1);
+            let slots_needed = |saved| need(waited, saved).max(1);
+            let saved = request.saved_for_tests.get();
+            let asking = slots_needed(saved);
             if let Some(notice) =
                 self.test_wait_notice(request.kind, start.elapsed(), asking, &mut noticed)
             {
@@ -946,6 +951,18 @@ impl Scheduler {
                 WaitStep::Busy(busy) if !busy.is_empty() => {
                     let armed = permit_wait::arm(&self.root, &busy);
                     let seen = permit_wait::snapshot(&self.root);
+                    // A full-pool request is already the most restrictive
+                    // choice. Avoid publishing the same critical pressure
+                    // again unless recovery or a test reservation needs a recheck.
+                    let saved_now = request.saved_for_tests.get();
+                    let asking = if asking == self.pool_size
+                        && !request.recovering.get()
+                        && saved_now == saved
+                    {
+                        asking
+                    } else {
+                        slots_needed(saved_now)
+                    };
                     match self.collect_permits(request, asking, ticket, start) {
                         WaitStep::Ready(slots) => return Some(slots),
                         WaitStep::Stop => return None,
@@ -1411,6 +1428,9 @@ struct Request {
     kind: queue::Kind,
     spare: bool,
     rank: u64,
+    priority: Priority,
+    /// The latest compile admission scan saw calm pressure and a reduced ceiling.
+    recovering: std::cell::Cell<bool>,
     /// What the last scan found the queue saving for a waiting test.
     saved_for_tests: std::cell::Cell<u32>,
     evidence: std::cell::RefCell<SchedulerDecision>,
@@ -1424,6 +1444,8 @@ impl Request {
             kind,
             spare,
             rank: queue::rank(SystemTime::now(), priority),
+            priority,
+            recovering: std::cell::Cell::new(false),
             saved_for_tests: std::cell::Cell::new(0),
             evidence: std::cell::RefCell::new(SchedulerDecision {
                 phase: SchedulerPhase::Capacity,
@@ -1432,6 +1454,12 @@ impl Request {
             }),
             queued_at: std::cell::Cell::new(None),
         }
+    }
+
+    fn can_advance(&self, waited: Duration) -> bool {
+        self.recovering.get()
+            && self.priority == Priority::Foreground
+            && waited >= Duration::from_secs(2)
     }
 
     fn available(&self, free: u32) {
@@ -1536,14 +1564,27 @@ impl Scheduler {
         ticket: &mut Option<queue::Ticket>,
     ) -> Result<Collect> {
         let now = SystemTime::now();
+        let mut queued = queue::list(&self.root)?;
         let me = match ticket {
             Some(ticket) => {
-                ticket.refresh(need, now)?;
+                let waited = request
+                    .queued_at
+                    .get()
+                    .map(|at| at.elapsed())
+                    .unwrap_or_default();
+                let rank = if request.can_advance(waited) {
+                    ticket.recovery_rank(request.rank, &queued, queue::pass_budget(self.pool_size))
+                } else {
+                    request.rank
+                };
+                if ticket.refresh(rank, need, now)? {
+                    // The planner inserts the refreshed entry in rank order.
+                    queued.retain(|entry| entry.id != ticket.entry().id);
+                }
                 ticket.entry().clone()
             }
-            None => queue::Entry::new(request.rank, request.kind, need),
+            None => queue::Entry::new(request.rank, request.kind, need, request.priority),
         };
-        let queued = queue::list(&self.root)?;
         let collect = if queued.iter().all(|entry| entry.id == me.id) {
             self.collect_unordered(request, need)?
         } else {
@@ -3773,6 +3814,99 @@ mod tests {
     }
 
     #[test]
+    fn steady_critical_pressure_is_observed_once_per_wait_iteration() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 2);
+        let _pressure = PinnedPressure::new(Level::Critical);
+        let _enabled = pressure::InvocationPressureScope::enter(true);
+        let _holder = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        let request = Request::new(queue::Kind::Compile, false);
+        let scans = std::cell::RefCell::new(Vec::new());
+        let slots = scheduler
+            .wait_for_request(
+                &request,
+                |waited, saved| {
+                    scans.borrow_mut().push(waited);
+                    // Release the pressure cap on the next ordinary observation.
+                    if waited {
+                        pressure::force(Some(Level::Calm));
+                        fs::write(scheduler.root.join("pressure"), "1 0 0").unwrap();
+                    }
+                    scheduler.observed_need(&request, 1, waited, saved)
+                },
+                &mut None,
+            )
+            .unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(*scans.borrow(), [false, true]);
+    }
+
+    #[test]
+    fn armed_rescan_rechecks_other_asks_and_changed_test_reservations() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 3);
+        let _held = scheduler.take_free_slots(1..3);
+        // A lower ask, an unsatisfiable ask, and a full ask whose
+        // previously saved test slot is no longer reserved.
+        for (first_ask, saved_before) in [(2, 0), (4, 0), (3, 1)] {
+            let request = Request::new(queue::Kind::Compile, false);
+            request.saved_for_tests.set(saved_before);
+            let first = std::cell::Cell::new(true);
+            let slots = scheduler
+                .wait_for_request(
+                    &request,
+                    |waited, saved| {
+                        assert!(!waited, "the second scan must happen before parking");
+                        if first.replace(false) {
+                            assert_eq!(saved, saved_before);
+                            first_ask
+                        } else {
+                            assert_eq!(saved, 0);
+                            0 // The minimum request is one on either scan.
+                        }
+                    },
+                    &mut None,
+                )
+                .unwrap();
+            assert_eq!(slots.len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_armed_rescan_can_use_a_recovered_pressure_slot_before_parking() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _pressure = pressure::InvocationPressureScope::enter(true);
+        let _pin = PinnedPressure::new(Level::Calm);
+        let _held = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        let record = scheduler.root.join("pressure");
+        fs::write(&record, "1 0 -").unwrap();
+        let request = Request::new(queue::Kind::Compile, false);
+        reset_permit_scans();
+        let slots = scheduler
+            .wait_for_request(
+                &request,
+                |waited, saved| {
+                    let need = scheduler.observed_need(&request, 1, waited, saved);
+                    // Complete the calm interval after the first observation.
+                    // The holder keeps slot 0 throughout, so no release wakes us.
+                    fs::write(&record, "1 0 0").unwrap();
+                    need
+                },
+                &mut None,
+            )
+            .unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, 1);
+        assert_eq!(permit_scans(), 2);
+        assert_eq!(PERMIT_POLL_MAX.with(|max| max.get()), Duration::ZERO);
+    }
+
+    #[test]
     fn an_unsatisfiable_permit_need_retries_on_the_short_poll() {
         let dir = temp_cache();
         let scheduler = Scheduler::open_with(
@@ -5482,6 +5616,112 @@ mod tests {
     }
 
     #[test]
+    fn a_foreground_compile_that_has_waited_can_pass_background_work_during_recovery() {
+        let cache = temp_cache();
+        let scheduler = test_scheduler(cache.path(), 4);
+        let _enabled = pressure::InvocationPressureScope::enter(true);
+        let _priority = InvocationPriorityScope::enter(Some(Priority::Foreground));
+        let _pressure = PinnedPressure::new(Level::Critical);
+        let request = Request::new(queue::Kind::Compile, false);
+        let held = scheduler.take_free_slots(0..4);
+        // The regular rank already includes a ten-second foreground head start.
+        let blocking = hold_ticket(
+            cache.path(),
+            request.rank - 3_000,
+            queue::Kind::Compile,
+            4,
+            SystemTime::now(),
+        );
+        let mut ticket = None;
+        let scan = |ticket: &mut Option<queue::Ticket>| {
+            let need = scheduler.observed_need(&request, 1, ticket.is_some(), 0);
+            scheduler
+                .admit(&request, need, ticket, Duration::from_secs(1))
+                .unwrap()
+        };
+        assert!(matches!(scan(&mut ticket), Collect::Busy(_)));
+        let initial = ticket.as_ref().unwrap().entry().clone();
+        queue::record_pass(&scheduler.root, &initial).unwrap();
+        pressure::force(Some(Level::Calm));
+        assert!(matches!(scan(&mut ticket), Collect::Busy(_)));
+        assert!(!request.can_advance(Duration::from_millis(1_999)));
+        assert!(request.can_advance(Duration::from_secs(2)));
+        assert_eq!(ticket.as_ref().unwrap().entry().rank, initial.rank);
+
+        request
+            .queued_at
+            .set(Some(Instant::now() - Duration::from_secs(4)));
+        assert!(
+            matches!(scan(&mut ticket), Collect::Busy(_)),
+            "all slots are still held"
+        );
+        let promoted = ticket.as_ref().unwrap().entry().clone();
+        assert_eq!(promoted.rank, initial.rank - 10_000);
+        assert_eq!(promoted.id, initial.id);
+        assert_eq!(queue::passes(&scheduler.root, &promoted), 1);
+        assert_eq!(queued(cache.path())[0], promoted);
+
+        for level in [Level::Unknown, Level::Warning, Level::Critical] {
+            pressure::force(Some(level));
+            assert!(matches!(scan(&mut ticket), Collect::Busy(_)));
+            assert_eq!(ticket.as_ref().unwrap().entry().rank, initial.rank);
+        }
+        pressure::force(Some(Level::Calm));
+        {
+            let _off = pressure::InvocationPressureScope::enter(false);
+            assert!(matches!(scan(&mut ticket), Collect::Busy(_)));
+            assert_eq!(ticket.as_ref().unwrap().entry().rank, initial.rank);
+        }
+        drop(held);
+        assert!(
+            matches!(scan(&mut ticket), Collect::Ready(_)),
+            "foreground goes first when slots are released"
+        );
+        assert_eq!(queued(cache.path()), [blocking.entry().clone()]);
+    }
+
+    #[test]
+    fn a_refresh_keeps_other_waiters_ahead_of_the_request() {
+        let cache = temp_cache();
+        let scheduler = test_scheduler(cache.path(), 2);
+        let mut held = scheduler.take_free_slots(0..2);
+        let ahead = hold_ticket(cache.path(), 0, queue::Kind::Compile, 1, SystemTime::now());
+        let request = Request::new(queue::Kind::Compile, false);
+        let mut ticket = None;
+        let scan = |need, ticket: &mut Option<queue::Ticket>| {
+            scheduler
+                .admit(&request, need, ticket, Duration::from_secs(1))
+                .unwrap()
+        };
+
+        assert!(matches!(scan(2, &mut ticket), Collect::Busy(_)));
+        // Only one slot is free, and the older request can take it.
+        drop(held.pop().unwrap());
+        assert!(matches!(scan(1, &mut ticket), Collect::Busy(_)));
+        drop(ahead);
+        assert!(matches!(scan(1, &mut ticket), Collect::Ready(_)));
+    }
+
+    #[test]
+    fn an_aged_background_compile_or_a_full_pool_uses_the_ordinary_rank() {
+        let cache = temp_cache();
+        let scheduler = test_scheduler(cache.path(), 4);
+        let _enabled = pressure::InvocationPressureScope::enter(true);
+        let _pressure = PinnedPressure::new(Level::Calm);
+        let _priority = InvocationPriorityScope::enter(Some(Priority::Foreground));
+        let foreground = Request::new(queue::Kind::Compile, false);
+        scheduler.observed_need(&foreground, 1, true, 0);
+        assert!(!foreground.can_advance(Duration::from_secs(4)));
+        let _priority = InvocationPriorityScope::enter(Some(Priority::Background));
+        let background = Request::new(queue::Kind::Compile, false);
+        pressure::force(Some(Level::Critical));
+        scheduler.observed_need(&background, 1, true, 0);
+        pressure::force(Some(Level::Calm));
+        scheduler.observed_need(&background, 1, true, 0);
+        assert!(!background.can_advance(Duration::from_secs(4)));
+    }
+
+    #[test]
     fn a_foreground_request_goes_before_earlier_background_ones() {
         let dir = temp_cache();
         let cache = dir.path();
@@ -5587,7 +5827,7 @@ mod tests {
     ) -> queue::Ticket {
         queue::Ticket::create(
             &scheduler_root(cache),
-            queue::Entry::new(rank, kind, need),
+            queue::Entry::new(rank, kind, need, Priority::Background),
             seen,
         )
         .unwrap()

@@ -267,17 +267,22 @@ pub(crate) fn shared(root: &Path, pool: u32, level: Level, now: u64) -> u32 {
         return after.slots(pool, now);
     }
     match StoreLock::try_acquire(&root.join("pressure.lock")) {
-        Ok(Some(_lock)) => {
-            let after = stored(&path).observe(level, pool, now);
-            if let Err(error) =
-                crate::atomic::atomic_replace_deferrable(&path, after.render().as_bytes(), false)
-            {
-                tracing::debug!("memory pressure ceiling not stored: {error:#}");
-            }
-            after.slots(pool, now)
-        }
+        Ok(Some(_lock)) => update_under_lock(&path, pool, level, now),
         Ok(None) | Err(_) => after.slots(pool, now),
     }
+}
+
+/// Another wrapper may have persisted this observation since our first read.
+fn update_under_lock(path: &Path, pool: u32, level: Level, now: u64) -> u32 {
+    let before = stored(path);
+    let after = before.observe(level, pool, now);
+    if after != before
+        && let Err(error) =
+            crate::atomic::atomic_replace_deferrable(path, after.render().as_bytes(), false)
+    {
+        tracing::debug!("memory pressure ceiling not stored: {error:#}");
+    }
+    after.slots(pool, now)
 }
 
 fn stored(path: &Path) -> Ceiling {
@@ -645,6 +650,54 @@ mod tests {
         std::fs::write(&record, "garbage").unwrap();
         assert_eq!(shared(root, 8, Level::Warning, T + 4), 4, "garbage is open");
         assert_eq!(read(), format!("4 {} -", T + 4));
+    }
+
+    #[test]
+    fn the_locked_recheck_keeps_a_concurrent_writers_identical_record() {
+        use std::fs::{self, OpenOptions};
+        use std::time::UNIX_EPOCH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("pressure");
+        let initial = stored(&path);
+        // Both wrappers read an open ceiling before one stores the observation.
+        assert_ne!(initial.observe(Level::Critical, 8, T), initial);
+        assert_eq!(shared(root, 8, Level::Critical, T), 1);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        drop(file);
+
+        let lock = StoreLock::try_acquire(&root.join("pressure.lock"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(update_under_lock(&path, 16, Level::Critical, T), 1);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("1 {T} -"));
+        drop(lock);
+
+        // A later critical reading still records its exact cut timestamp.
+        assert_eq!(shared(root, 8, Level::Critical, T + 1), 1);
+        assert_eq!(stored(&path), ceiling(1, T + 1, None));
+    }
+
+    #[test]
+    fn a_late_calm_sample_keeps_the_last_critical_cut_across_pools() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(shared(root, 1, Level::Critical, T), 1);
+        let last_cut = T + SETTLE_MS;
+        assert_eq!(shared(root, 1, Level::Critical, last_cut), 1);
+        // The calm reading reached the shared store a millisecond out of order.
+        assert_eq!(shared(root, 4, Level::Calm, last_cut - 1), 1);
+        assert_eq!(
+            shared(root, 20, Level::Warning, last_cut - 1 + SETTLE_MS),
+            6,
+            "the critical cut is still inside the warning cooldown"
+        );
+        assert_eq!(shared(root, 4, Level::Warning, last_cut + SETTLE_MS), 2);
     }
 
     #[test]

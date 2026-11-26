@@ -234,17 +234,19 @@ impl<'a> RemoteLayout<'a> {
         decoder
             .window_log_max(MAX_ZSTD_WINDOW_LOG)
             .context("setting v3 zstd window-log cap")?;
-        let extracted = extract_entry_pack_until(
-            decoder,
-            entry_dir,
-            deadline,
-            Some(ExpectedEntryBinding {
-                cache_key,
-                crate_name,
-                meta_digest: None,
-            }),
-            self.remote.restore_max_size,
-        )?;
+        let extracted = off_runtime_workers(|| {
+            extract_entry_pack_until(
+                decoder,
+                entry_dir,
+                deadline,
+                Some(ExpectedEntryBinding {
+                    cache_key,
+                    crate_name,
+                    meta_digest: None,
+                }),
+                self.remote.restore_max_size,
+            )
+        })?;
         let extract_ms = extract_start.elapsed().as_millis() as u64;
 
         Ok(DownloadResult {
@@ -492,17 +494,19 @@ pub(crate) fn extract_verified_prefetch_entry(
     decoder
         .window_log_max(MAX_ZSTD_WINDOW_LOG)
         .context("setting packed-prefetch zstd window-log cap")?;
-    let extracted = extract_entry_pack_until(
-        decoder,
-        entry_dir,
-        deadline,
-        Some(ExpectedEntryBinding {
-            cache_key,
-            crate_name,
-            meta_digest: Some(meta_digest),
-        }),
-        max_bytes,
-    )?;
+    let extracted = off_runtime_workers(|| {
+        extract_entry_pack_until(
+            decoder,
+            entry_dir,
+            deadline,
+            Some(ExpectedEntryBinding {
+                cache_key,
+                crate_name,
+                meta_digest: Some(meta_digest),
+            }),
+            max_bytes,
+        )
+    })?;
     Ok(VerifiedPackEntry {
         restored: VerifiedRestoredEntry {
             cache_key: cache_key.to_string(),
@@ -511,6 +515,20 @@ pub(crate) fn extract_verified_prefetch_entry(
         original_bytes: extracted.original_bytes,
         extract_ms: extract_start.elapsed().as_millis() as u64,
     })
+}
+
+/// Run synchronous decompression and extraction from async code without
+/// parking a runtime worker. On the daemon's multi-thread runtime the worker
+/// hands its other tasks (deadline timers, status requests, the accept loop)
+/// to the rest of the pool first. Elsewhere (current-thread runtimes, plain
+/// threads) the closure runs in place.
+fn off_runtime_workers<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
 }
 
 fn v3_manifest_key(prefix: &str, cache_key: &str, crate_name: &str) -> String {
@@ -930,6 +948,46 @@ fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_worker_tests {
+    use super::off_runtime_workers;
+    use std::time::Duration;
+
+    /// On the daemon's multi-thread runtime, extraction releases its worker:
+    /// a task queued on that same single worker still runs meanwhile.
+    #[test]
+    fn extraction_hands_the_runtime_worker_to_other_tasks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let ran_beside = runtime.block_on(async {
+            tokio::spawn(async {
+                let (started, observed) = std::sync::mpsc::channel();
+                let beside = tokio::spawn(async move {
+                    let _ = started.send(());
+                });
+                let ran =
+                    off_runtime_workers(|| observed.recv_timeout(Duration::from_secs(10)).is_ok());
+                beside.await.unwrap();
+                ran
+            })
+            .await
+            .unwrap()
+        });
+        assert!(ran_beside, "the queued task waited for the extraction");
+    }
+
+    /// A current-thread runtime cannot lend its only thread: run in place.
+    #[tokio::test]
+    async fn extraction_runs_in_place_on_a_current_thread_runtime() {
+        let caller = std::thread::current().id();
+        assert_eq!(off_runtime_workers(|| std::thread::current().id()), caller);
+        assert_eq!(off_runtime_workers(|| 7), 7);
+    }
 }
 
 #[cfg(test)]

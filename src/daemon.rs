@@ -251,6 +251,9 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 /// Read timeout for a stats round trip. Generous: a busy daemon may be holding
 /// the index lock when the request lands.
 const STATS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `Stats` waits for the shared store before it reads through a
+/// private connection. Well inside [`STATS_READ_TIMEOUT`].
+const STATS_STORE_WAIT: Duration = Duration::from_millis(500);
 /// Read timeout for the stats refetch after a stale daemon was replaced. The
 /// replacement has just bound its socket and has nothing queued, so a slow
 /// answer here means something is wrong rather than busy.
@@ -2545,6 +2548,34 @@ impl Daemon {
             .ok_or_else(|| anyhow::anyhow!("daemon store failed to initialize"))
     }
 
+    /// Run `f` on the shared store, or on a private connection to the same
+    /// index once another holder has kept the shared one for `wait` (a GC
+    /// sweep, an import on a slow disk, a wedged worker). Status readers use
+    /// this so a stuck holder can never make `kache stats` hang with it; the
+    /// index is WAL-mode, so a second reader sees every committed row.
+    pub(crate) fn with_store_or_private<T>(
+        &self,
+        wait: Duration,
+        f: impl FnOnce(&Store) -> Result<T>,
+    ) -> Result<T> {
+        let shared = self.store_lock()?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match shared.try_lock() {
+                Ok(guard) => return f(&guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("daemon store mutex poisoned")
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break,
+            }
+        }
+        tracing::debug!("shared store busy for {wait:?}; reading through a private connection");
+        f(&Store::open(&self.config)?)
+    }
+
     pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let guard = self
             .store_lock()?
@@ -3281,7 +3312,7 @@ impl Daemon {
 
     /// Handle a stats request — reads store and event log.
     pub fn handle_stats(&self, req: &StatsRequest) -> Response {
-        let inventory = match self.with_store(|store| {
+        let inventory = match self.with_store_or_private(STATS_STORE_WAIT, |store| {
             crate::store_view::read_with_main(
                 &self.config,
                 store,
@@ -8754,8 +8785,21 @@ async fn handle_connection_after_queue(
         tracing::warn!(%error, "rejected IPC connection from another local user");
         return Ok(());
     }
-    let _permit = limiter.acquire_owned().await.ok();
-    handle_connection_started_at(stream, daemon, lifecycle, request_started_at).await
+    handle_connection_started_at(stream, daemon, lifecycle, Some(limiter), request_started_at).await
+}
+
+/// Requests that answer from in-memory state or a bounded read, never wait
+/// on compiler work, and must stay available while every handler slot is
+/// occupied by blocked pipelines: liveness, status and shutdown.
+fn bypasses_handler_limit(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Health
+            | Request::Stats(_)
+            | Request::ExecutionStatus { .. }
+            | Request::Shutdown
+            | Request::GcHint
+    )
 }
 
 #[cfg(test)]
@@ -8764,15 +8808,19 @@ pub(crate) async fn handle_connection(
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
-    handle_connection_started_at(stream, daemon, lifecycle, Instant::now()).await
+    handle_connection_started_at(stream, daemon, lifecycle, None, Instant::now()).await
 }
 
 async fn handle_connection_started_at(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
     request_started_at: Instant,
 ) -> Result<()> {
+    // Taken by the first request that needs a handler slot, then held for
+    // the rest of the connection. Control requests never wait for one.
+    let mut handler_slot = None;
     // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
     // does not shut it down", which causes the reader to never see EOF and
@@ -8799,8 +8847,14 @@ async fn handle_connection_started_at(
         let Some(_request) = lifecycle.begin() else {
             break;
         };
-        let start = Instant::now();
         let parsed = serde_json::from_str::<Request>(&line);
+        if handler_slot.is_none()
+            && !parsed.as_ref().is_ok_and(bypasses_handler_limit)
+            && let Some(limiter) = &limiter
+        {
+            handler_slot = Arc::clone(limiter).acquire_owned().await.ok();
+        }
+        let start = Instant::now();
 
         let client_version = parsed
             .as_ref()
@@ -8973,11 +9027,6 @@ fn key_prefix(key: &str) -> &str {
     &key[..end]
 }
 
-fn send_retry_delay(attempt: u32, pid: u32) -> Duration {
-    let jitter = (u64::from(pid) * 7) % 50;
-    Duration::from_millis(100 * u64::from(attempt) + jitter)
-}
-
 fn should_warn_key_cache_refresh_failure(consecutive_refresh_failures: u32) -> bool {
     consecutive_refresh_failures == 1 || consecutive_refresh_failures.is_multiple_of(10)
 }
@@ -8992,8 +9041,9 @@ use crate::platform::wait_for_shutdown as shutdown_signal;
 
 // ── Client ───────────────────────────────────────────────────────
 
-/// Send an upload job to the daemon. Auto-starts daemon if needed.
-/// Non-blocking: if daemon can't be reached, logs a warning and returns Ok.
+/// Send an upload job to the daemon. Never starts or waits for a daemon: the
+/// job is a durable intent first, and a daemon that cannot be reached picks it
+/// up from the spool when it next starts.
 ///
 /// Uses fire-and-forget: the request is written into the kernel socket buffer
 /// and the connection is closed immediately — no waiting for a response.
@@ -9021,64 +9071,33 @@ pub fn send_upload_job(
     // absent or restarts after accepting bytes, startup replay still sees the
     // intent and no successful local compile silently loses its upload.
     let durable_job = persist_upload_job(config, &job)?;
-    let req = Request::Upload(durable_job);
+    wake_daemon_for_upload(&socket_path, &Request::Upload(durable_job), crate_name, key);
+    Ok(())
+}
 
-    let key_short = key_prefix(key);
+/// Longest a compile waits to hand an upload to the daemon. The intent is
+/// already durable, so this is only a wake-up: a daemon that is busy, draining
+/// or absent picks the intent up from the spool when it next starts.
+const UPLOAD_WAKEUP_WAIT: Duration = Duration::from_millis(500);
 
-    let try_send = |path: &Path| -> Result<()> { send_request_fire_and_forget(path, &req) };
-
-    match try_send(&socket_path) {
-        Ok(()) => return Ok(()),
-        Err(first_err) => {
-            tracing::debug!(
-                crate_name,
-                key = key_short,
-                "initial upload send failed, starting daemon: {first_err:#}",
-            );
-            // Daemon unreachable — try auto-starting it.
-            // Swallow errors: never fail the build over daemon startup issues.
-            match start_daemon_background() {
-                Ok(true) => {}
-                Ok(false) | Err(_) => {
-                    tracing::warn!(
-                        crate_name,
-                        key = key_short,
-                        "could not reach or start daemon; upload remains queued durably"
-                    );
-                    return Ok(());
-                }
-            }
+/// Tell the daemon about a durable upload intent, once, without waiting for
+/// the remote. The compile never waits on a PUT, a daemon start, or a retry.
+fn wake_daemon_for_upload(socket_path: &Path, req: &Request, crate_name: &str, key: &str) {
+    let mut line = match serde_json::to_string(req) {
+        Ok(line) => line,
+        Err(error) => {
+            tracing::debug!(crate_name, "upload wake-up not serialized: {error}");
+            return;
         }
+    };
+    line.push('\n');
+    if let Err(error) = send_line_fire_and_forget(socket_path, line, UPLOAD_WAKEUP_WAIT) {
+        tracing::debug!(
+            crate_name,
+            key = key_prefix(key),
+            "daemon not reachable for upload ({error:#}); the durable intent replays on its next start"
+        );
     }
-
-    // Daemon is (re)started — retry with backoff + jitter.
-    // Only the connect() can fail now (daemon not yet listening); writes
-    // always succeed once connected because the kernel buffers them.
-    for attempt in 1..=3u32 {
-        match try_send(&socket_path) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if attempt < 3 {
-                    let delay = send_retry_delay(attempt, std::process::id());
-                    tracing::debug!(
-                        crate_name,
-                        key = key_short,
-                        attempt,
-                        "upload send retry {attempt}/3 failed, backoff {delay:?}: {e:#}",
-                    );
-                    std::thread::sleep(delay);
-                } else {
-                    tracing::warn!(
-                        crate_name,
-                        key = key_short,
-                        socket = %socket_path.display(),
-                        "upload send failed after {attempt} retries: {e:#}",
-                    );
-                }
-            }
-        }
-    }
-    Ok(()) // Non-blocking: don't fail the build
 }
 
 pub struct GcRequestOutcome {

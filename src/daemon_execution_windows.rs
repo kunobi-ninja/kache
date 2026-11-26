@@ -1,6 +1,8 @@
 //! The daemon owns the pipeline; its frontend owns native Windows launches.
 
-use super::execution_policy::{WORKER_STOP_GRACE, stop_worker, unfinished_reply};
+use super::execution_policy::{
+    EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver, stop_worker, unfinished_reply,
+};
 use super::*;
 use crate::invocation::{
     InvocationContext, InvocationEnv,
@@ -249,6 +251,19 @@ pub(super) async fn handle(
         write_reply(stream, &ExecutionReply::Accepted),
     )
     .await??;
+    // From here on every frame, heartbeats included, is written by a
+    // dedicated thread with its own handle on the connection: a starved
+    // runtime or worker pool cannot silence the daemon.
+    let frames = match frames::FrameWriter::start(stream, EXECUTION_HEARTBEAT) {
+        Ok(frames) => frames,
+        Err(error) => {
+            return hand_back(
+                stream,
+                &format!("execution frame writer unavailable: {error}"),
+            )
+            .await;
+        }
+    };
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
     let (send, mut calls) = tokio::sync::mpsc::channel(8);
@@ -318,7 +333,7 @@ pub(super) async fn handle(
                     client_owns_effects,
                     "daemon is shutting down".into(),
                 );
-                return write_reply(stream, &reply).await;
+                return deliver(frames, &reply).await;
             }
             // Reap completed owners before admitting another native spawn.
             Some(id) = finished.recv() => Call {
@@ -328,7 +343,7 @@ pub(super) async fn handle(
             Some(call) = calls.recv() => call,
             result = &mut worker => break result,
         };
-        if let Err(error) = service_call(stream, reader, call).await {
+        if let Err(error) = service_call(&frames, reader, call).await {
             drop(calls);
             drop(finished);
             cancellation.cancel();
@@ -353,21 +368,17 @@ pub(super) async fn handle(
             format!("compiler worker failed: {error}"),
         ),
     };
-    write_reply(stream, &reply).await
+    deliver(frames, &reply).await
 }
 
 async fn service_call(
-    stream: &TokioStream,
+    frames: &frames::FrameWriter,
     reader: &mut BufReader<&TokioStream>,
     call: Call,
 ) -> Result<()> {
-    write_reply(
-        stream,
-        &ExecutionReply::WindowsControl {
-            command: call.command,
-        },
-    )
-    .await?;
+    frames.send(&ExecutionReply::WindowsControl {
+        command: call.command,
+    })?;
     let mut frame = Vec::new();
     let line = read_bounded_line(reader, &mut frame)
         .await?

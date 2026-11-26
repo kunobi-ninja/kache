@@ -187,6 +187,10 @@ pub enum ExecutionReply {
     Fallback {
         reason: String,
     },
+    /// The daemon still serves this invocation. Sent every few seconds after
+    /// Accepted, independent of compiler progress: a client that hears
+    /// nothing for its silence limit treats the daemon as wedged.
+    Heartbeat,
     /// Windows launches native children in the client's security/console context.
     WindowsControl {
         command: windows::Command,

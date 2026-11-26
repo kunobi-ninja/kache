@@ -15,6 +15,21 @@ use std::time::Duration;
 /// handler answers without it rather than holding the drain and the client.
 pub(super) const WORKER_STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// Interval of [`ExecutionReply::Heartbeat`] frames to a delegated client,
+/// written by [`super::frames::FrameWriter`]'s thread. The client gives up
+/// after `kache_ipc::execution::EXECUTION_SILENCE_LIMIT` without a byte.
+pub(super) const EXECUTION_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Write the terminal reply of a delegated invocation after every frame
+/// queued before it, then release the writer's handle on the connection.
+pub(super) async fn deliver(
+    frames: super::frames::FrameWriter,
+    reply: &ExecutionReply,
+) -> anyhow::Result<()> {
+    frames.send(reply)?;
+    frames.finish().await
+}
+
 /// Cancel a delegated compiler worker and wait up to `grace` for it to
 /// finish. True when it finished, so its children are reaped and nothing it
 /// started can still write into the client's target directory.
@@ -52,6 +67,12 @@ pub(super) fn unfinished_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_heartbeats_fit_in_the_clients_silence_limit() {
+        assert_eq!(EXECUTION_HEARTBEAT, Duration::from_secs(5));
+        assert!(kache_ipc::execution::EXECUTION_SILENCE_LIMIT >= EXECUTION_HEARTBEAT * 10);
+    }
 
     #[test]
     fn an_unfinished_invocation_returns_to_the_client_only_when_a_rerun_is_safe() {

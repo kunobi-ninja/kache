@@ -122,9 +122,16 @@ impl Client {
         ))
     }
 
-    /// Wait on both connections. Completion or disconnect must interrupt an
-    /// otherwise idle broker; compiler output travels over independent pipes.
-    pub(super) fn ready(&self, completion: BorrowedFd<'_>) -> io::Result<bool> {
+    /// Wait on both connections for at most `limit`. Completion or disconnect
+    /// must interrupt an otherwise idle broker; compiler output travels over
+    /// independent pipes. `None` when neither connection spoke in time,
+    /// `Some(true)` for a native request, `Some(false)` when a completion
+    /// frame (or the daemon's disconnect) is readable.
+    pub(super) fn broker_ready_within(
+        &self,
+        completion: BorrowedFd<'_>,
+        limit: std::time::Duration,
+    ) -> io::Result<Option<bool>> {
         let mut fds = [
             libc::pollfd {
                 fd: completion.as_raw_fd(),
@@ -137,8 +144,10 @@ impl Client {
                 revents: 0,
             },
         ];
-        retry_interrupted(|| checked(unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) }))?;
-        Ok(fds[0].revents == 0)
+        let timeout = libc::c_int::try_from(limit.as_millis()).unwrap_or(libc::c_int::MAX);
+        let ready =
+            retry_interrupted(|| checked(unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) }))?;
+        Ok((ready != 0).then_some(fds[0].revents == 0))
     }
 
     /// Whether the daemon announced console output, or started a child on
@@ -504,13 +513,47 @@ mod tests {
                 producer.write_all(b"complete").unwrap();
             });
             let start = std::time::Instant::now();
-            assert!(!client.ready(completion.as_fd()).unwrap());
+            assert_eq!(
+                client
+                    .broker_ready_within(completion.as_fd(), WAIT)
+                    .unwrap(),
+                Some(false)
+            );
             assert!(start.elapsed() >= std::time::Duration::from_millis(10));
         });
         let (empty, _producer) = UnixStream::pair().unwrap();
         control.write_all(b"request").unwrap();
-        assert!(client.ready(empty.as_fd()).unwrap());
-        assert!(!client.ready(completion.as_fd()).unwrap());
+        assert_eq!(
+            client.broker_ready_within(empty.as_fd(), WAIT).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            client
+                .broker_ready_within(completion.as_fd(), WAIT)
+                .unwrap(),
+            Some(false)
+        );
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A daemon that neither completes nor asks for anything ends the wait
+    /// at the limit instead of parking the client forever.
+    #[test]
+    fn a_silent_daemon_ends_the_readiness_wait_at_its_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let (client, _endpoints) = fixture_with_manifest(root.path(), false, 0);
+        let (silent, _daemon) = UnixStream::pair().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            client
+                .broker_ready_within(silent.as_fd(), std::time::Duration::from_millis(50))
+                .unwrap(),
+            None
+        );
+        let waited = start.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(50), "{waited:?}");
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
     }
 
     #[test]

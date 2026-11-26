@@ -32,6 +32,13 @@ impl Connection {
         self.inner.set_recv_timeout(None)?;
         Ok(())
     }
+
+    /// Bound the next reads by the daemon's silence limit. Heartbeats arrive
+    /// far more often, so only a wedged daemon reaches it.
+    pub(super) fn wait_at_most(&self, limit: std::time::Duration) -> Result<()> {
+        self.inner.set_recv_timeout(Some(limit))?;
+        Ok(())
+    }
 }
 
 impl Read for &Connection {

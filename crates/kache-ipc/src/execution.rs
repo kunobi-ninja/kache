@@ -34,6 +34,17 @@ use unix::Connection;
 #[cfg(unix)]
 mod unix_client;
 
+/// How long a client waits after Commit without a single byte from the
+/// daemon (acceptance, heartbeat, completion, a native request to service)
+/// before it treats the daemon as wedged.
+///
+/// A dedicated daemon thread sends a heartbeat every 5 s whatever the
+/// compiler or the daemon's runtime does, so silence means the process or
+/// the connection is stuck. 180 s, 36 heartbeats, tolerates a host so
+/// starved that threads get CPU only in bursts, and still ends a wedge that
+/// would otherwise hold the build forever.
+pub const EXECUTION_SILENCE_LIMIT: Duration = Duration::from_secs(180);
+
 /// Set on the engine a frontend starts after [`Attempt::HandedBack`], so the
 /// engine compiles at once instead of asking the daemon again.
 pub const HANDED_BACK_ENV: &str = "KACHE_EXECUTION_HANDED_BACK";
@@ -96,12 +107,28 @@ pub fn try_execute_with_recovery(
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Attempt> {
+    try_execute_within(
+        socket,
+        request,
+        #[cfg(unix)]
+        descriptors,
+        EXECUTION_SILENCE_LIMIT,
+    )
+}
+
+fn try_execute_within(
+    socket: &Path,
+    request: &ExecutionRequest,
+    #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
+    silence: Duration,
+) -> Result<Attempt> {
     let mut progress = Progress::default();
     let result = exchange(
         socket,
         request,
         #[cfg(unix)]
         descriptors,
+        silence,
         &mut progress,
     );
     finish_attempt(result, progress)
@@ -195,6 +222,7 @@ fn exchange(
     socket: &Path,
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
+    silence: Duration,
     progress: &mut Progress,
 ) -> Result<Outcome> {
     #[cfg(unix)]
@@ -286,7 +314,9 @@ fn exchange(
     stream.prepare_commit()?;
     if let Err(error) = send_commit(&mut &stream, &mut progress.committed) {
         // A draining daemon hands the invocation back and closes without
-        // reading Commit. Its reply is still readable after the write failed.
+        // reading Commit. Its reply is still readable after the write failed;
+        // a daemon that neither reads nor answers is bounded like any other.
+        stream.wait_at_most(silence)?;
         if let Ok(ExecutionReply::Fallback { reason }) = read_reply(&mut reader) {
             return Ok(Outcome::Fallback(reason));
         }
@@ -294,16 +324,23 @@ fn exchange(
     }
     #[cfg(windows)]
     stream.commit_written()?;
-    match read_reply(&mut reader).context("waiting for compiler acceptance")? {
+    let silent = || format!("no word from the daemon for {silence:?}");
+    stream.wait_at_most(silence)?;
+    match read_reply(&mut reader)
+        .with_context(silent)
+        .context("waiting for compiler acceptance")?
+    {
         ExecutionReply::Accepted => {}
         ExecutionReply::Fallback { reason } => return Ok(Outcome::Fallback(reason)),
         reply => bail!("daemon did not acknowledge compiler execution: {reply:?}"),
     }
     #[cfg(windows)]
     loop {
-        match read_reply(&mut reader)? {
+        stream.wait_at_most(silence)?;
+        match read_reply(&mut reader).with_context(silent)? {
             ExecutionReply::Complete { exit_code } => return Ok(Outcome::Exit(exit_code)),
             ExecutionReply::Fallback { reason } => return Ok(Outcome::Fallback(reason)),
+            ExecutionReply::Heartbeat => {}
             ExecutionReply::Failed { message } => return Ok(Outcome::Failed(message)),
             ExecutionReply::WindowsControl { command } => {
                 // Recorded before the command runs: a partial write counts.
@@ -318,25 +355,35 @@ fn exchange(
         #[cfg(unix)]
         if let Some(client) = &mut unix_client
             && reader.buffer().is_empty()
-            && client.ready(stream.as_fd())?
         {
-            let open = client
-                .service()
-                .context("servicing client-owned native operations");
-            progress.output_written |= client.output_started();
-            if !open? {
-                // The worker can release its broker before the async handler
-                // writes Complete. Completion still comes from that handler.
-                unix_client = None;
+            match client.broker_ready_within(stream.as_fd(), silence)? {
+                None => bail!(silent()),
+                Some(true) => {
+                    let open = client
+                        .service()
+                        .context("servicing client-owned native operations");
+                    progress.output_written |= client.output_started();
+                    if !open? {
+                        // The worker can release its broker before the async
+                        // handler writes Complete. Completion still comes from
+                        // that handler.
+                        unix_client = None;
+                    }
+                    continue;
+                }
+                Some(false) => {}
             }
-            continue;
         }
-        return match read_reply(&mut reader).context("waiting for compiler completion")? {
-            ExecutionReply::Complete { exit_code } => Ok(Outcome::Exit(exit_code)),
-            ExecutionReply::Fallback { reason } => Ok(Outcome::Fallback(reason)),
-            ExecutionReply::Failed { message } => Ok(Outcome::Failed(message)),
+        match read_reply(&mut reader)
+            .with_context(silent)
+            .context("waiting for compiler completion")?
+        {
+            ExecutionReply::Complete { exit_code } => return Ok(Outcome::Exit(exit_code)),
+            ExecutionReply::Fallback { reason } => return Ok(Outcome::Fallback(reason)),
+            ExecutionReply::Failed { message } => return Ok(Outcome::Failed(message)),
+            ExecutionReply::Heartbeat => {}
             reply => bail!("invalid compiler completion: {reply:?}"),
-        };
+        }
     }
 }
 
@@ -345,6 +392,7 @@ fn retry_until<T>(
     deadline: Option<std::time::Instant>,
     mut operation: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
+    let mut attempts = 0u32;
     loop {
         match operation() {
             Err(error)
@@ -356,7 +404,11 @@ fn retry_until<T>(
                 if deadline.is_some_and(|until| std::time::Instant::now() >= until) {
                     return Err(std::io::ErrorKind::TimedOut.into());
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                // Setup retries settle within milliseconds. A committed
+                // Windows client waits here for a whole compile between
+                // heartbeats, so it backs off instead of waking every 1 ms.
+                attempts = attempts.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(if attempts < 64 { 1 } else { 10 }));
             }
             result => return result,
         }
@@ -740,6 +792,13 @@ mod tests {
         FallbackForCommit,
         /// The daemon accepts, then hands the invocation back.
         FallbackAfterAccepted,
+        /// The daemon accepts, then neither completes nor heartbeats (a
+        /// wedged daemon that keeps the connection open).
+        SilentAfterAccepted,
+        /// A compile slower than the silence limit, kept alive by heartbeats.
+        HeartbeatsThenComplete,
+        /// The completion frame arrives one byte at a time.
+        TrickledCompletion,
     }
 
     struct Fixture {
@@ -787,6 +846,10 @@ mod tests {
     }
 
     fn staged_exchange(stage: Disconnect) -> Result<Attempt> {
+        staged_exchange_within(stage, EXECUTION_SILENCE_LIMIT)
+    }
+
+    fn staged_exchange_within(stage: Disconnect, silence: Duration) -> Result<Attempt> {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("control");
         let listener = UnixListener::bind(&path).unwrap();
@@ -882,14 +945,47 @@ mod tests {
                     return;
                 }
                 write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
-                if matches!(stage, Disconnect::FallbackAfterAccepted) {
-                    write_message(&mut stream, &fallback).unwrap();
+                match stage {
+                    Disconnect::FallbackAfterAccepted => {
+                        write_message(&mut stream, &fallback).unwrap();
+                    }
+                    Disconnect::SilentAfterAccepted => {
+                        // Hold the connection open until the client leaves.
+                        let mut byte = [0; 1];
+                        let _ = std::io::Read::read(&mut reader, &mut byte);
+                    }
+                    Disconnect::TrickledCompletion => {
+                        let mut frame =
+                            serde_json::to_vec(&ExecutionReply::Complete { exit_code: 7 }).unwrap();
+                        frame.push(b'\n');
+                        for byte in frame {
+                            std::thread::sleep(Duration::from_millis(40));
+                            stream.write_all(&[byte]).unwrap();
+                        }
+                    }
+                    Disconnect::HeartbeatsThenComplete => {
+                        for _ in 0..6 {
+                            std::thread::sleep(Duration::from_millis(100));
+                            write_message(&mut stream, &ExecutionReply::Heartbeat).unwrap();
+                        }
+                        write_message(&mut stream, &ExecutionReply::Complete { exit_code: 7 })
+                            .unwrap();
+                    }
+                    Disconnect::BeforeReady
+                    | Disconnect::LegacyDaemon
+                    | Disconnect::BeforePrepared
+                    | Disconnect::AfterPrepared
+                    | Disconnect::AfterCommit
+                    | Disconnect::AfterAccepted
+                    | Disconnect::FallbackBeforeCommit
+                    | Disconnect::FallbackForCommit => {}
                 }
             });
-            let result = try_execute_with_recovery(
+            let result = try_execute_within(
                 &path,
                 &context.request,
                 &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
+                silence,
             );
             server.join().unwrap();
             result
@@ -992,6 +1088,45 @@ mod tests {
         assert!(
             error.to_string().contains("will not be run again locally"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_accepts_and_goes_silent_ends_the_wait_at_the_limit() {
+        let silence = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        // This fixture passes descriptors without a client broker, so the
+        // client cannot rule out that output reached Cargo: no rerun.
+        let error = staged_exchange_within(Disconnect::SilentAfterAccepted, silence).unwrap_err();
+        let waited = started.elapsed();
+        assert!(
+            format!("{error:#}").contains("no word from the daemon"),
+            "{error:#}"
+        );
+        assert!(waited >= silence, "{waited:?}");
+        assert!(waited < Duration::from_secs(4), "{waited:?}");
+    }
+
+    #[test]
+    fn any_byte_from_the_daemon_restarts_the_silence_limit() {
+        // The completion frame trickles in a byte every 40 ms: well over the
+        // 300 ms limit in total, never 300 ms without a byte.
+        assert_eq!(
+            staged_exchange_within(Disconnect::TrickledCompletion, Duration::from_millis(300))
+                .unwrap(),
+            Attempt::Complete(7)
+        );
+    }
+
+    #[test]
+    fn heartbeats_keep_a_compile_longer_than_the_silence_limit_alive() {
+        assert_eq!(
+            staged_exchange_within(
+                Disconnect::HeartbeatsThenComplete,
+                Duration::from_millis(300)
+            )
+            .unwrap(),
+            Attempt::Complete(7)
         );
     }
 
@@ -1255,7 +1390,13 @@ mod windows_tests {
         // A complete peer must expose preparation errors, rather than letting
         // the availability fallback hide them behind the server's timeout.
         let result = if matches!(peer, Peer::Complete | Peer::Workspace) {
-            exchange(&path, &request, &mut Progress::default()).map(|outcome| match outcome {
+            exchange(
+                &path,
+                &request,
+                EXECUTION_SILENCE_LIMIT,
+                &mut Progress::default(),
+            )
+            .map(|outcome| match outcome {
                 Outcome::Exit(exit) => Some(exit),
                 Outcome::Fallback(_) | Outcome::Failed(_) => None,
             })
@@ -1449,7 +1590,13 @@ mod windows_tests {
         drop(probe);
 
         let mut progress = Progress::default();
-        let error = exchange(&socket, &request(root.path()), &mut progress).unwrap_err();
+        let error = exchange(
+            &socket,
+            &request(root.path()),
+            EXECUTION_SILENCE_LIMIT,
+            &mut progress,
+        )
+        .unwrap_err();
         assert!(!progress.committed);
         assert!(
             format!("{error:#}").contains("security context differs"),

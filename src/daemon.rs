@@ -29,6 +29,9 @@ mod execution;
 #[cfg(any(unix, windows))]
 #[path = "daemon_execution_policy.rs"]
 mod execution_policy;
+#[cfg(any(unix, windows))]
+#[path = "daemon_frames.rs"]
+mod frames;
 #[cfg(any(windows, test))]
 #[path = "daemon_image.rs"]
 mod image;

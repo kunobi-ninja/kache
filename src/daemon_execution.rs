@@ -1,7 +1,9 @@
 //! Compiler tasks reuse the daemon process. Preparation owns every resource
 //! before Commit, and never starts compiler work.
 
-use super::execution_policy::{WORKER_STOP_GRACE, stop_worker, unfinished_reply};
+use super::execution_policy::{
+    EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver, stop_worker, unfinished_reply,
+};
 use super::*;
 use crate::invocation::{
     InvocationContext, InvocationEnv, io::InvocationIo, process::Cancellation,
@@ -436,6 +438,19 @@ pub(super) async fn handle(
     context.priority = Some(crate::scheduler::Priority::of_process(client_pid));
     write_reply(stream, &ExecutionReply::Accepted).await?;
     let streams = context.io.clone();
+    // From here on every frame, heartbeats included, is written by a
+    // dedicated thread with its own handle on the connection: a starved
+    // runtime or worker pool cannot silence the daemon.
+    let frames = match frames::FrameWriter::start(stream, EXECUTION_HEARTBEAT) {
+        Ok(frames) => frames,
+        Err(error) => {
+            return hand_back(
+                stream,
+                &format!("execution frame writer unavailable: {error}"),
+            )
+            .await;
+        }
+    };
     let activity = daemon.request_clock.begin_activity();
 
     let mut worker = tokio::task::spawn_blocking(move || {
@@ -473,7 +488,7 @@ pub(super) async fn handle(
                     false,
                     "daemon is shutting down".into(),
                 );
-                return write_reply(stream, &reply).await;
+                return deliver(frames, &reply).await;
             }
         }
     };
@@ -492,7 +507,7 @@ pub(super) async fn handle(
             format!("compiler worker failed: {error}"),
         ),
     };
-    write_reply(stream, &reply).await
+    deliver(frames, &reply).await
 }
 
 #[cfg(test)]

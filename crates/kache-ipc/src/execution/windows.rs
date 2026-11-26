@@ -21,6 +21,8 @@ pub(super) const MAX_REPLY_BYTES: u64 = 8 << 20;
 pub(super) struct Connection {
     pub(super) inner: crate::SyncStream,
     pub(super) deadline: std::cell::Cell<Option<std::time::Instant>>,
+    /// After Commit: the daemon's silence limit, restarted by every byte read.
+    silence: std::cell::Cell<Option<std::time::Duration>>,
     peer: PeerSecurity,
     write_capacity: usize,
 }
@@ -155,6 +157,7 @@ impl Connection {
         Ok(Self {
             inner,
             deadline: std::cell::Cell::new(Some(deadline)),
+            silence: std::cell::Cell::new(None),
             peer,
             write_capacity: write_capacity as usize,
         })
@@ -207,6 +210,14 @@ impl Connection {
         Ok(())
     }
 
+    /// Bound the next read by the daemon's silence limit. Heartbeats arrive
+    /// far more often, so only a wedged daemon reaches it.
+    pub(super) fn wait_at_most(&self, limit: std::time::Duration) -> Result<()> {
+        self.silence.set(Some(limit));
+        self.deadline.set(Some(std::time::Instant::now() + limit));
+        Ok(())
+    }
+
     pub(super) fn commit_written(&self) -> Result<()> {
         // This fallible transition is after the first Commit write attempt.
         // A failure never permits a second local compiler run.
@@ -247,6 +258,14 @@ impl Read for &Connection {
             // between the peek and this bounded read.
             let count = bytes.len().min(available as usize);
             (&self.inner).read(&mut bytes[..count])
+        })
+        .inspect(|&read| {
+            // Any byte proves the daemon alive: restart the silence limit.
+            if read > 0
+                && let Some(silence) = self.silence.get()
+            {
+                self.deadline.set(Some(std::time::Instant::now() + silence));
+            }
         })
     }
 }

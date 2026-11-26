@@ -24,6 +24,7 @@ pub(super) struct Client {
     children: HashMap<u64, Pending>,
     next_id: u64,
     workspace: workspace::Files,
+    output_started: bool,
 }
 
 struct Pending {
@@ -115,6 +116,7 @@ impl Client {
                 children: HashMap::new(),
                 next_id: 0,
                 workspace: workspace::Files::default(),
+                output_started: false,
             },
             [peer.into(), peer_pipes.into()],
         ))
@@ -137,6 +139,12 @@ impl Client {
         ];
         retry_interrupted(|| checked(unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) }))?;
         Ok(fds[0].revents == 0)
+    }
+
+    /// Whether the daemon announced console output, or started a child on
+    /// this client's own output streams.
+    pub(super) fn output_started(&self) -> bool {
+        self.output_started
     }
 
     pub(super) fn service(&mut self) -> anyhow::Result<bool> {
@@ -197,7 +205,10 @@ impl Client {
                 drop(self.children.remove(&id).ok_or_else(unknown)?);
                 Reply::Done
             }
-            Command::OutputStarted => Reply::Done,
+            Command::OutputStarted => {
+                self.output_started = true;
+                Reply::Done
+            }
         };
         Ok((reply, Vec::new()))
     }
@@ -205,6 +216,9 @@ impl Client {
     fn spawn(&mut self, spawn: Spawn, indices: Vec<usize>) -> io::Result<(Reply, Vec<OwnedFd>)> {
         if self.children.len() >= 64 {
             return Err(invalid("too many native compiler children"));
+        }
+        if spawn.stdio.stdout == Stream::Inherit || spawn.stdio.stderr == Stream::Inherit {
+            self.output_started = true;
         }
         let program = PathBuf::from(spawn.program.decode().map_err(invalid)?);
         let cwd = PathBuf::from(spawn.cwd.decode().map_err(invalid)?);
@@ -435,6 +449,37 @@ mod tests {
                 stdio,
             }),
             jobserver: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn announced_output_and_children_on_client_streams_are_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, _endpoints) = fixture_with_manifest(root.path(), false, 0);
+        assert!(!client.output_started());
+        assert_eq!(
+            client.execute(Command::OutputStarted).unwrap().0,
+            Reply::Done
+        );
+        assert!(client.output_started());
+        for (stdout, stderr, shown) in [
+            (Stream::Inherit, Stream::Null, true),
+            (Stream::Null, Stream::Inherit, true),
+            (Stream::Pipe, Stream::Null, false),
+        ] {
+            let mut client = fixture(root.path());
+            let plan = Plan {
+                stdin: Stream::Null,
+                stdout,
+                stderr,
+            };
+            let (Reply::Spawned { id, .. }, _files) =
+                client.execute(spawn(root.path(), "exit 0", plan)).unwrap()
+            else {
+                panic!("missing child");
+            };
+            assert_eq!(client.output_started(), shown, "{plan:?}");
+            client.execute(Command::Release { id }).unwrap();
         }
     }
 

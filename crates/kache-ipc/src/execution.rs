@@ -96,15 +96,15 @@ pub fn try_execute_with_recovery(
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Attempt> {
-    let mut committed = false;
+    let mut progress = Progress::default();
     let result = exchange(
         socket,
         request,
         #[cfg(unix)]
         descriptors,
-        &mut committed,
+        &mut progress,
     );
-    finish_attempt(result, committed)
+    finish_attempt(result, progress)
 }
 
 /// What a completed exchange reports.
@@ -113,16 +113,38 @@ enum Outcome {
     Exit(i32),
     /// The daemon handed the invocation back ([`ExecutionReply::Fallback`]).
     Fallback(String),
+    /// The daemon's own verdict ([`ExecutionReply::Failed`]). Unlike a lost
+    /// connection it is final: the daemon only sends it when a rerun could
+    /// repeat output or race work it could not stop.
+    Failed(String),
 }
 
-fn finish_attempt(result: Result<Outcome>, committed: bool) -> Result<Attempt> {
+/// How far an exchange got, for deciding whether a failure may still be
+/// answered by compiling locally.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Progress {
+    /// Set before the first Commit byte is written.
+    committed: bool,
+    /// This client sees every operation that can show Cargo output: it relays
+    /// every console write and owns every compiler child (Windows, and Unix
+    /// with a client broker that hears [`kache_protocol::execution::unix::Command::OutputStarted`]).
+    observes_output: bool,
+    /// Console output was written, or a child was started on the client's
+    /// own streams. A rerun would repeat what Cargo already read.
+    output_written: bool,
+}
+
+fn finish_attempt(result: Result<Outcome>, progress: Progress) -> Result<Attempt> {
     match result {
         Ok(Outcome::Exit(exit)) => Ok(Attempt::Complete(exit)),
         Ok(Outcome::Fallback(reason)) => {
             tracing::debug!(%reason, "daemon handed the compiler invocation back");
             Ok(Attempt::HandedBack)
         }
-        Err(error) if !committed => {
+        Ok(Outcome::Failed(message)) => Err(anyhow::anyhow!(message).context(
+            "daemon compilation did not complete; the compiler will not be run again locally",
+        )),
+        Err(error) if !progress.committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
             let denied = error.chain().any(|cause| {
                 cause
@@ -135,9 +157,37 @@ fn finish_attempt(result: Result<Outcome>, committed: bool) -> Result<Attempt> {
                 Attempt::Recoverable
             })
         }
+        // The client stops every child it started for the daemon before it
+        // returns, and Cargo has seen nothing: a local run repeats nothing.
+        Err(error) if progress.observes_output && !progress.output_written => {
+            tracing::warn!(
+                "daemon compilation ended before any output ({error:#}); compiling locally"
+            );
+            Ok(Attempt::HandedBack)
+        }
         Err(error) => Err(error.context(
             "daemon compilation did not complete; the compiler will not be run again locally",
         )),
+    }
+}
+
+/// Whether servicing `command` can make output visible to Cargo: a console
+/// write, or a child that writes to the client's own streams.
+#[cfg(any(windows, test))]
+fn command_shows_output(command: &kache_protocol::execution::windows::Command) -> bool {
+    use kache_protocol::execution::process::Stream;
+    use kache_protocol::execution::windows::Command;
+    match command {
+        Command::Write { .. } => true,
+        Command::Spawn(spawn) => {
+            spawn.stdio.stdout == Stream::Inherit || spawn.stdio.stderr == Stream::Inherit
+        }
+        Command::Flush { .. }
+        | Command::Finish { .. }
+        | Command::Abort { .. }
+        | Command::Release { .. }
+        | Command::Workspace { .. }
+        | Command::DiscoverMsvc(_) => false,
     }
 }
 
@@ -145,7 +195,7 @@ fn exchange(
     socket: &Path,
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
-    committed: &mut bool,
+    progress: &mut Progress,
 ) -> Result<Outcome> {
     #[cfg(unix)]
     let (mut unix_client, broker_files) = if matches!(
@@ -157,6 +207,14 @@ fn exchange(
     } else {
         (None, None)
     };
+    #[cfg(unix)]
+    {
+        progress.observes_output = unix_client.is_some();
+    }
+    #[cfg(windows)]
+    {
+        progress.observes_output = true;
+    }
     #[cfg(windows)]
     let mut client = windows_client::Client::default();
     #[cfg(unix)]
@@ -226,7 +284,7 @@ fn exchange(
     drop(broker_files);
 
     stream.prepare_commit()?;
-    if let Err(error) = send_commit(&mut &stream, committed) {
+    if let Err(error) = send_commit(&mut &stream, &mut progress.committed) {
         // A draining daemon hands the invocation back and closes without
         // reading Commit. Its reply is still readable after the write failed.
         if let Ok(ExecutionReply::Fallback { reason }) = read_reply(&mut reader) {
@@ -246,8 +304,10 @@ fn exchange(
         match read_reply(&mut reader)? {
             ExecutionReply::Complete { exit_code } => return Ok(Outcome::Exit(exit_code)),
             ExecutionReply::Fallback { reason } => return Ok(Outcome::Fallback(reason)),
-            ExecutionReply::Failed { message } => bail!("{message}"),
+            ExecutionReply::Failed { message } => return Ok(Outcome::Failed(message)),
             ExecutionReply::WindowsControl { command } => {
+                // Recorded before the command runs: a partial write counts.
+                progress.output_written |= command_shows_output(&command);
                 write_message(&mut &stream, &client.execute_from(command, &stream))?;
             }
             reply => bail!("invalid compiler completion: {reply:?}"),
@@ -260,10 +320,11 @@ fn exchange(
             && reader.buffer().is_empty()
             && client.ready(stream.as_fd())?
         {
-            if !client
+            let open = client
                 .service()
-                .context("servicing client-owned native operations")?
-            {
+                .context("servicing client-owned native operations");
+            progress.output_written |= client.output_started();
+            if !open? {
                 // The worker can release its broker before the async handler
                 // writes Complete. Completion still comes from that handler.
                 unix_client = None;
@@ -273,7 +334,7 @@ fn exchange(
         return match read_reply(&mut reader).context("waiting for compiler completion")? {
             ExecutionReply::Complete { exit_code } => Ok(Outcome::Exit(exit_code)),
             ExecutionReply::Fallback { reason } => Ok(Outcome::Fallback(reason)),
-            ExecutionReply::Failed { message } => bail!("{message}"),
+            ExecutionReply::Failed { message } => Ok(Outcome::Failed(message)),
             reply => bail!("invalid compiler completion: {reply:?}"),
         };
     }
@@ -330,6 +391,20 @@ fn read_reply(reader: &mut impl BufRead) -> Result<ExecutionReply> {
 mod recovery_tests {
     use super::*;
 
+    fn progress(committed: bool, observes_output: bool, output_written: bool) -> Progress {
+        Progress {
+            committed,
+            observes_output,
+            output_written,
+        }
+    }
+
+    const UNCOMMITTED: Progress = Progress {
+        committed: false,
+        observes_output: false,
+        output_written: false,
+    };
+
     #[test]
     fn recovery_runs_once_only_when_it_can_help() {
         for (attempt, expected) in [
@@ -365,7 +440,7 @@ mod recovery_tests {
         let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let error = anyhow::Error::from(error).context("checking daemon process security");
         assert_eq!(
-            finish_attempt(Err(error), false).unwrap(),
+            finish_attempt(Err(error), UNCOMMITTED).unwrap(),
             Attempt::LocalOnly
         );
     }
@@ -378,14 +453,14 @@ mod recovery_tests {
             std::io::ErrorKind::TimedOut,
         ] {
             assert_eq!(
-                finish_attempt(Err(std::io::Error::from(kind).into()), false).unwrap(),
+                finish_attempt(Err(std::io::Error::from(kind).into()), UNCOMMITTED).unwrap(),
                 Attempt::Recoverable
             );
         }
         assert_eq!(
             finish_attempt(
                 Err(anyhow::anyhow!("unsupported execution protocol")),
-                false
+                UNCOMMITTED
             )
             .unwrap(),
             Attempt::Recoverable
@@ -398,11 +473,15 @@ mod recovery_tests {
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::BrokenPipe,
         ] {
-            let error = finish_attempt(Err(std::io::Error::from(kind).into()), true).unwrap_err();
+            let error = finish_attempt(
+                Err(std::io::Error::from(kind).into()),
+                progress(true, false, false),
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("will not be run again locally"));
         }
         assert_eq!(
-            finish_attempt(Ok(Outcome::Exit(17)), true).unwrap(),
+            finish_attempt(Ok(Outcome::Exit(17)), progress(true, true, true)).unwrap(),
             Attempt::Complete(17)
         );
         assert_eq!(Attempt::Complete(17).exit_code(), Some(17));
@@ -412,11 +491,78 @@ mod recovery_tests {
     }
 
     #[test]
+    fn a_lost_daemon_compiles_locally_only_while_cargo_has_seen_nothing() {
+        let broken = || Err(anyhow::anyhow!("incomplete compiler execution response"));
+        // Every child is stopped and nothing was shown: compile locally.
+        assert_eq!(
+            finish_attempt(broken(), progress(true, true, false)).unwrap(),
+            Attempt::HandedBack
+        );
+        // Output may have reached Cargo, or this client cannot tell.
+        for state in [progress(true, true, true), progress(true, false, false)] {
+            let error = finish_attempt(broken(), state).unwrap_err();
+            assert!(
+                error.to_string().contains("will not be run again locally"),
+                "{state:?}"
+            );
+        }
+        // The daemon's own verdict is final even when nothing was shown.
+        let error = finish_attempt(
+            Ok(Outcome::Failed("worker could not be stopped".into())),
+            progress(true, true, false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("will not be run again locally"));
+        assert_eq!(
+            format!("{:#}", error).rsplit(": ").next(),
+            Some("worker could not be stopped")
+        );
+    }
+
+    #[test]
+    fn only_console_writes_and_children_on_the_client_streams_show_output() {
+        use kache_protocol::execution::NativeString;
+        use kache_protocol::execution::windows::{Command, Output, Spawn, Stdio, Stream};
+        let spawn = |stdout, stderr| {
+            Command::Spawn(Box::new(Spawn {
+                program: NativeString::capture("rustc".as_ref()),
+                args: vec![],
+                env: vec![],
+                cwd: NativeString::capture("/".as_ref()),
+                stdio: Stdio {
+                    stdin: Stream::Inherit,
+                    stdout,
+                    stderr,
+                },
+            }))
+        };
+        assert!(command_shows_output(&Command::Write {
+            output: Output::Stderr,
+            bytes: vec![],
+        }));
+        assert!(command_shows_output(&spawn(Stream::Inherit, Stream::Pipe)));
+        assert!(command_shows_output(&spawn(Stream::Pipe, Stream::Inherit)));
+        // Captured children and stdin alone show Cargo nothing.
+        assert!(!command_shows_output(&spawn(Stream::Pipe, Stream::Pipe)));
+        assert!(!command_shows_output(&spawn(Stream::Null, Stream::Pipe)));
+        for quiet in [
+            Command::Flush {
+                output: Output::Stdout,
+            },
+            Command::Finish { id: 1 },
+            Command::Abort { id: 1 },
+            Command::Release { id: 1 },
+        ] {
+            assert!(!command_shows_output(&quiet));
+        }
+    }
+
+    #[test]
     fn a_handed_back_invocation_compiles_locally_without_recovery() {
         assert_eq!(
             finish_attempt(
                 Ok(Outcome::Fallback("daemon is shutting down".into())),
-                true
+                progress(true, true, true)
             )
             .unwrap(),
             Attempt::HandedBack
@@ -772,6 +918,83 @@ mod tests {
         }
     }
 
+    /// A daemon with a client broker that disconnects after Accepted, having
+    /// announced console output first or not.
+    fn brokered_disconnect(announce: bool) -> Result<Attempt> {
+        use kache_protocol::execution::unix::{Command, Reply};
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let path = root.path().join("control");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut context = fixture(root.path());
+        context.request.channels = ExecutionChannels::UnixClient {
+            terminal: false,
+            jobserver: vec![],
+            trusted_pipeline: false,
+        };
+        std::thread::scope(|threads| {
+            let server = threads.spawn(|| {
+                let (mut stream, _) =
+                    retry_until(Some(std::time::Instant::now() + PREPARE_TIMEOUT), || {
+                        listener.accept()
+                    })
+                    .unwrap();
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let endpoint = root.path().join("fds");
+                let datagram = UnixDatagram::bind(&endpoint).unwrap();
+                datagram.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let ticket = kache_protocol::execution::DescriptorTicket {
+                    endpoint: NativeString::capture(endpoint.as_os_str()),
+                    key: [37; 16],
+                };
+                write_message(
+                    &mut stream,
+                    &ExecutionReply::Ready {
+                        version: EXECUTION_VERSION,
+                        descriptors: Some(ticket.clone()),
+                    },
+                )
+                .unwrap();
+                let mut files =
+                    crate::descriptors::receive(datagram.as_fd(), &ticket.key, 5).unwrap();
+                let control = std::os::unix::net::UnixStream::from(files.remove(3));
+                control.set_read_timeout(Some(PREPARE_TIMEOUT)).unwrap();
+                let mut control = std::io::BufReader::new(control);
+                write_message(&mut stream, &ExecutionReply::Prepared).unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
+                if announce {
+                    write_message(control.get_mut(), &Command::OutputStarted).unwrap();
+                    line.clear();
+                    control.read_line(&mut line).unwrap();
+                    assert_eq!(serde_json::from_str::<Reply>(&line).unwrap(), Reply::Done);
+                }
+            });
+            let result = try_execute_with_recovery(
+                &path,
+                &context.request,
+                &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
+            );
+            server.join().unwrap();
+            result
+        })
+    }
+
+    #[test]
+    fn a_daemon_lost_after_commit_compiles_locally_until_output_was_announced() {
+        assert_eq!(brokered_disconnect(false).unwrap(), Attempt::HandedBack);
+        let error = brokered_disconnect(true).unwrap_err();
+        assert!(
+            error.to_string().contains("will not be run again locally"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn a_daemon_fallback_after_commit_runs_the_compiler_locally() {
         for stage in [
@@ -1032,9 +1255,9 @@ mod windows_tests {
         // A complete peer must expose preparation errors, rather than letting
         // the availability fallback hide them behind the server's timeout.
         let result = if matches!(peer, Peer::Complete | Peer::Workspace) {
-            exchange(&path, &request, &mut false).map(|outcome| match outcome {
+            exchange(&path, &request, &mut Progress::default()).map(|outcome| match outcome {
                 Outcome::Exit(exit) => Some(exit),
-                Outcome::Fallback(_) => None,
+                Outcome::Fallback(_) | Outcome::Failed(_) => None,
             })
         } else {
             try_execute(&path, &request)
@@ -1052,8 +1275,9 @@ mod windows_tests {
         for peer in [Peer::BeforePrepared, Peer::Legacy] {
             assert_eq!(exchange_with(peer).unwrap(), None);
         }
-        let error = exchange_with(Peer::AfterCommit).unwrap_err();
-        assert!(error.to_string().contains("will not be run again locally"));
+        // A frontend relays every console write and owns every child: a
+        // daemon lost after Commit, before any output, is a local compile.
+        assert_eq!(exchange_with(Peer::AfterCommit).unwrap(), None);
     }
 
     #[test]
@@ -1224,9 +1448,9 @@ mod windows_tests {
         );
         drop(probe);
 
-        let mut committed = false;
-        let error = exchange(&socket, &request(root.path()), &mut committed).unwrap_err();
-        assert!(!committed);
+        let mut progress = Progress::default();
+        let error = exchange(&socket, &request(root.path()), &mut progress).unwrap_err();
+        assert!(!progress.committed);
         assert!(
             format!("{error:#}").contains("security context differs"),
             "{error:#}"

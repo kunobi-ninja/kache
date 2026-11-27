@@ -17,7 +17,7 @@ The exact set depends on the invocation. It can include:
 - source and included file contents discovered through dep-info
 - code-generation flags, rustflags, and requested emit kinds
 - lint levels and `--check-cfg` values (`-A`, `-W`, `-D`, `-F`, `--force-warn`, `--cap-lints`), in order, because they decide whether a compile succeeds
-- diagnostic presentation flags (`--error-format`, `--json`, `--color`), in order, because a hit replays the stored diagnostics. A terminal width is handled separately, as described below
+- diagnostic presentation flags (`--error-format`, `--json`, `--color`), in order, because a hit replays the stored diagnostics. A terminal width and the flags of dependencies whose lints are capped are handled separately, as described below
 - `-Z` flags, `RUSTC_BOOTSTRAP` when set, `--sysroot`, and the `CARGO_CFG_*` variables
 - the library of a codegen backend selected by name, or a backend dylib passed as a path when `cache.trust_codegen_backends` allows it, by content
 - other rustc flags Kache does not model, with paths normalized (`KACHE_LOG=warn` names them)
@@ -89,8 +89,30 @@ once and stores its own entry. A piped build stores its warnings under the
 shared key, which terminal builds use only when its output is width-free.
 
 Malformed or repeated width options stay in the key, so a cached success cannot
-hide rustc's error about them. After upgrading, crates that warn at a terminal
-width miss once. Piped builds and capped dependencies keep their keys.
+hide rustc's error about them. When terminal width handling was introduced,
+crates that warned at a terminal width missed once.
+
+Cargo builds every dependency that is not a path package with
+`--cap-lints allow`. Under exactly one such cap and no `--force-warn`, rustc
+lowers every lint to `allow` and emits no warnings, so neither the lint levels
+nor how diagnostics are rendered can change the artifacts or the outcome. For
+these units the key keeps only what rustc emits besides rendered text (JSON or
+not, `--json=artifacts`, `--json=future-incompat`) and `--check-cfg`. It leaves
+out `--error-format` human, short or json, `--color`, `--diagnostic-width`,
+`--json=diagnostic-short` and `diagnostic-rendered-ansi`, and every other lint
+level. For example, Cargo's human and short formats can share an entry. JSON
+builds share entries with other JSON builds that request the same artifact
+and future-incompatibility records. Within either group, the entry can also
+be reused with different lint levels, including `-D warnings`.
+
+Output without rendered text is stored under that key. Any other output, such
+as a `future-incompat` report, is stored under a second key derived from the
+first key and the flags it leaves out, and replays only for those flags. A
+repeated single-valued presentation option, an unknown option, `--force-warn`, a cap other than
+`allow`, `-W help`, `--json` without `--error-format=json`, and `--json` with
+`--color` keep every flag in the key. After upgrading, capped dependencies
+miss once. Kache combines supported repeated `--json` options into the same
+set of JSON records that rustc emits.
 
 Explicit per-kind Rust output destinations, such as `--emit=metadata=custom.rmeta`, pass through to rustc so it writes the requested file. Emit kinds without destinations still use the cache. This fix changes Rust cache keys, so existing Rust entries miss once after upgrading.
 

@@ -157,10 +157,47 @@ fn verify_durability_file(
     Ok(file)
 }
 
-/// A hardlinked ingest must not publish a writable shared inode.
+#[cfg(unix)]
+fn shared_blob_mode(mode: u32) -> u32 {
+    if mode & 0o111 == 0 { 0o444 } else { 0o555 }
+}
+
+/// Avoid hardlinking a private output that would need broader access to serve
+/// readers of the store. Its own copy may use the store's permissions.
+fn store_hardlink_source(source: &Path) -> bool {
+    fs::symlink_metadata(source).is_ok_and(|meta| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            if mode & shared_blob_mode(mode) != shared_blob_mode(mode) {
+                return false;
+            }
+        }
+        meta.file_type().is_file()
+    })
+}
+
+/// Seal a blob so it can be read through the store. An existing hardlink
+/// from an older writer may also name a private output. Remove write access
+/// from such an inode without granting new read or execute access.
 fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
     let mut perms = meta.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let current = perms.mode();
+        let mut sealed = shared_blob_mode(current);
+        if meta.nlink() > 1 {
+            sealed &= current;
+        }
+        if current & 0o7777 == sealed {
+            return Ok(());
+        }
+        perms.set_mode(sealed);
+    }
+    #[cfg(not(unix))]
     perms.set_readonly(true);
     fs::set_permissions(blob, perms)
 }
@@ -346,21 +383,17 @@ fn is_blob_hash_name(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
-/// Best-effort unlink of a blob file (clears read-only first).
+/// Best-effort unlink of a blob file. Another name may share its inode (a
+/// restored or ingested build output), so the removal changes its mode only
+/// where the platform refuses to unlink a read-only file.
 fn unlink_blob(blob: &Path) {
-    if blob.exists() {
-        if let Ok(meta) = fs::metadata(blob) {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(blob, perms);
-        }
-        if fs::remove_file(blob).is_err() && blob.exists() {
-            // Removal can fail transiently on Windows (sharing violation /
-            // delete-pending). The surviving blob may share an inode with a
-            // live build output (insert/restore hardlinks), so re-arm the
-            // read-only guard rather than leaving a writable blob behind.
-            set_blob_readonly(blob);
-        }
+    if crate::atomic::remove_file_robust(blob).is_err() {
+        // Removal can fail transiently on Windows (sharing violation /
+        // delete-pending). The surviving blob may share an inode with a
+        // live build output (insert/restore hardlinks), so re-arm the
+        // read-only guard rather than leaving a writable blob behind. A
+        // missing blob makes this a no-op.
+        set_blob_readonly(blob);
     }
 }
 
@@ -467,6 +500,12 @@ fn materialize_blob_with_durability(
     durable: bool,
 ) -> Result<bool> {
     if blob.is_file() {
+        // Content addressing hands every put of these bytes the blob already
+        // here, possibly sealed at a narrower mode by an older writer. The put
+        // about to reference it seals it, so a reused blob holds the same
+        // invariant as a published one. The put's locked phase runs this for
+        // every output, under the writer lock.
+        set_blob_readonly(blob);
         return Ok(false);
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
@@ -497,10 +536,7 @@ fn materialize_blob_with_durability(
                 && crate::link::try_reflink(source, tmp).is_ok();
             if reflink_ok {
                 ingest.set(StoreIngest::Reflink);
-            } else if allow_store_hardlink(
-                allow_hardlink,
-                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
-            ) {
+            } else if allow_store_hardlink(allow_hardlink, store_hardlink_source(source)) {
                 match try_store_hard_link(source, tmp) {
                     Ok(()) => {
                         ingest.set(StoreIngest::Hardlink);
@@ -907,10 +943,44 @@ fn restore_source_writable_if_unshared(source: &Path, blob: &Path) {
         return;
     }
     if let Ok(meta) = fs::metadata(source) {
-        let mut perms = meta.permissions();
+        let perms = meta.permissions();
         if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(source, perms);
+            let _ = fs::set_permissions(source, crate::link::owner_writable(perms));
+        }
+    }
+}
+
+/// A build output whose own inode a hardlinked staging snapshot sealed.
+///
+/// The output stays sealed only while a store name still is that inode, as
+/// after a warm restore. Every other outcome of its put (the blob already
+/// existed, a lost race, a refused output) gives it back its owner write bit
+/// when the put is done with it, on every exit path.
+struct SealedOutput<'a> {
+    source: &'a Path,
+    /// The store name that may share the output's inode: the staging
+    /// snapshot until its hash is known, then the blob it publishes to.
+    holder: Option<PathBuf>,
+}
+
+impl<'a> SealedOutput<'a> {
+    /// Only a hardlinked ingest seals the output; any other leaves it alone.
+    fn new(source: &'a Path, staged: &Path, ingest: StoreIngest) -> Self {
+        let holder = matches!(ingest, StoreIngest::Hardlink).then(|| staged.to_path_buf());
+        Self { source, holder }
+    }
+
+    fn held_by(&mut self, blob: PathBuf) {
+        if let Some(holder) = self.holder.as_mut() {
+            *holder = blob;
+        }
+    }
+}
+
+impl Drop for SealedOutput<'_> {
+    fn drop(&mut self) {
+        if let Some(holder) = &self.holder {
+            restore_source_writable_if_unshared(self.source, holder);
         }
     }
 }
@@ -3470,6 +3540,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);
 
             let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
+            let mut sealed_output = SealedOutput::new(source_path, &staged, ingest);
             let staged_meta = match fs::metadata(&staged) {
                 Ok(meta) => meta,
                 Err(e) => {
@@ -3486,6 +3557,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             total_size += size;
 
             let hash = crate::file_hash::hash_file(&staged)?;
+            sealed_output.held_by(self.blob_path(&hash));
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -4567,10 +4639,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     || crate::link::try_reflink(source, tmp).is_ok());
             let ingest = if reflink_ok {
                 StoreIngest::Reflink
-            } else if allow_store_hardlink(
-                allow_hardlink,
-                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
-            ) {
+            } else if allow_store_hardlink(allow_hardlink, store_hardlink_source(source)) {
                 // Refused for symlink sources: hashing followed the link, but a
                 // hardlink would link the symlink itself — a pointer into mutable
                 // external state, never valid for a blob (same rule as
@@ -4841,16 +4910,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             stats.scanned += 1;
             let size = meta.len();
-            // Staging temps may be hardlinked (and therefore read-only); clear
-            // that before unlinking. Counted only when the file is really gone,
-            // so Windows sharing violations don't over-claim reclaimed bytes.
-            let removed = (|| -> std::io::Result<()> {
-                let mut perms = meta.permissions();
-                perms.set_readonly(false);
-                fs::set_permissions(entry.path(), perms)?;
-                fs::remove_file(entry.path())
-            })()
-            .is_ok();
+            // Staging temps may be hardlinked to a build output (and therefore
+            // read-only); the removal leaves that shared inode's mode alone.
+            // Counted only when the file is really gone, so Windows sharing
+            // violations don't over-claim reclaimed bytes.
+            let removed = crate::atomic::remove_file_robust(&entry.path()).is_ok();
             if removed {
                 stats.removed += 1;
                 stats.bytes_reclaimed += size;

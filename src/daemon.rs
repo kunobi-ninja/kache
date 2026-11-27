@@ -2560,10 +2560,13 @@ impl Daemon {
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     anyhow::bail!("daemon store mutex poisoned")
                 }
-                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
                 }
-                Err(std::sync::TryLockError::WouldBlock) => break,
             }
         }
         tracing::debug!("shared store busy for {wait:?}; reading through a private connection");

@@ -1145,10 +1145,9 @@ fn writable_mode(permissions: &fs::Permissions) -> u32 {
     }
 }
 
-/// Grant owner write access on an independent restore, retaining other bits.
-/// Call only after the target is known to have its own inode.
-fn set_owner_write_permission(path: &Path) -> Result<()> {
-    let mut permissions = fs::metadata(path)?.permissions();
+/// `permissions` plus owner write access, retaining every other bit. On Unix
+/// `set_readonly(false)` would grant write to group and other as well.
+pub(crate) fn owner_writable(mut permissions: fs::Permissions) -> fs::Permissions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1156,6 +1155,13 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     permissions.set_readonly(false);
+    permissions
+}
+
+/// Grant owner write access on an independent restore, retaining other bits.
+/// Call only after the target is known to have its own inode.
+fn set_owner_write_permission(path: &Path) -> Result<()> {
+    let permissions = owner_writable(fs::metadata(path)?.permissions());
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Permissions(
         path,
         writable_mode(&permissions),

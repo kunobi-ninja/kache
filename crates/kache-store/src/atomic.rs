@@ -94,24 +94,18 @@ pub(crate) fn retry_transient<T>(
     Err(last_err.expect("retry_transient records an error before the budget is spent"))
 }
 
-/// Remove a file, clearing the read-only attribute first to ensure deletion
-/// succeeds even on Windows when the file was marked read-only.
+/// Remove a file, even one marked read-only.
 ///
-/// On Unix, when the path is one of several hardlinks (`nlink > 1`), the RO bit
-/// is left alone: clearing it would make every name on the shared inode
-/// writable (including a published content-addressed blob the temp still
-/// shares). Unlink alone is enough — the remaining names keep their mode.
-fn remove_file_robust(path: &Path) -> std::io::Result<()> {
+/// Windows refuses to delete a read-only file, so the attribute is cleared
+/// there first. Unix unlinks by the directory's permissions alone, so the
+/// file's mode is left untouched: another name may share the inode (a
+/// published content-addressed blob, a build output), and clearing the bit
+/// would make every name writable, by group and other too.
+pub(crate) fn remove_file_robust(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();
         if perms.readonly() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.nlink() > 1 {
-                    return fs::remove_file(path);
-                }
-            }
             perms.set_readonly(false);
             let _ = fs::set_permissions(path, perms);
         }

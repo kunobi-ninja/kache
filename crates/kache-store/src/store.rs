@@ -5861,9 +5861,50 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// every eviction policy must retain that entry until the upload path
     /// retires the file. Read errors abort the sweep rather than treating an
     /// unreadable spool as empty and destroying data needed for replay.
+    ///
+    /// Every spool of the store counts: a writer with a scoped prefix queues
+    /// in `upload-queue-<scope>`, and an eviction by any daemon or command
+    /// sharing the store must keep those entries as well as its own.
     fn durable_upload_keys(&self) -> Result<std::collections::HashSet<String>> {
-        let dir = self.config.upload_spool_dir();
-        let entries = match fs::read_dir(&dir) {
+        let mut keys = std::collections::HashSet::new();
+        for dir in self.upload_spool_dirs()? {
+            keys.extend(self.spool_upload_keys(&dir)?);
+        }
+        Ok(keys)
+    }
+
+    /// The unscoped spool and every scoped `upload-queue-*` directory beside
+    /// it. A missing cache directory has only the unscoped one, which is then
+    /// missing too; any other read error fails closed.
+    fn upload_spool_dirs(&self) -> Result<Vec<PathBuf>> {
+        let unscoped = self.config.upload_spool_dir();
+        let scoped = format!(
+            "{}-",
+            unscoped.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut dirs = vec![unscoped];
+        let parent = &self.config.cache_dir;
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", parent.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", parent.display()))?;
+            if entry.file_name().to_string_lossy().starts_with(&scoped)
+                && entry.file_type()?.is_dir()
+            {
+                dirs.push(entry.path());
+            }
+        }
+        Ok(dirs)
+    }
+
+    /// The keys one spool directory pins; a missing directory pins none.
+    fn spool_upload_keys(&self, dir: &Path) -> Result<std::collections::HashSet<String>> {
+        let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(std::collections::HashSet::new());

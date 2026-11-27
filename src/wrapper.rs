@@ -9985,7 +9985,9 @@ impl KeyEventRecord {
     /// Name the terminal width an entry key was derived for, so a miss
     /// explained against a hit at another width says what changed.
     fn note_entry_key(&mut self, key: &rustc_diagnostics::EntryKey) {
-        if let (Some(columns), Some(fields)) = (key.width, self.fields.as_mut()) {
+        if let (Some(rustc_diagnostics::Derived::Width(columns)), Some(fields)) =
+            (key.derived, self.fields.as_mut())
+        {
             fields.insert("diagnostic_width".to_string(), columns.to_string());
         }
     }

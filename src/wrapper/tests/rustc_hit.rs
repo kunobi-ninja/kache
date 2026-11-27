@@ -142,7 +142,7 @@ fn shared_width_fixture() -> Fixture {
 fn width_key() -> rustc_diagnostics::EntryKey {
     rustc_diagnostics::lookup_keys(&shared_width_fixture().args, CACHE_KEY)
         .pop()
-        .filter(|key| key.width == Some(80))
+        .filter(|key| key.derived == Some(rustc_diagnostics::Derived::Width(80)))
         .unwrap()
 }
 

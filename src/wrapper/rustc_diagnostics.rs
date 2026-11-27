@@ -1,35 +1,60 @@
-//! Rust entries for invocations whose key omits the terminal width.
+//! Rust entries for invocations whose key omits how diagnostics render.
 //!
 //! The cache key leaves out one valid `--diagnostic-width`, so a compile run
 //! from a terminal, after a resize, or through a pipe computes one shared key.
-//! Output that renders the same at every width is stored there. Rendered
-//! diagnostics are stored under a key derived from the shared key and the
-//! width, so a hit always replays them at the width the invocation asked for.
+//! A unit whose lints are all capped at `allow` leaves out every presentation
+//! and lint flag ([`RustcArgs::capped_presentation`]), so `cargo build`, an IDE
+//! asking for JSON and a profile with `-D warnings` share one key too.
+//! Output that renders the same under every omitted flag is stored there.
+//! Rendered diagnostics are stored under a key derived from the shared key and
+//! the omitted flags, so a hit always replays them as the invocation asked.
 
 use super::{EntryMeta, RustcArgs, Store};
+use crate::args::CappedPresentation;
 use anyhow::Result;
 use serde_json::Value;
+
+/// What a key derived from the shared key stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Derived {
+    /// Rendered diagnostics at this terminal width.
+    Width(u16),
+    /// Rendered diagnostics of a capped unit under its omitted flags.
+    Presentation,
+}
 
 /// A key a Rust entry may be stored under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct EntryKey {
     pub key: String,
-    /// The terminal width this key was derived for; `None` for the shared key.
-    pub width: Option<u16>,
+    /// What this key was derived for; `None` for the shared key.
+    pub derived: Option<Derived>,
 }
 
 impl EntryKey {
     pub(super) fn shared(key: &str) -> Self {
         Self {
             key: key.to_string(),
-            width: None,
+            derived: None,
         }
     }
 
     pub(super) fn for_width(shared: &str, columns: u16) -> Self {
         Self {
             key: width_key(shared, columns),
-            width: Some(columns),
+            derived: Some(Derived::Width(columns)),
+        }
+    }
+
+    /// The key for rendered output of a capped unit (`args`).
+    pub(super) fn for_presentation(
+        shared: &str,
+        args: &RustcArgs,
+        capped: &CappedPresentation<'_>,
+    ) -> Self {
+        Self {
+            key: presentation_key(shared, args, capped),
+            derived: Some(Derived::Presentation),
         }
     }
 
@@ -38,7 +63,7 @@ impl EntryKey {
     pub(super) fn bound_to_checkout(&self, checkout: &[u8]) -> Self {
         Self {
             key: checkout_key(&self.key, checkout),
-            width: self.width,
+            derived: self.derived,
         }
     }
 }
@@ -69,13 +94,42 @@ fn width_key(shared: &str, columns: u16) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// The key for rendered output of a capped unit: every flag its shared key
+/// omits, diagnostic and lint tokens apart and each in argv order. Derived
+/// from the shared key alone, so no input is hashed twice.
+fn presentation_key(shared: &str, args: &RustcArgs, capped: &CappedPresentation<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.rustc.capped-presentation.v1\0");
+    hasher.update(shared.as_bytes());
+    let diagnostics = args
+        .diagnostic_flags
+        .iter()
+        .map(|flag| (b'd', flag.as_str()));
+    let lints = capped.dropped_lint_flags.iter().map(|flag| (b'l', *flag));
+    for (kind, token) in diagnostics.chain(lints) {
+        hasher.update(&[kind]);
+        hasher.update(&(token.len() as u64).to_le_bytes());
+        hasher.update(token.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The key rendered output of this invocation is stored under, if its shared
+/// key omits anything that renders: every presentation flag of a capped
+/// unit, otherwise one valid terminal width.
+fn derived_key(args: &RustcArgs, shared: &str) -> Option<EntryKey> {
+    match args.capped_presentation() {
+        Some(capped) => Some(EntryKey::for_presentation(shared, args, &capped)),
+        None => args
+            .omitted_diagnostic_width()
+            .map(|width| EntryKey::for_width(shared, width)),
+    }
+}
+
 /// Shared keys can be queried from the remote store.
 pub(super) fn lookup_keys(args: &RustcArgs, shared: &str) -> Vec<EntryKey> {
     std::iter::once(EntryKey::shared(shared))
-        .chain(
-            args.omitted_diagnostic_width()
-                .map(|width| EntryKey::for_width(shared, width)),
-        )
+        .chain(derived_key(args, shared))
         .collect()
 }
 
@@ -97,20 +151,20 @@ pub(super) fn local_lookup_keys<'a>(
 }
 
 /// Where a successful compile is stored. Only rendered output from an
-/// invocation with a terminal width needs that width's key.
+/// invocation whose shared key omits how it renders needs a derived key.
 pub(super) fn store_key(args: &RustcArgs, shared: &str, stdout: &str, stderr: &str) -> EntryKey {
-    match args.omitted_diagnostic_width() {
-        Some(columns) if !width_independent(stdout, stderr) => EntryKey::for_width(shared, columns),
+    match derived_key(args, shared) {
+        Some(derived) if !width_independent(stdout, stderr) => derived,
         _ => EntryKey::shared(shared),
     }
 }
 
-/// A shared-key entry serves a terminal width only when its output does not
-/// depend on one. An invocation without a width accepts any shared entry:
-/// width-dependent output is stored there only by such invocations.
+/// A shared-key entry serves an invocation with a derived key only when its
+/// output does not render. Any other invocation accepts any shared entry:
+/// rendered output is stored there only by such invocations.
 pub(super) fn diagnostics_match(args: &RustcArgs, key: &EntryKey, meta: &EntryMeta) -> bool {
-    key.width.is_some()
-        || args.omitted_diagnostic_width().is_none()
+    key.derived.is_some()
+        || derived_key(args, &key.key).is_none()
         || width_independent(&meta.stdout, &meta.stderr)
 }
 
@@ -177,7 +231,8 @@ pub(super) fn width_independent(stdout: &str, stderr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryKey, local_lookup_keys, lookup_keys, store_key, width_independent, width_key,
+        Derived, EntryKey, diagnostics_match, local_lookup_keys, lookup_keys, presentation_key,
+        store_key, width_independent, width_key,
     };
     use crate::args::RustcArgs;
 
@@ -232,7 +287,7 @@ mod tests {
         let elsewhere = args_in(&[], &[("CARGO_MANIFEST_DIR", "/w/two/a")]);
         assert!(!local_lookup_keys(&elsewhere, &shared).any(|key| key == keys[2]));
         assert_eq!(lookup_keys(&cargo, &shared), [shared_key, width]);
-        assert_eq!(keys[3].width, Some(80));
+        assert_eq!(keys[3].derived, Some(Derived::Width(80)));
     }
 
     #[test]
@@ -260,7 +315,7 @@ mod tests {
                 EntryKey::shared(&shared),
                 EntryKey {
                     key: width_key(&shared, 80),
-                    width: Some(80),
+                    derived: Some(Derived::Width(80)),
                 },
             ]
         );
@@ -279,16 +334,16 @@ mod tests {
         let shared = "b".repeat(64);
         let artifact = r#"{"$message_type":"artifact","artifact":"libfoo.rlib","emit":"link"}"#;
         let terminal = args(&["--diagnostic-width=120"]);
-        assert_eq!(store_key(&terminal, &shared, "", artifact).width, None);
+        assert_eq!(store_key(&terminal, &shared, "", artifact).derived, None);
         assert_eq!(
             store_key(&terminal, &shared, "", "warning: unused\n"),
             EntryKey {
                 key: width_key(&shared, 120),
-                width: Some(120),
+                derived: Some(Derived::Width(120)),
             }
         );
         assert_eq!(
-            store_key(&args(&[]), &shared, "", "warning: unused\n").width,
+            store_key(&args(&[]), &shared, "", "warning: unused\n").derived,
             None
         );
     }
@@ -337,5 +392,159 @@ mod tests {
         ] {
             assert!(!width_independent("", stderr), "{stderr}");
         }
+    }
+
+    const CARGO_JSON: [&str; 2] = [
+        "--error-format=json",
+        "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+    ];
+    const ARTIFACT: &str = r#"{"$message_type":"artifact","artifact":"libfoo.rlib","emit":"link"}"#;
+    const REPORT: &str = r#"{"$message_type":"future_incompat","future_incompat_report":[{"diagnostic":{"rendered":"warning: this will be rejected"}}]}"#;
+
+    /// A capped dependency unit as Cargo invokes it, plus `extra`.
+    fn capped(extra: &[&str]) -> RustcArgs {
+        let mut flags = CARGO_JSON.to_vec();
+        flags.extend_from_slice(&["--cap-lints", "allow"]);
+        flags.extend_from_slice(extra);
+        args(&flags)
+    }
+
+    fn presentation(args: &RustcArgs, shared: &str) -> String {
+        let capped = args.capped_presentation().unwrap();
+        presentation_key(shared, args, &capped)
+    }
+
+    fn meta(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
+        crate::store::EntryMeta {
+            cache_key: "k".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            rustc_version: None,
+            crate_name: "foo".to_string(),
+            crate_types: vec![],
+            files: vec![],
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            features: vec![],
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: vec![],
+        }
+    }
+
+    #[test]
+    fn capped_units_look_up_the_shared_key_then_their_presentation_key() {
+        let shared = "d".repeat(64);
+        let unit = capped(&["--diagnostic-width=80"]);
+        let derived = EntryKey {
+            key: presentation(&unit, &shared),
+            derived: Some(Derived::Presentation),
+        };
+        assert_eq!(
+            lookup_keys(&unit, &shared),
+            [EntryKey::shared(&shared), derived.clone()]
+        );
+        assert_ne!(derived.key, width_key(&shared, 80));
+        // An unmodeled option keeps the flags keyed and only the width omitted.
+        assert_eq!(
+            lookup_keys(
+                &capped(&["--json=timings", "--diagnostic-width=80"]),
+                &shared
+            ),
+            [EntryKey::shared(&shared), EntryKey::for_width(&shared, 80)]
+        );
+    }
+
+    #[test]
+    fn presentation_keys_are_valid_and_distinct_per_omitted_flag() {
+        let shared = "0".repeat(64);
+        let base = capped(&[]);
+        let key = presentation(&base, &shared);
+        assert!(kache_format::is_valid_cache_key(&key), "{key}");
+        assert_eq!(key, presentation(&base, &shared));
+        assert_eq!(
+            key,
+            presentation(
+                &args(&[
+                    "--error-format",
+                    "json",
+                    "--json",
+                    "diagnostic-rendered-ansi,artifacts,future-incompat",
+                    "--cap-lints",
+                    "allow",
+                ]),
+                &shared
+            ),
+            "separated and attached diagnostic flags render the same"
+        );
+        assert_ne!(key, shared);
+        assert_ne!(key, presentation(&base, &"1".repeat(64)));
+        for other in [
+            &["--diagnostic-width=80"][..],
+            &["--json=diagnostic-short"][..],
+            &["-Awarnings"][..],
+            &["-W", "unused"][..],
+        ] {
+            assert_ne!(key, presentation(&capped(other), &shared), "{other:?}");
+        }
+        assert_ne!(
+            key,
+            presentation(
+                &args(&[CARGO_JSON[0], CARGO_JSON[1], "--cap-lints=allow"]),
+                &shared
+            ),
+            "the cap spelling is a dropped lint token"
+        );
+        // `--check-cfg` stays in the shared key, not the presentation.
+        assert_eq!(key, presentation(&capped(&["--check-cfg=cfg(a)"]), &shared));
+        // Order within a kind may change the rendering, interleaving cannot.
+        assert_ne!(
+            presentation(&capped(&["-Dwarnings", "-Aunused"]), &shared),
+            presentation(&capped(&["-Aunused", "-Dwarnings"]), &shared),
+        );
+        assert_eq!(
+            presentation(&args(&["--color=never", "--cap-lints=allow"]), &shared),
+            presentation(&args(&["--cap-lints=allow", "--color=never"]), &shared),
+        );
+        // A token's kind is digested with it.
+        let mut moved = base.capped_presentation().unwrap();
+        moved.dropped_lint_flags.insert(0, CARGO_JSON[1]);
+        let mut fewer = base.clone();
+        fewer.diagnostic_flags.pop();
+        assert_ne!(presentation_key(&shared, &fewer, &moved), key);
+    }
+
+    #[test]
+    fn capped_units_store_rendered_output_under_their_presentation_key() {
+        let shared = "e".repeat(64);
+        let unit = capped(&["-D", "warnings"]);
+        assert_eq!(
+            store_key(&unit, &shared, "", ARTIFACT),
+            EntryKey::shared(&shared)
+        );
+        assert_eq!(store_key(&unit, &shared, "", ""), EntryKey::shared(&shared));
+        let derived = EntryKey {
+            key: presentation(&unit, &shared),
+            derived: Some(Derived::Presentation),
+        };
+        assert_eq!(
+            store_key(&unit, &shared, "", &format!("{ARTIFACT}\n{REPORT}\n")),
+            derived
+        );
+        assert_eq!(store_key(&unit, &shared, "compiler output", ""), derived);
+    }
+
+    #[test]
+    fn capped_units_replay_rendered_output_only_from_their_presentation_key() {
+        let shared = "f".repeat(64);
+        let unit = capped(&[]);
+        let derived = lookup_keys(&unit, &shared).pop().unwrap();
+        let shared_key = EntryKey::shared(&shared);
+        let rendered = meta("", REPORT);
+        assert!(!diagnostics_match(&unit, &shared_key, &rendered));
+        assert!(diagnostics_match(&unit, &shared_key, &meta("", ARTIFACT)));
+        assert!(diagnostics_match(&unit, &derived, &rendered));
+        // An uncapped unit without a width stores rendered output there itself.
+        assert!(diagnostics_match(&args(&[]), &shared_key, &rendered));
     }
 }

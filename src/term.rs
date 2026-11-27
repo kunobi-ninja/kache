@@ -254,10 +254,10 @@ fn wrap_pieces(text: &str, columns: usize, split_wide_tokens: bool) -> Vec<Strin
         } else {
             vec![word.to_string()]
         };
-        for (index, chunk) in chunks.iter().enumerate() {
-            // A later slice of one token stays glued to the slice before it.
-            let gap = index == 0 && !line.is_empty();
-            if !line.is_empty() && width(&line) + usize::from(gap) + width(chunk) > columns {
+        for chunk in &chunks {
+            // A later slice fills the column, so the word space still wraps
+            // it onto the next line and the two slices stay glued.
+            if !line.is_empty() && width(&line) + 1 + width(chunk) > columns {
                 lines.push(std::mem::take(&mut line));
             }
             if !line.is_empty() {
@@ -337,7 +337,7 @@ fn table_fitted(
     };
     let fitted = |cells: &[&str]| -> Vec<String> {
         let plain = line(&mut cells.iter().copied());
-        let Some(fit) = fit.filter(|fit| *fit > 0 && columns > 0) else {
+        let Some(fit) = fit.filter(|fit| *fit > 0) else {
             return vec![plain];
         };
         // A row that already fits keeps its alignment, including a
@@ -704,6 +704,14 @@ mod tests {
         assert_eq!(wrap("/a/very/long/path", Some(4)), ["/a/very/long/path"]);
         assert_eq!(wrap("a  b", None), ["a  b"]);
         assert_eq!(wrap("", Some(20)), [""]);
+        // Zero is not a terminal width. `>=` would treat it as one and
+        // break the line before every word.
+        assert_eq!(wrap("a b", Some(0)), ["a b"]);
+        // The space counts. Without it each of these stays one line.
+        assert_eq!(wrap("a bcd", Some(4)), ["a", "bcd"]);
+        assert_eq!(wrap("abc d", Some(4)), ["abc", "d"]);
+        assert_eq!(wrap("abcd e", Some(4)), ["abcd", "e"]);
+        assert_eq!(wrap("ab cde", Some(6)), ["ab cde"]);
         assert_eq!(width("缓存"), 4);
         assert_eq!(width("\x1b[32m✓\x1b[0m"), 1);
     }
@@ -827,6 +835,34 @@ mod tests {
         // A reported width of 0 is not a terminal. The row stays one line.
         let unwrapped = table_fitted(&["WHY"], &[Align::Left], &[vec!["abcd".into()]], Some(0));
         assert_eq!(unwrapped, ["  WHY", "  abcd"]);
+        // A width of 0 means "do not split", including a token that is
+        // wider than 0. `&&` would cut it into characters.
+        assert_eq!(chunks_of("ab", 0), ["ab"]);
+        assert_eq!(chunks_of("abcd", 4), ["abcd"]);
+        assert_eq!(chunks_of("abcde", 4), ["abcd", "e"]);
+    }
+
+    #[test]
+    fn a_wrapped_row_keeps_the_gap_between_earlier_columns() {
+        let lines = table_fitted(
+            &["A", "B", "WHY"],
+            &[Align::Left, Align::Left, Align::Left],
+            &[vec![
+                "aa".into(),
+                "bb".into(),
+                "because-this-is-long".into(),
+            ]],
+            Some(20),
+        );
+        assert_eq!(
+            lines,
+            [
+                "  A    B    WHY",
+                "  aa   bb   because-",
+                "            this-is-",
+                "            long",
+            ]
+        );
     }
 
     #[test]

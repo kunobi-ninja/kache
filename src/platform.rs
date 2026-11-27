@@ -289,6 +289,176 @@ pub fn raise_open_file_limit() -> std::io::Result<Option<(libc::rlim_t, libc::rl
     Ok(Some((before, target)))
 }
 
+/// How many malloc arenas the daemon lets glibc keep.
+///
+/// glibc gives each thread an arena of its own on its first allocation, up
+/// to eight per core (1,536 on a 192-thread machine), and keeps what a
+/// thread frees for that arena. The daemon runs hundreds of threads, and a
+/// sweep's ranking or a housekeeping pass leaves its peak in whichever
+/// arena its thread had: a daemon on a 192-thread build host grew from 5.3
+/// to 10.9 GB (RSS and swap) in 2.5 hours, in about 1,100 arena heaps. A
+/// private daemon serving 30 rounds of builds grew to 3.2 GB holding 43 MB,
+/// still growing; with eight arenas it stayed at 0.63 GB from round 20 on.
+/// Each thread keeps a cache in front of the arenas (tcache), so a few
+/// arenas cost little contention.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub const DAEMON_MALLOC_ARENAS: libc::c_int = 8;
+
+/// Cap glibc's malloc arenas at [`DAEMON_MALLOC_ARENAS`], unless the
+/// environment sets `MALLOC_ARENA_MAX` (glibc then applies that itself).
+/// Returns the cap set. Arenas already made stay.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn limit_malloc_arenas() -> Option<libc::c_int> {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return None;
+    }
+    cap_malloc_arenas(DAEMON_MALLOC_ARENAS).then_some(DAEMON_MALLOC_ARENAS)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cap_malloc_arenas(arenas: libc::c_int) -> bool {
+    // SAFETY: mallopt only changes glibc's allocator tuning.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) == 1 }
+}
+
+/// Give the heap's free pages back to the system. glibc returns only the
+/// top of each arena on its own; after a sweep freed hundreds of megabytes
+/// in the middle of one, those pages stayed resident until reused.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn release_free_heap() {
+    // SAFETY: malloc_trim takes the arenas' own locks; 0 keeps no padding.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// This process's resident memory in bytes, from `/proc/self/statm`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf only reads a system constant.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page).ok().map(|page| pages * page)
+}
+
+/// When the daemon gives its free heap back, and why ([`HeapTrim`]).
+///
+/// Growth: once its resident memory has grown [`HeapTrimGate::GROWTH`] past
+/// the lowest it has been since the last trim. Sweeps and the builds'
+/// requests leave freed memory in glibc's arenas, which only a trim returns:
+/// a busy daemon went from 0.5 to 1.4 GB in the 15 minutes after a sweep,
+/// and a trim took it from 2.2 GB to 0.5 GB. Memory that is in use stays,
+/// and the next trim waits for as much growth again, so a daemon that really
+/// holds more trims no more often.
+///
+/// Quiet: once the builds have stopped, when it holds
+/// [`HeapTrimGate::QUIET_GROWTH`] more than it did at rest (after its last
+/// quiet trim, or the least since). A burst's last growth trim runs while
+/// the burst's memory is still in use, and what the burst frees after it
+/// stays resident until the daemon grows a whole [`HeapTrimGate::GROWTH`]
+/// again: four cold builds left a daemon at 0.88 GB for fifteen minutes,
+/// half a gigabyte above what a trim leaves. One trim at rest gives it
+/// back, and the next waits for another burst, so the daemon's own upkeep
+/// without builds is left to the growth rule.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Debug, Default)]
+pub struct HeapTrimGate {
+    floor: Option<u64>,
+    rest: Option<u64>,
+    quiet_trimmed: Option<u64>,
+}
+
+/// Why [`HeapTrimGate`] trims.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapTrim {
+    /// The heap grew past its floor.
+    Growth,
+    /// No build is running, and the heap holds more than at rest. `since`
+    /// names the quiet spell: the time of the last build request.
+    Quiet { since: u64 },
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl HeapTrim {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeapTrim::Growth => "growth",
+            HeapTrim::Quiet { .. } => "quiet",
+        }
+    }
+}
+
+/// One heap trim [`HeapTrimGate::trim_if_due`] ran: why, the resident bytes
+/// before and after, and how long it took.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Debug)]
+pub struct HeapTrimRun {
+    pub trim: HeapTrim,
+    pub before: u64,
+    pub after: u64,
+    pub elapsed: std::time::Duration,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl HeapTrimGate {
+    pub const GROWTH: u64 = 256 << 20;
+    pub const QUIET_GROWTH: u64 = 64 << 20;
+
+    /// Whether to trim at `resident` bytes, and why. `quiet` gives the time
+    /// of the last build request once the builds have stopped, and `None`
+    /// while they run; it is asked only when the heap holds
+    /// [`Self::QUIET_GROWTH`] more than at rest. A quiet spell trims once.
+    pub fn due(&mut self, resident: u64, quiet: impl FnOnce() -> Option<u64>) -> Option<HeapTrim> {
+        let floor = self.floor.map_or(resident, |floor| floor.min(resident));
+        let rest = self.rest.map_or(resident, |rest| rest.min(resident));
+        self.floor = Some(floor);
+        self.rest = Some(rest);
+        let spell = (resident >= rest.saturating_add(Self::QUIET_GROWTH))
+            .then(quiet)
+            .flatten()
+            .filter(|&since| self.quiet_trimmed != Some(since));
+        if let Some(since) = spell {
+            Some(HeapTrim::Quiet { since })
+        } else if resident >= floor.saturating_add(Self::GROWTH) {
+            Some(HeapTrim::Growth)
+        } else {
+            None
+        }
+    }
+
+    /// A trim for `trim` left `resident` bytes.
+    pub fn trimmed(&mut self, trim: HeapTrim, resident: u64) {
+        self.floor = Some(resident);
+        if let HeapTrim::Quiet { since } = trim {
+            self.rest = Some(resident);
+            self.quiet_trimmed = Some(since);
+        }
+    }
+
+    /// Read the resident memory (`resident`: [`resident_bytes`]) and trim
+    /// when [`Self::due`] says so. Blocking: `malloc_trim` walks every arena.
+    pub fn trim_if_due(
+        &mut self,
+        resident: impl Fn() -> Option<u64>,
+        quiet: impl FnOnce() -> Option<u64>,
+    ) -> Option<HeapTrimRun> {
+        let before = resident()?;
+        let trim = self.due(before, quiet)?;
+        let started = std::time::Instant::now();
+        release_free_heap();
+        let after = resident().unwrap_or(before);
+        self.trimmed(trim, after);
+        Some(HeapTrimRun {
+            trim,
+            before,
+            after,
+            elapsed: started.elapsed(),
+        })
+    }
+}
+
 /// The soft limit to ask for: the hard limit, capped by what the kernel lets
 /// one process open. `None` when that is no higher than `soft`.
 #[cfg(unix)]
@@ -420,6 +590,209 @@ pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> b
 
 #[cfg(test)]
 mod tests {
+    /// The arenas glibc has, read from malloc_info's XML.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn malloc_arena_count() -> usize {
+        let mut buffer: *mut libc::c_char = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        // SAFETY: open_memstream owns `buffer` until fclose, which leaves it
+        // NUL-terminated for us to read and free.
+        let xml = unsafe {
+            let stream = libc::open_memstream(&mut buffer, &mut size);
+            assert!(!stream.is_null());
+            assert_eq!(libc::malloc_info(0, stream), 0);
+            libc::fclose(stream);
+            let xml = std::ffi::CStr::from_ptr(buffer)
+                .to_string_lossy()
+                .into_owned();
+            libc::free(buffer.cast());
+            xml
+        };
+        xml.matches("<heap nr=").count()
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_heap_is_trimmed_after_growth_and_once_when_the_builds_stop() {
+        use super::HeapTrim::{Growth, Quiet};
+        const MIB: u64 = 1 << 20;
+        let busy = || None;
+        let mut gate = super::HeapTrimGate::default();
+        assert_eq!(
+            gate.due(500 * MIB, || Some(0)),
+            None,
+            "the first reading only sets the floor"
+        );
+        assert_eq!(gate.due(700 * MIB, busy), None);
+        // A sweep's own trim lowered it: growth counts from there.
+        assert_eq!(gate.due(300 * MIB, busy), None);
+        assert_eq!(gate.due(555 * MIB, busy), None);
+        assert_eq!(gate.due(556 * MIB, busy), Some(Growth));
+        // Memory in use stays: the next trim waits for as much growth again.
+        gate.trimmed(Growth, 550 * MIB);
+        assert_eq!(gate.due(805 * MIB, busy), None);
+        assert_eq!(gate.due(806 * MIB, busy), Some(Growth));
+        gate.trimmed(Growth, 790 * MIB);
+        // The builds stopped: what they freed after the last trim goes back,
+        // measured from rest (300 MiB), not from that trim (790 MiB).
+        assert_eq!(gate.due(870 * MIB, || Some(7)), Some(Quiet { since: 7 }));
+        gate.trimmed(Quiet { since: 7 }, 320 * MIB);
+        assert_eq!(
+            gate.due(383 * MIB, || panic!("asked below rest + QUIET_GROWTH")),
+            None
+        );
+        // Once per quiet spell: the daemon's own upkeep may grow meanwhile.
+        assert_eq!(gate.due(500 * MIB, || Some(7)), None);
+        assert_eq!(gate.due(500 * MIB, || Some(9)), Some(Quiet { since: 9 }));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_due_trim_reports_both_readings_and_moves_the_floor() {
+        use std::cell::RefCell;
+        const MIB: u64 = 1 << 20;
+        let mut gate = super::HeapTrimGate::default();
+        assert!(gate.trim_if_due(|| None, || Some(0)).is_none());
+        assert!(gate.trim_if_due(|| Some(300 * MIB), || None).is_none());
+        // Popped from the end: before, then after.
+        let readings = RefCell::new(vec![310 * MIB, 900 * MIB]);
+        let read = || readings.borrow_mut().pop();
+        let run = gate.trim_if_due(read, || None).expect("600 MiB of growth");
+        assert_eq!(run.trim, super::HeapTrim::Growth);
+        assert_eq!((run.before, run.after), (900 * MIB, 310 * MIB));
+        assert_eq!(gate.floor, Some(310 * MIB));
+        // An unreadable second reading keeps the first.
+        let readings = RefCell::new(vec![700 * MIB]);
+        let read = || readings.borrow_mut().pop();
+        let run = gate.trim_if_due(read, || None).expect("390 MiB of growth");
+        assert_eq!((run.before, run.after), (700 * MIB, 700 * MIB));
+        assert_eq!(super::HeapTrim::Growth.as_str(), "growth");
+        assert_eq!(super::HeapTrim::Quiet { since: 3 }.as_str(), "quiet");
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn resident_bytes_reads_this_process() {
+        let resident = super::resident_bytes().unwrap();
+        assert!(resident > 1 << 20, "{resident}");
+    }
+
+    /// Run the ignored test `name` of this binary in a process of its own,
+    /// with `MALLOC_ARENA_MAX` set to `arena_max` or unset.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn run_fixture(name: &str, arena_max: Option<&str>) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            name,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ]);
+        match arena_max {
+            Some(value) => command.env("MALLOC_ARENA_MAX", value),
+            None => command.env_remove("MALLOC_ARENA_MAX"),
+        };
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// glibc fixes its arena limit the first time a thread finds more than
+    /// eight arenas, and ignores `M_ARENA_MAX` after that: in a test process
+    /// whose other tests' threads got there first, the cap cannot work, as it
+    /// cannot in a daemon that sets it late. So the check runs in a process
+    /// of its own, as the daemon sets the cap, before its threads start.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn capped_malloc_arenas_stop_many_threads_making_one_each() {
+        run_fixture("platform::tests::capped_malloc_arenas_fixture", None);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_malloc_arena_max_from_the_environment_wins() {
+        run_fixture("platform::tests::capped_malloc_arenas_fixture", Some("2"));
+    }
+
+    /// `free` keeps the pages of a block in the middle of the heap; the trim
+    /// gives them back. In a process of its own, so no other test's
+    /// allocations move its resident memory.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn releasing_the_free_heap_returns_pages_free_kept() {
+        run_fixture("platform::tests::released_heap_fixture", None);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "run in a process of its own by releasing_the_free_heap_returns_pages_free_kept"]
+    fn released_heap_fixture() {
+        const MIB: u64 = 1 << 20;
+        // 128 MiB in blocks under glibc's mmap threshold, so they come from
+        // the heap, written so their pages are resident.
+        let blocks: Vec<Vec<u8>> = (0..2048)
+            .map(|_| std::hint::black_box(vec![1u8; 64 << 10]))
+            .collect();
+        // Above them, so freeing them leaves a hole rather than a top to trim.
+        let guard = std::hint::black_box(vec![1u8; 64 << 10]);
+        drop(blocks);
+        let kept = super::resident_bytes().unwrap();
+        super::release_free_heap();
+        let after = super::resident_bytes().unwrap();
+        drop(guard);
+        assert!(
+            after + 64 * MIB <= kept,
+            "{kept} bytes resident became {after}"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "run in a process of its own by the two arena tests above"]
+    fn capped_malloc_arenas_fixture() {
+        use std::sync::{Arc, Barrier};
+        if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+            // glibc applies the environment's value itself.
+            assert_eq!(super::limit_malloc_arenas(), None);
+            return;
+        }
+        assert_eq!(
+            super::limit_malloc_arenas(),
+            Some(super::DAEMON_MALLOC_ARENAS)
+        );
+        let before = malloc_arena_count();
+        // A thread takes an arena of its own on its first allocation while
+        // the count is under the cap: 32 threads alive at once would make 32.
+        let barrier = Arc::new(Barrier::new(33));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let block = std::hint::black_box(vec![1u8; 4096]);
+                    barrier.wait();
+                    barrier.wait();
+                    drop(block);
+                })
+            })
+            .collect();
+        barrier.wait();
+        let during = malloc_arena_count();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let cap = super::DAEMON_MALLOC_ARENAS as usize;
+        assert!(
+            during <= before.max(cap),
+            "{before} arenas became {during} with the cap at {cap}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn host_utilities_capture_bytes_without_request_cancellation() {

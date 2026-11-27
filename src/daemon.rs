@@ -2408,6 +2408,10 @@ const PERIODIC_GC_RETRY: Duration = Duration::from_secs(600);
 /// How many times a periodic sweep asks again for the stores it found held,
 /// [`PERIODIC_GC_RETRY`] apart: an hour, well inside the six-hour interval.
 const PERIODIC_GC_RETRIES: u32 = 6;
+/// How often the daemon reads its resident memory to see whether a heap
+/// trim is due (`HeapTrimGate`): one small `/proc` read.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_TRIM_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One periodic sweep: `sweep(None)` sweeps every store and returns those
 /// another GC held; while any are left, `pause(retry)`, then
@@ -7159,6 +7163,12 @@ pub fn run_server(
         tracing::info!("another daemon holds the run lock, exiting");
         return Ok(());
     };
+    // Before the runtime starts its threads, each of which would otherwise
+    // take an arena of its own.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Some(arenas) = crate::platform::limit_malloc_arenas() {
+        tracing::debug!(arenas, "capped glibc's malloc arenas");
+    }
     #[cfg(unix)]
     match crate::platform::raise_open_file_limit() {
         Ok(Some((before, after))) => {
@@ -7608,6 +7618,46 @@ async fn server_main(
             .await;
         }
     });
+
+    // Give back the free heap that sweeps and the builds' requests leave in
+    // glibc's arenas, and once more when the builds stop: see
+    // `HeapTrimGate`.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let trim_daemon = daemon.clone();
+        tokio::spawn(async move {
+            let gate = Arc::new(Mutex::new(crate::platform::HeapTrimGate::default()));
+            let mut interval = tokio::time::interval(HEAP_TRIM_CHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let gate = Arc::clone(&gate);
+                let daemon = trim_daemon.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let Ok(mut gate) = gate.lock() else {
+                        return;
+                    };
+                    let quiet = || {
+                        crate::maintenance::quiet_since(
+                            &daemon.request_clock,
+                            daemon.gc_hint_pending.load(Ordering::Acquire),
+                            || crate::scheduler::permits_in_use(&daemon.config.cache_dir),
+                        )
+                    };
+                    if let Some(run) = gate.trim_if_due(crate::platform::resident_bytes, quiet) {
+                        tracing::info!(
+                            reason = run.trim.as_str(),
+                            before_bytes = run.before,
+                            after_bytes = run.after,
+                            elapsed_ms = run.elapsed.as_millis() as u64,
+                            "gave free heap back"
+                        );
+                    }
+                })
+                .await;
+            }
+        });
+    }
 
     let maintenance_handle = config
         .index_auto_compact

@@ -65,6 +65,12 @@ impl RequestClock {
         Duration::from_millis(self.ms_at(now).saturating_sub(last))
     }
 
+    /// When the last request came, in milliseconds since the clock started.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn last_request_ms(&self) -> u64 {
+        self.last_ms.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn idle_for(&self) -> Duration {
         if self.active.load(Ordering::Acquire) != 0 {
             return Duration::ZERO;
@@ -97,6 +103,22 @@ impl Drop for BuildActivity {
 /// not quiet.
 pub(crate) fn is_quiet(permits: Option<u32>, since_last_request: Duration) -> bool {
     permits == Some(0) && since_last_request >= QUIET_AFTER
+}
+
+/// The time of the last build request once the builds have stopped, which
+/// names the quiet spell, and `None` while they run: no request or accepted
+/// work for [`QUIET_AFTER`], no hinted sweep pending and no permit held. The
+/// cheap checks come first; `permits` is a walk of the slot files.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn quiet_since(
+    clock: &RequestClock,
+    sweep_pending: bool,
+    permits: impl FnOnce() -> Option<u32>,
+) -> Option<u64> {
+    let since = clock.last_request_ms();
+    let idle = clock.idle_for();
+    let quiet = idle >= QUIET_AFTER && !sweep_pending && is_quiet(permits(), idle);
+    quiet.then_some(since)
 }
 
 /// What asked for the maintenance.
@@ -221,6 +243,31 @@ mod tests {
         assert!(clock.idle_for() < Duration::from_secs(1));
         clock.last_ms.store(0, Ordering::Relaxed);
         assert!(clock.idle_for() >= QUIET_AFTER);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_quiet_spell_is_named_by_the_last_request_and_needs_every_check() {
+        let no_permits = || Some(0);
+        let clock = RequestClock::idle();
+        clock.last_ms.store(1_234, Ordering::Relaxed);
+        // `idle()` puts the clock's origin two quiet windows back.
+        assert_eq!(quiet_since(&clock, false, no_permits), Some(1_234));
+        assert_eq!(quiet_since(&clock, true, no_permits), None);
+        assert_eq!(quiet_since(&clock, false, || Some(1)), None);
+        assert_eq!(quiet_since(&clock, false, || None), None);
+        // Busy clocks never walk the permit slots.
+        let clock = RequestClock::new();
+        assert_eq!(
+            quiet_since(&clock, false, || panic!(
+                "walked the permits of a busy clock"
+            )),
+            None
+        );
+        let clock = Arc::new(RequestClock::idle());
+        let _activity = clock.begin_activity();
+        clock.last_ms.store(0, Ordering::Relaxed);
+        assert_eq!(quiet_since(&clock, false, no_permits), None);
     }
 
     #[test]

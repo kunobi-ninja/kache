@@ -2521,16 +2521,18 @@ fn every_env_var_config_reads_maps_to_a_config_key() {
         gated, mapped,
         "ignore_env gates all other file-backed variables"
     );
-    // KACHE_PULL_REQUEST_PREFIX modifies a remote but does not describe one,
-    // so it must not make the host's [cache.remote] table yield to the
-    // environment.
+    // KACHE_PULL_REQUEST_PREFIX and KACHE_PROPOSAL_PREFIX modify a remote but
+    // do not describe one, so they must not make the host's [cache.remote]
+    // table yield to the environment.
     let remote: Vec<&str> = ENV_FILE_KEYS
         .iter()
         .filter(|(var, key)| {
             key.starts_with("cache.remote.")
                 && !matches!(
                     *var,
-                    "KACHE_PULL_REQUEST_PREFIX" | "KACHE_PULL_REQUEST_BUCKET"
+                    "KACHE_PULL_REQUEST_PREFIX"
+                        | "KACHE_PULL_REQUEST_BUCKET"
+                        | "KACHE_PROPOSAL_PREFIX"
                 )
         })
         .map(|(var, _)| *var)
@@ -3496,6 +3498,7 @@ fn test_file_config_roundtrip() {
                 atomic_write_dir: None,
                 pull_request_prefix: None,
                 pull_request_bucket: None,
+                proposal_prefix: None,
                 repository: None,
                 insecure: None,
             }),
@@ -7037,6 +7040,173 @@ fn a_pull_request_job_with_its_own_prefix_may_write_there() {
         "a protected push never uses the pull request prefix"
     );
     assert!(!config.remote_readonly);
+}
+
+/// Loads `remote_toml` from a snapshot environment: `vars` on top of a
+/// pinned config path, so the test never reads the live process environment.
+fn load_with_vars(remote_toml: &str, vars: &[(&str, &str)]) -> Config {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, remote_toml).unwrap();
+    let mut all = vec![
+        (
+            "KACHE_CONFIG".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+        ),
+        ("KACHE_HOST_CONFIG".to_owned(), String::new()),
+    ];
+    all.extend(
+        vars.iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    let invocation = InvocationEnv::from_parts(
+        all,
+        Some(dir.path().to_owned()),
+        Some(dir.path().to_owned()),
+        dir.path().to_owned(),
+    );
+    Config::load_for(&invocation).unwrap()
+}
+
+/// A GitHub job of `event` on an unprotected branch.
+fn github(event: &str) -> Vec<(&str, &str)> {
+    vec![
+        ("GITHUB_ACTIONS", "true"),
+        ("GITHUB_EVENT_NAME", event),
+        ("GITHUB_REF_TYPE", "branch"),
+        ("GITHUB_REF_PROTECTED", "false"),
+    ]
+}
+
+const S3_ARTIFACTS: &str =
+    "[cache.remote]\ntype = \"s3\"\nbucket = \"base-store\"\nprefix = \"artifacts\"\n";
+
+#[test]
+fn a_proposal_prefix_applies_outside_ci_and_the_env_wins_over_the_file() {
+    let with = format!("{S3_ARTIFACTS}proposal_prefix = \"proposals/file\"\n");
+    let config = load_with_vars(&with, &[]);
+    assert_eq!(
+        config.pull_request_prefix.as_deref(),
+        Some("proposals/file")
+    );
+    assert!(!config.remote_readonly);
+    let queue = config.upload_spool_dir();
+    let queue = queue.file_name().unwrap().to_str().unwrap();
+    assert!(
+        queue.starts_with("upload-queue-pr-"),
+        "a scoped writer gets its own upload queue: {queue}"
+    );
+
+    let env = [("KACHE_PROPOSAL_PREFIX", "proposals/env")];
+    let config = load_with_vars(&with, &env);
+    assert_eq!(config.pull_request_prefix.as_deref(), Some("proposals/env"));
+    assert!(!config.remote_readonly);
+    let config = load_with_vars(S3_ARTIFACTS, &env);
+    assert_eq!(config.pull_request_prefix.as_deref(), Some("proposals/env"));
+
+    let pinned = format!("[cache]\nignore_env = true\n{with}");
+    let config = load_with_vars(&pinned, &env);
+    assert_eq!(
+        config.pull_request_prefix.as_deref(),
+        Some("proposals/file"),
+        "ignore_env pins the file's value"
+    );
+
+    for blank in ["", "  "] {
+        let config = load_with_vars(&with, &[("KACHE_PROPOSAL_PREFIX", blank)]);
+        assert_eq!(config.pull_request_prefix, None, "{blank:?} turns it off");
+        assert!(!config.remote_readonly, "{blank:?}");
+    }
+    let config = load_with_vars(S3_ARTIFACTS, &[]);
+    assert_eq!(config.pull_request_prefix, None);
+    assert!(!config.remote_readonly);
+}
+
+#[test]
+fn an_unusable_proposal_prefix_makes_the_remote_read_only() {
+    for (base, bad) in [
+        ("artifacts", "artifacts"),
+        ("artifacts", "artifacts/x"),
+        ("proposals/x/inner", "proposals/x"),
+    ] {
+        let remote =
+            format!("[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"{base}\"\n");
+        let from_file = load_with_vars(&format!("{remote}proposal_prefix = \"{bad}\"\n"), &[]);
+        let from_env = load_with_vars(&remote, &[("KACHE_PROPOSAL_PREFIX", bad)]);
+        for config in [from_file, from_env] {
+            assert!(config.remote.is_some(), "{bad}: reads still work");
+            assert_eq!(config.pull_request_prefix, None, "{bad}");
+            assert!(
+                config.remote_readonly,
+                "{bad}: never writes the base prefix"
+            );
+        }
+    }
+    let readonly = format!("{S3_ARTIFACTS}proposal_prefix = \"artifacts\"\n");
+    let config = load_with_vars(&readonly, &[("KACHE_REMOTE_READONLY", "1")]);
+    assert!(config.remote_readonly, "already read-only stays read-only");
+
+    let oci = "[cache.remote]\ntype = \"oci\"\nrepository = \"ghcr.io/team/cache\"\n\
+               prefix = \"artifacts\"\nproposal_prefix = \"proposals/x\"\n";
+    for event in [None, Some("pull_request"), Some("push")] {
+        let vars = event.map(github).unwrap_or_default();
+        let config = load_with_vars(oci, &vars);
+        assert!(config.remote.is_some(), "{event:?}");
+        assert!(config.remote_readonly, "{event:?}");
+        assert_eq!(config.pull_request_prefix, None, "{event:?}");
+    }
+}
+
+#[test]
+fn a_proposal_prefix_wins_over_a_pull_request_prefix_and_bucket() {
+    let both = format!(
+        "{S3_ARTIFACTS}pull_request_prefix = \"artifacts-pr\"\npull_request_bucket = \"pr-store\"\n\
+         proposal_prefix = \"proposals/x\"\n"
+    );
+    let no_pr_bucket = |config: &Config| {
+        matches!(
+            config.require_remote().unwrap().backend,
+            RemoteBackendConfig::S3(ref s3) if s3.pull_request_bucket.is_none()
+        )
+    };
+    let config = load_with_vars(&both, &github("pull_request"));
+    assert_eq!(config.pull_request_prefix.as_deref(), Some("proposals/x"));
+    assert!(
+        !config.remote_readonly,
+        "its own prefix lifts the CI read-only policy like a pull request prefix"
+    );
+    assert!(
+        no_pr_bucket(&config),
+        "proposal writes stay in the bucket they read"
+    );
+    let mut vars = github("pull_request");
+    vars.push(("KACHE_PULL_REQUEST_BUCKET", "pr-store"));
+    let only_proposal = format!("{S3_ARTIFACTS}proposal_prefix = \"proposals/x\"\n");
+    assert!(no_pr_bucket(&load_with_vars(&only_proposal, &vars)));
+    assert!(
+        !no_pr_bucket(&load_with_vars(S3_ARTIFACTS, &vars)),
+        "without a proposal prefix the pull request bucket applies"
+    );
+
+    // An unprotected push is read-only by CI policy; the proposal prefix applies there too.
+    let config = load_with_vars(&both, &github("push"));
+    assert_eq!(config.pull_request_prefix.as_deref(), Some("proposals/x"));
+    assert!(!config.remote_readonly);
+}
+
+#[test]
+fn a_read_only_proposal_writer_still_reads_both_prefixes() {
+    let with = format!("{S3_ARTIFACTS}proposal_prefix = \"proposals/x\"\n");
+    let mut in_pull_request = github("pull_request");
+    in_pull_request.push(("KACHE_REMOTE_READONLY", "true"));
+    for vars in [vec![("KACHE_REMOTE_READONLY", "true")], in_pull_request] {
+        let config = load_with_vars(&with, &vars);
+        assert!(config.remote_readonly);
+        assert_eq!(config.pull_request_prefix.as_deref(), Some("proposals/x"));
+    }
+    let config = load_with_vars(&format!("[cache]\nremote_readonly = true\n{with}"), &[]);
+    assert!(config.remote_readonly);
+    assert_eq!(config.pull_request_prefix.as_deref(), Some("proposals/x"));
 }
 
 #[test]

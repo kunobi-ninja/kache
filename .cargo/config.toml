@@ -6,3 +6,9 @@
 # that wants a host file sets KACHE_HOST_CONFIG on its own command.
 [env]
 KACHE_HOST_CONFIG = ""
+# The bundled SQLite without process-wide allocation statistics: counting
+# them takes one mutex around every allocation and every page-cache overflow
+# page, which serializes the daemon's index statements when many run at once
+# on a large index. kache never reads them. A value set in the environment
+# wins.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"

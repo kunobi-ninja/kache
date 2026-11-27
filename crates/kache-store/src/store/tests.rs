@@ -8,6 +8,40 @@ fn connection_synchronous(db: &Connection) -> i64 {
         .unwrap()
 }
 
+/// One of SQLite's process-wide statistics, as `(current, highwater)`.
+fn sqlite_status(op: std::os::raw::c_int) -> (i64, i64) {
+    let (mut current, mut highwater) = (0i64, 0i64);
+    // SAFETY: sqlite3_status64 writes two i64 into the locals it is given,
+    // which outlive the call; it takes SQLite's own mutex for the read.
+    let rc = unsafe { rusqlite::ffi::sqlite3_status64(op, &mut current, &mut highwater, 0) };
+    assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "a known status op");
+    (current, highwater)
+}
+
+#[test]
+fn sqlite_keeps_no_process_wide_allocation_statistics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_index_db(&dir.path().join("index.db")).unwrap();
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+    // Counting them takes one mutex for the whole process around every
+    // allocation and every page-cache overflow page, so concurrent index
+    // statements on the daemon's connections queue on it. .cargo/config.toml
+    // builds the bundled SQLite without them.
+    assert_eq!(
+        sqlite_status(rusqlite::ffi::SQLITE_STATUS_MEMORY_USED),
+        (0, 0),
+        "SQLite counts its allocations: build it with SQLITE_DEFAULT_MEMSTATUS=0"
+    );
+    assert_eq!(
+        sqlite_status(rusqlite::ffi::SQLITE_STATUS_PAGECACHE_OVERFLOW),
+        (0, 0),
+        "SQLite counts page-cache overflow: build it with SQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
+    );
+}
+
 #[test]
 fn index_connections_take_the_configured_synchronous_mode() {
     const SQLITE_OFF: i64 = 0;

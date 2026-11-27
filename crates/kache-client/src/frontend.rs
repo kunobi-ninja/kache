@@ -66,6 +66,11 @@ pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
                 if let Some(exit) = attempt.exit_code() {
                     return Ok(exit);
                 }
+                if attempt == kache_ipc::execution::Attempt::HandedBack {
+                    // The daemon took this invocation and gave it back: the
+                    // engine compiles locally without asking that daemon again.
+                    return forward_engine_handed_back(&executable, version, &args, started_at);
+                }
                 #[cfg(windows)]
                 if let Some(exit) = attempt.recover_with(|| {
                     windows::try_bootstrap(
@@ -95,8 +100,26 @@ fn forward_engine(
     args: &[OsString],
     started_at: std::time::Instant,
 ) -> Result<i32> {
-    let (mut command, _argv_file) =
+    let (command, argv_file) =
         forwarded_command(executable, version, args, started_at, cfg!(windows))?;
+    run_engine(command, argv_file)
+}
+
+/// [`forward_engine`] with [`kache_ipc::execution::HANDED_BACK_ENV`] set.
+#[cfg(any(unix, windows))]
+fn forward_engine_handed_back(
+    executable: &std::path::Path,
+    version: &str,
+    args: &[OsString],
+    started_at: std::time::Instant,
+) -> Result<i32> {
+    let (mut command, argv_file) =
+        forwarded_command(executable, version, args, started_at, cfg!(windows))?;
+    command.env(kache_ipc::execution::HANDED_BACK_ENV, "1");
+    run_engine(command, argv_file)
+}
+
+fn run_engine(mut command: Command, _argv_file: Option<crate::argv_file::ArgvFile>) -> Result<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

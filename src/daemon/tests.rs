@@ -1,4 +1,5 @@
 mod post_upload_gc;
+mod request_lifecycle;
 use super::*;
 use std::fs;
 use std::sync::mpsc;
@@ -2582,14 +2583,6 @@ fn release_precedence_ignores_build_metadata_and_unknown_versions() {
         serde_json::from_str::<DaemonHealth>("{}").unwrap().version,
         ""
     );
-}
-
-#[test]
-fn send_retry_delay_uses_linear_backoff_and_pid_jitter() {
-    // Branch: retry backoff math. delay = 100*attempt + (pid*7)%50.
-    // pid 7 -> (49)%50 = 49; pid 8 -> (56)%50 = 6.
-    assert_eq!(send_retry_delay(1, 7), Duration::from_millis(100 + 49));
-    assert_eq!(send_retry_delay(3, 8), Duration::from_millis(300 + 6));
 }
 
 #[test]

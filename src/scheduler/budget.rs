@@ -18,7 +18,7 @@ pub(crate) struct InvocationWaitScope {
 
 impl InvocationWaitScope {
     pub(crate) fn enter() -> Self {
-        Self::with_budget(super::WAIT_TIMEOUT)
+        Self::with_budget(super::COORDINATION_ALLOWANCE)
     }
 
     pub(super) fn with_budget(allowance: Duration) -> Self {
@@ -80,11 +80,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compiler_coordination_allowance_defaults_to_thirty_minutes() {
+    fn compiler_coordination_allowance_is_two_minutes() {
         let _scope = InvocationWaitScope::enter();
         let wait = BudgetWait::start(Duration::from_secs(1800));
         assert!(wait.scoped());
-        assert_eq!(wait.timeout, Duration::from_secs(1800));
+        assert_eq!(wait.timeout, Duration::from_secs(120));
     }
 
     #[test]
@@ -155,7 +155,7 @@ mod tests {
         let _scope = InvocationWaitScope::enter();
         assert_eq!(
             BudgetWait::start(Duration::from_secs(1800)).timeout,
-            Duration::from_secs(1800)
+            Duration::from_secs(120)
         );
     }
 }

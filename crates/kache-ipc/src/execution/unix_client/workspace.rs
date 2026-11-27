@@ -9,31 +9,19 @@ use kache_protocol::execution::{
 use std::io::Seek;
 #[cfg(test)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::{fd::AsFd, unix::net::UnixDatagram};
 #[cfg(test)]
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 use std::{fs::File, io};
 
 #[derive(Default)]
 pub(super) struct Files(super::super::workspace::Files);
 impl Files {
+    /// The caller has already taken the request's contents descriptor.
     pub(super) fn execute(
         &mut self,
         operation: Workspace,
-        pipes: &UnixDatagram,
+        input: Option<File>,
     ) -> io::Result<Reply> {
-        let input = if matches!(
-            &operation,
-            Workspace::Write { .. } | Workspace::PrepareBytes { .. }
-        ) {
-            let mut files = crate::descriptors::receive(pipes.as_fd(), &[0; 16], 1)?;
-            Some(File::from(files.remove(0)))
-        } else {
-            None
-        };
         self.0.execute(operation, input).map(|reply| match reply {
             WorkspaceReply::Done => Reply::Done,
             WorkspaceReply::PreparedFile {
@@ -109,7 +97,6 @@ mod tests {
         let target = root.path().join("target");
         fs::write(&blob, b"cached bytes").unwrap();
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
-        let (_, pipes) = UnixDatagram::pair().unwrap();
         let mut files = Files::default();
         for executable in [false, true] {
             files
@@ -119,7 +106,7 @@ mod tests {
                         target: native(&target),
                         executable,
                     },
-                    &pipes,
+                    None,
                 )
                 .unwrap();
             assert_eq!(fs::read(&target).unwrap(), b"cached bytes");
@@ -142,7 +129,6 @@ mod tests {
         let blob = root.path().join("blob");
         let target = root.path().join("target");
         fs::write(&blob, b"cached bytes").unwrap();
-        let (_, pipes) = UnixDatagram::pair().unwrap();
         let mut files = Files::default();
         let Reply::PreparedFile { id, bytes, .. } = files
             .execute(
@@ -150,7 +136,7 @@ mod tests {
                     source: native(&blob),
                     target: native(&target),
                 },
-                &pipes,
+                None,
             )
             .unwrap()
         else {
@@ -161,7 +147,7 @@ mod tests {
         fs::write(&target, b"race winner").unwrap();
         assert_eq!(
             files
-                .execute(Workspace::Publish { id, replace: false }, &pipes)
+                .execute(Workspace::Publish { id, replace: false }, None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
@@ -174,14 +160,14 @@ mod tests {
                     source: native(&blob),
                     target: native(&target),
                 },
-                &pipes,
+                None,
             )
             .unwrap()
         else {
             panic!("no stage");
         };
         files
-            .execute(Workspace::Publish { id, replace: true }, &pipes)
+            .execute(Workspace::Publish { id, replace: true }, None)
             .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"cached bytes");
         files
@@ -190,7 +176,7 @@ mod tests {
                     source: native(&blob),
                     target: native(&target),
                 },
-                &pipes,
+                None,
             )
             .unwrap();
         let pending = fs::read_dir(root.path())
@@ -217,8 +203,6 @@ mod tests {
         let mut contents = tempfile::tempfile().unwrap();
         contents.write_all(&bytes).unwrap();
         contents.rewind().unwrap();
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
-        crate::descriptors::send(sender.as_fd(), &[0; 16], &[contents.as_fd()]).unwrap();
         let mut files = Files::default();
         files
             .execute(
@@ -226,7 +210,7 @@ mod tests {
                     path: native(&target),
                     mode: 0o644,
                 },
-                &receiver,
+                Some(contents),
             )
             .unwrap();
         let mut actual = Vec::new();
@@ -241,7 +225,7 @@ mod tests {
                 Workspace::Touch {
                     path: native(&target),
                 },
-                &receiver,
+                None,
             )
             .unwrap();
     }
@@ -249,7 +233,6 @@ mod tests {
     #[test]
     fn client_operations_reject_relative_paths_and_non_regular_timestamp_targets() {
         let root = tempfile::tempdir().unwrap();
-        let (_, pipes) = UnixDatagram::pair().unwrap();
         let mut files = Files::default();
         assert!(
             files
@@ -257,7 +240,7 @@ mod tests {
                     Workspace::Remove {
                         path: native(Path::new("relative"))
                     },
-                    &pipes
+                    None
                 )
                 .is_err()
         );
@@ -268,7 +251,7 @@ mod tests {
                         path: native(root.path()),
                         mode: 0o4777
                     },
-                    &pipes
+                    None
                 )
                 .is_err()
         );
@@ -278,7 +261,7 @@ mod tests {
                     Workspace::Touch {
                         path: native(root.path())
                     },
-                    &pipes
+                    None
                 )
                 .is_err()
         );
@@ -289,49 +272,10 @@ mod tests {
                         id: 88,
                         replace: false
                     },
-                    &pipes
+                    None
                 )
                 .is_err()
         );
-        assert!(
-            files
-                .execute(Workspace::Discard { id: 88 }, &pipes)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rejected_writes_discard_their_payload_before_the_next_operation() {
-        use std::io::{Seek, Write};
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("output");
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
-        let mut files = Files::default();
-        for (path, bytes, accepted) in [
-            (
-                PathBuf::from("invalid-relative"),
-                b"rejected".as_slice(),
-                false,
-            ),
-            (target.clone(), b"current".as_slice(), true),
-        ] {
-            let mut payload = tempfile::tempfile().unwrap();
-            payload.write_all(bytes).unwrap();
-            payload.rewind().unwrap();
-            crate::descriptors::send(sender.as_fd(), &[0; 16], &[payload.as_fd()]).unwrap();
-            assert_eq!(
-                files
-                    .execute(
-                        Workspace::Write {
-                            path: native(&path),
-                            mode: 0o644
-                        },
-                        &receiver
-                    )
-                    .is_ok(),
-                accepted
-            );
-        }
-        assert_eq!(fs::read(target).unwrap(), b"current");
+        assert!(files.execute(Workspace::Discard { id: 88 }, None).is_err());
     }
 }

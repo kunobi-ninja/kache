@@ -24,6 +24,7 @@ pub(super) struct Client {
     children: HashMap<u64, Pending>,
     next_id: u64,
     workspace: workspace::Files,
+    output_started: bool,
 }
 
 struct Pending {
@@ -115,14 +116,22 @@ impl Client {
                 children: HashMap::new(),
                 next_id: 0,
                 workspace: workspace::Files::default(),
+                output_started: false,
             },
             [peer.into(), peer_pipes.into()],
         ))
     }
 
-    /// Wait on both connections. Completion or disconnect must interrupt an
-    /// otherwise idle broker; compiler output travels over independent pipes.
-    pub(super) fn ready(&self, completion: BorrowedFd<'_>) -> io::Result<bool> {
+    /// Wait on both connections for at most `limit`. Completion or disconnect
+    /// must interrupt an otherwise idle broker; compiler output travels over
+    /// independent pipes. `None` when neither connection spoke in time,
+    /// `Some(true)` for a native request, `Some(false)` when a completion
+    /// frame (or the daemon's disconnect) is readable.
+    pub(super) fn broker_ready_within(
+        &self,
+        completion: BorrowedFd<'_>,
+        limit: std::time::Duration,
+    ) -> io::Result<Option<bool>> {
         let mut fds = [
             libc::pollfd {
                 fd: completion.as_raw_fd(),
@@ -135,17 +144,30 @@ impl Client {
                 revents: 0,
             },
         ];
-        retry_interrupted(|| checked(unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) }))?;
-        Ok(fds[0].revents == 0)
+        let timeout = libc::c_int::try_from(limit.as_millis()).unwrap_or(libc::c_int::MAX);
+        let ready =
+            retry_interrupted(|| checked(unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) }))?;
+        Ok((ready != 0).then_some(fds[0].revents == 0))
     }
 
+    /// Whether the daemon announced console output, or started a child on
+    /// this client's own output streams.
+    pub(super) fn output_started(&self) -> bool {
+        self.output_started
+    }
+
+    /// Requests and their descriptors arrive in separate messages. A daemon
+    /// stalled between them delays the request and never fails it, and a
+    /// contents descriptor the client cannot take ends the channel instead of
+    /// staying queued for the next request.
     pub(super) fn service(&mut self) -> anyhow::Result<bool> {
         use std::io::Read;
+        let control = self.control.get_ref().as_raw_fd();
+        // SAFETY: self.control owns the descriptor for this whole call.
+        let alive = || crate::peer_wait::connected(unsafe { BorrowedFd::borrow_raw(control) });
         let mut frame = Vec::new();
-        self.control
-            .by_ref()
-            .take(MAX_FRAME_BYTES)
-            .read_until(b'\n', &mut frame)?;
+        let mut request = self.control.by_ref().take(MAX_FRAME_BYTES);
+        crate::peer_wait::while_alive(alive, || request.read_until(b'\n', &mut frame))?;
         if frame.is_empty() {
             return Ok(false);
         }
@@ -154,7 +176,16 @@ impl Client {
             "incomplete native process request"
         );
         let command = serde_json::from_slice(&frame)?;
-        let (reply, files) = match self.execute(command) {
+        let contents = match &command {
+            Command::Workspace(operation) if super::workspace::carries_contents(operation) => {
+                let mut files = crate::peer_wait::while_alive(alive, || {
+                    crate::descriptors::receive(self.pipes.as_fd(), &[0; 16], 1)
+                })?;
+                Some(File::from(files.remove(0)))
+            }
+            _ => None,
+        };
+        let (reply, files) = match self.execute_with(command, contents) {
             Ok(result) => result,
             Err(error) => (
                 Reply::Failed {
@@ -164,7 +195,9 @@ impl Client {
                 Vec::new(),
             ),
         };
-        super::write_message(self.control.get_mut(), &reply)?;
+        let mut frame = serde_json::to_vec(&reply)?;
+        frame.push(b'\n');
+        crate::peer_wait::write_all_while_alive(&mut self.control.get_ref(), &frame, alive)?;
         if !files.is_empty() {
             let files = files.iter().map(AsFd::as_fd).collect::<Vec<_>>();
             crate::descriptors::send(self.pipes.as_fd(), &[0; 16], &files)?;
@@ -172,12 +205,21 @@ impl Client {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn execute(&mut self, command: Command) -> io::Result<(Reply, Vec<OwnedFd>)> {
+        self.execute_with(command, None)
+    }
+
+    fn execute_with(
+        &mut self,
+        command: Command,
+        contents: Option<File>,
+    ) -> io::Result<(Reply, Vec<OwnedFd>)> {
         let reply = match command {
             Command::Workspace(operation) => {
                 return self
                     .workspace
-                    .execute(operation, &self.pipes)
+                    .execute(operation, contents)
                     .map(|reply| (reply, Vec::new()));
             }
             Command::Spawn { command, jobserver } => return self.spawn(*command, jobserver),
@@ -197,6 +239,10 @@ impl Client {
                 drop(self.children.remove(&id).ok_or_else(unknown)?);
                 Reply::Done
             }
+            Command::OutputStarted => {
+                self.output_started = true;
+                Reply::Done
+            }
         };
         Ok((reply, Vec::new()))
     }
@@ -204,6 +250,9 @@ impl Client {
     fn spawn(&mut self, spawn: Spawn, indices: Vec<usize>) -> io::Result<(Reply, Vec<OwnedFd>)> {
         if self.children.len() >= 64 {
             return Err(invalid("too many native compiler children"));
+        }
+        if spawn.stdio.stdout == Stream::Inherit || spawn.stdio.stderr == Stream::Inherit {
+            self.output_started = true;
         }
         let program = PathBuf::from(spawn.program.decode().map_err(invalid)?);
         let cwd = PathBuf::from(spawn.cwd.decode().map_err(invalid)?);
@@ -438,6 +487,146 @@ mod tests {
     }
 
     #[test]
+    fn announced_output_and_children_on_client_streams_are_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, _endpoints) = fixture_with_manifest(root.path(), false, 0);
+        assert!(!client.output_started());
+        assert_eq!(
+            client.execute(Command::OutputStarted).unwrap().0,
+            Reply::Done
+        );
+        assert!(client.output_started());
+        for (stdout, stderr, shown) in [
+            (Stream::Inherit, Stream::Null, true),
+            (Stream::Null, Stream::Inherit, true),
+            (Stream::Pipe, Stream::Null, false),
+        ] {
+            let mut client = fixture(root.path());
+            let plan = Plan {
+                stdin: Stream::Null,
+                stdout,
+                stderr,
+            };
+            let (Reply::Spawned { id, .. }, _files) =
+                client.execute(spawn(root.path(), "exit 0", plan)).unwrap()
+            else {
+                panic!("missing child");
+            };
+            assert_eq!(client.output_started(), shown, "{plan:?}");
+            client.execute(Command::Release { id }).unwrap();
+        }
+    }
+
+    /// Shrink the client deadlines so a test can outlast them.
+    fn stalled_daemon_fixture(
+        root: &std::path::Path,
+    ) -> (Client, BufReader<UnixStream>, UnixDatagram) {
+        let (client, [control, pipes]) = fixture_with_manifest(root, false, 0);
+        let deadline = Some(std::time::Duration::from_millis(20));
+        client.control.get_ref().set_read_timeout(deadline).unwrap();
+        client.pipes.set_read_timeout(deadline).unwrap();
+        let control = UnixStream::from(control);
+        control
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        (client, BufReader::new(control), UnixDatagram::from(pipes))
+    }
+
+    fn write_request(target: &std::path::Path) -> Vec<u8> {
+        let mut frame = serde_json::to_vec(&Command::Workspace(
+            kache_protocol::execution::unix::Workspace::Write {
+                path: NativeString::capture(target.as_os_str()),
+                mode: 0o644,
+            },
+        ))
+        .unwrap();
+        frame.push(b'\n');
+        frame
+    }
+
+    /// A daemon stalled by memory reclaim, a CPU quota or SIGSTOP in the
+    /// middle of a request or before its descriptor delays the restore. It
+    /// must neither fail it nor leave the late descriptor queued for the
+    /// next request, which would write the previous file's bytes.
+    #[test]
+    fn a_stalled_daemon_delays_requests_and_their_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut control, pipes) = stalled_daemon_fixture(root.path());
+        let stall = || std::thread::sleep(std::time::Duration::from_millis(100));
+        for (name, bytes) in [
+            ("first", &b"first file"[..]),
+            ("second", &b"second file"[..]),
+        ] {
+            let target = root.path().join(name);
+            let frame = write_request(&target);
+            let mut contents = tempfile::tempfile().unwrap();
+            contents.write_all(bytes).unwrap();
+            contents.rewind().unwrap();
+            let reply = std::thread::scope(|threads| {
+                let daemon = threads.spawn(|| {
+                    let (head, tail) = frame.split_at(frame.len() / 2);
+                    control.get_mut().write_all(head).unwrap();
+                    stall();
+                    control.get_mut().write_all(tail).unwrap();
+                    stall();
+                    crate::descriptors::send(pipes.as_fd(), &[0; 16], &[contents.as_fd()]).unwrap();
+                    let mut reply = String::new();
+                    control.read_line(&mut reply).map(|_| reply)
+                });
+                let serviced = client.service();
+                let reply = daemon.join().unwrap();
+                assert!(serviced.unwrap(), "{name}");
+                serde_json::from_str::<Reply>(&reply.unwrap()).unwrap()
+            });
+            assert!(matches!(reply, Reply::Done), "{name}: {reply:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), bytes, "{name}");
+        }
+    }
+
+    /// Waiting for a stalled daemon ends when the daemon closes the channel.
+    #[test]
+    fn a_daemon_that_closes_the_channel_ends_a_descriptor_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut control, _pipes) = stalled_daemon_fixture(root.path());
+        control
+            .get_mut()
+            .write_all(&write_request(&root.path().join("target")))
+            .unwrap();
+        drop(control);
+        assert!(client.service().is_err());
+        assert!(!root.path().join("target").exists());
+    }
+
+    /// The client takes a request's descriptor before validating it, so a
+    /// rejected write never leaves its payload for the next operation.
+    #[test]
+    fn rejected_writes_consume_their_payload_before_the_next_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, mut control, pipes) = stalled_daemon_fixture(root.path());
+        let target = root.path().join("output");
+        for (path, bytes, accepted) in [
+            (
+                std::path::Path::new("invalid-relative"),
+                &b"rejected"[..],
+                false,
+            ),
+            (target.as_path(), &b"current"[..], true),
+        ] {
+            let mut payload = tempfile::tempfile().unwrap();
+            payload.write_all(bytes).unwrap();
+            payload.rewind().unwrap();
+            control.get_mut().write_all(&write_request(path)).unwrap();
+            crate::descriptors::send(pipes.as_fd(), &[0; 16], &[payload.as_fd()]).unwrap();
+            assert!(client.service().unwrap());
+            let mut reply = String::new();
+            control.read_line(&mut reply).unwrap();
+            let reply = serde_json::from_str::<Reply>(&reply).unwrap();
+            assert_eq!(matches!(reply, Reply::Done), accepted, "{reply:?}");
+        }
+        assert_eq!(std::fs::read(target).unwrap(), b"current");
+    }
+
+    #[test]
     fn terminal_and_jobserver_descriptors_follow_the_manifest() {
         let root = tempfile::tempdir().unwrap();
         for terminal in [false, true] {
@@ -458,13 +647,47 @@ mod tests {
                 producer.write_all(b"complete").unwrap();
             });
             let start = std::time::Instant::now();
-            assert!(!client.ready(completion.as_fd()).unwrap());
+            assert_eq!(
+                client
+                    .broker_ready_within(completion.as_fd(), WAIT)
+                    .unwrap(),
+                Some(false)
+            );
             assert!(start.elapsed() >= std::time::Duration::from_millis(10));
         });
         let (empty, _producer) = UnixStream::pair().unwrap();
         control.write_all(b"request").unwrap();
-        assert!(client.ready(empty.as_fd()).unwrap());
-        assert!(!client.ready(completion.as_fd()).unwrap());
+        assert_eq!(
+            client.broker_ready_within(empty.as_fd(), WAIT).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            client
+                .broker_ready_within(completion.as_fd(), WAIT)
+                .unwrap(),
+            Some(false)
+        );
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A daemon that neither completes nor asks for anything ends the wait
+    /// at the limit instead of parking the client forever.
+    #[test]
+    fn a_silent_daemon_ends_the_readiness_wait_at_its_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let (client, _endpoints) = fixture_with_manifest(root.path(), false, 0);
+        let (silent, _daemon) = UnixStream::pair().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            client
+                .broker_ready_within(silent.as_fd(), std::time::Duration::from_millis(50))
+                .unwrap(),
+            None
+        );
+        let waited = start.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(50), "{waited:?}");
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
     }
 
     #[test]

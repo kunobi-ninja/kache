@@ -20,6 +20,8 @@ pub(crate) struct Broker {
     finished: tokio::sync::mpsc::UnboundedSender<u64>,
     peer: Arc<PeerProcess>,
     env: InvocationEnv,
+    /// A console write or a child on the client's own streams was requested.
+    written: std::sync::atomic::AtomicBool,
 }
 
 impl Broker {
@@ -43,7 +45,18 @@ impl Broker {
             finished,
             peer,
             env,
+            written: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// See [`crate::invocation::io::InvocationIo::output_written`].
+    pub(crate) fn output_written(&self) -> bool {
+        self.written.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn note_written(&self) {
+        self.written
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn spawn(
@@ -67,6 +80,11 @@ impl Broker {
             cwd: NativeString::capture(cwd.as_os_str()),
             stdio,
         };
+        if stdio.stdout == kache_protocol::execution::process::Stream::Inherit
+            || stdio.stderr == kache_protocol::execution::process::Stream::Inherit
+        {
+            self.note_written();
+        }
         let Reply::Spawned { child } = self.call(Command::Spawn(Box::new(spawn)))? else {
             return Err(io::Error::other(
                 "frontend did not return a native compiler",
@@ -99,6 +117,7 @@ impl Broker {
     }
 
     pub(crate) fn write(&self, output: Output, bytes: &[u8]) -> io::Result<()> {
+        self.note_written();
         for chunk in output_chunks(bytes) {
             self.done(Command::Write {
                 output,

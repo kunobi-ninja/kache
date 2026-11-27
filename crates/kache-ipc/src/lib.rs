@@ -17,6 +17,7 @@ use std::path::Path;
 
 mod deadline_io;
 pub use deadline_io::finish_by;
+pub mod peer_wait;
 
 pub use interprocess::local_socket::ListenerOptions;
 #[cfg(feature = "async")]

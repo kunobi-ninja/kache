@@ -1,5 +1,9 @@
 //! The daemon owns the pipeline; its frontend owns native Windows launches.
 
+use super::execution_policy::{
+    CACHE_STAGE_BUDGET, CacheStageWatch, EXECUTION_HEARTBEAT, WORKER_STOP_GRACE, deliver,
+    execution_ticker, stop_worker, unfinished_reply,
+};
 use super::*;
 use crate::invocation::{
     InvocationContext, InvocationEnv,
@@ -166,6 +170,20 @@ async fn write_reply(stream: &TokioStream, reply: &ExecutionReply) -> Result<()>
     Ok(())
 }
 
+/// Return a committed invocation that has not started to the frontend.
+async fn hand_back(stream: &TokioStream, reason: &str) -> Result<()> {
+    tokio::time::timeout(
+        PREPARE_TIMEOUT,
+        write_reply(
+            stream,
+            &ExecutionReply::Fallback {
+                reason: reason.into(),
+            },
+        ),
+    )
+    .await?
+}
+
 async fn decline(stream: &TokioStream, reason: impl ToString) -> Result<()> {
     tokio::time::timeout(
         PREPARE_TIMEOUT,
@@ -215,7 +233,9 @@ pub(super) async fn handle(
     .await??;
     let mut frame = Vec::new();
     let commit = tokio::select! {
-        _ = lifecycle.draining() => return Ok(()),
+        // The frontend may already have written Commit: closing silently
+        // would turn this shutdown into its build failure. Nothing has run.
+        _ = lifecycle.draining() => return hand_back(stream, "daemon is shutting down").await,
         line = tokio::time::timeout(PREPARE_TIMEOUT, read_bounded_line(reader, &mut frame)) => line??,
     }.context("compiler frontend disconnected before Commit")?;
     anyhow::ensure!(
@@ -232,6 +252,19 @@ pub(super) async fn handle(
         write_reply(stream, &ExecutionReply::Accepted),
     )
     .await??;
+    // From here on every frame, heartbeats included, is written by a
+    // dedicated thread with its own handle on the connection: a starved
+    // runtime or worker pool cannot silence the daemon.
+    let frames = match frames::FrameWriter::start(stream, EXECUTION_HEARTBEAT) {
+        Ok(frames) => frames,
+        Err(error) => {
+            return hand_back(
+                stream,
+                &format!("execution frame writer unavailable: {error}"),
+            )
+            .await;
+        }
+    };
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
     let (send, mut calls) = tokio::sync::mpsc::channel(8);
@@ -255,6 +288,10 @@ pub(super) async fn handle(
         cancellation: Some(cancellation.clone()),
         priority: Some(priority),
     };
+    // Children and target-directory writes of an untrusted pipeline belong
+    // to the frontend, which stops them when it takes the invocation back.
+    let client_owns_effects = !trusted_pipeline;
+    let streams = context.io.clone();
     let activity = daemon.request_clock.begin_activity();
     let mut worker = tokio::task::spawn_blocking(move || {
         let _activity = activity;
@@ -269,6 +306,9 @@ pub(super) async fn handle(
         }
     });
     let mut unexpected = [0u8; 1];
+    let mut drain_seen = false;
+    let mut ticker = execution_ticker();
+    let mut watch = CacheStageWatch::new(CACHE_STAGE_BUDGET, Instant::now());
     let result = loop {
         let call = tokio::select! {
             biased;
@@ -280,6 +320,39 @@ pub(super) async fn handle(
                 let _ = worker.await;
                 return Ok(());
             }
+            _ = lifecycle.draining(), if !drain_seen => {
+                drain_seen = true;
+                if streams.output_written() {
+                    // Cargo is already reading this compile: let it finish
+                    // under the drain deadline.
+                    continue;
+                }
+                drop(calls);
+                drop(finished);
+                let stopped = stop_worker(&cancellation, &mut worker, WORKER_STOP_GRACE).await;
+                let reply = unfinished_reply(
+                    streams.output_written(),
+                    stopped,
+                    client_owns_effects,
+                    "daemon is shutting down".into(),
+                );
+                return deliver(frames, &reply).await;
+            }
+            _ = ticker.tick() => {
+                if watch.expired(Instant::now(), cancellation.child_activity()) {
+                    drop(calls);
+                    drop(finished);
+                    let stopped = stop_worker(&cancellation, &mut worker, WORKER_STOP_GRACE).await;
+                    let reply = unfinished_reply(
+                        streams.output_written(),
+                        stopped,
+                        client_owns_effects,
+                        format!("cache stages made no progress for {CACHE_STAGE_BUDGET:?}"),
+                    );
+                    return deliver(frames, &reply).await;
+                }
+                continue;
+            }
             // Reap completed owners before admitting another native spawn.
             Some(id) = finished.recv() => Call {
                 command: kache_protocol::execution::windows::Command::Finish { id },
@@ -288,7 +361,7 @@ pub(super) async fn handle(
             Some(call) = calls.recv() => call,
             result = &mut worker => break result,
         };
-        if let Err(error) = service_call(stream, reader, call).await {
+        if let Err(error) = service_call(&frames, reader, call).await {
             drop(calls);
             drop(finished);
             cancellation.cancel();
@@ -296,30 +369,34 @@ pub(super) async fn handle(
             return Err(error);
         }
     };
+    // A pipeline error or panic before any output is a cache failure, not a
+    // build failure: the frontend compiles locally.
     let reply = match result {
         Ok(Ok(exit_code)) => ExecutionReply::Complete { exit_code },
-        Ok(Err(error)) => ExecutionReply::Failed {
-            message: format!("{error:#}"),
-        },
-        Err(error) => ExecutionReply::Failed {
-            message: format!("compiler worker failed: {error}"),
-        },
+        Ok(Err(error)) => unfinished_reply(
+            streams.output_written(),
+            true,
+            client_owns_effects,
+            format!("{error:#}"),
+        ),
+        Err(error) => unfinished_reply(
+            streams.output_written(),
+            true,
+            client_owns_effects,
+            format!("compiler worker failed: {error}"),
+        ),
     };
-    write_reply(stream, &reply).await
+    deliver(frames, &reply).await
 }
 
 async fn service_call(
-    stream: &TokioStream,
+    frames: &frames::FrameWriter,
     reader: &mut BufReader<&TokioStream>,
     call: Call,
 ) -> Result<()> {
-    write_reply(
-        stream,
-        &ExecutionReply::WindowsControl {
-            command: call.command,
-        },
-    )
-    .await?;
+    frames.send(&ExecutionReply::WindowsControl {
+        command: call.command,
+    })?;
     let mut frame = Vec::new();
     let line = read_bounded_line(reader, &mut frame)
         .await?

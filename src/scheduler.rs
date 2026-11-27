@@ -95,6 +95,13 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 pub use kache_config::TEST_LEASE_ENV;
 
 pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
+/// One compile's total time waiting on other compiles of the same unit
+/// (discovery flight, compile flight, cache-key lock). Past it the compile
+/// runs uncoalesced, which is always correct and at worst repeats a peer's
+/// work: two minutes covers waiting behind a typical peer compile of the
+/// same unit, and a wedged or vanished owner no longer holds every waiter
+/// for the 30 min flight budget. Capacity waits keep their own 30 s cap.
+pub(crate) const COORDINATION_ALLOWANCE: Duration = Duration::from_secs(120);
 /// How long a test waits for slots before it names who holds them.
 const TEST_WAIT_NOTICE: Duration = Duration::from_secs(10);
 /// How long a test lease waits for its marker, never longer than its wait

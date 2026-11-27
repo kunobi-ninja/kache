@@ -5891,10 +5891,10 @@ fn listing_upload_spools_tolerates_only_a_missing_cache_directory() {
     let file = dir.path().join("a-file");
     fs::write(&file, b"not a directory").unwrap();
     store.config.cache_dir = file;
-    let blocked = store.durable_upload_keys().unwrap_err();
-    assert!(
-        format!("{blocked:#}").contains("a-file"),
-        "an unreadable cache directory fails closed: {blocked:#}"
+    let blocked = store.upload_spool_dirs().unwrap_err();
+    assert_eq!(
+        blocked.to_string(),
+        format!("reading {}", store.config.cache_dir.display())
     );
 }
 

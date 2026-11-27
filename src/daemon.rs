@@ -2567,7 +2567,7 @@ impl Daemon {
             }
         }
         tracing::debug!("shared store busy for {wait:?}; reading through a private connection");
-        f(&Store::open(&self.config)?)
+        f(&Store::open_read_only(&self.config)?)
     }
 
     pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
@@ -8868,16 +8868,20 @@ async fn handle_connection_started_at(
             }
             Err(e) => return Err(e.into()),
         };
-        let Some(_request) = lifecycle.begin() else {
-            break;
-        };
         let parsed = serde_json::from_str::<Request>(&line);
         if handler_slot.is_none()
             && !parsed.as_ref().is_ok_and(bypasses_handler_limit)
             && let Some(limiter) = &limiter
         {
-            handler_slot = Arc::clone(limiter).acquire_owned().await.ok();
+            handler_slot = tokio::select! {
+                biased;
+                _ = lifecycle.draining() => break,
+                slot = Arc::clone(limiter).acquire_owned() => Some(slot?),
+            };
         }
+        let Some(_request) = lifecycle.begin() else {
+            break;
+        };
         let start = Instant::now();
 
         let client_version = parsed

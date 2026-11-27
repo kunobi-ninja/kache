@@ -33,6 +33,12 @@ fn stats_answer_while_the_shared_store_is_held() {
     };
     held.1.recv().unwrap();
 
+    assert!(
+        daemon
+            .with_store_or_private(Duration::ZERO, |store| Ok(store.is_read_only()))
+            .unwrap(),
+        "status must not open another writer while the shared store is held"
+    );
     let started = Instant::now();
     let response = daemon.handle_stats(&stats_request());
     let elapsed = started.elapsed();

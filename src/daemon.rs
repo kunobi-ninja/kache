@@ -245,6 +245,9 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 /// Read timeout for a stats round trip. Generous: a busy daemon may be holding
 /// the index lock when the request lands.
 const STATS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `Stats` waits for the shared store before it reads through a
+/// private connection. Well inside [`STATS_READ_TIMEOUT`].
+const STATS_STORE_WAIT: Duration = Duration::from_millis(500);
 /// Read timeout for the stats refetch after a stale daemon was replaced. The
 /// replacement has just bound its socket and has nothing queued, so a slow
 /// answer here means something is wrong rather than busy.
@@ -2539,6 +2542,37 @@ impl Daemon {
             .ok_or_else(|| anyhow::anyhow!("daemon store failed to initialize"))
     }
 
+    /// Run `f` on the shared store, or on a private connection to the same
+    /// index once another holder has kept the shared one for `wait` (a GC
+    /// sweep, an import on a slow disk, a wedged worker). Status readers use
+    /// this so a stuck holder can never make `kache stats` hang with it; the
+    /// index is WAL-mode, so a second reader sees every committed row.
+    pub(crate) fn with_store_or_private<T>(
+        &self,
+        wait: Duration,
+        f: impl FnOnce(&Store) -> Result<T>,
+    ) -> Result<T> {
+        let shared = self.store_lock()?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match shared.try_lock() {
+                Ok(guard) => return f(&guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("daemon store mutex poisoned")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
+            }
+        }
+        tracing::debug!("shared store busy for {wait:?}; reading through a private connection");
+        f(&Store::open_read_only(&self.config)?)
+    }
+
     pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let guard = self
             .store_lock()?
@@ -3275,7 +3309,7 @@ impl Daemon {
 
     /// Handle a stats request — reads store and event log.
     pub fn handle_stats(&self, req: &StatsRequest) -> Response {
-        let inventory = match self.with_store(|store| {
+        let inventory = match self.with_store_or_private(STATS_STORE_WAIT, |store| {
             crate::store_view::read_with_main(
                 &self.config,
                 store,
@@ -8778,8 +8812,21 @@ async fn handle_connection_after_queue(
         tracing::warn!(%error, "rejected IPC connection from another local user");
         return Ok(());
     }
-    let _permit = limiter.acquire_owned().await.ok();
-    handle_connection_started_at(stream, daemon, lifecycle, request_started_at).await
+    handle_connection_started_at(stream, daemon, lifecycle, Some(limiter), request_started_at).await
+}
+
+/// Requests that answer from in-memory state or a bounded read, never wait
+/// on compiler work, and must stay available while every handler slot is
+/// occupied by blocked pipelines: liveness, status and shutdown.
+fn bypasses_handler_limit(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Health
+            | Request::Stats(_)
+            | Request::ExecutionStatus { .. }
+            | Request::Shutdown
+            | Request::GcHint
+    )
 }
 
 #[cfg(test)]
@@ -8788,15 +8835,19 @@ pub(crate) async fn handle_connection(
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
-    handle_connection_started_at(stream, daemon, lifecycle, Instant::now()).await
+    handle_connection_started_at(stream, daemon, lifecycle, None, Instant::now()).await
 }
 
 async fn handle_connection_started_at(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
     request_started_at: Instant,
 ) -> Result<()> {
+    // Taken by the first request that needs a handler slot, then held for
+    // the rest of the connection. Control requests never wait for one.
+    let mut handler_slot = None;
     // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
     // does not shut it down", which causes the reader to never see EOF and
@@ -8820,11 +8871,21 @@ async fn handle_connection_started_at(
             }
             Err(e) => return Err(e.into()),
         };
+        let parsed = serde_json::from_str::<Request>(&line);
+        if handler_slot.is_none()
+            && !parsed.as_ref().is_ok_and(bypasses_handler_limit)
+            && let Some(limiter) = &limiter
+        {
+            handler_slot = tokio::select! {
+                biased;
+                _ = lifecycle.draining() => break,
+                slot = Arc::clone(limiter).acquire_owned() => Some(slot?),
+            };
+        }
         let Some(_request) = lifecycle.begin() else {
             break;
         };
         let start = Instant::now();
-        let parsed = serde_json::from_str::<Request>(&line);
 
         let client_version = parsed
             .as_ref()

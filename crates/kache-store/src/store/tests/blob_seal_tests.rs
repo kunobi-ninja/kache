@@ -85,7 +85,7 @@ fn sealing_maps_every_permission_mode_to_the_store_mode() {
 fn owner_only_outputs_publish_world_readable_blobs() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
-    let ingests = ["copy", "reflink", "hardlink"];
+    let ingests = ["copy", "reflink"];
     for (index, ingest) in ingests.into_iter().enumerate() {
         for source_mode in [0o600, 0o640, 0o700, 0o750] {
             let output = dir
@@ -94,7 +94,9 @@ fn owner_only_outputs_publish_world_readable_blobs() {
             fs::write(&output, format!("{ingest} {source_mode:o}")).unwrap();
             set_mode(&output, source_mode);
             let _reflink = (ingest == "reflink").then(ModeDroppingIngest::enable);
-            let _hardlink = (ingest == "hardlink").then(ForceStoreHardlink::enable);
+            // Disable the real reflink in the copy case. A restrictive
+            // source is ineligible for hardlinking, so it must copy.
+            let _no_reflink = (ingest == "copy").then(ForceStoreHardlink::enable);
             let blob = put_one(
                 &store,
                 &format!("owner-only-{index}-{source_mode:o}"),
@@ -125,6 +127,25 @@ fn owner_only_outputs_publish_world_readable_blobs() {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blob_already_sealed_keeps_its_ctime() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("sealed");
+    fs::write(&blob, b"cached bytes").unwrap();
+    set_mode(&blob, 0o444);
+    let stamp = crate::file_hash::metadata_ctime_ns(&fs::metadata(&blob).unwrap());
+    // Separate this operation from the chmod above even on a filesystem
+    // using the kernel's coarse timestamp for permission changes.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    set_blob_readonly_checked(&blob).unwrap();
+    assert_eq!(
+        crate::file_hash::metadata_ctime_ns(&fs::metadata(&blob).unwrap()),
+        stamp,
+        "a metadata-only change invalidates hashes of every alias"
+    );
 }
 
 /// A hardlinked ingest that publishes keeps the output sealed: it is the

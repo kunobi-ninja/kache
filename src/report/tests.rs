@@ -21,7 +21,10 @@ fn reports_distinguish_fixed_prediction_bugs_and_keep_raw_details() {
     assert!(bypass_reason_words(&bypass.reasons[0]).contains("fixed in Kache 2.0.0-rc.3"));
     assert_eq!(
         bypass_reason_words(&bypass.reasons[1]),
-        old.passthrough_reason
+        format!(
+            "refused: {}",
+            old.passthrough_reason.split_once('|').unwrap().1
+        )
     );
     let mut lines = Vec::new();
     push_bypass_tables(&mut lines, &bypass);
@@ -5349,7 +5352,7 @@ fn only_compiles_kache_ran_and_did_not_store_are_uncached_compiles() {
     assert!(ran_compiler_uncached(&skipped));
     assert_eq!(
         uncached_compile_words(&skipped),
-        "compiled, not stored: inputs-changed"
+        "compiled, not stored: inputs changed, so this compile was not stored"
     );
     assert_eq!(
         uncached_compile_words(&passthrough("unsupported|assembly", false)),
@@ -5400,6 +5403,43 @@ fn adaptive_reasons_have_plain_words() {
         "edit rebuild: rustc rebuilt a crate still being edited incrementally (adaptive active)"
     );
     assert_eq!(uncached_reason_words("linker"), "linker");
+    assert_eq!(
+        uncached_reason_words("inputs-changed"),
+        "inputs changed, so this compile was not stored"
+    );
+    assert_eq!(
+        uncached_reason_words("not-a-compile|query / probe (--print, -vV)"),
+        "not a compile: query / probe (--print, -vV)"
+    );
+    assert_eq!(
+        uncached_reason_words("unsupported|assembly"),
+        "unsupported: assembly"
+    );
+    assert_eq!(
+        uncached_reason_words("unsupported|rustc build-script probe — not yet"),
+        "unsupported: rustc build-script probe, not cached yet"
+    );
+    assert_eq!(
+        uncached_reason_words("rustdoc flag (not yet supported)"),
+        "rustdoc flag, not cached yet"
+    );
+    assert_eq!(
+        uncached_reason_words(
+            "refused|build-script run not recorded: it ran over an existing OUT_DIR"
+        ),
+        "refused: build script ran over an existing OUT_DIR, so kache did not record it"
+    );
+    assert_eq!(
+        uncached_reason_words(
+            "not-a-compile|query / probe (--print, -vV); rustc build-script probe — not yet"
+        ),
+        "not a compile: query / probe (--print, -vV); rustc build-script probe, not cached yet"
+    );
+    assert_eq!(uncached_reason_words("refused: odd flag"), "odd flag");
+    assert_eq!(
+        uncached_reason_words("build-script-inputs-changed"),
+        "build-script inputs changed, so this compile was not stored"
+    );
 }
 
 #[test]

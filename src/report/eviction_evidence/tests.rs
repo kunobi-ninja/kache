@@ -32,9 +32,13 @@ fn horizon_is_independent_of_event_window_and_reads_production_schema() {
         text.contains("Eviction observations · 7d horizon"),
         "{text}"
     );
-    assert!(text.contains("900.0–900.0ms/logical GiB"));
+    assert!(text.contains("both rankings would delete: 1 judged, 0 recent"));
+    assert!(text.contains("Compiled again: 1, 900 ms (900.0 ms/logical GiB)"));
     assert!(text.contains("independent of the build-event window"));
-    assert!(text.contains("unknown cost 0"));
+    assert!(
+        !text.contains("unknown cost 0"),
+        "a zero unknown cost is not a row: {text}"
+    );
 }
 
 #[test]
@@ -118,11 +122,16 @@ fn distinct_cohorts_and_missing_cost_remain_visible() {
         }],
     };
     let text = lines(&report).join("\n");
-    assert!(text.contains("Store 5 live/shadow agreed: 2 mature, 0 immature, 0 invalid"));
-    assert!(text.contains("Store 5 live/shadow kept: 0 mature, 3 immature, 0 invalid"));
-    assert!(text.contains("Store 5 shadow only: 0 mature, 0 immature, 4 invalid"));
-    assert!(text.contains("unknown cost 1"));
-    assert!(text.contains("0–0ms (unavailable)"));
+    assert!(text.contains("Store 5, both rankings would delete: 2 judged, 0 recent\n"));
+    assert!(text.contains("Store 5, live deleted, other ranking would keep: 0 judged, 3 recent"));
+    assert!(text.contains(
+        "Store 5, other ranking would delete, live kept: 0 judged, 0 recent, 4 unusable"
+    ));
+    assert!(text.contains("Compiled again: 0, 0 ms (unavailable), unknown cost 1"));
+    assert!(
+        !text.contains("live deleted, other ranking would keep: 0 judged, 3 recent\n    Compiled"),
+        "a cohort with nothing demanded has no compiled-again line: {text}"
+    );
 }
 
 #[test]
@@ -150,12 +159,78 @@ fn the_block_shows_only_with_observations() {
     for cohort in 0..3 {
         let text = lines(&report(Some(cohort))).join("\n");
         assert!(text.contains("7d horizon"), "{text}");
-        assert!(text.contains("limit"), "{text}");
+        assert!(text.contains("do not change what gets deleted"), "{text}");
+        assert!(
+            text.contains("Recent rows are not in the compiled-again count."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Logical bytes include shared blobs and are not disk space freed."),
+            "{text}"
+        );
+        assert!(!text.contains("limit"), "{text}");
     }
+    let mut hours = report(Some(0));
+    hours.horizon_secs = 7_200;
+    let hours = lines(&hours).join("\n");
+    assert!(
+        hours.contains("Judged rows have finished the 2h horizon."),
+        "{hours}"
+    );
+    let mut ranged = EvictionHorizonEvidence::default();
+    ranged.live_shadow_kept.observations = 2;
+    ranged.live_shadow_kept.mature = 2;
+    ranged.live_shadow_kept.demand_within_horizon_lower = 1;
+    ranged.live_shadow_kept.demand_within_horizon_upper = 3;
+    ranged.live_shadow_kept.demanded_gross_compile_cost_ms_lower = 10;
+    ranged.live_shadow_kept.demanded_gross_compile_cost_ms_upper = 40;
+    ranged.live_shadow_kept.known_cost_logical_bytes = 1 << 30;
+    let ranged = EvictionEvidenceReport {
+        horizon_secs: HORIZON_SECS,
+        as_of_unix_secs: 0,
+        limitations: vec![],
+        stores: vec![StoreEvidence {
+            store_index: 0,
+            evidence: Some(ranged),
+            error: None,
+        }],
+    };
+    let ranged = lines(&ranged).join("\n");
+    assert!(
+        ranged.contains("Compiled again: 1–3, 10 ms–40 ms (10.0–40.0 ms/logical GiB)"),
+        "{ranged}"
+    );
+
     let mut errored = report(None);
     errored.stores[0].evidence = None;
     errored.stores[0].error = Some("index unavailable".into());
     assert!(lines(&errored).is_empty());
+}
+
+#[test]
+fn any_one_demand_or_cost_prints_compiled_again() {
+    let show = |edit: fn(&mut kache_store::EvictionEvidenceCohort)| {
+        let mut evidence = EvictionHorizonEvidence::default();
+        evidence.live_shadow_agreed.observations = 1;
+        edit(&mut evidence.live_shadow_agreed);
+        let report = EvictionEvidenceReport {
+            horizon_secs: HORIZON_SECS,
+            as_of_unix_secs: 0,
+            limitations: vec![],
+            stores: vec![StoreEvidence {
+                store_index: 0,
+                evidence: Some(evidence),
+                error: None,
+            }],
+        };
+        let text = lines(&report).join("\n");
+        assert!(text.contains("Compiled again"), "{text}");
+    };
+    show(|cohort| cohort.demand_within_horizon_lower = 1);
+    show(|cohort| cohort.demand_within_horizon_upper = 1);
+    show(|cohort| cohort.demanded_gross_compile_cost_ms_lower = 1);
+    show(|cohort| cohort.demanded_gross_compile_cost_ms_upper = 1);
+    show(|cohort| cohort.unknown_compile_cost = 1);
 }
 
 #[test]

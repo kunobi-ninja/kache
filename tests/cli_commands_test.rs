@@ -6222,7 +6222,9 @@ fn explain_all_lists_complete_history() {
         .stdout(predicates::str::contains("crate_0"))
         .stdout(predicates::str::contains("crate_14"))
         .stdout(predicates::str::contains("store_declined"))
-        .stdout(predicates::str::contains("inputs-changed"))
+        .stdout(predicates::str::contains(
+            "inputs changed, so this compile was not stored",
+        ))
         .stdout(predicates::str::contains("--print cfg"))
         .stdout(predicates::str::contains(
             "These records describe past builds. Rebuild to check the installed version.",

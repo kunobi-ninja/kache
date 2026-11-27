@@ -58,7 +58,8 @@ pub(super) fn collect(
 }
 
 /// The `stats --full` block, or nothing when no store has observed an
-/// eviction yet.
+/// eviction yet. The JSON report keeps the full [`LIMITATIONS`] list; this
+/// text is the part a person can read on one screen.
 pub(super) fn lines(report: &EvictionEvidenceReport) -> Vec<String> {
     if !has_observations(report) {
         return Vec::new();
@@ -80,19 +81,93 @@ pub(super) fn lines(report: &EvictionEvidenceReport) -> Vec<String> {
             continue;
         };
         for (name, cohort) in [
-            ("live/shadow agreed", &evidence.live_shadow_agreed),
-            ("live/shadow kept", &evidence.live_shadow_kept),
-            ("shadow only", &evidence.shadow_only),
+            ("both rankings would delete", &evidence.live_shadow_agreed),
+            (
+                "live deleted, other ranking would keep",
+                &evidence.live_shadow_kept,
+            ),
+            (
+                "other ranking would delete, live kept",
+                &evidence.shadow_only,
+            ),
         ] {
-            let cost = cohort
-                .demanded_cost_ms_per_logical_gib()
-                .map(|(lower, upper)| format!("{lower:.1}–{upper:.1}ms/logical GiB"))
-                .unwrap_or_else(|| "unavailable".into());
-            lines.push(format!("  Store {} {name}: {} mature, {} immature, {} invalid; recorded demand {}–{}; unknown cost {}; gross demanded compile cost {}–{}ms ({cost})",store.store_index,cohort.mature,cohort.immature,cohort.invalid,cohort.demand_within_horizon_lower,cohort.demand_within_horizon_upper,cohort.unknown_compile_cost,cohort.demanded_gross_compile_cost_ms_lower,cohort.demanded_gross_compile_cost_ms_upper));
+            lines.extend(cohort_lines(store.store_index, name, cohort));
         }
     }
-    lines.extend(report.limitations.iter().map(|limit| format!("  {limit}")));
+    lines.push(format!(
+        "  Judged rows have finished the {} horizon.",
+        horizon_label(report.horizon_secs)
+    ));
+    lines.push("  Recent rows are not in the compiled-again count.".to_string());
+    lines.push(
+        "  This covers every store, independent of the build-event window and root filter."
+            .to_string(),
+    );
+    lines.push("  Logical bytes include shared blobs and are not disk space freed.".to_string());
+    lines.push("  These observations do not change what gets deleted.".to_string());
     lines
+}
+
+fn cohort_lines(
+    store: usize,
+    name: &str,
+    cohort: &kache_store::EvictionEvidenceCohort,
+) -> Vec<String> {
+    let mut counts = format!(
+        "  Store {store}, {name}: {} judged, {} recent",
+        cohort.mature, cohort.immature
+    );
+    if cohort.invalid > 0 {
+        counts.push_str(&format!(", {} unusable", cohort.invalid));
+    }
+    let mut lines = vec![counts];
+    let demanded = cohort.demand_within_horizon_lower > 0
+        || cohort.demand_within_horizon_upper > 0
+        || cohort.demanded_gross_compile_cost_ms_lower > 0
+        || cohort.demanded_gross_compile_cost_ms_upper > 0
+        || cohort.unknown_compile_cost > 0;
+    if !demanded {
+        return lines;
+    }
+    let demand = span(
+        cohort.demand_within_horizon_lower,
+        cohort.demand_within_horizon_upper,
+    );
+    let cost = if cohort.demanded_gross_compile_cost_ms_lower
+        == cohort.demanded_gross_compile_cost_ms_upper
+    {
+        crate::term::duration_ms(cohort.demanded_gross_compile_cost_ms_lower)
+    } else {
+        format!(
+            "{}–{}",
+            crate::term::duration_ms(cohort.demanded_gross_compile_cost_ms_lower),
+            crate::term::duration_ms(cohort.demanded_gross_compile_cost_ms_upper)
+        )
+    };
+    let per = cohort
+        .demanded_cost_ms_per_logical_gib()
+        .map(|(lower, upper)| {
+            if lower == upper {
+                format!("{lower:.1} ms/logical GiB")
+            } else {
+                format!("{lower:.1}–{upper:.1} ms/logical GiB")
+            }
+        })
+        .unwrap_or_else(|| "unavailable".to_string());
+    let mut again = format!("    Compiled again: {demand}, {cost} ({per})");
+    if cohort.unknown_compile_cost > 0 {
+        again.push_str(&format!(", unknown cost {}", cohort.unknown_compile_cost));
+    }
+    lines.push(again);
+    lines
+}
+
+fn span(lower: u64, upper: u64) -> String {
+    if lower == upper {
+        lower.to_string()
+    } else {
+        format!("{lower}–{upper}")
+    }
 }
 
 /// Whether any store recorded an observation in any cohort.

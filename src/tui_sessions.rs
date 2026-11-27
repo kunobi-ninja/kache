@@ -684,13 +684,15 @@ pub(crate) fn passthrough_parts(reason: &str) -> (&str, &str) {
 /// A passthrough reason in one line: `kind: detail`, or plain words for a
 /// reason that has no kind.
 pub(crate) fn passthrough_words(reason: &str) -> String {
-    let (kind, detail) = passthrough_parts(reason);
-    let detail = known_bug(reason).map_or(detail, |bug| bug.current_words);
-    if kind.is_empty() {
-        crate::report::uncached_reason_words(detail)
-    } else {
-        format!("{kind}: {detail}")
+    if let Some(bug) = known_bug(reason) {
+        let (kind, _) = passthrough_parts(reason);
+        return if kind.is_empty() {
+            bug.current_words.to_string()
+        } else {
+            format!("{kind}: {}", bug.current_words)
+        };
     }
+    crate::report::uncached_reason_words(reason)
 }
 
 struct KnownBug {

@@ -2173,15 +2173,63 @@ pub(crate) fn uncached_reason_label(reason: &str) -> Option<&'static str> {
         "adaptive active" => Some(
             "edit rebuild: rustc rebuilt a crate still being edited incrementally (adaptive active)",
         ),
+        "inputs-changed" => Some("inputs changed, so this compile was not stored"),
+        "build-script-inputs-changed" => {
+            Some("build-script inputs changed, so this compile was not stored")
+        }
         _ => None,
     }
 }
 
 /// A passthrough reason as a report row shows it.
 pub(crate) fn uncached_reason_words(reason: &str) -> String {
-    uncached_reason_label(reason)
-        .map(str::to_string)
-        .unwrap_or_else(|| reason.to_string())
+    let reason = reason.trim();
+    if let Some(label) = uncached_reason_label(reason) {
+        return label.to_string();
+    }
+    // Legacy events wrote `refused: detail` with no category.
+    if let Some(detail) = reason.strip_prefix("refused: ") {
+        return detail_words(detail);
+    }
+    match reason.split_once('|') {
+        Some((kind, detail)) => format!(
+            "{}: {}",
+            kind_words(kind.trim()),
+            detail_words(detail.trim())
+        ),
+        None => detail_words(reason),
+    }
+}
+
+fn kind_words(kind: &str) -> String {
+    match kind {
+        "not-a-compile" => "not a compile".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// One clause of a refusal. Joined clauses stay separate sentences.
+fn detail_words(detail: &str) -> String {
+    if detail.contains("; ") {
+        return detail
+            .split("; ")
+            .map(detail_words)
+            .collect::<Vec<_>>()
+            .join("; ");
+    }
+    if let Some(label) = uncached_reason_label(detail) {
+        return label.to_string();
+    }
+    if detail == "build-script run not recorded: it ran over an existing OUT_DIR" {
+        return "build script ran over an existing OUT_DIR, so kache did not record it".to_string();
+    }
+    if let Some(rest) = detail.strip_suffix(" — not yet") {
+        return format!("{rest}, not cached yet");
+    }
+    if let Some(rest) = detail.strip_suffix(" (not yet supported)") {
+        return format!("{rest}, not cached yet");
+    }
+    detail.to_string()
 }
 
 fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {

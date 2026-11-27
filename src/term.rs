@@ -222,22 +222,76 @@ fn rows_with(rows: &[Row<'_>], output: Output) -> Vec<String> {
 
 /// Wrap prose at spaces; keep paths and other indivisible values intact.
 fn wrap(text: &str, columns: Option<usize>) -> Vec<String> {
-    let Some(columns) = columns else {
+    let Some(columns) = columns.filter(|columns| *columns > 0) else {
         return vec![text.to_owned()];
     };
+    let lines = wrap_pieces(text, columns, false);
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+/// Wrap a table cell. A token wider than the column is split, so the
+/// terminal does not break it at the screen edge.
+fn wrap_cell(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(1);
+    let lines = wrap_pieces(text, columns, true);
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn wrap_pieces(text: &str, columns: usize, split_wide_tokens: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
-        if !line.is_empty() && width(&line) + 1 + width(word) > columns {
-            lines.push(std::mem::take(&mut line));
+        let chunks = if split_wide_tokens {
+            chunks_of(word, columns)
+        } else {
+            vec![word.to_string()]
+        };
+        for chunk in &chunks {
+            // A later slice fills the column, so the word space still wraps
+            // it onto the next line and the two slices stay glued.
+            if !line.is_empty() && width(&line) + 1 + width(chunk) > columns {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(chunk);
         }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
     }
-    lines.push(line);
+    if !line.is_empty() {
+        lines.push(line);
+    }
     lines
+}
+
+/// `word` in pieces no wider than `columns`. A word that already fits is one
+/// piece, including when it is exactly `columns` wide.
+fn chunks_of(word: &str, columns: usize) -> Vec<String> {
+    if columns == 0 || width(word) <= columns {
+        return vec![word.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    for ch in word.chars() {
+        let mut next = part.clone();
+        next.push(ch);
+        if width(&next) > columns && !part.is_empty() {
+            parts.push(std::mem::take(&mut part));
+        }
+        part.push(ch);
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
 }
 
 /// How a table column lines up.
@@ -248,8 +302,19 @@ pub(crate) enum Align {
 }
 
 /// A header row and body rows under a two-space indent, each column as wide
-/// as its widest cell. The last column is not padded.
+/// as its widest cell. The last column is not padded. On a terminal, that
+/// column continues on the next line under itself instead of letting the
+/// screen split a reason in the middle.
 pub(crate) fn table(header: &[&str], align: &[Align], body: &[Vec<String>]) -> Vec<String> {
+    table_fitted(header, align, body, Output::current().columns)
+}
+
+fn table_fitted(
+    header: &[&str],
+    align: &[Align],
+    body: &[Vec<String>],
+    fit: Option<usize>,
+) -> Vec<String> {
     let columns = header.len();
     let mut widths: Vec<usize> = header.iter().map(|cell| width(cell)).collect();
     for row in body {
@@ -270,9 +335,58 @@ pub(crate) fn table(header: &[&str], align: &[Align], body: &[Vec<String>]) -> V
         }
         out.trim_end().to_string()
     };
-    let mut lines = vec![heading(line(&mut header.iter().copied()))];
+    let fitted = |cells: &[&str]| -> Vec<String> {
+        let plain = line(&mut cells.iter().copied());
+        let Some(fit) = fit.filter(|fit| *fit > 0) else {
+            return vec![plain];
+        };
+        // A row that already fits keeps its alignment, including a
+        // right-aligned last column.
+        if width(&plain) <= fit {
+            return vec![plain];
+        }
+        let last = columns - 1;
+        let mut prefix = String::from("  ");
+        for (column, cell) in cells.iter().copied().enumerate().take(last) {
+            if column > 0 {
+                prefix.push_str("   ");
+            }
+            match align.get(column).copied().unwrap_or(Align::Left) {
+                Align::Right => prefix.push_str(&pad_left(cell, widths[column])),
+                Align::Left => prefix.push_str(&pad(cell, widths[column])),
+            }
+        }
+        if last > 0 {
+            prefix.push_str("   ");
+        }
+        let cell = cells.get(last).copied().unwrap_or("");
+        let prefix_width = width(&prefix);
+        // One free column is enough for the first character. A prefix that
+        // already fills the screen keeps its own line.
+        let alongside = prefix_width < fit;
+        let indent = if alongside { prefix_width } else { 2 };
+        let available = fit.saturating_sub(indent).max(1);
+        let pieces = wrap_cell(cell, available);
+        let mut lines = Vec::new();
+        if alongside {
+            let mut first = prefix;
+            first.push_str(&pieces[0]);
+            lines.push(first.trim_end().to_string());
+            for piece in pieces.iter().skip(1) {
+                lines.push(format!("{}{piece}", " ".repeat(indent)));
+            }
+        } else {
+            lines.push(prefix.trim_end().to_string());
+            for piece in &pieces {
+                lines.push(format!("{}{piece}", " ".repeat(indent)));
+            }
+        }
+        lines
+    };
+    let mut lines: Vec<String> = fitted(header).into_iter().map(heading).collect();
     for row in body {
-        lines.push(line(&mut row.iter().map(String::as_str)));
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        lines.extend(fitted(&cells));
     }
     lines
 }
@@ -590,6 +704,14 @@ mod tests {
         assert_eq!(wrap("/a/very/long/path", Some(4)), ["/a/very/long/path"]);
         assert_eq!(wrap("a  b", None), ["a  b"]);
         assert_eq!(wrap("", Some(20)), [""]);
+        // Zero is not a terminal width. `>=` would treat it as one and
+        // break the line before every word.
+        assert_eq!(wrap("a b", Some(0)), ["a b"]);
+        // The space counts. Without it each of these stays one line.
+        assert_eq!(wrap("a bcd", Some(4)), ["a", "bcd"]);
+        assert_eq!(wrap("abc d", Some(4)), ["abc", "d"]);
+        assert_eq!(wrap("abcd e", Some(4)), ["abcd", "e"]);
+        assert_eq!(wrap("ab cde", Some(6)), ["ab cde"]);
         assert_eq!(width("缓存"), 4);
         assert_eq!(width("\x1b[32m✓\x1b[0m"), 1);
     }
@@ -641,6 +763,127 @@ mod tests {
             &[vec!["long".into(), "x".into()]],
         );
         assert_eq!(left, ["  A      B", "  long   x"]);
+    }
+
+    #[test]
+    fn a_row_that_fits_keeps_a_right_aligned_last_column() {
+        let lines = table_fitted(
+            &["", "TIME"],
+            &[Align::Left, Align::Right],
+            &[vec!["read".into(), "1 s".into()]],
+            Some(80),
+        );
+        assert_eq!(lines, ["         TIME", "  read    1 s"]);
+        // The plain row is exactly this wide. A `<` in place of `<=` wraps
+        // it and drops the right-aligned space before `1 s`.
+        let fit = lines.iter().map(|line| width(line)).max().unwrap();
+        assert_eq!(
+            table_fitted(
+                &["", "TIME"],
+                &[Align::Left, Align::Right],
+                &[vec!["read".into(), "1 s".into()]],
+                Some(fit),
+            ),
+            lines
+        );
+    }
+
+    #[test]
+    fn the_last_column_continues_under_itself() {
+        let reason = "not-a-compile|query / probe (--print, -vV)";
+        let lines = table_fitted(
+            &["COUNT", "WHY"],
+            &[Align::Right, Align::Left],
+            &[
+                vec!["16".into(), reason.into()],
+                vec!["13".into(), "inputs-changed".into()],
+            ],
+            Some(36),
+        );
+        let body = &lines[1..];
+        assert!(body.iter().all(|line| width(line) <= 36), "{body:?}");
+        assert!(
+            body[0].ends_with("not-a-compile|query /"),
+            "the token stays whole: {body:?}"
+        );
+        assert!(
+            body[1].starts_with("          probe"),
+            "the continuation sits under WHY: {body:?}"
+        );
+        assert!(body.iter().any(|line| line.contains("13")), "{body:?}");
+        assert!(!body[1].contains("13"), "{body:?}");
+    }
+
+    #[test]
+    fn a_token_wider_than_the_column_is_split_on_the_boundary() {
+        // "  abcdX" is wider than 6, so the cell wraps into a column of 4.
+        // "abcd" is exactly that wide and stays one piece; "ab c" fills it
+        // exactly and stays one piece too.
+        let lines = table_fitted(&["WHY"], &[Align::Left], &[vec!["abcdX".into()]], Some(6));
+        assert_eq!(lines, ["  WHY", "  abcd", "  X"]);
+        let joined = table_fitted(&["WHY"], &[Align::Left], &[vec!["ab c de".into()]], Some(6));
+        assert_eq!(joined, ["  WHY", "  ab c", "  de"]);
+        // "ab cde" is exactly the cell width. The next word wraps. A `>=`
+        // in the fit check would wrap before `cde`.
+        let exact = table_fitted(
+            &["WHY"],
+            &[Align::Left],
+            &[vec!["ab cde xyz".into()]],
+            Some(8),
+        );
+        assert_eq!(exact, ["  WHY", "  ab cde", "  xyz"]);
+        // A reported width of 0 is not a terminal. The row stays one line.
+        let unwrapped = table_fitted(&["WHY"], &[Align::Left], &[vec!["abcd".into()]], Some(0));
+        assert_eq!(unwrapped, ["  WHY", "  abcd"]);
+        // A width of 0 means "do not split", including a token that is
+        // wider than 0. `&&` would cut it into characters.
+        assert_eq!(chunks_of("ab", 0), ["ab"]);
+        assert_eq!(chunks_of("abcd", 4), ["abcd"]);
+        assert_eq!(chunks_of("abcde", 4), ["abcd", "e"]);
+    }
+
+    #[test]
+    fn a_wrapped_row_keeps_the_gap_between_earlier_columns() {
+        let lines = table_fitted(
+            &["A", "B", "WHY"],
+            &[Align::Left, Align::Left, Align::Left],
+            &[vec![
+                "aa".into(),
+                "bb".into(),
+                "because-this-is-long".into(),
+            ]],
+            Some(20),
+        );
+        assert_eq!(
+            lines,
+            [
+                "  A    B    WHY",
+                "  aa   bb   because-",
+                "            this-is-",
+                "            long",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_fills_the_screen_puts_the_cell_on_the_next_line() {
+        let lines = table_fitted(
+            &["NAME", "WHY"],
+            &[Align::Left, Align::Left],
+            &[vec!["long-name".into(), "because".into()]],
+            Some(12),
+        );
+        assert_eq!(lines, ["  NAME", "  WHY", "  long-name", "  because"]);
+        assert!(lines.iter().all(|line| width(line) <= 12), "{lines:?}");
+        // The name column plus its gap is 14 wide. At that exact width the
+        // reason still takes the next line. `<=` would start it on the name's line.
+        let exact = table_fitted(
+            &["NAME", "WHY"],
+            &[Align::Left, Align::Left],
+            &[vec!["long-name".into(), "because".into()]],
+            Some(14),
+        );
+        assert_eq!(exact, ["  NAME", "  WHY", "  long-name", "  because"]);
     }
 
     #[test]

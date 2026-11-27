@@ -2340,7 +2340,7 @@ fn why_lines_fit_the_width_they_are_given() {
     );
     let text = why_text(&mut s, 100).join("\n");
     assert!(text.contains("(queries, not compiles)"), "{text}");
-    assert!(text.contains("not-a-compile: --print cfg with"), "{text}");
+    assert!(text.contains("not a compile: --print cfg with"), "{text}");
 
     // The filter narrows the passthrough list and says so.
     s.why_filter = "rustc".to_string();

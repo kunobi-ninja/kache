@@ -629,6 +629,66 @@ fn an_older_release_reopening_the_index_does_not_empty_the_file_hash_memo() {
     assert_eq!(served(&db, "/older-release"), None);
 }
 
+/// A newer release stamps a higher schema generation; when this release
+/// opens that index (a build-script launcher keeps running the kache that
+/// installed it, so two releases open one store for a while), it neither
+/// runs its own DDL again nor stamps its older generation over the newer
+/// one, which would make the newer release run its DDL on its next open.
+#[test]
+fn index_from_a_newer_release_keeps_its_generation_and_skips_the_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    let newer = INDEX_SCHEMA_GENERATION + 1;
+    db.pragma_update(None, "user_version", newer).unwrap();
+    // Gone so a DDL pass shows: it would create the table again.
+    db.execute_batch("DROP TABLE incremental_dirs").unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, newer, "the newer generation was stamped down");
+    let tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'incremental_dirs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "the DDL ran on an index a newer release keeps");
+}
+
+/// Even when a newer index lacks what [`crate::file_hash::has_rule_columns`]
+/// checks (an older GC rebuilt the table), the DDL that puts the columns
+/// back keeps the newer generation.
+#[test]
+fn ddl_on_a_newer_index_never_stamps_its_generation_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    let newer = INDEX_SCHEMA_GENERATION + 1;
+    db.execute_batch(
+        "DROP TABLE file_hashes;
+         CREATE TABLE file_hashes (
+             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+             ctime_ns INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+             hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         ) WITHOUT ROWID;",
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", newer).unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert!(crate::file_hash::has_rule_columns(&db).unwrap());
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, newer, "the newer generation was stamped down");
+}
+
 /// GC in releases 0.27 to 1.0 opens the index when it starts and rebuilds
 /// a rowid `file_hashes` table, without `rule`, when it ends. If this
 /// release opened the index in between, the rebuild leaves generation 9 in

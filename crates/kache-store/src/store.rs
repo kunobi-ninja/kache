@@ -2134,8 +2134,16 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     // added or changed below. It cannot vouch for the memo rule columns
     // ([`crate::file_hash::has_rule_columns`]), so those are checked too.
     // Both checks only read.
+    //
+    // A higher generation is a newer release's stamp. That release ran its
+    // own DDL, which holds every statement below, so this release skips them
+    // as on a current index and never stamps its own generation over the
+    // newer one: a build-script launcher keeps running the kache that
+    // installed it until the script is rebuilt, so two releases open one
+    // store for a while, and a downward stamp makes the newer one run its
+    // DDL again.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation == INDEX_SCHEMA_GENERATION
+    if generation >= INDEX_SCHEMA_GENERATION
         && crate::file_hash::has_rule_columns(db)?
         && crate::cc_memo::has_shadowing_column(db)?
         && crate::cc_memo::has_header_macros_table(db)?
@@ -2303,7 +2311,11 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
         .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
-    db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
+    db.pragma_update(
+        None,
+        "user_version",
+        generation.max(INDEX_SCHEMA_GENERATION),
+    )?;
 
     Ok(())
 }
@@ -2339,6 +2351,10 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 /// 15: `cc_preprocess_memos.shadowing`. An older release stamps 14 back, so
 ///    the open also checks for the column.
 /// 16: `cc_header_macros`, checked for the same reason.
+///
+/// A release that finds a higher number leaves it (and skips the DDL): the
+/// stamp only ever goes up. Releases before this rule stamp their own number
+/// back, so a newer one runs its DDL once more after such an open.
 const INDEX_SCHEMA_GENERATION: i64 = 16;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the

@@ -3378,11 +3378,25 @@ fn shared_hardlink_restores_are_off_unless_switched_on() {
 fn probe_memos_live_under_the_configured_cache_dir() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
+    // The memos follow the loaded configuration, so no user or host config
+    // may select another store.
+    let config = dir.path().join("kache.toml");
+    std::fs::write(&config, "").unwrap();
+    let _config = set_kache_config_for_test(&config);
+    let _host_config = set_env_for_test("KACHE_HOST_CONFIG", Some("".as_ref()));
     // SAFETY: the process-state lock serialises environment edits.
     unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path()) };
     let probes = probe_memo_dir();
+    // Under a trust domain the store moves into the domain's directory, and the
+    // memos, facts about this machine, stay beside it for every domain.
+    let _domain = set_env_for_test("KACHE_TRUST_DOMAIN", Some("ci".as_ref()));
+    let domain_probes = probe_memo_dir();
+    let domain_store = Config::load().unwrap().cache_dir;
+    drop(_domain);
     unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
     assert_eq!(probes, dir.path().join("probes"));
+    assert_eq!(domain_probes, dir.path().join("probes"));
+    assert_eq!(domain_store, dir.path().join("ci"));
     let default = probe_memo_dir();
     assert_eq!(default, default_cache_dir().join("probes"));
     assert!(default.is_absolute());
@@ -4123,6 +4137,7 @@ fn test_config_store_dir() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
+        probe_root: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
         shared_store_socket: Ok(None),
@@ -4227,6 +4242,7 @@ fn test_config_index_db_path() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
+        probe_root: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
         shared_store_socket: Ok(None),
@@ -4327,6 +4343,7 @@ fn test_config_event_log_path() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
+        probe_root: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
         shared_store_socket: Ok(None),
@@ -4494,6 +4511,7 @@ fn test_config_socket_path() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
+        probe_root: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
         shared_store_socket: Ok(None),

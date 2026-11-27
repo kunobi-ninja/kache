@@ -155,6 +155,7 @@ fn test_config() -> Config {
         incremental_crates: Vec::new(),
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
+        probe_root: std::env::temp_dir().join("kache-tui-test").clone(),
         cache_dir: std::env::temp_dir().join("kache-tui-test"),
         runtime_dir: std::env::temp_dir().join("kache-tui-test"),
         max_size: 1024 * 1024,

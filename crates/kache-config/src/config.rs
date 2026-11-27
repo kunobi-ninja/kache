@@ -183,6 +183,10 @@ pub fn default_recovery_floor(in_ci: bool) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
+    /// The cache directory before trust-domain isolation: probe memos are facts about this
+    /// machine's toolchains, shared by every trust domain, so they stay beside the domains' stores
+    /// ([`Config::probe_memo_dir`]). Equal to `cache_dir` without a trust domain.
+    pub probe_root: PathBuf,
     /// Job/process-lifetime state root. Defaults to [`Self::cache_dir`] for
     /// compatibility, but can be separated from a persistent node-local store
     /// with `KACHE_RUNTIME_DIR` / `[cache] runtime_dir`. When
@@ -1910,6 +1914,7 @@ impl Config {
         // single path-safe label. Invalid or unusable labels fail open to the
         // unscoped cache dir. Do not export this on public/fork jobs.
         let trust_domain = invocation.var("KACHE_TRUST_DOMAIN").ok();
+        let probe_root = cache_dir.clone();
         let cache_dir = isolate_cache_dir_for_trust_domain(cache_dir, trust_domain.as_deref());
         let runtime_dir = if runtime_follows_cache {
             cache_dir.clone()
@@ -2732,6 +2737,7 @@ impl Config {
 
         Ok(Config {
             cache_dir,
+            probe_root,
             runtime_dir,
             socket_path_override,
             shared_store_socket,
@@ -4324,6 +4330,19 @@ impl Config {
         self.cache_dir.join("index.db")
     }
 
+    /// Where probe memos (CRT placements, build-script tree digests) live: in
+    /// the local store, so they outlive a throwaway home whose store is
+    /// mounted. A local store without memos starts from the read-only
+    /// store's ([`seed_probe_memo_dir`]); each memo still checks its own
+    /// stamps before it is used.
+    pub fn probe_memo_dir(&self) -> PathBuf {
+        let memo_dir = self.probe_root.join(PROBE_MEMO_DIR_NAME);
+        if let Some(readonly_store) = &self.readonly_store {
+            seed_probe_memo_dir(&memo_dir, &readonly_store.join(PROBE_MEMO_DIR_NAME));
+        }
+        memo_dir
+    }
+
     pub fn event_log_path(&self) -> PathBuf {
         self.runtime_dir.join("events.jsonl")
     }
@@ -4569,10 +4588,9 @@ pub fn default_cache_executables() -> bool {
     cfg!(target_os = "linux") || cfg!(target_os = "macos")
 }
 
-/// Where probe memos (CRT placements, build-script tree digests) live: under
-/// the cache directory the environment selects, else the default one. Callers
-/// without a loaded configuration use this; the configured `cache_dir` wins
-/// where one is at hand.
+/// Where probe memos live for this process's invocation
+/// ([`probe_memo_dir_for`]), else under the cache directory the environment
+/// selects or the default one. Callers without an invocation use this.
 pub fn probe_memo_dir() -> PathBuf {
     let invocation = InvocationEnv::capture();
     probe_memo_dir_for(&invocation).unwrap_or_else(|_| {
@@ -4584,13 +4602,82 @@ pub fn probe_memo_dir() -> PathBuf {
     })
 }
 
-/// Probe memos belong to the invoking client's store selection.
+/// Probe memos belong to the invoking client's store selection: the store its
+/// configuration selects ([`Config::probe_memo_dir`]), loaded once per
+/// invocation. Callers that hold a loaded configuration ask it instead.
 pub fn probe_memo_dir_for(invocation: &InvocationEnv) -> Result<PathBuf> {
-    let base = invocation
-        .var_os("KACHE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_cache_dir_for(invocation));
-    Ok(resolve_invocation_path(invocation, &base)?.join("probes"))
+    invocation
+        .derived_path(Path::new(""), "probe-memo-dir", || {
+            match Config::load_for(invocation) {
+                Ok(config) => Some(config.probe_memo_dir()),
+                Err(error) => {
+                    tracing::debug!("no probe memo directory: {error:#}");
+                    None
+                }
+            }
+        })
+        .context("the configuration selecting the probe memo directory does not load")
+}
+
+/// The directory of the probe memos inside a store.
+const PROBE_MEMO_DIR_NAME: &str = "probes";
+
+/// Gives a local store without a memo directory a copy of the read-only
+/// store's memos. Built beside it and renamed into place, so a concurrent
+/// client sees all of them or none; a failure leaves the client to probe.
+/// Modification times are kept: a memo written before this boot is refused,
+/// and a copy must not pass for a newer one.
+fn seed_probe_memo_dir(memo_dir: &Path, readonly_memo_dir: &Path) {
+    static SEEDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if memo_dir.exists() || !readonly_memo_dir.is_dir() {
+        return;
+    }
+    let Some(parent) = memo_dir.parent() else {
+        return;
+    };
+    let staging = parent.join(format!(
+        ".{PROBE_MEMO_DIR_NAME}-seed-{}-{}",
+        std::process::id(),
+        SEEDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let seeded = std::fs::create_dir_all(&staging)
+        .and_then(|()| copy_dir_files(readonly_memo_dir, &staging))
+        .and_then(|()| std::fs::rename(&staging, memo_dir));
+    match seeded {
+        Ok(()) => tracing::debug!(
+            "seeded probe memos {} from {}",
+            memo_dir.display(),
+            readonly_memo_dir.display()
+        ),
+        Err(error) => {
+            tracing::debug!(
+                "probe memos {} not seeded from {}: {error}",
+                memo_dir.display(),
+                readonly_memo_dir.display()
+            );
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+    }
+}
+
+/// Copies the regular files below `from` into the directory `to`, keeping
+/// each file's modification time.
+fn copy_dir_files(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            std::fs::create_dir(&target)?;
+            copy_dir_files(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            let modified = entry.metadata()?.modified()?;
+            let mut copy = std::fs::File::create(&target)?;
+            std::io::copy(&mut std::fs::File::open(entry.path())?, &mut copy)?;
+            copy.set_modified(modified)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn default_cache_dir() -> PathBuf {
@@ -6015,6 +6102,84 @@ pull_request_prefix = "pr/42"
         );
         // Loading another request cannot overwrite the original snapshot.
         assert_eq!(Config::load_for(&one).unwrap().key_salt, a.key_salt);
+    }
+
+    /// Probe memos live in the local store the config file selects, not in the
+    /// default cache directory a throwaway home loses. A local store without
+    /// memos starts from the read-only store's, with their modification
+    /// times; one with a memo directory keeps its own.
+    #[test]
+    fn probe_memos_live_in_the_configured_local_store_and_start_from_the_readonly_one() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("local");
+        let host = root.path().join("host");
+        std::fs::create_dir_all(host.join("probes/tree")).unwrap();
+        std::fs::write(host.join("probes/crt.json"), "crt").unwrap();
+        std::fs::write(host.join("probes/tree/digest"), "tree").unwrap();
+        let written = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
+        std::fs::File::options()
+            .write(true)
+            .open(host.join("probes/tree/digest"))
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        let config = root.path().join("kache.toml");
+        let quote = |path: &Path| toml::Value::String(path.display().to_string()).to_string();
+        let write_config = |readonly: &Path| {
+            std::fs::write(
+                &config,
+                format!(
+                    "[cache]\nlocal_store = {}\nreadonly_store = {}\n",
+                    quote(&local),
+                    quote(readonly)
+                ),
+            )
+            .unwrap();
+        };
+        let invocation = || {
+            snapshot(
+                root.path(),
+                &[
+                    ("KACHE_CONFIG", config.to_str().unwrap()),
+                    ("KACHE_HOST_CONFIG", ""),
+                ],
+            )
+        };
+
+        write_config(&root.path().join("no-host"));
+        let memo = probe_memo_dir_for(&invocation()).unwrap();
+        assert_eq!(memo, local.join("probes"));
+        assert!(!memo.exists(), "nothing to seed from");
+
+        std::fs::create_dir_all(&memo).unwrap();
+        write_config(&host);
+        assert_eq!(probe_memo_dir_for(&invocation()).unwrap(), memo);
+        assert!(
+            std::fs::read_dir(&memo).unwrap().next().is_none(),
+            "a memo directory of its own is not seeded"
+        );
+
+        std::fs::remove_dir(&memo).unwrap();
+        assert_eq!(probe_memo_dir_for(&invocation()).unwrap(), memo);
+        assert_eq!(
+            std::fs::read_to_string(memo.join("crt.json")).unwrap(),
+            "crt"
+        );
+        let digest = memo.join("tree/digest");
+        assert_eq!(std::fs::read_to_string(&digest).unwrap(), "tree");
+        assert_eq!(
+            std::fs::metadata(&digest).unwrap().modified().unwrap(),
+            written
+        );
+        let staging = std::fs::read_dir(&local)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "probes")
+            .count();
+        assert_eq!(staging, 0, "no staging directory is left behind");
+
+        std::fs::write(host.join("probes/later.json"), "later").unwrap();
+        assert_eq!(probe_memo_dir_for(&invocation()).unwrap(), memo);
+        assert!(!memo.join("later.json").exists(), "seeded once");
     }
 
     #[test]

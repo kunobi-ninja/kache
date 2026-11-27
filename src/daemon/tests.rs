@@ -1852,6 +1852,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         incremental_crates: Vec::new(),
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
+        probe_root: dir.to_path_buf().clone(),
         cache_dir: dir.to_path_buf(),
         runtime_dir: dir.to_path_buf(),
         socket_path_override: None,

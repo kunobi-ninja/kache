@@ -642,7 +642,7 @@ struct Run {
 fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     let start = std::time::Instant::now();
     let config = Config::load()?;
-    let _ = TREE_MEMO_DIR.set(config.cache_dir.clone());
+    let _ = TREE_MEMO_DIR.set(config.probe_memo_dir());
     if config.disabled {
         anyhow::bail!("kache is disabled");
     }
@@ -661,31 +661,33 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         start,
     };
 
-    let local_prediction = run.prediction()?;
+    let local_prediction = readable_prediction(&run, &run.store);
     if let Some(prediction) = &local_prediction
         && run.config.build_script_hermetic
         && let Some(code) = hermetic::run(&run, real, argv, prediction)?
     {
         return Ok(code);
     }
-    // The action key folds the declarations stored with the run. A reader
-    // that has never run this script takes them from the read-only store,
-    // which is where the entry lives too.
-    let prediction = match local_prediction {
-        Some(prediction) => Some(prediction),
-        None => match &readonly {
-            Some(store) => run.prediction_in(store)?,
-            None => None,
-        },
-    };
+    let predictions = declaration_sets(
+        local_prediction,
+        readonly
+            .as_ref()
+            .and_then(|store| readable_prediction(&run, store)),
+    );
+    tracing::debug!(
+        "[build-script] {} declaration set(s) to look up (read-only store: {})",
+        predictions.len(),
+        readonly.is_some()
+    );
     // Everything below writes into `OUT_DIR` itself.
     detach_out_dir(&run.environment.out_dir)?;
-    let key_start = std::time::Instant::now();
-    // A stored run Cargo would now rerun is a miss, so running the script
-    // records its current declarations.
-    if let Some(prediction) = &prediction
-        && let Some(key) = unless_rerun_every_build(run.action_key(prediction))?
-    {
+    for prediction in &predictions {
+        let key_start = std::time::Instant::now();
+        // A stored run Cargo would now rerun is a miss, so running the script
+        // records its current declarations.
+        let Some(key) = unless_rerun_every_build(run.action_key(prediction))? else {
+            continue;
+        };
         let key_ms = key_start.elapsed().as_millis() as u64;
         let lookup_start = std::time::Instant::now();
         let found = lookup_recorded_run(&run.store, readonly.as_ref(), &key)?;
@@ -709,9 +711,15 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
                     );
                     return Ok(0);
                 }
-                Err(error) => continue_after_restore_failure(error)?,
+                Err(error) => {
+                    // A rejected restore runs the real script; the next
+                    // declarations would only find another run to reject.
+                    continue_after_restore_failure(error)?;
+                    break;
+                }
             }
         }
+        tracing::debug!("[build-script] no store holds build-script run {key}");
     }
 
     // Only a run that starts from an empty OUT_DIR produces a state worth
@@ -851,6 +859,34 @@ fn lookup_recorded_run<'a>(
         return Ok(None);
     };
     Ok(readonly.get(key)?.map(|meta| (readonly, meta)))
+}
+
+/// The declarations to look a recorded run up under, local first. The action
+/// key folds the declarations stored with the run, so a run is found only
+/// under those of the store that recorded it, and a script whose declarations
+/// depend on the tree declares differently in a reader's tree than in the
+/// writer's: the local set must not hide the read-only store's.
+fn declaration_sets(local: Option<Prediction>, readonly: Option<Prediction>) -> Vec<Prediction> {
+    let mut sets = Vec::from_iter(local);
+    if let Some(readonly) = readonly
+        && !sets.contains(&readonly)
+    {
+        sets.push(readonly);
+    }
+    sets
+}
+
+/// [`Run::prediction_in`], with a record `store` cannot hand back (a busy
+/// index, an undecodable row) taken as none: the other store's declarations
+/// are still tried, and one bad record never bypasses the cache.
+fn readable_prediction(run: &Run, store: &Store) -> Option<Prediction> {
+    run.prediction_in(store).unwrap_or_else(|error| {
+        tracing::debug!(
+            "[build-script] declarations unreadable in {}: {error:#}",
+            store.cache_dir().display()
+        );
+        None
+    })
 }
 
 fn stored_prediction(store: &Store, identity: &str) -> Result<Option<Prediction>> {
@@ -1638,6 +1674,7 @@ impl Run {
     }
 
     /// This package's own prediction, else the one every checkout shares.
+    #[cfg(test)]
     fn prediction(&self) -> Result<Option<Prediction>> {
         self.prediction_in(&self.store)
     }
@@ -4241,6 +4278,55 @@ mod tests {
         );
         run.record_prediction(&current).unwrap();
         assert_eq!(run.prediction().unwrap(), Some(current));
+    }
+
+    /// Each distinct declaration set is looked up once, the local one first.
+    #[test]
+    fn declaration_sets_try_the_readonly_store_s_set_only_when_it_differs() {
+        let set = |input: &str| prediction_with(Some(vec![input.to_string()]), false);
+        assert!(declaration_sets(None, None).is_empty());
+        assert_eq!(declaration_sets(Some(set("a")), None), [set("a")]);
+        assert_eq!(declaration_sets(None, Some(set("b"))), [set("b")]);
+        assert_eq!(
+            declaration_sets(Some(set("a")), Some(set("a"))),
+            [set("a")],
+            "the same set is looked up once"
+        );
+        assert_eq!(
+            declaration_sets(Some(set("a")), Some(set("b"))),
+            [set("a"), set("b")]
+        );
+    }
+
+    /// A stored prediction that cannot be decoded is no prediction, so the
+    /// run still looks the other store up instead of bypassing the cache.
+    #[test]
+    fn an_unreadable_prediction_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "unreadable-declarations".to_string(),
+            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        run.store
+            .file_hash_cache()
+            .put_input_prediction(
+                &run.identity(),
+                PREDICTION_SCHEMA,
+                Some(CRATE_NAME),
+                "{broken JSON",
+            )
+            .unwrap();
+        assert!(run.prediction().is_err());
+        assert_eq!(readable_prediction(&run, &run.store), None);
+
+        let current =
+            recorded_prediction(Vec::new(), vec!["MODE".into()], false, Vec::new(), false);
+        run.record_prediction(&current).unwrap();
+        assert_eq!(readable_prediction(&run, &run.store), Some(current));
     }
 
     /// A dependency path captured before execution keys its current contents,
@@ -8256,6 +8342,59 @@ mod tests {
         assert_eq!(host_store.entry_count().unwrap(), entries);
         assert_eq!(entry_metas(&host), metas);
         assert_eq!(event_results(&job), ["local_hit+readonly"]);
+    }
+
+    /// The job recorded the script under other declarations than the host,
+    /// whose tree then matched the job's again: the host's run is found under
+    /// the host's declarations although the job has declarations of its own.
+    #[cfg(unix)]
+    #[test]
+    fn build_script_readonly_store_restores_under_its_own_declarations() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let mut env = EnvRestore::new();
+        let fixture = script_fixture();
+        let root = fixture.dir.path();
+        kache_fs::testutil::write_executable(
+            &fixture.script,
+            "#!/bin/sh\nset -e\nprintf x >> \"$1\"\nmode=$(cat \"$CARGO_MANIFEST_DIR/mode\")\nprintf \"$mode\" > \"$OUT_DIR/marker\"\necho cargo:rerun-if-changed=mode\nif [ \"$mode\" = a ]; then echo cargo:rerun-if-changed=optional; fi\n",
+        );
+        let set = |name: &str, contents: &str, at: i64| {
+            let path = fixture.package.join(name);
+            std::fs::write(&path, contents).unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(at, 0)).unwrap();
+        };
+        let (host, job) = (root.join("host"), root.join("job"));
+        let (host_config, job_config) = (root.join("host.toml"), root.join("job.toml"));
+        write_reader_config(&host_config, &host, None);
+        write_reader_config(&job_config, &job, Some(&host));
+        let out = root.join("out");
+        let mut build = |config: &Path| {
+            prepare_out(&out);
+            let code = run_reader(
+                &mut env,
+                config,
+                &out,
+                &fixture.package,
+                &fixture.script,
+                &fixture.sentinel,
+            );
+            assert_eq!(code, 0, "job {:?}", event_results(&job));
+            (
+                std::fs::read_to_string(out.join("marker")).unwrap(),
+                std::fs::read_to_string(&fixture.sentinel).unwrap(),
+            )
+        };
+        set("mode", "a", 1_000_000_000);
+        set("optional", "o", 1_000_000_000);
+        assert_eq!(build(&job_config), ("a".into(), "x".into()));
+        set("mode", "b", 1_000_000_100);
+        assert_eq!(build(&host_config), ("b".into(), "xx".into()));
+        assert_eq!(
+            build(&job_config),
+            ("b".into(), "xx".into()),
+            "the job restores the host's run"
+        );
+        assert_eq!(event_results(&job), ["miss", "local_hit+readonly"]);
     }
 
     /// No read-only store is configured. A miss still records into the local

@@ -7599,8 +7599,7 @@ fn written_while_building(
     store: Option<&Store>,
     env: &crate::invocation::InvocationEnv,
 ) -> Vec<PathBuf> {
-    let probe_dir =
-        crate::config::probe_memo_dir_for(env).unwrap_or_else(|_| config.cache_dir.join("probes"));
+    let probe_dir = config.probe_root.join("probes");
     let mut written = crate::build_script_inputs::excluded_roots(
         None,
         [

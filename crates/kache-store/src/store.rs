@@ -157,24 +157,45 @@ fn verify_durability_file(
     Ok(file)
 }
 
-/// Seal a blob to the one store mode, whatever its kind or ingest path.
-///
-/// On Unix every sealed blob is `0o444`, or `0o555` when it carries an execute
-/// bit. The arriving read bits are not kept: an output created under a
-/// restrictive umask (or a private temporary file) would otherwise seal
-/// `0o400`, and a reader with another uid restores nothing from it. Who may
-/// reach a blob is decided by the store directory. A hardlinked ingest must
-/// not publish a writable shared inode, so this also seals that inode.
+#[cfg(unix)]
+fn shared_blob_mode(mode: u32) -> u32 {
+    if mode & 0o111 == 0 { 0o444 } else { 0o555 }
+}
+
+/// Avoid hardlinking a private output that would need broader access to serve
+/// readers of the store. Its own copy may use the store's permissions.
+fn store_hardlink_source(source: &Path) -> bool {
+    fs::symlink_metadata(source).is_ok_and(|meta| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            if mode & shared_blob_mode(mode) != shared_blob_mode(mode) {
+                return false;
+            }
+        }
+        meta.file_type().is_file()
+    })
+}
+
+/// Seal a blob so it can be read through the store. An existing hardlink
+/// from an older writer may also name a private output. Remove write access
+/// from such an inode without granting new read or execute access.
 fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
-    let mut perms = fs::metadata(blob)?.permissions();
+    let meta = fs::metadata(blob)?;
+    let mut perms = meta.permissions();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(if perms.mode() & 0o111 == 0 {
-            0o444
-        } else {
-            0o555
-        });
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let current = perms.mode();
+        let mut sealed = shared_blob_mode(current);
+        if meta.nlink() > 1 {
+            sealed &= current;
+        }
+        if current & 0o7777 == sealed {
+            return Ok(());
+        }
+        perms.set_mode(sealed);
     }
     #[cfg(not(unix))]
     perms.set_readonly(true);
@@ -515,10 +536,7 @@ fn materialize_blob_with_durability(
                 && crate::link::try_reflink(source, tmp).is_ok();
             if reflink_ok {
                 ingest.set(StoreIngest::Reflink);
-            } else if allow_store_hardlink(
-                allow_hardlink,
-                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
-            ) {
+            } else if allow_store_hardlink(allow_hardlink, store_hardlink_source(source)) {
                 match try_store_hard_link(source, tmp) {
                     Ok(()) => {
                         ingest.set(StoreIngest::Hardlink);
@@ -4621,10 +4639,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     || crate::link::try_reflink(source, tmp).is_ok());
             let ingest = if reflink_ok {
                 StoreIngest::Reflink
-            } else if allow_store_hardlink(
-                allow_hardlink,
-                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
-            ) {
+            } else if allow_store_hardlink(allow_hardlink, store_hardlink_source(source)) {
                 // Refused for symlink sources: hashing followed the link, but a
                 // hardlink would link the symlink itself — a pointer into mutable
                 // external state, never valid for a blob (same rule as

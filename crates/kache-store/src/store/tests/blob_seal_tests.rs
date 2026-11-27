@@ -113,6 +113,16 @@ fn owner_only_outputs_publish_world_readable_blobs() {
                 expected,
                 "{ingest} put of a {source_mode:03o} output"
             );
+            assert_ne!(
+                fs::metadata(&blob).unwrap().ino(),
+                fs::metadata(&output).unwrap().ino(),
+                "{ingest} must not share a private output's inode"
+            );
+            assert_eq!(
+                mode(&output),
+                source_mode,
+                "{ingest} changed the output mode"
+            );
         }
     }
 }
@@ -221,6 +231,19 @@ fn materializing_onto_an_existing_blob_seals_it() {
     set_mode(&blob, 0o400);
     assert!(!materialize_blob(&source, &blob, false).unwrap());
     assert_eq!(mode(&blob), 0o444);
+}
+
+#[test]
+fn resealing_a_legacy_hardlink_does_not_widen_output_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("private.rlib");
+    let blob = dir.path().join("legacy");
+    fs::write(&output, b"private output").unwrap();
+    set_mode(&output, 0o600);
+    fs::hard_link(&output, &blob).unwrap();
+    assert!(!materialize_blob(&output, &blob, true).unwrap());
+    assert_eq!(mode(&output), 0o400);
+    assert_eq!(mode(&blob), 0o400);
 }
 
 /// A hardlinked snapshot that loses the publish race to another writer is

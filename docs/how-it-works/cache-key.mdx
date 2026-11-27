@@ -89,8 +89,8 @@ once and stores its own entry. A piped build stores its warnings under the
 shared key, which terminal builds use only when its output is width-free.
 
 Malformed or repeated width options stay in the key, so a cached success cannot
-hide rustc's error about them. After upgrading, crates that warn at a terminal
-width miss once. Piped builds and capped dependencies keep their keys.
+hide rustc's error about them. When terminal width handling was introduced,
+crates that warned at a terminal width missed once.
 
 Cargo builds every dependency that is not a path package with
 `--cap-lints allow`. Under exactly one such cap and no `--force-warn`, rustc
@@ -100,17 +100,19 @@ these units the key keeps only what rustc emits besides rendered text (JSON or
 not, `--json=artifacts`, `--json=future-incompat`) and `--check-cfg`. It leaves
 out `--error-format` human, short or json, `--color`, `--diagnostic-width`,
 `--json=diagnostic-short` and `diagnostic-rendered-ansi`, and every other lint
-level. `cargo build`, `--message-format short`, an editor using
-`--message-format json` and a profile that adds `-D warnings` to its rustflags
-then share each dependency's entry.
+level. For example, Cargo's human and short formats can share an entry. JSON
+builds share entries with other JSON builds that request the same artifact
+and future-incompatibility records. Within either group, the entry can also
+be reused with different lint levels, including `-D warnings`.
 
 Output without rendered text is stored under that key. Any other output, such
 as a `future-incompat` report, is stored under a second key derived from the
 first key and the flags it leaves out, and replays only for those flags. A
-repeated or unknown presentation option, `--force-warn`, a cap other than
+repeated single-valued presentation option, an unknown option, `--force-warn`, a cap other than
 `allow`, `-W help`, `--json` without `--error-format=json`, and `--json` with
 `--color` keep every flag in the key. After upgrading, capped dependencies
-miss once.
+miss once. Kache combines supported repeated `--json` options into the same
+set of JSON records that rustc emits.
 
 Explicit per-kind Rust output destinations, such as `--emit=metadata=custom.rmeta`, pass through to rustc so it writes the requested file. Emit kinds without destinations still use the cache. This fix changes Rust cache keys, so existing Rust entries miss once after upgrading.
 

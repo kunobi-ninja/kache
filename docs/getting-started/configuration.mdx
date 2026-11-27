@@ -341,7 +341,7 @@ The equivalent environment setting is `KACHE_READONLY_STORE=/kache-host`. The va
 - Rust and C/C++ lookups ask the local store first (a volume shard, then the main store), then the read-only store. NVCC currently uses its own local and remote stores.
 - A hit there is restored as a private copy (a reflink where the filesystem supports it), never a hardlink into that store.
 - Kache skips index writes, hit stamps and maintenance there. A damaged or legacy entry is a miss. A rejected hit compiles and caches in your own writable store.
-- Its owner must keep the WAL side files available. A WAL-mode index without `index.db-wal` and `index.db-shm` is skipped with a warning. A read-only mount is required to prevent SQLite from creating side files if the owner removes them during an open. The connection alone cannot enforce that protection on a writable mount.
+- Kache writers keep `index.db-wal` and `index.db-shm` when they close, so jobs can keep reading the store after the writer exits. If an older writer removed the files, reopen the store with an updated writer before mounting it read-only. Kache skips a WAL-mode index when either file is missing. A read-only mount prevents SQLite from recreating the side files if they disappear during an open.
 - With a read-only store set, a unit with no record in the local store is keyed before it compiles, so it can still hit there.
 - `kache stats` and `kache report` count its hits as local hits and also report them on their own as `readonly_hits`, so you can see how much of the local hit count the shared store served. Hits logged by older versions of kache are not marked.
 
